@@ -283,10 +283,6 @@ impl BTree {
                         let mid_key = cells[m].0.clone();
                         let right_cells = cells.split_off(m);
                         let new_leftmost = right_cells[0].1;
-                        let right_cells = right_cells
-                            .into_iter()
-                            .map(|(k, c)| (k, c))
-                            .collect::<Vec<_>>();
                         let right = ctx.pager.allocate_page(ctx.tx)?;
                         Self::write_node(
                             ctx.pager,
@@ -498,12 +494,12 @@ mod tests {
                 0 | 1 => {
                     let v = (r >> 16) % 10_000;
                     let res = tree.insert(&mut pager, &mut tx, Value::Int(k), v, true);
-                    if model.contains_key(&k) {
-                        // Unique index must reject a re-insert of a live key.
-                        assert!(matches!(res, Err(BTreeError::Duplicate)), "k={k}");
-                    } else {
-                        res.unwrap();
-                        model.insert(k, v);
+                    match (model.contains_key(&k), res) {
+                        (true, Err(BTreeError::Duplicate)) => {}
+                        (false, Ok(())) => {
+                            model.insert(k, v);
+                        }
+                        (_, r) => panic!("unexpected insert result for k={k}: {r:?}"),
                     }
                 }
                 _ => {
