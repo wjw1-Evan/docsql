@@ -76,6 +76,32 @@ sql "$P" "ROLLBACK;" >/dev/null
 after=$(sql "$P" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 [ "$before" = "$after" ] && ok "rollback over network (count $before == $after)" || bad "tx rollback: $before != $after"
 
+echo "== 9. web console in docker =="
+W="http://127.0.0.1:17700"
+# 页面
+body=$(curl -s "$W/")
+echo "$body" | grep -q "docsql console" && ok "web UI served" || bad "web UI: $(echo "$body" | head -c 80)"
+# SQL 执行
+r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"CREATE TABLE web_check (id INT PRIMARY KEY, note TEXT)"}')
+echo "$r" | grep -q '"affected"' && ok "web sql create" || bad "web sql create: $r"
+r=$(curl -s -X POST "$W/api/sql" -H "Content-Type: application/json" -d "{\"sql\":\"INSERT INTO web_check VALUES (1, 'fromweb')\"}")
+echo "$r" | grep -q '"count":1' && ok "web sql insert" || bad "web sql insert: $r"
+r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"SELECT id, note FROM web_check"}')
+echo "$r" | grep -q '"fromweb"' && ok "web sql select" || bad "web sql select: $r"
+# SQL 错误返回错误而非崩溃
+r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"SELECT * FROM missing"}')
+echo "$r" | grep -q '"error"' && ok "web sql error surfaced" || bad "web sql error: $r"
+# KV + 键浏览
+curl -s -X POST "$W/api/kv" -H 'Content-Type: application/json' -d '{"command":"SET","args":["web:key","ok"]}' >/dev/null
+r=$(curl -s "$W/api/keys")
+echo "$r" | grep -q '"web:key"' && ok "web kv set + keys browser" || bad "web keys: $r"
+# 统计
+r=$(curl -s "$W/api/stats")
+echo "$r" | grep -q '"kv_keys":1' && ok "web stats" || bad "web stats: $r"
+# 认证开关(DOCSQL_TOKEN 未设置时应放行;此处仅验证无 token 可访问)
+code=$(curl -s -o /dev/null -w "%{http_code}" "$W/api/stats")
+[ "$code" = "200" ] && ok "web no-auth mode accessible" || bad "web http code: $code"
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

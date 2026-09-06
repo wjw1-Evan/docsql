@@ -13,12 +13,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # Test gate: any failing test fails the build (exit code propagates).
 RUN cargo test --workspace --release
-RUN cargo build --release -p docsql-server -p docsql-cli
+RUN cargo build --release -p docsql-server -p docsql-cli -p docsql-web
 
 # Runtime stage: server + cli only.
 FROM mcr.microsoft.com/azurelinux/base/core:3.0
 RUN tdnf install -y ca-certificates libstdc++ && tdnf clean all
 COPY --from=builder /build/target/release/docsql-server /usr/local/bin/docsql-server
 COPY --from=builder /build/target/release/docsql-cli /usr/local/bin/docsql-cli
-EXPOSE 7600
+COPY --from=builder /build/target/release/docsql-web /usr/local/bin/docsql-web
+EXPOSE 7600 7700
 ENTRYPOINT ["docsql-server"]

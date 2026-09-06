@@ -5,6 +5,7 @@ set -eu
 cd "$(dirname "$0")"
 echo "== reset cluster (fresh volumes) =="
 docker compose down -v >/dev/null 2>&1 || true
+docker compose build >/dev/null
 docker compose up -d >/dev/null
 echo "== wait for nodes =="
 for port in 17601 17602 17603; do

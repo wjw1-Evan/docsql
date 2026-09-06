@@ -51,8 +51,24 @@ services:
       node-primary:
         condition: service_started
 
+  # Web console (embedded engine on its own volume; REST + UI on :7700).
+  node-web:
+    image: docsql:latest
+    container_name: docsql-web
+    command: ["/data/docsql.db", "0.0.0.0:7700"]
+    entrypoint: ["docsql-web"]
+    ports:
+      - "17700:7700"
+    volumes:
+      - web-data:/data
+    networks: [docsql]
+    depends_on:
+      node-primary:
+        condition: service_started
+
 volumes:
   primary-data:
+  web-data:
   replica-a-data:
   shard-b-data:
 
