@@ -1,0 +1,11 @@
+//! docsql-core: embedded multi-model database core.
+//!
+//! Documents (JSON-like values) are stored whole, like a document store,
+//! while a full SQL layer operates on top of them.
+
+pub mod encode;
+pub mod pager;
+pub mod value;
+pub mod wal;
+
+pub use value::Value;
