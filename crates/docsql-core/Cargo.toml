@@ -8,6 +8,7 @@ description = "docsql embedded core: document storage engine + SQL execution"
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+sqlparser = "0.62"
+
+

@@ -4,7 +4,10 @@
 //! while a full SQL layer operates on top of them.
 
 pub mod encode;
+pub mod engine;
+pub mod heap;
 pub mod pager;
+pub mod proto;
 pub mod value;
 pub mod wal;
 
