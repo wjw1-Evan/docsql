@@ -254,6 +254,18 @@ impl Database {
         self.tx_snapshot.is_some()
     }
 
+    /// True when the statement mutates data (used by replicas to reject
+    /// client writes while accepting replicated ones).
+    pub fn is_write_statement(sql: &str) -> bool {
+        match Parser::parse_sql(&GenericDialect {}, sql) {
+            Ok(stmts) => match stmts.first() {
+                Some(Statement::Query(_)) | Some(Statement::Pragma { .. }) | None => false,
+                Some(_) => true,
+            },
+            Err(_) => true,
+        }
+    }
+
     /// Execute exactly one SQL statement.
     pub fn execute(&mut self, sql: &str) -> Result<ExecOutcome> {
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)

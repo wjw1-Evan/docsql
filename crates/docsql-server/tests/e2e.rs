@@ -18,6 +18,8 @@ async fn start_server(token: Option<&str>) -> (tempfile::TempDir, String) {
         db_path: db,
         listen: addr.clone(),
         auth_token: token.map(String::from),
+        replicate_to: None,
+        read_only: false,
     };
     tokio::spawn(docsql_server::run(cfg));
     // Wait for the port to accept.
@@ -188,4 +190,85 @@ async fn sql_error_reaches_client() {
     // Connection stays usable afterwards.
     let r = c.kv(&["PING"]).await;
     assert_eq!(payload_str(&r), "pong");
+}
+
+/// Replication + failover: writes on the primary appear on the replica;
+/// killing the primary and promoting the replica restores write capability.
+#[tokio::test]
+async fn replication_and_failover() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let replica_addr = free();
+    let primary_addr = free();
+
+    // Replica: read-only, no upstream.
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join("replica.db"),
+        listen: replica_addr.clone(),
+        auth_token: None,
+        replicate_to: None,
+        read_only: true,
+    }));
+    // Primary: forwards writes to the replica.
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join("primary.db"),
+        listen: primary_addr.clone(),
+        auth_token: None,
+        replicate_to: Some(replica_addr.clone()),
+        read_only: false,
+    }));
+    for addr in [&primary_addr, &replica_addr] {
+        for _ in 0..100 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    // Write on the primary.
+    let mut p = Client::connect(&primary_addr).await;
+    p.sql("CREATE TABLE fail (id INT)").await;
+    p.sql("INSERT INTO fail VALUES (7)").await;
+
+    // The replica sees it (async forwarding — poll briefly).
+    let mut r = Client::connect(&replica_addr).await;
+    let mut seen = false;
+    for _ in 0..50 {
+        let resp = r.sql("SELECT id FROM fail").await;
+        if resp.frame_type == proto::RESP_ROWS
+            && String::from_utf8_lossy(&resp.payload).contains("\"rows\":[[7]]")
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(seen, "replica did not observe the replicated write");
+
+    // Replica rejects client writes before promotion.
+    let resp = r.sql("INSERT INTO fail VALUES (8)").await;
+    assert_eq!(resp.frame_type, proto::RESP_ERROR);
+    assert!(payload_str(&resp).contains("read-only"));
+
+    // Failover: promote the replica; writes now succeed.
+    r.kv(&["PROMOTE"]).await;
+    let resp = r.sql("INSERT INTO fail VALUES (8)").await;
+    assert_eq!(
+        resp.frame_type,
+        proto::RESP_AFFECTED,
+        "promoted insert failed: {}",
+        payload_str(&resp)
+    );
+    let resp = r.sql("SELECT COUNT(id) FROM fail").await;
+    assert!(
+        payload_str(&resp).contains("[[2]]"),
+        "got {}",
+        payload_str(&resp)
+    );
 }

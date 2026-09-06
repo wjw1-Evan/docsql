@@ -27,12 +27,25 @@ pub struct ServerState {
     pub kv: Mutex<Kv>,
     pub pubsub: PubSub,
     pub auth_token: Option<String>,
+    /// Upstream replication target (empty when not replicating).
+    pub replicate_to: tokio::sync::Mutex<Option<String>>,
+    /// Replicas reject client writes until promoted.
+    pub read_only: std::sync::atomic::AtomicBool,
 }
+
+/// Flags bit 1 marks replication-internal frames (bypasses read-only).
+pub const FLAG_REPLICATION: u16 = 0x0002;
 
 pub struct ServerConfig {
     pub db_path: PathBuf,
     pub listen: String,
     pub auth_token: Option<String>,
+    /// Replication upstream: every successful write is forwarded here
+    /// (host:port of a docsql-server in replica mode).
+    pub replicate_to: Option<String>,
+    /// Replica mode: reject client writes (replication frames excepted)
+    /// until promoted via PROMOTE.
+    pub read_only: bool,
 }
 
 pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
@@ -41,6 +54,8 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         kv: Mutex::new(kv),
         pubsub: PubSub::new(),
         auth_token: cfg.auth_token,
+        replicate_to: tokio::sync::Mutex::new(cfg.replicate_to.clone()),
+        read_only: std::sync::atomic::AtomicBool::new(cfg.read_only),
     });
     let listener = TcpListener::bind(&cfg.listen).await?;
     eprintln!("docsql-server listening on {}", cfg.listen);
@@ -185,8 +200,28 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
         Ok(s) => s,
         Err(e) => return Frame::new(proto::RESP_ERROR, kvproto::err_payload(&e.to_string())),
     };
-    let mut kv = state.kv.lock().unwrap();
-    match kv.db.execute(&sql) {
+    // Replica read-only gate (replication-internal frames pass through).
+    let is_replication = frame.flags & FLAG_REPLICATION != 0;
+    let read_only = state.read_only.load(std::sync::atomic::Ordering::SeqCst);
+    if read_only && !is_replication && docsql_core::engine::Database::is_write_statement(&sql) {
+        return Frame::new(
+            proto::RESP_ERROR,
+            kvproto::err_payload("read-only replica; PROMOTE to accept writes"),
+        );
+    }
+    let outcome = {
+        let mut kv = state.kv.lock().unwrap();
+        kv.db.execute(&sql)
+    };
+    // Replicate successful writes to the upstream (async, best-effort log).
+    if !is_replication && matches!(outcome, Ok(ExecOutcome::Affected(_))) {
+        if let Some(target) = state.replicate_to.lock().await.clone() {
+            if let Err(e) = forward_write(&target, &sql).await {
+                eprintln!("replication to {target} failed: {e}");
+            }
+        }
+    }
+    match outcome {
         Ok(ExecOutcome::Rows(r)) => {
             let mut obj = docsql_core::value::Object::new();
             obj.insert(
@@ -205,6 +240,31 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
         Ok(ExecOutcome::Affected(n)) => Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec()),
         Err(e) => Frame::new(proto::RESP_ERROR, kvproto::err_payload(&e.to_string())),
     }
+}
+
+/// Send one write to the replication upstream.
+async fn forward_write(target: &str, sql: &str) -> std::io::Result<()> {
+    let mut stream = tokio::net::TcpStream::connect(target).await?;
+    let mut frame = Frame::new(proto::REQ_SQL, proto::encode_sql(sql).unwrap_or_default());
+    frame.flags = FLAG_REPLICATION;
+    let bytes = frame.encode().map_err(std::io::Error::other)?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    // Read the response header + payload and discard.
+    let mut header = [0u8; proto::HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    if header[6] == (proto::RESP_ERROR & 0xff) as u8 && header[7] == (proto::RESP_ERROR >> 8) as u8
+    {
+        return Err(std::io::Error::other(format!(
+            "replica rejected: {}",
+            String::from_utf8_lossy(&payload)
+        )));
+    }
+    Ok(())
 }
 
 pub fn parse_kv_args(payload: &[u8]) -> Result<Vec<String>, String> {

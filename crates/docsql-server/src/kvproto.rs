@@ -328,6 +328,13 @@ pub async fn handle(
                 ),
             }
         }
+        "PROMOTE" => {
+            state
+                .read_only
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            *state.replicate_to.lock().await = None;
+            (ok(&["promoted"]), None, authed)
+        }
         "MULTI" => match state.kv.lock().unwrap().multi() {
             Ok(()) => (ok(&["ok"]), None, authed),
             Err(e) => (
