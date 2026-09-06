@@ -216,6 +216,30 @@ impl Kv {
         Ok(next)
     }
 
+    /// MULTI — start a transaction (same engine transaction as SQL BEGIN).
+    pub fn multi(&mut self) -> Result<()> {
+        match self.db.execute("BEGIN") {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// EXEC — commit the transaction.
+    pub fn exec(&mut self) -> Result<()> {
+        match self.db.execute("COMMIT") {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// DISCARD — roll back the transaction.
+    pub fn discard(&mut self) -> Result<()> {
+        match self.db.execute("ROLLBACK") {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Remove every expired row (background/periodic cleanup).
     pub fn sweep(&mut self) -> Result<u64> {
         let now = now_ms();
@@ -472,6 +496,43 @@ mod tests {
         // Plain SET clears the TTL (no KEEPTTL option given).
         kv.set("k", "v2", SetOpts::default()).unwrap();
         assert_eq!(kv.ttl_ms("k").unwrap(), None);
+    }
+
+    #[test]
+    fn multi_exec_atomic_batch() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.multi().unwrap();
+        kv.set("a", "1", SetOpts::default()).unwrap();
+        kv.set("b", "2", SetOpts::default()).unwrap();
+        kv.incr_by("count", 5).unwrap();
+        kv.exec().unwrap();
+        assert_eq!(kv.get("a").unwrap(), Some("1".into()));
+        assert_eq!(kv.get("count").unwrap(), Some("5".into()));
+    }
+
+    #[test]
+    fn discard_rolls_back_whole_batch() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("keep", "old", SetOpts::default()).unwrap();
+        kv.multi().unwrap();
+        kv.set("keep", "new", SetOpts::default()).unwrap();
+        kv.del("keep").unwrap();
+        kv.set("added", "x", SetOpts::default()).unwrap();
+        kv.discard().unwrap();
+        assert_eq!(kv.get("keep").unwrap(), Some("old".into()));
+        assert_eq!(kv.get("added").unwrap(), None);
+    }
+
+    #[test]
+    fn sql_and_kv_share_one_transaction() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.multi().unwrap();
+        // SQL write inside the same transaction as KV writes
+        kv.db.execute("INSERT INTO _kv (\"key\", type, value, expire_at) VALUES ('sqlkey', 'string', 'v1', 0)").unwrap();
+        kv.set("kvkey", "v2", SetOpts::default()).unwrap();
+        kv.discard().unwrap();
+        assert_eq!(kv.get("sqlkey").unwrap(), None);
+        assert_eq!(kv.get("kvkey").unwrap(), None);
     }
 
     #[test]

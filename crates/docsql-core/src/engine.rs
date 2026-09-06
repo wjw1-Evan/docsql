@@ -97,6 +97,9 @@ impl TableMeta {
 pub struct Database {
     pager: Pager,
     tables: std::collections::BTreeMap<String, TableMeta>,
+    /// Session transaction snapshot: full table state at BEGIN. Rollback
+    /// restores it; commit just discards it (durability is the WAL's job).
+    tx_snapshot: Option<std::collections::BTreeMap<String, (TableMeta, Vec<Object>)>>,
 }
 
 impl Database {
@@ -153,7 +156,11 @@ impl Database {
                 }
             }
         }
-        Ok(Database { pager, tables })
+        Ok(Database {
+            pager,
+            tables,
+            tx_snapshot: None,
+        })
     }
 
     pub fn in_memory() -> Result<Database> {
@@ -208,6 +215,36 @@ impl Database {
         Ok(())
     }
 
+    fn snapshot_all(&mut self) -> std::collections::BTreeMap<String, (TableMeta, Vec<Object>)> {
+        let names: Vec<String> = self.tables.keys().cloned().collect();
+        let mut snap = std::collections::BTreeMap::new();
+        for name in names {
+            let meta = self.tables.get(&name).cloned().unwrap_or_default();
+            let docs = self.table_docs(&name).unwrap_or_default();
+            snap.insert(name, (meta, docs));
+        }
+        snap
+    }
+
+    fn rollback_tx(&mut self) -> Result<ExecOutcome> {
+        let Some(snap) = self.tx_snapshot.take() else {
+            return err("no transaction in progress");
+        };
+        self.tables.clear();
+        for (name, (mut meta, docs)) in snap {
+            let pages = self.rewrite_table(&name, docs)?;
+            meta.pages = pages;
+            self.tables.insert(name, meta);
+        }
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
+    /// True when a session transaction is open.
+    pub fn in_transaction(&self) -> bool {
+        self.tx_snapshot.is_some()
+    }
+
     /// Execute exactly one SQL statement.
     pub fn execute(&mut self, sql: &str) -> Result<ExecOutcome> {
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)
@@ -246,6 +283,20 @@ impl Database {
                 from, selection, ..
             }) => self.exec_delete(from, selection),
             Statement::AlterTable(alter) => self.exec_alter(alter),
+            Statement::StartTransaction { .. } => {
+                if self.tx_snapshot.is_some() {
+                    return err("transaction already in progress");
+                }
+                self.tx_snapshot = Some(self.snapshot_all());
+                Ok(ExecOutcome::Affected(0))
+            }
+            Statement::Commit { .. } => {
+                if self.tx_snapshot.take().is_none() {
+                    return err("no transaction in progress");
+                }
+                Ok(ExecOutcome::Affected(0))
+            }
+            Statement::Rollback { .. } => self.rollback_tx(),
             Statement::Query(q) => self.exec_query(*q),
             other => err(format!("unsupported statement: {other}")),
         }
@@ -253,7 +304,8 @@ impl Database {
 
     /// Rewrite the whole table from `docs` (delete+reinsert; old pages are
     /// orphaned until compaction arrives with the B+ tree milestone).
-    fn rewrite_table(&mut self, table: &str, docs: Vec<Object>) -> Result<()> {
+    /// Rewrite the table from `docs`; returns the new page list.
+    fn rewrite_table(&mut self, table: &str, docs: Vec<Object>) -> Result<Vec<u32>> {
         let mut heap = Heap { pages: Vec::new() };
         let mut tx = self.pager.begin_tx();
         for doc in &docs {
@@ -261,9 +313,10 @@ impl Database {
         }
         self.pager.commit_tx(tx)?;
         if let Some(meta) = self.tables.get_mut(table) {
-            meta.pages = heap.pages;
+            meta.pages = heap.pages.clone();
         }
-        self.save_catalog()
+        self.save_catalog()?;
+        Ok(heap.pages)
     }
 
     fn table_docs(&mut self, table: &str) -> Result<Vec<Object>> {
@@ -1666,6 +1719,63 @@ mod tests {
             .execute("SELECT a, COUNT(*) FROM t GROUP BY b")
             .unwrap_err();
         assert!(e.to_string().contains("GROUP BY"), "{e}");
+    }
+
+    #[test]
+    fn rollback_undoes_inserts_updates_deletes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        run(&mut db, "BEGIN");
+        run(&mut db, "INSERT INTO t VALUES (2, 'b')");
+        run(&mut db, "UPDATE t SET v = 'changed' WHERE id = 1");
+        run(&mut db, "DELETE FROM t WHERE id = 1");
+        assert_eq!(rows(&mut db, "SELECT id FROM t ORDER BY id").rows.len(), 1); // sees id=2
+        run(&mut db, "ROLLBACK");
+        let r = rows(&mut db, "SELECT id, v FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(1), Value::Str("a".into())]]);
+    }
+
+    #[test]
+    fn commit_persists_transaction_changes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "BEGIN");
+        run(&mut db, "INSERT INTO t VALUES (42)");
+        run(&mut db, "COMMIT");
+        let r = rows(&mut db, "SELECT a FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(42)]]);
+        // nested begin rejected
+        run(&mut db, "BEGIN");
+        assert!(db.execute("BEGIN").is_err());
+        assert!(db.execute("ROLLBACK").is_ok());
+        // rollback/commit without begin rejected
+        assert!(db.execute("COMMIT").is_err());
+        assert!(db.execute("ROLLBACK").is_err());
+    }
+
+    #[test]
+    fn rollback_restores_dropped_and_created_tables() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE keep (a INT)");
+        run(&mut db, "BEGIN");
+        run(&mut db, "DROP TABLE keep");
+        run(&mut db, "CREATE TABLE fresh (b INT)");
+        run(&mut db, "ROLLBACK");
+        assert!(db.execute("SELECT * FROM fresh").is_err());
+        assert!(db.execute("SELECT * FROM keep").is_ok());
+    }
+
+    #[test]
+    fn rollback_restores_constraints() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        run(&mut db, "BEGIN");
+        run(&mut db, "DELETE FROM t");
+        run(&mut db, "ROLLBACK");
+        // PK still enforced after rollback
+        assert!(db.execute("INSERT INTO t VALUES (1)").is_err());
     }
 
     #[test]
