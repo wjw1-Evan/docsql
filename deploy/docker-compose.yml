@@ -1,0 +1,60 @@
+services:
+  # Primary: accepts writes, forwards them to both replicas.
+  node-primary:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: docsql:latest
+    container_name: docsql-primary
+    command: ["/data/docsql.db", "0.0.0.0:7600"]
+    environment:
+      # Compose service DNS names; replicas listen on their own ports below.
+      DOCSQL_REPLICATE_TO: "node-replica-a:7600"
+    ports:
+      - "17601:7600"
+    volumes:
+      - primary-data:/data
+    networks: [docsql]
+    healthcheck:
+      test: ["CMD-SHELL", "docsql-cli connect node-primary:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Replica A: read-only, receives replicated writes from the primary.
+  node-replica-a:
+    image: docsql:latest
+    container_name: docsql-replica-a
+    command: ["/data/docsql.db", "0.0.0.0:7600"]
+    environment:
+      DOCSQL_READ_ONLY: "1"
+    ports:
+      - "17602:7600"
+    volumes:
+      - replica-a-data:/data
+    networks: [docsql]
+    depends_on:
+      node-primary:
+        condition: service_started
+
+  # Shard node: independent shard for the hash-slot router test.
+  node-shard-b:
+    image: docsql:latest
+    container_name: docsql-shard-b
+    command: ["/data/docsql.db", "0.0.0.0:7600"]
+    ports:
+      - "17603:7600"
+    volumes:
+      - shard-b-data:/data
+    networks: [docsql]
+    depends_on:
+      node-primary:
+        condition: service_started
+
+volumes:
+  primary-data:
+  replica-a-data:
+  shard-b-data:
+
+networks:
+  docsql:

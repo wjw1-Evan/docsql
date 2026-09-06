@@ -48,9 +48,26 @@ DOCSQL_WEB=1 ./target/debug/docsql-web my.db 127.0.0.1:7700
 
 ## 测试
 
-- Rust:11 个测试目标全绿(单元 + SQL 集成 + KV 语义 + 协议 + 端到端 + 复制故障转移 + 多分片)
+- Rust:11 个测试目标、109 个用例全绿(单元 + SQL 集成 + KV 语义 + 协议 + 端到端 + 复制故障转移 + 多分片;亦在 Docker 构建内作为门禁执行)
+- Docker:3 节点 compose 集群,16 项多节点部署测试全绿(SQL+KV 复制/只读/故障转移/分片隔离/事务)
 - .NET:xUnit(ADO.NET 合规 5 项 + EF Core CRUD/LINQ/Include 2 项)
 - 门禁:`cargo fmt` + `cargo clippy -D warnings` + `cargo test` 全过
+
+## Docker 多节点部署
+
+```bash
+# 构建镜像(构建期内置全量 cargo test 门禁)并启动 3 节点集群:
+#   node-primary(17601, 主)+ node-replica-a(17602, 只读副本)+ node-shard-b(17603, 独立分片)
+./deploy/run-tests.sh     # 一键:重建集群 + 16 项多节点部署测试
+
+# 单独操作
+cd deploy && docker compose up -d
+docker compose logs -f node-primary
+```
+
+部署测试覆盖:主节点 SQL/KV 写入 → 副本复制可见、只读强制、PROMOTE 故障转移后恢复写入、独立分片数据隔离、跨网络事务回滚。
+
+> 注:本环境的 Docker 构建基于 mcr.microsoft.com/azurelinux(docker.io 不可达)。
 
 ## 已知边界(v1)
 

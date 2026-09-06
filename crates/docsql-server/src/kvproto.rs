@@ -26,6 +26,29 @@ fn int(n: u64) -> Frame {
 
 /// Handle one KV frame. Returns the response and, for SUBSCRIBE, the
 /// channel the connection should be pushed messages for.
+/// Commands that mutate state and must be replicated.
+fn is_write_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "SET"
+            | "DEL"
+            | "INCR"
+            | "INCRBY"
+            | "EXPIRE"
+            | "PERSIST"
+            | "LPUSH"
+            | "RPUSH"
+            | "LPOP"
+            | "RPOP"
+            | "HSET"
+            | "SADD"
+            | "ZADD"
+            | "MULTI"
+            | "EXEC"
+            | "DISCARD"
+    )
+}
+
 pub async fn handle(
     state: &Arc<ServerState>,
     frame: &Frame,
@@ -43,9 +66,37 @@ pub async fn handle(
         );
     };
     let rest: Vec<String> = args[1..].to_vec();
-    let a = |i: usize| -> Option<&String> { rest.get(i) };
 
-    match cmd.as_str() {
+    let (resp, sub, authed) = handle_inner(state, authed, &cmd, &rest).await;
+
+    // Replicate successful KV mutations (skips replication-internal frames).
+    let is_replication = frame.flags & crate::FLAG_REPLICATION != 0;
+    // Only a writable primary replicates (replicas skip; the replication
+    // flag on forwarded frames prevents loops).
+    if !is_replication
+        && is_write_cmd(&cmd)
+        && !state.read_only.load(std::sync::atomic::Ordering::SeqCst)
+        && resp.frame_type != docsql_core::proto::RESP_ERROR
+    {
+        if let Some(target) = state.replicate_to.lock().await.clone() {
+            let mut fwd = frame.clone();
+            fwd.flags = crate::FLAG_REPLICATION;
+            if let Err(e) = crate::forward_frame(&target, &fwd).await {
+                eprintln!("kv replication to {target} failed: {e}");
+            }
+        }
+    }
+    (resp, sub, authed)
+}
+
+async fn handle_inner(
+    state: &Arc<ServerState>,
+    authed: bool,
+    cmd: &str,
+    rest: &[String],
+) -> (Frame, Option<String>, bool) {
+    let a = |i: usize| -> Option<&String> { rest.get(i) };
+    match cmd {
         "AUTH" => {
             let token = a(0).cloned().unwrap_or_default();
             match &state.auth_token {

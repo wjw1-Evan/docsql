@@ -251,6 +251,19 @@ async fn replication_and_failover() {
     }
     assert!(seen, "replica did not observe the replicated write");
 
+    // KV writes replicate too.
+    p.kv(&["SET", "replkey", "replval"]).await;
+    let mut kv_seen = false;
+    for _ in 0..50 {
+        let resp = r.kv(&["GET", "replkey"]).await;
+        if resp.frame_type == proto::RESP_AFFECTED && payload_str(&resp) == "replval" {
+            kv_seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(kv_seen, "KV write did not replicate");
+
     // Replica rejects client writes before promotion.
     let resp = r.sql("INSERT INTO fail VALUES (8)").await;
     assert_eq!(resp.frame_type, proto::RESP_ERROR);

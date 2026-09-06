@@ -243,6 +243,24 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     }
 }
 
+/// Send a raw frame to a peer and read one response frame back.
+pub async fn forward_frame(target: &str, frame: &Frame) -> std::io::Result<Frame> {
+    let mut stream = tokio::net::TcpStream::connect(target).await?;
+    let bytes = frame.encode().map_err(std::io::Error::other)?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    let mut header = [0u8; proto::HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let mut buf = header.to_vec();
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    buf.extend_from_slice(&payload);
+    let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
+    Ok(f)
+}
+
 /// Send one write to the replication upstream.
 async fn forward_write(target: &str, sql: &str) -> std::io::Result<()> {
     let mut stream = tokio::net::TcpStream::connect(target).await?;

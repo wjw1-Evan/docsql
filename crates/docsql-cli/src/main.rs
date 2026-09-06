@@ -19,6 +19,16 @@ fn main() {
         remote_shell(&addr);
         return;
     }
+    if args.get(1).map(String::as_str) == Some("kv") {
+        // `docsql-cli kv host:port "SET key value ..." | "PROMOTE"`
+        let addr = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1:7600".into());
+        let rest: Vec<String> = args[3..].to_vec();
+        kv_one(&addr, &rest);
+        return;
+    }
     let path = args
         .get(1)
         .cloned()
@@ -59,6 +69,55 @@ fn main() {
         }
         stmt.clear();
     }
+}
+
+/// Send one KV command; print the NUL-joined reply payload.
+fn kv_one(addr: &str, args: &[String]) {
+    use std::io::Write as _;
+    let Ok(mut stream) = std::net::TcpStream::connect(addr) else {
+        eprintln!("docsql: cannot connect {addr}");
+        std::process::exit(1);
+    };
+    let payload = args.join("\x00").into_bytes();
+    let frame = Frame::new(proto::REQ_KV, payload);
+    let Ok(_) = stream
+        .write_all(&frame.encode().unwrap())
+        .and_then(|_| stream.flush())
+    else {
+        eprintln!("write failed");
+        std::process::exit(1);
+    };
+    let mut header = [0u8; proto::HEADER_LEN];
+    if stream.read_exact(&mut header).is_err() {
+        eprintln!("connection closed");
+        std::process::exit(1);
+    }
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let mut buf = header.to_vec();
+    let mut payload = vec![0u8; len];
+    if stream.read_exact(&mut payload).is_err() {
+        eprintln!("connection closed");
+        std::process::exit(1);
+    }
+    buf.extend_from_slice(&payload);
+    let (f, _) = Frame::decode(&buf).unwrap();
+    if f.frame_type == proto::RESP_ERROR {
+        eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
+        std::process::exit(2);
+    }
+    // Integer replies (counts, TTLs): small LE u64s have zero high bytes,
+    // which an 8-character ASCII string never does.
+    if f.payload.len() == 8 && f.payload[4..8] == [0u8; 4] {
+        println!("{}", u64::from_le_bytes(f.payload[..8].try_into().unwrap()));
+        return;
+    }
+    let text = String::from_utf8_lossy(&f.payload);
+    let joined = text
+        .split('\x00')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("{joined}");
 }
 
 fn remote_shell(addr: &str) {
