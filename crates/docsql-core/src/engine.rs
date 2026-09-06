@@ -669,7 +669,27 @@ impl Database {
     fn exec_select(&mut self, query: Query, select: sqlparser::ast::Select) -> Result<ExecOutcome> {
         use sqlparser::ast::{JoinConstraint, JoinOperator};
         if select.from.is_empty() {
-            return err("SELECT requires FROM in this version");
+            // FROM-less SELECT: one row of constant expressions.
+            let mut project: Vec<(String, SqlExpr)> = Vec::new();
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e.clone())),
+                    SelectItem::ExprWithAlias { expr, alias, .. } => {
+                        project.push((alias.value.clone(), expr.clone()))
+                    }
+                    _ => return err("unsupported select item"),
+                }
+            }
+            let empty = Object::new();
+            let row = project
+                .iter()
+                .map(|(_, e)| eval_expr(e, &empty))
+                .collect::<Result<Vec<_>>>()?;
+            let columns = project.iter().map(|(n, _)| n.clone()).collect();
+            return Ok(ExecOutcome::Rows(QueryResult {
+                columns,
+                rows: vec![row],
+            }));
         }
         let base = &select.from[0];
         let (bname, balias, mut bdocs) = self.load_table_factor(&base.relation)?;
