@@ -7,6 +7,7 @@ pub mod btree;
 pub mod encode;
 pub mod engine;
 pub mod heap;
+pub mod json;
 pub mod pager;
 pub mod proto;
 pub mod value;

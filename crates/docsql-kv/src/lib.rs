@@ -12,6 +12,9 @@ use docsql_core::engine::{Database, ExecOutcome, QueryResult, SqlError};
 use docsql_core::value::{Object, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod collections;
+pub mod pubsub;
+
 pub const KV_TABLE: &str = "_kv";
 
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +75,7 @@ impl Kv {
     }
 
     /// Read a live (non-expired) entry.
-    fn fetch(&mut self, key: &str, now: i64) -> Result<Option<Object>> {
+    pub(crate) fn raw_row(&mut self, key: &str, now: i64) -> Result<Option<Object>> {
         sweep_key(&mut self.db, key, now)?;
         let r = self.query(&format!(
             "SELECT \"key\", type, value, expire_at FROM {KV_TABLE} WHERE \"key\" = '{esc}'",
@@ -97,7 +100,7 @@ impl Kv {
 
     pub fn get(&mut self, key: &str) -> Result<Option<String>> {
         let now = now_ms();
-        match self.fetch(key, now)? {
+        match self.raw_row(key, now)? {
             Some(o) => match o.get("value") {
                 Some(Value::Str(s)) => Ok(Some(s.clone())),
                 _ => err("wrong value type"),
@@ -111,7 +114,7 @@ impl Kv {
             return err("NX and XX are mutually exclusive");
         }
         let now = now_ms();
-        let exists = self.fetch(key, now)?.is_some();
+        let exists = self.raw_row(key, now)?.is_some();
         if (opts.nx && exists) || (opts.xx && !exists) {
             return Ok(false);
         }
@@ -136,7 +139,7 @@ impl Kv {
 
     pub fn del(&mut self, key: &str) -> Result<bool> {
         let now = now_ms();
-        if self.fetch(key, now)?.is_none() {
+        if self.raw_row(key, now)?.is_none() {
             return Ok(false);
         }
         self.db.execute(&format!(
@@ -150,7 +153,7 @@ impl Kv {
     /// (returns Ok(None) for both missing and no-TTL callers use ttl_or).
     pub fn ttl_ms(&mut self, key: &str) -> Result<Option<i64>> {
         let now = now_ms();
-        match self.fetch(key, now)? {
+        match self.raw_row(key, now)? {
             Some(o) => match o.get("expire_at") {
                 Some(Value::Int(0)) | None => Ok(None),
                 Some(Value::Int(at)) => Ok(Some(*at - now)),
@@ -162,7 +165,7 @@ impl Kv {
 
     pub fn expire(&mut self, key: &str, ttl_ms: i64) -> Result<bool> {
         let now = now_ms();
-        if self.fetch(key, now)?.is_none() {
+        if self.raw_row(key, now)?.is_none() {
             return Ok(false);
         }
         self.db.execute(&format!(
@@ -175,7 +178,7 @@ impl Kv {
 
     pub fn persist(&mut self, key: &str) -> Result<bool> {
         let now = now_ms();
-        if self.fetch(key, now)?.is_none() {
+        if self.raw_row(key, now)?.is_none() {
             return Ok(false);
         }
         self.db.execute(&format!(
@@ -187,7 +190,7 @@ impl Kv {
 
     pub fn incr_by(&mut self, key: &str, delta: i64) -> Result<i64> {
         let now = now_ms();
-        let cur = match self.fetch(key, now)? {
+        let cur = match self.raw_row(key, now)? {
             Some(o) => match o.get("value") {
                 Some(Value::Str(s)) => s
                     .parse::<i64>()
@@ -197,7 +200,7 @@ impl Kv {
             None => 0,
         };
         let next = cur + delta;
-        if cur == 0 && self.fetch(key, now)?.is_none() {
+        if cur == 0 && self.raw_row(key, now)?.is_none() {
             self.db.execute(&format!(
                 "INSERT INTO {KV_TABLE} (\"key\", type, value, expire_at) VALUES ('{k}', 'string', '{v}', 0)",
                 k = escape(key),
@@ -225,7 +228,7 @@ fn escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-fn sweep_key(db: &mut Database, key: &str, now: i64) -> Result<()> {
+pub(crate) fn sweep_key(db: &mut Database, key: &str, now: i64) -> Result<()> {
     let sql = format!(
         "SELECT expire_at FROM {KV_TABLE} WHERE \"key\" = '{k}'",
         k = escape(key)
