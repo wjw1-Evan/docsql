@@ -59,6 +59,7 @@ struct TableMeta {
     primary_key: Option<String>,
     unique: Vec<String>,
     not_null: Vec<String>,
+    autoinc: Option<String>,
 }
 
 impl TableMeta {
@@ -141,6 +142,8 @@ impl Database {
                                 .map(String::from);
                             let unique = str_list(m, "unique");
                             let not_null = str_list(m, "not_null");
+                            let autoinc =
+                                m.get("autoinc").and_then(|v| v.as_str()).map(String::from);
                             tables.insert(
                                 name.clone(),
                                 TableMeta {
@@ -149,6 +152,7 @@ impl Database {
                                     primary_key,
                                     unique,
                                     not_null,
+                                    autoinc,
                                 },
                             );
                         }
@@ -277,11 +281,15 @@ impl Database {
                 table,
                 assignments,
                 selection,
+                returning,
                 ..
-            }) => self.exec_update(table, assignments, selection),
+            }) => self.exec_update(table, assignments, selection, returning),
             Statement::Delete(sqlparser::ast::Delete {
-                from, selection, ..
-            }) => self.exec_delete(from, selection),
+                from,
+                selection,
+                returning,
+                ..
+            }) => self.exec_delete(from, selection, returning),
             Statement::AlterTable(alter) => self.exec_alter(alter),
             Statement::StartTransaction { .. } => {
                 if self.tx_snapshot.is_some() {
@@ -336,11 +344,13 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn exec_update(
         &mut self,
         table: sqlparser::ast::TableWithJoins,
         assignments: Vec<sqlparser::ast::Assignment>,
         selection: Option<SqlExpr>,
+        update_returning: Option<Vec<SelectItem>>,
     ) -> Result<ExecOutcome> {
         let sqlparser::ast::TableFactor::Table { name, .. } = table.relation else {
             return err("only simple table names in UPDATE");
@@ -348,6 +358,7 @@ impl Database {
         let tname = obj_name(&name);
         let docs = self.table_docs(&tname)?;
         let mut out = Vec::new();
+        let mut changed_docs: Vec<Object> = Vec::new();
         let mut count = 0u64;
         for doc in docs {
             if self.matches(&selection, &doc)? {
@@ -361,6 +372,7 @@ impl Database {
                     doc.insert(col_name, v);
                 }
                 count += 1;
+                changed_docs.push(doc.clone());
                 out.push(doc);
             } else {
                 out.push(doc);
@@ -372,7 +384,11 @@ impl Database {
             meta.check(doc)?;
         }
         meta.check_unique(&out)?;
+        let changed = changed_docs.clone();
         self.rewrite_table(&tname, out)?;
+        if let Some(ret) = &update_returning {
+            return project_returning(ret, &changed);
+        }
         Ok(ExecOutcome::Affected(count))
     }
 
@@ -380,6 +396,7 @@ impl Database {
         &mut self,
         from: sqlparser::ast::FromTable,
         selection: Option<SqlExpr>,
+        returning: Option<Vec<SelectItem>>,
     ) -> Result<ExecOutcome> {
         let sqlparser::ast::FromTable::WithFromKeyword(tables) = from else {
             return err("unsupported DELETE form");
@@ -393,15 +410,20 @@ impl Database {
         let tname = obj_name(&name);
         let docs = self.table_docs(&tname)?;
         let mut kept = Vec::new();
+        let mut removed = Vec::new();
         let mut count = 0u64;
         for doc in docs {
             if self.matches(&selection, &doc)? {
                 count += 1;
+                removed.push(doc);
             } else {
                 kept.push(doc);
             }
         }
         self.rewrite_table(&tname, kept)?;
+        if let Some(ret) = &returning {
+            return project_returning(ret, &removed);
+        }
         Ok(ExecOutcome::Affected(count))
     }
 
@@ -465,6 +487,18 @@ impl Database {
                     CO::Unique { .. } => meta.unique.push(col.name.value.clone()),
                     CO::NotNull => meta.not_null.push(col.name.value.clone()),
                     CO::Null => {}
+                    CO::DialectSpecific(tokens) => {
+                        let text = tokens
+                            .iter()
+                            .map(|t| t.to_string().to_uppercase())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if text.contains("AUTOINCREMENT") || text.contains("AUTO_INCREMENT") {
+                            meta.autoinc = Some(col.name.value.clone());
+                        } else {
+                            return err("unsupported column constraint");
+                        }
+                    }
                     _ => return err("unsupported column constraint"),
                 }
             }
@@ -482,7 +516,7 @@ impl Database {
         let Some(meta) = self.tables.get(&table).cloned() else {
             return err(format!("table {table} does not exist"));
         };
-        let columns: Vec<String> = if insert.columns.is_empty() {
+        let mut columns: Vec<String> = if insert.columns.is_empty() {
             meta.columns.clone()
         } else {
             insert.columns.iter().map(obj_name).collect()
@@ -508,14 +542,54 @@ impl Database {
         }
         // Build all documents first, validate, and only then write — a
         // failed statement must leave the table untouched.
+        // AUTOINCREMENT: append the column when the INSERT omits it, then
+        // assign max(id)+1 to missing/NULL values per row.
+        let autoinc_appended = match &meta.autoinc {
+            Some(col) if !columns.contains(col) => {
+                columns.push(col.clone());
+                true
+            }
+            _ => false,
+        };
+        let mut next_autoinc = {
+            let mut max: i64 = 0;
+            if let Some(col) = &meta.autoinc {
+                let docs = Heap {
+                    pages: meta.pages.clone(),
+                }
+                .scan(&mut self.pager)
+                .unwrap_or_default();
+                for d in &docs {
+                    if let Some(Value::Int(i)) = d.get(col) {
+                        max = max.max(*i);
+                    }
+                }
+            }
+            max + 1
+        };
         let mut new_docs: Vec<Object> = Vec::new();
         for row in rows {
+            let mut row = row;
+            if autoinc_appended {
+                row.push(Value::Int(next_autoinc));
+                next_autoinc += 1;
+            }
             if row.len() != columns.len() {
                 return err(format!(
                     "INSERT has {} values but {} columns",
                     row.len(),
                     columns.len()
                 ));
+            }
+            if !autoinc_appended {
+                if let Some(col) = &meta.autoinc {
+                    if let Some(idx) = columns.iter().position(|c| c == col) {
+                        if matches!(row.get(idx), Some(Value::Null) | None) {
+                            row[idx] = Value::Int(next_autoinc);
+                            next_autoinc += 1;
+                        }
+                    }
+                }
             }
             let doc: Object = columns.iter().cloned().zip(row).collect();
             meta.check(&doc)?;
@@ -543,6 +617,9 @@ impl Database {
             m.pages = heap.pages.clone();
         }
         self.save_catalog()?;
+        if let Some(ret) = &insert.returning {
+            return project_returning(ret, &new_docs);
+        }
         Ok(ExecOutcome::Affected(count))
     }
 
@@ -863,9 +940,57 @@ impl Database {
             return err("only simple tables in FROM");
         };
         let tname = obj_name(name);
-        let docs = self.table_docs(&tname)?;
         let alias = alias.as_ref().map(|a| a.name.value.clone());
+        let qualified: String = name
+            .0
+            .iter()
+            .map(|p| match p {
+                ObjectNamePart::Identifier(i) => i.value.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        if qualified == "information_schema.tables" || qualified == "information_schema.columns" {
+            let docs = self.information_schema(&qualified);
+            return Ok(("information_schema".into(), alias, docs));
+        }
+        let docs = self.table_docs(&tname)?;
         Ok((tname, alias, docs))
+    }
+
+    /// Virtual information_schema tables from the catalog.
+    fn information_schema(&self, which: &str) -> Vec<Object> {
+        let mut out = Vec::new();
+        if which.ends_with("tables") {
+            for (name, meta) in &self.tables {
+                out.push(Object::from([
+                    ("table_name".into(), Value::Str(name.clone())),
+                    ("pages".into(), Value::Int(meta.pages.len() as i64)),
+                ]));
+            }
+        } else {
+            for (name, meta) in &self.tables {
+                for col in &meta.columns {
+                    out.push(Object::from([
+                        ("table_name".into(), Value::Str(name.clone())),
+                        ("column_name".into(), Value::Str(col.clone())),
+                        (
+                            "is_nullable".into(),
+                            Value::Str(
+                                if meta.not_null.contains(col) {
+                                    "NO"
+                                } else {
+                                    "YES"
+                                }
+                                .into(),
+                            ),
+                        ),
+                        ("data_type".into(), Value::Str("ANY".into())),
+                    ]));
+                }
+            }
+        }
+        out
     }
 
     fn apply_order_limit(
@@ -1072,6 +1197,34 @@ fn contains_agg(e: &SqlExpr) -> bool {
         SqlExpr::Nested(inner) => contains_agg(inner),
         _ => false,
     }
+}
+
+/// Build a rows result from RETURNING items over the affected documents.
+fn project_returning(items: &[SelectItem], docs: &[Object]) -> Result<ExecOutcome> {
+    let mut columns = Vec::new();
+    let mut exprs = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::UnnamedExpr(e) => {
+                columns.push(expr_name(e));
+                exprs.push(e.clone());
+            }
+            SelectItem::ExprWithAlias { expr, alias, .. } => {
+                columns.push(alias.value.clone());
+                exprs.push(expr.clone());
+            }
+            _ => return err("unsupported RETURNING item"),
+        }
+    }
+    let mut rows = Vec::new();
+    for doc in docs {
+        let mut row = Vec::with_capacity(exprs.len());
+        for e in &exprs {
+            row.push(eval_expr(e, doc)?);
+        }
+        rows.push(row);
+    }
+    Ok(ExecOutcome::Rows(QueryResult { columns, rows }))
 }
 
 fn str_list(m: &Object, key: &str) -> Vec<String> {
@@ -1776,6 +1929,73 @@ mod tests {
         run(&mut db, "ROLLBACK");
         // PK still enforced after rollback
         assert!(db.execute("INSERT INTO t VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn autoincrement_assigns_ids() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v TEXT)",
+        );
+        let r = match run(
+            &mut db,
+            "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, v",
+        ) {
+            ExecOutcome::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r.columns, vec!["id", "v"]);
+        assert_eq!(r.rows[0][0], Value::Int(1));
+        assert_eq!(r.rows[1][0], Value::Int(2));
+        // explicit id still works and bumps the counter
+        run(&mut db, "INSERT INTO t (id, v) VALUES (10, 'ten')");
+        let r = rows(&mut db, "INSERT INTO t (v) VALUES ('c') RETURNING id");
+        assert_eq!(r.rows[0][0], Value::Int(11));
+    }
+
+    #[test]
+    fn returning_on_update_and_delete() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+        let r = match run(&mut db, "UPDATE t SET v = 'z' WHERE id = 2 RETURNING id, v") {
+            ExecOutcome::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r.rows, vec![vec![Value::Int(2), Value::Str("z".into())]]);
+        let r = match run(&mut db, "DELETE FROM t WHERE id = 1 RETURNING id") {
+            ExecOutcome::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn information_schema_lists_tables_and_columns() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE alpha (x INT NOT NULL, y TEXT)");
+        run(&mut db, "CREATE TABLE beta (z INT)");
+        let r = rows(
+            &mut db,
+            "SELECT table_name FROM information_schema.tables ORDER BY table_name",
+        );
+        let names: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].as_str().unwrap().into())
+            .collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+        let r = rows(&mut db, "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'alpha' ORDER BY column_name");
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Str("x".into()), Value::Str("NO".into())]
+        );
+        assert_eq!(
+            r.rows[1],
+            vec![Value::Str("y".into()), Value::Str("YES".into())]
+        );
     }
 
     #[test]

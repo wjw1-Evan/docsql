@@ -9,4 +9,5 @@ description = "docsql interactive shell"
 docsql-core = { path = "../docsql-core" }
 
 [dev-dependencies]
+sqlparser = "0.62"
 tempfile.workspace = true
