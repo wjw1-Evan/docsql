@@ -292,6 +292,11 @@ impl Tx {
     pub fn id(&self) -> u64 {
         self.id
     }
+
+    /// A staged (uncommitted) image of a page, if this tx wrote it.
+    pub fn staged_page(&self, id: u32) -> Option<&[u8]> {
+        self.staged.get(&id).map(|v| v.as_slice())
+    }
 }
 
 fn wal_path_for(path: &Path) -> PathBuf {

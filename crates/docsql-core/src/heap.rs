@@ -116,10 +116,14 @@ impl Heap {
                 PAGE_SIZE - HEADER_FIXED - SLOT_SIZE,
             ));
         }
-        // Try the last page first.
+        // Try the last page first (prefer this tx's staged image — the
+        // page may not be on disk yet).
         let mut placed = false;
         if let Some(&last) = self.pages.last() {
-            let mut page = pager.read_page(last)?.to_vec();
+            let mut page = match tx.staged_page(last) {
+                Some(p) => p.to_vec(),
+                None => pager.read_page(last)?.to_vec(),
+            };
             if free_space(&page) >= bytes.len() + SLOT_SIZE {
                 let off = content_start(&page) - bytes.len();
                 page[off..off + bytes.len()].copy_from_slice(&bytes);

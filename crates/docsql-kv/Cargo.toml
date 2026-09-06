@@ -1,0 +1,13 @@
+[package]
+name = "docsql-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "docsql KV command layer over the SQL engine"
+
+[dependencies]
+docsql-core = { path = "../docsql-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -165,9 +165,113 @@ impl Database {
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Insert(insert) => self.exec_insert(insert),
+            Statement::Update(sqlparser::ast::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            }) => self.exec_update(table, assignments, selection),
+            Statement::Delete(sqlparser::ast::Delete {
+                from, selection, ..
+            }) => self.exec_delete(from, selection),
             Statement::Query(q) => self.exec_query(*q),
             other => err(format!("unsupported statement: {other}")),
         }
+    }
+
+    /// Rewrite the whole table from `docs` (delete+reinsert; old pages are
+    /// orphaned until compaction arrives with the B+ tree milestone).
+    fn rewrite_table(&mut self, table: &str, docs: Vec<Object>) -> Result<()> {
+        let mut heap = Heap { pages: Vec::new() };
+        let mut tx = self.pager.begin_tx();
+        for doc in &docs {
+            heap.insert(&mut self.pager, &mut tx, doc)?;
+        }
+        self.pager.commit_tx(tx)?;
+        if let Some(meta) = self.tables.get_mut(table) {
+            meta.pages = heap.pages;
+        }
+        self.save_catalog()
+    }
+
+    fn table_docs(&mut self, table: &str) -> Result<Vec<Object>> {
+        let Some(meta) = self.tables.get(table) else {
+            return err(format!("table {table} does not exist"));
+        };
+        let heap = Heap {
+            pages: meta.pages.clone(),
+        };
+        heap.scan(&mut self.pager).map_err(Into::into)
+    }
+
+    fn matches(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
+        match selection {
+            None => Ok(true),
+            Some(e) => Ok(matches!(eval_expr(e, doc)?, Value::Bool(true))),
+        }
+    }
+
+    fn exec_update(
+        &mut self,
+        table: sqlparser::ast::TableWithJoins,
+        assignments: Vec<sqlparser::ast::Assignment>,
+        selection: Option<SqlExpr>,
+    ) -> Result<ExecOutcome> {
+        let sqlparser::ast::TableFactor::Table { name, .. } = table.relation else {
+            return err("only simple table names in UPDATE");
+        };
+        let tname = obj_name(&name);
+        let docs = self.table_docs(&tname)?;
+        let mut out = Vec::new();
+        let mut count = 0u64;
+        for doc in docs {
+            if self.matches(&selection, &doc)? {
+                let mut doc = doc;
+                for a in &assignments {
+                    let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target else {
+                        return err("unsupported assignment target");
+                    };
+                    let col_name = obj_name(col);
+                    let v = eval_expr(&a.value, &doc)?;
+                    doc.insert(col_name, v);
+                }
+                count += 1;
+                out.push(doc);
+            } else {
+                out.push(doc);
+            }
+        }
+        self.rewrite_table(&tname, out)?;
+        Ok(ExecOutcome::Affected(count))
+    }
+
+    fn exec_delete(
+        &mut self,
+        from: sqlparser::ast::FromTable,
+        selection: Option<SqlExpr>,
+    ) -> Result<ExecOutcome> {
+        let sqlparser::ast::FromTable::WithFromKeyword(tables) = from else {
+            return err("unsupported DELETE form");
+        };
+        if tables.len() != 1 {
+            return err("DELETE from exactly one table");
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = tables[0].relation.clone() else {
+            return err("only simple table names in DELETE");
+        };
+        let tname = obj_name(&name);
+        let docs = self.table_docs(&tname)?;
+        let mut kept = Vec::new();
+        let mut count = 0u64;
+        for doc in docs {
+            if self.matches(&selection, &doc)? {
+                count += 1;
+            } else {
+                kept.push(doc);
+            }
+        }
+        self.rewrite_table(&tname, kept)?;
+        Ok(ExecOutcome::Affected(count))
     }
 
     fn exec_create(&mut self, create: sqlparser::ast::CreateTable) -> Result<ExecOutcome> {
@@ -636,7 +740,70 @@ mod tests {
         assert!(db.execute("CREATE TABLE t (a INT)").is_err()); // duplicate
         assert!(db.execute("INSERT INTO t (a) VALUES (1, 2)").is_err()); // arity
         assert!(db.execute("SELECT * FROM missing").is_err());
-        assert!(db.execute("UPDATE t SET a = 1").is_err()); // M4
+    }
+
+    #[test]
+    fn update_sets_matching_rows_and_keeps_others() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, name TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+        match run(&mut db, "UPDATE t SET name = 'z' WHERE id >= 2") {
+            ExecOutcome::Affected(2) => {}
+            o => panic!("affected={o:?}"),
+        }
+        let r = rows(&mut db, "SELECT id, name FROM t ORDER BY id");
+        assert_eq!(r.rows[0][1], Value::Str("a".into()));
+        assert_eq!(r.rows[1][1], Value::Str("z".into()));
+        assert_eq!(r.rows[2][1], Value::Str("z".into()));
+        // update without WHERE touches everything
+        match run(&mut db, "UPDATE t SET name = 'all'") {
+            ExecOutcome::Affected(3) => {}
+            o => panic!("affected={o:?}"),
+        }
+    }
+
+    #[test]
+    fn update_referencing_old_values() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (n INT)");
+        run(&mut db, "INSERT INTO t VALUES (10)");
+        run(&mut db, "UPDATE t SET n = n + 5");
+        let r = rows(&mut db, "SELECT n FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(15)]]);
+    }
+
+    #[test]
+    fn delete_removes_matching_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT)");
+        for i in 0..5 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i})"));
+        }
+        // IN lists arrive with M5; for now they are rejected cleanly.
+        assert!(db.execute("DELETE FROM t WHERE id IN (1)").is_err());
+        match run(&mut db, "DELETE FROM t WHERE id = 1") {
+            ExecOutcome::Affected(1) => {}
+            o => panic!("affected={o:?}"),
+        }
+        match run(&mut db, "DELETE FROM t WHERE id > 3") {
+            ExecOutcome::Affected(1) => {}
+            o => panic!("affected={o:?}"),
+        }
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(0)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+        match run(&mut db, "DELETE FROM t") {
+            ExecOutcome::Affected(3) => {}
+            o => panic!("affected={o:?}"),
+        }
+        let r = rows(&mut db, "SELECT id FROM t");
+        assert!(r.rows.is_empty());
     }
 
     #[test]
