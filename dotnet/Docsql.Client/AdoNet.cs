@@ -8,6 +8,13 @@ using System.Text.Json;
 
 namespace Docsql.Client;
 
+public static class EndpointExtensions
+{
+    public static DocsqlConnectionStringBuilder ToBuilder(
+        this (string host, int port, string token) ep) =>
+        new() { Host = ep.host, Port = ep.port, Token = ep.token };
+}
+
 public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
 {
     public string Host
@@ -36,10 +43,16 @@ public sealed class DocsqlConnection : DbConnection
 
     public DocsqlConnection() { }
 
+    /// <param name="connectionString">docsql endpoint ("host=..;port=..;token=..") or,
+    /// for EF-compatible callers, any string whose endpoint parts live in EndpointOverride.</param>
     public DocsqlConnection(string connectionString)
     {
         ConnectionString = connectionString;
     }
+
+    /// Optional explicit endpoint; when set it wins over ConnectionString
+    /// (lets hosts like EF's SQLite layer rewrite ConnectionString freely).
+    public (string host, int port, string token)? EndpointOverride { get; set; }
 
     private DocsqlConnectionStringBuilder Parsed => new() { ConnectionString = ConnectionString };
 
@@ -64,7 +77,7 @@ public sealed class DocsqlConnection : DbConnection
         {
             return;
         }
-        var p = Parsed;
+        var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
         _proto = new ProtocolConnection(p.Host, p.Port);
         // AUTH when a token is configured.
         if (!string.IsNullOrEmpty(p.Token))
@@ -214,7 +227,8 @@ public sealed class DocsqlCommand : DbCommand
                 bool b => b ? "TRUE" : "FALSE",
                 _ => $"'{p.Value.ToString()!.Replace("'", "''")}'",
             };
-            sql = sql.Replace($"@{p.ParameterName}", literal);
+            var name = p.ParameterName?.TrimStart('@') ?? "";
+            sql = sql.Replace($"@{name}", literal);
         }
         return sql;
     }

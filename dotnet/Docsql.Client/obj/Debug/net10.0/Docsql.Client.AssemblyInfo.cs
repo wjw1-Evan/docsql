@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Docsql.Client")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a956842a44e25c1d5048889b156c0361b0228bfe")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b8ccd1784f606b59c7de937163db763f2115530c")]
 [assembly: System.Reflection.AssemblyProductAttribute("Docsql.Client")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Docsql.Client")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

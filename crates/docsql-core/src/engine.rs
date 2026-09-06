@@ -60,6 +60,9 @@ struct TableMeta {
     unique: Vec<String>,
     not_null: Vec<String>,
     autoinc: Option<String>,
+    /// Index names registered on this table (catalog-level v1; B+ tree
+    /// backing arrives with the index-integration milestone).
+    indexes: Vec<String>,
 }
 
 impl TableMeta {
@@ -144,6 +147,7 @@ impl Database {
                             let not_null = str_list(m, "not_null");
                             let autoinc =
                                 m.get("autoinc").and_then(|v| v.as_str()).map(String::from);
+                            let indexes = str_list(m, "indexes");
                             tables.insert(
                                 name.clone(),
                                 TableMeta {
@@ -153,6 +157,7 @@ impl Database {
                                     unique,
                                     not_null,
                                     autoinc,
+                                    indexes,
                                 },
                             );
                         }
@@ -264,13 +269,33 @@ impl Database {
         match stmt {
             Statement::CreateTable(create) => self.exec_create(create),
             Statement::Drop {
-                object_type, names, ..
+                object_type,
+                names,
+                if_exists,
+                ..
             } => {
+                if object_type == sqlparser::ast::ObjectType::Index {
+                    for n in &names {
+                        let iname = obj_name(n);
+                        let mut found = false;
+                        for meta in self.tables.values_mut() {
+                            if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
+                                meta.indexes.remove(pos);
+                                found = true;
+                            }
+                        }
+                        if !found && !if_exists {
+                            return err(format!("index {iname} does not exist"));
+                        }
+                    }
+                    self.save_catalog()?;
+                    return Ok(ExecOutcome::Affected(0));
+                }
                 if object_type != sqlparser::ast::ObjectType::Table {
-                    return err("only DROP TABLE is supported");
+                    return err("only DROP TABLE/INDEX are supported");
                 }
                 let name = names.first().map(obj_name).unwrap_or_default();
-                if self.tables.remove(&name).is_none() {
+                if self.tables.remove(&name).is_none() && !if_exists {
                     return err(format!("table {name} does not exist"));
                 }
                 self.save_catalog()?;
@@ -305,7 +330,13 @@ impl Database {
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Rollback { .. } => self.rollback_tx(),
+            Statement::CreateIndex(idx) => self.exec_create_index(idx),
             Statement::Query(q) => self.exec_query(*q),
+            Statement::Pragma { .. } => {
+                // Compatibility shim: accept and ignore PRAGMA statements
+                // (SQLite-dialect callers, e.g. EF Core startup probes).
+                Ok(ExecOutcome::Affected(0))
+            }
             other => err(format!("unsupported statement: {other}")),
         }
     }
@@ -425,6 +456,23 @@ impl Database {
             return project_returning(ret, &removed);
         }
         Ok(ExecOutcome::Affected(count))
+    }
+
+    fn exec_create_index(&mut self, idx: sqlparser::ast::CreateIndex) -> Result<ExecOutcome> {
+        let table = obj_name(&idx.table_name);
+        let iname = idx
+            .name
+            .as_ref()
+            .map(obj_name)
+            .unwrap_or_else(|| format!("idx_{}", table));
+        let Some(meta) = self.tables.get_mut(&table) else {
+            return err(format!("table {table} does not exist"));
+        };
+        if !meta.indexes.contains(&iname) {
+            meta.indexes.push(iname);
+        }
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
     }
 
     fn exec_alter(&mut self, alter: sqlparser::ast::AlterTable) -> Result<ExecOutcome> {
@@ -957,6 +1005,25 @@ impl Database {
         tf: &sqlparser::ast::TableFactor,
     ) -> Result<(String, Option<String>, Vec<Object>)> {
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = tf else {
+            // Derived table: FROM (SELECT ...) AS alias
+            if let sqlparser::ast::TableFactor::Derived {
+                subquery, alias, ..
+            } = tf
+            {
+                let ExecOutcome::Rows(r) = self.exec_query(subquery.as_ref().clone())? else {
+                    return err("derived table must be a SELECT");
+                };
+                let docs: Vec<Object> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| r.columns.iter().cloned().zip(row).collect())
+                    .collect();
+                let alias = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_default();
+                return Ok(("@derived".into(), Some(alias), docs));
+            }
             return err("only simple tables in FROM");
         };
         let tname = obj_name(name);
@@ -970,6 +1037,23 @@ impl Database {
             })
             .collect::<Vec<_>>()
             .join(".");
+        if qualified == "sqlite_master" || qualified == "sqlite_temporal_master" {
+            // SQLite-dialect compatibility view (EF Core probes it to learn
+            // which tables exist).
+            let docs: Vec<Object> = self
+                .tables
+                .keys()
+                .map(|n| {
+                    Object::from([
+                        ("type".into(), Value::Str("table".into())),
+                        ("name".into(), Value::Str(n.clone())),
+                        ("tbl_name".into(), Value::Str(n.clone())),
+                        ("sql".into(), Value::Str(String::new())),
+                    ])
+                })
+                .collect();
+            return Ok(("sqlite_master".into(), alias, docs));
+        }
         if qualified == "information_schema.tables" || qualified == "information_schema.columns" {
             let docs = self.information_schema(&qualified);
             return Ok(("information_schema".into(), alias, docs));
@@ -1330,16 +1414,13 @@ fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
         return Ok(v.clone());
     }
     let suffix = format!(".{name}");
-    let hits: Vec<&Value> = doc
+    // Unqualified name on joined rows: take the FIRST source in row order
+    // (BTreeMap order is deterministic; matches left-table-first convention).
+    Ok(doc
         .iter()
-        .filter(|(k, _)| k.ends_with(&suffix))
-        .map(|(_, v)| v)
-        .collect();
-    match hits.len() {
-        0 => Ok(Value::Null),
-        1 => Ok(hits[0].clone()),
-        _ => err(format!("ambiguous column: {name}")),
-    }
+        .find(|(k, _)| k.ends_with(&suffix))
+        .map(|(_, v)| v.clone())
+        .unwrap_or(Value::Null))
 }
 
 /// Evaluate an expression against a document row.
