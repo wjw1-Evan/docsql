@@ -11,6 +11,7 @@
 //! task.
 
 pub mod kvproto;
+pub mod shard;
 
 use docsql_core::engine::ExecOutcome;
 use docsql_core::proto::{self, Frame};

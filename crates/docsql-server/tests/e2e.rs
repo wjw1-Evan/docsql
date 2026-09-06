@@ -272,3 +272,51 @@ async fn replication_and_failover() {
         payload_str(&resp)
     );
 }
+
+/// Two real shards: KV keys route by hash slot and land deterministically.
+#[tokio::test]
+async fn shard_routing_distributes_kv_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut addrs = Vec::new();
+    for i in 0..2 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+        drop(l);
+        tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+            db_path: dir.path().join(format!("shard{i}.db")),
+            listen: a.clone(),
+            auth_token: None,
+            replicate_to: None,
+            read_only: false,
+        }));
+        addrs.push(a);
+    }
+    for a in &addrs {
+        for _ in 0..100 {
+            if TcpStream::connect(a).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    let router = docsql_server::shard::ShardRouter::new(addrs.clone());
+    assert_eq!(router.shard_count(), 2);
+
+    // Write through the router, read directly from each shard.
+    let keys = ["shard-key-a", "shard-key-b", "shard-key-c", "shard-key-d"];
+    for k in keys {
+        let resp = router.kv("SET", k).await.unwrap();
+        assert_ne!(resp.frame_type, proto::RESP_ERROR, "SET {k} failed");
+    }
+    for k in keys {
+        let target = router.shard_for(k);
+        let mut c = Client::connect(target).await;
+        let resp = c.kv(&["GET", k]).await;
+        // SET without a value writes an empty string — GET must succeed.
+        assert_ne!(resp.frame_type, proto::RESP_ERROR, "GET {k} on {target}");
+    }
+
+    // Same key always routes to the same shard (read-your-writes).
+    assert_eq!(router.shard_for("stable"), router.shard_for("stable"));
+}
