@@ -1,0 +1,15 @@
+[package]
+name = "docsql-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "docsql network server: SQL/KV protocol + pub/sub push + auth"
+
+[dependencies]
+docsql-core = { path = "../docsql-core" }
+docsql-kv = { path = "../docsql-kv" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
