@@ -494,29 +494,163 @@ impl Database {
     }
 
     fn exec_query(&mut self, query: Query) -> Result<ExecOutcome> {
-        let SetExpr::Select(select) = *query.body else {
-            return err("only SELECT ... FROM is supported here");
-        };
-        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-            return err("expected exactly one table in FROM");
+        let body = query.body.clone();
+        match *body {
+            SetExpr::Select(select) => self.exec_select(query.clone(), *select),
+            SetExpr::SetOperation {
+                left,
+                op,
+                set_quantifier,
+                right,
+            } => {
+                use sqlparser::ast::{SetOperator, SetQuantifier};
+                if op != SetOperator::Union {
+                    return err("only UNION is supported");
+                }
+                let l = self.exec_query(Query {
+                    body: left,
+                    ..query.clone()
+                })?;
+                let r = self.exec_query(Query {
+                    body: right,
+                    ..query
+                })?;
+                let (ExecOutcome::Rows(mut lr), ExecOutcome::Rows(rr)) = (l, r) else {
+                    return err("UNION requires SELECT on both sides");
+                };
+                if lr.columns != rr.columns {
+                    return err("UNION arms have different column counts");
+                }
+                lr.rows.extend(rr.rows);
+                if set_quantifier != SetQuantifier::All {
+                    let mut seen = std::collections::BTreeSet::new();
+                    lr.rows.retain(|row| {
+                        seen.insert(
+                            encode::encode_to_vec(&Value::Array(row.clone())).unwrap_or_default(),
+                        )
+                    });
+                }
+                Ok(ExecOutcome::Rows(lr))
+            }
+            other => err(format!("unsupported query body: {other}")),
         }
-        let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
-            return err("only simple table names in FROM");
-        };
-        let table = obj_name(name);
-        let Some(meta) = self.tables.get(&table) else {
-            return err(format!("table {table} does not exist"));
-        };
-        let heap = Heap {
-            pages: meta.pages.clone(),
-        };
-        let docs = heap.scan(&mut self.pager)?;
+    }
 
-        // Projection: output column list plus (optional) expressions to
-        // evaluate per row. Plain identifiers read fields; anything else
-        // (arithmetic, comparisons) is computed.
-        let mut project: Vec<(String, SqlExpr)> = Vec::new();
+    fn exec_select(&mut self, query: Query, select: sqlparser::ast::Select) -> Result<ExecOutcome> {
+        use sqlparser::ast::{JoinConstraint, JoinOperator};
+        if select.from.is_empty() {
+            return err("SELECT requires FROM in this version");
+        }
+        let base = &select.from[0];
+        let (bname, balias, mut bdocs) = self.load_table_factor(&base.relation)?;
+        let bkey = balias.unwrap_or_else(|| bname.clone());
+        // A lone base table keeps unqualified field names; anything joined
+        // gets "alias.col" keys to keep namespaces apart.
+        let solo = base.joins.is_empty() && select.from.len() == 1;
+        let mut rows: Vec<Object> = if solo {
+            bdocs
+        } else {
+            bdocs.drain(..).map(|d| qualify(&d, &bkey)).collect()
+        };
+        let mut all_joins: Vec<&sqlparser::ast::Join> = base.joins.iter().collect();
+        if !solo {
+            for twj in &select.from[1..] {
+                // comma-separated FROM entries: cross join their base tables
+                let (n, a, d) = self.load_table_factor(&twj.relation)?;
+                let k = a.unwrap_or(n);
+                rows = join_rows(rows, &d, &k, None, false)?;
+                all_joins.extend(twj.joins.iter());
+            }
+        }
+        for j in all_joins {
+            let (jname, jalias, jdocs) = self.load_table_factor(&j.relation)?;
+            let jkey = jalias.unwrap_or(jname);
+            let (left_join, on) = match &j.join_operator {
+                JoinOperator::Join(c)
+                | JoinOperator::Inner(c)
+                | JoinOperator::Left(c)
+                | JoinOperator::LeftOuter(c)
+                | JoinOperator::Right(c)
+                | JoinOperator::RightOuter(c) => {
+                    let on = match c {
+                        JoinConstraint::On(e) => Some(e.clone()),
+                        JoinConstraint::Using(cols) => {
+                            // a USING b == ON left.b = right.b (unqualified lookups
+                            // are not supported; use alias-qualified names)
+                            let mut e = None;
+                            for c in cols {
+                                let col = obj_name(c);
+                                let eq = SqlExpr::BinaryOp {
+                                    left: Box::new(SqlExpr::Identifier(
+                                        sqlparser::ast::Ident::new(format!("{bkey}.{col}")),
+                                    )),
+                                    op: sqlparser::ast::BinaryOperator::Eq,
+                                    right: Box::new(SqlExpr::Identifier(
+                                        sqlparser::ast::Ident::new(format!("{jkey}.{col}")),
+                                    )),
+                                };
+                                e = Some(match e {
+                                    None => eq,
+                                    Some(prev) => SqlExpr::BinaryOp {
+                                        left: Box::new(prev),
+                                        op: sqlparser::ast::BinaryOperator::And,
+                                        right: Box::new(eq),
+                                    },
+                                });
+                            }
+                            e
+                        }
+                        _ => None,
+                    };
+                    let right_join = matches!(
+                        j.join_operator,
+                        JoinOperator::Right(_) | JoinOperator::RightOuter(_)
+                    );
+                    (
+                        matches!(
+                            j.join_operator,
+                            JoinOperator::Left(_) | JoinOperator::LeftOuter(_)
+                        ) && !right_join,
+                        on,
+                    )
+                }
+                JoinOperator::CrossJoin(_) => (false, None),
+                _ => return err("unsupported join type"),
+            };
+            rows = join_rows(rows, &jdocs, &jkey, on.as_ref(), left_join)?;
+        }
+
+        // WHERE
+        if let Some(cond) = &select.selection {
+            let mut kept = Vec::new();
+            for doc in &rows {
+                if matches!(eval_expr(cond, doc)?, Value::Bool(true)) {
+                    kept.push(doc.clone());
+                }
+            }
+            rows = kept;
+        }
+
+        // Aggregation path: aggregate functions in projection or GROUP BY.
+        let group_exprs: Vec<SqlExpr> = match &select.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
+            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
+        };
+        if !group_exprs.is_empty() || select.projection.iter().any(is_agg_item) {
+            return self.exec_grouped_select(query, select, rows, group_exprs);
+        }
+        self.exec_plain_select(query, select, rows)
+    }
+
+    /// No aggregation: project expressions over rows.
+    fn exec_plain_select(
+        &mut self,
+        query: Query,
+        select: sqlparser::ast::Select,
+        rows: Vec<Object>,
+    ) -> Result<ExecOutcome> {
         let mut want_star = false;
+        let mut project: Vec<(String, SqlExpr)> = Vec::new();
         for item in &select.projection {
             match item {
                 SelectItem::Wildcard(_) => want_star = true,
@@ -528,33 +662,165 @@ impl Database {
             }
         }
         let columns_out: Vec<String> = if want_star {
-            union_of_fields(&docs)
+            union_of_fields(&rows)
         } else {
             project.iter().map(|(n, _)| n.clone()).collect()
         };
 
-        // WHERE filter.
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        for doc in &docs {
-            if let Some(cond) = &select.selection {
-                match eval_expr(cond, doc)? {
-                    Value::Bool(true) => {}
-                    _ => continue,
-                }
-            }
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        for doc in &rows {
             if want_star {
-                let get = |c: &str| doc.get(c).cloned().unwrap_or(Value::Null);
-                rows.push(columns_out.iter().map(|c| get(c)).collect());
+                out.push(
+                    columns_out
+                        .iter()
+                        .map(|c| doc.get(c).cloned().unwrap_or(Value::Null))
+                        .collect(),
+                );
             } else {
                 let mut row = Vec::with_capacity(project.len());
                 for (_, e) in &project {
                     row.push(eval_expr(e, doc)?);
                 }
-                rows.push(row);
+                out.push(row);
             }
         }
+        out = self.apply_order_limit(query, out, &columns_out)?;
+        Ok(ExecOutcome::Rows(QueryResult {
+            columns: columns_out,
+            rows: out,
+        }))
+    }
 
-        // ORDER BY on output columns.
+    /// GROUP BY + aggregates (+ HAVING).
+    fn exec_grouped_select(
+        &mut self,
+        query: Query,
+        select: sqlparser::ast::Select,
+        rows: Vec<Object>,
+        group_exprs: Vec<SqlExpr>,
+    ) -> Result<ExecOutcome> {
+        // Evaluate group keys per row.
+        let mut groups: Vec<(Vec<Value>, Vec<&Object>)> = Vec::new();
+        for doc in &rows {
+            let key: Vec<Value> = group_exprs
+                .iter()
+                .map(|e| eval_expr(e, doc))
+                .collect::<Result<_>>()?;
+            match groups.iter_mut().find(|(k, _)| k == &key) {
+                Some((_, g)) => g.push(doc),
+                None => groups.push((key, vec![doc])),
+            }
+        }
+        // With no GROUP BY, aggregates run over one group even when empty.
+        if group_exprs.is_empty() && groups.is_empty() {
+            groups.push((vec![], vec![]));
+        }
+        // Projection must be aggregate functions or group exprs.
+        let mut columns = Vec::new();
+        let mut agg_specs = Vec::new(); // per column: AggSpec
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => {
+                    columns.push(expr_name(e));
+                    agg_specs.push(self.agg_spec(e, &group_exprs)?);
+                }
+                SelectItem::ExprWithAlias { expr, alias, .. } => {
+                    columns.push(alias.value.clone());
+                    agg_specs.push(self.agg_spec(expr, &group_exprs)?);
+                }
+                _ => return err("unsupported item in aggregate SELECT"),
+            }
+        }
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        for (key, docs) in &groups {
+            let mut row = Vec::with_capacity(agg_specs.len());
+            for spec in &agg_specs {
+                row.push(eval_agg(spec, docs, key)?);
+            }
+            // HAVING: aggregate subexpressions resolve to output columns
+            // (matched by their SQL text), everything else evaluates normally.
+            if let Some(having) = &select.having {
+                let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
+                if !matches!(eval_having(having, &doc)?, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            out.push(row);
+        }
+        let out = self.apply_order_limit(query, out, &columns)?;
+        Ok(ExecOutcome::Rows(QueryResult { columns, rows: out }))
+    }
+
+    fn agg_spec(&self, e: &SqlExpr, group_exprs: &[SqlExpr]) -> Result<AggSpec> {
+        // A projection item equal to a GROUP BY expression echoes its key.
+        for (i, g) in group_exprs.iter().enumerate() {
+            if format!("{g}") == format!("{e}") {
+                return Ok(AggSpec::GroupKey { idx: i });
+            }
+        }
+        if let SqlExpr::Identifier(i) = e {
+            // Bare column: allowed only if some group expr is that column.
+            for (i2, g) in group_exprs.iter().enumerate() {
+                if matches!(g, SqlExpr::Identifier(gi) if gi.value == i.value) {
+                    return Ok(AggSpec::GroupKey { idx: i2 });
+                }
+            }
+            return err(format!(
+                "column {} must appear in GROUP BY or an aggregate",
+                i.value
+            ));
+        }
+        let SqlExpr::Function(f) = e else {
+            return err(format!("unsupported aggregate projection: {e}"));
+        };
+        let fname = f.name.to_string().to_uppercase();
+        let inner = match &f.args {
+            sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.first().and_then(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) => Some(e.clone()),
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Wildcard,
+                    ) => Some(SqlExpr::Identifier(sqlparser::ast::Ident::new("__count__"))),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        let Some(inner) = inner else {
+            return err(format!("unsupported aggregate arguments: {fname}"));
+        };
+        let op = match fname.as_str() {
+            "COUNT" => AggOp::Count,
+            "SUM" => AggOp::Sum,
+            "AVG" => AggOp::Avg,
+            "MIN" => AggOp::Min,
+            "MAX" => AggOp::Max,
+            other => return err(format!("unknown function: {other}")),
+        };
+        Ok(AggSpec::Agg { op, arg: inner })
+    }
+
+    fn load_table_factor(
+        &mut self,
+        tf: &sqlparser::ast::TableFactor,
+    ) -> Result<(String, Option<String>, Vec<Object>)> {
+        let sqlparser::ast::TableFactor::Table { name, alias, .. } = tf else {
+            return err("only simple tables in FROM");
+        };
+        let tname = obj_name(name);
+        let docs = self.table_docs(&tname)?;
+        let alias = alias.as_ref().map(|a| a.name.value.clone());
+        Ok((tname, alias, docs))
+    }
+
+    fn apply_order_limit(
+        &mut self,
+        query: Query,
+        mut rows: Vec<Vec<Value>>,
+        columns: &[String],
+    ) -> Result<Vec<Vec<Value>>> {
         if let Some(order_by) = &query.order_by {
             let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
                 return err("unsupported ORDER BY");
@@ -565,20 +831,18 @@ impl Database {
                 .collect();
             rows.sort_by(|a, b| {
                 for (col, asc) in &keys {
-                    let idx = columns_out.iter().position(|c| c == col);
+                    let idx = columns.iter().position(|c| c == col);
                     let ord = match idx {
                         Some(i) => Value::cmp_values(&a[i], &b[i]),
-                        None => Ordering::Equal,
+                        None => std::cmp::Ordering::Equal,
                     };
-                    if ord != Ordering::Equal {
+                    if ord != std::cmp::Ordering::Equal {
                         return if *asc { ord } else { ord.reverse() };
                     }
                 }
-                Ordering::Equal
+                std::cmp::Ordering::Equal
             });
         }
-
-        // LIMIT / OFFSET.
         if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
             let n = match limit {
                 Some(e) => eval_const(e)?.as_i64().unwrap_or(i64::MAX).max(0) as usize,
@@ -590,11 +854,170 @@ impl Database {
             };
             rows = rows.into_iter().skip(skip).take(n).collect();
         }
+        Ok(rows)
+    }
+}
 
-        Ok(ExecOutcome::Rows(QueryResult {
-            columns: columns_out,
-            rows,
-        }))
+enum AggOp {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+// Short-lived, built per statement; size difference is fine here.
+#[allow(clippy::large_enum_variant)]
+enum AggSpec {
+    GroupKey { idx: usize },
+    Agg { op: AggOp, arg: SqlExpr },
+}
+
+fn add_values(a: Value, b: Value) -> Result<Value> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_add(y))),
+        (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 + y)),
+        (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + y as f64)),
+        (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x + y)),
+        _ => err("SUM of non-numeric values"),
+    }
+}
+
+fn eval_agg(spec: &AggSpec, docs: &[&Object], key: &[Value]) -> Result<Value> {
+    match spec {
+        AggSpec::GroupKey { idx } => Ok(key.get(*idx).cloned().unwrap_or(Value::Null)),
+        AggSpec::Agg { op, arg } => {
+            let mut vals: Vec<Value> = Vec::new();
+            for d in docs {
+                let v = eval_expr(arg, d)?;
+                if !matches!(v, Value::Null) {
+                    vals.push(v);
+                }
+            }
+            Ok(match op {
+                AggOp::Count => {
+                    // COUNT(*) is rewritten to a sentinel column that never
+                    // exists, so count rows instead of non-null values.
+                    if matches!(arg, SqlExpr::Identifier(i) if i.value == "__count__") {
+                        Value::Int(docs.len() as i64)
+                    } else {
+                        Value::Int(vals.len() as i64)
+                    }
+                }
+                AggOp::Sum => {
+                    if vals.is_empty() {
+                        Value::Null
+                    } else {
+                        let mut sum = vals.remove(0);
+                        for v in vals {
+                            sum = add_values(sum, v)?;
+                        }
+                        sum
+                    }
+                }
+                AggOp::Avg => {
+                    if vals.is_empty() {
+                        Value::Null
+                    } else {
+                        let n = vals.len() as f64;
+                        let mut acc = 0.0f64;
+                        for v in &vals {
+                            acc += match v {
+                                Value::Int(i) => *i as f64,
+                                Value::Float(f) => *f,
+                                _ => return err("AVG of non-numeric"),
+                            };
+                        }
+                        Value::Float(acc / n)
+                    }
+                }
+                AggOp::Min => vals
+                    .into_iter()
+                    .reduce(|a, b| {
+                        if Value::cmp_values(&a, &b) != std::cmp::Ordering::Greater {
+                            a
+                        } else {
+                            b
+                        }
+                    })
+                    .unwrap_or(Value::Null),
+                AggOp::Max => vals
+                    .into_iter()
+                    .reduce(|a, b| {
+                        if Value::cmp_values(&a, &b) != std::cmp::Ordering::Less {
+                            a
+                        } else {
+                            b
+                        }
+                    })
+                    .unwrap_or(Value::Null),
+            })
+        }
+    }
+}
+
+/// Prefix every field with the source alias: "col" -> "alias.col".
+fn qualify(doc: &Object, alias: &str) -> Object {
+    doc.iter()
+        .map(|(k, v)| (format!("{alias}.{k}"), v.clone()))
+        .collect()
+}
+
+/// Nested-loop join. ON is evaluated over the merged (qualified) row.
+fn join_rows(
+    left: Vec<Object>,
+    right: &[Object],
+    right_key: &str,
+    on: Option<&SqlExpr>,
+    left_join: bool,
+) -> Result<Vec<Object>> {
+    let mut out = Vec::new();
+    for l in &left {
+        let mut matched = false;
+        for r in right {
+            let mut merged = l.clone();
+            for (k, v) in r {
+                merged.insert(format!("{right_key}.{k}"), v.clone());
+            }
+            let ok = match on {
+                None => true,
+                Some(e) => matches!(eval_expr(e, &merged)?, Value::Bool(true)),
+            };
+            if ok {
+                matched = true;
+                out.push(merged);
+            }
+        }
+        if !matched && left_join {
+            let mut merged = l.clone();
+            if let Some(r) = right.first() {
+                for k in r.keys() {
+                    merged.insert(format!("{right_key}.{k}"), Value::Null);
+                }
+            }
+            out.push(merged);
+        }
+    }
+    Ok(out)
+}
+
+fn is_agg_item(item: &SelectItem) -> bool {
+    let e = match item {
+        SelectItem::UnnamedExpr(e) => e,
+        SelectItem::ExprWithAlias { expr, .. } => expr,
+        _ => return false,
+    };
+    contains_agg(e)
+}
+
+fn contains_agg(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Function(f) => matches!(
+            f.name.to_string().to_uppercase().as_str(),
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+        ),
+        SqlExpr::Nested(inner) => contains_agg(inner),
+        _ => false,
     }
 }
 
@@ -621,9 +1044,11 @@ fn obj_name(name: &ObjectName) -> String {
 fn expr_name(e: &SqlExpr) -> String {
     match e {
         SqlExpr::Identifier(i) => i.value.clone(),
-        SqlExpr::CompoundIdentifier(parts) => {
-            parts.last().map(|p| p.value.clone()).unwrap_or_default()
-        }
+        SqlExpr::CompoundIdentifier(parts) => parts
+            .iter()
+            .map(|p| p.value.clone())
+            .collect::<Vec<_>>()
+            .join("."),
         other => other.to_string(),
     }
 }
@@ -672,13 +1097,41 @@ fn sql_value(v: &sqlparser::ast::Value) -> Result<Value> {
     Ok(out)
 }
 
+/// Resolve a bare column name: exact key first, then a unique "alias.col"
+/// match (qualified rows from joins); ambiguous matches are an error.
+fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
+    if let Some(v) = doc.get(name) {
+        return Ok(v.clone());
+    }
+    let suffix = format!(".{name}");
+    let hits: Vec<&Value> = doc
+        .iter()
+        .filter(|(k, _)| k.ends_with(&suffix))
+        .map(|(_, v)| v)
+        .collect();
+    match hits.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(hits[0].clone()),
+        _ => err(format!("ambiguous column: {name}")),
+    }
+}
+
 /// Evaluate an expression against a document row.
 pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
     match e {
-        SqlExpr::Identifier(i) => Ok(doc.get(&i.value).cloned().unwrap_or(Value::Null)),
+        SqlExpr::Identifier(i) => lookup_col(doc, &i.value),
         SqlExpr::CompoundIdentifier(parts) => {
-            let name = parts.last().map(|p| p.value.clone()).unwrap_or_default();
-            Ok(doc.get(&name).cloned().unwrap_or(Value::Null))
+            let full = parts
+                .iter()
+                .map(|p| p.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            if let Some(v) = doc.get(&full) {
+                Ok(v.clone())
+            } else {
+                let last = parts.last().map(|p| p.value.clone()).unwrap_or_default();
+                lookup_col(doc, &last)
+            }
         }
         SqlExpr::Value(v) => sql_value(v),
         SqlExpr::UnaryOp { op, expr } => {
@@ -695,7 +1148,41 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             binop(l, op, r)
         }
         SqlExpr::Nested(e) => eval_expr(e, doc),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_expr(expr, doc)?;
+            let mut hit = false;
+            for item in list {
+                let iv = eval_expr(item, doc)?;
+                if Value::cmp_values(&v, &iv) == std::cmp::Ordering::Equal {
+                    hit = true;
+                    break;
+                }
+            }
+            Ok(Value::Bool(hit != *negated))
+        }
         other => err(format!("unsupported expression: {other}")),
+    }
+}
+
+/// HAVING evaluation where aggregate expressions are replaced by the
+/// already-computed output column values.
+fn eval_having(e: &SqlExpr, out: &Object) -> Result<Value> {
+    match e {
+        SqlExpr::Function(f) if contains_agg(&SqlExpr::Function(f.clone())) => {
+            let name = expr_name(e);
+            Ok(out.get(&name).cloned().unwrap_or(Value::Null))
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let l = eval_having(left, out)?;
+            let r = eval_having(right, out)?;
+            binop(l, op, r)
+        }
+        SqlExpr::Nested(inner) => eval_having(inner, out),
+        other => eval_expr(other, out),
     }
 }
 
@@ -930,10 +1417,12 @@ mod tests {
         for i in 0..5 {
             run(&mut db, &format!("INSERT INTO t VALUES ({i})"));
         }
-        // IN lists arrive with M5; for now they are rejected cleanly.
-        assert!(db.execute("DELETE FROM t WHERE id IN (1)").is_err());
-        match run(&mut db, "DELETE FROM t WHERE id = 1") {
+        match run(&mut db, "DELETE FROM t WHERE id IN (1)") {
             ExecOutcome::Affected(1) => {}
+            o => panic!("{o:?}"),
+        }
+        match run(&mut db, "DELETE FROM t WHERE id = 1") {
+            ExecOutcome::Affected(0) => {} // already removed by the IN delete
             o => panic!("affected={o:?}"),
         }
         match run(&mut db, "DELETE FROM t WHERE id > 3") {
@@ -1029,6 +1518,154 @@ mod tests {
         assert_eq!(r.columns, vec!["a"]);
         assert_eq!(r.rows.len(), 2);
         assert!(db.execute("ALTER TABLE missing ADD COLUMN x INT").is_err());
+    }
+
+    #[test]
+    fn inner_join_with_on() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE u (uid INT, name TEXT)");
+        run(&mut db, "CREATE TABLE o (oid INT, uid INT, item TEXT)");
+        run(&mut db, "INSERT INTO u VALUES (1, 'ann'), (2, 'bob')");
+        run(&mut db, "INSERT INTO o VALUES (10, 1, 'book'), (11, 1, 'pen'), (12, 2, 'cap'), (13, 9, 'ghost')");
+        let r = rows(
+            &mut db,
+            "SELECT u.name, o.item FROM u JOIN o ON u.uid = o.uid ORDER BY o.oid",
+        );
+        assert_eq!(r.columns, vec!["u.name", "o.item"]);
+        assert_eq!(r.rows.len(), 3); // ghost dropped
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Str("ann".into()), Value::Str("book".into())]
+        );
+        assert_eq!(
+            r.rows[2],
+            vec![Value::Str("bob".into()), Value::Str("cap".into())]
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_unmatched() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT)");
+        run(&mut db, "CREATE TABLE b (id INT, aid INT, v TEXT)");
+        run(&mut db, "INSERT INTO a VALUES (1), (2)");
+        run(&mut db, "INSERT INTO b VALUES (100, 1, 'x')");
+        let r = rows(
+            &mut db,
+            "SELECT a.id, b.v FROM a LEFT JOIN b ON b.aid = a.id ORDER BY a.id",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[1], vec![Value::Int(2), Value::Null]);
+    }
+
+    #[test]
+    fn cross_join_cartesian() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE x (a INT)");
+        run(&mut db, "CREATE TABLE y (b INT)");
+        run(&mut db, "INSERT INTO x VALUES (1), (2)");
+        run(&mut db, "INSERT INTO y VALUES (3), (4), (5)");
+        let r = rows(&mut db, "SELECT x.a, y.b FROM x CROSS JOIN y");
+        assert_eq!(r.rows.len(), 6);
+    }
+
+    #[test]
+    fn aggregates_without_group_by() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (v INT)");
+        run(&mut db, "INSERT INTO t VALUES (2), (4), (6), (NULL)");
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*), COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM t",
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                Value::Int(4),
+                Value::Int(3),
+                Value::Int(12),
+                Value::Float(4.0),
+                Value::Int(2),
+                Value::Int(6),
+            ]]
+        );
+        // empty table
+        run(&mut db, "CREATE TABLE e (v INT)");
+        let r = rows(&mut db, "SELECT COUNT(*), SUM(v) FROM e");
+        assert_eq!(r.rows, vec![vec![Value::Int(0), Value::Null]]);
+    }
+
+    #[test]
+    fn group_by_with_having() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE s (dept TEXT, pay INT)");
+        run(
+            &mut db,
+            "INSERT INTO s VALUES ('eng', 100), ('eng', 120), ('ops', 80), ('ops', 90), ('hr', 50)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT dept, COUNT(*), SUM(pay) FROM s GROUP BY dept ORDER BY dept",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("eng".into()), Value::Int(2), Value::Int(220)],
+                vec![Value::Str("hr".into()), Value::Int(1), Value::Int(50)],
+                vec![Value::Str("ops".into()), Value::Int(2), Value::Int(170)],
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT dept, SUM(pay) FROM s GROUP BY dept HAVING SUM(pay) > 100 ORDER BY dept",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert!(r.rows.iter().all(|row| row[1].as_i64().unwrap() > 100));
+    }
+
+    #[test]
+    fn in_list_filter() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT)");
+        for i in 0..6 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i})"));
+        }
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id IN (1, 3, 5) ORDER BY id",
+        );
+        assert_eq!(r.rows.len(), 3);
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id NOT IN (1, 3, 5) ORDER BY id",
+        );
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Value::Int(0));
+        assert_eq!(r.rows[2][0], Value::Int(4));
+    }
+
+    #[test]
+    fn union_and_union_all() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (v INT)");
+        run(&mut db, "CREATE TABLE b (v INT)");
+        run(&mut db, "INSERT INTO a VALUES (1), (2)");
+        run(&mut db, "INSERT INTO b VALUES (2), (3)");
+        let r = rows(&mut db, "SELECT v FROM a UNION SELECT v FROM b ORDER BY v");
+        assert_eq!(r.rows.len(), 3);
+        let r = rows(&mut db, "SELECT v FROM a UNION ALL SELECT v FROM b");
+        assert_eq!(r.rows.len(), 4);
+    }
+
+    #[test]
+    fn non_grouped_column_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, b INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 2)");
+        let e = db
+            .execute("SELECT a, COUNT(*) FROM t GROUP BY b")
+            .unwrap_err();
+        assert!(e.to_string().contains("GROUP BY"), "{e}");
     }
 
     #[test]
