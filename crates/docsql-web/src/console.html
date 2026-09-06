@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>docsql console</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, Menlo, monospace; background: #14161a; color: #d7dce3; margin: 0; display: flex; height: 100vh; }
+  nav { width: 200px; background: #0d0f12; padding: 16px; }
+  nav h1 { font-size: 15px; color: #6fb3ff; }
+  main { flex: 1; padding: 16px; overflow: auto; }
+  textarea, input { width: 100%; background: #1d2026; color: #d7dce3; border: 1px solid #333; padding: 8px; font: inherit; }
+  button { background: #2b6cb0; border: none; color: #fff; padding: 8px 14px; cursor: pointer; margin-top: 6px; }
+  table { border-collapse: collapse; margin-top: 10px; width: 100%; }
+  th, td { border: 1px solid #2a2e35; padding: 4px 8px; text-align: left; font-size: 13px; }
+  th { background: #1a1d22; }
+  #msg { margin-top: 8px; font-size: 13px; white-space: pre-wrap; }
+  .err { color: #ff7b72; } .ok { color: #7ee787; }
+</style>
+</head>
+<body>
+<nav>
+  <h1>docsql console</h1>
+  <a href="#" onclick="show('sql')">SQL 工作台</a><br><br>
+  <a href="#" onclick="show('keys')">KV 键浏览</a><br><br>
+  <a href="#" onclick="show('pubsub')">发布订阅</a><br><br>
+  <a href="#" onclick="show('stats')">监控</a>
+</nav>
+<main>
+  <div>
+    token <input id="token" placeholder="X-Docsql-Token" style="width:200px">
+  </div>
+  <section id="sql">
+    <h2>SQL 工作台</h2>
+    <textarea id="sqltext" rows="6">CREATE TABLE demo (id INT PRIMARY KEY, name TEXT);
+INSERT INTO demo VALUES (1, 'ann'), (2, 'bob');
+SELECT id, name FROM demo ORDER BY id;</textarea><br>
+    <button onclick="runSql()">执行</button>
+    <div id="msg"></div>
+    <div id="result"></div>
+  </section>
+  <section id="keys" hidden>
+    <h2>KV 键浏览</h2>
+    <button onclick="loadKeys()">刷新</button>
+    <div id="keytable"></div>
+    <h3>命令</h3>
+    <input id="kvcmd" placeholder="SET key value" style="width:400px">
+    <button onclick="runKv()">执行</button>
+  </section>
+  <section id="pubsub" hidden>
+    <h2>发布订阅</h2>
+    <p>发布订阅走 TCP 协议端口(SUBSCRIBE/PUBLISH),Web 控制台提供只读说明。
+       发布消息: <input id="pubch" placeholder="channel" style="width:120px">
+       <input id="pubmsg" placeholder="message" style="width:200px">
+       <button onclick="publish()">PUBLISH</button></p>
+  </section>
+  <section id="stats" hidden>
+    <h2>监控</h2>
+    <button onclick="loadStats()">刷新</button>
+    <pre id="statsout"></pre>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const headers = () => { const t = $('token').value.trim(); return t ? {'X-Docsql-Token': t} : {}; };
+
+function show(which) {
+  for (const s of ['sql','keys','pubsub','stats']) $(s).hidden = (s !== which);
+}
+
+async function runSql() {
+  $('msg').textContent = ''; $('result').innerHTML = '';
+  const resp = await fetch('/api/sql', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', ...headers()},
+    body: JSON.stringify({sql: $('sqltext').value})
+  });
+  if (resp.status === 401) { $('msg').textContent = '未授权:请填写 token'; return; }
+  const data = await resp.json();
+  if (data.kind === 'error') { $('msg').className = 'err'; $('msg').textContent = data.message; return; }
+  if (data.kind === 'affected') { $('msg').className = 'ok'; $('msg').textContent = `(${data.count} rows affected)`; return; }
+  let html = '<table><tr>' + data.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
+  for (const row of data.rows) html += '<tr>' + row.map(v => `<td>${v === null ? 'NULL' : v}</td>`).join('') + '</tr>';
+  $('result').innerHTML = html + '</table>';
+}
+
+async function loadKeys() {
+  const resp = await fetch('/api/keys', {headers: headers()});
+  const data = await resp.json();
+  let html = '<table><tr><th>key</th><th>type</th><th>ttl(ms)</th></tr>';
+  for (const k of data.keys) html += `<tr><td>${k.key}</td><td>${k.type}</td><td>${k.ttl_ms < 0 ? '∞' : k.ttl_ms}</td></tr>`;
+  $('keytable').innerHTML = html + '</table>';
+}
+
+async function runKv() {
+  const parts = $('kvcmd').value.trim().split(/\s+/);
+  if (!parts.length) return;
+  const resp = await fetch('/api/kv', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', ...headers()},
+    body: JSON.stringify({command: parts[0], args: parts.slice(1)})
+  });
+  alert(JSON.stringify(await resp.json()));
+}
+
+async function publish() {
+  const resp = await fetch('/api/kv', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', ...headers()},
+    body: JSON.stringify({command: 'PUBLISH', args: [$('pubch').value, $('pubmsg').value]})
+  });
+  alert(JSON.stringify(await resp.json()));
+}
+
+async function loadStats() {
+  const resp = await fetch('/api/stats', {headers: headers()});
+  $('statsout').textContent = JSON.stringify(await resp.json(), null, 2);
+}
+</script>
+</body>
+</html>
