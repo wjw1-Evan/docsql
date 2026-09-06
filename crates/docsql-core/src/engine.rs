@@ -52,10 +52,46 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct TableMeta {
     columns: Vec<String>,
     pages: Vec<u32>,
+    primary_key: Option<String>,
+    unique: Vec<String>,
+    not_null: Vec<String>,
+}
+
+impl TableMeta {
+    /// Validate a document against declared constraints.
+    fn check(&self, doc: &Object) -> Result<()> {
+        for col in &self.not_null {
+            if matches!(doc.get(col), Some(Value::Null) | None) {
+                return err(format!("NOT NULL constraint failed: {col}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce PRIMARY KEY / UNIQUE across the whole (rewritten) doc set.
+    fn check_unique(&self, docs: &[Object]) -> Result<()> {
+        for col in self.primary_key.iter().chain(self.unique.iter()) {
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            for doc in docs {
+                if let Some(v) = doc.get(col) {
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    let key = encode::encode_to_vec(v).map_err(SqlError::Encode)?;
+                    if seen.binary_search(&key).is_ok() {
+                        return err(format!("UNIQUE constraint failed: {col}"));
+                    }
+                    seen.push(key);
+                    seen.sort();
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct Database {
@@ -96,7 +132,22 @@ impl Database {
                                     .collect(),
                                 _ => vec![],
                             };
-                            tables.insert(name.clone(), TableMeta { columns, pages });
+                            let primary_key = m
+                                .get("primary_key")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let unique = str_list(m, "unique");
+                            let not_null = str_list(m, "not_null");
+                            tables.insert(
+                                name.clone(),
+                                TableMeta {
+                                    columns,
+                                    pages,
+                                    primary_key,
+                                    unique,
+                                    not_null,
+                                },
+                            );
                         }
                     }
                 }
@@ -124,6 +175,26 @@ impl Database {
                 "pages".into(),
                 Value::Array(meta.pages.iter().map(|p| Value::Int(*p as i64)).collect()),
             );
+            if let Some(pk) = &meta.primary_key {
+                m.insert("primary_key".into(), Value::Str(pk.clone()));
+            }
+            if !meta.unique.is_empty() {
+                m.insert(
+                    "unique".into(),
+                    Value::Array(meta.unique.iter().map(|c| Value::Str(c.clone())).collect()),
+                );
+            }
+            if !meta.not_null.is_empty() {
+                m.insert(
+                    "not_null".into(),
+                    Value::Array(
+                        meta.not_null
+                            .iter()
+                            .map(|c| Value::Str(c.clone()))
+                            .collect(),
+                    ),
+                );
+            }
             tables.insert(name.clone(), Value::Object(m));
         }
         let mut cat = Object::new();
@@ -174,6 +245,7 @@ impl Database {
             Statement::Delete(sqlparser::ast::Delete {
                 from, selection, ..
             }) => self.exec_delete(from, selection),
+            Statement::AlterTable(alter) => self.exec_alter(alter),
             Statement::Query(q) => self.exec_query(*q),
             other => err(format!("unsupported statement: {other}")),
         }
@@ -241,6 +313,12 @@ impl Database {
                 out.push(doc);
             }
         }
+        let meta = self.tables.get(&tname).cloned().unwrap_or_default();
+        // Validate BEFORE writing: a failed UPDATE must not change data.
+        for doc in &out {
+            meta.check(doc)?;
+        }
+        meta.check_unique(&out)?;
         self.rewrite_table(&tname, out)?;
         Ok(ExecOutcome::Affected(count))
     }
@@ -274,6 +352,44 @@ impl Database {
         Ok(ExecOutcome::Affected(count))
     }
 
+    fn exec_alter(&mut self, alter: sqlparser::ast::AlterTable) -> Result<ExecOutcome> {
+        use sqlparser::ast::AlterTableOperation as Op;
+        let tname = obj_name(&alter.name);
+        let Some(mut meta) = self.tables.get(&tname).cloned() else {
+            return err(format!("table {tname} does not exist"));
+        };
+        for op in &alter.operations {
+            match op {
+                Op::AddColumn { column_def, .. } => {
+                    let col = column_def.name.value.clone();
+                    if !meta.columns.contains(&col) {
+                        meta.columns.push(col);
+                    }
+                }
+                Op::DropColumn { column_names, .. } => {
+                    for id in column_names {
+                        meta.columns.retain(|c| c != &id.value);
+                    }
+                    let docs = self.table_docs(&tname)?;
+                    let stripped: Vec<Object> = docs
+                        .into_iter()
+                        .map(|mut d| {
+                            for id in column_names {
+                                d.remove(&id.value);
+                            }
+                            d
+                        })
+                        .collect();
+                    self.rewrite_table(&tname, stripped)?;
+                }
+                other => return err(format!("unsupported ALTER TABLE operation: {other}")),
+            }
+        }
+        self.tables.insert(tname.clone(), meta);
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
     fn exec_create(&mut self, create: sqlparser::ast::CreateTable) -> Result<ExecOutcome> {
         let name = obj_name(&create.name);
         if self.tables.contains_key(&name) {
@@ -284,13 +400,23 @@ impl Database {
             .iter()
             .map(|c| c.name.value.clone())
             .collect();
-        self.tables.insert(
-            name.clone(),
-            TableMeta {
-                columns,
-                pages: vec![],
-            },
-        );
+        let mut meta = TableMeta {
+            columns,
+            ..Default::default()
+        };
+        for col in &create.columns {
+            for opt in &col.options {
+                use sqlparser::ast::ColumnOption as CO;
+                match &opt.option {
+                    CO::PrimaryKey { .. } => meta.primary_key = Some(col.name.value.clone()),
+                    CO::Unique { .. } => meta.unique.push(col.name.value.clone()),
+                    CO::NotNull => meta.not_null.push(col.name.value.clone()),
+                    CO::Null => {}
+                    _ => return err("unsupported column constraint"),
+                }
+            }
+        }
+        self.tables.insert(name.clone(), meta);
         self.save_catalog()?;
         Ok(ExecOutcome::Affected(0))
     }
@@ -300,7 +426,7 @@ impl Database {
             return err("unsupported INSERT target");
         };
         let table = obj_name(name);
-        let Some(meta) = self.tables.get(&table) else {
+        let Some(meta) = self.tables.get(&table).cloned() else {
             return err(format!("table {table} does not exist"));
         };
         let columns: Vec<String> = if insert.columns.is_empty() {
@@ -327,10 +453,9 @@ impl Database {
         if rows.is_empty() {
             return err("INSERT has no rows");
         }
-        let mut heap = Heap {
-            pages: self.tables.get(&table).unwrap().pages.clone(),
-        };
-        let mut count = 0u64;
+        // Build all documents first, validate, and only then write — a
+        // failed statement must leave the table untouched.
+        let mut new_docs: Vec<Object> = Vec::new();
         for row in rows {
             if row.len() != columns.len() {
                 return err(format!(
@@ -340,13 +465,29 @@ impl Database {
                 ));
             }
             let doc: Object = columns.iter().cloned().zip(row).collect();
-            let mut tx = self.pager.begin_tx();
-            heap.insert(&mut self.pager, &mut tx, &doc)?;
-            self.pager.commit_tx(tx)?;
-            count += 1;
+            meta.check(&doc)?;
+            new_docs.push(doc);
         }
-        if let Some(meta) = self.tables.get_mut(&table) {
-            meta.pages = heap.pages.clone();
+        let existing: Vec<Object> = Heap {
+            pages: meta.pages.clone(),
+        }
+        .scan(&mut self.pager)
+        .unwrap_or_default();
+        let mut combined = existing.clone();
+        combined.extend(new_docs.iter().cloned());
+        meta.check_unique(&combined)?;
+
+        let mut heap = Heap {
+            pages: meta.pages.clone(),
+        };
+        for doc in &new_docs {
+            let mut tx = self.pager.begin_tx();
+            heap.insert(&mut self.pager, &mut tx, doc)?;
+            self.pager.commit_tx(tx)?;
+        }
+        let count = new_docs.len() as u64;
+        if let Some(m) = self.tables.get_mut(&table) {
+            m.pages = heap.pages.clone();
         }
         self.save_catalog()?;
         Ok(ExecOutcome::Affected(count))
@@ -454,6 +595,16 @@ impl Database {
             columns: columns_out,
             rows,
         }))
+    }
+}
+
+fn str_list(m: &Object, key: &str) -> Vec<String> {
+    match m.get(key) {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+        _ => vec![],
     }
 }
 
@@ -804,6 +955,80 @@ mod tests {
         }
         let r = rows(&mut db, "SELECT id FROM t");
         assert!(r.rows.is_empty());
+    }
+
+    #[test]
+    fn primary_key_and_unique_constraints() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t (id, email, name) VALUES (1, 'a@x', 'ann')",
+        );
+        // duplicate PK
+        let e = db
+            .execute("INSERT INTO t (id, email, name) VALUES (1, 'b@x', 'bob')")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+        // duplicate UNIQUE
+        let e = db
+            .execute("INSERT INTO t (id, email, name) VALUES (2, 'a@x', 'bob')")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+        // distinct is fine
+        run(
+            &mut db,
+            "INSERT INTO t (id, email, name) VALUES (2, 'b@x', 'bob')",
+        );
+        // UPDATE that would collide is rejected
+        let e = db
+            .execute("UPDATE t SET email = 'a@x' WHERE id = 2")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+    }
+
+    #[test]
+    fn not_null_constraint() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT NOT NULL)");
+        let e = db.execute("INSERT INTO t (a) VALUES (NULL)").unwrap_err();
+        assert!(e.to_string().contains("NOT NULL"), "{e}");
+        run(&mut db, "INSERT INTO t (a) VALUES (5)");
+        let e = db.execute("UPDATE t SET a = NULL").unwrap_err();
+        assert!(e.to_string().contains("NOT NULL"), "{e}");
+    }
+
+    #[test]
+    fn constraints_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cons.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY)");
+            run(&mut db, "INSERT INTO t (id) VALUES (1)");
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert!(db.execute("INSERT INTO t (id) VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn alter_table_add_and_drop_column() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "INSERT INTO t (a) VALUES (1)");
+        run(&mut db, "ALTER TABLE t ADD COLUMN b TEXT");
+        run(&mut db, "INSERT INTO t (a, b) VALUES (2, 'two')");
+        let r = rows(&mut db, "SELECT a, b FROM t ORDER BY a");
+        assert_eq!(r.rows[0][1], Value::Null);
+        assert_eq!(r.rows[1][1], Value::Str("two".into()));
+        run(&mut db, "ALTER TABLE t DROP COLUMN b");
+        let r = rows(&mut db, "SELECT a FROM t ORDER BY a");
+        assert_eq!(r.columns, vec!["a"]);
+        assert_eq!(r.rows.len(), 2);
+        assert!(db.execute("ALTER TABLE missing ADD COLUMN x INT").is_err());
     }
 
     #[test]
