@@ -207,13 +207,14 @@ internal sealed class ServerLauncher : IDisposable
                 "找不到 docsql-server,请先 cargo build -p docsql-server:" + exe);
         var dbFile = Path.Combine(Path.GetTempPath(), $"docsql-efsample-{port}.db");
         try { File.Delete(dbFile); } catch { }
-        var proc = Process.Start(new ProcessStartInfo
+        var psi = new ProcessStartInfo
         {
             FileName = exe,
             Arguments = $"{dbFile} 127.0.0.1:{port}",
             CreateNoWindow = true,
             RedirectStandardError = true,
-        }) ?? throw new InvalidOperationException("无法启动 docsql-server");
+        };
+        var proc = Process.Start(psi) ?? throw new InvalidOperationException("无法启动 docsql-server");
         for (var i = 0; i < 100; i++)
         {
             try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", port); return new(proc, dbFile); }

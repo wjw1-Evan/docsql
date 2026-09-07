@@ -3199,9 +3199,23 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
     match e {
         SqlExpr::Value(v) => sql_value(v),
         SqlExpr::UnaryOp { op, expr } => {
+            // `-9223372036854775808` lexes as Minus over 9223372036854775808,
+            // which overflows i64 on its own — re-parse the signed text so the
+            // value stays an Int instead of degrading to Float.
+            if *op == sqlparser::ast::UnaryOperator::Minus {
+                if let SqlExpr::Value(nv) = expr.as_ref() {
+                    if let sqlparser::ast::Value::Number(n, _) = &nv.value {
+                        if let Ok(i) = format!("-{n}").parse::<i64>() {
+                            return Ok(Value::Int(i));
+                        }
+                    }
+                }
+            }
             let v = eval_const(expr)?;
             match (op, v) {
-                (sqlparser::ast::UnaryOperator::Minus, Value::Int(i)) => Ok(Value::Int(-i)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Int(i)) => {
+                    Ok(Value::Int(i.wrapping_neg()))
+                }
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
                 _ => err("unsupported unary operand"),
             }
@@ -6346,7 +6360,6 @@ mod tests {
 
     // 待办:-9223372036854775808 目前被解析为浮点(一元负号 + 溢出字面量),
     // 需要解析器层支持;恢复前保持 ignore。
-    #[ignore = "i64::MIN literal parses as float (parser gap)"]
     #[test]
     fn integer_boundary_values_roundtrip() {
         let mut db = Database::in_memory().unwrap();

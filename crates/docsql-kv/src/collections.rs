@@ -373,4 +373,46 @@ mod tests {
         assert_eq!(kv.type_of("l").unwrap().as_deref(), Some("list"));
         assert_eq!(kv.type_of("nope").unwrap(), None);
     }
+
+    #[test]
+    fn zset_update_member_score_and_empty_ranges() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.zadd("Z", 1.0, "m").unwrap();
+        // re-adding the same member updates its score instead of duplicating
+        kv.zadd("Z", 5.0, "m").unwrap();
+        assert_eq!(kv.zscore("Z", "m").unwrap(), Some(5.0));
+        let all = kv.zrange("Z", f64::NEG_INFINITY, f64::INFINITY).unwrap();
+        assert_eq!(all.len(), 1);
+        // min > max yields nothing
+        assert!(kv.zrange("Z", 10.0, 1.0).unwrap().is_empty());
+        // empty zset: range and rank on a missing key
+        assert!(kv
+            .zrange("none", f64::NEG_INFINITY, f64::INFINITY)
+            .unwrap()
+            .is_empty());
+        assert_eq!(kv.zrank("none", "m").unwrap(), None);
+        // negative and fractional scores order correctly
+        kv.zadd("Z", -2.5, "neg").unwrap();
+        kv.zadd("Z", 0.25, "frac").unwrap();
+        let all = kv.zrange("Z", f64::NEG_INFINITY, f64::INFINITY).unwrap();
+        assert_eq!(
+            all.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            vec!["neg", "frac", "m"]
+        );
+    }
+
+    #[test]
+    fn zadd_and_list_ops_reject_string_key() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("plain", "str", SetOpts::default()).unwrap();
+        assert!(kv.zadd("plain", 1.0, "m").is_err());
+        assert!(kv.sadd("plain", &["m"]).is_err());
+        assert!(kv
+            .zrange("plain", f64::NEG_INFINITY, f64::INFINITY)
+            .is_err());
+        // DEL frees the key for a new type
+        assert!(kv.del("plain").unwrap());
+        assert!(kv.zadd("plain", 1.0, "m").is_ok());
+        assert_eq!(kv.type_of("plain").unwrap().as_deref(), Some("zset"));
+    }
 }

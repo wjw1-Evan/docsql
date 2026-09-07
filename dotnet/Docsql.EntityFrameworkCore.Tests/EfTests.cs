@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Docsql.Client;
 using Docsql.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Xunit;
 
 [Index(nameof(Email), IsUnique = true)]
@@ -609,6 +610,53 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
             db.Blogs.Remove(victim);
             db.SaveChanges();
             Assert.Single(db.Blogs.ToList());
+        }
+    }
+
+    [Fact]
+    public void Batch_update_and_delete_in_one_SaveChanges()
+    {
+        Clean();
+        using (var db = NewDb())
+        {
+            db.Blogs.AddRange(new Blog { Title = "a" }, new Blog { Title = "b" }, new Blog { Title = "c" });
+            db.SaveChanges();
+        }
+        using (var db = NewDb())
+        {
+            // 一次 SaveChanges 混合:2 个 UPDATE + 1 个 DELETE
+            foreach (var b in db.Blogs.Where(x => x.Title != "b").ToList())
+                b.Title = b.Title + "!";
+            db.Blogs.Remove(db.Blogs.Single(x => x.Title == "b"));
+            db.SaveChanges();
+        }
+        using (var db = NewDb())
+        {
+            var titles = db.Blogs.OrderBy(b => b.Title).Select(b => b.Title).ToList();
+            Assert.Equal(new[] { "a!", "c!" }, titles);
+        }
+    }
+
+    [Fact]
+    public void Unchanged_entities_do_not_produce_updates()
+    {
+        Clean();
+        using (var db = NewDb())
+        {
+            db.Blogs.Add(new Blog { Title = "stable" });
+            db.SaveChanges();
+        }
+        // 二次上下文只读不 SaveChanges 不会写;真正 SaveChanges 空变更集也应是 0 条 SQL 写
+        using (var db = NewDb())
+        {
+            var blog = db.Blogs.Single();
+            Assert.Equal(EntityState.Unchanged, db.Entry(blog).State);
+            db.SaveChanges();
+            Assert.Equal(EntityState.Unchanged, db.Entry(blog).State);
+        }
+        using (var db = NewDb())
+        {
+            Assert.Equal("stable", db.Blogs.Single().Title);
         }
     }
 }

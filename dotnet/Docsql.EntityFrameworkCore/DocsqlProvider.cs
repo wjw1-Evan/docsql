@@ -1,39 +1,39 @@
-// EF Core support for docsql.
+// 原生 docsql EF Core 提供程序入口:不借壳 SQLite,仅依赖
+// Microsoft.EntityFrameworkCore.Relational 的通用管线。
 //
-// Strategy: reuse EF Core's SQLite provider for the full SQL-generation and
-// update pipeline (our engine's SQL surface tracks the SQLite-style dialect),
-// swapping the ADO.NET connection for Docsql.Client. This gives LINQ,
-// SaveChanges and EnsureCreated against a docsql server without maintaining
-// a bespoke EF service stack.
+// SQL 生成(Infrastructure/)、更新执行、类型映射、EnsureCreated 全部
+// 由本程序集提供;连接走 Docsql.Client 的 TCP 二进制协议。
 
 using Docsql.Client;
 using Microsoft.EntityFrameworkCore;
+using Docsql.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 
 namespace Docsql.EntityFrameworkCore;
 
 public static class DocsqlDbContextOptionsExtensions
 {
-    /// <summary>Use docsql as the backend, generating SQLite-compatible SQL.</summary>
+    /// <summary>连接 docsql:连接串 "host=..;port=..;token=..;key=.."。</summary>
     public static DbContextOptionsBuilder UseDocsql(
         this DbContextOptionsBuilder options,
         string connectionString)
     {
-        var b = new DocsqlConnectionStringBuilder { ConnectionString = connectionString };
-        var conn = new DocsqlConnection("Data Source=docsql")
-        {
-            // EF's SQLite layer inspects ConnectionString; the real endpoint
-            // is carried separately.
-            EndpointOverride = (b.Host, b.Port, b.Token),
-            KeyOverride = b.Key,
-        };
-        return options.UseSqlite(conn)
-            .AddInterceptors(new DocsqlAutoCreateInterceptor());
+        var extension = (options.Options.FindExtension<DocsqlOptionsExtension>()
+                ?? new DocsqlOptionsExtension())
+            .WithConnectionString(connectionString);
+        ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(extension);
+        return options.AddInterceptors(new DocsqlAutoCreateInterceptor());
     }
 
-    /// <summary>Use docsql with an already-open connection.</summary>
+    /// <summary>用已有连接。</summary>
     public static DbContextOptionsBuilder UseDocsql(
         this DbContextOptionsBuilder options,
         DocsqlConnection connection)
-        => options.UseSqlite(connection)
-            .AddInterceptors(new DocsqlAutoCreateInterceptor());
+    {
+        var extension = (options.Options.FindExtension<DocsqlOptionsExtension>()
+                ?? new DocsqlOptionsExtension())
+            .WithConnection(connection);
+        ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(extension);
+        return options.AddInterceptors(new DocsqlAutoCreateInterceptor());
+    }
 }

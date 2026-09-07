@@ -509,6 +509,10 @@ pub fn kv_dispatch(
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
+        "EXISTS" => match kv.exists(arg(0)) {
+            Ok(done) => json!({"ok": true, "value": if done { 1 } else { 0 }}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
         "DEL" => match kv.del(arg(0)) {
             Ok(done) => json!({"ok": true, "value": if done { 1 } else { 0 }}),
             Err(e) => json!({"ok": false, "error": e.to_string()}),

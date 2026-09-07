@@ -227,7 +227,8 @@ public sealed class DocsqlCommand : DbCommand
         return frame.Type switch
         {
             FrameType.RespRows => new DocsqlDataReader(frame.Payload),
-            FrameType.RespAffected => new DocsqlDataReader(Array.Empty<byte>()),
+            FrameType.RespAffected => new DocsqlDataReader(
+                Array.Empty<byte>(), DecodeAffected(frame.Payload)),
             _ => throw new DocsqlException(ErrorText(frame)),
         };
     }
@@ -267,7 +268,7 @@ public sealed class DocsqlCommand : DbCommand
 
     private static string ErrorText(Frame f) => Encoding.UTF8.GetString(f.Payload);
 
-    private static int DecodeAffected(byte[] payload) =>
+    internal static int DecodeAffected(byte[] payload) =>
         payload.Length >= 8 ? BitConverter.ToInt32(payload, 0) : 0;
 
     public override void Prepare() { }
@@ -348,8 +349,11 @@ public sealed class DocsqlDataReader : DbDataReader
     private readonly List<object?[]> _rows = new();
     private int _pos = -1;
 
-    internal DocsqlDataReader(byte[] payload)
+    private readonly int _recordsAffected;
+
+    internal DocsqlDataReader(byte[] payload, int recordsAffected = 0)
     {
+        _recordsAffected = recordsAffected;
         if (payload.Length == 0)
         {
             return;
@@ -378,7 +382,7 @@ public sealed class DocsqlDataReader : DbDataReader
     public override int FieldCount => _columns.Count;
     public override bool HasRows => _rows.Count > 0;
     public override bool IsClosed => false;
-    public override int RecordsAffected => _rows.Count;
+    public override int RecordsAffected => _recordsAffected;
 
     public override bool Read()
     {
@@ -390,7 +394,9 @@ public sealed class DocsqlDataReader : DbDataReader
         return true;
     }
 
-    public override object? GetValue(int ordinal) => _rows[_pos][ordinal];
+    // ADO.NET contract: NULL columns surface as DBNull.Value, not null.
+    public override object GetValue(int ordinal) =>
+        _rows[_pos][ordinal] ?? DBNull.Value;
     public override bool IsDBNull(int ordinal) => _rows[_pos][ordinal] is null;
     public override string GetName(int ordinal) => _columns[ordinal];
     public override int GetOrdinal(string name) => _columns.IndexOf(name);

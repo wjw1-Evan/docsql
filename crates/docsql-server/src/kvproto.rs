@@ -181,6 +181,20 @@ async fn handle_inner(
                 ),
             }
         }
+        "EXISTS" => match state
+            .kv
+            .lock()
+            .unwrap()
+            .exists(&a(0).cloned().unwrap_or_default())
+        {
+            Ok(true) => (int(1), None, authed),
+            Ok(false) => (int(0), None, authed),
+            Err(e) => (
+                Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
+                None,
+                authed,
+            ),
+        },
         "DEL" => match state
             .kv
             .lock()
@@ -222,6 +236,19 @@ async fn handle_inner(
                 ),
             }
         }
+        "PERSIST" => match state
+            .kv
+            .lock()
+            .unwrap()
+            .persist(&a(0).cloned().unwrap_or_default())
+        {
+            Ok(done) => (ok(&[if done { "1" } else { "0" }]), None, authed),
+            Err(e) => (
+                Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
+                None,
+                authed,
+            ),
+        },
         "TTL" => match state
             .kv
             .lock()

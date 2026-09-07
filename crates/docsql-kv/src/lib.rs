@@ -111,6 +111,12 @@ impl Kv {
         }
     }
 
+    /// EXISTS — true if the key holds a live entry of any type.
+    pub fn exists(&mut self, key: &str) -> Result<bool> {
+        let now = now_ms();
+        Ok(self.raw_row(key, now)?.is_some())
+    }
+
     pub fn set(&mut self, key: &str, val: &str, opts: SetOpts) -> Result<bool> {
         if opts.nx && opts.xx {
             return err("NX and XX are mutually exclusive");
@@ -547,5 +553,71 @@ mod tests {
         }
         let mut kv = Kv::open(&path).unwrap();
         assert_eq!(kv.get("durable").unwrap(), Some("yes".into()));
+    }
+
+    #[test]
+    fn exists_across_value_types_and_after_del() {
+        let mut kv = Kv::in_memory().unwrap();
+        assert!(!kv.exists("missing").unwrap());
+        kv.set("s", "v", SetOpts::default()).unwrap();
+        assert!(kv.exists("s").unwrap());
+        // collection-typed keys exist too
+        kv.rpush("list", &["a"]).unwrap();
+        kv.hset("h", "f", "v").unwrap();
+        kv.sadd("set", &["m"]).unwrap();
+        kv.zadd("z", 1.0, "m").unwrap();
+        for k in ["list", "h", "set", "z"] {
+            assert!(kv.exists(k).unwrap(), "expected {k} to exist");
+        }
+        // DEL drops existence; a wrong-typed get no longer lies about it
+        assert!(kv.del("list").unwrap());
+        assert!(!kv.exists("list").unwrap());
+        assert!(kv.get("list").is_err() || kv.get("list").unwrap().is_none());
+    }
+
+    #[test]
+    fn del_inside_multi_rolls_back_on_discard() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("keep", "v", SetOpts::default()).unwrap();
+        kv.multi().unwrap();
+        assert!(kv.del("keep").unwrap());
+        assert!(!kv.exists("keep").unwrap());
+        kv.discard().unwrap();
+        assert!(kv.exists("keep").unwrap());
+        assert_eq!(kv.get("keep").unwrap(), Some("v".into()));
+    }
+
+    #[test]
+    fn ttl_zero_and_negative_expire_immediately() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("a", "1", SetOpts::default()).unwrap();
+        kv.set("b", "2", SetOpts::default()).unwrap();
+        assert!(kv.expire("a", 0).unwrap());
+        assert!(kv.expire("b", -50).unwrap());
+        assert_eq!(kv.get("a").unwrap(), None);
+        assert_eq!(kv.get("b").unwrap(), None);
+        assert!(!kv.exists("a").unwrap());
+    }
+
+    #[test]
+    fn expire_resurrects_after_expiry_and_ttl_covers_collections() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("k", "v", SetOpts::default()).unwrap();
+        assert!(kv.expire("k", 0).unwrap());
+        assert_eq!(kv.get("k").unwrap(), None);
+        // re-SET brings the key back (new row, no TTL)
+        kv.set("k", "v2", SetOpts::default()).unwrap();
+        assert_eq!(kv.get("k").unwrap(), Some("v2".into()));
+        assert_eq!(kv.ttl_ms("k").unwrap(), None);
+        // EXPIRE on a collection key hides the whole collection
+        kv.rpush("l", &["x", "y"]).unwrap();
+        assert!(kv.expire("l", 0).unwrap());
+        assert!(!kv.exists("l").unwrap());
+        // PERSIST then sweep leaves the row alone
+        kv.set("p", "v", SetOpts::default()).unwrap();
+        kv.expire("p", 10_000).unwrap();
+        assert!(kv.persist("p").unwrap());
+        kv.sweep().unwrap();
+        assert!(kv.exists("p").unwrap());
     }
 }

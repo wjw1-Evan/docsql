@@ -167,6 +167,84 @@ async fn kv_commands_over_wire() {
 }
 
 #[tokio::test]
+async fn kv_full_surface_over_wire() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    let int = |f: &Frame| u64::from_le_bytes(f.payload[..8].try_into().unwrap());
+
+    // DEL + EXISTS round trip
+    c.kv(&["SET", "k", "v"]).await;
+    let r = c.kv(&["EXISTS", "k"]).await;
+    assert_eq!(int(&r), 1);
+    let r = c.kv(&["EXISTS", "missing"]).await;
+    assert_eq!(int(&r), 0);
+    let r = c.kv(&["DEL", "k"]).await;
+    assert_eq!(payload_str(&r), "1");
+    let r = c.kv(&["DEL", "k"]).await;
+    assert_eq!(payload_str(&r), "0");
+    let r = c.kv(&["EXISTS", "k"]).await;
+    assert_eq!(int(&r), 0);
+
+    // SET flags: NX on existing key skips, XX on missing key skips
+    c.kv(&["SET", "f", "a"]).await;
+    let r = c.kv(&["SET", "f", "b", "NX"]).await;
+    assert_eq!(payload_str(&r), "skip");
+    let r = c.kv(&["SET", "f2", "b", "XX"]).await;
+    assert_eq!(payload_str(&r), "skip");
+    let r = c.kv(&["SET", "f", "b", "XX"]).await;
+    assert_eq!(payload_str(&r), "ok");
+
+    // EXPIRE / TTL / PERSIST
+    let r = c.kv(&["EXPIRE", "f", "60000"]).await;
+    assert_eq!(payload_str(&r), "1");
+    let r = c.kv(&["TTL", "f"]).await;
+    let ttl = int(&r);
+    assert!(ttl > 0 && ttl <= 60_000, "unexpected ttl {ttl}");
+    let r = c.kv(&["PERSIST", "f"]).await;
+    assert_eq!(payload_str(&r), "1");
+    let r = c.kv(&["TTL", "f"]).await;
+    assert_eq!(payload_str(&r), "-1");
+
+    // hash / set / zset over the wire
+    let r = c.kv(&["HSET", "H", "field", "val"]).await;
+    assert_eq!(int(&r), 1);
+    let r = c.kv(&["HGET", "H", "field"]).await;
+    assert_eq!(payload_str(&r), "val");
+    let r = c.kv(&["HGET", "H", "nope"]).await;
+    assert_eq!(r.payload.len(), 0); // nil
+    let r = c.kv(&["SADD", "S", "x", "y", "x"]).await;
+    assert_eq!(int(&r), 2);
+    let r = c.kv(&["SMEMBERS", "S"]).await;
+    let members = payload_str(&r);
+    assert!(members.contains("x") && members.contains("y"), "{members}");
+    let r = c.kv(&["ZADD", "Z", "2.5", "m2"]).await;
+    assert_eq!(int(&r), 1);
+    let r = c.kv(&["ZADD", "Z", "1.5", "m1"]).await;
+    assert_eq!(int(&r), 1);
+    let r = c.kv(&["ZRANGE", "Z", "-inf", "inf"]).await;
+    assert_eq!(payload_str(&r), "m1\x001.5\x00m2\x002.5");
+
+    // MULTI / EXEC commit
+    c.kv(&["MULTI"]).await;
+    c.kv(&["SET", "txa", "1"]).await;
+    c.kv(&["RPUSH", "txl", "e"]).await;
+    let r = c.kv(&["EXEC"]).await;
+    assert_eq!(payload_str(&r), "ok");
+    let r = c.kv(&["GET", "txa"]).await;
+    assert_eq!(payload_str(&r), "1");
+    let r = c.kv(&["LRANGE", "txl", "0", "-1"]).await;
+    assert_eq!(payload_str(&r), "e");
+
+    // MULTI / DISCARD rolls back
+    c.kv(&["MULTI"]).await;
+    c.kv(&["SET", "txa", "999"]).await;
+    let r = c.kv(&["DISCARD"]).await;
+    assert_eq!(payload_str(&r), "ok");
+    let r = c.kv(&["GET", "txa"]).await;
+    assert_eq!(payload_str(&r), "1");
+}
+
+#[tokio::test]
 async fn auth_gate() {
     let (_dir, addr) = start_server(Some("s3cret")).await;
     let mut c = Client::connect(&addr).await;

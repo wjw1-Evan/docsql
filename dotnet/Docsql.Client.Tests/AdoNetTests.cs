@@ -157,4 +157,86 @@ public sealed class AdoNetTests : IClassFixture<ServerFixture>
         cmd.CommandText = "SELECT 1 + 1 AS two";
         Assert.Equal(2L, cmd.ExecuteScalar());
     }
+
+    [Fact]
+    public void Parameterized_update_and_delete_report_affected_rows()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE IF NOT EXISTS upd (id INT, name TEXT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "DELETE FROM upd";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO upd VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "UPDATE upd SET name = @n WHERE id = @id";
+        var p = (DocsqlParameterCollection)cmd.Parameters;
+        p.AddWithValue("n", "changed");
+        p.AddWithValue("id", 2L);
+        Assert.Equal(1, cmd.ExecuteNonQuery());
+        cmd.Parameters.Clear();
+        p.AddWithValue("id", 99L);
+        p.AddWithValue("n", "x");
+        Assert.Equal(0, cmd.ExecuteNonQuery());
+
+        cmd.CommandText = "SELECT name FROM upd WHERE id = 2";
+        Assert.Equal("changed", cmd.ExecuteScalar());
+
+        cmd.CommandText = "DELETE FROM upd WHERE id = @id";
+        cmd.Parameters.Clear();
+        p.AddWithValue("id", 1L);
+        Assert.Equal(1, cmd.ExecuteNonQuery());
+        cmd.Parameters.Clear();
+        p.AddWithValue("id", 1L);
+        Assert.Equal(0, cmd.ExecuteNonQuery());
+        cmd.CommandText = "SELECT COUNT(id) FROM upd";
+        Assert.Equal(2L, cmd.ExecuteScalar());
+    }
+
+    [Fact]
+    public async Task Async_apis_roundtrip()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE IF NOT EXISTS async_t (id INT, v TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "DELETE FROM async_t";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO async_t VALUES (1, 'x'), (2, 'y')";
+        Assert.Equal(2, await cmd.ExecuteNonQueryAsync());
+
+        cmd.CommandText = "SELECT COUNT(id) FROM async_t";
+        Assert.Equal(2L, await cmd.ExecuteScalarAsync());
+
+        cmd.CommandText = "SELECT id, v FROM async_t WHERE id = 1";
+        using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1L, reader.GetInt64(0));
+        Assert.Equal("x", reader.GetString(1));
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public void Reader_handles_ordinals_and_dbnull()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE IF NOT EXISTS ord_t (id INT, v TEXT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "DELETE FROM ord_t";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO ord_t VALUES (7, NULL)";
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "SELECT id, v FROM ord_t";
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal(0, reader.GetOrdinal("id"));
+        Assert.Equal(1, reader.GetOrdinal("v"));
+        Assert.True(reader.IsDBNull(1));
+        Assert.False(reader.IsDBNull(0));
+        Assert.Equal(System.DBNull.Value, reader.GetValue(1));
+        Assert.False(reader.NextResult()); // single result set
+    }
 }
