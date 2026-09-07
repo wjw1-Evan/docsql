@@ -10,6 +10,9 @@ docsql-core = { path = "../docsql-core" }
 docsql-kv = { path = "../docsql-kv" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 serde.workspace = true
+serde_json = "1"
+aes-gcm = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile.workspace = true

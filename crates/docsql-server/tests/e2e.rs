@@ -19,7 +19,10 @@ async fn start_server(token: Option<&str>) -> (tempfile::TempDir, String) {
         listen: addr.clone(),
         auth_token: token.map(String::from),
         replicate_to: None,
+        peers: Vec::new(),
         read_only: false,
+        transport_key: None,
+        async_commit: false,
     };
     tokio::spawn(docsql_server::run(cfg));
     // Wait for the port to accept.
@@ -119,6 +122,33 @@ async fn sql_roundtrip_over_wire() {
 }
 
 #[tokio::test]
+async fn sql_join_groupby_over_wire() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE users (id INT, name TEXT)").await;
+    c.sql("CREATE TABLE orders (oid INT, uid INT, amount INT)")
+        .await;
+    c.sql("INSERT INTO users VALUES (1, 'ann'), (2, 'bob'), (3, 'zed')")
+        .await;
+    c.sql("INSERT INTO orders VALUES (10, 1, 5), (11, 1, 7), (12, 2, 3)")
+        .await;
+    // LEFT JOIN + GROUP BY + aggregate + ORDER BY, end to end.
+    let r = c
+        .sql(
+            "SELECT u.name, COUNT(o.oid) AS n, SUM(o.amount) AS total \
+             FROM users u LEFT JOIN orders o ON u.id = o.uid \
+             GROUP BY u.name ORDER BY u.name",
+        )
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    let body = payload_str(&r);
+    assert!(body.contains("[\"u.name\",\"n\",\"total\"]"), "{body}");
+    assert!(body.contains("[\"ann\",2,12]"), "{body}");
+    assert!(body.contains("[\"bob\",1,3]"), "{body}");
+    assert!(body.contains("[\"zed\",0,null]"), "{body}");
+}
+
+#[tokio::test]
 async fn kv_commands_over_wire() {
     let (_dir, addr) = start_server(None).await;
     let mut c = Client::connect(&addr).await;
@@ -212,7 +242,10 @@ async fn replication_and_failover() {
         listen: replica_addr.clone(),
         auth_token: None,
         replicate_to: None,
+        peers: Vec::new(),
         read_only: true,
+        transport_key: None,
+        async_commit: false,
     }));
     // Primary: forwards writes to the replica.
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
@@ -220,7 +253,10 @@ async fn replication_and_failover() {
         listen: primary_addr.clone(),
         auth_token: None,
         replicate_to: Some(replica_addr.clone()),
+        peers: Vec::new(),
         read_only: false,
+        transport_key: None,
+        async_commit: false,
     }));
     for addr in [&primary_addr, &replica_addr] {
         for _ in 0..100 {
@@ -286,6 +322,91 @@ async fn replication_and_failover() {
     );
 }
 
+/// Poll a node until the probe response payload contains `needle`.
+async fn wait_seen(addr: &str, probe: &str, needle: &str) -> bool {
+    for _ in 0..50 {
+        let mut c = Client::connect(addr).await;
+        let resp = if let Some(kv) = probe.strip_prefix("KV ") {
+            c.kv(&kv.split_whitespace().collect::<Vec<_>>()).await
+        } else {
+            c.sql(probe).await
+        };
+        let text = String::from_utf8_lossy(&resp.payload).to_string();
+        if resp.frame_type != proto::RESP_ERROR && text.contains(needle) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Symmetric three-node cluster: no primary/replica roles — any node accepts
+/// writes and fans them out to its peers.
+#[tokio::test]
+async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let addrs = vec![free(), free(), free()];
+    for (i, addr) in addrs.iter().enumerate() {
+        let peers = addrs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, a)| a.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+            db_path: dir.path().join(format!("peer{i}.db")),
+            listen: addr.clone(),
+            auth_token: None,
+            replicate_to: None,
+            peers: peers.split(',').map(String::from).collect(),
+            read_only: false,
+            transport_key: None,
+            async_commit: false,
+        }));
+    }
+    for addr in &addrs {
+        for _ in 0..100 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    // Write through node 0 (SQL), node 1 (KV); read from node 2.
+    let mut a = Client::connect(&addrs[0]).await;
+    a.sql("CREATE TABLE sym (id INT, src INT)").await;
+    a.sql("INSERT INTO sym VALUES (1, 0)").await;
+    let mut b = Client::connect(&addrs[1]).await;
+    b.sql("INSERT INTO sym VALUES (2, 1)").await;
+    b.kv(&["SET", "symkey", "from1"]).await;
+
+    assert!(
+        wait_seen(&addrs[2], "SELECT src FROM sym ORDER BY src", "[[0],[1]]").await,
+        "node2 did not see both SQL writes"
+    );
+    assert!(
+        wait_seen(&addrs[2], "KV GET symkey", "from1").await,
+        "node2 did not see the KV write"
+    );
+
+    // Any node also accepts writes (no read-only role anywhere).
+    let mut c = Client::connect(&addrs[2]).await;
+    let resp = c.sql("INSERT INTO sym VALUES (3, 2)").await;
+    assert_eq!(resp.frame_type, proto::RESP_AFFECTED);
+    assert!(
+        wait_seen(&addrs[0], "SELECT COUNT(id) FROM sym", "[[3]]").await,
+        "node0 did not see node2's write"
+    );
+}
+
 /// Two real shards: KV keys route by hash slot and land deterministically.
 #[tokio::test]
 async fn shard_routing_distributes_kv_keys() {
@@ -300,7 +421,10 @@ async fn shard_routing_distributes_kv_keys() {
             listen: a.clone(),
             auth_token: None,
             replicate_to: None,
+            peers: Vec::new(),
             read_only: false,
+            transport_key: None,
+            async_commit: false,
         }));
         addrs.push(a);
     }
@@ -332,4 +456,52 @@ async fn shard_routing_distributes_kv_keys() {
 
     // Same key always routes to the same shard (read-your-writes).
     assert_eq!(router.shard_for("stable"), router.shard_for("stable"));
+}
+
+/// Query log: executed statements appear in the docsql_log view with
+/// latency and affected counts; the view query itself is not logged.
+#[tokio::test]
+async fn query_log_records_statements() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+    drop(l);
+    let db = dir.path().join("qlog.db");
+    let db_str = db.clone();
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: db_str,
+        listen: addr.clone(),
+        auth_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE q (id INT)").await;
+    c.sql("INSERT INTO q VALUES (1), (2)").await;
+    c.sql("SELECT nope FROM missing").await; // 错误也要记录
+
+    let resp = c
+        .sql("SELECT sql, affected, error FROM docsql_log ORDER BY ts_ms")
+        .await;
+    let text = String::from_utf8_lossy(&resp.payload).to_string();
+    assert!(resp.frame_type == proto::RESP_ROWS, "got {text}");
+    assert!(text.contains("CREATE TABLE q"), "missing create: {text}");
+    assert!(text.contains("INSERT INTO q"), "missing insert: {text}");
+    assert!(text.contains("missing"), "missing error entry: {text}");
+    // affected:插入 2 行应记录 2
+    assert!(text.contains("2"), "affected count missing: {text}");
+    // 视图查询本身不写日志:每行含一次 peer,数 peer 出现次数
+    let resp2 = c.sql("SELECT * FROM docsql_log").await;
+    let t2 = String::from_utf8_lossy(&resp2.payload).to_string();
+    assert_eq!(t2.matches("127.0.0.1").count(), 3, "log rows: {t2}");
 }

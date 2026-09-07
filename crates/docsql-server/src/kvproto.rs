@@ -81,8 +81,17 @@ pub async fn handle(
         if let Some(target) = state.replicate_to.lock().await.clone() {
             let mut fwd = frame.clone();
             fwd.flags = crate::FLAG_REPLICATION;
-            if let Err(e) = crate::forward_frame(&target, &fwd).await {
+            if let Err(e) = crate::forward_frame(&target, &fwd, state.transport_key.as_ref()).await
+            {
                 eprintln!("kv replication to {target} failed: {e}");
+            }
+        }
+        // Symmetric cluster: fan the write out to every peer.
+        for peer in state.peers.lock().await.clone() {
+            let mut fwd = frame.clone();
+            fwd.flags = crate::FLAG_REPLICATION;
+            if let Err(e) = crate::forward_frame(&peer, &fwd, state.transport_key.as_ref()).await {
+                eprintln!("kv peer replication to {peer} failed: {e}");
             }
         }
     }

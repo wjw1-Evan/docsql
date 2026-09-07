@@ -9,7 +9,12 @@ public sealed class ServerFixture : IDisposable
 
     public ServerFixture()
     {
-        Port = 17600 + Random.Shared.Next(200);
+        // 系统分配空闲端口:测试类并行运行时随机区间端口会碰撞。
+        using var l = new System.Net.Sockets.TcpListener(
+            System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        Port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
         var tmp = Path.Combine(Path.GetTempPath(), $"docsql-adonet-{Port}.db");
         try { File.Delete(tmp); } catch { }
         var exe = FindServer();

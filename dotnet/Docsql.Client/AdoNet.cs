@@ -34,6 +34,13 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
         get => TryGetValue("token", out var v) ? (string)v : "";
         set => this["token"] = value;
     }
+
+    /// <summary>传输加密密钥(64 位 hex 字符,32 字节 AES-256-GCM)。</summary>
+    public string Key
+    {
+        get => TryGetValue("key", out var v) ? (string)v : "";
+        set => this["key"] = value;
+    }
 }
 
 public sealed class DocsqlConnection : DbConnection
@@ -54,6 +61,20 @@ public sealed class DocsqlConnection : DbConnection
     /// (lets hosts like EF's SQLite layer rewrite ConnectionString freely).
     public (string host, int port, string token)? EndpointOverride { get; set; }
 
+    /// Optional explicit transport key (hex); wins over ConnectionString's
+    /// key= when EF rewrites the connection string.</summary>
+    public string? KeyOverride { get; set; }
+
+    /// <summary>hex 密钥 → 32 字节;空串返回 null(明文模式)。</summary>
+    private static byte[]? ParseKey(string hex)
+    {
+        hex = hex.Trim();
+        if (hex.Length == 0) return null;
+        if (hex.Length != 64)
+            throw new ArgumentException("key 必须是 64 位 hex(32 字节)");
+        return Convert.FromHexString(hex);
+    }
+
     private DocsqlConnectionStringBuilder Parsed => new() { ConnectionString = ConnectionString };
 
     public override string ConnectionString { get; set; } = "";
@@ -71,6 +92,17 @@ public sealed class DocsqlConnection : DbConnection
 
     public override void ChangeDatabase(string databaseName) { }
 
+    /// <summary>
+    /// 发送 KV 命令(GET/SET/PROMOTE/...),参数以 \x00 分隔编码。
+    /// 返回 (响应帧类型, 文本 payload);错误帧时 payload 为错误消息。
+    /// </summary>
+    public (FrameType Type, string Payload) Kv(params string[] args)
+    {
+        var payload = Encoding.UTF8.GetBytes("\x00" + string.Join("\x00", args));
+        var resp = Proto.Send(new Frame(FrameType.ReqKv, 0, 0, payload));
+        return (resp.Type, Encoding.UTF8.GetString(resp.Payload));
+    }
+
     public override void Open()
     {
         if (_state == ConnectionState.Open)
@@ -78,7 +110,7 @@ public sealed class DocsqlConnection : DbConnection
             return;
         }
         var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
-        _proto = new ProtocolConnection(p.Host, p.Port);
+        _proto = new ProtocolConnection(p.Host, p.Port, ParseKey(KeyOverride ?? p.Key));
         // AUTH when a token is configured.
         if (!string.IsNullOrEmpty(p.Token))
         {

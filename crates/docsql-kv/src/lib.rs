@@ -54,10 +54,12 @@ pub struct SetOpts {
 }
 
 impl Kv {
-    /// Wrap a Database, creating the _kv table if needed.
+    /// Wrap a Database, creating the _kv table if needed. The key column is
+    /// the PRIMARY KEY, so every GET/SET/DELETE goes through its B+ tree
+    /// instead of a heap scan.
     pub fn new(mut db: Database) -> Result<Kv> {
         if let Err(e) = db.execute(&format!(
-            "CREATE TABLE {KV_TABLE} (\"key\" TEXT, type TEXT, value TEXT, expire_at INT)"
+            "CREATE TABLE {KV_TABLE} (\"key\" TEXT PRIMARY KEY, type TEXT, value TEXT, expire_at INT)"
         )) {
             if !e.to_string().contains("already exists") {
                 return Err(e.into());

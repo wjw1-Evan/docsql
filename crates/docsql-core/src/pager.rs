@@ -245,6 +245,22 @@ impl Pager {
     /// Commit: WAL-log every staged after-image, fsync WAL, then write pages
     /// to the data file. Returns the commit LSN.
     pub fn commit_tx(&mut self, tx: Tx) -> Result<u64> {
+        self.commit_tx_inner(tx, true)
+    }
+
+    /// Commit without the WAL fsync — used inside explicit SQL
+    /// transactions so the whole batch pays one flush at COMMIT
+    /// (`sync_wal`) instead of one per statement.
+    pub fn commit_tx_deferred(&mut self, tx: Tx) -> Result<u64> {
+        self.commit_tx_inner(tx, false)
+    }
+
+    /// Make every deferred commit durable (SQL COMMIT).
+    pub fn sync_wal(&mut self) -> Result<()> {
+        self.wal.sync().map_err(PagerError::Wal)
+    }
+
+    fn commit_tx_inner(&mut self, tx: Tx, fsync: bool) -> Result<u64> {
         if tx.staged.is_empty() {
             return Ok(0);
         }
@@ -255,7 +271,11 @@ impl Pager {
             payload.extend_from_slice(data);
             self.wal.log_write(tx.id, &payload)?;
         }
-        let lsn = self.wal.commit(tx.id)?;
+        let lsn = if fsync {
+            self.wal.commit(tx.id)?
+        } else {
+            self.wal.commit_deferred(tx.id)?
+        };
         // WAL durable — now apply to data file and update the buffer pool.
         for (id, data) in &tx.staged {
             self.write_file_page(*id, data)?;
@@ -264,7 +284,21 @@ impl Pager {
                 p.dirty = false;
             }
         }
+        self.maybe_checkpoint()?;
         Ok(lsn)
+    }
+
+    /// Bound WAL growth (and with it fsync cost): once the log exceeds a
+    /// few MB and the data file is synced, every committed change lives in
+    /// the data file and the log can be dropped.
+    fn maybe_checkpoint(&mut self) -> Result<()> {
+        const WAL_LIMIT: u64 = 8 * 1024 * 1024;
+        if self.wal.file_len()? < WAL_LIMIT {
+            return Ok(());
+        }
+        self.file.sync_all()?;
+        self.wal.checkpoint()?;
+        Ok(())
     }
 
     /// Abort: staged writes never reach disk, nothing to undo (WAL never

@@ -231,16 +231,13 @@ impl BTree {
     ) -> Result<Option<(Value, u32)>> {
         match Self::read_node(ctx.pager, ctx.tx, id)? {
             Node::Leaf { mut cells } => {
-                let at = cells
-                    .binary_search_by(|(k, _)| Value::cmp_values(k, key))
-                    .unwrap_or_else(|i| i);
-                if at < cells.len() && Value::cmp_values(&cells[at].0, key) == Ordering::Equal {
-                    if unique {
-                        return Err(BTreeError::Duplicate);
-                    }
-                    cells[at].1 = val;
-                    Self::write_node(ctx.pager, ctx.tx, id, &Node::Leaf { cells })?;
-                    return Ok(None);
+                // Insert after all keys <= key (rightmost of an equal run) so
+                // duplicate keys accumulate and routing (equal goes right)
+                // stays consistent.
+                let at =
+                    cells.partition_point(|(k, _)| Value::cmp_values(k, key) != Ordering::Greater);
+                if unique && at > 0 && Value::cmp_values(&cells[at - 1].0, key) == Ordering::Equal {
+                    return Err(BTreeError::Duplicate);
                 }
                 cells.insert(at, (key.clone(), val));
                 if cells.len() <= MAX_KEYS {
@@ -266,9 +263,10 @@ impl BTree {
                     to_insert = Some((mid, right));
                 }
                 if let Some((mid, right)) = to_insert {
+                    // Insert after equal separators (duplicate keys can both
+                    // split into parents); binary_search would panic on Ok.
                     let at = cells
-                        .binary_search_by(|(k, _)| Value::cmp_values(k, &mid))
-                        .unwrap_err();
+                        .partition_point(|(k, _)| Value::cmp_values(k, &mid) != Ordering::Greater);
                     cells.insert(at, (mid, right));
                     if cells.len() <= MAX_KEYS {
                         Self::write_node(
@@ -334,6 +332,95 @@ impl BTree {
         Self::delete_rec(pager, tx, self.root, key)
     }
 
+    /// Remove the exact `(key, locator)` pair. Needed for non-unique trees
+    /// where several entries share a key: `delete` would drop an arbitrary
+    /// one of them. Returns whether the pair was present.
+    pub fn delete_entry(
+        &mut self,
+        pager: &mut Pager,
+        tx: &mut Tx,
+        key: &Value,
+        loc: u64,
+    ) -> Result<bool> {
+        Self::delete_entry_rec(pager, tx, self.root, key, loc)
+    }
+
+    fn delete_entry_rec(
+        pager: &mut Pager,
+        tx: &mut Tx,
+        id: u32,
+        key: &Value,
+        loc: u64,
+    ) -> Result<bool> {
+        match Self::read_node(pager, tx, id)? {
+            Node::Leaf { mut cells } => {
+                // binary_search lands on *an* equal key; equal keys may not be
+                // contiguous after interleaved updates, so scan the whole leaf.
+                for i in 0..cells.len() {
+                    if Value::cmp_values(&cells[i].0, key) == Ordering::Equal && cells[i].1 == loc {
+                        cells.remove(i);
+                        Self::write_node(pager, tx, id, &Node::Leaf { cells })?;
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Node::Internal { leftmost, cells } => {
+                let child = descend(&cells, leftmost, key);
+                Self::delete_entry_rec(pager, tx, child, key, loc)
+            }
+        }
+    }
+
+    /// All pairs with key >= `key`, in key order (range-scan entry point).
+    /// Cheap: only the subtree that can hold `key..` is visited.
+    pub fn range_from(&self, pager: &mut Pager, tx: &Tx, key: &Value) -> Result<Vec<(Value, u64)>> {
+        let mut out = Vec::new();
+        Self::range_from_rec(pager, tx, self.root, key, &mut out)?;
+        Ok(out)
+    }
+
+    fn range_from_rec(
+        pager: &mut Pager,
+        tx: &Tx,
+        id: u32,
+        key: &Value,
+        out: &mut Vec<(Value, u64)>,
+    ) -> Result<()> {
+        match Self::read_node(pager, tx, id)? {
+            Node::Leaf { cells } => {
+                out.extend(
+                    cells
+                        .into_iter()
+                        .filter(|(k, _)| Value::cmp_values(k, key) != Ordering::Less),
+                );
+            }
+            Node::Internal { leftmost, cells } => {
+                // Child i nominally covers [sep_i, sep_{i+1}) — but a split
+                // can leave keys EQUAL to a separator in the child left of
+                // it, so any child whose upper separator is >= key may hold
+                // matching entries; only upper < key is safely skippable.
+                let leftmost_upper_ge = match cells.first() {
+                    Some((k, _)) => Value::cmp_values(k, key) != Ordering::Less,
+                    None => true,
+                };
+                if leftmost_upper_ge {
+                    Self::range_from_rec(pager, tx, leftmost, key, out)?;
+                }
+                for (i, (_, child)) in cells.iter().enumerate() {
+                    let upper_ge = match cells.get(i + 1) {
+                        Some((k, _)) => Value::cmp_values(k, key) != Ordering::Less,
+                        None => true,
+                    };
+                    if upper_ge {
+                        Self::range_from_rec(pager, tx, *child, key, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn delete_rec(pager: &mut Pager, tx: &mut Tx, id: u32, key: &Value) -> Result<bool> {
         match Self::read_node(pager, tx, id)? {
             Node::Leaf { mut cells } => {
@@ -385,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_violation_and_overwrite() {
+    fn unique_violation_and_duplicate_appends() {
         let (_d, mut pager) = fresh("bt2.db");
         let mut tx = pager.begin_tx();
         let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
@@ -395,15 +482,57 @@ mod tests {
             tree.insert(&mut pager, &mut tx, Value::Str("k".into()), 2, true),
             Err(BTreeError::Duplicate)
         ));
-        // non-unique overwrites
+        // non-unique appends a second entry for the same key
         tree.insert(&mut pager, &mut tx, Value::Str("k".into()), 2, false)
             .unwrap();
         pager.commit_tx(tx).unwrap();
         let tx = pager.begin_tx();
-        assert_eq!(
-            tree.get(&mut pager, &tx, &Value::Str("k".into())).unwrap(),
-            Some(2)
-        );
+        let all = tree.scan(&mut pager, &tx).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].1, 1);
+        assert_eq!(all[1].1, 2);
+    }
+
+    #[test]
+    fn duplicate_runs_survive_splits() {
+        let (_d, mut pager) = fresh("bt9.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        // Only 10 distinct keys; runs far exceed MAX_KEYS, forcing splits
+        // with equal separators.
+        let mut model = std::collections::BTreeMap::<i64, usize>::new();
+        for i in 0..500i64 {
+            let k = i % 10;
+            tree.insert(&mut pager, &mut tx, Value::Int(k), i as u64, false)
+                .unwrap();
+            *model.entry(k).or_insert(0) += 1;
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let all = tree.scan(&mut pager, &tx).unwrap();
+        assert_eq!(all.len(), 500);
+        // grouped and sorted by key, locators ascending within each run
+        let mut last_key = i64::MIN;
+        let mut last_loc = 0u64;
+        for (k, v) in &all {
+            let k = k.as_i64().unwrap();
+            assert!(k >= last_key, "keys must be non-decreasing");
+            if k == last_key {
+                assert!(*v > last_loc, "locators ascending within a run");
+            }
+            last_key = k;
+            last_loc = *v;
+        }
+        for (k, n) in &model {
+            let got = all
+                .iter()
+                .filter(|(key, _)| key.as_i64() == Some(*k))
+                .count();
+            assert_eq!(got, *n, "key {k}");
+        }
+        // range_from lands inside the run correctly
+        let from_5 = tree.range_from(&mut pager, &tx, &Value::Int(5)).unwrap();
+        assert_eq!(from_5.len(), 500 - 5 * 50);
     }
 
     #[test]
@@ -470,6 +599,61 @@ mod tests {
             Some(299)
         );
         assert_eq!(tree.get(&mut pager, &tx, &Value::Int(0)).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn range_from_finds_suffix_in_order() {
+        let (_d, mut pager) = fresh("bt7.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        for i in 0..300i64 {
+            tree.insert(&mut pager, &mut tx, Value::Int(i), i as u64, true)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let got = tree.range_from(&mut pager, &tx, &Value::Int(295)).unwrap();
+        let keys: Vec<i64> = got.iter().map(|(k, _)| k.as_i64().unwrap()).collect();
+        assert_eq!(keys, vec![295, 296, 297, 298, 299]);
+        // Below everything → whole tree; above everything → empty.
+        assert_eq!(
+            tree.range_from(&mut pager, &tx, &Value::Int(-1))
+                .unwrap()
+                .len(),
+            300
+        );
+        assert!(tree
+            .range_from(&mut pager, &tx, &Value::Int(300))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn delete_entry_removes_exact_pair() {
+        let (_d, mut pager) = fresh("bt8.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        // Same key, three locators (non-unique index; inserts append).
+        for loc in [10u64, 20, 30] {
+            tree.insert(&mut pager, &mut tx, Value::Str("k".into()), loc, false)
+                .unwrap();
+        }
+        // Non-unique inserts append separate entries per locator.
+        assert_eq!(tree.scan(&mut pager, &tx).unwrap().len(), 3);
+        assert!(tree
+            .delete_entry(&mut pager, &mut tx, &Value::Str("k".into()), 20)
+            .unwrap());
+        let left: Vec<u64> = tree
+            .scan(&mut pager, &tx)
+            .unwrap()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(left, vec![10, 30]);
+        assert!(!tree
+            .delete_entry(&mut pager, &mut tx, &Value::Str("k".into()), 20)
+            .unwrap());
+        pager.commit_tx(tx).unwrap();
     }
 
     /// Property test against BTreeMap: interleaved random-ish ops must agree.

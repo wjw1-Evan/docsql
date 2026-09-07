@@ -10,7 +10,9 @@
 //! connections receive RESP_PUSH frames from the pub/sub bus via a writer
 //! task.
 
+pub mod crypto;
 pub mod kvproto;
+pub mod querylog;
 pub mod shard;
 
 use docsql_core::engine::ExecOutcome;
@@ -30,8 +32,15 @@ pub struct ServerState {
     pub auth_token: Option<String>,
     /// Upstream replication target (empty when not replicating).
     pub replicate_to: tokio::sync::Mutex<Option<String>>,
+    /// Symmetric peers: every successful write is forwarded to all of them
+    /// and every node accepts writes (no primary/replica roles).
+    pub peers: tokio::sync::Mutex<Vec<String>>,
     /// Replicas reject client writes until promoted.
     pub read_only: std::sync::atomic::AtomicBool,
+    /// When set, every frame payload is sealed with AES-256-GCM.
+    pub transport_key: Option<crypto::TransportKey>,
+    /// Statement audit log (docsql_log view).
+    pub query_log: querylog::QueryLog,
 }
 
 /// Flags bit 1 marks replication-internal frames (bypasses read-only).
@@ -44,19 +53,33 @@ pub struct ServerConfig {
     /// Replication upstream: every successful write is forwarded here
     /// (host:port of a docsql-server in replica mode).
     pub replicate_to: Option<String>,
+    /// Symmetric-cluster peers (host:port list). In this mode there is no
+    /// read-only role: any node accepts writes and fans them out.
+    pub peers: Vec<String>,
     /// Replica mode: reject client writes (replication frames excepted)
     /// until promoted via PROMOTE.
     pub read_only: bool,
+    /// Transport encryption key (32 bytes); None = plaintext frames.
+    pub transport_key: Option<crypto::TransportKey>,
+    /// Async-commit mode: statement commits skip the WAL fsync; a
+    /// background flusher batches fsyncs every ~2ms (MongoDB-style
+    /// journal interval). Bounded loss window on power failure.
+    pub async_commit: bool,
 }
 
 pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
-    let kv = Kv::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?;
+    let mut kv =
+        Kv::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?;
+    kv.db.set_async_commit(cfg.async_commit);
     let state = Arc::new(ServerState {
         kv: Mutex::new(kv),
         pubsub: PubSub::new(),
         auth_token: cfg.auth_token,
         replicate_to: tokio::sync::Mutex::new(cfg.replicate_to.clone()),
+        peers: tokio::sync::Mutex::new(cfg.peers.clone()),
         read_only: std::sync::atomic::AtomicBool::new(cfg.read_only),
+        transport_key: cfg.transport_key,
+        query_log: querylog::QueryLog::new(),
     });
     let listener = TcpListener::bind(&cfg.listen).await?;
     eprintln!("docsql-server listening on {}", cfg.listen);
@@ -101,16 +124,31 @@ impl Conn {
 }
 
 pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let (rd, mut wr) = stream.into_split();
     let mut conn = Conn {
         stream: rd,
         buf: Vec::new(),
     };
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
+    let key = state.transport_key;
 
-    // Writer task: serializes responses + pub/sub pushes.
+    // Writer task: serializes responses + pub/sub pushes (sealing when a
+    // transport key is configured).
     let writer = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
+            let f = if let Some(k) = key {
+                Frame {
+                    flags: f.flags | crypto::FLAG_ENCRYPTED,
+                    payload: crypto::seal(&k, &f.payload),
+                    ..f
+                }
+            } else {
+                f
+            };
             let bytes = match f.encode() {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -124,10 +162,58 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
 
     let mut authed = state.auth_token.is_none();
     let result = async {
-        while let Some(frame) = conn.read_frame().await? {
+        while let Some(mut frame) = conn.read_frame().await? {
+            if let Some(k) = key {
+                if frame.flags & crypto::FLAG_ENCRYPTED == 0 {
+                    let _ = tx
+                        .send(Frame::new(
+                            proto::RESP_ERROR,
+                            kvproto::err_payload(
+                                "transport encrypted; client must send encrypted frames",
+                            ),
+                        ))
+                        .await;
+                    break;
+                }
+                match crypto::open(&k, &frame.payload) {
+                    Ok(pt) => frame.payload = pt,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Frame::new(proto::RESP_ERROR, kvproto::err_payload(&e)))
+                            .await;
+                        break;
+                    }
+                }
+            }
             let resp = match frame.frame_type {
                 proto::REQ_PING => Frame::new(proto::RESP_PONG, vec![]),
-                proto::REQ_SQL if authed => handle_sql(&state, &frame).await,
+                proto::REQ_SQL if authed => {
+                    let started = std::time::Instant::now();
+                    let sql = proto::decode_sql(&frame.payload)
+                        .map(|s| s.chars().take(512).collect::<String>())
+                        .unwrap_or_default();
+                    let mut logged = false;
+                    let resp = match querylog::try_serve_log_view(&sql, &state) {
+                        // 读日志的查询本身不写日志(避免读日志刷日志)。
+                        Some(f) => f,
+                        None => {
+                            let resp = handle_sql(&state, &frame).await;
+                            logged = true;
+                            resp
+                        }
+                    };
+                    if logged {
+                        querylog::record(
+                            &state,
+                            &peer,
+                            &sql,
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            &resp,
+                            frame.flags & FLAG_REPLICATION != 0,
+                        );
+                    }
+                    resp
+                }
                 proto::REQ_KV => {
                     let (resp, sub_channel, now_authed) =
                         kvproto::handle(&state, &frame, authed).await;
@@ -215,10 +301,19 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
         kv.db.execute(&sql)
     };
     // Replicate successful writes to the upstream (async, best-effort log).
-    if !is_replication && matches!(outcome, Ok(ExecOutcome::Affected(_))) {
+    // INSERT ... RETURNING yields Rows, not Affected, so classify by statement
+    // kind — otherwise EF Core's inserts would silently never replicate.
+    if !is_replication && outcome.is_ok() && docsql_core::engine::Database::is_write_statement(&sql)
+    {
         if let Some(target) = state.replicate_to.lock().await.clone() {
-            if let Err(e) = forward_write(&target, &sql).await {
+            if let Err(e) = forward_write(&target, &sql, state.transport_key.as_ref()).await {
                 eprintln!("replication to {target} failed: {e}");
+            }
+        }
+        // Symmetric cluster: fan the write out to every peer.
+        for peer in state.peers.lock().await.clone() {
+            if let Err(e) = forward_write(&peer, &sql, state.transport_key.as_ref()).await {
+                eprintln!("peer replication to {peer} failed: {e}");
             }
         }
     }
@@ -244,8 +339,23 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
 }
 
 /// Send a raw frame to a peer and read one response frame back.
-pub async fn forward_frame(target: &str, frame: &Frame) -> std::io::Result<Frame> {
+/// When a transport key is configured the outbound frame is sealed (peers
+/// share the key); the response is discarded, so it is not opened here.
+pub async fn forward_frame(
+    target: &str,
+    frame: &Frame,
+    key: Option<&crypto::TransportKey>,
+) -> std::io::Result<Frame> {
     let mut stream = tokio::net::TcpStream::connect(target).await?;
+    let frame = if let Some(k) = key {
+        Frame {
+            flags: frame.flags | crypto::FLAG_ENCRYPTED,
+            payload: crypto::seal(k, &frame.payload),
+            ..frame.clone()
+        }
+    } else {
+        frame.clone()
+    };
     let bytes = frame.encode().map_err(std::io::Error::other)?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(&bytes).await?;
@@ -262,10 +372,18 @@ pub async fn forward_frame(target: &str, frame: &Frame) -> std::io::Result<Frame
 }
 
 /// Send one write to the replication upstream.
-async fn forward_write(target: &str, sql: &str) -> std::io::Result<()> {
+async fn forward_write(
+    target: &str,
+    sql: &str,
+    key: Option<&crypto::TransportKey>,
+) -> std::io::Result<()> {
     let mut stream = tokio::net::TcpStream::connect(target).await?;
     let mut frame = Frame::new(proto::REQ_SQL, proto::encode_sql(sql).unwrap_or_default());
     frame.flags = FLAG_REPLICATION;
+    if let Some(k) = key {
+        frame.payload = crypto::seal(k, &frame.payload);
+        frame.flags |= crypto::FLAG_ENCRYPTED;
+    }
     let bytes = frame.encode().map_err(std::io::Error::other)?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(&bytes).await?;

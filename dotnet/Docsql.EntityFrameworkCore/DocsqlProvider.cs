@@ -24,13 +24,16 @@ public static class DocsqlDbContextOptionsExtensions
             // EF's SQLite layer inspects ConnectionString; the real endpoint
             // is carried separately.
             EndpointOverride = (b.Host, b.Port, b.Token),
+            KeyOverride = b.Key,
         };
-        return options.UseSqlite(conn);
+        return options.UseSqlite(conn)
+            .AddInterceptors(new DocsqlAutoCreateInterceptor());
     }
 
     /// <summary>Use docsql with an already-open connection.</summary>
     public static DbContextOptionsBuilder UseDocsql(
         this DbContextOptionsBuilder options,
         DocsqlConnection connection)
-        => options.UseSqlite(connection);
+        => options.UseSqlite(connection)
+            .AddInterceptors(new DocsqlAutoCreateInterceptor());
 }

@@ -5,3 +5,9 @@ Cargo.lock.bak
 node_modules/
 dist/
 bin/obj
+
+# .NET build artifacts
+**/bin/
+**/obj/
+.DS_Store
+.playwright-mcp/

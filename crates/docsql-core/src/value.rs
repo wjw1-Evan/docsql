@@ -50,6 +50,13 @@ impl Value {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     /// Total ordering used by indexes and ORDER BY. Null < Bool < numbers
     /// (int/float compared numerically) < Str < Bytes < Array < Object.
     pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {

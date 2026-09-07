@@ -2,120 +2,1209 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>docsql console</title>
+<meta name="description" content="docsql console">
+<title>docsql Studio — 管理控制台</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: ui-monospace, Menlo, monospace; background: #14161a; color: #d7dce3; margin: 0; display: flex; height: 100vh; }
-  nav { width: 200px; background: #0d0f12; padding: 16px; }
-  nav h1 { font-size: 15px; color: #6fb3ff; }
-  main { flex: 1; padding: 16px; overflow: auto; }
-  textarea, input { width: 100%; background: #1d2026; color: #d7dce3; border: 1px solid #333; padding: 8px; font: inherit; }
-  button { background: #2b6cb0; border: none; color: #fff; padding: 8px 14px; cursor: pointer; margin-top: 6px; }
-  table { border-collapse: collapse; margin-top: 10px; width: 100%; }
-  th, td { border: 1px solid #2a2e35; padding: 4px 8px; text-align: left; font-size: 13px; }
-  th { background: #1a1d22; }
-  #msg { margin-top: 8px; font-size: 13px; white-space: pre-wrap; }
-  .err { color: #ff7b72; } .ok { color: #7ee787; }
+  /* ============ docsql Studio(SSMS 风格)============ */
+  :root {
+    --chrome: #f0f0f0; --chrome2: #f7f7f7; --border: #d4d4d4; --border2: #e4e4e4;
+    --accent: #0072c6; --accent-dk: #005a9e;
+    --tree-sel: #cce4f7; --tree-hover: #e8f2fc; --tree-sel-bd: #99d1ff;
+    --grid-hd: #f5f6f7; --grid-bd: #dcdfe3; --grid-hover: #f0f7fd;
+    --err: #e81123; --ok: #107c10; --warn: #ff8c00;
+    --txt: #1a1a1a; --txt2: #555; --txt3: #888;
+    --mono: ui-monospace, Menlo, Consolas, monospace;
+    --ui: "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --sql-kw: #0000c0; --sql-str: #a31515; --sql-num: #800000; --sql-cm: #008000; --sql-fn: #c7254e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font: 12px/1.5 var(--ui); color: var(--txt); background: var(--chrome);
+    margin: 0; display: flex; flex-direction: column; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  button, input, select, textarea { font: inherit; }
+  button {
+    background: linear-gradient(#fdfdfd, #f0f0f0); border: 1px solid var(--border);
+    border-radius: 3px; padding: 3px 10px; cursor: pointer; color: var(--txt);
+  }
+  button:hover { background: linear-gradient(#f0f7fd, #e4f0fb); border-color: #a6d3f0; }
+  button:active { background: #dceefa; }
+  button:disabled { color: #aaa; border-color: var(--border2); background: #f5f5f5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent-dk); color: #fff; }
+  button.primary:hover { background: #1a86d4; }
+  button.danger { color: var(--err); }
+  input[type=text], textarea {
+    border: 1px solid var(--border); border-radius: 2px; padding: 3px 6px; background: #fff;
+    -webkit-user-select: text; user-select: text;
+  }
+  input[type=text]:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+  /* ---------- 菜单栏 ---------- */
+  #menubar {
+    display: flex; align-items: center; height: 28px; background: var(--chrome);
+    border-bottom: 1px solid var(--border); padding: 0 6px; flex: none;
+  }
+  #menubar .brand { font-weight: 600; color: var(--accent-dk); margin-right: 10px; }
+  #menubar .brand small { color: var(--txt3); font-weight: 400; }
+  .menu { position: relative; }
+  .menu > span { display: inline-block; padding: 4px 10px; border-radius: 2px; cursor: default; }
+  .menu > span:hover, .menu.open > span { background: var(--tree-sel); }
+  .menu-drop {
+    display: none; position: absolute; top: 100%; left: 0; min-width: 190px; z-index: 300;
+    background: #fff; border: 1px solid var(--border); box-shadow: 0 3px 10px rgba(0,0,0,.18);
+    padding: 3px 0;
+  }
+  .menu.open .menu-drop { display: block; }
+  .menu-drop div { padding: 4px 22px 4px 26px; cursor: default; white-space: nowrap; }
+  .menu-drop div:hover { background: var(--tree-sel); }
+  .menu-drop hr { border: 0; border-top: 1px solid var(--border2); margin: 3px 0; }
+  .menu-drop .kbd { float: right; color: var(--txt3); margin-left: 24px; }
+
+  /* ---------- 工具栏 ---------- */
+  #toolbar {
+    display: flex; align-items: center; gap: 6px; height: 36px; padding: 0 8px;
+    background: var(--chrome2); border-bottom: 1px solid var(--border); flex: none;
+  }
+  #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
+  #toolbar .spacer { flex: 1; }
+  #token { width: 150px; }
+  .tb-ico { display: inline-flex; vertical-align: -3px; margin-right: 4px; }
+
+  /* ---------- 主区域 ---------- */
+  #main { flex: 1; display: flex; min-height: 0; }
+  #explorer {
+    width: 268px; min-width: 180px; background: #fff; border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; flex: none;
+  }
+  .panel-title {
+    background: var(--chrome); border-bottom: 1px solid var(--border); padding: 5px 10px;
+    font-weight: 600; color: var(--txt2); display: flex; align-items: center; gap: 6px;
+    flex: none;
+  }
+  .panel-title .mini { margin-left: auto; display: flex; gap: 2px; }
+  .panel-title .mini button { padding: 1px 6px; font-size: 12px; }
+  #tree { flex: 1; overflow: auto; padding: 4px 0 12px; -webkit-user-select: none; user-select: none; }
+  .tnode { display: flex; align-items: center; gap: 4px; padding: 2px 6px 2px 0;
+           white-space: nowrap; cursor: default; }
+  .tnode:hover { background: var(--tree-hover); }
+  .tnode.sel { background: var(--tree-sel); outline: 1px dotted var(--tree-sel-bd); }
+  .tnode .twist { width: 14px; flex: none; text-align: center; color: var(--txt3);
+                  font-size: 9px; cursor: pointer; }
+  .tnode .tico { width: 17px; flex: none; display: inline-flex; }
+  .tnode .tlabel { overflow: hidden; text-overflow: ellipsis; }
+  .tnode .tlabel .cnt { color: var(--txt3); }
+  .tnode .badge { font-size: 10px; color: var(--accent-dk); border: 1px solid #b8d7f0;
+                  border-radius: 6px; padding: 0 4px; margin-left: 4px; background: #eef6fd; }
+  .tnode .ttl-flag { color: var(--warn); margin-left: 3px; font-size: 11px; }
+  .tchildren { padding-left: 15px; }
+  .tchildren.collapsed { display: none; }
+
+  /* ---------- 文档区 ---------- */
+  #docarea { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fff; }
+  #tabstrip {
+    display: flex; align-items: stretch; background: var(--chrome); border-bottom: 1px solid var(--border);
+    overflow-x: auto; flex: none; min-height: 27px;
+  }
+  .tab {
+    display: flex; align-items: center; gap: 5px; padding: 4px 8px 4px 12px; cursor: default;
+    border-right: 1px solid var(--border2); white-space: nowrap; color: var(--txt2);
+  }
+  .tab.active { background: #fff; color: var(--txt); box-shadow: inset 0 2px 0 var(--accent); }
+  .tab .x { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;
+            border-radius: 2px; color: var(--txt3); font-size: 12px; }
+  .tab .x:hover { background: #ffd7d4; color: var(--err); }
+  #tabcontent { flex: 1; min-height: 0; position: relative; }
+  .doc { position: absolute; inset: 0; display: none; flex-direction: column; min-height: 0; }
+  .doc.active { display: flex; }
+  .doc-bar {
+    display: flex; align-items: center; gap: 6px; padding: 5px 8px; background: var(--chrome2);
+    border-bottom: 1px solid var(--border2); flex: none; flex-wrap: wrap;
+  }
+  .doc-bar .title { font-weight: 600; color: var(--txt2); margin-right: 6px; }
+  .doc-bar .meta { color: var(--txt3); }
+  .doc-bar .spacer { flex: 1; }
+
+  /* ---------- 查询编辑器 ---------- */
+  .q-wrap { flex: 1; display: flex; flex-direction: column; min-height: 120px; }
+  .editor { flex: 1.2; display: flex; min-height: 90px; background: #fff; overflow: hidden;
+            border-bottom: 2px solid var(--border); }
+  .gutter {
+    flex: none; width: 44px; background: var(--chrome); border-right: 1px solid var(--border2);
+    overflow: hidden; text-align: right; padding: 6px 6px 6px 0;
+    font: 12.5px/1.55 var(--mono); color: var(--txt3); user-select: none;
+  }
+  .edit-scroll { position: relative; flex: 1; overflow: hidden; }
+  .hl, .src {
+    position: absolute; inset: 0; margin: 0; padding: 6px 8px;
+    font: 12.5px/1.55 var(--mono); white-space: pre; overflow: auto;
+    tab-size: 2;
+  }
+  .hl { pointer-events: none; z-index: 1; color: var(--txt); }
+  .src {
+    z-index: 2; background: transparent; color: transparent; caret-color: #000;
+    border: 0; outline: 0; resize: none; -webkit-user-select: text; user-select: text;
+  }
+  .src::selection { background: #b4d7ff; color: transparent; }
+  .k { color: var(--sql-kw); font-weight: 600; } .s { color: var(--sql-str); }
+  .n { color: var(--sql-num); } .c { color: var(--sql-cm); font-style: italic; }
+  .f { color: var(--sql-fn); }
+
+  /* ---------- 结果区 ---------- */
+  .res-wrap { flex: 1; display: flex; flex-direction: column; min-height: 60px; }
+  .res-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); background: var(--chrome2); flex: none; }
+  .res-tab { padding: 4px 16px; cursor: default; color: var(--txt2); border: 1px solid transparent;
+             border-bottom: 0; margin-bottom: -1px; }
+  .res-tab.active { background: #fff; color: var(--txt); border-color: var(--border);
+                    box-shadow: inset 0 2px 0 var(--accent); }
+  .res-pane { flex: 1; overflow: auto; display: none; min-height: 0; }
+  .res-pane.active { display: block; }
+  .msg-list { font: 12px/1.7 var(--mono); padding: 6px 10px; -webkit-user-select: text; user-select: text; }
+  .msg-list .m-err { color: var(--err); }
+  .msg-list .m-ok { color: var(--ok); }
+  .msg-list .m-info { color: var(--txt2); }
+
+  /* ---------- 网格 ---------- */
+  .grid-wrap { overflow: auto; }
+  table.grid { border-collapse: collapse; font: 12px/1.5 var(--mono); -webkit-user-select: text; user-select: text; }
+  .grid th, .grid td { border: 1px solid var(--grid-bd); padding: 2px 8px; text-align: left;
+                       white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+  .grid th { background: var(--grid-hd); position: sticky; top: 0; z-index: 2; cursor: pointer;
+             font-family: var(--ui); font-weight: 600; color: var(--txt2); }
+  .grid th .sort-ind { color: var(--accent); margin-left: 3px; }
+  .grid td.rownum, .grid th.rownum { background: var(--grid-hd); color: var(--txt3); text-align: right;
+                                      position: sticky; left: 0; z-index: 1; font-family: var(--ui); }
+  .grid th.rownum { z-index: 3; cursor: default; }
+  .grid tr.sel td { background: var(--tree-sel); }
+  .grid td:hover { background: var(--grid-hover); }
+  .grid .null { color: #b0b0b0; font-style: italic; }
+  .grid-label { font-weight: 600; color: var(--txt2); padding: 6px 10px 2px; }
+
+  /* ---------- KV 详情 ---------- */
+  .kv-body { flex: 1; overflow: auto; padding: 10px; -webkit-user-select: text; user-select: text; }
+  .kv-str-area { width: 100%; min-height: 140px; font: 12.5px/1.55 var(--mono); white-space: pre; }
+  .kv-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .kv-form input { width: 160px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
+  .chip { border: 1px solid var(--border); border-radius: 10px; padding: 1px 10px; background: #fff;
+          color: var(--txt2); }
+  .chip b { color: var(--txt); }
+
+  /* ---------- 仪表盘 ---------- */
+  .dash { overflow: auto; padding: 16px; }
+  .dash h2 { margin: 0 0 4px; font-size: 18px; }
+  .dash .sub { color: var(--txt3); margin-bottom: 16px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .card { border: 1px solid var(--border); border-radius: 4px; padding: 12px 14px; background: #fff;
+          box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .card .v { font-size: 24px; font-weight: 600; color: var(--accent-dk); }
+  .card .v small { font-size: 12px; color: var(--txt3); font-weight: 400; }
+  .card .k { color: var(--txt2); margin-top: 2px; }
+  .dash-actions { margin: 16px 0; display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ---------- 发布订阅 ---------- */
+  .pub-wrap { flex: 1; display: flex; min-height: 0; }
+  .pub-left { width: 320px; flex: none; border-right: 1px solid var(--border2); padding: 10px; overflow: auto; }
+  .pub-right { flex: 1; overflow: auto; font: 12px/1.6 var(--mono); padding: 6px 0; }
+  .feed-item { padding: 3px 10px; border-bottom: 1px solid #f2f2f2; display: flex; gap: 8px;
+               -webkit-user-select: text; user-select: text; }
+  .feed-item .no { color: var(--txt3); width: 46px; flex: none; }
+  .feed-item .ch { color: var(--accent-dk); width: 130px; flex: none; overflow: hidden;
+                   text-overflow: ellipsis; }
+  .note { background: #fff8e1; border: 1px solid #f0e0a0; border-radius: 3px; padding: 6px 10px;
+          color: #6a5a00; margin-bottom: 10px; }
+
+  /* ---------- 状态栏 ---------- */
+  #statusbar {
+    height: 24px; flex: none; background: var(--accent); color: #fff; display: flex;
+    align-items: center; gap: 0; font-size: 11.5px;
+  }
+  #statusbar.busy { background: var(--warn); }
+  #statusbar.err { background: var(--err); }
+  #statusbar span { padding: 0 10px; border-right: 1px solid rgba(255,255,255,.25); }
+  #statusbar .grow { flex: 1; border: 0; }
+
+  /* ---------- 右键菜单 / 弹窗 / 提示 ---------- */
+  #ctxmenu {
+    display: none; position: fixed; z-index: 500; background: #fff; border: 1px solid var(--border);
+    box-shadow: 0 3px 12px rgba(0,0,0,.2); padding: 3px 0; min-width: 180px;
+  }
+  #ctxmenu div { padding: 4px 24px 4px 28px; cursor: default; white-space: nowrap; }
+  #ctxmenu div:hover { background: var(--tree-sel); }
+  #ctxmenu hr { border: 0; border-top: 1px solid var(--border2); margin: 3px 0; }
+  #overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.25); z-index: 600;
+    align-items: center; justify-content: center;
+  }
+  .dialog { background: #fff; border: 1px solid var(--border); box-shadow: 0 6px 24px rgba(0,0,0,.25);
+            min-width: 360px; max-width: 520px; border-radius: 4px; overflow: hidden; }
+  .dialog h3 { margin: 0; padding: 9px 14px; background: var(--chrome); border-bottom: 1px solid var(--border);
+               font-size: 13px; }
+  .dialog .body { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .dialog .row { display: flex; align-items: center; gap: 8px; }
+  .dialog .row label { width: 90px; color: var(--txt2); flex: none; }
+  .dialog .row input { flex: 1; }
+  .dialog .foot { padding: 10px 14px; border-top: 1px solid var(--border2); display: flex;
+                  justify-content: flex-end; gap: 8px; background: var(--chrome2); }
+  .dialog .err-line { color: var(--err); min-height: 16px; }
+  #toasts { position: fixed; right: 14px; bottom: 34px; z-index: 700; display: flex;
+            flex-direction: column; gap: 6px; }
+  .toast { background: #323130; color: #fff; border-radius: 4px; padding: 8px 14px; max-width: 380px;
+           box-shadow: 0 3px 10px rgba(0,0,0,.3); animation: tin .18s ease-out; }
+  .toast.err { background: var(--err); }
+  @keyframes tin { from { opacity: 0; transform: translateY(6px); } }
+  ::-webkit-scrollbar { width: 14px; height: 14px; }
+  ::-webkit-scrollbar-thumb { background: #c8c8c8; border: 3px solid #fff; border-radius: 7px; }
+  ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
 </style>
 </head>
 <body>
-<nav>
-  <h1>docsql console</h1>
-  <a href="#" onclick="show('sql')">SQL 工作台</a><br><br>
-  <a href="#" onclick="show('keys')">KV 键浏览</a><br><br>
-  <a href="#" onclick="show('pubsub')">发布订阅</a><br><br>
-  <a href="#" onclick="show('stats')">监控</a>
-</nav>
-<main>
-  <div>
-    token <input id="token" placeholder="X-Docsql-Token" style="width:200px">
+
+<div id="menubar">
+  <span class="brand">docsql <small>Studio</small></span>
+  <div class="menu" data-menu><span>文件</span><div class="menu-drop">
+    <div data-act="new-query">新建查询<span class="kbd">Ctrl+N</span></div>
+    <hr>
+    <div data-act="close-tab">关闭当前文档</div>
+  </div></div>
+  <div class="menu" data-menu><span>视图</span><div class="menu-drop">
+    <div data-act="refresh">刷新对象资源管理器<span class="kbd">Ctrl+R</span></div>
+    <div data-act="dashboard">服务器仪表盘</div>
+  </div></div>
+  <div class="menu" data-menu><span>工具</span><div class="menu-drop">
+    <div data-act="open-kv">KV 键值浏览器</div>
+    <div data-act="open-pub">发布订阅监视器</div>
+  </div></div>
+  <div class="menu" data-menu><span>帮助</span><div class="menu-drop">
+    <div data-act="about">关于 docsql Studio</div>
+  </div></div>
+</div>
+
+<div id="toolbar">
+  <span title="连接状态" id="conn-dot" style="font-weight:700;color:#e81123">●</span>
+  <input id="token" type="text" placeholder="令牌 X-Docsql-Token" title="服务器开启认证时填写令牌">
+  <button id="btn-connect">连接</button>
+  <div class="sep"></div>
+  <button id="btn-newq" title="新建查询编辑器 (Ctrl+N)"><span class="tb-ico" data-ico="query"></span>新建查询</button>
+  <button id="btn-exec" class="primary" title="执行 (F5)"><span class="tb-ico" data-ico="run"></span>执行</button>
+  <button id="btn-parse" title="分析 (Ctrl+F5) — 仅语法检查,不执行">分析</button>
+  <div class="sep"></div>
+  <button id="btn-refresh" title="刷新对象资源管理器 (Ctrl+R)"><span class="tb-ico" data-ico="refresh"></span>刷新</button>
+  <div class="spacer"></div>
+  <span id="tb-server" class="meta" style="color:#888"></span>
+</div>
+
+<div id="main">
+  <div id="explorer">
+    <div class="panel-title">
+      <span class="tb-ico" data-ico="explorer"></span>对象资源管理器
+      <span class="mini"><button id="exp-collapse" title="全部折叠">⊖</button></span>
+    </div>
+    <div id="tree"></div>
   </div>
-  <section id="sql">
-    <h2>SQL 工作台</h2>
-    <textarea id="sqltext" rows="6">CREATE TABLE demo (id INT PRIMARY KEY, name TEXT);
-INSERT INTO demo VALUES (1, 'ann'), (2, 'bob');
-SELECT id, name FROM demo ORDER BY id;</textarea><br>
-    <button onclick="runSql()">执行</button>
-    <div id="msg"></div>
-    <div id="result"></div>
-  </section>
-  <section id="keys" hidden>
-    <h2>KV 键浏览</h2>
-    <button onclick="loadKeys()">刷新</button>
-    <div id="keytable"></div>
-    <h3>命令</h3>
-    <input id="kvcmd" placeholder="SET key value" style="width:400px">
-    <button onclick="runKv()">执行</button>
-  </section>
-  <section id="pubsub" hidden>
-    <h2>发布订阅</h2>
-    <p>发布订阅走 TCP 协议端口(SUBSCRIBE/PUBLISH),Web 控制台提供只读说明。
-       发布消息: <input id="pubch" placeholder="channel" style="width:120px">
-       <input id="pubmsg" placeholder="message" style="width:200px">
-       <button onclick="publish()">PUBLISH</button></p>
-  </section>
-  <section id="stats" hidden>
-    <h2>监控</h2>
-    <button onclick="loadStats()">刷新</button>
-    <pre id="statsout"></pre>
-  </section>
-</main>
+  <div id="docarea">
+    <div id="tabstrip"></div>
+    <div id="tabcontent"></div>
+  </div>
+</div>
+
+<div id="statusbar">
+  <span id="st-conn">未连接</span>
+  <span id="st-server">docsql</span>
+  <span id="st-last" style="display:none"></span>
+  <span class="grow"></span>
+  <span id="st-ready">就绪</span>
+</div>
+
+<div id="ctxmenu"></div>
+<div id="overlay"></div>
+<div id="toasts"></div>
+
 <script>
-const $ = (id) => document.getElementById(id);
-const headers = () => { const t = $('token').value.trim(); return t ? {'X-Docsql-Token': t} : {}; };
+"use strict";
+/* ================= 基础工具 ================= */
+const $ = (sel, el) => (el || document).querySelector(sel);
+const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtBytes = (n) => { if (!n) return '0 B'; const u = ['B','KB','MB','GB']; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
+const fmtDur = (ms) => { const s = Math.floor(ms/1000), d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  return d ? `${d}天${h}时${m}分` : h ? `${h}时${m}分` : m ? `${m}分${s%60}秒` : `${s}秒`; };
 
-function show(which) {
-  for (const s of ['sql','keys','pubsub','stats']) $(s).hidden = (s !== which);
+/* ================= 图标(内联 SVG)================= */
+const SVG = (inner, vb) => `<svg width="16" height="16" viewBox="${vb||'0 0 16 16'}" fill="none" xmlns="http://www.w3.org/2000/svg">${inner}</svg>`;
+const ICONS = {
+  server: SVG(`<ellipse cx="8" cy="3.4" rx="5.6" ry="2.1" stroke="#4a7a54" stroke-width="1.1"/><path d="M2.4 3.4v9.2c0 1.16 2.5 2.1 5.6 2.1s5.6-.94 5.6-2.1V3.4" stroke="#4a7a54" stroke-width="1.1"/><path d="M2.4 8c0 1.16 2.5 2.1 5.6 2.1S13.6 9.16 13.6 8" stroke="#4a7a54" stroke-width="1.1"/>`),
+  folder: SVG(`<path d="M1.5 4.2c0-.5.4-.9.9-.9h3l1.4 1.5h6.8c.5 0 .9.4.9.9v6.4c0 .5-.4.9-.9.9H2.4c-.5 0-.9-.4-.9-.9V4.2z" fill="#f5c26b" stroke="#c99b3f" stroke-width="1"/>`),
+  folderOpen: SVG(`<path d="M1.5 4.2c0-.5.4-.9.9-.9h3l1.4 1.5h6.8c.5 0 .9.4.9.9V7H1.5V4.2z" fill="#f5c26b" stroke="#c99b3f" stroke-width="1"/><path d="M1 7.4h13.8l-1.7 5.4c-.1.4-.5.7-.9.7H2.3c-.4 0-.8-.3-.9-.7L1 7.4z" fill="#ffd98a" stroke="#c99b3f" stroke-width="1"/>`),
+  table: SVG(`<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="#cfe3f7" stroke="#5b8dbf" stroke-width="1"/><path d="M1.5 5.6h13M1.5 8.7h13M6 5.6v8" stroke="#5b8dbf" stroke-width=".9"/>`),
+  column: SVG(`<rect x="4.5" y="2.5" width="7" height="11" rx="1" fill="#e8f0fb" stroke="#5b8dbf" stroke-width="1"/><path d="M4.5 5.5h7" stroke="#5b8dbf" stroke-width=".9"/>`),
+  key: SVG(`<circle cx="5" cy="6" r="2.8" stroke="#c8a000" stroke-width="1.3" fill="#ffe9a8"/><path d="M7 8l5.4 5.4M10 11l1.8-1.8M11.5 12.5l1.8-1.8" stroke="#c8a000" stroke-width="1.3"/>`),
+  index: SVG(`<path d="M2.5 4h11M2.5 8h8M2.5 12h5" stroke="#8a6db8" stroke-width="1.6" stroke-linecap="round"/>`),
+  view: SVG(`<ellipse cx="8" cy="8" rx="6.3" ry="4" stroke="#5b8dbf" stroke-width="1.1"/><circle cx="8" cy="8" r="1.9" fill="#5b8dbf"/>`),
+  query: SVG(`<path d="M3 3.5h7l3 3V12.5H3z" fill="#fff" stroke="#5b8dbf" stroke-width="1.1"/><path d="M5 7h6M5 9.4h4" stroke="#5b8dbf" stroke-width="1"/>`),
+  run: SVG(`<path d="M4.5 3l8 5-8 5z" fill="#107c10"/>`),
+  refresh: SVG(`<path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6v3h-3" stroke="#0072c6" stroke-width="1.4" fill="none" stroke-linecap="round"/>`),
+  explorer: SVG(`<rect x="2" y="3" width="12" height="10" rx="1" stroke="#888" stroke-width="1.1"/><path d="M6 3v10" stroke="#888" stroke-width="1.1"/>`),
+  chart: SVG(`<path d="M2.5 13V3M2.5 13h11" stroke="#666" stroke-width="1.2"/><rect x="4.5" y="8" width="2.2" height="4" fill="#0072c6"/><rect x="7.6" y="5.5" width="2.2" height="6.5" fill="#0072c6"/><rect x="10.7" y="7" width="2.2" height="5" fill="#0072c6"/>`),
+  pub: SVG(`<circle cx="5" cy="11" r="1.6" fill="#c0504d"/><path d="M6.2 9.8 11 5M8.3 7.7l1.8 1.8M10 6l2-2" stroke="#c0504d" stroke-width="1.2" stroke-linecap="round"/>`),
+  dashboard: SVG(`<path d="M3 12a5 5 0 0 1 10 0" stroke="#0072c6" stroke-width="1.3"/><path d="M8 12l2.6-3.4" stroke="#e81123" stroke-width="1.4" stroke-linecap="round"/>`),
+};
+function kvIcon(kind) {
+  const map = { string:'#0072c6', list:'#2e8b57', hash:'#c0504d', set:'#8a6db8', zset:'#b8860b' };
+  const ch = { string:'S', list:'L', hash:'H', set:'M', zset:'Z' }[kind] || '?';
+  return SVG(`<rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="${map[kind]||'#666'}22" stroke="${map[kind]||'#666'}" stroke-width="1.1"/><text x="8" y="11.2" text-anchor="middle" font-size="8.5" font-weight="700" fill="${map[kind]||'#666'}">${ch}</text>`);
+}
+$$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
+
+/* ================= API 层 ================= */
+const api = {
+  token: localStorage.getItem('docsql.token') || '',
+  headers() { const h = {'Content-Type': 'application/json'}; if (this.token) h['X-Docsql-Token'] = this.token; return h; },
+  async get(path) { return this._do(fetch(path, {headers: this.headers()})); },
+  async post(path, body) { return this._do(fetch(path, {method: 'POST', headers: this.headers(), body: JSON.stringify(body||{})})); },
+  async _do(p) {
+    const r = await p;
+    if (r.status === 401) { ui.connState('unauth'); throw new Error('未授权:请在工具栏填写正确的令牌'); }
+    ui.connState('ok');
+    return r.json();
+  }
+};
+
+/* ================= UI 反馈 ================= */
+const ui = {
+  connState(state) {
+    const dot = $('#conn-dot'), bar = $('#st-conn'), sb = $('#statusbar');
+    if (state === 'ok') { dot.textContent = '●'; dot.style.color = '#107c10';
+      bar.textContent = '已连接 ' + location.host; sb.className = ''; }
+    else if (state === 'unauth') { dot.textContent = '●'; dot.style.color = '#e81123';
+      bar.textContent = '未授权(令牌错误)'; sb.className = 'err'; }
+    else { dot.textContent = '●'; dot.style.color = '#e81123'; bar.textContent = '未连接'; sb.className = ''; }
+  },
+  status(text, cls) {
+    const sb = $('#statusbar');
+    sb.className = cls || '';
+    $('#st-last').style.display = text ? '' : 'none';
+    if (text) $('#st-last').textContent = text;
+    $('#st-ready').textContent = text ? '' : '就绪';
+  },
+  toast(msg, isErr) {
+    const el = document.createElement('div');
+    el.className = 'toast' + (isErr ? ' err' : '');
+    el.textContent = msg;
+    $('#toasts').appendChild(el);
+    setTimeout(() => el.remove(), isErr ? 5000 : 2600);
+  }
+};
+
+/* ================= 右键菜单 ================= */
+const ctx = {
+  open(items, x, y) {
+    const m = $('#ctxmenu');
+    m.innerHTML = items.map(it => it === '-' ? '<hr>' :
+      `<div data-mi="${esc(it.id)}">${it.label}${it.kbd ? `<span class="kbd" style="float:right;color:#999;margin-left:22px">${it.kbd}</span>` : ''}</div>`).join('');
+    m.style.display = 'block';
+    const r = m.getBoundingClientRect();
+    m.style.left = Math.min(x, innerWidth - r.width - 6) + 'px';
+    m.style.top = Math.min(y, innerHeight - r.height - 6) + 'px';
+    m.onclick = (e) => { const t = e.target.closest('[data-mi]'); if (t) { ctx.close(); const it = items.find(i => i !== '-' && i.id === t.dataset.mi); if (it) it.act(); } };
+  },
+  close() { $('#ctxmenu').style.display = 'none'; }
+};
+document.addEventListener('click', () => ctx.close());
+document.addEventListener('contextmenu', (e) => { if (!e.target.closest('#tree')) ctx.close(); });
+
+/* ================= 弹窗表单 ================= */
+function dialog(title, fields, okText, onOk) {
+  const ov = $('#overlay');
+  ov.innerHTML = `<div class="dialog"><h3>${esc(title)}</h3><div class="body">` +
+    fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="text" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
+    `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`;
+  ov.style.display = 'flex';
+  const first = $('input[data-f]', ov); if (first) first.focus();
+  $('[data-cancel]', ov).onclick = () => { ov.style.display = 'none'; ov.innerHTML = ''; };
+  ov.onmousedown = (e) => { if (e.target === ov) { ov.style.display = 'none'; ov.innerHTML = ''; } };
+  $('[data-ok]', ov).onclick = async () => {
+    const vals = {};
+    fields.forEach(f => { vals[f.name] = $(`input[data-f="${f.name}"]`, ov).value.trim(); });
+    try { await onOk(vals, (m) => { $('[data-err]', ov).textContent = m || ''; }); 
+      ov.style.display = 'none'; ov.innerHTML = ''; } catch (e) { /* handled */ }
+  };
+  ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
 }
 
-async function runSql() {
-  $('msg').textContent = ''; $('result').innerHTML = '';
-  const resp = await fetch('/api/sql', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', ...headers()},
-    body: JSON.stringify({sql: $('sqltext').value})
+/* ================= 标签页管理 ================= */
+const tabs = {
+  list: [], active: null, seq: 0,
+  open(kind, key, title, build) {
+    const found = this.list.find(t => t.kind === kind && t.key === key);
+    if (found) { this.activate(found); return found; }
+    const t = { id: ++this.seq, kind, key, title };
+    const stripEl = document.createElement('div');
+    stripEl.className = 'tab';
+    stripEl.innerHTML = `<span class="tb-ico" style="display:inline-flex">${ICONS[tabs.kindIcon(kind)]||''}</span><span class="t">${esc(title)}</span><span class="x" title="关闭">×</span>`;
+    stripEl.onclick = () => this.activate(t);
+    stripEl.onmousedown = (e) => { if (e.button === 1) this.close(t); };
+    $('.x', stripEl).onclick = (e) => { e.stopPropagation(); this.close(t); };
+    $('#tabstrip').appendChild(stripEl);
+    const docEl = document.createElement('div');
+    docEl.className = 'doc';
+    $('#tabcontent').appendChild(docEl);
+    t.stripEl = stripEl; t.el = docEl;
+    this.list.push(t);
+    build(t);
+    this.activate(t);
+    return t;
+  },
+  kindIcon(kind) { return { query: 'query', data: 'table', kv: 'view', pub: 'pub', dash: 'dashboard' }[kind] || 'view'; },
+  activate(t) {
+    this.active = t;
+    $$('.tab').forEach(el => el.classList.remove('active'));
+    $$('.doc').forEach(el => el.classList.remove('active'));
+    t.stripEl.classList.add('active'); t.el.classList.add('active');
+    if (t.onActivate) t.onActivate();
+  },
+  close(t) {
+    if (t.onClose) t.onClose();
+    t.stripEl.remove(); t.el.remove();
+    this.list = this.list.filter(x => x !== t);
+    if (this.active === t && this.list.length) this.activate(this.list[this.list.length - 1]);
+    else if (!this.list.length) { this.active = null; ui.status(''); }
+  },
+  byKind(kind) { return this.list.filter(t => t.kind === kind); },
+  activeQuery() { return this.active && this.active.kind === 'query' ? this.active : null; }
+};
+
+/* ================= SQL 高亮编辑器 ================= */
+const KW = ('SELECT FROM WHERE AND OR NOT NULL IS IN LIKE BETWEEN ORDER BY GROUP HAVING LIMIT OFFSET AS ASC DESC ' +
+  'INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE ALTER ADD DROP INDEX VIEW PRIMARY KEY UNIQUE AUTOINCREMENT ' +
+  'AUTO_INCREMENT INT INTEGER TEXT REAL FLOAT BOOLEAN BOOL BEGIN COMMIT ROLLBACK TRANSACTION JOIN INNER LEFT CROSS ' +
+  'ON USING UNION ALL DISTINCT COUNT SUM AVG MIN MAX RETURNING IF EXISTS CASCADE CONSTRAINT CHECK DEFAULT FOREIGN ' +
+  'REFERENCES EXPLAIN PRAGMA CASE WHEN THEN ELSE END EXISTS').split(/\s+/);
+const FN = ['COUNT','SUM','AVG','MIN','MAX','UPPER','LOWER','LENGTH','ABS','ROUND','COALESCE'];
+const KW_RE = new RegExp(`^(?:${KW.join('|')})$`, 'i');
+
+function highlightSQL(src) {
+  let out = '';
+  const re = /(--[^\n]*|\/\*[\s\S]*?\*\/)|('(?:[^']|'')*')|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)/g;
+  let last = 0, m;
+  while ((m = re.exec(src))) {
+    out += esc(src.slice(last, m.index));
+    if (m[1]) out += `<span class="c">${esc(m[1])}</span>`;
+    else if (m[2]) out += `<span class="s">${esc(m[2])}</span>`;
+    else if (m[3]) out += `<span class="n">${esc(m[3])}</span>`;
+    else if (KW_RE.test(m[4])) out += `<span class="k">${esc(m[4])}</span>`;
+    else if (FN.includes(m[4].toUpperCase())) out += `<span class="f">${esc(m[4])}</span>`;
+    else out += esc(m[4]);
+    last = re.lastIndex;
+  }
+  out += esc(src.slice(last));
+  return out + '\n';
+}
+
+function makeEditor(container, initial) {
+  container.innerHTML = `<div class="editor">
+    <div class="gutter"><div class="gutter-in">1</div></div>
+    <div class="edit-scroll"><pre class="hl"><code></code></pre>
+    <textarea class="src" spellcheck="false" wrap="off"></textarea></div></div>`;
+  const ed = $('.editor', container), ta = $('.src', container), code = $('code', container),
+        gutterIn = $('.gutter-in', container), hl = $('.hl', container);
+  ta.value = initial || '';
+  const render = () => {
+    code.innerHTML = highlightSQL(ta.value);
+    const lines = ta.value.split('\n').length;
+    gutterIn.innerHTML = Array.from({length: lines}, (_, i) => i + 1).join('<br>');
+  };
+  const sync = () => { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; gutterIn.style.transform = `translateY(${-ta.scrollTop}px)`; };
+  ta.addEventListener('input', render);
+  ta.addEventListener('scroll', sync);
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') { e.preventDefault();
+      const s = ta.selectionStart, en = ta.selectionEnd;
+      ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
+      ta.selectionStart = ta.selectionEnd = s + 2; render(); }
   });
-  if (resp.status === 401) { $('msg').textContent = '未授权:请填写 token'; return; }
-  const data = await resp.json();
-  if (data.kind === 'error') { $('msg').className = 'err'; $('msg').textContent = data.message; return; }
-  if (data.kind === 'affected') { $('msg').className = 'ok'; $('msg').textContent = `(${data.count} rows affected)`; return; }
-  let html = '<table><tr>' + data.columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
-  for (const row of data.rows) html += '<tr>' + row.map(v => `<td>${v === null ? 'NULL' : v}</td>`).join('') + '</tr>';
-  $('result').innerHTML = html + '</table>';
+  render();
+  return {
+    el: ed, ta,
+    get value() { return ta.value; },
+    set value(v) { ta.value = v; render(); },
+    selectedText() { return ta.value.slice(ta.selectionStart, ta.selectionEnd).trim(); },
+    focus() { ta.focus(); }
+  };
 }
 
-async function loadKeys() {
-  const resp = await fetch('/api/keys', {headers: headers()});
-  const data = await resp.json();
-  let html = '<table><tr><th>key</th><th>type</th><th>ttl(ms)</th></tr>';
-  for (const k of data.keys) html += `<tr><td>${k.key}</td><td>${k.type}</td><td>${k.ttl_ms < 0 ? '∞' : k.ttl_ms}</td></tr>`;
-  $('keytable').innerHTML = html + '</table>';
+/* ================= 结果网格 ================= */
+function renderGrid(container, cols, rows, opts) {
+  opts = opts || {};
+  const state = { sortCol: null, asc: true };
+  const wrap = document.createElement('div');
+  wrap.className = 'grid-wrap';
+  container.appendChild(wrap);
+  const draw = () => {
+    let data = rows;
+    if (state.sortCol !== null) {
+      const i = state.sortCol;
+      data = rows.slice().sort((a, b) => {
+        const x = a[i], y = b[i];
+        if (x === null) return 1; if (y === null) return -1;
+        if (typeof x === 'number' && typeof y === 'number') return state.asc ? x - y : y - x;
+        const c = String(x).localeCompare(String(y));
+        return state.asc ? c : -c;
+      });
+    }
+    const head = `<th class="rownum">#</th>` + cols.map((c, i) =>
+      `<th data-ci="${i}" title="${esc(c)}">${esc(c)}${state.sortCol === i ? `<span class="sort-ind">${state.asc ? '▲' : '▼'}</span>` : ''}</th>`).join('');
+    const body = data.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
+      `<td class="rownum">${ri + 1}</td>` +
+      row.map(v => `<td title="${v === null ? 'NULL' : esc(v)}">${v === null ? '<span class="null">NULL</span>' : esc(v)}</td>`).join('') + '</tr>').join('');
+    wrap.innerHTML = `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    $$('th[data-ci]', wrap).forEach(th => th.onclick = () => {
+      const i = +th.dataset.ci;
+      if (state.sortCol === i) { if (state.asc) state.asc = false; else { state.sortCol = null; } }
+      else { state.sortCol = i; state.asc = true; }
+      draw();
+    });
+    if (opts.onRowClick) $$('tr[data-ri]', wrap).forEach(tr => {
+      tr.onclick = () => { $$('tr', wrap).forEach(x => x.classList.remove('sel')); tr.classList.add('sel');
+        opts.onRowClick(data[+tr.dataset.ri]); };
+    });
+  };
+  draw();
+  return wrap;
 }
 
-async function runKv() {
-  const parts = $('kvcmd').value.trim().split(/\s+/);
-  if (!parts.length) return;
-  const resp = await fetch('/api/kv', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', ...headers()},
-    body: JSON.stringify({command: parts[0], args: parts.slice(1)})
+/* ================= 查询标签页 ================= */
+let querySeq = 0;
+function openQueryTab(title, sql, autoRun) {
+  querySeq++;
+  return tabs.open('query', 'q' + querySeq, title || `查询 ${querySeq}`, (t) => {
+    t.el.innerHTML = `<div class="doc-bar">
+        <button data-do="exec" class="primary" title="F5"><span class="tb-ico">${ICONS.run}</span>执行</button>
+        <button data-do="parse" title="Ctrl+F5 — 语法检查,不执行">分析</button>
+        <button data-do="execsel" title="仅执行选中文本">执行所选</button>
+        <div class="sep"></div>
+        <span class="meta">F5 执行 · Ctrl+F5 分析 · 批量语句将依次执行并返回全部结果</span>
+      </div>
+      <div class="q-wrap"><div class="ed-host" style="flex:1.2;display:flex;min-height:90px;flex-direction:column"></div>
+      <div class="res-wrap">
+        <div class="res-tabs">
+          <div class="res-tab active" data-rt="results">结果</div>
+          <div class="res-tab" data-rt="messages">消息</div>
+        </div>
+        <div class="res-pane active" data-rp="results"></div>
+        <div class="res-pane" data-rp="messages"><div class="msg-list"></div></div>
+      </div></div>`;
+    t.editor = makeEditor($('.ed-host', t.el), sql || '');
+    t.msg = (text, cls) => { const d = document.createElement('div');
+      if (cls) d.className = 'm-' + cls; d.textContent = text;
+      $('[data-rp="messages"] .msg-list', t.el).appendChild(d);
+      $('[data-rt="messages"]', t.el).click(); };
+    t.showResults = () => { const rt = $('[data-rt="results"]', t.el); if (rt) rt.click(); };
+    t.clearOutput = () => {
+      $('[data-rp="results"]', t.el).innerHTML = '';
+      $('[data-rp="messages"] .msg-list', t.el).innerHTML = '';
+    };
+    $$('.res-tab', t.el).forEach(tabEl => tabEl.onclick = () => {
+      $$('.res-tab', t.el).forEach(x => x.classList.remove('active'));
+      $$('.res-pane', t.el).forEach(x => x.classList.remove('active'));
+      tabEl.classList.add('active');
+      $(`[data-rp="${tabEl.dataset.rt}"]`, t.el).classList.add('active');
+    });
+    $('[data-do="exec"]', t.el).onclick = () => execQuery(t);
+    $('[data-do="parse"]', t.el).onclick = () => parseQuery(t);
+    $('[data-do="execsel"]', t.el).onclick = () => execQuery(t, true);
+    t.onActivate = () => t.editor.focus();
+    if (autoRun) execQuery(t);
   });
-  alert(JSON.stringify(await resp.json()));
 }
 
-async function publish() {
-  const resp = await fetch('/api/kv', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', ...headers()},
-    body: JSON.stringify({command: 'PUBLISH', args: [$('pubch').value, $('pubmsg').value]})
+async function execQuery(t, selectedOnly) {
+  const sql = (selectedOnly ? t.editor.selectedText() : t.editor.value).trim();
+  if (!sql) { ui.toast('没有可执行的 SQL'); return; }
+  t.clearOutput();
+  ui.status('正在执行查询…', 'busy');
+  const t0 = performance.now();
+  let data;
+  try { data = await api.post('/api/sql', {sql}); }
+  catch (e) { t.msg(e.message, 'err'); ui.status('执行失败', 'err'); return; }
+  const ms = Math.max(1, Math.round(performance.now() - t0));
+  const results = $('[data-rp="results"]', t.el);
+  const renderOutcome = (o, idx) => {
+    if (o.kind === 'rows') {
+      if (idx !== undefined) { const lab = document.createElement('div'); lab.className = 'grid-label';
+        lab.textContent = `结果 ${idx + 1}(${o.rows.length} 行)`; results.appendChild(lab); }
+      renderGrid(results, o.columns, o.rows);
+      t.msg(`(${o.rows.length} 行)` + (idx === undefined ? '' : ` — 结果 ${idx + 1}`), 'info');
+    } else if (o.kind === 'affected') {
+      t.msg(`(${o.count} 行受影响)`, 'ok');
+    } else if (o.kind === 'error') {
+      t.msg(`错误:${o.message}`, 'err');
+    }
+  };
+  if (data.kind === 'batch') {
+    data.results.forEach((o, i) => renderOutcome(o, data.results.some(x => x.kind === 'rows') ? i : undefined));
+    if (data.error) t.msg(`批处理在语句 ${data.error.statement + 1} 处停止:${data.error.message}`, 'err');
+    t.msg(`总耗时: ${ms} ms`, 'info');
+  } else {
+    renderOutcome(data);
+    if (data.kind !== 'error') t.msg(`命令已成功完成。总耗时: ${ms} ms`, 'ok');
+    else t.msg(`总耗时: ${ms} ms`, 'info');
+  }
+  const rowCount = data.kind === 'rows' ? data.rows.length :
+    data.kind === 'batch' ? data.results.reduce((n, o) => n + (o.rows ? o.rows.length : 0), 0) : 0;
+  const hasErr = data.kind === 'error' || (data.kind === 'batch' && data.error);
+  if (hasErr) ui.status(`查询完成(有错误)· 耗时 ${ms} ms · ${rowCount} 行`, 'err');
+  else ui.status(`查询已成功执行 · 耗时 ${ms} ms · ${rowCount} 行`);
+  t.showResults();
+}
+
+async function parseQuery(t) {
+  const sql = t.editor.value.trim();
+  if (!sql) { ui.toast('没有可分析的 SQL'); return; }
+  try {
+    const r = await api.post('/api/parse', {sql});
+    if (r.ok) { t.msg('分析完成: 未检测到语法错误。', 'ok'); ui.toast('分析通过:无语法错误'); }
+    else { t.msg('分析失败: ' + r.message, 'err'); ui.toast('分析失败(见消息页)', true); }
+  } catch (e) { t.msg(e.message, 'err'); }
+}
+
+/* ================= 表数据查看 ================= */
+async function dropTable(tableName, after) {
+  dialog('删除表', [{name: 'name', label: '表名', value: tableName, ph: '输入表名以确认'}], '删除', async (v, err) => {
+    if (v.name !== tableName) { err('表名不匹配'); throw new Error('cancel'); }
+    const r = await api.post('/api/sql', {sql: `DROP TABLE "${tableName}"`});
+    if (r.kind === 'error') { ui.toast(r.message, true); return; }
+    ui.toast(`已删除表 ${tableName}`);
+    explorer.refreshSoon();
+    if (after) after();
   });
-  alert(JSON.stringify(await resp.json()));
 }
 
-async function loadStats() {
-  const resp = await fetch('/api/stats', {headers: headers()});
-  $('statsout').textContent = JSON.stringify(await resp.json(), null, 2);
+function openDataTab(tableName, meta) {
+  tabs.open('data', 'data:' + tableName, `表: ${tableName}`, (t) => {
+    t.offset = 0; t.limit = 200; t.selected = null;
+    t.el.innerHTML = `<div class="doc-bar">
+        <span class="title">${esc(tableName)}</span>
+        <button data-do="refresh">刷新</button>
+        <button data-do="prev">◀ 上一页</button>
+        <button data-do="next">下一页 ▶</button>
+        <span class="meta" data-range></span>
+        <div class="spacer"></div>
+        <button data-do="query">生成查询</button>
+        <button data-do="drop" class="danger">删除表…</button>
+      </div><div class="res-wrap"><div class="res-pane active grid-host" style="display:block"></div></div>`;
+    t.host = $('.grid-host', t.el);
+    const range = () => { $('[data-range]', t.el).textContent = t.offset === 0 && t.total === 0 ? '(空表)' : `第 ${t.offset + 1}–${Math.min(t.offset + t.limit, t.total)} 行,共 ${t.total} 行`; };
+    t.load = async () => {
+      ui.status(`正在加载 ${tableName}…`, 'busy');
+      try {
+        const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${tableName}"`});
+        t.total = count.kind === 'rows' ? +count.rows[0][0] : 0;
+        const r = await api.post('/api/sql', {sql: `SELECT * FROM "${tableName}" ORDER BY 1 LIMIT ${t.limit} OFFSET ${t.offset}`});
+        t.host.innerHTML = '';
+        if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; return; }
+        const pk = meta && meta.keys && meta.keys[0];
+        renderGrid(t.host, r.columns, r.rows, pk ? {onRowClick: row => { t.selected = row; }} : {});
+        range();
+        ui.status(`${tableName}:共 ${t.total} 行`);
+        $('[data-do="prev"]', t.el).disabled = t.offset <= 0;
+        $('[data-do="next"]', t.el).disabled = t.offset + t.limit >= t.total;
+      } catch (e) { ui.toast(e.message, true); }
+    };
+    $('[data-do="refresh"]', t.el).onclick = t.load;
+    $('[data-do="prev"]', t.el).onclick = () => { t.offset = Math.max(0, t.offset - t.limit); t.load(); };
+    $('[data-do="next"]', t.el).onclick = () => { t.offset += t.limit; t.load(); };
+    $('[data-do="query"]', t.el).onclick = () => openQueryTab(`查询: ${tableName}`, `SELECT * FROM "${tableName}" LIMIT 200;`, true);
+    $('[data-do="drop"]', t.el).onclick = () => dropTable(tableName, () => tabs.close(t));
+    t.load();
+  });
 }
+
+/* ================= KV 键详情 ================= */
+const KV_TYPES = [['string','字符串'],['list','列表'],['hash','哈希'],['set','集合'],['zset','有序集合']];
+function kvTypeLabel(k) { const f = KV_TYPES.find(x => x[0] === k); return f ? f[1] : k; }
+
+function openKvTab(key) {
+  tabs.open('kv', 'kv:' + key, `键: ${key}`, (t) => {
+    t.el.innerHTML = `<div class="doc-bar">
+        <span class="title" data-kv-key></span>
+        <span class="meta" data-kv-type></span>
+        <span class="meta" data-kv-ttl></span>
+        <div class="spacer"></div>
+        <button data-do="refresh">刷新</button>
+        <button data-do="ttl">设置 TTL…</button>
+        <button data-do="persist">移除 TTL</button>
+        <button data-do="del" class="danger">删除键…</button>
+      </div><div class="kv-body" data-kv-body></div>`;
+    t.body = $('[data-kv-body]', t.el);
+    const cmd = async (command, args) => {
+      const r = await api.post('/api/kv', {command, args});
+      if (!r.ok) { ui.toast(`命令失败:${r.error}`, true); return null; }
+      return r;
+    };
+    t.load = async () => {
+      ui.status(`正在读取键 ${key}…`, 'busy');
+      try {
+        const d = await api.get('/api/kvkey?key=' + encodeURIComponent(key));
+        if (d.error) { t.body.innerHTML = `<div class="note">${esc(d.error)}</div>`; return; }
+        $('[data-kv-key]', t.el).textContent = d.key;
+        $('[data-kv-type]', t.el).innerHTML = `${kvIcon(d.type)} ${kvTypeLabel(d.type)}`;
+        $('[data-kv-ttl]', t.el).textContent = d.ttl_ms >= 0 ? `TTL ${(d.ttl_ms/1000).toFixed(1)}s` : 'TTL ∞';
+        renderKvBody(t, d);
+        ui.status(`键 ${key}(${kvTypeLabel(d.type)})`);
+      } catch (e) { ui.toast(e.message, true); }
+    };
+    $('[data-do="refresh"]', t.el).onclick = t.load;
+    $('[data-do="ttl"]', t.el).onclick = () => dialog('设置 TTL(秒)', [{name:'secs', label:'秒数', value:'60'}], '确定', async (v, err) => {
+      if (!v.secs || +v.secs <= 0) { err('请输入正整数'); throw new Error('cancel'); }
+      const r = await cmd('EXPIRE', [key, String(+v.secs * 1000)]);
+      if (r) { ui.toast(`TTL 已设置为 ${v.secs}s`); t.load(); explorer.refreshSoon(); }
+    });
+    $('[data-do="persist"]', t.el).onclick = async () => { const r = await cmd('PERSIST', [key]); if (r) { ui.toast('TTL 已移除'); t.load(); } };
+    $('[data-do="del"]', t.el).onclick = () => dialog('删除键', [{name:'name', label:'键名', value: key, ph:'输入键名以确认'}], '删除', async (v, err) => {
+      if (v.name !== key) { err('键名不匹配'); throw new Error('cancel'); }
+      const r = await cmd('DEL', [key]);
+      if (r) { ui.toast(`已删除键 ${key}`); explorer.refreshSoon(); tabs.close(t); }
+    });
+    t.load();
+  });
+}
+
+function renderKvBody(t, d) {
+  const body = t.body, v = d.value;
+  body.innerHTML = '';
+  const act = async (command, args, afterMsg) => {
+    const r = await api.post('/api/kv', {command, args});
+    if (!r.ok) { ui.toast(`命令失败:${r.error}`, true); return; }
+    if (afterMsg) ui.toast(afterMsg);
+    t.load(); explorer.refreshSoon();
+  };
+  if (v.kind === 'string') {
+    body.innerHTML = `<div class="kv-form"><span style="color:#777">字符串值</span><span class="spacer"></span></div>
+      <textarea class="kv-str-area" data-str>${esc(v.text)}</textarea>
+      <div class="kv-form"><button class="primary" data-save>保存(SET)</button></div>`;
+    $('[data-save]', body).onclick = () => act('SET', [d.key, $('[data-str]', body).value]);
+  } else if (v.kind === 'list') {
+    renderGrid(body, ['索引', '元素'], v.items.map((x, i) => [String(i), String(x)]));
+    const f = document.createElement('div'); f.className = 'kv-form';
+    f.innerHTML = `<input data-v placeholder="值"> <button data-lp>左推入 LPUSH</button> <button data-rp>右推入 RPUSH</button>
+      <button data-lo>左弹出 LPOP</button> <button data-ro>右弹出 RPOP</button> <span style="color:#777">长度 ${v.items.length}</span>`;
+    body.appendChild(f);
+    $('[data-lp]', f).onclick = () => { const x = $('[data-v]', f).value.trim(); if (x) act('LPUSH', [d.key, x], '已推入'); };
+    $('[data-rp]', f).onclick = () => { const x = $('[data-v]', f).value.trim(); if (x) act('RPUSH', [d.key, x], '已推入'); };
+    $('[data-lo]', f).onclick = () => act('LPOP', [d.key], '已弹出');
+    $('[data-ro]', f).onclick = () => act('RPOP', [d.key], '已弹出');
+  } else if (v.kind === 'hash') {
+    renderGrid(body, ['字段', '值'], v.fields.map(x => [x.field, x.value === null ? null : String(x.value)]));
+    const f = document.createElement('div'); f.className = 'kv-form';
+    f.innerHTML = `<input data-hf placeholder="字段" style="width:120px"> <input data-hv placeholder="值"> <button class="primary" data-hs>HSET</button>`;
+    body.appendChild(f);
+    $('[data-hs]', f).onclick = () => { const fd = $('[data-hf]', f).value.trim(), val = $('[data-hv]', f).value;
+      if (fd) act('HSET', [d.key, fd, val], '字段已保存'); };
+  } else if (v.kind === 'set') {
+    renderGrid(body, ['成员'], v.members.map(x => [String(x)]));
+    const f = document.createElement('div'); f.className = 'kv-form';
+    f.innerHTML = `<input data-sm placeholder="成员"> <button class="primary" data-sa>SADD 添加</button>`;
+    body.appendChild(f);
+    $('[data-sa]', f).onclick = () => { const x = $('[data-sm]', f).value.trim(); if (x) act('SADD', [d.key, x], '成员已添加'); };
+  } else if (v.kind === 'zset') {
+    renderGrid(body, ['成员', '分数'], v.pairs.map(p => [String(p[0]), p[1] === null ? null : String(p[1])]));
+    const f = document.createElement('div'); f.className = 'kv-form';
+    f.innerHTML = `<input data-zs placeholder="分数" style="width:90px"> <input data-zm placeholder="成员"> <button class="primary" data-za>ZADD</button>`;
+    body.appendChild(f);
+    $('[data-za]', f).onclick = () => { const s = $('[data-zs]', f).value.trim(), m = $('[data-zm]', f).value.trim();
+      if (s && m) act('ZADD', [d.key, s, m], '成员已添加'); };
+  } else {
+    body.innerHTML = `<div class="note">未知类型 ${esc(v.kind)}</div>`;
+  }
+}
+
+/* ================= 发布订阅监视器 ================= */
+function openPubTab() {
+  tabs.open('pub', 'pub', '发布订阅监视器', (t) => {
+    t.latest = 0;
+    t.el.innerHTML = `<div class="pub-wrap">
+      <div class="pub-left">
+        <div class="note">此监视器记录 <b>Web 控制台侧</b> 的发布事件(环形日志,最近 200 条)。
+          TCP 客户端的 SUBSCRIBE/PSUBSCRIBE 走协议端口(默认 7600),与本监视器相互独立。</div>
+        <h3 style="margin:4px 0 8px">发布消息</h3>
+        <div class="kv-form" style="flex-direction:column;align-items:stretch">
+          <input data-ch placeholder="频道名,如 orders" value="console">
+          <input data-ms placeholder="消息内容">
+          <button class="primary" data-pub>PUBLISH 发布</button>
+        </div>
+        <div style="color:#888;margin-top:14px">提示:发送 <code>kv</code> 命令
+          <code>PUBLISH 频道 消息</code> 也会记录到此监视器。</div>
+      </div>
+      <div class="pub-right"><div class="feed-item" style="color:#999"><span class="no">#</span><span class="ch">频道</span><span>消息(等待发布…)</span></div><div data-feed></div></div>
+    </div>`;
+    const feedEl = $('[data-feed]', t.el);
+    t.poll = async () => {
+      if (!t.el.classList.contains('active')) return;
+      try {
+        const d = await api.get('/api/events?after=' + t.latest);
+        for (const e of d.events) {
+          const row = document.createElement('div'); row.className = 'feed-item';
+          const time = new Date(e.at_ms).toLocaleTimeString('zh-CN', {hour12: false});
+          row.innerHTML = `<span class="no">${e.seq}</span><span class="ch" title="${esc(e.channel)}">${esc(e.channel)}</span><span>${esc(e.message)}</span><span style="color:#bbb;margin-left:auto">${time}</span>`;
+          feedEl.prepend(row);
+          t.latest = Math.max(t.latest, e.seq);
+        }
+      } catch (e) { /* 下轮重试 */ }
+    };
+    $('[data-pub]', t.el).onclick = async () => {
+      const ch = $('[data-ch]', t.el).value.trim(), ms = $('[data-ms]', t.el).value;
+      if (!ch) { ui.toast('请填写频道名', true); return; }
+      try { await api.post('/api/publish', {channel: ch, message: ms}); $('[data-ms]', t.el).value = ''; t.poll(); }
+      catch (e) { ui.toast(e.message, true); }
+    };
+    t.timer = setInterval(t.poll, 2000);
+    t.onActivate = t.poll;
+    t.onClose = () => clearInterval(t.timer);
+    t.poll();
+  });
+}
+
+/* ================= 仪表盘 ================= */
+function openDashboard() {
+  tabs.open('dash', 'dash', '服务器仪表盘', (t) => {
+    t.el.innerHTML = `<div class="dash">
+      <h2>docsql 服务器仪表盘</h2>
+      <div class="sub">多模数据库 · 文档存储 + SQL + KV + 发布订阅 · 管理控制台 v1.0(SSMS 风格)</div>
+      <div class="dash-actions">
+        <button class="primary" data-do="newq">新建查询</button>
+        <button data-do="refresh">刷新</button>
+      </div>
+      <div class="cards" data-cards></div>
+      <h3 style="margin-top:20px">KV 存储分布</h3><div class="chips" data-kvchips></div>
+    </div>`;
+    $('[data-do="newq"]', t.el).onclick = () => openQueryTab();
+    $('[data-do="refresh"]', t.el).onclick = t.load;
+    t.load = async () => {
+      try {
+        const m = await api.get('/api/meta');
+        const s = m.storage, sv = m.server;
+        const cards = [
+          [`${m.totals.tables}<small> 张</small>`, '用户表'],
+          [`${m.totals.rows}<small> 行</small>`, '表数据总行数'],
+          [`${m.kv.total}<small> 个</small>`, 'KV 键(未过期)'],
+          [`${s.num_pages}<small> 页 × ${s.page_size / 1024}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, '已分配页'],
+          [`${fmtBytes(s.db_bytes)}<small> / WAL ${fmtBytes(s.wal_bytes)}</small>`, '数据文件 / WAL'],
+          [`${fmtDur(sv.uptime_ms)}<small> · v${sv.version}</small>`, '服务运行时长 · 版本'],
+        ];
+        $('[data-cards]', t.el).innerHTML = cards.map(c => `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('');
+        $('[data-kvchips]', t.el).innerHTML = Object.entries(m.kv.by_type).map(([k, n]) =>
+          `<span class="chip">${kvIcon(k)} ${kvTypeLabel(k)} <b>${n}</b></span>`).join('') || '<span style="color:#999">暂无键</span>';
+      } catch (e) { ui.toast(e.message, true); }
+    };
+    t.load();
+  });
+}
+
+/* ================= 对象资源管理器 ================= */
+const explorer = {
+  meta: null, keys: null, expanded: new Set(['tables']), selPath: null,
+  _timer: null,
+  async refresh() {
+    try {
+      this.meta = await api.get('/api/meta');
+      this.keys = await api.get('/api/keys?limit=5000');
+      this.render();
+      $('#st-server').textContent = `docsql v${this.meta.server.version} · ${this.meta.totals.tables} 表 · ${this.meta.kv.total} KV 键`;
+    } catch (e) { ui.toast('刷新失败:' + e.message, true); }
+  },
+  refreshSoon() { clearTimeout(this._timer); this._timer = setTimeout(() => this.refresh(), 250); },
+
+  node(path, icon, labelHTML, opts) {
+    opts = opts || {};
+    const children = opts.children ? `<div class="tchildren${this.expanded.has(path) ? '' : ' collapsed'}" data-ch="${esc(path)}"></div>` : '';
+    const twist = opts.children ? `<span class="twist">${this.expanded.has(path) ? '▼' : '▶'}</span>` : '<span class="twist"></span>';
+    return `<div class="tnode${this.selPath === path ? ' sel' : ''}" data-path="${esc(path)}" data-kind="${esc(opts.kind || '')}" data-name="${esc(opts.name || '')}" data-more="${esc(opts.more || '')}">
+      ${twist}<span class="tico">${icon}</span><span class="tlabel">${labelHTML}</span></div>${children}`;
+  },
+
+  render() {
+    const m = this.meta, k = this.keys;
+    if (!m) return;
+    const host = location.host || 'localhost';
+    const branch = [];
+    branch.push(['server', ICONS.server, `<b>${esc(host)}</b> <span class="cnt">docsql v${m.server.version}</span>`, {}]);
+
+    // 表
+    const tablesInner = m.tables.map(t =>
+      this.node('table:' + t.name, ICONS.table, `${esc(t.name)} <span class="cnt">(${t.row_count})</span>`,
+        {kind: 'table', name: t.name, more: t.row_count, children: true}));
+    branch.push(['tables', ICONS.folder, `表 <span class="cnt">(${m.totals.tables})</span>`, {kind: 'tables', children: true}]);
+
+    // KV
+    const byType = {};
+    (k.keys || []).forEach(e => { (byType[e.type] = byType[e.type] || []).push(e); });
+    const kvInner = KV_TYPES.map(([tk, tl]) => {
+      const keys = byType[tk] || [];
+      return this.node('kvtype:' + tk, kvIcon(tk), `${tl} <span class="cnt">(${keys.length})</span>`,
+        {kind: 'kvtype', name: tk, children: true});
+    }).join('');
+    branch.push(['kv', ICONS.folder, `KV 存储 <span class="cnt">(${k.total})</span>`, {kind: 'kv', children: true}]);
+
+    // 发布订阅
+    branch.push(['pub', ICONS.pub, `发布订阅 <span class="cnt">(监视器)</span>`, {kind: 'pub'}]);
+
+    // 系统视图
+    branch.push(['sys', ICONS.folder, '系统视图', {kind: 'sys', children: true}]);
+
+    const tree = $('#tree');
+    tree.innerHTML = branch.map(([path, icon, label, opts]) => this.node(path, icon, label, opts)).join('');
+
+    // 填充已展开分支
+    if (this.expanded.has('tables')) {
+      $(`[data-ch="tables"]`, tree).innerHTML = tablesInner.join('') || '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无表)</span></div>';
+      m.tables.forEach(t => {
+        const p = 'table:' + t.name;
+        if (!this.expanded.has(p)) return;
+        const cols = t.columns.map(c => {
+          const badges = [c.primary_key ? '<span class="badge">PK</span>' : '', c.unique ? '<span class="badge">UQ</span>' : '',
+                          !c.nullable ? '<span class="badge">NN</span>' : '', c.autoinc ? '<span class="badge">AI</span>' : ''].join('');
+          return this.node('col:' + t.name + '.' + c.name, c.primary_key ? ICONS.key : ICONS.column,
+            `${esc(c.name)}${badges}`, {kind: 'column', name: c.name, more: t.name});
+        }).join('');
+        const idxs = t.indexes.length ? t.indexes.map(i =>
+          this.node('idx:' + t.name + '.' + i, ICONS.index, esc(i), {kind: 'index', name: i, more: t.name})).join('')
+          : '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无索引)</span></div>';
+        const keys = t.keys.length ? t.keys.map(kk =>
+          this.node('key:' + t.name + '.' + kk, ICONS.key, esc(kk), {kind: 'key', name: kk, more: t.name})).join('')
+          : '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无键)</span></div>';
+        const el = $(`[data-ch="${CSS.escape(p)}"]`, tree);
+        if (el) el.innerHTML =
+          this.node(p + '/columns', ICONS.folder, `列 <span class="cnt">(${t.columns.length})</span>`, {children: true}) +
+          this.node(p + '/indexes', ICONS.folder, `索引 <span class="cnt">(${t.indexes.length})</span>`, {children: true}) +
+          this.node(p + '/keys', ICONS.folder, `键 <span class="cnt">(${t.keys.length})</span>`, {children: true});
+        const cEl = $(`[data-ch="${CSS.escape(p + '/columns')}"]`, tree); if (cEl) cEl.innerHTML = cols;
+        const iEl = $(`[data-ch="${CSS.escape(p + '/indexes')}"]`, tree); if (iEl) iEl.innerHTML = idxs;
+        const kEl = $(`[data-ch="${CSS.escape(p + '/keys')}"]`, tree); if (kEl) kEl.innerHTML = keys;
+      });
+    }
+    if (this.expanded.has('kv')) {
+      const el = $('[data-ch="kv"]', tree); if (el) el.innerHTML = kvInner;
+      KV_TYPES.forEach(([tk]) => {
+        if (!this.expanded.has('kvtype:' + tk)) return;
+        const el2 = $(`[data-ch="kvtype:${tk}"]`, tree);
+        if (!el2) return;
+        const keys = (byType[tk] || []);
+        el2.innerHTML = keys.map(e => this.node('key:' + e.key, kvIcon(tk),
+          `${esc(e.key)}${e.ttl_ms >= 0 ? '<span class="ttl-flag" title="TTL ' + Math.round(e.ttl_ms / 1000) + 's">⏳</span>' : ''}`,
+          {kind: 'kvkey', name: e.key, more: tk})).join('') ||
+          '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无键)</span></div>';
+      });
+    }
+    if (this.expanded.has('sys')) {
+      const sysViews = [
+        ['_kv', 'KV 系统表(键/类型/值/过期)'],
+        ['information_schema.tables', '表清单(名称/页数)'],
+        ['information_schema.columns', '列清单(可空性/类型)'],
+        ['sqlite_master', 'SQLite 兼容视图'],
+      ];
+      const el = $('[data-ch="sys"]', tree);
+      if (el) el.innerHTML = sysViews.map(([n, d]) =>
+        this.node('sys:' + n, ICONS.view, `${esc(n)} <span class="cnt" title="${esc(d)}">—</span>`, {kind: 'sysview', name: n})).join('');
+    }
+  },
+
+  tableMeta(name) { return this.meta && this.meta.tables.find(t => t.name === name); },
+
+  /* 交互绑定(事件委托) */
+  bind() {
+    const tree = $('#tree');
+    const hasChildren = (node) => node.nextElementSibling && node.nextElementSibling.dataset.ch !== undefined;
+    const toggle = (node) => {
+      const path = node.dataset.path;
+      if (this.expanded.has(path)) this.expanded.delete(path); else this.expanded.add(path);
+      this.render();
+    };
+    tree.addEventListener('click', (e) => {
+      const node = e.target.closest('.tnode[data-path]');
+      if (!node) return;
+      const kind = node.dataset.kind;
+      this.selPath = node.dataset.path;
+      $$('.tnode').forEach(n => n.classList.remove('sel'));
+      node.classList.add('sel');
+      // SSMS 语义:单击箭头折叠/展开;单击标签仅选中(双击再触发打开)
+      if (e.target.closest('.twist') && hasChildren(node)) toggle(node);
+      else if (kind === 'pub') openPubTab();
+    });
+    tree.addEventListener('dblclick', (e) => {
+      const node = e.target.closest('.tnode[data-path]');
+      if (!node) return;
+      const kind = node.dataset.kind, name = node.dataset.name;
+      if (kind === 'table') openDataTab(name, explorer.tableMeta(name));
+      else if (kind === 'kvkey') openKvTab(name);
+      else if (kind === 'sysview') openQueryTab(`查询: ${name}`, `SELECT * FROM ${name} LIMIT 100;`, true);
+      else if (hasChildren(node)) toggle(node);
+    });
+    tree.addEventListener('contextmenu', (e) => {
+      const node = e.target.closest('.tnode[data-path]');
+      if (!node) { ctx.close(); return; }
+      e.preventDefault();
+      this.selPath = node.dataset.path;
+      this.menuFor(node.dataset.kind, node.dataset.name, node.dataset.more, e.clientX, e.clientY);
+    });
+  },
+
+  menuFor(kind, name, more, x, y) {
+    const q = (sql, title) => openQueryTab(title, sql, true);
+    if (kind === 'table') {
+      const m = this.tableMeta(name);
+      const ddl = m ? this.createScript(m) : '';
+      ctx.open([
+        {id: 'newq', label: '新建查询', kbd: 'Ctrl+N', act: () => openQueryTab(`查询: ${name}`)},
+        {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${name}" LIMIT 1000;`, `查询: ${name}`)},
+        {id: 'data', label: '查看数据(编辑前 200 行)', act: () => openDataTab(name, m)},
+        '-',
+        {id: 'creategen', label: '编写表脚本为 CREATE TO →', act: () => openQueryTab(`脚本: ${name}`, ddl)},
+        {id: 'dropgen', label: '编写表脚本为 DROP TO →', act: () => openQueryTab(`脚本: ${name}`, `-- 删除表 ${name}\nDROP TABLE IF EXISTS "${name}";`)},
+        '-',
+        {id: 'drop', label: `删除表 ${name}…`, act: () => dropTable(name)},
+        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+      ], x, y);
+    } else if (kind === 'column' || kind === 'index' || kind === 'key' || kind === 'kvkey' || kind === 'sysview') {
+      ctx.open([
+        {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
+        ...(kind === 'kvkey' ? [
+          '-',
+          {id: 'open', label: '打开键值详情', act: () => openKvTab(name)},
+          {id: 'ttl', label: '设置 TTL…', act: () => dialog('设置 TTL(秒)', [{name:'secs', label:'秒数', value:'60'}], '确定', async (v, err) => {
+            if (!v.secs || +v.secs <= 0) { err('请输入正整数'); throw new Error('cancel'); }
+            const r = await api.post('/api/kv', {command: 'EXPIRE', args: [name, String(+v.secs * 1000)]});
+            if (r.ok) { ui.toast('TTL 已设置'); this.refresh(); } else ui.toast(r.error, true);
+          })},
+          {id: 'del', label: '删除键…', act: () => dialog('删除键', [{name:'name', label:'键名', value: name, ph:'输入键名以确认'}], '删除', async (v, err) => {
+            if (v.name !== name) { err('键名不匹配'); throw new Error('cancel'); }
+            const r = await api.post('/api/kv', {command: 'DEL', args: [name]});
+            if (r.ok) { ui.toast('已删除'); this.refresh(); } else ui.toast(r.error, true);
+          })},
+        ] : []),
+        ...(kind === 'sysview' ? [{id: 'sel', label: '选择前 100 行', act: () => q(`SELECT * FROM ${name} LIMIT 100;`, `查询: ${name}`)}] : []),
+      ], x, y);
+    } else if (kind === 'kvtype') {
+      ctx.open([
+        {id: 'newk', label: `新建${kvTypeLabel(name)}键…`, act: () => dialog(`新建${kvTypeLabel(name)}键`, [
+          {name: 'key', label: '键名', ph: '如 user:1'},
+          {name: 'val', label: '初始值', ph: name === 'string' ? '字符串值' : '(可留空,打开详情页再编辑)'},
+        ], '创建', async (v, err) => {
+          if (!v.key) { err('请填写键名'); throw new Error('cancel'); }
+          if (name === 'string') {
+            const r = await api.post('/api/kv', {command: 'SET', args: [v.key, v.val || '']});
+            if (!r.ok) { ui.toast(r.error, true); return; }
+          } else {
+            // 集合类型直接写入空集合结构(与 collections 层存储布局一致)
+            const empty = {list: '[]', hash: '{}', set: '[]', zset: '{}'}[name];
+            const escKey = v.key.replace(/'/g, "''");
+            const r = await api.post('/api/sql', {sql:
+              `INSERT INTO _kv ("key", type, value, expire_at) VALUES ('${escKey}', '${name}', '${empty}', 0)`});
+            if (r.kind === 'error') { ui.toast(r.message, true); return; }
+          }
+          ui.toast(`已创建键 ${v.key}`); this.refresh(); openKvTab(v.key);
+        })},
+        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+      ], x, y);
+    } else if (kind === 'tables') {
+      ctx.open([
+        {id: 'newq', label: '新建查询', act: () => openQueryTab()},
+        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+      ], x, y);
+    } else if (kind === 'kv') {
+      ctx.open([{id: 'refresh', label: '刷新', act: () => this.refresh()},
+        {id: 'all', label: '在查询中查看 _kv 表', act: () => openQueryTab('查询: _kv', 'SELECT "key", type, value, expire_at FROM _kv LIMIT 500;', true)}], x, y);
+    } else if (kind === 'pub') {
+      ctx.open([{id: 'open', label: '打开发布监视器', act: () => openPubTab()}], x, y);
+    } else if (kind === 'server') {
+      ctx.open([
+        {id: 'dash', label: '服务器仪表盘', act: () => openDashboard()},
+        {id: 'newq', label: '新建查询', act: () => openQueryTab()},
+        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+      ], x, y);
+    }
+  },
+
+  createScript(m) {
+    const cols = m.columns.map(c => {
+      let s = `  ${c.name} ANY`;
+      if (c.primary_key) s += ' PRIMARY KEY';
+      if (c.unique) s += ' UNIQUE';
+      if (!c.nullable) s += ' NOT NULL';
+      if (c.autoinc) s += ' AUTOINCREMENT';
+      return s;
+    }).join(',\n');
+    let s = `-- 表 ${m.name}(${m.row_count} 行,${m.pages} 页)\nCREATE TABLE ${m.name} (\n${cols}\n);`;
+    for (const i of m.indexes) s += `\nCREATE INDEX ${i} ON ${m.name} (${m.columns[0] ? m.columns[0].name : '*'});`;
+    return s;
+  }
+};
+
+/* ================= 全局事件 ================= */
+function execActive() { const t = tabs.activeQuery(); if (t) execQuery(t); else ui.toast('当前没有查询窗口'); }
+function parseActive() { const t = tabs.activeQuery(); if (t) parseQuery(t); }
+
+document.addEventListener('keydown', (e) => {
+  const inField = /INPUT|TEXTAREA/.test(document.activeElement.tagName);
+  if (e.key === 'F5') { e.preventDefault(); if (e.ctrlKey) parseActive(); else execActive(); }
+  else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); execActive(); }
+  else if (e.key === 'Escape') { ctx.close(); }
+  else if (!inField && (e.key === 'n' || e.key === 'N') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openQueryTab(); }
+  else if (!inField && (e.key === 'r' || e.key === 'R') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); explorer.refresh(); }
+});
+// Ctrl+F5 语义:浏览器会拦截部分场景,菜单/按钮同样可达
+$('#btn-exec').onclick = execActive;
+$('#btn-parse').onclick = parseActive;
+$('#btn-newq').onclick = () => openQueryTab();
+$('#btn-refresh').onclick = () => explorer.refresh();
+$('#exp-collapse').onclick = () => { explorer.expanded.clear(); explorer.render(); };
+
+$('#btn-connect').onclick = async () => {
+  api.token = $('#token').value.trim();
+  localStorage.setItem('docsql.token', api.token);
+  try {
+    await api.get('/api/meta');
+    ui.toast('连接成功');
+    explorer.refresh();
+  } catch (e) { ui.toast(e.message, true); }
+};
+$('#token').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-connect').click(); });
+
+/* 菜单栏 */
+$$('[data-menu] > span').forEach(sp => {
+  sp.onclick = (e) => { e.stopPropagation();
+    const menu = sp.parentElement;
+    const wasOpen = menu.classList.contains('open');
+    $$('[data-menu]').forEach(m => m.classList.remove('open'));
+    if (!wasOpen) menu.classList.add('open');
+  };
+  sp.onmouseenter = () => { if ($$('.menu.open').length) {
+    $$('[data-menu]').forEach(m => m.classList.remove('open')); sp.parentElement.classList.add('open'); } };
+});
+document.addEventListener('click', () => $$('[data-menu]').forEach(m => m.classList.remove('open')));
+$$('.menu-drop [data-act]').forEach(item => {
+  item.onclick = () => {
+    const act = item.dataset.act;
+    if (act === 'new-query') openQueryTab();
+    else if (act === 'close-tab') { if (tabs.active) tabs.close(tabs.active); }
+    else if (act === 'refresh') explorer.refresh();
+    else if (act === 'dashboard') openDashboard();
+    else if (act === 'open-kv') { explorer.expanded.add('kv'); explorer.refresh();
+      const kvKeys = tabs.list.find(t => t.kind === 'kv'); if (kvKeys) tabs.activate(kvKeys); }
+    else if (act === 'open-pub') openPubTab();
+    else if (act === 'about') dialog('关于 docsql Studio', [
+      {name:'a', label: '产品', value: 'docsql Studio — 多模数据库管理控制台(SSMS 风格) v1.0'},
+    ], '确定', async () => {});
+  };
+});
+
+/* ================= 启动 ================= */
+$('#token').value = api.token;
+explorer.bind();
+openDashboard();
+explorer.refresh();
 </script>
 </body>
 </html>

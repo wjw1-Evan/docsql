@@ -145,6 +145,11 @@ impl Wal {
         &self.path
     }
 
+    /// Current log size in bytes.
+    pub fn file_len(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
     fn append(&mut self, kind: u8, txid: u64, payload: &[u8]) -> Result<u64> {
         let lsn = self.next_lsn;
         let mut frame = Vec::with_capacity(9 + 1 + 8 + 4 + payload.len() + 4);
@@ -173,10 +178,25 @@ impl Wal {
     /// Commit: append Commit frame and fsync. After this call returns Ok,
     /// the transaction survives any crash.
     pub fn commit(&mut self, txid: u64) -> Result<u64> {
+        let lsn = self.commit_deferred(txid)?;
+        self.sync()?;
+        Ok(lsn)
+    }
+
+    /// Commit without fsync — durability arrives with the next `sync`
+    /// (used to batch an explicit BEGIN..COMMIT into one flush).
+    pub fn commit_deferred(&mut self, txid: u64) -> Result<u64> {
         let lsn = self.append(KIND_COMMIT, txid, &[])?;
-        self.file.sync_data()?;
         self.durable_lsn = self.durable_lsn.max(lsn);
         Ok(lsn)
+    }
+
+    /// Flush the log tail: every commit_deferred before this point is now
+    /// durable. Recovery only replays the fsynced prefix, so a crash before
+    /// sync simply drops those (uncommitted) transactions.
+    pub fn sync(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
     }
 
     pub fn abort(&mut self, txid: u64) -> Result<u64> {

@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Docsql.Client;
@@ -35,14 +36,18 @@ public readonly record struct Frame(FrameType Type, ushort Flags, ulong Topology
 
 public sealed class ProtocolConnection : IDisposable
 {
+    private const ushort FlagEncrypted = 0x0004;
+
     private readonly TcpClient _tcp;
     private readonly NetworkStream _stream;
     private readonly byte[] _header = new byte[20];
+    private readonly byte[]? _key;
 
-    public ProtocolConnection(string host, int port)
+    public ProtocolConnection(string host, int port, byte[]? key = null)
     {
         _tcp = new TcpClient(host, port);
         _stream = _tcp.GetStream();
+        _key = key;
     }
 
     /// SQL text payload: length-prefixed UTF-8, tag 4 (string).
@@ -58,9 +63,53 @@ public sealed class ProtocolConnection : IDisposable
 
     public Frame Send(Frame request)
     {
+        if (_key is not null)
+        {
+            request = request with
+            {
+                Flags = (ushort)(request.Flags | FlagEncrypted),
+                Payload = Seal(_key, request.Payload),
+            };
+        }
         _stream.Write(request.Encode());
         _stream.Flush();
         return ReadFrame();
+    }
+
+    /// <summary>AES-256-GCM:nonce(12) ‖ 密文 ‖ tag(16)。</summary>
+    private static byte[] Seal(byte[] key, byte[] plaintext)
+    {
+        var nonce = new byte[12];
+        RandomNumberGenerator.Fill(nonce);
+        using var gcm = new AesGcm(key, 16);
+        var ct = new byte[plaintext.Length];
+        var tag = new byte[16];
+        gcm.Encrypt(nonce, plaintext, ct, tag);
+        var sealed_ = new byte[12 + ct.Length + 16];
+        nonce.CopyTo(sealed_, 0);
+        ct.CopyTo(sealed_, 12);
+        tag.CopyTo(sealed_, 12 + ct.Length);
+        return sealed_;
+    }
+
+    private static byte[] Unseal(byte[] key, byte[] sealed_)
+    {
+        if (sealed_.Length < 12 + 16)
+            throw new DocsqlException("加密载荷过短");
+        var nonce = sealed_[..12];
+        var ct = sealed_[12..^16];
+        var tag = sealed_[^16..];
+        using var gcm = new AesGcm(key, 16);
+        var pt = new byte[ct.Length];
+        try
+        {
+            gcm.Decrypt(nonce, ct, tag, pt);
+        }
+        catch (CryptographicException)
+        {
+            throw new DocsqlException("解密失败(密钥错误或数据被篡改)");
+        }
+        return pt;
     }
 
     private Frame ReadFrame()
@@ -77,6 +126,12 @@ public sealed class ProtocolConnection : IDisposable
         int len = (int)BinaryPrimitives.ReadUInt32LittleEndian(_header.AsSpan(16, 4));
         var payload = new byte[len];
         ReadExact(payload);
+        if ((flags & FlagEncrypted) != 0)
+        {
+            if (_key is null)
+                throw new DocsqlException("服务端返回加密帧但客户端未配置 key");
+            payload = Unseal(_key, payload);
+        }
         return new Frame(type, flags, topo, payload);
     }
 
