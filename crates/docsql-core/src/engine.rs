@@ -47,6 +47,23 @@ pub enum ExecOutcome {
     Rows(QueryResult),
 }
 
+/// Transaction-control classification, used by servers to time replication:
+/// writes inside an open transaction must not reach peers until the
+/// transaction commits; a rollback discards them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxControl {
+    Begin,
+    Commit,
+    /// Plain ROLLBACK, or ROLLBACK TO SAVEPOINT when `savepoint` is set.
+    Rollback {
+        savepoint: Option<String>,
+    },
+    Savepoint(String),
+    Release(String),
+    /// Not transaction control.
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -613,11 +630,6 @@ impl Database {
         Ok(ExecOutcome::Affected(0))
     }
 
-    /// True when a session transaction is open.
-    pub fn in_transaction(&self) -> bool {
-        self.tx_snapshot.is_some()
-    }
-
     /// True when the statement mutates data (used by replicas to reject
     /// client writes while accepting replicated ones).
     pub fn is_write_statement(sql: &str) -> bool {
@@ -636,6 +648,30 @@ impl Database {
                 Some(_) => true,
             },
             Err(_) => true,
+        }
+    }
+
+    /// True when a session transaction is open.
+    pub fn in_transaction(&self) -> bool {
+        self.tx_snapshot.is_some()
+    }
+
+    /// Classify transaction-control statements, used by servers to time
+    /// replication: writes inside an open transaction must not reach peers
+    /// until the transaction commits; a rollback discards them.
+    pub fn tx_control(sql: &str) -> TxControl {
+        let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else {
+            return TxControl::None;
+        };
+        match stmts.first() {
+            Some(Statement::StartTransaction { .. }) => TxControl::Begin,
+            Some(Statement::Commit { .. }) => TxControl::Commit,
+            Some(Statement::Rollback { savepoint, .. }) => TxControl::Rollback {
+                savepoint: savepoint.as_ref().map(|i| i.value.clone()),
+            },
+            Some(Statement::Savepoint { name }) => TxControl::Savepoint(name.value.clone()),
+            Some(Statement::ReleaseSavepoint { name }) => TxControl::Release(name.value.clone()),
+            _ => TxControl::None,
         }
     }
 

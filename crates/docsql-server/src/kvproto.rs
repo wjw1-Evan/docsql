@@ -70,6 +70,9 @@ pub async fn handle(
     let (resp, sub, authed) = handle_inner(state, authed, &cmd, &rest).await;
 
     // Replicate successful KV mutations (skips replication-internal frames).
+    // Transaction control (MULTI/EXEC/DISCARD) is never forwarded — data
+    // commands inside the open engine transaction buffer until EXEC commits
+    // them, mirroring the SQL-side BEGIN/COMMIT/ROLLBACK timing.
     let is_replication = frame.flags & crate::FLAG_REPLICATION != 0;
     // Only a writable primary replicates (replicas skip; the replication
     // flag on forwarded frames prevents loops).
@@ -78,20 +81,16 @@ pub async fn handle(
         && !state.read_only.load(std::sync::atomic::Ordering::SeqCst)
         && resp.frame_type != docsql_core::proto::RESP_ERROR
     {
-        if let Some(target) = state.replicate_to.lock().await.clone() {
-            let mut fwd = frame.clone();
-            fwd.flags = crate::FLAG_REPLICATION;
-            if let Err(e) = crate::forward_frame(&target, &fwd, state.transport_key.as_ref()).await
-            {
-                eprintln!("kv replication to {target} failed: {e}");
-            }
-        }
-        // Symmetric cluster: fan the write out to every peer.
-        for peer in state.peers.lock().await.clone() {
-            let mut fwd = frame.clone();
-            fwd.flags = crate::FLAG_REPLICATION;
-            if let Err(e) = crate::forward_frame(&peer, &fwd, state.transport_key.as_ref()).await {
-                eprintln!("kv peer replication to {peer} failed: {e}");
+        match cmd.as_str() {
+            "MULTI" => {}
+            "EXEC" => crate::drain_tx_pending(state).await,
+            "DISCARD" => state.tx_pending.lock().await.clear(),
+            _ => {
+                if state.kv.lock().unwrap().db.in_transaction() {
+                    state.tx_pending.lock().await.frames.push(frame.clone());
+                } else {
+                    crate::forward_kv_all(state, frame).await;
+                }
             }
         }
     }

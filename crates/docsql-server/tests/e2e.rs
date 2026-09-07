@@ -485,6 +485,108 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
     );
 }
 
+/// Two-node symmetric cluster: transaction semantics must hold across
+/// replication — a rolled-back write never reaches the peer, committed
+/// transaction writes replay in order, and savepoint rollbacks trim exactly
+/// the buffered tail (SQL and KV alike).
+#[tokio::test]
+async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let addrs = vec![free(), free()];
+    for (i, addr) in addrs.iter().enumerate() {
+        let peers = addrs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, a)| a.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+            db_path: dir.path().join(format!("txpeer{i}.db")),
+            listen: addr.clone(),
+            auth_token: None,
+            replicate_to: None,
+            peers: peers.split(',').map(String::from).collect(),
+            read_only: false,
+            transport_key: None,
+            async_commit: false,
+        }));
+    }
+    for addr in &addrs {
+        for _ in 0..100 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    let mut a = Client::connect(&addrs[0]).await;
+    a.sql("CREATE TABLE txr (id INT)").await;
+    a.sql("INSERT INTO txr VALUES (1)").await;
+    assert!(
+        wait_seen(&addrs[1], "SELECT id FROM txr", "[[1]]").await,
+        "autocommit write did not replicate"
+    );
+
+    // Rolled-back transaction: the peer must never observe id=2.
+    a.sql("BEGIN").await;
+    a.sql("INSERT INTO txr VALUES (2)").await;
+    a.sql("ROLLBACK").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut b = Client::connect(&addrs[1]).await;
+    let resp = b.sql("SELECT id FROM txr WHERE id = 2").await;
+    assert_eq!(resp.frame_type, proto::RESP_ROWS);
+    assert!(
+        payload_str(&resp).contains("\"rows\":[]"),
+        "peer observed a rolled-back write: {}",
+        payload_str(&resp)
+    );
+
+    // Savepoints: writes past ROLLBACK TO SAVEPOINT stay local-only; the
+    // rest replays in order on commit.
+    a.sql("BEGIN").await;
+    a.sql("INSERT INTO txr VALUES (3)").await;
+    a.sql("SAVEPOINT sp").await;
+    a.sql("INSERT INTO txr VALUES (4)").await;
+    a.sql("ROLLBACK TO SAVEPOINT sp").await;
+    a.sql("INSERT INTO txr VALUES (5)").await;
+    let resp = a.sql("COMMIT").await;
+    assert_ne!(resp.frame_type, proto::RESP_ERROR);
+    assert!(
+        wait_seen(&addrs[1], "SELECT id FROM txr ORDER BY id", "[[1],[3],[5]]").await,
+        "committed transaction did not replicate (or savepoint leaked)"
+    );
+
+    // KV MULTI/DISCARD: buffered frames never reach the peer.
+    a.kv(&["MULTI"]).await;
+    a.kv(&["SET", "txk", "discarded"]).await;
+    a.kv(&["DISCARD"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let resp = b.kv(&["GET", "txk"]).await;
+    assert_ne!(
+        payload_str(&resp),
+        "discarded",
+        "peer observed a KV write from a discarded MULTI"
+    );
+
+    // KV MULTI/EXEC: the buffered write replays at commit time.
+    a.kv(&["MULTI"]).await;
+    a.kv(&["SET", "txk2", "committed"]).await;
+    let resp = a.kv(&["EXEC"]).await;
+    assert_ne!(resp.frame_type, proto::RESP_ERROR, "EXEC failed");
+    assert!(
+        wait_seen(&addrs[1], "KV GET txk2", "committed").await,
+        "KV transaction write did not replicate on EXEC"
+    );
+}
+
 /// Two real shards: KV keys route by hash slot and land deterministically.
 #[tokio::test]
 async fn shard_routing_distributes_kv_keys() {
