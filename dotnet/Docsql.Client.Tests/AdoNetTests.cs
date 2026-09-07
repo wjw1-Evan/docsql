@@ -21,7 +21,7 @@ public sealed class ServerFixture : IDisposable
         _proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
             FileName = exe,
-            Arguments = $"{tmp} 127.0.0.1:{Port}",
+            ArgumentList = { tmp, $"127.0.0.1:{Port}" },
             CreateNoWindow = true,
             RedirectStandardError = true,
         })!;

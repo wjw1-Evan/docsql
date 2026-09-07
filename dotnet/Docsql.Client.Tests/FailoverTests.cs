@@ -30,7 +30,7 @@ public sealed class NodeProcess : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = exe,
-            Arguments = $"{dbFile} 127.0.0.1:{port}",
+            ArgumentList = { dbFile, $"127.0.0.1:{port}" },
             CreateNoWindow = true,
             RedirectStandardError = true,
         };

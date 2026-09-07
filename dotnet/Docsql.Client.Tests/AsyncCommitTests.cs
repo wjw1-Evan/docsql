@@ -20,7 +20,7 @@ public sealed class AsyncCommitTests
         try { File.Delete(db); } catch { }
         var psi = new ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{db} 127.0.0.1:{port}",
+            FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true, RedirectStandardError = true,
         };
         psi.Environment["DOCSQL_ASYNC_COMMIT"] = "1";

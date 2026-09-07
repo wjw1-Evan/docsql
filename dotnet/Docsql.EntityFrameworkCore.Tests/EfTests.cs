@@ -61,7 +61,7 @@ public sealed class EfServerFixture : IDisposable
         Assert.True(File.Exists(exe), $"server binary not found at {exe}");
         _proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{tmp} 127.0.0.1:{Port}",
+            FileName = exe, ArgumentList = { tmp, $"127.0.0.1:{Port}" },
             CreateNoWindow = true, RedirectStandardError = true,
         })!;
         for (int i = 0; i < 100; i++)
@@ -697,7 +697,7 @@ public sealed class EfFailoverTests
         try { File.Delete(db); } catch { }
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{db} 127.0.0.1:{port}",
+            FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true, RedirectStandardError = true,
         };
         if (replicateTo is not null) psi.Environment["DOCSQL_REPLICATE_TO"] = replicateTo;
@@ -794,7 +794,7 @@ public sealed class EfSymmetricClusterTests
             try { File.Delete(db); } catch { }
             var psi = new ProcessStartInfo
             {
-                FileName = exe, Arguments = $"{db} 127.0.0.1:{port}",
+                FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
                 CreateNoWindow = true, RedirectStandardError = true,
             };
             psi.Environment["DOCSQL_PEERS"] = peers;
@@ -881,7 +881,7 @@ public sealed class EfTransactionTests
         try { File.Delete(db); } catch { }
         var proc = Process.Start(new ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{db} 127.0.0.1:{port}",
+            FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true, RedirectStandardError = true,
         })!;
         for (var i = 0; i < 100; i++)

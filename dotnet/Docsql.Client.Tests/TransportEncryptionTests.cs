@@ -30,7 +30,7 @@ public sealed class TlsServer : IDisposable
         try { File.Delete(db); } catch { }
         var psi = new ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{db} 127.0.0.1:{port}",
+            FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true, RedirectStandardError = true,
         };
         if (keyHex is not null) psi.Environment["DOCSQL_KEY"] = keyHex;
@@ -128,7 +128,7 @@ public sealed class TransportEncryptionTests
         var db = Path.Combine(Path.GetTempPath(), $"docsql-tlsb-{bPort}.db");
         var psi = new ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{db} 127.0.0.1:{bPort}",
+            FileName = exe, ArgumentList = { db, $"127.0.0.1:{bPort}" },
             CreateNoWindow = true, RedirectStandardError = true,
         };
         psi.Environment["DOCSQL_KEY"] = TlsServer.KeyHex;

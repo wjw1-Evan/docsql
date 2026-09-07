@@ -20,7 +20,7 @@ public sealed class QueryLogTests
         try { File.Delete(db); File.Delete(logFile); } catch { }
         var psi = new ProcessStartInfo
         {
-            FileName = exe, Arguments = $"{db} 127.0.0.1:{port}",
+            FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true, RedirectStandardError = true,
         };
         psi.Environment["DOCSQL_LOG_FILE"] = logFile;

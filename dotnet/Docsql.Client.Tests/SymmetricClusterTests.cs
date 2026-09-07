@@ -30,7 +30,7 @@ public sealed class PeerNode : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = exe,
-            Arguments = $"{db} 127.0.0.1:{port}",
+            ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true,
             RedirectStandardError = true,
         };
