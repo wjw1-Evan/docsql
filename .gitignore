@@ -11,3 +11,9 @@ bin/obj
 **/obj/
 .DS_Store
 .playwright-mcp/
+
+# deploy/.env holds the production DOCSQL_TOKEN secret (template: .env.example)
+deploy/.env
+
+# mimosa security-scan artifacts
+.mimosa/

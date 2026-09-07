@@ -13,6 +13,7 @@ docsql 是一个原生多模数据库,用 Rust 实现:
 - **Web 管理控制台**:docsql Studio(SSMS 风格)
 - **.NET 生态**:ADO.NET 提供程序 + EF Core 提供程序
 - **集群**:主从复制、只读副本、PROMOTE 故障转移、16384 哈希槽分片
+- **运行环境**:仅 Docker(镜像由 GitHub Actions 自动构建发布到 GHCR)
 
 代码规模约 1.8 万行 Rust + .NET 客户端栈。
 
@@ -27,7 +28,8 @@ crates/
   docsql-cli/           # 嵌入式 shell 与远程客户端
   docsql-web/           # Web 控制台(REST API + 内嵌单页 UI)
 dotnet/                 # Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、测试与示例
-deploy/                 # Dockerfile、docker-compose.yml、多节点测试脚本
+deploy/                 # docker-compose.yml(本地开发,源码构建)、docker-compose.prod.yml(生产,GHCR 镜像)、多节点测试脚本
+.github/workflows/      # CI:cargo/dotnet 测试 → 构建多架构镜像发布 GHCR → 部署测试
 target/                 # 构建产物(git 忽略)
 ```
 
@@ -82,28 +84,33 @@ target/                 # 构建产物(git 忽略)
 
 ## 3. 构建与运行
 
+**运行环境统一为 Docker**:镜像由 GitHub Actions 自动构建并发布到 `ghcr.io/wjw1-evan/docsql`(`.github/workflows/docker-image.yml`,push 到 `main` / `v*` 标签触发;`latest`、`main`、`v1.2.3`、`sha-*` 等标签)。
+
 ```bash
-cargo build --workspace
-cargo test --workspace          # Rust 全量测试
-cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二进制)
+# 单节点部署(compose `single` profile:独立节点 :17600 + web 控制台 :17710)
+cd deploy && docker compose --profile single up -d --build         # 本地开发(源码构建,:local)
+cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d   # 生产(GHCR 镜像)
 
-# 嵌入式 shell
-cargo run -p docsql-cli -- :memory:
+# 多节点部署(compose `cluster` profile:3 节点对等集群 :17601-17603 + web :17700)
+cd deploy && docker compose --profile cluster up -d --build        # 本地开发
+cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d  # 生产(配置见 .env.example)
 
-# 服务器 + 远程 shell
-./target/debug/docsql-server my.db 127.0.0.1:7600 &
-./target/debug/docsql-cli connect 127.0.0.1:7600
+# 停止与清理(带相同 profile 参数)
+cd deploy && docker compose --profile single --profile cluster down -v
 
-# Web 控制台
-./target/debug/docsql-web my.db 127.0.0.1:7700
-DOCSQL_TOKEN=secret ./target/debug/docsql-web my.db 127.0.0.1:7700   # 开启认证
-
-# Docker 多节点集群(主 17601 / 副本 17602 / 分片 17603 / web 17700)
-./deploy/run-tests.sh           # 一键:重建集群 + 多节点部署测试
-cd deploy && docker compose up -d
+# 本地改动后的部署验证:本地构建镜像(内置全量 cargo test 门禁)+ 42 项部署测试
+./deploy/run-tests.sh            # 多节点 24 项 + 单节点 18 项;或 DOCSQL_IMAGE_TAG=<已有tag> 跳过构建
 ```
 
-环境变量:`DOCSQL_TOKEN`(web/server 认证)、`DOCSQL_PEERS`(对称集群节点表;注意当前为对称集群、无反熵追赶,新加入副本不会自动补历史数据)。
+开发门禁(仅测试,不作为产品运行方式):
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cd dotnet && dotnet test         # 需先 cargo build 出 server 二进制
+```
+
+环境变量:`DOCSQL_TOKEN`(web/server 认证)、`DOCSQL_PEERS`(对称集群节点表;注意当前为对称集群、无反熵追赶,新加入副本不会自动补历史数据)、`DOCSQL_IMAGE_TAG`(compose 使用的镜像标签)。
 
 ## 4. 测试与门禁
 
@@ -120,8 +127,9 @@ cargo test --workspace
 - **单元/内核**:core 的 pager/WAL/B+树/engine 各模块内测试
 - **SQL 集成 / KV 语义 / 协议**:各 crate tests
 - **端到端**:`crates/docsql-server/tests/e2e.rs`
-- **多节点部署**:Docker compose 内 24 项测试(构建期内置全量 cargo test 门禁),改动部署/复制相关逻辑后跑 `./deploy/run-tests.sh`;重部署用 `docker compose down -v` 清卷后再 up,避免旧状态干扰
+- **多节点部署**:Docker compose 内 24 项测试(CI 对 main 分支在镜像发布后执行;本地跑 `./deploy/run-tests.sh` 会先构建带测试门禁的本地镜像),改动部署/复制相关逻辑后必跑;重部署用 `docker compose down -v` 清卷后再 up,避免旧状态干扰
 - **.NET**:`dotnet test`(ADO.NET 合规 + EF Core CRUD/LINQ/Include)
+- **CI**(`.github/workflows/docker-image.yml`,push/PR 触发):上述三门禁 + `dotnet test` → 构建多架构镜像(amd64/arm64,`RUN_TESTS=false` 因测试已原生跑过)发布到 `ghcr.io/wjw1-evan/docsql` → main 分支另加载 amd64 镜像跑同一套部署测试
 
 注意:`deploy` 相关 API 有兼容性钉子(部署测试脚本断言固定接口),改 REST/协议字段前先同步 `deploy/multinode-test.sh`。
 
@@ -164,6 +172,8 @@ cargo test --workspace
 
 - 分支:小步提交在 `main`;里程碑式提交信息格式见 git log(如 `M16: ...`、`Engine milestones: ...`)
 - 提交前:第 4 节三门禁 + 相关 dotnet 测试
+- **最后一步:提交并推送源码**(`git push`;443 间歇阻断时用 `git -c http.version=HTTP/1.1 push` 重试)——push 即触发 CI
+- push 到 GitHub 后 CI 自动执行:三门禁 + dotnet 测试 → 构建多架构镜像发布 `ghcr.io/wjw1-evan/docsql` → main 分支跑部署测试;CI 失败等同门禁失败
 - 改动跨复制/分片时:本地 e2e 之外必须跑 `./deploy/run-tests.sh`(先 `docker compose down -v`)
 - 改协议/REST 字段:同步更新 `deploy/multinode-test.sh` 的兼容性断言与 dotnet 客户端
 - 文档:用户可见行为更新 README,开发向内容更新本文件

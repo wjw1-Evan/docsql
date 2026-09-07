@@ -1,17 +1,19 @@
-# Local development deployment: builds the image from source (Dockerfile at
-# the repo root, full cargo test gate inside the build) and tags it
-# ghcr.io/wjw1-evan/docsql:local. Two topologies via compose profiles:
+# Production deployment: CI-published image ghcr.io/wjw1-evan/docsql — no
+# local build, auto-restart on failure, bounded logs. Two topologies via
+# compose profiles:
 #
-#   docker compose --profile single up -d    # 1 standalone node (:17600) + web (:17710)
-#   docker compose --profile cluster up -d   # 3 symmetric peers + web (see below)
-#   docker compose --profile single --profile cluster up -d   # both at once
+#   docker compose -f docker-compose.prod.yml --profile single up -d
+#   docker compose -f docker-compose.prod.yml --profile cluster up -d
 #
-# Tear down with the same profile flags: docker compose --profile ... down -v
-# Set DOCSQL_IMAGE_TAG to run against an existing image instead of building.
+# Configure via deploy/.env (see .env.example):
+#   DOCSQL_IMAGE_TAG  image tag (default: latest; pin a released version for
+#                     reproducible deploys, e.g. v1.0.0)
+#   DOCSQL_TOKEN      web console auth token (empty = no auth)
 #
-# Production deployment (CI-published image, no local build) — same two
-# profiles:
-#   docker compose -f docker-compose.prod.yml --profile single|cluster up -d
+#   cp .env.example .env && edit, then pick a profile and up -d.
+#
+# Dev vs prod share host ports (17600-17603, 17700, 17710): run only one of
+# them at a time and `down -v` before switching.
 services:
   # ---- profile: cluster ------------------------------------------------
   # Symmetric cluster: every node is equal — accepts writes and fans each
@@ -19,11 +21,8 @@ services:
   # primary/replica role; connect to any node to read and write.
   node-a:
     profiles: ["cluster"]
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
-    container_name: docsql-a
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-a
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-b:7600,node-c:7600"
@@ -32,16 +31,20 @@ services:
     volumes:
       - peer-a-data:/data
     networks: [docsql]
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "docsql-cli connect node-a:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   node-b:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
-    container_name: docsql-b
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-b
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
@@ -53,16 +56,20 @@ services:
     depends_on:
       node-a:
         condition: service_started
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "docsql-cli connect node-b:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   node-c:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
-    container_name: docsql-c
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-c
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
@@ -74,19 +81,26 @@ services:
     depends_on:
       node-a:
         condition: service_started
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "docsql-cli connect node-c:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   # Web console (embedded engine on its own volume; REST + UI on :7700).
+  # Set DOCSQL_TOKEN in .env to require auth for the console and REST API.
   node-web:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
-    container_name: docsql-web
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-web
     command: ["/data/docsql.db", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
+    environment:
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
       - "17700:7700"
     volumes:
@@ -95,36 +109,42 @@ services:
     depends_on:
       node-a:
         condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   # ---- profile: single -------------------------------------------------
-  # One standalone database node: no DOCSQL_PEERS, no replication — reads
-  # and writes stay local. Its own web console on :17710 so both profiles
-  # can run side by side.
+  # One standalone database node: no DOCSQL_PEERS, no replication. Own web
+  # console on :17710 so both profiles can run side by side.
   node-single:
     profiles: ["single"]
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
-    container_name: docsql-single
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     ports:
       - "17600:7600"
     volumes:
       - single-data:/data
     networks: [docsql]
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "docsql-cli connect node-single:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   node-web-single:
     profiles: ["single"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
-    container_name: docsql-web-single
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-web-single
     command: ["/data/docsql.db", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
+    environment:
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
       - "17710:7700"
     volumes:
@@ -133,6 +153,10 @@ services:
     depends_on:
       node-single:
         condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
 volumes:
   peer-a-data:
