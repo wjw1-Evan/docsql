@@ -475,4 +475,50 @@ mod tests {
         assert_eq!(&page[20..23], b"BBB");
         assert_eq!(&page[0..10], &[0u8; 10]);
     }
+    // ---- 覆盖率补充:坏头 / 越界写 / 元信息 ----
+
+    #[test]
+    fn corrupt_header_rejected() {
+        let (_dir, path) = tmp_db("bad.db");
+        std::fs::write(&path, vec![0u8; PAGE_SIZE]).unwrap();
+        assert!(matches!(Pager::open(&path), Err(PagerError::BadHeader)));
+    }
+
+    #[test]
+    fn out_of_range_write_and_meta() {
+        let (_dir, path) = tmp_db("meta.db");
+        let mut pager = Pager::open(&path).unwrap();
+        assert_eq!(pager.path(), path.as_path());
+        // 未分配页的写入被拒
+        let mut tx = pager.begin_tx();
+        let e = pager.write_page(&mut tx, 999, 0, b"x").unwrap_err();
+        assert!(matches!(e, PagerError::OutOfRange(..)), "{e:?}");
+        // 页内越界
+        let p = pager.allocate_page(&mut tx).unwrap();
+        let e = pager
+            .write_page(&mut tx, p, PAGE_SIZE - 1, b"toolong")
+            .unwrap_err();
+        assert!(matches!(e, PagerError::OutOfRange(..)));
+        pager.commit_tx(tx).unwrap();
+        pager.sync().unwrap();
+    }
+    #[test]
+    fn many_pages_commit_and_reopen() {
+        let (_dir, path) = tmp_db("many.db");
+        let mut pager = Pager::open(&path).unwrap();
+        for batch in 0..3 {
+            let mut tx = pager.begin_tx();
+            for i in 0..120u32 {
+                let p = pager.allocate_page(&mut tx).unwrap();
+                pager
+                    .write_page(&mut tx, p, 0, format!("batch{batch}-page{i}").as_bytes())
+                    .unwrap();
+            }
+            pager.commit_tx(tx).unwrap();
+        }
+        let mut reopened = Pager::open(&path).unwrap();
+        assert!(reopened.num_pages() >= 360);
+        let page = reopened.read_page(200).unwrap();
+        assert!(!page.is_empty());
+    }
 }

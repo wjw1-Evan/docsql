@@ -220,10 +220,13 @@ dependencies = [
  "axum",
  "docsql-core",
  "docsql-kv",
+ "http",
+ "http-body-util",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]

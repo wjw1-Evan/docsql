@@ -948,4 +948,663 @@ mod tests {
         }
         assert_eq!(log.since(0).len(), EVENT_LOG_CAP);
     }
+
+    // ---- Router-level integration tests (one-shot requests) ----
+
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_app(token: Option<String>) -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Kv::open(&dir.path().join("t.db")).unwrap();
+        let state = Arc::new(WebState {
+            kv: Mutex::new(kv),
+            token,
+            db_path: dir.path().join("t.db"),
+            started: Instant::now(),
+            events: Mutex::new(EventLog::default()),
+        });
+        let app = Router::new()
+            .route("/", get(index))
+            .route("/api/sql", post(api_sql))
+            .route("/api/parse", post(api_parse))
+            .route("/api/meta", get(api_meta))
+            .route("/api/keys", get(api_keys))
+            .route("/api/kvkey", get(api_kvkey))
+            .route("/api/kv", post(api_kv))
+            .route("/api/stats", get(api_stats))
+            .route("/api/publish", post(api_publish))
+            .route("/api/events", get(api_events))
+            .with_state(state);
+        (app, dir)
+    }
+
+    async fn json_req(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            b = b.header("X-Docsql-Token", t);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                b.header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let code = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (code, v)
+    }
+
+    #[tokio::test]
+    async fn index_serves_console_html() {
+        let (app, _d) = test_app(None);
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("docsql console"));
+    }
+
+    #[tokio::test]
+    async fn sql_parse_meta_stats_endpoints_work() {
+        let (app, _d) = test_app(None);
+        // SQL: DDL, DML, rows, error
+        let (c, v) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            None,
+            serde_json::json!({"sql": "CREATE TABLE t (id INT PRIMARY KEY)"}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["kind"], "affected");
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            None,
+            serde_json::json!({"sql": "INSERT INTO t VALUES (1),(2)"}),
+        )
+        .await;
+        assert_eq!(v["count"], 2);
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            None,
+            serde_json::json!({"sql": "SELECT id FROM t ORDER BY id"}),
+        )
+        .await;
+        assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            None,
+            serde_json::json!({"sql": "SELECT * FROM nope"}),
+        )
+        .await;
+        assert_eq!(v["kind"], "error");
+
+        // Parse check
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/parse",
+            None,
+            serde_json::json!({"sql": "SELECT 1"}),
+        )
+        .await;
+        assert_eq!(v["ok"], true);
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/parse",
+            None,
+            serde_json::json!({"sql": "SELEC 1"}),
+        )
+        .await;
+        assert_eq!(v["ok"], false);
+
+        // Meta
+        let (c, v) = json_req(&app, "GET", "/api/meta", None, serde_json::Value::Null).await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["totals"]["tables"], 1);
+        assert_eq!(v["totals"]["rows"], 2);
+
+        // Stats
+        let (c, v) = json_req(&app, "GET", "/api/stats", None, serde_json::Value::Null).await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["tables"], 1);
+        assert_eq!(v["page_size"], 4096);
+        assert!(v["uptime_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn token_required_when_configured() {
+        let (app, _d) = test_app(Some("secret".into()));
+        let (c, _) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            None,
+            serde_json::json!({"sql": "SELECT 1"}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::UNAUTHORIZED);
+        let (c, _) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            Some("wrong"),
+            serde_json::json!({"sql": "SELECT 1"}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::UNAUTHORIZED);
+        for (m, uri) in [
+            ("GET", "/api/meta"),
+            ("GET", "/api/keys"),
+            ("GET", "/api/kvkey?key=x"),
+            ("GET", "/api/stats"),
+            ("GET", "/api/events"),
+        ] {
+            let (c, _) = json_req(&app, m, uri, None, serde_json::Value::Null).await;
+            assert_eq!(c, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        let (c, _) = json_req(
+            &app,
+            "POST",
+            "/api/publish",
+            None,
+            serde_json::json!({"channel":"c","message":"m"}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::UNAUTHORIZED);
+        let (c, _) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"PING","args":[]}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::UNAUTHORIZED);
+        // Correct token passes
+        let (c, _) = json_req(
+            &app,
+            "POST",
+            "/api/sql",
+            Some("secret"),
+            serde_json::json!({"sql": "SELECT 1"}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn keys_browser_filters_and_limits() {
+        let (app, _d) = test_app(None);
+        for i in 0..5 {
+            json_req(
+                &app,
+                "POST",
+                "/api/kv",
+                None,
+                serde_json::json!({"command":"SET","args":[format!("user:{i}"), "v"]}),
+            )
+            .await;
+        }
+        json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"RPUSH","args":["jobs","a"]}),
+        )
+        .await;
+        let (_, v) = json_req(&app, "GET", "/api/keys", None, serde_json::Value::Null).await;
+        assert_eq!(v["total"], 6);
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/keys?type=string&like=user:",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(v["total"], 5);
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/keys?limit=2",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(v["total"], 6);
+        assert_eq!(v["keys"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn kvkey_endpoint_lookup() {
+        let (app, _d) = test_app(None);
+        json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"SET","args":["greet","hi"]}),
+        )
+        .await;
+        json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"RPUSH","args":["q","a","b"]}),
+        )
+        .await;
+        let (_, v) = json_req(&app, "GET", "/api/kvkey", None, serde_json::Value::Null).await;
+        assert!(v["error"].as_str().unwrap().contains("missing"));
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/kvkey?key=absent",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert!(v["error"].as_str().unwrap().contains("no such key"));
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/kvkey?key=greet",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(v["type"], "string");
+        assert_eq!(v["ttl_ms"], -1);
+        assert_eq!(v["value"]["text"], "hi");
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/kvkey?key=q",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(v["value"]["kind"], "list");
+        assert_eq!(v["value"]["items"].as_array().unwrap().len(), 2);
+        // TTL-bearing key reports remaining ttl
+        json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"SET","args":["tmp","x","PX=60000"]}),
+        )
+        .await;
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/kvkey?key=tmp",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert!(v["ttl_ms"].as_i64().unwrap() > 0);
+        assert!(v["expires_at_ms"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn kv_dispatch_endpoint_and_publish_monitor() {
+        let (app, _d) = test_app(None);
+        let (c, v) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"PING","args":[]}),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["value"], "PONG");
+        json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"SET","args":["k","v"]}),
+        )
+        .await;
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"GET","args":["k"]}),
+        )
+        .await;
+        assert_eq!(v["value"], "v");
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"GET","args":["missing"]}),
+        )
+        .await;
+        assert_eq!(v["value"], serde_json::Value::Null);
+        // PUBLISH lands in the event log and shows via /api/events
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"PUBLISH","args":["news","hello"]}),
+        )
+        .await;
+        assert_eq!(v["ok"], true);
+        assert!(v["seq"].as_u64().unwrap() >= 1);
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/publish",
+            None,
+            serde_json::json!({"channel":"news","message":"again"}),
+        )
+        .await;
+        assert_eq!(v["ok"], true);
+        let (_, v) = json_req(&app, "GET", "/api/events", None, serde_json::Value::Null).await;
+        assert_eq!(v["latest"], 2);
+        assert_eq!(v["events"].as_array().unwrap().len(), 2);
+        let (_, v) = json_req(
+            &app,
+            "GET",
+            "/api/events?after=1",
+            None,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(v["events"].as_array().unwrap().len(), 1);
+        assert_eq!(v["events"][0]["message"], "again");
+        // MULTI/EXEC via the API
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"MULTI","args":[]}),
+        )
+        .await;
+        assert_eq!(v["value"], "OK");
+        let (_, v) = json_req(
+            &app,
+            "POST",
+            "/api/kv",
+            None,
+            serde_json::json!({"command":"EXEC","args":[]}),
+        )
+        .await;
+        assert_eq!(v["value"], "OK");
+    }
+
+    #[test]
+    fn decode_kv_value_malformed_and_other_types() {
+        // malformed collection payloads degrade to empty
+        assert_eq!(
+            decode_kv_value("list", "not json"),
+            serde_json::json!({"kind": "list", "items": []})
+        );
+        assert_eq!(
+            decode_kv_value("hash", "[1]"),
+            serde_json::json!({"kind": "hash", "fields": []})
+        );
+        assert_eq!(
+            decode_kv_value("set", "{}"),
+            serde_json::json!({"kind": "set", "members": []})
+        );
+        assert_eq!(
+            decode_kv_value("zset", "[1]"),
+            serde_json::json!({"kind": "zset", "pairs": []})
+        );
+        // non-numeric zset scores are skipped
+        assert_eq!(
+            decode_kv_value("zset", r#"{"a":"x"}"#),
+            serde_json::json!({"kind": "zset", "pairs": []})
+        );
+        // int scores accepted
+        assert_eq!(
+            decode_kv_value("zset", r#"{"a":1}"#),
+            serde_json::json!({"kind": "zset", "pairs": [["a", 1.0]]})
+        );
+        assert_eq!(
+            decode_kv_value("hyper", "blob"),
+            serde_json::json!({"kind": "hyper", "text": "blob"})
+        );
+    }
+
+    #[test]
+    fn kv_dispatch_error_paths() {
+        let mut k = kv();
+        let d = |k: &mut Kv, c: &str, a: &[&str]| {
+            let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            kv_dispatch(k, None, c, &args)
+        };
+        // incr on a non-numeric string
+        d(&mut k, "SET", &["s", "abc"]);
+        assert!(!d(&mut k, "INCR", &["s"])["ok"].as_bool().unwrap());
+        // rpop empty / missing key
+        assert_eq!(
+            d(&mut k, "RPOP", &["none"])["value"],
+            serde_json::Value::Null
+        );
+        // LLEN on missing key
+        assert_eq!(d(&mut k, "LLEN", &["none"])["value"], 0);
+        // hget missing field
+        assert_eq!(
+            d(&mut k, "HGET", &["none", "f"])["value"],
+            serde_json::Value::Null
+        );
+        // sismember false
+        assert_eq!(d(&mut k, "SISMEMBER", &["none", "m"])["value"], 0);
+        // type of missing key
+        assert_eq!(
+            d(&mut k, "TYPE", &["none"])["value"],
+            serde_json::Value::Null
+        );
+        // LPUSH/RPUSH with key only
+        assert_eq!(d(&mut k, "LPUSH", &["solo"])["value"], 0);
+        // EXPIRE missing key / persist missing key
+        assert_eq!(d(&mut k, "EXPIRE", &["none", "1000"])["value"], 0);
+        assert_eq!(d(&mut k, "PERSIST", &["none"])["value"], 0);
+        assert_eq!(d(&mut k, "EXISTS", &["none"])["value"], 0);
+        assert_eq!(d(&mut k, "DEL", &["none"])["value"], 0);
+        // INCRBY/DECRBY arg parsing fallbacks
+        assert_eq!(d(&mut k, "INCRBY", &["n", "x"])["value"], 1);
+        assert_eq!(d(&mut k, "DECRBY", &["n"])["value"], 0);
+        // zrank/zscore of missing key
+        assert_eq!(
+            d(&mut k, "ZSCORE", &["none", "m"])["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            d(&mut k, "ZRANK", &["none", "m"])["value"],
+            serde_json::Value::Null
+        );
+        // ZRANGE defaults
+        assert_eq!(
+            d(&mut k, "ZRANGE", &["none"])
+                .as_array()
+                .unwrap_or(&vec![])
+                .len(),
+            0
+        );
+        // SET with unparsable EX flag is ignored
+        assert_eq!(d(&mut k, "SET", &["kf", "1", "EX=bogus"])["value"], "OK");
+    }
+    #[test]
+    fn value_json_all_variants() {
+        assert_eq!(value_json(&Value::Bool(true)), serde_json::json!(true));
+        assert_eq!(value_json(&Value::Float(1.25)), serde_json::json!(1.25));
+        assert_eq!(
+            value_json(&Value::Bytes(vec![1, 2])),
+            serde_json::json!("x'0102'")
+        );
+        assert_eq!(
+            value_json(&Value::Array(vec![Value::Int(1)])),
+            serde_json::json!("[1]")
+        );
+    }
+
+    #[test]
+    fn kv_dispatch_wrongtype_matrix() {
+        let mut k = kv();
+        let d = |k: &mut Kv, c: &str, a: &[&str]| {
+            let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            kv_dispatch(k, None, c, &args)
+        };
+        d(&mut k, "SET", &["s", "text"]);
+        for cmd in [
+            &["INCR", "s"][..],
+            &["LPUSH", "s", "x"],
+            &["LPOP", "s"],
+            &["RPOP", "s"],
+            &["LRANGE", "s", "0", "-1"],
+            &["HSET", "s", "f", "v"],
+            &["HGET", "s", "f"],
+            &["HGETALL", "s"],
+            &["SADD", "s", "m"],
+            &["SMEMBERS", "s"],
+            &["ZADD", "s", "1.0", "m"],
+            &["ZSCORE", "s", "m"],
+            &["ZRANGE", "s", "0", "1"],
+            &["ZRANK", "s", "m"],
+        ] {
+            let r = d(&mut k, cmd[0], &cmd[1..]);
+            assert!(!r["ok"].as_bool().unwrap(), "{cmd:?} 应报错: {r}");
+        }
+        // LLEN 错误吞掉返回 0;TTL 错误返回 -2
+        assert_eq!(d(&mut k, "LLEN", &["s"])["value"], 0);
+        assert_eq!(d(&mut k, "TTL", &["s"])["value"], -1);
+        // MULTI/EXEC/DISCARD 正常路径
+        assert_eq!(d(&mut k, "MULTI", &[])["value"], "OK");
+        assert_eq!(d(&mut k, "DISCARD", &[])["value"], "OK");
+        assert!(!d(&mut k, "EXEC", &[])["ok"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn live_server_serves_http() {
+        // 用一次性端口起真实服务器(run),再打原生 HTTP 请求
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.db");
+        let listen = format!("127.0.0.1:{port}");
+        let cfg = WebConfig {
+            db_path: db_path.clone(),
+            token: None,
+        };
+        let srv = tokio::spawn(async move { run(cfg, &listen).await });
+        // 轮询等待端口就绪
+        let mut ok = false;
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "服务器未启动");
+        async fn http(port: u16, method: &str, uri: &str, body: Option<&str>) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (head, payload) = match (method, body) {
+                ("POST", Some(b)) => (
+                    format!(
+                        "POST {uri} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        b.len()
+                    ),
+                    b.to_string(),
+                ),
+                _ => (
+                    format!("GET {uri} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+                    String::new(),
+                ),
+            };
+            s.write_all(head.as_bytes()).await.unwrap();
+            s.write_all(payload.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        let get = |uri: &'static str| http(port, "GET", uri, None);
+        let post = |uri: &'static str, body: &'static str| http(port, "POST", uri, Some(body));
+        // 首页 + meta + stats
+        assert!(get("/").await.contains("docsql console"));
+        assert!(get("/api/meta").await.contains("\"tables\":[]"));
+        assert!(get("/api/stats").await.contains("kv_keys"));
+        assert!(get("/api/keys").await.contains("\"total\":0"));
+        assert!(get("/api/events").await.contains("\"latest\":0"));
+        assert!(get("/api/kvkey?key=nope").await.contains("no such key"));
+        // SQL 与 KV 写入
+        assert!(post(
+            "/api/sql",
+            r#"{"sql":"CREATE TABLE lt (id INT PRIMARY KEY)"}"#
+        )
+        .await
+        .contains("affected"));
+        assert!(post("/api/kv", r#"{"command":"SET","args":["lk","lv"]}"#)
+            .await
+            .contains("\"ok\":true"));
+        assert!(get("/api/keys?type=string").await.contains("lk"));
+        assert!(get("/api/kvkey?key=lk").await.contains("lv"));
+        assert!(post("/api/parse", r#"{"sql":"SELECT 1"}"#)
+            .await
+            .contains("\"ok\":true"));
+        assert!(post("/api/publish", r#"{"channel":"c","message":"m"}"#)
+            .await
+            .contains("\"seq\":1"));
+        srv.abort();
+        let _ = srv.await;
+    }
+    #[test]
+    fn list_keys_skips_expired() {
+        let mut k = kv();
+        let d = |k: &mut Kv, c: &str, a: &[&str]| {
+            let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            kv_dispatch(k, None, c, &args)
+        };
+        d(&mut k, "SET", &["gone", "1", "PX=1"]);
+        d(&mut k, "SET", &["stay", "2"]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let keys = list_keys(&mut k, None, None);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "stay");
+        assert_eq!(keys[0].ttl_ms, -1);
+    }
 }

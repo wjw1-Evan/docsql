@@ -201,4 +201,120 @@ mod tests {
         ]));
         assert_eq!(Value::cmp_values(&v, &v.clone()), Equal);
     }
+
+    #[test]
+    fn accessors_and_type_names() {
+        let s = Value::Str("hi".into());
+        assert_eq!(s.as_str(), Some("hi"));
+        assert_eq!(Value::Int(7).as_i64(), Some(7));
+        assert_eq!(Value::Bool(true).as_bool(), Some(true));
+        // wrong-type accessors yield None
+        assert_eq!(s.as_i64(), None);
+        assert_eq!(s.as_bool(), None);
+        assert_eq!(Value::Int(1).as_str(), None);
+        assert_eq!(Value::Bool(false).as_i64(), None);
+        assert_eq!(Value::Null.as_bool(), None);
+        for (v, name) in [
+            (&Value::Null, "null"),
+            (&Value::Bool(false), "bool"),
+            (&Value::Int(0), "int"),
+            (&Value::Float(0.0), "float"),
+            (&s, "string"),
+            (&Value::Bytes(vec![]), "bytes"),
+            (&Value::Array(vec![]), "array"),
+            (&Value::Object(Object::new()), "object"),
+        ] {
+            assert_eq!(v.type_name(), name);
+        }
+    }
+
+    #[test]
+    fn display_covers_all_variants() {
+        assert_eq!(Value::Null.to_string(), "null");
+        assert_eq!(Value::Bool(true).to_string(), "true");
+        assert_eq!(Value::Int(-5).to_string(), "-5");
+        assert_eq!(Value::Float(1.5).to_string(), "1.5");
+        assert_eq!(Value::Str("s".into()).to_string(), "s");
+        assert_eq!(
+            Value::Bytes(vec![0xde, 0xad, 0x01]).to_string(),
+            "x'dead01'"
+        );
+        assert_eq!(
+            Value::Array(vec![Value::Int(1), Value::Str("b".into())]).to_string(),
+            "[1,b]"
+        );
+        assert_eq!(
+            Value::Object(Object::from([
+                ("a".into(), Value::Int(1)),
+                ("b".into(), Value::Null),
+            ]))
+            .to_string(),
+            "{a:1,b:null}"
+        );
+    }
+
+    #[test]
+    fn ordering_object_key_and_prefix_cases() {
+        use std::cmp::Ordering::*;
+        let mk = |pairs: &[(&str, i64)]| {
+            Value::Object(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), Value::Int(*v)))
+                    .collect(),
+            )
+        };
+        // key decides before value
+        assert_eq!(Value::cmp_values(&mk(&[("a", 9)]), &mk(&[("b", 1)])), Less);
+        // equal keys compare values
+        assert_eq!(Value::cmp_values(&mk(&[("a", 1)]), &mk(&[("a", 2)])), Less);
+        // prefix object is smaller
+        assert_eq!(
+            Value::cmp_values(&mk(&[("a", 1)]), &mk(&[("a", 1), ("b", 1)])),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&mk(&[("a", 1), ("b", 1)]), &mk(&[("a", 1)])),
+            Greater
+        );
+        // bytes compare
+        assert_eq!(
+            Value::cmp_values(&Value::Bytes(vec![1]), &Value::Bytes(vec![2])),
+            Less
+        );
+        // rank separation: str < bytes < array < object
+        assert_eq!(
+            Value::cmp_values(&Value::Str("z".into()), &Value::Bytes(vec![])),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Bytes(vec![]), &Value::Array(vec![])),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Array(vec![]), &Value::Object(Object::new())),
+            Less
+        );
+        // nested array element decides before length
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Array(vec![Value::Int(1)]),
+                &Value::Array(vec![Value::Int(2), Value::Int(3)])
+            ),
+            Less
+        );
+        // equal-length arrays with equal elements
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Array(vec![Value::Null]),
+                &Value::Array(vec![Value::Null])
+            ),
+            Equal
+        );
+        // float NaN falls back to Equal rather than panicking
+        assert_eq!(
+            Value::cmp_values(&Value::Float(f64::NAN), &Value::Float(1.0)),
+            Equal
+        );
+    }
 }

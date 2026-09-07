@@ -408,4 +408,104 @@ mod tests {
             let _ = from_str(&s[..cut]);
         }
     }
+
+    #[test]
+    fn bytes_serialize_lossless() {
+        let v = Value::Bytes(vec![0, 1, 255]);
+        let s = to_string(&v);
+        assert_eq!(s, r#"{"$bytes":[0,1,255]}"#);
+        // Parsing yields the generic object form (bytes is a write-side encoding).
+        assert!(matches!(from_str(&s), Ok(Value::Object(_))));
+        assert_eq!(to_string(&Value::Bytes(vec![])), r#"{"$bytes":[]}"#);
+    }
+
+    #[test]
+    fn control_characters_escaped() {
+        assert_eq!(
+            to_string(&Value::Str("\u{1}\u{1f}".into())),
+            "\"\\u0001\\u001f\""
+        );
+        assert_eq!(from_str(r#""\u0001""#).unwrap(), Value::Str("\u{1}".into()));
+        assert_eq!(to_string(&Value::Str("\r".into())), r#""\r""#);
+    }
+
+    #[test]
+    fn empty_containers_and_whitespace() {
+        assert_eq!(from_str(" [] ").unwrap(), Value::Array(vec![]));
+        assert_eq!(from_str(" { } ").unwrap(), Value::Object(Object::new()));
+        assert_eq!(
+            from_str("\t[1]\n").unwrap(),
+            Value::Array(vec![Value::Int(1)])
+        );
+        assert_eq!(to_string(&Value::Array(vec![])), "[]");
+        assert_eq!(to_string(&Value::Object(Object::new())), "{}");
+    }
+
+    #[test]
+    fn bad_numbers_rejected() {
+        assert!(matches!(from_str("-"), Err(JsonError::BadNumber(_))));
+        assert!(from_str("1.2.3").is_err());
+        // huge integer overflows i64 → falls back to float
+        assert!(matches!(
+            from_str("99999999999999999999999"),
+            Ok(Value::Float(_))
+        ));
+        assert!(matches!(from_str("-1e-5"), Ok(Value::Float(_))));
+    }
+
+    #[test]
+    fn string_escapes_full_set() {
+        assert_eq!(
+            from_str(r#""\" \\ \/ \b \f \n \r \t""#).unwrap(),
+            Value::Str("\" \\ / \u{8} \u{c} \n \r \t".into())
+        );
+        // bad \u hex digits
+        assert!(matches!(
+            from_str(r#""\uZZZZ""#),
+            Err(JsonError::BadEscape(_))
+        ));
+        // \u with fewer than 4 digits / eof
+        assert!(from_str(r#""\u12""#).is_err());
+        assert!(from_str(r#""\u""#).is_err());
+        // lone high surrogate without a following pair degrades to U+FFFD
+        // (the closing quote is consumed by the failed pair lookahead, so a
+        // trailing char keeps the parse alive)
+        assert_eq!(
+            from_str(r#""\ud83d x""#).unwrap(),
+            Value::Str("\u{FFFD}x".into())
+        );
+        // proper surrogate pair decodes to the emoji
+        assert_eq!(
+            from_str("\"\\ud83d\\ude00\"").unwrap(),
+            Value::Str("😀".into())
+        );
+        // invalid code point degrades to U+FFFD
+        assert_eq!(
+            from_str(r#""\udfff""#).unwrap(),
+            Value::Str("\u{FFFD}".into())
+        );
+    }
+
+    #[test]
+    fn structural_errors_are_precise() {
+        assert!(matches!(
+            from_str("{1:2}"),
+            Err(JsonError::Unexpected(_, _))
+        ));
+        assert!(matches!(
+            from_str("[1 2]"),
+            Err(JsonError::Unexpected(_, _))
+        ));
+        assert!(matches!(
+            from_str(r#"{"a" 1}"#),
+            Err(JsonError::Unexpected(_, _))
+        ));
+        assert!(matches!(from_str(""), Err(JsonError::Unexpected(_, _))));
+        assert!(matches!(from_str("@"), Err(JsonError::Unexpected('@', _))));
+        assert!(matches!(from_str("nulls"), Err(JsonError::Trailing(_))));
+        assert!(matches!(from_str("truex"), Err(JsonError::Trailing(_))));
+        assert!(matches!(from_str("[1]]"), Err(JsonError::Trailing(_))));
+        assert!(matches!(from_str(r#""abc"#), Err(JsonError::Eof)));
+        assert!(matches!(from_str(r#""auncfé""#), Ok(Value::Str(_))));
+    }
 }

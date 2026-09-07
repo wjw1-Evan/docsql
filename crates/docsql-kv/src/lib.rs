@@ -620,4 +620,90 @@ mod tests {
         kv.sweep().unwrap();
         assert!(kv.exists("p").unwrap());
     }
+    // ---- 覆盖率补充:WRONGTYPE 矩阵与集合边界 ----
+
+    #[test]
+    fn wrongtype_matrix_for_collections() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("s", "text", SetOpts::default()).unwrap();
+        // list ops on a string key
+        assert!(kv.lpush("s", &["x"]).is_err());
+        assert!(kv.rpush("s", &["x"]).is_err());
+        assert!(kv.lpop("s").is_err());
+        assert!(kv.rpop("s").is_err());
+        assert!(kv.llen("s").is_err());
+        assert!(kv.lrange("s", 0, -1).is_err());
+        // hash ops on a string key
+        assert!(kv.hset("s", "f", "v").is_err());
+        assert!(kv.hget("s", "f").is_err());
+        assert!(kv.hgetall("s").is_err());
+        // set ops
+        assert!(kv.sismember("s", "m").is_err());
+        assert!(kv.smembers("s").is_err());
+        // zset ops
+        assert!(kv.zscore("s", "m").is_err());
+        assert!(kv.zrank("s", "m").is_err());
+        // incr on non-numeric
+        assert!(kv.incr_by("s", 1).is_err());
+    }
+
+    #[test]
+    fn list_boundary_semantics() {
+        let mut kv = Kv::in_memory().unwrap();
+        // 空列表 range / pop
+        kv.rpush("e", &["only"]).unwrap();
+        assert!(kv.lpop("e").unwrap().is_some());
+        // 弹空后键不存在
+        assert_eq!(kv.llen("e").unwrap(), 0);
+        assert!(kv.lpop("e").unwrap().is_none());
+        // lrange 越界收缩
+        kv.rpush("l", &["a", "b", "c"]).unwrap();
+        assert_eq!(kv.lrange("l", 5, 10).unwrap(), Vec::<String>::new());
+        assert_eq!(kv.lrange("l", -100, 100).unwrap().len(), 3);
+        assert_eq!(kv.lrange("l", 2, 1).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn hash_set_extra_ops() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.hset("h", "f1", "v1").unwrap();
+        kv.hset("h", "f2", "v2").unwrap();
+        // 覆盖同字段返回 0
+        assert_eq!(kv.hset("h", "f1", "v1b").unwrap(), 0);
+        assert_eq!(kv.hget("h", "f1").unwrap().as_deref(), Some("v1b"));
+        assert_eq!(kv.hgetall("h").unwrap().len(), 2);
+        assert_eq!(kv.hget("h", "nope").unwrap(), None);
+        // 集合成员去重计数
+        kv.sadd("set", &["a", "b", "a"]).unwrap();
+        assert_eq!(kv.smembers("set").unwrap().len(), 2);
+        assert!(!kv.sismember("set", "zz").unwrap());
+    }
+
+    #[test]
+    fn expire_persist_edges() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("k", "v", SetOpts::default()).unwrap();
+        assert!(kv.expire("k", 50).unwrap());
+        assert!(kv.ttl_ms("k").unwrap().is_some());
+        assert!(kv.persist("k").unwrap());
+        assert!(kv.ttl_ms("k").unwrap().is_none());
+        // 不存在的键
+        assert!(!kv.expire("none", 50).unwrap());
+        assert!(!kv.persist("none").unwrap());
+        // sweep 无过期键
+        assert_eq!(kv.sweep().unwrap(), 0);
+    }
+
+    #[test]
+    fn multi_exec_discard_states() {
+        let mut kv = Kv::in_memory().unwrap();
+        // 无事务 DISCARD/EXEC
+        assert!(kv.discard().is_err());
+        assert!(kv.exec().is_err());
+        kv.multi().unwrap();
+        assert!(kv.multi().is_err()); // 重复开启
+        kv.set("q", "1", SetOpts::default()).unwrap();
+        kv.exec().unwrap();
+        assert_eq!(kv.get("q").unwrap().as_deref(), Some("1"));
+    }
 }

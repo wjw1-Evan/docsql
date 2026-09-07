@@ -388,4 +388,17 @@ mod tests {
         assert_eq!(recs.len(), 6);
         assert_eq!(w.durable_lsn, 5);
     }
+    #[test]
+    fn corrupt_wal_header_and_path() {
+        let (_dir, path) = wal_dir();
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        assert!(matches!(Wal::open(&path), Err(WalError::Corrupt(0, _))));
+        let w = Wal::open(&path).unwrap_or_else(|_| {
+            // 坏头文件被拒后换个新路径
+            let p2 = _dir.path().join("ok.wal");
+            Wal::open(&p2).unwrap()
+        });
+        let p = w.path().to_path_buf();
+        assert!(p.to_string_lossy().ends_with(".wal"));
+    }
 }

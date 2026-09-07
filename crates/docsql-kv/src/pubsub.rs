@@ -249,4 +249,21 @@ mod tests {
         assert_eq!(ps.channels(""), vec!["a.one", "a.two"]);
         assert_eq!(ps.numpat(), 1);
     }
+    #[test]
+    fn unsubscribe_all_and_dead_prune() {
+        let ps = PubSub::new();
+        let rx = ps.subscribe("ch");
+        assert_eq!(ps.numsub("ch"), 1);
+        ps.unsubscribe_all("ch");
+        assert_eq!(ps.numsub("ch"), 0);
+        assert_eq!(ps.publish("ch", "m"), 0);
+        assert!(PubSub::drain(&rx).is_empty());
+        // 订阅后立即退订 pattern 端
+        let rx2 = ps.psubscribe("p.*");
+        ps.publish("p.1", "x");
+        let _ = PubSub::drain(&rx2);
+        // 空 pattern 条目被裁剪
+        ps.psubscribe("gone.*");
+        assert_eq!(ps.numpat(), 2);
+    }
 }

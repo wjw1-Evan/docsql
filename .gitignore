@@ -17,3 +17,8 @@ deploy/.env
 
 # mimosa security-scan artifacts
 .mimosa/
+
+# Coverage reports
+coverage/
+coverage2/
+*.profraw

@@ -709,4 +709,58 @@ mod tests {
             assert_eq!(*v, *mv);
         }
     }
+    // ---- 覆盖率补充:节点分裂 / 超大键 / 越界写 ----
+
+    #[test]
+    fn tree_splits_under_load_and_range_reads_all() {
+        let (_d, mut pager) = fresh("bt_split.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        // 大量插入迫使叶节点多次分裂
+        for i in 0..2000i64 {
+            tree.insert(&mut pager, &mut tx, Value::Int(i), i as u64, false)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let all = tree.range_from(&mut pager, &tx, &Value::Int(0)).unwrap();
+        assert_eq!(all.len(), 2000);
+        assert_eq!(all[0].0, Value::Int(0));
+        assert_eq!(all[1999].0, Value::Int(1999));
+        pager.abort_tx(tx).unwrap();
+    }
+
+    #[test]
+    fn oversized_key_rejected() {
+        let (_d, mut pager) = fresh("bt_bigkey.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        let big = Value::Str("K".repeat(PAGE_SIZE));
+        let e = tree.insert(&mut pager, &mut tx, big, 1, false).unwrap_err();
+        assert!(matches!(e, BTreeError::KeyTooLarge(_)), "{e:?}");
+        pager.abort_tx(tx).unwrap();
+    }
+    #[test]
+    fn delete_through_internal_nodes() {
+        let (_d, mut pager) = fresh("bt_del.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        for i in 0..1500i64 {
+            tree.insert(&mut pager, &mut tx, Value::Int(i), i as u64, false)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        // 删除一半,迫使删除路径下沉经过内部节点
+        for i in (0..1500i64).step_by(2) {
+            let mut tx = pager.begin_tx();
+            tree.delete_entry(&mut pager, &mut tx, &Value::Int(i), i as u64)
+                .unwrap();
+            pager.commit_tx(tx).unwrap();
+        }
+        let tx = pager.begin_tx();
+        let all = tree.range_from(&mut pager, &tx, &Value::Int(0)).unwrap();
+        assert_eq!(all.len(), 750);
+        assert!(all.iter().all(|(k, _)| k.as_i64().unwrap() % 2 == 1));
+        pager.abort_tx(tx).unwrap();
+    }
 }

@@ -107,17 +107,7 @@ fn kv_one(addr: &str, args: &[String]) {
     }
     // Integer replies (counts, TTLs): small LE u64s have zero high bytes,
     // which an 8-character ASCII string never does.
-    if f.payload.len() == 8 && f.payload[4..8] == [0u8; 4] {
-        println!("{}", u64::from_le_bytes(f.payload[..8].try_into().unwrap()));
-        return;
-    }
-    let text = String::from_utf8_lossy(&f.payload);
-    let joined = text
-        .split('\x00')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!("{joined}");
+    println!("{}", decode_kv_payload(&f.payload));
 }
 
 fn remote_shell(addr: &str) {
@@ -208,9 +198,13 @@ fn remote_shell(addr: &str) {
 }
 
 fn print_rows(r: &QueryResult) {
+    print!("{render}", render = render_rows(r));
+}
+
+/// Format a result table exactly as the shell prints it (pure, testable).
+pub fn render_rows(r: &QueryResult) -> String {
     if r.rows.is_empty() {
-        println!("(no rows)");
-        return;
+        return "(no rows)\n".to_string();
     }
     let mut widths: Vec<usize> = r.columns.iter().map(|c| c.len()).collect();
     let cells: Vec<Vec<String>> = r
@@ -242,8 +236,11 @@ fn print_rows(r: &QueryResult) {
         .map(|(c, w)| format!(" {c:<w$}"))
         .collect::<Vec<_>>()
         .join("|");
-    println!("{header}");
-    println!("{sep}");
+    let mut out = String::new();
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&sep);
+    out.push('\n');
     for row in &cells {
         let line: String = row
             .iter()
@@ -251,7 +248,83 @@ fn print_rows(r: &QueryResult) {
             .map(|(c, w)| format!(" {c:<w$}"))
             .collect::<Vec<_>>()
             .join("|");
-        println!("{line}");
+        out.push_str(&line);
+        out.push('\n');
     }
-    println!("({} rows)", r.rows.len());
+    out.push_str(&format!("({} rows)\n", r.rows.len()));
+    out
+}
+
+/// Decode one KV reply payload the way `kv_one` prints it: small LE u64
+/// integers print numerically, everything else NUL-joins non-empty parts.
+pub fn decode_kv_payload(payload: &[u8]) -> String {
+    if payload.len() == 8 && payload[4..8] == [0u8; 4] {
+        return u64::from_le_bytes(payload[..8].try_into().unwrap()).to_string();
+    }
+    String::from_utf8_lossy(payload)
+        .split('\x00')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use docsql_core::engine::Database;
+
+    #[test]
+    fn render_rows_empty_and_populated() {
+        let empty = QueryResult {
+            columns: vec!["a".into()],
+            rows: vec![],
+        };
+        assert_eq!(render_rows(&empty), "(no rows)\n");
+
+        let r = QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Value::Int(1), Value::Str("ann".into())],
+                vec![Value::Null, Value::Str("bo".into())],
+            ],
+        };
+        let out = render_rows(&r);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5);
+        // NULL 渲染与行计数(lines[0] 表头、[1] 分隔线、[2..] 数据)
+        assert!(lines[3].contains("NULL"));
+        assert!(lines[3].contains("bo"));
+        assert_eq!(lines[4], "(2 rows)");
+        // 数据行之间等宽(按列宽渲染)
+        assert_eq!(lines[2].chars().count(), lines[3].chars().count());
+        // 分隔线只含 - 与 +
+        assert!(lines[1].chars().all(|c| c == '-' || c == '+'));
+    }
+
+    #[test]
+    fn decode_kv_payload_int_and_text() {
+        assert_eq!(decode_kv_payload(&7u64.to_le_bytes()), "7");
+        assert_eq!(decode_kv_payload(&0u64.to_le_bytes()), "0");
+        // 8 字节非整数(ASCII 文本)不误判
+        assert_eq!(decode_kv_payload(b"12345678"), "12345678");
+        assert_eq!(decode_kv_payload(b"subscribed\x00ch"), "subscribed ch");
+        assert_eq!(decode_kv_payload(b"a\x00\x00b"), "a b");
+    }
+
+    #[test]
+    fn embedded_end_to_end_via_helpers() {
+        // 完整链路:执行 SQL 后按 shell 规则渲染
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+            .unwrap();
+        let out = match db.execute("SELECT id, v FROM t ORDER BY id").unwrap() {
+            ExecOutcome::Rows(r) => render_rows(&r),
+            other => panic!("{other:?}"),
+        };
+        assert!(out.contains("id") && out.contains("(2 rows)"));
+        let err = db.execute("SELECT * FROM nope").unwrap_err();
+        assert!(err.to_string().contains("nope"));
+    }
 }

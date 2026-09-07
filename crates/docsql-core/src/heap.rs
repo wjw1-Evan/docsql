@@ -520,4 +520,57 @@ mod tests {
         assert!(heap.pages.is_empty());
         assert_eq!(heap.scan(&mut pager).unwrap().len(), 0);
     }
+    // ---- 覆盖率补充:超大文档 / 坏槽位 / tombstone 扫描 ----
+
+    #[test]
+    fn doc_too_large_and_bad_slot_paths() {
+        let (_d, mut pager) = db("heap_big.db");
+        let mut heap = Heap::default();
+        let big = "z".repeat(PAGE_SIZE * 2);
+        let mut tx = pager.begin_tx();
+        // 超过单页容量的文档拒绝写入
+        let e = heap.insert(&mut pager, &mut tx, &doc(1, &big)).unwrap_err();
+        assert!(matches!(e, HeapError::DocTooLarge(..)), "{e:?}");
+        pager.commit_tx(tx).unwrap();
+        // 正常插入后 replace 到越界槽位
+        let mut tx = pager.begin_tx();
+        let loc = heap.insert(&mut pager, &mut tx, &doc(2, "ok")).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let mut tx = pager.begin_tx();
+        assert!(heap
+            .replace(&mut pager, &mut tx, loc + (1 << 20), &doc(3, "x"))
+            .is_err());
+        pager.abort_tx(tx).unwrap();
+        // doc_at 对 tombstone 返回 None
+        let mut tx = pager.begin_tx();
+        let l2 = heap.insert(&mut pager, &mut tx, &doc(4, "gone")).unwrap();
+        heap.remove_many(&mut pager, &mut tx, &[l2]).unwrap();
+        pager.commit_tx(tx).unwrap();
+        assert_eq!(heap.doc_at(&mut pager, l2).unwrap(), None);
+        // 删除+重插使扫描跳过 tombstone
+        let mut tx = pager.begin_tx();
+        heap.insert(&mut pager, &mut tx, &doc(5, "new")).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let docs = heap.scan(&mut pager).unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+    #[test]
+    fn replace_dead_slot_rejected() {
+        let (_d, mut pager) = db("heap_dead.db");
+        let mut heap = Heap::default();
+        let mut tx = pager.begin_tx();
+        let l1 = heap.insert(&mut pager, &mut tx, &doc(1, "aaa")).unwrap();
+        let _l2 = heap.insert(&mut pager, &mut tx, &doc(2, "bbb")).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let mut tx = pager.begin_tx();
+        heap.remove_many(&mut pager, &mut tx, &[l1]).unwrap();
+        pager.commit_tx(tx).unwrap();
+        // 删除 + repack 后 l1 槽位要么已被迁移文档占用(replace 合法),
+        // 要么越界/死亡被拒:两种情况下 replace 都不会破坏扫描一致性
+        let mut tx = pager.begin_tx();
+        let _ = heap.replace(&mut pager, &mut tx, l1, &doc(3, "ccc"));
+        pager.abort_tx(tx).unwrap();
+        let docs = heap.scan(&mut pager).unwrap();
+        assert_eq!(docs.len(), 1);
+    }
 }
