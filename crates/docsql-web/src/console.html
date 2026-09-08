@@ -181,16 +181,6 @@
   .grid .null { color: #b0b0b0; font-style: italic; }
   .grid-label { font-weight: 600; color: var(--txt2); padding: 6px 10px 2px; }
 
-  /* ---------- KV 详情 ---------- */
-  .kv-body { flex: 1; overflow: auto; padding: 10px; -webkit-user-select: text; user-select: text; }
-  .kv-str-area { width: 100%; min-height: 140px; font: 12.5px/1.55 var(--mono); white-space: pre; }
-  .kv-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
-  .kv-form input { width: 160px; }
-  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
-  .chip { border: 1px solid var(--border); border-radius: 10px; padding: 1px 10px; background: #fff;
-          color: var(--txt2); }
-  .chip b { color: var(--txt); }
-
   /* ---------- 仪表盘 ---------- */
   .dash { overflow: auto; padding: 16px; }
   .dash h2 { margin: 0 0 4px; font-size: 18px; }
@@ -202,18 +192,6 @@
   .card .v small { font-size: 12px; color: var(--txt3); font-weight: 400; }
   .card .k { color: var(--txt2); margin-top: 2px; }
   .dash-actions { margin: 16px 0; display: flex; gap: 8px; flex-wrap: wrap; }
-
-  /* ---------- 发布订阅 ---------- */
-  .pub-wrap { flex: 1; display: flex; min-height: 0; }
-  .pub-left { width: 320px; flex: none; border-right: 1px solid var(--border2); padding: 10px; overflow: auto; }
-  .pub-right { flex: 1; overflow: auto; font: 12px/1.6 var(--mono); padding: 6px 0; }
-  .feed-item { padding: 3px 10px; border-bottom: 1px solid #f2f2f2; display: flex; gap: 8px;
-               -webkit-user-select: text; user-select: text; }
-  .feed-item .no { color: var(--txt3); width: 46px; flex: none; }
-  .feed-item .ch { color: var(--accent-dk); width: 130px; flex: none; overflow: hidden;
-                   text-overflow: ellipsis; }
-  .note { background: #fff8e1; border: 1px solid #f0e0a0; border-radius: 3px; padding: 6px 10px;
-          color: #6a5a00; margin-bottom: 10px; }
 
   /* ---------- 状态栏 ---------- */
   #statusbar {
@@ -271,10 +249,6 @@
   <div class="menu" data-menu><span>视图</span><div class="menu-drop">
     <div data-act="refresh">刷新对象资源管理器<span class="kbd">Ctrl+R</span></div>
     <div data-act="dashboard">服务器仪表盘</div>
-  </div></div>
-  <div class="menu" data-menu><span>工具</span><div class="menu-drop">
-    <div data-act="open-kv">KV 键值浏览器</div>
-    <div data-act="open-pub">发布订阅监视器</div>
   </div></div>
   <div class="menu" data-menu><span>帮助</span><div class="menu-drop">
     <div data-act="about">关于 docsql Studio</div>
@@ -350,14 +324,8 @@ const ICONS = {
   refresh: SVG(`<path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6v3h-3" stroke="#0072c6" stroke-width="1.4" fill="none" stroke-linecap="round"/>`),
   explorer: SVG(`<rect x="2" y="3" width="12" height="10" rx="1" stroke="#888" stroke-width="1.1"/><path d="M6 3v10" stroke="#888" stroke-width="1.1"/>`),
   chart: SVG(`<path d="M2.5 13V3M2.5 13h11" stroke="#666" stroke-width="1.2"/><rect x="4.5" y="8" width="2.2" height="4" fill="#0072c6"/><rect x="7.6" y="5.5" width="2.2" height="6.5" fill="#0072c6"/><rect x="10.7" y="7" width="2.2" height="5" fill="#0072c6"/>`),
-  pub: SVG(`<circle cx="5" cy="11" r="1.6" fill="#c0504d"/><path d="M6.2 9.8 11 5M8.3 7.7l1.8 1.8M10 6l2-2" stroke="#c0504d" stroke-width="1.2" stroke-linecap="round"/>`),
   dashboard: SVG(`<path d="M3 12a5 5 0 0 1 10 0" stroke="#0072c6" stroke-width="1.3"/><path d="M8 12l2.6-3.4" stroke="#e81123" stroke-width="1.4" stroke-linecap="round"/>`),
 };
-function kvIcon(kind) {
-  const map = { string:'#0072c6', list:'#2e8b57', hash:'#c0504d', set:'#8a6db8', zset:'#b8860b' };
-  const ch = { string:'S', list:'L', hash:'H', set:'M', zset:'Z' }[kind] || '?';
-  return SVG(`<rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="${map[kind]||'#666'}22" stroke="${map[kind]||'#666'}" stroke-width="1.1"/><text x="8" y="11.2" text-anchor="middle" font-size="8.5" font-weight="700" fill="${map[kind]||'#666'}">${ch}</text>`);
-}
 $$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
 
 /* ================= API 层 ================= */
@@ -459,7 +427,7 @@ const tabs = {
     this.activate(t);
     return t;
   },
-  kindIcon(kind) { return { query: 'query', data: 'table', kv: 'view', pub: 'pub', dash: 'dashboard' }[kind] || 'view'; },
+  kindIcon(kind) { return { query: 'query', data: 'table', dash: 'dashboard' }[kind] || 'view'; },
   activate(t) {
     this.active = t;
     $$('.tab').forEach(el => el.classList.remove('active'));
@@ -724,163 +692,17 @@ function openDataTab(tableName, meta) {
   });
 }
 
-/* ================= KV 键详情 ================= */
-const KV_TYPES = [['string','字符串'],['list','列表'],['hash','哈希'],['set','集合'],['zset','有序集合']];
-function kvTypeLabel(k) { const f = KV_TYPES.find(x => x[0] === k); return f ? f[1] : k; }
-
-function openKvTab(key) {
-  tabs.open('kv', 'kv:' + key, `键: ${key}`, (t) => {
-    t.el.innerHTML = `<div class="doc-bar">
-        <span class="title" data-kv-key></span>
-        <span class="meta" data-kv-type></span>
-        <span class="meta" data-kv-ttl></span>
-        <div class="spacer"></div>
-        <button data-do="refresh">刷新</button>
-        <button data-do="ttl">设置 TTL…</button>
-        <button data-do="persist">移除 TTL</button>
-        <button data-do="del" class="danger">删除键…</button>
-      </div><div class="kv-body" data-kv-body></div>`;
-    t.body = $('[data-kv-body]', t.el);
-    const cmd = async (command, args) => {
-      const r = await api.post('/api/kv', {command, args});
-      if (!r.ok) { ui.toast(`命令失败:${r.error}`, true); return null; }
-      return r;
-    };
-    t.load = async () => {
-      ui.status(`正在读取键 ${key}…`, 'busy');
-      try {
-        const d = await api.get('/api/kvkey?key=' + encodeURIComponent(key));
-        if (d.error) { t.body.innerHTML = `<div class="note">${esc(d.error)}</div>`; return; }
-        $('[data-kv-key]', t.el).textContent = d.key;
-        $('[data-kv-type]', t.el).innerHTML = `${kvIcon(d.type)} ${esc(kvTypeLabel(d.type))}`;
-        $('[data-kv-ttl]', t.el).textContent = d.ttl_ms >= 0 ? `TTL ${(d.ttl_ms/1000).toFixed(1)}s` : 'TTL ∞';
-        renderKvBody(t, d);
-        ui.status(`键 ${key}(${kvTypeLabel(d.type)})`);
-      } catch (e) { ui.toast(e.message, true); }
-    };
-    $('[data-do="refresh"]', t.el).onclick = t.load;
-    $('[data-do="ttl"]', t.el).onclick = () => dialog('设置 TTL(秒)', [{name:'secs', label:'秒数', value:'60'}], '确定', async (v, err) => {
-      if (!v.secs || +v.secs <= 0) { err('请输入正整数'); throw new Error('cancel'); }
-      const r = await cmd('EXPIRE', [key, String(+v.secs * 1000)]);
-      if (r) { ui.toast(`TTL 已设置为 ${v.secs}s`); t.load(); explorer.refreshSoon(); }
-    });
-    $('[data-do="persist"]', t.el).onclick = async () => { const r = await cmd('PERSIST', [key]); if (r) { ui.toast('TTL 已移除'); t.load(); } };
-    $('[data-do="del"]', t.el).onclick = () => dialog('删除键', [{name:'name', label:'键名', value: key, ph:'输入键名以确认'}], '删除', async (v, err) => {
-      if (v.name !== key) { err('键名不匹配'); throw new Error('cancel'); }
-      const r = await cmd('DEL', [key]);
-      if (r) { ui.toast(`已删除键 ${key}`); explorer.refreshSoon(); tabs.close(t); }
-    });
-    t.load();
-  });
-}
-
-function renderKvBody(t, d) {
-  const body = t.body, v = d.value;
-  body.innerHTML = '';
-  const act = async (command, args, afterMsg) => {
-    const r = await api.post('/api/kv', {command, args});
-    if (!r.ok) { ui.toast(`命令失败:${r.error}`, true); return; }
-    if (afterMsg) ui.toast(afterMsg);
-    t.load(); explorer.refreshSoon();
-  };
-  if (v.kind === 'string') {
-    body.innerHTML = `<div class="kv-form"><span style="color:#777">字符串值</span><span class="spacer"></span></div>
-      <textarea class="kv-str-area" data-str>${esc(v.text)}</textarea>
-      <div class="kv-form"><button class="primary" data-save>保存(SET)</button></div>`;
-    $('[data-save]', body).onclick = () => act('SET', [d.key, $('[data-str]', body).value]);
-  } else if (v.kind === 'list') {
-    renderGrid(body, ['索引', '元素'], v.items.map((x, i) => [String(i), String(x)]));
-    const f = document.createElement('div'); f.className = 'kv-form';
-    f.innerHTML = `<input data-v placeholder="值"> <button data-lp>左推入 LPUSH</button> <button data-rp>右推入 RPUSH</button>
-      <button data-lo>左弹出 LPOP</button> <button data-ro>右弹出 RPOP</button> <span style="color:#777">长度 ${v.items.length}</span>`;
-    body.appendChild(f);
-    $('[data-lp]', f).onclick = () => { const x = $('[data-v]', f).value.trim(); if (x) act('LPUSH', [d.key, x], '已推入'); };
-    $('[data-rp]', f).onclick = () => { const x = $('[data-v]', f).value.trim(); if (x) act('RPUSH', [d.key, x], '已推入'); };
-    $('[data-lo]', f).onclick = () => act('LPOP', [d.key], '已弹出');
-    $('[data-ro]', f).onclick = () => act('RPOP', [d.key], '已弹出');
-  } else if (v.kind === 'hash') {
-    renderGrid(body, ['字段', '值'], v.fields.map(x => [x.field, x.value === null ? null : String(x.value)]));
-    const f = document.createElement('div'); f.className = 'kv-form';
-    f.innerHTML = `<input data-hf placeholder="字段" style="width:120px"> <input data-hv placeholder="值"> <button class="primary" data-hs>HSET</button>`;
-    body.appendChild(f);
-    $('[data-hs]', f).onclick = () => { const fd = $('[data-hf]', f).value.trim(), val = $('[data-hv]', f).value;
-      if (fd) act('HSET', [d.key, fd, val], '字段已保存'); };
-  } else if (v.kind === 'set') {
-    renderGrid(body, ['成员'], v.members.map(x => [String(x)]));
-    const f = document.createElement('div'); f.className = 'kv-form';
-    f.innerHTML = `<input data-sm placeholder="成员"> <button class="primary" data-sa>SADD 添加</button>`;
-    body.appendChild(f);
-    $('[data-sa]', f).onclick = () => { const x = $('[data-sm]', f).value.trim(); if (x) act('SADD', [d.key, x], '成员已添加'); };
-  } else if (v.kind === 'zset') {
-    renderGrid(body, ['成员', '分数'], v.pairs.map(p => [String(p[0]), p[1] === null ? null : String(p[1])]));
-    const f = document.createElement('div'); f.className = 'kv-form';
-    f.innerHTML = `<input data-zs placeholder="分数" style="width:90px"> <input data-zm placeholder="成员"> <button class="primary" data-za>ZADD</button>`;
-    body.appendChild(f);
-    $('[data-za]', f).onclick = () => { const s = $('[data-zs]', f).value.trim(), m = $('[data-zm]', f).value.trim();
-      if (s && m) act('ZADD', [d.key, s, m], '成员已添加'); };
-  } else {
-    body.innerHTML = `<div class="note">未知类型 ${esc(v.kind)}</div>`;
-  }
-}
-
-/* ================= 发布订阅监视器 ================= */
-function openPubTab() {
-  tabs.open('pub', 'pub', '发布订阅监视器', (t) => {
-    t.latest = 0;
-    t.el.innerHTML = `<div class="pub-wrap">
-      <div class="pub-left">
-        <div class="note">此监视器记录 <b>Web 控制台侧</b> 的发布事件(环形日志,最近 200 条)。
-          TCP 客户端的 SUBSCRIBE/PSUBSCRIBE 走协议端口(默认 7600),与本监视器相互独立。</div>
-        <h3 style="margin:4px 0 8px">发布消息</h3>
-        <div class="kv-form" style="flex-direction:column;align-items:stretch">
-          <input data-ch placeholder="频道名,如 orders" value="console">
-          <input data-ms placeholder="消息内容">
-          <button class="primary" data-pub>PUBLISH 发布</button>
-        </div>
-        <div style="color:#888;margin-top:14px">提示:发送 <code>kv</code> 命令
-          <code>PUBLISH 频道 消息</code> 也会记录到此监视器。</div>
-      </div>
-      <div class="pub-right"><div class="feed-item" style="color:#999"><span class="no">#</span><span class="ch">频道</span><span>消息(等待发布…)</span></div><div data-feed></div></div>
-    </div>`;
-    const feedEl = $('[data-feed]', t.el);
-    t.poll = async () => {
-      if (!t.el.classList.contains('active')) return;
-      try {
-        const d = await api.get('/api/events?after=' + t.latest);
-        for (const e of d.events) {
-          const row = document.createElement('div'); row.className = 'feed-item';
-          const time = new Date(e.at_ms).toLocaleTimeString('zh-CN', {hour12: false});
-          row.innerHTML = `<span class="no">${e.seq}</span><span class="ch" title="${esc(e.channel)}">${esc(e.channel)}</span><span>${esc(e.message)}</span><span style="color:#bbb;margin-left:auto">${time}</span>`;
-          feedEl.prepend(row);
-          t.latest = Math.max(t.latest, e.seq);
-        }
-      } catch (e) { /* 下轮重试 */ }
-    };
-    $('[data-pub]', t.el).onclick = async () => {
-      const ch = $('[data-ch]', t.el).value.trim(), ms = $('[data-ms]', t.el).value;
-      if (!ch) { ui.toast('请填写频道名', true); return; }
-      try { await api.post('/api/publish', {channel: ch, message: ms}); $('[data-ms]', t.el).value = ''; t.poll(); }
-      catch (e) { ui.toast(e.message, true); }
-    };
-    t.timer = setInterval(t.poll, 2000);
-    t.onActivate = t.poll;
-    t.onClose = () => clearInterval(t.timer);
-    t.poll();
-  });
-}
-
 /* ================= 仪表盘 ================= */
 function openDashboard() {
   tabs.open('dash', 'dash', '服务器仪表盘', (t) => {
     t.el.innerHTML = `<div class="dash">
       <h2>docsql 服务器仪表盘</h2>
-      <div class="sub">多模数据库 · 文档存储 + SQL + KV + 发布订阅 · 管理控制台 v1.0(SSMS 风格)</div>
+      <div class="sub">文档数据库 · 文档存储 + SQL · 管理控制台 v1.0(SSMS 风格)</div>
       <div class="dash-actions">
         <button class="primary" data-do="newq">新建查询</button>
         <button data-do="refresh">刷新</button>
       </div>
       <div class="cards" data-cards></div>
-      <h3 style="margin-top:20px">KV 存储分布</h3><div class="chips" data-kvchips></div>
     </div>`;
     $('[data-do="newq"]', t.el).onclick = () => openQueryTab();
     $('[data-do="refresh"]', t.el).onclick = t.load;
@@ -891,14 +713,11 @@ function openDashboard() {
         const cards = [
           [`${m.totals.tables}<small> 张</small>`, '用户表'],
           [`${m.totals.rows}<small> 行</small>`, '表数据总行数'],
-          [`${m.kv.total}<small> 个</small>`, 'KV 键(未过期)'],
           [`${s.num_pages}<small> 页 × ${s.page_size / 1024}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, '已分配页'],
           [`${fmtBytes(s.db_bytes)}<small> / WAL ${fmtBytes(s.wal_bytes)}</small>`, '数据文件 / WAL'],
           [`${fmtDur(sv.uptime_ms)}<small> · v${sv.version}</small>`, '服务运行时长 · 版本'],
         ];
         $('[data-cards]', t.el).innerHTML = cards.map(c => `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('');
-        $('[data-kvchips]', t.el).innerHTML = Object.entries(m.kv.by_type).map(([k, n]) =>
-          `<span class="chip">${kvIcon(k)} ${esc(kvTypeLabel(k))} <b>${n}</b></span>`).join('') || '<span style="color:#999">暂无键</span>';
       } catch (e) { ui.toast(e.message, true); }
     };
     t.load();
@@ -907,14 +726,13 @@ function openDashboard() {
 
 /* ================= 对象资源管理器 ================= */
 const explorer = {
-  meta: null, keys: null, expanded: new Set(['tables']), selPath: null,
+  meta: null, expanded: new Set(['tables']), selPath: null,
   _timer: null,
   async refresh() {
     try {
       this.meta = await api.get('/api/meta');
-      this.keys = await api.get('/api/keys?limit=5000');
       this.render();
-      $('#st-server').textContent = `docsql v${this.meta.server.version} · ${this.meta.totals.tables} 表 · ${this.meta.kv.total} KV 键`;
+      $('#st-server').textContent = `docsql v${this.meta.server.version} · ${this.meta.totals.tables} 表`;
     } catch (e) { ui.toast('刷新失败:' + e.message, true); }
   },
   refreshSoon() { clearTimeout(this._timer); this._timer = setTimeout(() => this.refresh(), 250); },
@@ -928,7 +746,7 @@ const explorer = {
   },
 
   render() {
-    const m = this.meta, k = this.keys;
+    const m = this.meta;
     if (!m) return;
     const host = location.host || 'localhost';
     const branch = [];
@@ -939,19 +757,6 @@ const explorer = {
       this.node('table:' + t.name, ICONS.table, `${esc(t.name)} <span class="cnt">(${t.row_count})</span>`,
         {kind: 'table', name: t.name, more: t.row_count, children: true}));
     branch.push(['tables', ICONS.folder, `表 <span class="cnt">(${m.totals.tables})</span>`, {kind: 'tables', children: true}]);
-
-    // KV
-    const byType = {};
-    (k.keys || []).forEach(e => { (byType[e.type] = byType[e.type] || []).push(e); });
-    const kvInner = KV_TYPES.map(([tk, tl]) => {
-      const keys = byType[tk] || [];
-      return this.node('kvtype:' + tk, kvIcon(tk), `${tl} <span class="cnt">(${keys.length})</span>`,
-        {kind: 'kvtype', name: tk, children: true});
-    }).join('');
-    branch.push(['kv', ICONS.folder, `KV 存储 <span class="cnt">(${k.total})</span>`, {kind: 'kv', children: true}]);
-
-    // 发布订阅
-    branch.push(['pub', ICONS.pub, `发布订阅 <span class="cnt">(监视器)</span>`, {kind: 'pub'}]);
 
     // 系统视图
     branch.push(['sys', ICONS.folder, '系统视图', {kind: 'sys', children: true}]);
@@ -987,22 +792,8 @@ const explorer = {
         const kEl = $(`[data-ch="${CSS.escape(p + '/keys')}"]`, tree); if (kEl) kEl.innerHTML = keys;
       });
     }
-    if (this.expanded.has('kv')) {
-      const el = $('[data-ch="kv"]', tree); if (el) el.innerHTML = kvInner;
-      KV_TYPES.forEach(([tk]) => {
-        if (!this.expanded.has('kvtype:' + tk)) return;
-        const el2 = $(`[data-ch="kvtype:${tk}"]`, tree);
-        if (!el2) return;
-        const keys = (byType[tk] || []);
-        el2.innerHTML = keys.map(e => this.node('key:' + e.key, kvIcon(tk),
-          `${esc(e.key)}${e.ttl_ms >= 0 ? '<span class="ttl-flag" title="TTL ' + Math.round(e.ttl_ms / 1000) + 's">⏳</span>' : ''}`,
-          {kind: 'kvkey', name: e.key, more: tk})).join('') ||
-          '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无键)</span></div>';
-      });
-    }
     if (this.expanded.has('sys')) {
       const sysViews = [
-        ['_kv', 'KV 系统表(键/类型/值/过期)'],
         ['information_schema.tables', '表清单(名称/页数)'],
         ['information_schema.columns', '列清单(可空性/类型)'],
         ['sqlite_master', 'SQLite 兼容视图'],
@@ -1033,14 +824,12 @@ const explorer = {
       node.classList.add('sel');
       // SSMS 语义:单击箭头折叠/展开;单击标签仅选中(双击再触发打开)
       if (e.target.closest('.twist') && hasChildren(node)) toggle(node);
-      else if (kind === 'pub') openPubTab();
     });
     tree.addEventListener('dblclick', (e) => {
       const node = e.target.closest('.tnode[data-path]');
       if (!node) return;
       const kind = node.dataset.kind, name = node.dataset.name;
       if (kind === 'table') openDataTab(name, explorer.tableMeta(name));
-      else if (kind === 'kvkey') openKvTab(name);
       else if (kind === 'sysview') openQueryTab(`查询: ${name}`, `SELECT * FROM ${name} LIMIT 100;`, true);
       else if (hasChildren(node)) toggle(node);
     });
@@ -1069,57 +858,16 @@ const explorer = {
         {id: 'drop', label: `删除表 ${name}…`, act: () => dropTable(name)},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
-    } else if (kind === 'column' || kind === 'index' || kind === 'key' || kind === 'kvkey' || kind === 'sysview') {
+    } else if (kind === 'column' || kind === 'index' || kind === 'key' || kind === 'sysview') {
       ctx.open([
         {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
-        ...(kind === 'kvkey' ? [
-          '-',
-          {id: 'open', label: '打开键值详情', act: () => openKvTab(name)},
-          {id: 'ttl', label: '设置 TTL…', act: () => dialog('设置 TTL(秒)', [{name:'secs', label:'秒数', value:'60'}], '确定', async (v, err) => {
-            if (!v.secs || +v.secs <= 0) { err('请输入正整数'); throw new Error('cancel'); }
-            const r = await api.post('/api/kv', {command: 'EXPIRE', args: [name, String(+v.secs * 1000)]});
-            if (r.ok) { ui.toast('TTL 已设置'); this.refresh(); } else ui.toast(r.error, true);
-          })},
-          {id: 'del', label: '删除键…', act: () => dialog('删除键', [{name:'name', label:'键名', value: name, ph:'输入键名以确认'}], '删除', async (v, err) => {
-            if (v.name !== name) { err('键名不匹配'); throw new Error('cancel'); }
-            const r = await api.post('/api/kv', {command: 'DEL', args: [name]});
-            if (r.ok) { ui.toast('已删除'); this.refresh(); } else ui.toast(r.error, true);
-          })},
-        ] : []),
         ...(kind === 'sysview' ? [{id: 'sel', label: '选择前 100 行', act: () => q(`SELECT * FROM ${name} LIMIT 100;`, `查询: ${name}`)}] : []),
-      ], x, y);
-    } else if (kind === 'kvtype') {
-      ctx.open([
-        {id: 'newk', label: `新建${kvTypeLabel(name)}键…`, act: () => dialog(`新建${kvTypeLabel(name)}键`, [
-          {name: 'key', label: '键名', ph: '如 user:1'},
-          {name: 'val', label: '初始值', ph: name === 'string' ? '字符串值' : '(可留空,打开详情页再编辑)'},
-        ], '创建', async (v, err) => {
-          if (!v.key) { err('请填写键名'); throw new Error('cancel'); }
-          if (name === 'string') {
-            const r = await api.post('/api/kv', {command: 'SET', args: [v.key, v.val || '']});
-            if (!r.ok) { ui.toast(r.error, true); return; }
-          } else {
-            // 集合类型直接写入空集合结构(与 collections 层存储布局一致)
-            const empty = {list: '[]', hash: '{}', set: '[]', zset: '{}'}[name];
-            const escKey = v.key.replace(/'/g, "''");
-            const r = await api.post('/api/sql', {sql:
-              `INSERT INTO _kv ("key", type, value, expire_at) VALUES ('${escKey}', '${name}', '${empty}', 0)`});
-            if (r.kind === 'error') { ui.toast(r.message, true); return; }
-          }
-          ui.toast(`已创建键 ${v.key}`); this.refresh(); openKvTab(v.key);
-        })},
-        {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'tables') {
       ctx.open([
         {id: 'newq', label: '新建查询', act: () => openQueryTab()},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
-    } else if (kind === 'kv') {
-      ctx.open([{id: 'refresh', label: '刷新', act: () => this.refresh()},
-        {id: 'all', label: '在查询中查看 _kv 表', act: () => openQueryTab('查询: _kv', 'SELECT "key", type, value, expire_at FROM _kv LIMIT 500;', true)}], x, y);
-    } else if (kind === 'pub') {
-      ctx.open([{id: 'open', label: '打开发布监视器', act: () => openPubTab()}], x, y);
     } else if (kind === 'server') {
       ctx.open([
         {id: 'dash', label: '服务器仪表盘', act: () => openDashboard()},
@@ -1193,11 +941,8 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'close-tab') { if (tabs.active) tabs.close(tabs.active); }
     else if (act === 'refresh') explorer.refresh();
     else if (act === 'dashboard') openDashboard();
-    else if (act === 'open-kv') { explorer.expanded.add('kv'); explorer.refresh();
-      const kvKeys = tabs.list.find(t => t.kind === 'kv'); if (kvKeys) tabs.activate(kvKeys); }
-    else if (act === 'open-pub') openPubTab();
     else if (act === 'about') dialog('关于 docsql Studio', [
-      {name:'a', label: '产品', value: 'docsql Studio — 多模数据库管理控制台(SSMS 风格) v1.0'},
+      {name:'a', label: '产品', value: 'docsql Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},
     ], '确定', async () => {});
   };
 });

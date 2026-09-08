@@ -24,16 +24,6 @@ fn main() {
         remote_shell(&addr, token.as_deref());
         return;
     }
-    if args.get(1).map(String::as_str) == Some("kv") {
-        // `docsql-cli kv host:port "SET key value ..." | "PROMOTE"`
-        let addr = args
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| "127.0.0.1:7600".into());
-        let rest: Vec<String> = args.get(3..).map(|s| s.to_vec()).unwrap_or_default();
-        kv_one(&addr, &rest);
-        return;
-    }
     let path = args
         .get(1)
         .cloned()
@@ -104,34 +94,12 @@ fn round_trip(stream: &mut std::net::TcpStream, frame: &Frame) -> Result<Frame, 
         .map_err(|e| format!("protocol error: {e}"))
 }
 
-/// Send one KV command; print the NUL-joined reply payload.
-fn kv_one(addr: &str, args: &[String]) {
-    let Ok(mut stream) = std::net::TcpStream::connect(addr) else {
-        eprintln!("docsql: cannot connect {addr}");
-        std::process::exit(1);
-    };
-    let payload = args.join("\x00").into_bytes();
-    let frame = Frame::new(proto::REQ_KV, payload);
-    let f = match round_trip(&mut stream, &frame) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
-    if f.frame_type == proto::RESP_ERROR {
-        eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
-        std::process::exit(2);
-    }
-    // Integer replies (counts, TTLs): small LE u64s have zero high bytes,
-    // which an 8-character ASCII string never does.
-    println!("{}", decode_kv_payload(&f.payload));
-}
-
-/// AUTH against a token-protected server. Returns success.
-fn kv_auth(stream: &mut std::net::TcpStream, token: &str) -> bool {
-    let payload = format!("AUTH\x00{token}").into_bytes();
-    match round_trip(stream, &Frame::new(proto::REQ_KV, payload)) {
+/// AUTH against a token-protected server (REQ_AUTH frame). Returns success.
+fn auth(stream: &mut std::net::TcpStream, token: &str) -> bool {
+    match round_trip(
+        stream,
+        &Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec()),
+    ) {
         Ok(f) if f.frame_type != proto::RESP_ERROR => true,
         Ok(f) => {
             eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
@@ -153,7 +121,7 @@ fn remote_shell(addr: &str, token: Option<&str>) {
         }
     };
     if let Some(t) = token {
-        if !kv_auth(&mut stream, t) {
+        if !auth(&mut stream, t) {
             std::process::exit(2);
         }
     }
@@ -174,14 +142,14 @@ fn remote_shell(addr: &str, token: Option<&str>) {
         if trimmed == "exit" || trimmed == "exit;" {
             break;
         }
-        // Inline AUTH: forward as a KV command instead of SQL.
+        // Inline AUTH: a dedicated auth frame, not SQL.
         if let Some(tok) = trimmed
             .strip_prefix("auth ")
             .or_else(|| trimmed.strip_prefix("AUTH "))
             .map(|t| t.trim().trim_end_matches(';').trim())
             .filter(|t| !t.is_empty())
         {
-            if kv_auth(&mut stream, tok) {
+            if auth(&mut stream, tok) {
                 println!("ok");
             }
             continue;
@@ -301,19 +269,6 @@ pub fn render_rows(r: &QueryResult) -> String {
     out
 }
 
-/// Decode one KV reply payload the way `kv_one` prints it: small LE u64
-/// integers print numerically, everything else NUL-joins non-empty parts.
-pub fn decode_kv_payload(payload: &[u8]) -> String {
-    if payload.len() == 8 && payload[4..8] == [0u8; 4] {
-        return u64::from_le_bytes(payload[..8].try_into().unwrap()).to_string();
-    }
-    String::from_utf8_lossy(payload)
-        .split('\x00')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,16 +300,6 @@ mod tests {
         assert_eq!(lines[2].chars().count(), lines[3].chars().count());
         // 分隔线只含 - 与 +
         assert!(lines[1].chars().all(|c| c == '-' || c == '+'));
-    }
-
-    #[test]
-    fn decode_kv_payload_int_and_text() {
-        assert_eq!(decode_kv_payload(&7u64.to_le_bytes()), "7");
-        assert_eq!(decode_kv_payload(&0u64.to_le_bytes()), "0");
-        // 8 字节非整数(ASCII 文本)不误判
-        assert_eq!(decode_kv_payload(b"12345678"), "12345678");
-        assert_eq!(decode_kv_payload(b"subscribed\x00ch"), "subscribed ch");
-        assert_eq!(decode_kv_payload(b"a\x00\x00b"), "a b");
     }
 
     #[test]

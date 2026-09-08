@@ -64,7 +64,7 @@ public sealed class TransportEncryptionTests
     }
 
     [Fact]
-    public void Encrypted_roundtrip_sql_and_kv()
+    public void Encrypted_roundtrip_sql()
     {
         using var server = TlsServer.Start();
         using var conn = new DocsqlConnection(server.Cs);
@@ -82,9 +82,6 @@ public sealed class TransportEncryptionTests
             cmd.CommandText = "SELECT v FROM sec";
             Assert.Equal("机密数据", cmd.ExecuteScalar());
         }
-        var kv = conn.Kv("SET", "k", "v");
-        Assert.Equal(FrameType.RespAffected, kv.Type);
-        Assert.Equal("v", conn.Kv("GET", "k").Payload);
     }
 
     [Fact]

@@ -95,14 +95,15 @@ public sealed class DocsqlConnection : DbConnection
     public override void ChangeDatabase(string databaseName) { }
 
     /// <summary>
-    /// 发送 KV 命令(GET/SET/PROMOTE/...),参数以 \x00 分隔编码。
-    /// 返回 (响应帧类型, 文本 payload);错误帧时 payload 为错误消息。
+    /// 故障转移提升(REQ_PROMOTE):把只读副本提升为可写节点。
     /// </summary>
-    public (FrameType Type, string Payload) Kv(params string[] args)
+    public void Promote()
     {
-        var payload = Encoding.UTF8.GetBytes("\x00" + string.Join("\x00", args));
-        var resp = Proto.Send(new Frame(FrameType.ReqKv, 0, 0, payload));
-        return (resp.Type, Encoding.UTF8.GetString(resp.Payload));
+        var resp = Proto.Send(new Frame(FrameType.ReqPromote, 0, 0, Array.Empty<byte>()));
+        if (resp.Type == FrameType.RespError)
+        {
+            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
+        }
     }
 
     public override void Open()
@@ -115,11 +116,11 @@ public sealed class DocsqlConnection : DbConnection
         try
         {
             _proto = new ProtocolConnection(p.Host, p.Port, ParseKey(KeyOverride ?? p.Key));
-            // AUTH when a token is configured.
+            // AUTH when a token is configured (REQ_AUTH carries the raw token).
             if (!string.IsNullOrEmpty(p.Token))
             {
-                var payload = Encoding.UTF8.GetBytes($"\x00AUTH\x00{p.Token}");
-                var resp = _proto.Send(new Frame(FrameType.ReqKv, 0, 0, payload));
+                var payload = Encoding.UTF8.GetBytes(p.Token);
+                var resp = _proto.Send(new Frame(FrameType.ReqAuth, 0, 0, payload));
                 if (resp.Type == FrameType.RespError)
                 {
                     throw new DocsqlException("auth failed: " + Encoding.UTF8.GetString(resp.Payload));

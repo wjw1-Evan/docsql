@@ -22,7 +22,7 @@
 services:
   # ---- profile: cluster ------------------------------------------------
   # Symmetric cluster: every node is equal — accepts writes and fans each
-  # successful write out to its DOCSQL_PEERS (SQL and KV alike). There is no
+  # successful write out to its DOCSQL_PEERS. There is no
   # primary/replica role; connect to any node to read and write.
   node-a:
     profiles: ["cluster"]
@@ -31,7 +31,7 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-b:7600,node-c:7600"
-      # The token applies to this node's SQL/KV port too (nodes authenticate
+      # The token applies to this node's protocol port too (nodes authenticate
       # to each other automatically during replication fan-out).
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:

@@ -128,6 +128,16 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
     private string Cs => $"host=127.0.0.1;port={_fx.Port}";
 
     [Fact]
+    public void Database_Migrate_is_unsupported_and_fails_explicitly()
+    {
+        // docsql 的建表走 EnsureCreated/AutoCreate/SchemaSync,不提供迁移
+        // 管线;Migrate() 必须显式报错并指向替代方案,而非生成方言外的 SQL。
+        using var db = new TagDb(Cs);
+        var ex = Assert.ThrowsAny<NotSupportedException>(() => db.Database.Migrate());
+        Assert.Contains("EnsureCreated", ex.Message);
+    }
+
+    [Fact]
     public void String_primary_key_entity_roundtrips()
     {
         using var conn = new DocsqlConnection($"host=127.0.0.1;port={_fx.Port}");
@@ -749,8 +759,7 @@ public sealed class EfFailoverTests
         using (var conn = new DocsqlConnection(replicaCs))
         {
             conn.Open();
-            var resp = conn.Kv("PROMOTE");
-            Assert.NotEqual(FrameType.RespError, resp.Type);
+            conn.Promote();
         }
 
         // 阶段 3:EF 指向新主,复制来的数据可读,新写入可增删改

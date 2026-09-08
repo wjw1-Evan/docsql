@@ -14,7 +14,6 @@ ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
 sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$CTR" docsql-cli connect "$1" 2>/dev/null; }
-kv()  { docker exec "$CTR" docsql-cli kv "$1" "${@:2}" 2>/dev/null; }
 
 echo "== 1. standalone SQL =="
 out=$(sql "$A" "CREATE TABLE solo (id INT PRIMARY KEY, tag TEXT);")
@@ -26,15 +25,7 @@ echo "$out" | grep -q "one" && ok "select row back" || bad "select: $out"
 out=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 [ "$out" = "2" ] && ok "count = 2" || bad "count: '$out'"
 
-echo "== 2. standalone KV =="
-out=$(kv "$A" SET solo:greeting standalone)
-[ "$out" = "ok" ] && ok "kv SET" || bad "kv SET: $out"
-out=$(kv "$A" GET solo:greeting)
-[ "$out" = "standalone" ] && ok "kv GET roundtrip" || bad "kv GET: '$out'"
-out=$(kv "$A" INCR solo:counter)
-[ "$out" = "1" ] && ok "kv INCR" || bad "kv INCR: '$out'"
-
-echo "== 3. transactions (local) =="
+echo "== 2. transactions (local) =="
 before=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 sql "$A" "BEGIN;" >/dev/null
 sql "$A" "INSERT INTO solo VALUES (9, 'tx');" >/dev/null
@@ -42,7 +33,7 @@ sql "$A" "ROLLBACK;" >/dev/null
 after=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 [ "$before" = "$after" ] && ok "rollback (count $before == $after)" || bad "rollback: $before != $after"
 
-echo "== 4. persistence across container restart =="
+echo "== 3. persistence across container restart =="
 docker restart "$CTR" >/dev/null
 up=""
 for _ in $(seq 1 60); do
@@ -53,10 +44,8 @@ done
 [ -n "$up" ] && ok "node back up after restart" || bad "node did not come back"
 out=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 [ "$out" = "2" ] && ok "sql rows survive restart (count = 2)" || bad "rows lost on restart: '$out'"
-out=$(kv "$A" GET solo:greeting)
-[ "$out" = "standalone" ] && ok "kv survives restart" || bad "kv lost on restart: '$out'"
 
-echo "== 5. web console (:17710) =="
+echo "== 4. web console (:17710) =="
 W="http://127.0.0.1:17710"
 body=$(curl -s "$W/")
 echo "$body" | grep -q "docsql console" && ok "web UI served" || bad "web UI: $(echo "$body" | head -c 80)"
@@ -69,7 +58,7 @@ echo "$r" | grep -q '"fromweb"' && ok "web sql select" || bad "web sql select: $
 r=$(curl -s "$W/api/stats")
 echo "$r" | grep -q '"tables"' && ok "web stats" || bad "web stats: $r"
 
-echo "== 6. isolation from the cluster profile =="
+echo "== 5. isolation from the cluster profile =="
 if docker ps --filter "name=docsql-a" --format "{{.Names}}" | grep -q .; then
   sql "$A" "CREATE TABLE solo_only (k TEXT);" >/dev/null
   out=$(printf 'SELECT k FROM solo_only;\nexit;\n' | docker exec -i docsql-a docsql-cli connect node-a:7600 2>/dev/null)

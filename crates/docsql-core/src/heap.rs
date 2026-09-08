@@ -567,13 +567,18 @@ mod tests {
             .replace(&mut pager, &mut tx, loc + (1 << 20), &doc(3, "x"))
             .is_err());
         pager.abort_tx(tx).unwrap();
-        // doc_at 对 tombstone 返回 None
+        // 删除 commit 后页必然压缩(tombstone 只存在于事务内):
+        // 被删文档的旧 locator 越界,读回显式报错——静默返回 None 会掩盖
+        // stale-locator bug
         let mut tx = pager.begin_tx();
         let l2 = heap.insert(&mut pager, &mut tx, &doc(4, "gone")).unwrap();
         heap.remove_many(&mut pager, &mut tx, &[l2]).unwrap();
         pager.commit_tx(tx).unwrap();
-        assert_eq!(heap.doc_at(&mut pager, l2).unwrap(), None);
-        // 删除+重插使扫描跳过 tombstone
+        assert!(matches!(
+            heap.doc_at(&mut pager, l2),
+            Err(HeapError::Page(_, "slot out of range"))
+        ));
+        // 删除+重插使扫描跳过被删文档
         let mut tx = pager.begin_tx();
         heap.insert(&mut pager, &mut tx, &doc(5, "new")).unwrap();
         pager.commit_tx(tx).unwrap();

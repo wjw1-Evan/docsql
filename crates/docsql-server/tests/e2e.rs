@@ -73,9 +73,19 @@ impl Client {
         self.recv().await
     }
 
-    async fn kv(&mut self, args: &[&str]) -> Frame {
-        self.send(&Frame::new(proto::REQ_KV, args.join("\x00").into_bytes()))
+    async fn auth(&mut self, token: &str) -> Frame {
+        self.send(&Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec()))
             .await;
+        self.recv().await
+    }
+
+    async fn promote(&mut self) -> Frame {
+        self.send(&Frame::new(proto::REQ_PROMOTE, vec![])).await;
+        self.recv().await
+    }
+
+    async fn ping(&mut self) -> Frame {
+        self.send(&Frame::new(proto::REQ_PING, vec![])).await;
         self.recv().await
     }
 }
@@ -149,143 +159,20 @@ async fn sql_join_groupby_over_wire() {
 }
 
 #[tokio::test]
-async fn kv_commands_over_wire() {
-    let (_dir, addr) = start_server(None).await;
-    let mut c = Client::connect(&addr).await;
-    let r = c.kv(&["SET", "greeting", "hello"]).await;
-    assert_eq!(payload_str(&r), "ok");
-    let r = c.kv(&["GET", "greeting"]).await;
-    assert_eq!(payload_str(&r), "hello");
-    let r = c.kv(&["INCR", "hits"]).await;
-    assert_eq!(u64::from_le_bytes(r.payload[..8].try_into().unwrap()), 1);
-    let r = c.kv(&["RPUSH", "L", "a", "b"]).await;
-    assert_eq!(u64::from_le_bytes(r.payload[..8].try_into().unwrap()), 2);
-    let r = c.kv(&["LRANGE", "L", "0", "-1"]).await;
-    assert_eq!(payload_str(&r), "a\x00b");
-    let r = c.kv(&["NOPE"]).await;
-    assert_eq!(r.frame_type, proto::RESP_ERROR);
-}
-
-#[tokio::test]
-async fn kv_full_surface_over_wire() {
-    let (_dir, addr) = start_server(None).await;
-    let mut c = Client::connect(&addr).await;
-    let int = |f: &Frame| u64::from_le_bytes(f.payload[..8].try_into().unwrap());
-
-    // DEL + EXISTS round trip
-    c.kv(&["SET", "k", "v"]).await;
-    let r = c.kv(&["EXISTS", "k"]).await;
-    assert_eq!(int(&r), 1);
-    let r = c.kv(&["EXISTS", "missing"]).await;
-    assert_eq!(int(&r), 0);
-    let r = c.kv(&["DEL", "k"]).await;
-    assert_eq!(payload_str(&r), "1");
-    let r = c.kv(&["DEL", "k"]).await;
-    assert_eq!(payload_str(&r), "0");
-    let r = c.kv(&["EXISTS", "k"]).await;
-    assert_eq!(int(&r), 0);
-
-    // SET flags: NX on existing key skips, XX on missing key skips
-    c.kv(&["SET", "f", "a"]).await;
-    let r = c.kv(&["SET", "f", "b", "NX"]).await;
-    assert_eq!(payload_str(&r), "skip");
-    let r = c.kv(&["SET", "f2", "b", "XX"]).await;
-    assert_eq!(payload_str(&r), "skip");
-    let r = c.kv(&["SET", "f", "b", "XX"]).await;
-    assert_eq!(payload_str(&r), "ok");
-
-    // EXPIRE / TTL / PERSIST
-    let r = c.kv(&["EXPIRE", "f", "60000"]).await;
-    assert_eq!(payload_str(&r), "1");
-    let r = c.kv(&["TTL", "f"]).await;
-    let ttl = int(&r);
-    assert!(ttl > 0 && ttl <= 60_000, "unexpected ttl {ttl}");
-    let r = c.kv(&["PERSIST", "f"]).await;
-    assert_eq!(payload_str(&r), "1");
-    let r = c.kv(&["TTL", "f"]).await;
-    assert_eq!(payload_str(&r), "-1");
-
-    // hash / set / zset over the wire
-    let r = c.kv(&["HSET", "H", "field", "val"]).await;
-    assert_eq!(int(&r), 1);
-    let r = c.kv(&["HGET", "H", "field"]).await;
-    assert_eq!(payload_str(&r), "val");
-    let r = c.kv(&["HGET", "H", "nope"]).await;
-    assert_eq!(r.payload.len(), 0); // nil
-    let r = c.kv(&["SADD", "S", "x", "y", "x"]).await;
-    assert_eq!(int(&r), 2);
-    let r = c.kv(&["SMEMBERS", "S"]).await;
-    let members = payload_str(&r);
-    assert!(members.contains("x") && members.contains("y"), "{members}");
-    let r = c.kv(&["ZADD", "Z", "2.5", "m2"]).await;
-    assert_eq!(int(&r), 1);
-    let r = c.kv(&["ZADD", "Z", "1.5", "m1"]).await;
-    assert_eq!(int(&r), 1);
-    let r = c.kv(&["ZRANGE", "Z", "-inf", "inf"]).await;
-    assert_eq!(payload_str(&r), "m1\x001.5\x00m2\x002.5");
-
-    // MULTI / EXEC commit
-    c.kv(&["MULTI"]).await;
-    c.kv(&["SET", "txa", "1"]).await;
-    c.kv(&["RPUSH", "txl", "e"]).await;
-    let r = c.kv(&["EXEC"]).await;
-    assert_eq!(payload_str(&r), "ok");
-    let r = c.kv(&["GET", "txa"]).await;
-    assert_eq!(payload_str(&r), "1");
-    let r = c.kv(&["LRANGE", "txl", "0", "-1"]).await;
-    assert_eq!(payload_str(&r), "e");
-
-    // MULTI / DISCARD rolls back
-    c.kv(&["MULTI"]).await;
-    c.kv(&["SET", "txa", "999"]).await;
-    let r = c.kv(&["DISCARD"]).await;
-    assert_eq!(payload_str(&r), "ok");
-    let r = c.kv(&["GET", "txa"]).await;
-    assert_eq!(payload_str(&r), "1");
-}
-
-#[tokio::test]
 async fn auth_gate() {
     let (_dir, addr) = start_server(Some("s3cret")).await;
     let mut c = Client::connect(&addr).await;
     // SQL before AUTH is rejected.
     let r = c.sql("SELECT 1").await;
     assert_eq!(r.frame_type, proto::RESP_ERROR);
-    // KV GET before AUTH rejected too.
-    let r = c.kv(&["GET", "k"]).await;
-    assert_eq!(r.frame_type, proto::RESP_ERROR);
     // Wrong token rejected.
-    let r = c.kv(&["AUTH", "wrong"]).await;
+    let r = c.auth("wrong").await;
     assert_eq!(r.frame_type, proto::RESP_ERROR);
-    // Right token unlocks the session.
-    let r = c.kv(&["AUTH", "s3cret"]).await;
+    // Right token unlocks the session (SQL included).
+    let r = c.auth("s3cret").await;
     assert_eq!(payload_str(&r), "ok");
-    let r = c.kv(&["SET", "k", "v"]).await;
-    assert_eq!(payload_str(&r), "ok");
-}
-
-#[tokio::test]
-async fn pubsub_push_between_connections() {
-    let (_dir, addr) = start_server(None).await;
-    let mut sub = Client::connect(&addr).await;
-    let r = sub.kv(&["SUBSCRIBE", "news"]).await;
-    assert!(payload_str(&r).starts_with("subscribed"));
-    let mut pubber = Client::connect(&addr).await;
-    let r = pubber.kv(&["PUBLISH", "news", "hello world"]).await;
-    assert_eq!(u64::from_le_bytes(r.payload[..8].try_into().unwrap()), 1);
-    // The subscriber connection receives a RESP_PUSH frame.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let f = tokio::time::timeout_at(deadline.into(), sub.recv()).await;
-        match f {
-            Ok(frame) if frame.frame_type == proto::RESP_PUSH => {
-                assert_eq!(payload_str(&frame), "message\x00news\x00hello world");
-                break;
-            }
-            Ok(_) => continue,
-            Err(_) => panic!("no push received within timeout"),
-        }
-    }
+    let r = c.sql("SELECT 1").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS);
 }
 
 #[tokio::test]
@@ -295,9 +182,9 @@ async fn sql_error_reaches_client() {
     let r = c.sql("SELECT * FROM missing").await;
     assert_eq!(r.frame_type, proto::RESP_ERROR);
     assert!(payload_str(&r).contains("does not exist"));
-    // Connection stays usable afterwards.
-    let r = c.kv(&["PING"]).await;
-    assert_eq!(payload_str(&r), "pong");
+    // Connection stays usable afterwards (protocol-level ping).
+    let r = c.ping().await;
+    assert_eq!(r.frame_type, proto::RESP_PONG);
 }
 
 /// The engine allows one global transaction: a BEGIN from a second
@@ -405,26 +292,14 @@ async fn replication_and_failover() {
     }
     assert!(seen, "replica did not observe the replicated write");
 
-    // KV writes replicate too.
-    p.kv(&["SET", "replkey", "replval"]).await;
-    let mut kv_seen = false;
-    for _ in 0..50 {
-        let resp = r.kv(&["GET", "replkey"]).await;
-        if resp.frame_type == proto::RESP_AFFECTED && payload_str(&resp) == "replval" {
-            kv_seen = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(kv_seen, "KV write did not replicate");
-
     // Replica rejects client writes before promotion.
     let resp = r.sql("INSERT INTO fail VALUES (8)").await;
     assert_eq!(resp.frame_type, proto::RESP_ERROR);
     assert!(payload_str(&resp).contains("read-only"));
 
-    // Failover: promote the replica; writes now succeed.
-    r.kv(&["PROMOTE"]).await;
+    // Failover: promote the replica (REQ_PROMOTE); writes now succeed.
+    let resp = r.promote().await;
+    assert_ne!(resp.frame_type, proto::RESP_ERROR, "PROMOTE failed");
     let resp = r.sql("INSERT INTO fail VALUES (8)").await;
     assert_eq!(
         resp.frame_type,
@@ -444,11 +319,7 @@ async fn replication_and_failover() {
 async fn wait_seen(addr: &str, probe: &str, needle: &str) -> bool {
     for _ in 0..50 {
         let mut c = Client::connect(addr).await;
-        let resp = if let Some(kv) = probe.strip_prefix("KV ") {
-            c.kv(&kv.split_whitespace().collect::<Vec<_>>()).await
-        } else {
-            c.sql(probe).await
-        };
+        let resp = c.sql(probe).await;
         let text = String::from_utf8_lossy(&resp.payload).to_string();
         if resp.frame_type != proto::RESP_ERROR && text.contains(needle) {
             return true;
@@ -498,21 +369,16 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
         }
     }
 
-    // Write through node 0 (SQL), node 1 (KV); read from node 2.
+    // Write through node 0 and node 1; read from node 2.
     let mut a = Client::connect(&addrs[0]).await;
     a.sql("CREATE TABLE sym (id INT, src INT)").await;
     a.sql("INSERT INTO sym VALUES (1, 0)").await;
     let mut b = Client::connect(&addrs[1]).await;
     b.sql("INSERT INTO sym VALUES (2, 1)").await;
-    b.kv(&["SET", "symkey", "from1"]).await;
 
     assert!(
         wait_seen(&addrs[2], "SELECT src FROM sym ORDER BY src", "[[0],[1]]").await,
         "node2 did not see both SQL writes"
-    );
-    assert!(
-        wait_seen(&addrs[2], "KV GET symkey", "from1").await,
-        "node2 did not see the KV write"
     );
 
     // Any node also accepts writes (no read-only role anywhere).
@@ -528,7 +394,7 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
 /// Two-node symmetric cluster: transaction semantics must hold across
 /// replication — a rolled-back write never reaches the peer, committed
 /// transaction writes replay in order, and savepoint rollbacks trim exactly
-/// the buffered tail (SQL and KV alike).
+/// the buffered tail.
 #[tokio::test]
 async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -603,79 +469,6 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
         wait_seen(&addrs[1], "SELECT id FROM txr ORDER BY id", "[[1],[3],[5]]").await,
         "committed transaction did not replicate (or savepoint leaked)"
     );
-
-    // KV MULTI/DISCARD: buffered frames never reach the peer.
-    a.kv(&["MULTI"]).await;
-    a.kv(&["SET", "txk", "discarded"]).await;
-    a.kv(&["DISCARD"]).await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let resp = b.kv(&["GET", "txk"]).await;
-    assert_ne!(
-        payload_str(&resp),
-        "discarded",
-        "peer observed a KV write from a discarded MULTI"
-    );
-
-    // KV MULTI/EXEC: the buffered write replays at commit time.
-    a.kv(&["MULTI"]).await;
-    a.kv(&["SET", "txk2", "committed"]).await;
-    let resp = a.kv(&["EXEC"]).await;
-    assert_ne!(resp.frame_type, proto::RESP_ERROR, "EXEC failed");
-    assert!(
-        wait_seen(&addrs[1], "KV GET txk2", "committed").await,
-        "KV transaction write did not replicate on EXEC"
-    );
-}
-
-/// Two real shards: KV keys route by hash slot and land deterministically.
-#[tokio::test]
-async fn shard_routing_distributes_kv_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut addrs = Vec::new();
-    for i in 0..2 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
-        drop(l);
-        tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
-            db_path: dir.path().join(format!("shard{i}.db")),
-            listen: a.clone(),
-            auth_token: None,
-            replicate_to: None,
-            peers: Vec::new(),
-            read_only: false,
-            transport_key: None,
-            async_commit: false,
-        }));
-        addrs.push(a);
-    }
-    for a in &addrs {
-        for _ in 0..100 {
-            if TcpStream::connect(a).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    let router = docsql_server::shard::ShardRouter::new(addrs.clone());
-    assert_eq!(router.shard_count(), 2);
-
-    // Write through the router, read directly from each shard.
-    let keys = ["shard-key-a", "shard-key-b", "shard-key-c", "shard-key-d"];
-    for k in keys {
-        let resp = router.kv(&["SET", k, "routed"]).await.unwrap();
-        assert_ne!(resp.frame_type, proto::RESP_ERROR, "SET {k} failed");
-    }
-    for k in keys {
-        let target = router.shard_for(k);
-        let mut c = Client::connect(target).await;
-        let resp = c.kv(&["GET", k]).await;
-        // The value travels with the routed command.
-        assert_eq!(payload_str(&resp), "routed", "GET {k} on {target}");
-    }
-
-    // Same key always routes to the same shard (read-your-writes).
-    assert_eq!(router.shard_for("stable"), router.shard_for("stable"));
 }
 
 /// Query log: executed statements appear in the docsql_log view with

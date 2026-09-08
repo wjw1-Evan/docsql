@@ -22,3 +22,5 @@ deploy/.env
 coverage/
 coverage2/
 *.profraw
+# zcode agent session artifacts (plans etc.)
+.zcode/

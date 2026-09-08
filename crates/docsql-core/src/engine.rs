@@ -7523,19 +7523,10 @@ mod tx_rollback_tests {
         assert!(db
             .execute("SELECT SUBSTR(s, id + 0.5) FROM fn WHERE id = 1")
             .is_err());
-        // TRIM 家族三种模式
-        assert_eq!(
-            rows(&mut db, "SELECT TRIM(LEADING ' ' FROM '  x ')").rows[0][0],
-            Value::Str("x ".into())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT TRIM(TRAILING ' ' FROM '  x ')").rows[0][0],
-            Value::Str("  x".into())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT TRIM(BOTH ' ' FROM '  x ')").rows[0][0],
-            Value::Str("x".into())
-        );
+        // TRIM 带字符集(即使单空格)显式报错:不支持的语法不静默吞掉
+        assert!(db.execute("SELECT TRIM(LEADING ' ' FROM '  x ')").is_err());
+        assert!(db.execute("SELECT TRIM(TRAILING ' ' FROM '  x ')").is_err());
+        assert!(db.execute("SELECT TRIM(BOTH ' ' FROM '  x ')").is_err());
         // CONCAT NULL 传染 / LENGTH NULL
         assert_eq!(
             rows(&mut db, "SELECT CONCAT(s, 'x') FROM fn WHERE id = 2").rows[0][0],

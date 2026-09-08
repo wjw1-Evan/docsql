@@ -11,7 +11,10 @@ namespace Docsql.Client;
 public enum FrameType : ushort
 {
     ReqSql = 0x0001,
-    ReqKv = 0x0002,
+    /// <summary>会话认证:载荷为 token 原始字节。</summary>
+    ReqAuth = 0x0002,
+    /// <summary>故障转移提升:清除只读副本模式(需已认证会话)。</summary>
+    ReqPromote = 0x0007,
     ReqPing = 0x0006,
     RespRows = 0x0101,
     RespAffected = 0x0102,

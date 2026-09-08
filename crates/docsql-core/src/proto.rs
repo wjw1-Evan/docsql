@@ -20,12 +20,16 @@ pub const HEADER_LEN: usize = 4 + 2 + 2 + 8 + 4;
 
 // Request frame types.
 pub const REQ_SQL: u16 = 0x0001;
-/// KV command frame: payload = command name + arguments (M3+).
-pub const REQ_KV: u16 = 0x0002;
+/// Session authentication: payload = token bytes; success responds with
+/// RESP_AFFECTED ("ok"), failure with RESP_ERROR.
+pub const REQ_AUTH: u16 = 0x0002;
 pub const REQ_PREPARE: u16 = 0x0003;
 pub const REQ_EXECUTE: u16 = 0x0004;
 pub const REQ_CLOSE_STMT: u16 = 0x0005;
 pub const REQ_PING: u16 = 0x0006;
+/// Failover promotion: clears read-only mode on this node (requires an
+/// authenticated session). Replaces the former KV `PROMOTE` command.
+pub const REQ_PROMOTE: u16 = 0x0007;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
@@ -34,7 +38,6 @@ pub const RESP_ERROR: u16 = 0x0103;
 /// Cluster redirect: payload = "host:port" (reserved, M12+).
 pub const RESP_REDIRECT: u16 = 0x0104;
 pub const RESP_PONG: u16 = 0x0105;
-pub const RESP_PUSH: u16 = 0x0106; // pub/sub delivery (M6+)
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

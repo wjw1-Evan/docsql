@@ -125,7 +125,7 @@ public sealed class FailoverTests
     }
 
     [Fact]
-    public void Writes_replicate_sql_and_kv_to_replica()
+    public void Writes_replicate_sql_to_replica()
     {
         var (primary, replica) = Cluster();
         using var _r = replica;
@@ -138,21 +138,6 @@ public sealed class FailoverTests
             () => { try { return Long(replica.Cs, "SELECT id FROM fo"); } catch { return -1L; } },
             v => v == 7L, "副本看到 SQL 写入");
 
-        // KV 复制
-        using (var p = new DocsqlConnection(primary.Cs))
-        {
-            p.Open();
-            Assert.Equal(FrameType.RespAffected, p.Kv("SET", "fokey", "foval").Type);
-        }
-        using (var r = new DocsqlConnection(replica.Cs))
-        {
-            r.Open();
-            var got = Eventually(
-                () => r.Kv("GET", "fokey"),
-                resp => resp.Type == FrameType.RespAffected && resp.Payload == "foval",
-                "副本看到 KV 写入");
-            Assert.Equal("foval", got.Payload);
-        }
     }
 
     [Fact]
@@ -197,12 +182,11 @@ public sealed class FailoverTests
             Assert.ThrowsAny<Exception>(() => dead.Open());
         }
 
-        // 故障转移:PROMOTE 副本,写路径恢复,复制来的数据完整
+        // 故障转移:PROMOTE 副本(REQ_PROMOTE),写路径恢复,复制来的数据完整
         using (var r = new DocsqlConnection(replica.Cs))
         {
             r.Open();
-            var promoted = r.Kv("PROMOTE");
-            Assert.NotEqual(FrameType.RespError, promoted.Type);
+            r.Promote();
         }
         Assert.Equal(1, Exec(replica.Cs, "INSERT INTO fail VALUES (8)"));
         Assert.Equal(2L, Long(replica.Cs, "SELECT COUNT(id) FROM fail"));

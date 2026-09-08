@@ -36,9 +36,6 @@ public sealed class DocsqlOptionsExtension : RelationalOptionsExtension
 
     public override string? ConnectionString => _connectionString;
     public override DbConnection? Connection => _connection;
-    public override string? MigrationsAssembly => null;
-    public override string? MigrationsHistoryTableName => null;
-    public override string? MigrationsHistoryTableSchema => null;
 
     public override DocsqlOptionsExtension WithConnectionString(string? cs)
         => new(this) { _connectionString = cs };
@@ -94,7 +91,10 @@ internal static class DocsqlServiceCollectionExtensions
         services.TryAddSingleton<IMethodCallTranslatorPlugin, DocsqlMethodCallTranslatorPlugin>();
         services.TryAddScoped<IUpdateSqlGenerator, DocsqlUpdateSqlGenerator>();
         services.TryAddScoped<IModificationCommandBatchFactory, DocsqlModificationCommandBatchFactory>();
-        services.TryAddScoped<IMigrationsSqlGenerator, DocsqlMigrationsSqlGenerator>();
+        // EF Migrations 不提供:注册显式报错桩,Database.Migrate() 直接失败
+        // 并指向 EnsureCreated(建表/索引自动同步),而不是产出方言外的 SQL。
+        services.TryAddScoped<IMigrationsSqlGenerator, DocsqlUnsupportedMigrationsSqlGenerator>();
+        services.TryAddScoped<IHistoryRepository, DocsqlUnsupportedHistoryRepository>();
         services.TryAddSingleton<IRelationalAnnotationProvider, DocsqlAnnotationProvider>();
         return services;
     }

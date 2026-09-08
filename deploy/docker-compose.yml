@@ -15,7 +15,7 @@
 services:
   # ---- profile: cluster ------------------------------------------------
   # Symmetric cluster: every node is equal — accepts writes and fans each
-  # successful write out to its DOCSQL_PEERS (SQL and KV alike). There is no
+  # successful write out to its DOCSQL_PEERS. There is no
   # primary/replica role; connect to any node to read and write.
   node-a:
     profiles: ["cluster"]

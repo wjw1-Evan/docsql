@@ -20,7 +20,6 @@ ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
 sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$(ctr_of "$1")" docsql-cli connect "$1" 2>/dev/null; }
-kv()  { docker exec "$(ctr_of "$1")" docsql-cli kv "$1" "${@:2}" 2>/dev/null; }
 
 # wait_row <node> <sql> <ERE pattern>: poll until the query output matches.
 wait_row() {
@@ -55,31 +54,7 @@ echo "$out" | grep -q "1 rows affected" && ok "write on c accepted" || bad "writ
 wait_row "$A" "SELECT id FROM nodes WHERE id = 4;" "^[[:space:]]*4[[:space:]]*$" && ok "a sees c's write" || bad "a missing c's row"
 wait_row "$B" "SELECT id FROM nodes WHERE id = 4;" "^[[:space:]]*4[[:space:]]*$" && ok "b sees c's write" || bad "b missing c's row"
 
-echo "== 5. KV replication =="
-out=$(kv "$B" SET cluster:greeting deployed)
-[ "$out" = "ok" ] && ok "kv SET on b" || bad "kv SET on b: $out"
-found=""
-for i in $(seq 1 40); do
-  found=$(kv "$A" GET cluster:greeting)
-  [ "$found" = "deployed" ] && break
-  sleep 0.5
-done
-[ "$found" = "deployed" ] && ok "kv replicated b -> a" || bad "kv replication b->a: '$found'"
-found=""
-for i in $(seq 1 40); do
-  found=$(kv "$C" GET cluster:greeting)
-  [ "$found" = "deployed" ] && break
-  sleep 0.5
-done
-[ "$found" = "deployed" ] && ok "kv replicated b -> c" || bad "kv replication b->c: '$found'"
-
-echo "== 6. pub/sub =="
-# (push delivery is on the TCP port; validated in the Rust e2e suite — here we
-# verify PUBLISH returns a subscriber count of 0 without one connected.)
-out=$(kv "$A" PUBLISH ops "hello-nodes")
-echo "$out" | grep -qE "^[0-9]+$" && ok "publish returns count" || bad "publish: $out"
-
-echo "== 7. transactions over the wire (node-b) =="
+echo "== 5. transactions over the wire (node-b) =="
 before=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 sql "$B" "BEGIN;" >/dev/null
 sql "$B" "INSERT INTO nodes VALUES (10, 'tx');" >/dev/null
@@ -87,13 +62,13 @@ sql "$B" "ROLLBACK;" >/dev/null
 after=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 [ "$before" = "$after" ] && ok "rollback over network (count $before == $after)" || bad "tx rollback: $before != $after"
 
-echo "== 8. convergence: all nodes agree =="
+echo "== 6. convergence: all nodes agree =="
 ca=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 cb=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 cc=$(sql "$C" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 [ "$ca" = "$cb" ] && [ "$cb" = "$cc" ] && ok "row count converged: a=$ca b=$cb c=$cc" || bad "divergence: a=$ca b=$cb c=$cc"
 
-echo "== 9. web console in docker =="
+echo "== 7. web console in docker =="
 W="http://127.0.0.1:17700"
 # 页面
 body=$(curl -s "$W/")
@@ -108,13 +83,9 @@ echo "$r" | grep -q '"fromweb"' && ok "web sql select" || bad "web sql select: $
 # SQL 错误返回错误而非崩溃
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"SELECT * FROM missing"}')
 echo "$r" | grep -q '"error"' && ok "web sql error surfaced" || bad "web sql error: $r"
-# KV + 键浏览
-curl -s -X POST "$W/api/kv" -H 'Content-Type: application/json' -d '{"command":"SET","args":["web:key","ok"]}' >/dev/null
-r=$(curl -s "$W/api/keys")
-echo "$r" | grep -q '"web:key"' && ok "web kv set + keys browser" || bad "web keys: $r"
 # 统计
 r=$(curl -s "$W/api/stats")
-echo "$r" | grep -q '"kv_keys":1' && ok "web stats" || bad "web stats: $r"
+echo "$r" | grep -q '"tables"' && ok "web stats" || bad "web stats: $r"
 # 认证开关(DOCSQL_TOKEN 未设置时应放行;此处仅验证无 token 可访问)
 code=$(curl -s -o /dev/null -w "%{http_code}" "$W/api/stats")
 [ "$code" = "200" ] && ok "web no-auth mode accessible" || bad "web http code: $code"

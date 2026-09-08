@@ -1,5 +1,5 @@
 // 异步组提交(DOCSQL_ASYNC_COMMIT=1):服务端后台每 ~2ms 合并一次 WAL fsync。
-// 覆盖:并发多客户端写入全部可见、读一致、KV 路径同样生效。
+// 覆盖:并发多客户端写入全部可见、读一致。
 
 using Docsql.Client;
 using System.Diagnostics;

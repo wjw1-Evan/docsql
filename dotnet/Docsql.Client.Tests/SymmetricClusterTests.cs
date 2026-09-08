@@ -123,19 +123,6 @@ public sealed class SymmetricClusterTests
             Assert.Equal(0L, Long(c.Cs, "SELECT src FROM sym WHERE id = 1"));
             Assert.Equal(1L, Long(c.Cs, "SELECT src FROM sym WHERE id = 2"));
 
-            // KV 同样扇出:连 B SET,连 A GET
-            using (var bc = new DocsqlConnection(b.Cs))
-            {
-                bc.Open();
-                Assert.Equal(FrameType.RespAffected, bc.Kv("SET", "symkey", "fromB").Type);
-            }
-            Eventually(() =>
-            {
-                using var ac = new DocsqlConnection(a.Cs);
-                ac.Open();
-                Assert.Equal("fromB", ac.Kv("GET", "symkey").Payload);
-            }, "A 看到 B 的 KV 写入");
-
             // 连 C 写,连 A 读
             Exec(c.Cs, "INSERT INTO sym VALUES (3, 2)");
             Eventually(() => Assert.Equal(3L, Long(a.Cs, "SELECT COUNT(id) FROM sym")), "A 看到 C 的写入");

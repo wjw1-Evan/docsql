@@ -1,23 +1,71 @@
-// 迁移 SQL 生成器与注解提供程序:最小实现(满足 DI 契约)。
+// 提供程序支撑件:注解、日志定义、约定集、LINQ 字符串方法翻译,
+// 以及"EF Migrations 不受支持"的显式报错桩(docsql 的建表走
+// EnsureCreated/惰性建表拦截器与 SchemaSync,不提供迁移管线)。
 
 using System.Reflection;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Metadata;
-using Microsoft.EntityFrameworkCore.Metadata.Conventions;
 using Microsoft.EntityFrameworkCore.Metadata.Conventions.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Migrations.Operations;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
 using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Docsql.EntityFrameworkCore.Infrastructure;
 
-public sealed class DocsqlMigrationsSqlGenerator(
+/// <summary>
+/// EF Migrations(Add-Migration / Database.Migrate)不受支持:
+/// docsql 用 EnsureCreated + AutoCreate/SchemaSync 自动同步模型。
+/// 显式报错,而不是让通用 ANSI 生成器产出引擎方言外的 SQL。
+/// </summary>
+public sealed class DocsqlUnsupportedMigrationsSqlGenerator(
     MigrationsSqlGeneratorDependencies dependencies)
     : MigrationsSqlGenerator(dependencies)
 {
-    // 通用 ANSI 生成已可用;复杂迁移操作超出引擎方言时由测试暴露。
+    public override IReadOnlyList<MigrationCommand> Generate(
+        IReadOnlyList<MigrationOperation> operations,
+        IModel? model = null,
+        MigrationsSqlGenerationOptions options = MigrationsSqlGenerationOptions.Default)
+        => throw NotSupported();
+
+    private static NotSupportedException NotSupported() => new(
+        "docsql 不支持 EF Migrations;请使用 EnsureCreated(建表/索引随模型自动同步)");
+}
+
+/// <summary>
+/// 迁移历史仓储:关系层没有默认实现,不注册的话 Migrator 在 DI
+/// 激活阶段就死于"Unable to resolve IHistoryRepository"。每个成员都
+/// 显式报错,让 Database.Migrate() 得到可读的指引。
+/// </summary>
+public sealed class DocsqlUnsupportedHistoryRepository : IHistoryRepository
+{
+    private static NotSupportedException NotSupported() => new(
+        "docsql 不支持 EF Migrations;请使用 EnsureCreated(建表/索引随模型自动同步)");
+
+    public LockReleaseBehavior LockReleaseBehavior => throw NotSupported();
+    public IMigrationsDatabaseLock AcquireDatabaseLock() => throw NotSupported();
+    public Task<IMigrationsDatabaseLock> AcquireDatabaseLockAsync(
+        CancellationToken cancellationToken = default) => throw NotSupported();
+    public void Create() => throw NotSupported();
+    public Task CreateAsync(CancellationToken cancellationToken = default) => throw NotSupported();
+    public bool CreateIfNotExists() => throw NotSupported();
+    public Task<bool> CreateIfNotExistsAsync(CancellationToken cancellationToken = default)
+        => throw NotSupported();
+    public bool Exists() => throw NotSupported();
+    public Task<bool> ExistsAsync(CancellationToken cancellationToken = default)
+        => throw NotSupported();
+    public IReadOnlyList<HistoryRow> GetAppliedMigrations() => throw NotSupported();
+    public Task<IReadOnlyList<HistoryRow>> GetAppliedMigrationsAsync(
+        CancellationToken cancellationToken = default) => throw NotSupported();
+    public string GetBeginIfExistsScript(string migrationId) => throw NotSupported();
+    public string GetBeginIfNotExistsScript(string migrationId) => throw NotSupported();
+    public string GetCreateIfNotExistsScript() => throw NotSupported();
+    public string GetCreateScript() => throw NotSupported();
+    public string GetDeleteScript(string migrationId) => throw NotSupported();
+    public string GetEndIfScript() => throw NotSupported();
+    public string GetInsertScript(HistoryRow row) => throw NotSupported();
 }
 
 public sealed class DocsqlAnnotationProvider(
