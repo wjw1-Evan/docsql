@@ -327,6 +327,8 @@
 const $ = (sel, el) => (el || document).querySelector(sel);
 const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// 引用标识符转义:表名等进入 "..." 时,内嵌 " 必须加倍,否则注入/断句。
+const qident = (s) => String(s).replace(/"/g, '""');
 const fmtBytes = (n) => { if (!n) return '0 B'; const u = ['B','KB','MB','GB']; let i = 0;
   while (n >= 1024 && i < u.length-1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
 const fmtDur = (ms) => { const s = Math.floor(ms/1000), d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
@@ -403,7 +405,7 @@ const ctx = {
   open(items, x, y) {
     const m = $('#ctxmenu');
     m.innerHTML = items.map(it => it === '-' ? '<hr>' :
-      `<div data-mi="${esc(it.id)}">${it.label}${it.kbd ? `<span class="kbd" style="float:right;color:#999;margin-left:22px">${it.kbd}</span>` : ''}</div>`).join('');
+      `<div data-mi="${esc(it.id)}">${esc(it.label)}${it.kbd ? `<span class="kbd" style="float:right;color:#999;margin-left:22px">${esc(it.kbd)}</span>` : ''}</div>`).join('');
     m.style.display = 'block';
     const r = m.getBoundingClientRect();
     m.style.left = Math.min(x, innerWidth - r.width - 6) + 'px';
@@ -674,7 +676,7 @@ async function parseQuery(t) {
 async function dropTable(tableName, after) {
   dialog('删除表', [{name: 'name', label: '表名', value: tableName, ph: '输入表名以确认'}], '删除', async (v, err) => {
     if (v.name !== tableName) { err('表名不匹配'); throw new Error('cancel'); }
-    const r = await api.post('/api/sql', {sql: `DROP TABLE "${tableName}"`});
+    const r = await api.post('/api/sql', {sql: `DROP TABLE "${qident(tableName)}"`});
     if (r.kind === 'error') { ui.toast(r.message, true); return; }
     ui.toast(`已删除表 ${tableName}`);
     explorer.refreshSoon();
@@ -700,9 +702,9 @@ function openDataTab(tableName, meta) {
     t.load = async () => {
       ui.status(`正在加载 ${tableName}…`, 'busy');
       try {
-        const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${tableName}"`});
+        const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${qident(tableName)}"`});
         t.total = count.kind === 'rows' ? +count.rows[0][0] : 0;
-        const r = await api.post('/api/sql', {sql: `SELECT * FROM "${tableName}" ORDER BY 1 LIMIT ${t.limit} OFFSET ${t.offset}`});
+        const r = await api.post('/api/sql', {sql: `SELECT * FROM "${qident(tableName)}" ORDER BY 1 LIMIT ${t.limit} OFFSET ${t.offset}`});
         t.host.innerHTML = '';
         if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; return; }
         const pk = meta && meta.keys && meta.keys[0];
@@ -716,7 +718,7 @@ function openDataTab(tableName, meta) {
     $('[data-do="refresh"]', t.el).onclick = t.load;
     $('[data-do="prev"]', t.el).onclick = () => { t.offset = Math.max(0, t.offset - t.limit); t.load(); };
     $('[data-do="next"]', t.el).onclick = () => { t.offset += t.limit; t.load(); };
-    $('[data-do="query"]', t.el).onclick = () => openQueryTab(`查询: ${tableName}`, `SELECT * FROM "${tableName}" LIMIT 200;`, true);
+    $('[data-do="query"]', t.el).onclick = () => openQueryTab(`查询: ${tableName}`, `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
     $('[data-do="drop"]', t.el).onclick = () => dropTable(tableName, () => tabs.close(t));
     t.load();
   });
@@ -750,7 +752,7 @@ function openKvTab(key) {
         const d = await api.get('/api/kvkey?key=' + encodeURIComponent(key));
         if (d.error) { t.body.innerHTML = `<div class="note">${esc(d.error)}</div>`; return; }
         $('[data-kv-key]', t.el).textContent = d.key;
-        $('[data-kv-type]', t.el).innerHTML = `${kvIcon(d.type)} ${kvTypeLabel(d.type)}`;
+        $('[data-kv-type]', t.el).innerHTML = `${kvIcon(d.type)} ${esc(kvTypeLabel(d.type))}`;
         $('[data-kv-ttl]', t.el).textContent = d.ttl_ms >= 0 ? `TTL ${(d.ttl_ms/1000).toFixed(1)}s` : 'TTL ∞';
         renderKvBody(t, d);
         ui.status(`键 ${key}(${kvTypeLabel(d.type)})`);
@@ -896,7 +898,7 @@ function openDashboard() {
         ];
         $('[data-cards]', t.el).innerHTML = cards.map(c => `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('');
         $('[data-kvchips]', t.el).innerHTML = Object.entries(m.kv.by_type).map(([k, n]) =>
-          `<span class="chip">${kvIcon(k)} ${kvTypeLabel(k)} <b>${n}</b></span>`).join('') || '<span style="color:#999">暂无键</span>';
+          `<span class="chip">${kvIcon(k)} ${esc(kvTypeLabel(k))} <b>${n}</b></span>`).join('') || '<span style="color:#999">暂无键</span>';
       } catch (e) { ui.toast(e.message, true); }
     };
     t.load();
@@ -1058,11 +1060,11 @@ const explorer = {
       const ddl = m ? this.createScript(m) : '';
       ctx.open([
         {id: 'newq', label: '新建查询', kbd: 'Ctrl+N', act: () => openQueryTab(`查询: ${name}`)},
-        {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${name}" LIMIT 1000;`, `查询: ${name}`)},
+        {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, `查询: ${name}`)},
         {id: 'data', label: '查看数据(编辑前 200 行)', act: () => openDataTab(name, m)},
         '-',
         {id: 'creategen', label: '编写表脚本为 CREATE TO →', act: () => openQueryTab(`脚本: ${name}`, ddl)},
-        {id: 'dropgen', label: '编写表脚本为 DROP TO →', act: () => openQueryTab(`脚本: ${name}`, `-- 删除表 ${name}\nDROP TABLE IF EXISTS "${name}";`)},
+        {id: 'dropgen', label: '编写表脚本为 DROP TO →', act: () => openQueryTab(`脚本: ${name}`, `-- 删除表 ${name}\nDROP TABLE IF EXISTS "${qident(name)}";`)},
         '-',
         {id: 'drop', label: `删除表 ${name}…`, act: () => dropTable(name)},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},

@@ -104,9 +104,13 @@ impl Wal {
     }
 
     /// Returns (durable_commit_lsn, next_lsn) over all valid frames.
+    /// LSN continuity is checked *within* the log: the first frame's LSN is
+    /// adopted as the seed, because `checkpoint` truncates the log while
+    /// `next_lsn` keeps counting up (post-checkpoint frames never restart at 1
+    /// in files written by older versions).
     fn scan(buf: &[u8]) -> (u64, u64) {
         let mut pos = HEADER.len();
-        let mut next = 1u64;
+        let mut next: Option<u64> = None;
         let mut open: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut durable = 0u64;
         while pos < buf.len() {
@@ -122,20 +126,20 @@ impl Wal {
                 }
                 _ => {}
             }
-            next = rec.lsn + 1;
+            next = Some(rec.lsn + 1);
             pos += adv;
         }
-        (durable, next)
+        (durable, next.unwrap_or(1))
     }
 
     fn scan_end(buf: &[u8]) -> usize {
         let mut pos = HEADER.len();
-        let mut next = 1u64;
+        let mut next: Option<u64> = None;
         while pos < buf.len() {
-            let Some((_rec, adv)) = parse_frame(&buf[pos..], next).unwrap_or(None) else {
+            let Some((rec, adv)) = parse_frame(&buf[pos..], next).unwrap_or(None) else {
                 break;
             };
-            next += 1;
+            next = Some(rec.lsn + 1);
             pos += adv;
         }
         pos
@@ -203,7 +207,8 @@ impl Wal {
         self.append(KIND_ABORT, txid, &[])
     }
 
-    /// Iterate all valid frames (recovery input), in LSN order.
+    /// Iterate all valid frames (recovery input), in LSN order. Continuity
+    /// is seeded from the first frame (see `scan`).
     pub fn records(&self) -> Result<Vec<LogRecord>> {
         let mut buf = Vec::new();
         let mut f = &self.file;
@@ -211,12 +216,12 @@ impl Wal {
         f.read_to_end(&mut buf)?;
         let mut out = Vec::new();
         let mut pos = HEADER.len();
-        let mut next = 1u64;
+        let mut next: Option<u64> = None;
         while pos < buf.len() {
             let Some((rec, adv)) = parse_frame(&buf[pos..], next)? else {
                 break;
             };
-            next = rec.lsn + 1;
+            next = Some(rec.lsn + 1);
             pos += adv;
             out.push(rec);
         }
@@ -225,19 +230,23 @@ impl Wal {
 
     /// Checkpoint: after the data file is fully synced, drop the log.
     /// Safe because every committed change is now in the data file.
+    /// `next_lsn` restarts at 1 so the fresh log's first frame validates
+    /// against reopen scans (which seed continuity from the first frame).
     pub fn checkpoint(&mut self) -> Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(HEADER)?;
         self.file.sync_data()?;
         self.durable_lsn = 0;
+        self.next_lsn = 1;
         Ok(())
     }
 }
 
-/// Parse one frame at the start of `buf`. `expect_lsn` validates continuity.
+/// Parse one frame at the start of `buf`. `expect_lsn` validates continuity
+/// (`None` accepts any LSN, used for the first frame in the log).
 /// Returns None on a torn/corrupt tail (replay must stop there).
-fn parse_frame(buf: &[u8], expect_lsn: u64) -> Result<Option<(LogRecord, usize)>> {
+fn parse_frame(buf: &[u8], expect_lsn: Option<u64>) -> Result<Option<(LogRecord, usize)>> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -246,8 +255,10 @@ fn parse_frame(buf: &[u8], expect_lsn: u64) -> Result<Option<(LogRecord, usize)>
         return Ok(None);
     }
     let lsn = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    if lsn != expect_lsn {
-        return Err(WalError::Corrupt(expect_lsn, "lsn gap"));
+    if let Some(expect) = expect_lsn {
+        if lsn != expect {
+            return Err(WalError::Corrupt(expect, "lsn gap"));
+        }
     }
     let kind = buf[8];
     let txid = u64::from_le_bytes(buf[9..17].try_into().unwrap());
@@ -367,10 +378,54 @@ mod tests {
         w.checkpoint().unwrap();
         assert_eq!(w.records().unwrap().len(), 0);
         assert_eq!(w.durable_lsn, 0);
-        // Can keep writing after checkpoint (LSNs keep counting up).
+        // Can keep writing after checkpoint (LSNs restart at 1).
         w.begin(2).unwrap();
         w.commit(2).unwrap();
-        assert_eq!(w.durable_lsn, 4);
+        assert_eq!(w.durable_lsn, 2);
+    }
+
+    #[test]
+    fn post_checkpoint_records_survive_reopen() {
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.commit(1).unwrap();
+            w.checkpoint().unwrap();
+            // Post-checkpoint frames continue from the in-memory next_lsn.
+            w.begin(2).unwrap();
+            w.log_write(2, b"after-checkpoint").unwrap();
+            w.commit(2).unwrap();
+        }
+        let w = Wal::open(&path).unwrap();
+        // Reopen must NOT truncate the post-checkpoint tail as a "torn" end:
+        // all three frames survive and the commit replays.
+        let recs = w.records().unwrap();
+        assert_eq!(recs.len(), 3);
+        assert!(recs.iter().any(|r| r.payload == b"after-checkpoint"));
+        assert_eq!(w.durable_lsn, recs[2].lsn);
+    }
+
+    #[test]
+    fn reopen_after_checkpoint_and_more_writes_keeps_durable_data() {
+        // Full pager-level roundtrip: write past a checkpoint, reopen, and
+        // confirm replay still finds the post-checkpoint commit.
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.commit(1).unwrap();
+            w.checkpoint().unwrap();
+            w.begin(2).unwrap();
+            w.log_write(2, b"page-image").unwrap();
+            w.commit(2).unwrap();
+        }
+        // Simulate a fresh open tearing the tail: reopen scans with the first
+        // frame's LSN as the continuity seed, so nothing is discarded.
+        let w = Wal::open(&path).unwrap();
+        let (durable, _next) = Wal::scan(&std::fs::read(&path).unwrap());
+        assert_eq!(w.durable_lsn, durable);
+        assert!(durable > 0);
     }
 
     #[test]

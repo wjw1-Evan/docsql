@@ -124,6 +124,12 @@ public sealed class ProtocolConnection : IDisposable
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(_header.AsSpan(4, 2));
         var topo = BinaryPrimitives.ReadUInt64LittleEndian(_header.AsSpan(8, 8));
         int len = (int)BinaryPrimitives.ReadUInt32LittleEndian(_header.AsSpan(16, 4));
+        // Mirror the server's inbound cap: a corrupt or hostile length must
+        // not drive a multi-GB allocation.
+        if (len is < 0 or > 64 * 1024 * 1024)
+        {
+            throw new IOException($"frame length {len} out of range");
+        }
         var payload = new byte[len];
         ReadExact(payload);
         if ((flags & FlagEncrypted) != 0)

@@ -73,7 +73,7 @@ impl QueryLog {
                 }
             }
         }
-        let mut ring = self.ring.lock().unwrap();
+        let mut ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
         if ring.len() == self.capacity {
             ring.pop_front();
         }
@@ -81,7 +81,12 @@ impl QueryLog {
     }
 
     pub fn snapshot(&self) -> Vec<LogEntry> {
-        self.ring.lock().unwrap().iter().cloned().collect()
+        self.ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 

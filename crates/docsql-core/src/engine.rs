@@ -558,6 +558,15 @@ impl Database {
         let mut cat = Object::new();
         cat.insert("tables".into(), Value::Object(tables));
         let bytes = encode::encode_to_vec(&Value::Object(cat))?;
+        if bytes.len() > PAGE_SIZE {
+            // The catalog is a single page; overflowing must be a clean
+            // error, not a slice panic that wedges every later write.
+            return err(format!(
+                "catalog too large ({} bytes, max {PAGE_SIZE}): too many tables or heap pages; \
+                 drop tables to shrink metadata",
+                bytes.len()
+            ));
+        }
         let mut page = vec![0u8; PAGE_SIZE];
         page[..bytes.len()].copy_from_slice(&bytes);
         self.pager.write_page(tx, CATALOG_PAGE, 0, &page)?;
@@ -837,9 +846,11 @@ impl Database {
                 if object_type != sqlparser::ast::ObjectType::Table {
                     return err("only DROP TABLE/INDEX are supported");
                 }
-                let name = names.first().map(obj_name).unwrap_or_default();
-                if self.tables.remove(&name).is_none() && !if_exists {
-                    return err(format!("table {name} does not exist"));
+                for n in &names {
+                    let name = obj_name(n);
+                    if self.tables.remove(&name).is_none() && !if_exists {
+                        return err(format!("table {name} does not exist"));
+                    }
                 }
                 self.save_catalog()?;
                 Ok(ExecOutcome::Affected(0))
@@ -872,6 +883,9 @@ impl Database {
                 if self.tx_snapshot.take().is_none() {
                     return err("no transaction in progress");
                 }
+                // Savepoints die with their transaction: a stale mark must
+                // not be reachable from a later transaction's ROLLBACK TO.
+                self.savepoints.clear();
                 // One WAL fsync for every statement in the transaction
                 // (async-commit mode leaves it to the background flusher).
                 if !self.async_commit {
@@ -1131,14 +1145,16 @@ impl Database {
         }
 
         let docs = self.table_docs(&tname)?;
-        let (out, changed_docs, count) = match from {
+        let (out, changed_docs, old_changed, count) = match from {
             None => {
                 // Plain UPDATE: assignments and WHERE see only target columns.
                 let mut out = Vec::new();
                 let mut changed_docs: Vec<Object> = Vec::new();
+                let mut old_changed: Vec<Object> = Vec::new();
                 let mut count = 0u64;
                 for doc in docs {
                     if self.matches(&selection, &doc)? {
+                        old_changed.push(doc.clone());
                         let mut doc = doc;
                         for a in &assignments {
                             let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target
@@ -1156,7 +1172,7 @@ impl Database {
                         out.push(doc);
                     }
                 }
-                (out, changed_docs, count)
+                (out, changed_docs, old_changed, count)
             }
             Some(kind) => {
                 // UPDATE ... FROM: each target row is matched against the
@@ -1187,6 +1203,7 @@ impl Database {
                 let mut updates: std::collections::BTreeMap<Vec<u8>, Object> =
                     std::collections::BTreeMap::new();
                 let mut changed_docs: Vec<Object> = Vec::new();
+                let mut old_changed: Vec<Object> = Vec::new();
                 for m in &merged {
                     // Rebuild the target doc from its qualified slice.
                     let mut tdoc = Object::new();
@@ -1203,6 +1220,7 @@ impl Database {
                     if !self.matches(&selection, m)? {
                         continue;
                     }
+                    old_changed.push(tdoc.clone());
                     for a in &assignments {
                         let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target else {
                             return err("unsupported assignment target");
@@ -1223,7 +1241,7 @@ impl Database {
                     })
                     .collect();
                 let count = changed_docs.len() as u64;
-                (out, changed_docs, count)
+                (out, changed_docs, old_changed, count)
             }
         };
         // Validate BEFORE writing: a failed UPDATE must not change data.
@@ -1232,6 +1250,8 @@ impl Database {
             self.check_fks(&meta, doc)?;
         }
         meta.check_unique(&out)?;
+        // Parent-side FK: key values that disappear must not be referenced.
+        self.check_fk_parent_delete(&tname, &old_changed, &out)?;
         let changed = changed_docs.clone();
         self.rewrite_table(&tname, &mut meta, out)?;
         if let Some(ret) = &update_returning {
@@ -1274,15 +1294,34 @@ impl Database {
             }
             return Ok(ExecOutcome::Affected(0));
         }
+        // Parent-side FK check before any page is touched. `updates` rows
+        // are the only ones whose key values can disappear; their new docs
+        // are the survivors (referenced columns are unique in practice).
+        let old_docs: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
+        let new_docs: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
+        self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
+        // Pre-statement docs for the legacy whole-set unique check below.
+        let all_docs: Vec<Object> = self.table_docs(&tname)?;
         let mut heap = Heap {
             pages: meta.pages.clone(),
         };
         let mut roots = meta.index_roots.clone();
         let mut tx = self.pager.begin_tx();
-        for (loc, old_doc, new_doc) in &updates {
-            let page = crate::heap::unpack_loc(*loc).0;
+        for i in 0..updates.len() {
+            let (loc, old_doc, new_doc) = updates[i].clone();
+            let page = crate::heap::unpack_loc(loc).0;
             let before = heap.page_docs(&mut self.pager, &tx, page)?;
-            let out = heap.replace(&mut self.pager, &mut tx, *loc, new_doc)?;
+            let out = heap.replace(&mut self.pager, &mut tx, loc, &new_doc)?;
+            // An in-page re-pack moved this page's survivors: pending locators
+            // must follow, or a later update would target whatever document
+            // now occupies the stale slot.
+            if !out.moved.is_empty() {
+                for pending in updates.iter_mut().skip(i + 1) {
+                    if let Some((_, new_l)) = out.moved.iter().find(|(old, _)| *old == pending.0) {
+                        pending.0 = *new_l;
+                    }
+                }
+            }
             for (old_l, new_l) in &out.moved {
                 reindex_repoint(
                     &mut self.pager,
@@ -1298,13 +1337,37 @@ impl Database {
                 &mut tx,
                 &meta,
                 &mut roots,
-                old_doc,
-                *loc,
-                new_doc,
+                &old_doc,
+                loc,
+                &new_doc,
                 out.placed,
             ) {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
+            }
+        }
+        // Legacy files whose constraint columns predate trees keep the
+        // whole-set duplicate check (mirrors the INSERT path); tables with
+        // trees enforce uniqueness through reindex_replace above.
+        let has_constraints = meta.primary_key.is_some() || !meta.unique.is_empty();
+        if has_constraints {
+            let treeless = meta
+                .primary_key
+                .iter()
+                .chain(meta.unique.iter())
+                .any(|c| !roots.contains_key(c));
+            if treeless {
+                let combined: Vec<Object> = all_docs
+                    .into_iter()
+                    .map(|d| match updates.iter().find(|(_, old, _)| *old == d) {
+                        Some((_, _, new)) => new.clone(),
+                        None => d,
+                    })
+                    .collect();
+                if let Err(e) = meta.check_unique(&combined) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
             }
         }
         let pages_changed = heap.pages != meta.pages;
@@ -1412,6 +1475,7 @@ impl Database {
             (kept, removed)
         };
         let count = removed.len() as u64;
+        self.check_fk_parent_delete(&tname, &removed, &[])?;
         self.rewrite_table(&tname, &mut meta, kept)?;
         if let Some(ret) = &returning {
             return project_returning(ret, &removed);
@@ -1439,6 +1503,9 @@ impl Database {
             }
             return Ok(ExecOutcome::Affected(0));
         }
+        // Parent-side FK check before any page is touched.
+        let removed_docs: Vec<Object> = targets.iter().map(|(_, d)| d.clone()).collect();
+        self.check_fk_parent_delete(&tname, &removed_docs, &[])?;
         let mut heap = Heap {
             pages: meta.pages.clone(),
         };
@@ -1557,7 +1624,28 @@ impl Database {
                         match &opt.option {
                             CO::Default(e) => meta.defaults.push((col.clone(), format!("{e}"))),
                             CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
-                            CO::NotNull => meta.not_null.push(col.clone()),
+                            CO::NotNull => {
+                                // SQLite rule: a NOT NULL column needs a default
+                                // to backfill existing rows, else every later
+                                // UPDATE of a pre-existing row would fail.
+                                let has_default = meta.defaults.iter().any(|(c, _)| c == &col);
+                                if !has_default {
+                                    return err(format!(
+                                        "cannot add NOT NULL column {col} without a DEFAULT"
+                                    ));
+                                }
+                                meta.not_null.push(col.clone());
+                            }
+                            // Same parity as CREATE TABLE: these options on
+                            // ADD COLUMN would dangle (no tree, no backfill).
+                            CO::PrimaryKey { .. }
+                            | CO::Unique { .. }
+                            | CO::ForeignKey(_)
+                            | CO::DialectSpecific(_) => {
+                                return err(format!(
+                                    "constraint options are not supported on ADD COLUMN {col}"
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -1581,11 +1669,32 @@ impl Database {
                 }
                 Op::DropColumn { column_names, .. } => {
                     for id in column_names {
-                        meta.columns.retain(|c| c != &id.value);
-                        // Indexed columns lose their trees.
-                        for id in column_names {
-                            meta.index_roots.remove(&id.value);
+                        let name = id.value.clone();
+                        if meta.primary_key.as_deref() == Some(name.as_str()) {
+                            return err("cannot drop a PRIMARY KEY column");
                         }
+                        meta.columns.retain(|c| c != &name);
+                        meta.unique.retain(|c| c != &name);
+                        meta.constraint_unique.retain(|c| c != &name);
+                        meta.not_null.retain(|c| c != &name);
+                        meta.defaults.retain(|(c, _)| c != &name);
+                        meta.foreign_keys.retain(|(c, _, _)| c != &name);
+                        meta.index_roots.remove(&name);
+                        if meta.autoinc.as_deref() == Some(name.as_str()) {
+                            meta.autoinc = None;
+                        }
+                        // Indexes over the dropped column lose their
+                        // definitions (trees above were already removed).
+                        let dead: Vec<String> = meta
+                            .index_defs
+                            .iter()
+                            .filter(|(_, c, _)| c == &name)
+                            .map(|(n, _, _)| n.clone())
+                            .collect();
+                        for n in &dead {
+                            meta.indexes.retain(|i| i != n);
+                        }
+                        meta.index_defs.retain(|(_, c, _)| c != &name);
                     }
                     let docs = self.table_docs(&tname)?;
                     let stripped: Vec<Object> = docs
@@ -1642,6 +1751,37 @@ impl Database {
                             }
                         })
                         .collect();
+                    meta.constraint_unique = meta
+                        .constraint_unique
+                        .iter()
+                        .map(|c| if c == old { new.clone() } else { c.clone() })
+                        .collect();
+                    meta.index_defs = meta
+                        .index_defs
+                        .iter()
+                        .map(|(n, c, u)| {
+                            if c == old {
+                                (n.clone(), new.clone(), *u)
+                            } else {
+                                (n.clone(), c.clone(), *u)
+                            }
+                        })
+                        .collect();
+                    // FK columns on this table follow the rename (references
+                    // from other tables to the renamed column are not
+                    // tracked — renaming a referenced column elsewhere keeps
+                    // its old name here by design).
+                    meta.foreign_keys = meta
+                        .foreign_keys
+                        .iter()
+                        .map(|(c, rt, rc)| {
+                            if c == old {
+                                (new.clone(), rt.clone(), rc.clone())
+                            } else {
+                                (c.clone(), rt.clone(), rc.clone())
+                            }
+                        })
+                        .collect();
                     let docs = self.table_docs(&tname)?;
                     let renamed: Vec<Object> = docs
                         .into_iter()
@@ -1689,6 +1829,76 @@ impl Database {
             if !found {
                 return err(format!(
                     "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Referential integrity on the *parent* side (RESTRICT): rows removed
+    /// from `table` (DELETE, or UPDATE rows whose key value changes) may be
+    /// referenced by child tables. `replacement_docs` carries the statement's
+    /// surviving/updated rows of `table`: a parent-key value kept by any of
+    /// them stays referenceable. Referenced columns are PK/UNIQUE in
+    /// practice, so a disappearing value has no other copy in the table.
+    fn check_fk_parent_delete(
+        &mut self,
+        table: &str,
+        removed_docs: &[Object],
+        replacement_docs: &[Object],
+    ) -> Result<()> {
+        if removed_docs.is_empty() {
+            return Ok(());
+        }
+        // Child FKs referencing `table`: (child_table, child_col, parent_col).
+        let children: Vec<(String, String, String)> = self
+            .tables
+            .iter()
+            .flat_map(|(child_name, m)| {
+                m.foreign_keys
+                    .iter()
+                    .filter(|(_, rt, _)| rt == table)
+                    .map(|(c, _, rc)| (child_name.clone(), c.clone(), rc.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if children.is_empty() {
+            return Ok(());
+        }
+        let parent_cols: Vec<&String> = {
+            let mut v: Vec<&String> = children.iter().map(|(_, _, rc)| rc).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // Parent-key values that disappear with this statement.
+        let mut lost: Vec<&Value> = Vec::new();
+        for doc in removed_docs {
+            for rc in &parent_cols {
+                if let Some(v) = doc.get(rc.as_str()) {
+                    let kept = replacement_docs
+                        .iter()
+                        .any(|d| d.get(rc.as_str()).map(|rv| rv == v).unwrap_or(false));
+                    if !matches!(v, Value::Null) && !kept && !lost.contains(&v) {
+                        lost.push(v);
+                    }
+                }
+            }
+        }
+        if lost.is_empty() {
+            return Ok(());
+        }
+        for (child_table, child_col, rc) in &children {
+            let child_docs = self.table_docs(child_table)?;
+            let offender = child_docs.iter().any(|cd| {
+                cd.get(child_col)
+                    .map(|cv| !matches!(cv, Value::Null) && lost.contains(&cv))
+                    .unwrap_or(false)
+            });
+            if offender {
+                return err(format!(
+                    "FOREIGN KEY constraint failed: {child_table}.{child_col} references \
+                     {table}.{rc}; delete/update the child rows first"
                 ));
             }
         }
@@ -1833,6 +2043,9 @@ impl Database {
         use sqlparser::ast::ColumnOption as CO;
         let name = obj_name(&create.name);
         if self.tables.contains_key(&name) {
+            if create.if_not_exists {
+                return Ok(ExecOutcome::Affected(0));
+            }
             return err(format!("table {name} already exists"));
         }
         // CREATE TABLE ... AS SELECT: shape and rows come from the query.
@@ -1877,6 +2090,12 @@ impl Database {
                     }
                     CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
                     CO::ForeignKey(fk) => {
+                        if fk.on_delete.is_some() || fk.on_update.is_some() {
+                            return err(
+                                "FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
+                                 (declare the constraint and keep parent keys stable)",
+                            );
+                        }
                         let (Some(rt), Some(rc)) = (
                             fk.foreign_table.0.last().map(|p| match p {
                                 ObjectNamePart::Identifier(i) => i.value.clone(),
@@ -1924,6 +2143,10 @@ impl Database {
                 }
                 TC::Check(chk) => meta.checks.push(format!("{}", chk.expr)),
                 TC::ForeignKey(fk) => {
+                    if fk.on_delete.is_some() || fk.on_update.is_some() {
+                        return err("FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
+                             (declare the constraint and keep parent keys stable)");
+                    }
                     let Some(rt) = fk.foreign_table.0.last().map(|p| match p {
                         ObjectNamePart::Identifier(i) => i.value.clone(),
                         other => other.to_string(),
@@ -2027,7 +2250,7 @@ impl Database {
             let mut row = row;
             if autoinc_appended {
                 row.push(Value::Int(next_autoinc));
-                next_autoinc += 1;
+                next_autoinc = next_autoinc.saturating_add(1);
             }
             if row.len() != columns.len() {
                 return err(format!(
@@ -2041,7 +2264,7 @@ impl Database {
                     if let Some(idx) = columns.iter().position(|c| c == col) {
                         if matches!(row.get(idx), Some(Value::Null) | None) {
                             row[idx] = Value::Int(next_autoinc);
-                            next_autoinc += 1;
+                            next_autoinc = next_autoinc.saturating_add(1);
                         }
                     }
                 }
@@ -2072,6 +2295,12 @@ impl Database {
             if matches!(c.action, sqlparser::ast::OnConflictAction::DoUpdate(_)) {
                 return err("ON CONFLICT DO UPDATE is not supported yet");
             }
+        }
+        if matches!(
+            insert.on,
+            Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_))
+        ) {
+            return err("ON DUPLICATE KEY UPDATE is not supported");
         }
 
         // One pager transaction for heap pages and index trees alike: a
@@ -2237,7 +2466,7 @@ impl Database {
             let used = placed
                 .iter()
                 .filter_map(|(_, d)| match d.get(col) {
-                    Some(Value::Int(i)) => Some(*i + 1),
+                    Some(Value::Int(i)) => Some((*i).saturating_add(1)),
                     _ => None,
                 })
                 .max()
@@ -2309,7 +2538,8 @@ impl Database {
                 let (ExecOutcome::Rows(mut lr), ExecOutcome::Rows(rr)) = (l, r) else {
                     return err("set operations require SELECT on both sides");
                 };
-                if lr.columns != rr.columns {
+                // Column *counts* must match; names may differ (left wins).
+                if lr.columns.len() != rr.columns.len() {
                     return err("set operation arms have different column counts");
                 }
                 let all = set_quantifier == SetQuantifier::All;
@@ -2591,21 +2821,31 @@ impl Database {
             }
         }
         // DISTINCT: drop duplicate projected rows; the first occurrence's
-        // source doc stays for ORDER BY evaluation.
-        if matches!(select.distinct, Some(sqlparser::ast::Distinct::Distinct)) {
-            let mut seen = std::collections::BTreeSet::new();
-            let mut kept_docs = Vec::with_capacity(docs.len());
-            let mut kept_rows = Vec::with_capacity(out.len());
-            for (doc, row) in docs.into_iter().zip(out) {
-                let key =
-                    encode::encode_to_vec(&Value::Array(row.clone())).map_err(SqlError::Encode)?;
-                if seen.insert(key) {
-                    kept_docs.push(doc);
-                    kept_rows.push(row);
-                }
+        // source doc stays for ORDER BY evaluation. DISTINCT ON (...) is a
+        // different (unsupported) feature and must not pass silently.
+        match &select.distinct {
+            Some(sqlparser::ast::Distinct::On(cols)) => {
+                return err(format!(
+                    "DISTINCT ON is not supported: {}",
+                    cols.iter().map(expr_name).collect::<Vec<_>>().join(", ")
+                ));
             }
-            docs = kept_docs;
-            out = kept_rows;
+            Some(sqlparser::ast::Distinct::Distinct) => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut kept_docs = Vec::with_capacity(docs.len());
+                let mut kept_rows = Vec::with_capacity(out.len());
+                for (doc, row) in docs.into_iter().zip(out) {
+                    let key = encode::encode_to_vec(&Value::Array(row.clone()))
+                        .map_err(SqlError::Encode)?;
+                    if seen.insert(key) {
+                        kept_docs.push(doc);
+                        kept_rows.push(row);
+                    }
+                }
+                docs = kept_docs;
+                out = kept_rows;
+            }
+            None | Some(sqlparser::ast::Distinct::All) => {}
         }
         out = self.apply_order_limit(query, out, &columns_out, Some(docs))?;
         Ok(ExecOutcome::Rows(QueryResult {
@@ -2886,16 +3126,25 @@ impl Database {
                 }
             }
         }
-        if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
-            let n = match limit {
-                Some(e) => eval_const(e)?.as_i64().unwrap_or(i64::MAX).max(0) as usize,
-                None => usize::MAX,
-            };
-            let skip = match offset {
-                Some(o) => eval_const(&o.value)?.as_i64().unwrap_or(0).max(0) as usize,
-                None => 0,
-            };
-            rows = rows.into_iter().skip(skip).take(n).collect();
+        match &query.limit_clause {
+            Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+                let n = match limit {
+                    Some(e) => eval_const(e)?.as_i64().unwrap_or(i64::MAX).max(0) as usize,
+                    None => usize::MAX,
+                };
+                let skip = match offset {
+                    Some(o) => eval_const(&o.value)?.as_i64().unwrap_or(0).max(0) as usize,
+                    None => 0,
+                };
+                rows = rows.into_iter().skip(skip).take(n).collect();
+            }
+            // MySQL form `LIMIT <offset>, <count>` (order reversed).
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                let skip = eval_const(offset)?.as_i64().unwrap_or(0).max(0) as usize;
+                let n = eval_const(limit)?.as_i64().unwrap_or(i64::MAX).max(0) as usize;
+                rows = rows.into_iter().skip(skip).take(n).collect();
+            }
+            None => {}
         }
         Ok(rows)
     }
@@ -2928,6 +3177,13 @@ enum AggSpec {
 /// sentinel column so the executor counts rows instead of non-null values.
 fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool)> {
     let fname = f.name.to_string().to_uppercase();
+    // A window frame silently changes the result shape (one row per
+    // partition); refusing is better than returning wrong numbers.
+    if f.over.is_some() {
+        return err(format!(
+            "window functions (OVER) are not supported: {fname}"
+        ));
+    }
     let (distinct, inner) = match &f.args {
         sqlparser::ast::FunctionArguments::List(list) => {
             let distinct = matches!(
@@ -3161,10 +3417,13 @@ fn is_agg_item(item: &SelectItem) -> bool {
 
 fn contains_agg(e: &SqlExpr) -> bool {
     match e {
-        SqlExpr::Function(f) => matches!(
-            f.name.to_string().to_uppercase().as_str(),
-            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
-        ),
+        SqlExpr::Function(f) => {
+            !f.over.is_some()
+                && matches!(
+                    f.name.to_string().to_uppercase().as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
+                )
+        }
         SqlExpr::Nested(inner) => contains_agg(inner),
         _ => false,
     }
@@ -3325,7 +3584,12 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
         SqlExpr::UnaryOp { op, expr } => {
             let v = eval_expr(expr, doc)?;
             match (op, v) {
-                (sqlparser::ast::UnaryOperator::Minus, Value::Int(i)) => Ok(Value::Int(-i)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Int(i)) => match i.checked_neg() {
+                    Some(n) => Ok(Value::Int(n)),
+                    // -i64::MIN overflows; mirror literal handling and keep
+                    // the value instead of panicking in debug builds.
+                    None => Ok(Value::Float(-(i as f64))),
+                },
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
@@ -3468,11 +3732,16 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                 Some(sqlparser::ast::TrimWhereField::Trailing) => "RTRIM",
                 _ => "TRIM",
             };
-            let _ = trim_what; // custom trim character sets are not supported
+            if trim_what.is_some() {
+                return err("TRIM with a custom character set is not supported");
+            }
             scalar_function(name, &[base])
         }
         SqlExpr::Function(f) => {
             let name = f.name.to_string().to_uppercase();
+            if f.over.is_some() {
+                return err(format!("window functions (OVER) are not supported: {name}"));
+            }
             if matches!(
                 name.as_str(),
                 "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
@@ -3501,14 +3770,22 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
         } => {
             let v = eval_expr(expr, doc)?;
             let mut hit = false;
+            let mut saw_null = matches!(v, Value::Null);
             for item in list {
                 let iv = eval_expr(item, doc)?;
+                if matches!(iv, Value::Null) {
+                    saw_null = true;
+                    continue;
+                }
                 if Value::cmp_values(&v, &iv) == std::cmp::Ordering::Equal {
                     hit = true;
                     break;
                 }
             }
-            Ok(Value::Bool(hit != *negated))
+            // SQL three-valued logic: a NULL anywhere makes the predicate
+            // unknown, and unknown never passes a WHERE. `x NOT IN (..., NULL)`
+            // is therefore false for every row, not true.
+            Ok(Value::Bool(if *negated { !hit && !saw_null } else { hit }))
         }
         // Subqueries are resolved per-statement by subst_expr; reaching one
         // here means it was correlated or unsupported.
@@ -3623,28 +3900,61 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
     })
 }
 
-/// Scalar (non-aggregate) function library.
+/// Scalar (non-aggregate) function library. Arity is checked up front:
+/// a malformed call (`SELECT UPPER()`) must error, not panic on indexing.
 fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
+    fn arg<'a>(args: &'a [Value], i: usize, name: &str) -> Result<&'a Value> {
+        args.get(i).ok_or_else(|| {
+            SqlError::Message(format!("function {name} requires argument {}", i + 1))
+        })
+    }
+    fn exact_arity(name: &str, args: &[Value], n: usize) -> Result<()> {
+        if args.len() != n {
+            return Err(SqlError::Message(format!(
+                "function {name} takes exactly {n} argument(s), got {}",
+                args.len()
+            )));
+        }
+        Ok(())
+    }
     let null_prop = |v: &Value| matches!(v, Value::Null);
     Ok(match name {
-        "UPPER" | "UCASE" => Value::Str(value_to_text(&args[0]).to_uppercase()),
-        "LOWER" | "LCASE" => Value::Str(value_to_text(&args[0]).to_lowercase()),
-        "LENGTH" | "LEN" => Value::Int(match &args[0] {
-            Value::Str(s) => s.chars().count() as i64,
-            Value::Bytes(b) => b.len() as i64,
-            other => value_to_text(other).chars().count() as i64,
-        }),
-        "ABS" => match &args[0] {
-            Value::Int(i) => Value::Int(i.abs()),
-            Value::Float(f) => Value::Float(f.abs()),
-            Value::Null => Value::Null,
-            other => return err(format!("ABS of non-numeric: {other:?}")),
-        },
+        "UPPER" | "UCASE" => {
+            exact_arity(name, args, 1)?;
+            Value::Str(value_to_text(arg(args, 0, name)?).to_uppercase())
+        }
+        "LOWER" | "LCASE" => {
+            exact_arity(name, args, 1)?;
+            Value::Str(value_to_text(arg(args, 0, name)?).to_lowercase())
+        }
+        "LENGTH" | "LEN" => {
+            exact_arity(name, args, 1)?;
+            Value::Int(match arg(args, 0, name)? {
+                Value::Str(s) => s.chars().count() as i64,
+                Value::Bytes(b) => b.len() as i64,
+                other => value_to_text(other).chars().count() as i64,
+            })
+        }
+        "ABS" => {
+            exact_arity(name, args, 1)?;
+            match arg(args, 0, name)? {
+                Value::Int(i) => Value::Int(i.abs()),
+                Value::Float(f) => Value::Float(f.abs()),
+                Value::Null => Value::Null,
+                other => return err(format!("ABS of non-numeric: {other:?}")),
+            }
+        }
         "ROUND" => {
-            if null_prop(&args[0]) {
+            if args.is_empty() || args.len() > 2 {
+                return err(format!(
+                    "function ROUND takes 1 or 2 arguments, got {}",
+                    args.len()
+                ));
+            }
+            if null_prop(arg(args, 0, name)?) {
                 Value::Null
             } else {
-                let x = as_f64(&args[0])?;
+                let x = as_f64(arg(args, 0, name)?)?;
                 let digits = match args.get(1) {
                     Some(Value::Int(d)) => *d,
                     _ => 0,
@@ -3653,23 +3963,34 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Float((x * m).round() / m)
             }
         }
-        "COALESCE" | "IFNULL" => args
-            .iter()
-            .find(|v| !matches!(v, Value::Null))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "COALESCE" | "IFNULL" => {
+            if args.is_empty() {
+                return err(format!("function {name} requires at least 1 argument"));
+            }
+            args.iter()
+                .find(|v| !matches!(v, Value::Null))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
         "NULLIF" => {
-            if Value::cmp_values(&args[0], &args[1]) == Ordering::Equal {
+            exact_arity(name, args, 2)?;
+            if Value::cmp_values(arg(args, 0, name)?, arg(args, 1, name)?) == Ordering::Equal {
                 Value::Null
             } else {
                 args[0].clone()
             }
         }
         "SUBSTR" | "SUBSTRING" => {
-            if null_prop(&args[0]) {
+            if args.is_empty() || args.len() > 3 {
+                return err(format!(
+                    "function {name} takes 1 to 3 arguments, got {}",
+                    args.len()
+                ));
+            }
+            if null_prop(arg(args, 0, name)?) {
                 Value::Null
             } else {
-                let s: Vec<char> = value_to_text(&args[0]).chars().collect();
+                let s: Vec<char> = value_to_text(arg(args, 0, name)?).chars().collect();
                 // 1-based start; negative counts from the end (SQLite rule).
                 let start = match args.get(1) {
                     Some(Value::Int(i)) => {
@@ -3688,9 +4009,15 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Str(s[start.min(s.len())..end].iter().collect())
             }
         }
-        "TRIM" => Value::Str(value_to_text(&args[0]).trim().to_string()),
-        "LTRIM" => Value::Str(value_to_text(&args[0]).trim_start().to_string()),
-        "RTRIM" => Value::Str(value_to_text(&args[0]).trim_end().to_string()),
+        "TRIM" | "LTRIM" | "RTRIM" => {
+            exact_arity(name, args, 1)?;
+            let text = value_to_text(arg(args, 0, name)?);
+            Value::Str(match name {
+                "TRIM" => text.trim().to_string(),
+                "LTRIM" => text.trim_start().to_string(),
+                _ => text.trim_end().to_string(),
+            })
+        }
         "CONCAT" => {
             if args.iter().any(null_prop) {
                 Value::Null
@@ -3698,19 +4025,22 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Str(args.iter().map(value_to_text).collect())
             }
         }
-        "TYPEOF" => Value::Str(
-            match &args[0] {
-                Value::Null => "null",
-                Value::Bool(_) => "bool",
-                Value::Int(_) => "integer",
-                Value::Float(_) => "float",
-                Value::Str(_) => "text",
-                Value::Bytes(_) => "blob",
-                Value::Array(_) => "array",
-                Value::Object(_) => "object",
-            }
-            .into(),
-        ),
+        "TYPEOF" => {
+            exact_arity(name, args, 1)?;
+            Value::Str(
+                match arg(args, 0, name)? {
+                    Value::Null => "null",
+                    Value::Bool(_) => "bool",
+                    Value::Int(_) => "integer",
+                    Value::Float(_) => "float",
+                    Value::Str(_) => "text",
+                    Value::Bytes(_) => "blob",
+                    Value::Array(_) => "array",
+                    Value::Object(_) => "object",
+                }
+                .into(),
+            )
+        }
         other => return err(format!("unknown function: {other}")),
     })
 }
@@ -4076,9 +4406,17 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             Minus => Value::Int(a.wrapping_sub(*b)),
             Multiply => Value::Int(a.wrapping_mul(*b)),
             Divide if *b == 0 => Value::Null,
-            Divide => Value::Int(a / b),
+            // i64::MIN / -1 overflows (SIGFPE on some ISAs) — treat like
+            // division by zero and yield NULL instead of crashing.
+            Divide => match a.checked_div(*b) {
+                Some(q) => Value::Int(q),
+                None => Value::Null,
+            },
             Modulo if *b == 0 => Value::Null,
-            Modulo => Value::Int(a % b),
+            Modulo => match a.checked_rem(*b) {
+                Some(m) => Value::Int(m),
+                None => Value::Null,
+            },
             _ => return err("not an arithmetic operator"),
         }),
         _ => err(format!("non-numeric operands: {l:?} {op} {r:?}")),

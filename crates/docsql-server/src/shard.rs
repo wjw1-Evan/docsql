@@ -5,6 +5,7 @@
 //! migration are future work; resharding today means draining and
 //! re-importing with a different shard map.
 
+use crate::{CONNECT_TIMEOUT, IO_TIMEOUT, RECV_CAP};
 use docsql_core::proto::{self, Frame};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,10 +61,17 @@ impl ShardRouter {
         send_sql(shard, sql).await
     }
 
-    /// Route one KV command by its key (second token).
-    pub async fn kv(&self, command: &str, key: &str) -> std::io::Result<Frame> {
+    /// Route one full KV command (all arguments included — the shard is
+    /// chosen by the key, but the value must travel with it).
+    pub async fn kv(&self, args: &[&str]) -> std::io::Result<Frame> {
+        let Some(key) = args.get(1) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "kv command needs a key argument",
+            ));
+        };
         let shard = self.shard_for(key);
-        send_kv(shard, command, key).await
+        send_kv(shard, args).await
     }
 }
 
@@ -83,16 +91,22 @@ fn first_table(sql: &str) -> String {
 }
 
 async fn send_frame(addr: &str, frame: &Frame) -> std::io::Result<Frame> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
     let bytes = frame.encode().map_err(std::io::Error::other)?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
     let mut header = [0u8; proto::HEADER_LEN];
-    stream.read_exact(&mut header).await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut header)).await??;
     let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    if len > RECV_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "shard response too large",
+        ));
+    }
     let mut buf = header.to_vec();
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut payload)).await??;
     buf.extend_from_slice(&payload);
     let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
     Ok(f)
@@ -109,8 +123,8 @@ async fn send_sql(addr: &str, sql: &str) -> std::io::Result<Frame> {
     .await
 }
 
-async fn send_kv(addr: &str, command: &str, key: &str) -> std::io::Result<Frame> {
-    let payload = format!("{command}\x00{key}").into_bytes();
+async fn send_kv(addr: &str, args: &[&str]) -> std::io::Result<Frame> {
+    let payload = args.join("\x00").into_bytes();
     send_frame(addr, &Frame::new(proto::REQ_KV, payload)).await
 }
 

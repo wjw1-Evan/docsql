@@ -2,6 +2,8 @@
 
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
+using System.Linq;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -110,18 +112,27 @@ public sealed class DocsqlConnection : DbConnection
             return;
         }
         var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
-        _proto = new ProtocolConnection(p.Host, p.Port, ParseKey(KeyOverride ?? p.Key));
-        // AUTH when a token is configured.
-        if (!string.IsNullOrEmpty(p.Token))
+        try
         {
-            var payload = Encoding.UTF8.GetBytes($"\x00AUTH\x00{p.Token}");
-            var resp = _proto.Send(new Frame(FrameType.ReqKv, 0, 0, payload));
-            if (resp.Type == FrameType.RespError)
+            _proto = new ProtocolConnection(p.Host, p.Port, ParseKey(KeyOverride ?? p.Key));
+            // AUTH when a token is configured.
+            if (!string.IsNullOrEmpty(p.Token))
             {
-                _proto.Dispose();
-                _proto = null;
-                throw new DocsqlException("auth failed: " + Encoding.UTF8.GetString(resp.Payload));
+                var payload = Encoding.UTF8.GetBytes($"\x00AUTH\x00{p.Token}");
+                var resp = _proto.Send(new Frame(FrameType.ReqKv, 0, 0, payload));
+                if (resp.Type == FrameType.RespError)
+                {
+                    throw new DocsqlException("auth failed: " + Encoding.UTF8.GetString(resp.Payload));
+                }
             }
+        }
+        catch
+        {
+            // Never leak the socket on a failed open (retry would orphan it).
+            _proto?.Dispose();
+            _proto = null;
+            _state = ConnectionState.Broken;
+            throw;
         }
         _state = ConnectionState.Open;
     }
@@ -212,9 +223,22 @@ public sealed class DocsqlCommand : DbCommand
             return null;
         }
         var v = reader.GetValue(0);
-        return v is double or float or decimal && ((IConvertible)v).ToInt64(null) == Convert.ToInt64(v)
-            ? Convert.ToInt64(v)
-            : v;
+        if (v is double or float or decimal)
+        {
+            // Only narrow to long when exactly representable; out-of-range
+            // doubles (1e300, SUM overflow) must not throw OverflowException.
+            try
+            {
+                if (((IConvertible)v).ToInt64(null) == Convert.ToInt64(v))
+                {
+                    return Convert.ToInt64(v);
+                }
+            }
+            catch (OverflowException)
+            {
+            }
+        }
+        return v;
     }
 
     public new DocsqlDataReader ExecuteReader() => (DocsqlDataReader)base.ExecuteReader();
@@ -244,27 +268,90 @@ public sealed class DocsqlCommand : DbCommand
     }
 
     /// Substitute @name parameters (client-side v1; server-side binding is
-    /// tracked for the prepared-statement milestone).
+    /// tracked for the prepared-statement milestone). A single scanner pass
+    /// skips '...' string literals and matches whole identifiers, so
+    /// <c>@id</c> never rewrites <c>@id2</c>, literals containing
+    /// <c>@name</c> stay intact, and a parameter's own value can never be
+    /// rewritten by a later parameter.
     private string BindParameters()
     {
-        var sql = CommandText;
-        foreach (DocsqlParameter p in Parameters)
+        if (Parameters.Count == 0)
         {
-            var literal = p.Value switch
-            {
-                null => "NULL",
-                int or long or short or byte => p.Value.ToString(),
-                double d => d.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                float f => f.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                decimal m => m.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                bool b => b ? "TRUE" : "FALSE",
-                _ => $"'{p.Value.ToString()!.Replace("'", "''")}'",
-            };
-            var name = p.ParameterName?.TrimStart('@') ?? "";
-            sql = sql.Replace($"@{name}", literal);
+            return CommandText;
         }
-        return sql;
+        var sql = CommandText;
+        var sb = new StringBuilder(sql.Length);
+        int i = 0;
+        while (i < sql.Length)
+        {
+            char c = sql[i];
+            if (c == '\'')
+            {
+                // Copy the string literal verbatim ('' is an escaped quote).
+                int j = i + 1;
+                while (j < sql.Length)
+                {
+                    if (sql[j] == '\'')
+                    {
+                        if (j + 1 < sql.Length && sql[j + 1] == '\'')
+                        {
+                            j += 2;
+                            continue;
+                        }
+                        j++;
+                        break;
+                    }
+                    j++;
+                }
+                sb.Append(sql[i..j]);
+                i = j;
+                continue;
+            }
+            if (c == '@')
+            {
+                int k = i + 1;
+                while (k < sql.Length && (char.IsLetterOrDigit(sql[k]) || sql[k] == '_'))
+                {
+                    k++;
+                }
+                if (k > i + 1)
+                {
+                    var name = sql[(i + 1)..k];
+                    var p = FindParameter(name);
+                    if (p is not null)
+                    {
+                        sb.Append(LiteralOf(p));
+                        i = k;
+                        continue;
+                    }
+                }
+            }
+            sb.Append(c);
+            i++;
+        }
+        return sb.ToString();
     }
+
+    private DocsqlParameter? FindParameter(string name) =>
+        Parameters.Cast<DocsqlParameter>().FirstOrDefault(
+            p => (p.ParameterName?.TrimStart('@') ?? "") == name);
+
+    private static string LiteralOf(DocsqlParameter p) => p.Value switch
+    {
+        null or DBNull => "NULL",
+        int or long or short or byte => p.Value.ToString()!,
+        double d => d.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        float f => f.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        // Numeric literal: the engine stores decimals as f64 — big values
+        // lose precision beyond ~15-16 significant digits (no decimal type).
+        decimal m => m.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        bool b => b ? "TRUE" : "FALSE",
+        // No BLOB storage in the engine; storing ToString() would corrupt
+        // data silently — refuse loudly instead.
+        byte[] => throw new NotSupportedException(
+            "byte[] parameters are not supported (no BLOB storage); serialize to TEXT/Base64"),
+        _ => $"'{p.Value.ToString()!.Replace("'", "''")}'",
+    };
 
     private static string ErrorText(Frame f) => Encoding.UTF8.GetString(f.Payload);
 
@@ -347,6 +434,7 @@ public sealed class DocsqlDataReader : DbDataReader
 {
     private readonly List<string> _columns = new();
     private readonly List<object?[]> _rows = new();
+    private readonly List<Type> _types = new();
     private int _pos = -1;
 
     private readonly int _recordsAffected;
@@ -366,6 +454,11 @@ public sealed class DocsqlDataReader : DbDataReader
         foreach (var r in doc.RootElement.GetProperty("rows").EnumerateArray())
         {
             _rows.Add(r.EnumerateArray().Select(ElemToValue).ToArray());
+        }
+        // Column type from the first non-null value (schemaless storage).
+        for (int i = 0; i < _columns.Count; i++)
+        {
+            _types.Add(_rows.FirstOrDefault(r => r[i] is not null)?[i]?.GetType() ?? typeof(object));
         }
     }
 
@@ -394,25 +487,33 @@ public sealed class DocsqlDataReader : DbDataReader
         return true;
     }
 
-    // ADO.NET contract: NULL columns surface as DBNull.Value, not null.
-    public override object GetValue(int ordinal) =>
-        _rows[_pos][ordinal] ?? DBNull.Value;
-    public override bool IsDBNull(int ordinal) => _rows[_pos][ordinal] is null;
-    public override string GetName(int ordinal) => _columns[ordinal];
-    public override int GetOrdinal(string name) => _columns.IndexOf(name);
+    private object?[] CurrentRow => _pos >= 0 && _pos < _rows.Count
+        ? _rows[_pos]
+        : throw new InvalidOperationException("no current row (call Read first)");
 
-    public override long GetInt64(int ordinal) => Convert.ToInt64(_rows[_pos][ordinal]);
-    public override int GetInt32(int ordinal) => Convert.ToInt32(_rows[_pos][ordinal]);
-    public override double GetDouble(int ordinal) => Convert.ToDouble(_rows[_pos][ordinal]);
-    public override string GetString(int ordinal) => Convert.ToString(_rows[_pos][ordinal])!;
-    public override bool GetBoolean(int ordinal) => Convert.ToBoolean(_rows[_pos][ordinal]);
+    // ADO.NET contract: NULL columns surface as DBNull.Value, not null.
+    public override object GetValue(int ordinal) => CurrentRow[ordinal] ?? DBNull.Value;
+    public override bool IsDBNull(int ordinal) => CurrentRow[ordinal] is null;
+    public override string GetName(int ordinal) => _columns[ordinal];
+    public override int GetOrdinal(string name)
+    {
+        var idx = _columns.IndexOf(name);
+        return idx >= 0 ? idx : throw new IndexOutOfRangeException($"no column named '{name}'");
+    }
+
+    public override long GetInt64(int ordinal) => Convert.ToInt64(CurrentRow[ordinal]);
+    public override int GetInt32(int ordinal) => Convert.ToInt32(CurrentRow[ordinal]);
+    public override double GetDouble(int ordinal) => Convert.ToDouble(CurrentRow[ordinal]);
+    public override string GetString(int ordinal) => Convert.ToString(CurrentRow[ordinal])!;
+    public override bool GetBoolean(int ordinal) => Convert.ToBoolean(CurrentRow[ordinal]);
 
     public override int GetValues(object[] values)
     {
         int n = Math.Min(values.Length, _columns.Count);
         for (int i = 0; i < n; i++)
         {
-            values[i] = _rows[_pos][i];
+            // Contract: NULL must come back as DBNull.Value.
+            values[i] = CurrentRow[i] ?? DBNull.Value;
         }
         return n;
     }
@@ -423,23 +524,38 @@ public sealed class DocsqlDataReader : DbDataReader
 
     public override object this[string name] => GetValue(GetOrdinal(name))!;
 
-    public override short GetInt16(int ordinal) => Convert.ToInt16(_rows[_pos][ordinal]);
+    public override short GetInt16(int ordinal) => Convert.ToInt16(CurrentRow[ordinal]);
 
 
-    public override System.Data.DataTable GetSchemaTable() => new();
+    public override System.Data.DataTable GetSchemaTable()
+    {
+        var t = new System.Data.DataTable();
+        t.Columns.Add("ColumnName", typeof(string));
+        t.Columns.Add("ColumnOrdinal", typeof(int));
+        t.Columns.Add("DataType", typeof(Type));
+        t.Columns.Add("AllowDBNull", typeof(bool));
+        for (int i = 0; i < _columns.Count; i++)
+        {
+            int ordinal = i;
+            bool nullable = _rows.Any(r => r[ordinal] is null);
+            t.Rows.Add(_columns[i], ordinal, _types[i], nullable);
+        }
+        return t;
+    }
 
     #region Not needed for basic flows
 
     public override int Depth => 0;
     public override string GetDataTypeName(int ordinal) => GetFieldType(ordinal).Name;
 
-    public override Type GetFieldType(int ordinal) => (GetValue(ordinal) ?? DBNull.Value).GetType();
-    public override char GetChar(int ordinal) => Convert.ToChar(_rows[_pos][ordinal]);
-    public override byte GetByte(int ordinal) => Convert.ToByte(_rows[_pos][ordinal]);
+    public override Type GetFieldType(int ordinal) => _types[ordinal];
+    public override char GetChar(int ordinal) => Convert.ToChar(CurrentRow[ordinal]);
+    public override byte GetByte(int ordinal) => Convert.ToByte(CurrentRow[ordinal]);
     public override Guid GetGuid(int ordinal) => Guid.Parse(GetString(ordinal));
-    public override float GetFloat(int ordinal) => Convert.ToSingle(_rows[_pos][ordinal]);
-    public override decimal GetDecimal(int ordinal) => Convert.ToDecimal(_rows[_pos][ordinal]);
-    public override DateTime GetDateTime(int ordinal) => Convert.ToDateTime(_rows[_pos][ordinal]);
+    public override float GetFloat(int ordinal) => Convert.ToSingle(CurrentRow[ordinal]);
+    public override decimal GetDecimal(int ordinal) => Convert.ToDecimal(CurrentRow[ordinal]);
+    public override DateTime GetDateTime(int ordinal) =>
+        Convert.ToDateTime(CurrentRow[ordinal], CultureInfo.InvariantCulture);
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length) => 0;
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length) => 0;
     public override bool NextResult() => false;
@@ -483,8 +599,38 @@ public sealed class DocsqlTransaction : DbTransaction
         _done = true;
     }
 
-    private void Run(string sql) => _conn.Proto.Send(
-        new Frame(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(sql)));
+    // ADO.NET contract: disposing an unfinished transaction rolls it back —
+    // otherwise `using (var tx = ...)` without Commit would leak an open
+    // server-side transaction (every later BEGIN fails, writes buffer).
+    protected override void Dispose(bool disposing)
+    {
+        if (!_done)
+        {
+            _done = true;
+            try
+            {
+                _conn.Proto.Send(new Frame(
+                    FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql("ROLLBACK")));
+            }
+            catch
+            {
+                // Connection already broken; nothing to roll back.
+            }
+        }
+        base.Dispose(disposing);
+    }
+
+    private void Run(string sql)
+    {
+        var resp = _conn.Proto.Send(
+            new Frame(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(sql)));
+        if (resp.Type == FrameType.RespError)
+        {
+            // A failed BEGIN/COMMIT/ROLLBACK must surface: reporting success
+            // would tell the caller data is durable when it is not.
+            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
+        }
+    }
 }
 
 public sealed class DocsqlFactory : DbProviderFactory

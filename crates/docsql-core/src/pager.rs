@@ -40,6 +40,12 @@ pub struct Pager {
     pool: HashMap<u32, Page>,
     pool_order: Vec<u32>, // simple FIFO eviction track
     max_pool: usize,
+    /// Committed page images not yet written to the data file (deferred
+    /// commits). They are WAL-logged but the data file must not see them
+    /// before the WAL is fsynced, or a crash could resurrect pages of a
+    /// transaction whose commit record was lost. Flushed by `sync_wal` /
+    /// the next fsyncing commit.
+    pending_writes: std::collections::BTreeMap<u32, Vec<u8>>,
 }
 
 struct Page {
@@ -88,6 +94,7 @@ impl Pager {
             pool: HashMap::new(),
             pool_order: Vec::new(),
             max_pool: 1024,
+            pending_writes: std::collections::BTreeMap::new(),
         };
         pager.recover()?;
         Ok(pager)
@@ -174,7 +181,11 @@ impl Pager {
             return Err(PagerError::OutOfRange(0, self.num_pages));
         }
         if !self.pool.contains_key(&id) {
-            let data = self.read_file_page(id)?;
+            let data = if let Some(p) = self.pending_writes.get(&id) {
+                p.clone()
+            } else {
+                self.read_file_page(id)?
+            };
             self.evict_if_full();
             self.pool_order.push(id);
             self.pool.insert(id, Page { data, dirty: false });
@@ -226,6 +237,20 @@ impl Pager {
         }
     }
 
+    /// Latest committed image of a page: pool copy first, then a deferred
+    /// (not yet flushed) image, then the data file. A read failure is a real
+    /// I/O error and must propagate — silently staging a zero page would
+    /// commit 4 KB of zeros over live data.
+    fn current_page_image(&mut self, id: u32) -> Result<Vec<u8>> {
+        if let Some(p) = self.pool.get(&id) {
+            return Ok(p.data.clone());
+        }
+        if let Some(p) = self.pending_writes.get(&id) {
+            return Ok(p.clone());
+        }
+        self.read_file_page(id)
+    }
+
     /// Stage a full-page write inside `tx`.
     pub fn write_page(&mut self, tx: &mut Tx, id: u32, offset: usize, data: &[u8]) -> Result<()> {
         if offset + data.len() > PAGE_SIZE {
@@ -234,10 +259,11 @@ impl Pager {
         if id >= self.num_pages && !tx.staged.contains_key(&id) {
             return Err(PagerError::OutOfRange(id, self.num_pages));
         }
-        let page = tx.staged.entry(id).or_insert_with(|| {
-            self.read_file_page(id)
-                .unwrap_or_else(|_| vec![0u8; PAGE_SIZE])
-        });
+        if let std::collections::hash_map::Entry::Vacant(e) = tx.staged.entry(id) {
+            let base = self.current_page_image(id)?;
+            e.insert(base);
+        }
+        let page = tx.staged.get_mut(&id).expect("just inserted");
         page[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
     }
@@ -250,14 +276,37 @@ impl Pager {
 
     /// Commit without the WAL fsync — used inside explicit SQL
     /// transactions so the whole batch pays one flush at COMMIT
-    /// (`sync_wal`) instead of one per statement.
+    /// (`sync_wal`) instead of one per statement. The data file is NOT
+    /// touched until the WAL is durable: staged images become visible via
+    /// the buffer pool and `pending_writes`.
     pub fn commit_tx_deferred(&mut self, tx: Tx) -> Result<u64> {
         self.commit_tx_inner(tx, false)
     }
 
-    /// Make every deferred commit durable (SQL COMMIT).
+    /// Make every deferred commit durable: fsync the WAL first (write-ahead
+    /// rule), then flush its page images to the data file.
     pub fn sync_wal(&mut self) -> Result<()> {
-        self.wal.sync().map_err(PagerError::Wal)
+        self.wal.sync().map_err(PagerError::Wal)?;
+        self.flush_pending()?;
+        self.maybe_checkpoint()
+    }
+
+    /// Write `pending_writes` through to the data file and update the pool.
+    /// Entries are popped one at a time so an I/O failure leaves the rest
+    /// queued (their WAL records are already durable and replay on reopen).
+    fn flush_pending(&mut self) -> Result<()> {
+        while let Some((&id, _)) = self.pending_writes.iter().next() {
+            let (_, data) = self
+                .pending_writes
+                .pop_first()
+                .expect("key just observed present");
+            self.write_file_page(id, &data)?;
+            if let Some(p) = self.pool.get_mut(&id) {
+                p.data = data;
+                p.dirty = false;
+            }
+        }
+        Ok(())
     }
 
     fn commit_tx_inner(&mut self, tx: Tx, fsync: bool) -> Result<u64> {
@@ -276,15 +325,27 @@ impl Pager {
         } else {
             self.wal.commit_deferred(tx.id)?
         };
-        // WAL durable — now apply to data file and update the buffer pool.
+        // WAL durable — now apply to the buffer pool. In the deferred path
+        // the data file is deliberately left alone until `sync_wal`, so a
+        // crash can never leave uncommitted page images in the data file.
         for (id, data) in &tx.staged {
-            self.write_file_page(*id, data)?;
             if let Some(p) = self.pool.get_mut(id) {
                 p.data = data.clone();
                 p.dirty = false;
             }
+            if !fsync {
+                self.pending_writes.insert(*id, data.clone());
+            }
         }
-        self.maybe_checkpoint()?;
+        if fsync {
+            // The WAL fsync also durable-d every earlier deferred commit:
+            // flush those pages too, then write this tx's pages.
+            self.flush_pending()?;
+            for (id, data) in &tx.staged {
+                self.write_file_page(*id, data)?;
+            }
+            self.maybe_checkpoint()?;
+        }
         Ok(lsn)
     }
 
@@ -520,5 +581,43 @@ mod tests {
         assert!(reopened.num_pages() >= 360);
         let page = reopened.read_page(200).unwrap();
         assert!(!page.is_empty());
+    }
+
+    #[test]
+    fn deferred_commit_waits_for_sync_before_touching_data_file() {
+        // Write-ahead rule: a deferred commit must not put page images into
+        // the data file before the WAL is fsynced, or a crash could persist
+        // pages of a transaction whose commit record was lost.
+        let (_dir, path) = tmp_db("h.db");
+        let magic = b"deferred bytes";
+        let page_id;
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            let mut tx = pager.begin_tx();
+            let p = pager.allocate_page(&mut tx).unwrap();
+            page_id = p;
+            pager.write_page(&mut tx, p, 0, magic).unwrap();
+            pager.commit_tx_deferred(tx).unwrap();
+
+            // Visible through the pool (statement-to-statement reads work)...
+            let page = pager.read_page(p).unwrap().to_vec();
+            assert_eq!(&page[..magic.len()], magic);
+            // ...but the data file must not carry the page yet (only the
+            // 16-byte file header exists).
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(len, HEADER_LEN as u64, "no page image on disk yet");
+
+            // A second statement sees the deferred image when re-staging
+            // (read-modify-write within the transaction).
+            let mut tx = pager.begin_tx();
+            pager.write_page(&mut tx, p, 20, b"APPEND").unwrap();
+            pager.commit_tx_deferred(tx).unwrap();
+
+            pager.sync_wal().unwrap(); // SQL COMMIT
+        }
+        let mut pager = Pager::open(&path).unwrap();
+        let page = pager.read_page(page_id).unwrap().to_vec();
+        assert_eq!(&page[..magic.len()], magic);
+        assert_eq!(&page[20..26], b"APPEND");
     }
 }

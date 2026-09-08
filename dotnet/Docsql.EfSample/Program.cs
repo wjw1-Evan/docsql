@@ -212,7 +212,7 @@ internal sealed class ServerLauncher : IDisposable
             FileName = exe,
             ArgumentList = { dbFile, $"127.0.0.1:{port}" },
             CreateNoWindow = true,
-            RedirectStandardError = true,
+            RedirectStandardError = false,
         };
         var proc = Process.Start(psi) ?? throw new InvalidOperationException("无法启动 docsql-server");
         for (var i = 0; i < 100; i++)

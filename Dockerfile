@@ -19,11 +19,14 @@ COPY crates ./crates
 RUN if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace --release; fi
 RUN cargo build --release -p docsql-server -p docsql-cli -p docsql-web
 
-# Runtime stage: server + cli only.
+# Runtime stage: server + cli only, running as an unprivileged user.
+# /data is pre-owned so fresh named volumes inherit writable ownership.
 FROM mcr.microsoft.com/azurelinux/base/core:3.0
 RUN tdnf install -y ca-certificates libstdc++ && tdnf clean all
 COPY --from=builder /build/target/release/docsql-server /usr/local/bin/docsql-server
 COPY --from=builder /build/target/release/docsql-cli /usr/local/bin/docsql-cli
 COPY --from=builder /build/target/release/docsql-web /usr/local/bin/docsql-web
+RUN mkdir /data && chown 1000:1000 /data
+USER 1000:1000
 EXPOSE 7600 7700
 ENTRYPOINT ["docsql-server"]

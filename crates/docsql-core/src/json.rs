@@ -276,11 +276,20 @@ impl<'a> Parser<'a> {
                         let ch = if (0xD800..0xDC00).contains(&cp) {
                             if self.bump() == Some(b'\\') && self.bump() == Some(b'u') {
                                 let lo = self.hex4()?;
-                                let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                char::from_u32(combined).unwrap_or('\u{FFFD}')
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    // Not a low surrogate: the pair arithmetic
+                                    // would underflow — substitute instead.
+                                    '\u{FFFD}'
+                                } else {
+                                    let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    char::from_u32(combined).unwrap_or('\u{FFFD}')
+                                }
                             } else {
                                 '\u{FFFD}'
                             }
+                        } else if (0xDC00..0xE000).contains(&cp) {
+                            // Lone low surrogate is not a scalar value.
+                            '\u{FFFD}'
                         } else {
                             char::from_u32(cp).unwrap_or('\u{FFFD}')
                         };

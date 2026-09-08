@@ -46,6 +46,23 @@ fn set_count(page: &mut [u8], n: usize) {
     page[0..2].copy_from_slice(&(n as u16).to_le_bytes());
 }
 
+/// Bounds-check a page image loaded from storage: the slot directory and
+/// every live document region must lie inside the page. A damaged file must
+/// surface as an error, not as a slice panic.
+fn validate_page(page: &[u8], pid: u32) -> Result<()> {
+    let n = count_of(page);
+    if HEADER_FIXED + n * SLOT_SIZE > page.len() {
+        return Err(HeapError::Page(pid, "slot directory overflows page"));
+    }
+    for i in 0..n {
+        let (off, len) = slot(page, i);
+        if len > 0 && (off < HEADER_FIXED || off + len > page.len()) {
+            return Err(HeapError::Page(pid, "document region out of bounds"));
+        }
+    }
+    Ok(())
+}
+
 fn push_slot(page: &mut [u8], off: usize, len: usize) {
     let i = count_of(page);
     let at = HEADER_FIXED + i * SLOT_SIZE;
@@ -157,6 +174,7 @@ impl Heap {
         let mut out = Vec::new();
         for &pid in &self.pages {
             let page = pager.read_page(pid)?.to_vec();
+            validate_page(&page, pid)?;
             for i in 0..count_of(&page) {
                 let (off, len) = slot(&page, i);
                 if len == 0 {
@@ -176,6 +194,7 @@ impl Heap {
     /// mutations within one statement see each other.
     pub fn page_docs(&self, pager: &mut Pager, tx: &Tx, page: u32) -> Result<Vec<(u64, Object)>> {
         let buf = staged_or_file_page(pager, tx, page)?;
+        validate_page(&buf, page)?;
         let mut out = Vec::new();
         for i in 0..count_of(&buf) {
             let (off, len) = slot(&buf, i);
@@ -194,6 +213,10 @@ impl Heap {
     pub fn doc_at(&self, pager: &mut Pager, loc: u64) -> Result<Option<Object>> {
         let (page, slot_i) = unpack_loc(loc);
         let buf = pager.read_page(page)?.to_vec();
+        validate_page(&buf, page)?;
+        if slot_i >= count_of(&buf) {
+            return Err(HeapError::Page(page, "slot out of range"));
+        }
         let (off, len) = slot(&buf, slot_i);
         if len == 0 {
             return Ok(None);
@@ -220,6 +243,7 @@ impl Heap {
         let mut placed = None;
         if let Some(&last) = self.pages.last() {
             let mut page = staged_or_file_page(pager, tx, last)?;
+            validate_page(&page, last)?;
             if free_space(&page) >= bytes.len() + SLOT_SIZE {
                 let off = content_start(&page) - bytes.len();
                 page[off..off + bytes.len()].copy_from_slice(&bytes);
@@ -261,6 +285,7 @@ impl Heap {
         }
         let (page_id, slot_i) = unpack_loc(loc);
         let mut page = staged_or_file_page(pager, tx, page_id)?;
+        validate_page(&page, page_id)?;
         let n = count_of(&page);
         if slot_i >= n {
             return Err(HeapError::Page(page_id, "slot out of range"));
@@ -342,6 +367,7 @@ impl Heap {
             slots.sort_unstable();
             slots.dedup();
             let mut page = staged_or_file_page(pager, tx, page_id)?;
+            validate_page(&page, page_id)?;
             let n = count_of(&page);
             for &s in &slots {
                 if s >= n {

@@ -39,6 +39,10 @@ pub struct ServerState {
     /// and KV frames, in execution order). They reach peers only when the
     /// transaction commits; a rollback discards them.
     pub tx_pending: tokio::sync::Mutex<TxPending>,
+    /// Serializes write execution together with its fan-out so peers apply
+    /// writes in the order this node executed them (and the
+    /// buffer-vs-forward classification is race-free).
+    pub write_order: tokio::sync::Mutex<()>,
     /// Replicas reject client writes until promoted.
     pub read_only: std::sync::atomic::AtomicBool,
     /// When set, every frame payload is sealed with AES-256-GCM.
@@ -47,13 +51,19 @@ pub struct ServerState {
     pub query_log: querylog::QueryLog,
 }
 
+/// One buffered write inside the open transaction, in execution order.
+#[derive(Debug, Clone)]
+pub enum PendingWrite {
+    Sql(String),
+    Kv(Frame),
+}
+
 /// Replication buffer for the open engine transaction. Savepoint marks
 /// mirror engine savepoints so ROLLBACK TO SAVEPOINT trims the tail.
 #[derive(Default)]
 pub struct TxPending {
-    pub sqls: Vec<String>,
-    pub frames: Vec<Frame>,
-    marks: Vec<(String, usize, usize)>,
+    pub writes: Vec<PendingWrite>,
+    marks: Vec<(String, usize)>,
 }
 
 impl TxPending {
@@ -63,30 +73,27 @@ impl TxPending {
 
     /// SAVEPOINT name: remember the buffer length to roll back to.
     pub fn mark(&mut self, name: &str) {
-        self.marks
-            .push((name.to_string(), self.sqls.len(), self.frames.len()));
+        self.marks.push((name.to_string(), self.writes.len()));
     }
 
     /// ROLLBACK TO SAVEPOINT name: drop writes past the mark (and later marks).
     pub fn rollback_to(&mut self, name: &str) {
-        if let Some(pos) = self.marks.iter().position(|(n, ..)| n == name) {
-            let (_, sqls_len, frames_len) = self.marks[pos].clone();
-            self.sqls.truncate(sqls_len);
-            self.frames.truncate(frames_len);
+        if let Some(pos) = self.marks.iter().position(|(n, _)| n == name) {
+            let (_, len) = self.marks[pos].clone();
+            self.writes.truncate(len);
             self.marks.truncate(pos);
         }
     }
 
     /// RELEASE SAVEPOINT name: forget the mark, keep the writes.
     pub fn release(&mut self, name: &str) {
-        if let Some(pos) = self.marks.iter().position(|(n, ..)| n == name) {
+        if let Some(pos) = self.marks.iter().position(|(n, _)| n == name) {
             self.marks.truncate(pos);
         }
     }
 
     pub fn clear(&mut self) {
-        self.sqls.clear();
-        self.frames.clear();
+        self.writes.clear();
         self.marks.clear();
     }
 }
@@ -119,17 +126,48 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     let mut kv =
         Kv::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?;
     kv.db.set_async_commit(cfg.async_commit);
+    // Drop peer entries that point at ourselves: forwarding to self would
+    // double-apply every write locally (INCR/LPUSH corrupt).
+    let peers: Vec<String> = cfg
+        .peers
+        .into_iter()
+        .filter(|p| {
+            if is_self_peer(&cfg.listen, p) {
+                eprintln!("ignoring self-referencing peer entry {p}");
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     let state = Arc::new(ServerState {
         kv: Mutex::new(kv),
         pubsub: PubSub::new(),
         auth_token: cfg.auth_token,
         replicate_to: tokio::sync::Mutex::new(cfg.replicate_to.clone()),
-        peers: tokio::sync::Mutex::new(cfg.peers.clone()),
+        peers: tokio::sync::Mutex::new(peers),
         tx_pending: tokio::sync::Mutex::new(TxPending::new()),
+        write_order: tokio::sync::Mutex::new(()),
         read_only: std::sync::atomic::AtomicBool::new(cfg.read_only),
         transport_key: cfg.transport_key,
         query_log: querylog::QueryLog::new(),
     });
+    // Background TTL sweeper: without it, expired keys stay visible to SQL
+    // until some KV read happens to touch them.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = kv.sweep() {
+                    eprintln!("ttl sweep failed: {e}");
+                }
+            }
+        });
+    }
     let listener = TcpListener::bind(&cfg.listen).await?;
     eprintln!("docsql-server listening on {}", cfg.listen);
     loop {
@@ -143,6 +181,28 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     }
 }
 
+/// True when `peer` resolves to a loopback address on the port we listen on
+/// (or is literally the listen address): forwarding there would loop back.
+fn is_self_peer(listen: &str, peer: &str) -> bool {
+    if listen == peer {
+        return true;
+    }
+    use std::net::ToSocketAddrs;
+    let Some(port) = listen
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    match peer.to_socket_addrs() {
+        Ok(addrs) => addrs
+            .collect::<Vec<_>>()
+            .iter()
+            .any(|a| a.port() == port && a.ip().is_loopback()),
+        Err(_) => false,
+    }
+}
+
 struct Conn {
     stream: tokio::net::tcp::OwnedReadHalf,
     buf: Vec<u8>,
@@ -151,9 +211,21 @@ struct Conn {
 impl Conn {
     async fn read_frame(&mut self) -> std::io::Result<Option<Frame>> {
         loop {
-            if let Ok((f, n)) = Frame::decode(&self.buf) {
-                self.buf.drain(..n);
-                return Ok(Some(f));
+            match Frame::decode(&self.buf) {
+                Ok((f, n)) => {
+                    self.buf.drain(..n);
+                    return Ok(Some(f));
+                }
+                // Truncated is the only recoverable case: read more bytes.
+                Err(docsql_core::proto::ProtoError::Truncated(..)) => {}
+                // Anything else (e.g. bad magic) is permanent garbage —
+                // failing fast beats buffering up to the 64 MB cap.
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("protocol: {e}"),
+                    ))
+                }
             }
             // Need more bytes; header length check avoids unbounded growth.
             if self.buf.len() > 64 * 1024 * 1024 {
@@ -210,6 +282,12 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     });
 
     let mut authed = state.auth_token.is_none();
+    // Live subscription bridges: channel -> task handle. Repeated SUBSCRIBE
+    // on the same channel must not stack duplicates, and every bridge dies
+    // with the connection (its writer-channel clone otherwise pins the
+    // writer task — and the socket — open forever).
+    let mut subs: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
     let result = async {
         while let Some(mut frame) = conn.read_frame().await? {
             if let Some(k) = key {
@@ -264,11 +342,20 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     resp
                 }
                 proto::REQ_KV => {
-                    let (resp, sub_channel, now_authed) =
-                        kvproto::handle(&state, &frame, authed).await;
+                    let (resp, ev, now_authed) = kvproto::handle(&state, &frame, authed).await;
                     authed = now_authed;
-                    if let Some(ch) = sub_channel {
-                        spawn_subscription(state.clone(), ch, tx.clone());
+                    match ev {
+                        kvproto::ConnEvent::Subscribe(ch) => {
+                            subs.entry(ch.clone()).or_insert_with(|| {
+                                spawn_subscription(state.clone(), ch.clone(), tx.clone())
+                            });
+                        }
+                        kvproto::ConnEvent::Unsubscribe(ch) => {
+                            if let Some(h) = subs.remove(&ch) {
+                                h.abort();
+                            }
+                        }
+                        kvproto::ConnEvent::None => {}
                     }
                     resp
                 }
@@ -288,12 +375,19 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
         Ok::<(), std::io::Error>(())
     }
     .await;
+    for (_, h) in subs.drain() {
+        h.abort();
+    }
     drop(tx);
     let _ = writer.await;
     result
 }
 
-fn spawn_subscription(state: Arc<ServerState>, channel: String, tx: mpsc::Sender<Frame>) {
+fn spawn_subscription(
+    state: Arc<ServerState>,
+    channel: String,
+    tx: mpsc::Sender<Frame>,
+) -> tokio::task::JoinHandle<()> {
     let rx = state.pubsub.subscribe(&channel);
     tokio::spawn(async move {
         // Bridge the std receiver with a blocking drain loop.
@@ -328,7 +422,32 @@ fn spawn_subscription(state: Arc<ServerState>, channel: String, tx: mpsc::Sender
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    });
+    })
+}
+
+/// How long a client BEGIN/MULTI queues behind an engine transaction another
+/// connection holds open before erroring. The engine supports one global
+/// transaction; without the queue, concurrent EF contexts (one connection
+/// each, SaveChanges wraps in BEGIN..COMMIT) would fail on collision.
+pub(crate) const BEGIN_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const BEGIN_QUEUE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Sleep-poll until the shared engine transaction closes or `deadline`
+/// passes. Nothing is held across awaits, so the owning connection's
+/// COMMIT/ROLLBACK always makes progress.
+pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: tokio::time::Instant) {
+    while tokio::time::Instant::now() < deadline {
+        let busy = state
+            .kv
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .db
+            .in_transaction();
+        if !busy {
+            return;
+        }
+        tokio::time::sleep(BEGIN_QUEUE_POLL).await;
+    }
 }
 
 async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
@@ -345,20 +464,53 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
             kvproto::err_payload("read-only replica; PROMOTE to accept writes"),
         );
     }
-    let (outcome, in_tx) = {
-        let mut kv = state.kv.lock().unwrap();
-        let out = kv.db.execute(&sql);
-        // Capture inside the same lock: another connection must not be able
-        // to open/close a transaction between execute and classification.
-        let in_tx = kv.db.in_transaction();
-        (out, in_tx)
+    // Writes and transaction control serialize with their fan-out: peers
+    // observe this node's writes in execution order, and the
+    // buffer-vs-forward decision is race-free. Reads stay concurrent.
+    let is_write = docsql_core::engine::Database::is_write_statement(&sql);
+    let tx_kind = Database::tx_control(&sql);
+    // A client BEGIN queues behind an open engine transaction instead of
+    // erroring immediately (single-writer engine). The deadline bounds the
+    // queue so an abandoned BEGIN still surfaces the engine error.
+    let queues = !is_replication && matches!(tx_kind, TxControl::Begin);
+    let deadline = tokio::time::Instant::now() + BEGIN_QUEUE_WAIT;
+    let (outcome, in_tx, _order_guard) = loop {
+        if queues {
+            wait_engine_tx_free(state, deadline).await;
+        }
+        let guard = if !is_replication && (is_write || !matches!(tx_kind, TxControl::None)) {
+            Some(state.write_order.lock().await)
+        } else {
+            None
+        };
+        let (out, in_tx) = {
+            let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
+            let out = kv.db.execute(&sql);
+            // Capture inside the same lock: another connection must not be able
+            // to open/close a transaction between execute and classification.
+            let in_tx = kv.db.in_transaction();
+            (out, in_tx)
+        };
+        // Lost the race for the engine transaction between the wait and the
+        // locks: requeue until the deadline, then let the error through.
+        if queues
+            && out
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("transaction already in progress"))
+            && tokio::time::Instant::now() < deadline
+        {
+            drop(guard);
+            tokio::time::sleep(BEGIN_QUEUE_POLL).await;
+            continue;
+        }
+        break (out, in_tx, guard);
     };
     // Replication timing follows engine transaction state: writes inside an
     // open transaction buffer until COMMIT (ROLLBACK discards them), so peers
     // never observe writes this node later undoes. COMMIT/EXEC drain the
     // buffer in execution order, mixing SQL and KV writes alike.
     if !is_replication && outcome.is_ok() {
-        match Database::tx_control(&sql) {
+        match tx_kind {
             TxControl::Commit => drain_tx_pending(state).await,
             TxControl::Rollback { savepoint: None } => state.tx_pending.lock().await.clear(),
             TxControl::Rollback {
@@ -366,9 +518,14 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
             } => state.tx_pending.lock().await.rollback_to(&name),
             TxControl::Savepoint(name) => state.tx_pending.lock().await.mark(&name),
             TxControl::Release(name) => state.tx_pending.lock().await.release(&name),
-            _ if Database::is_write_statement(&sql) => {
+            _ if is_write => {
                 if in_tx {
-                    state.tx_pending.lock().await.sqls.push(sql.clone());
+                    state
+                        .tx_pending
+                        .lock()
+                        .await
+                        .writes
+                        .push(PendingWrite::Sql(sql.clone()));
                 } else {
                     forward_sql_all(state, &sql).await;
                 }
@@ -397,15 +554,70 @@ async fn handle_sql(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     }
 }
 
+/// Peer I/O budget: a partitioned or malicious peer must not wedge client
+/// writes for the OS TCP timeout, nor force huge allocations.
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const RECV_CAP: usize = 64 * 1024 * 1024;
+
+/// Read one response frame from an outbound connection.
+async fn read_response_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
+    let mut header = [0u8; proto::HEADER_LEN];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut header)).await??;
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    if len > RECV_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer response too large",
+        ));
+    }
+    let mut buf = header.to_vec();
+    let mut payload = vec![0u8; len];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut payload)).await??;
+    buf.extend_from_slice(&payload);
+    let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
+    Ok(f)
+}
+
+/// AUTH on a fresh peer connection when the server requires a token (the
+/// peer rejects everything else with "unauthorized").
+async fn auth_on(
+    stream: &mut TcpStream,
+    token: &str,
+    key: Option<&crypto::TransportKey>,
+) -> std::io::Result<()> {
+    let mut frame = Frame::new(proto::REQ_KV, format!("AUTH\x00{token}").into_bytes());
+    if let Some(k) = key {
+        frame.payload = crypto::seal(k, &frame.payload);
+        frame.flags |= crypto::FLAG_ENCRYPTED;
+    }
+    let bytes = frame.encode().map_err(std::io::Error::other)?;
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let resp = read_response_frame(stream).await?;
+    if resp.frame_type == proto::RESP_ERROR {
+        return Err(std::io::Error::other(format!(
+            "peer rejected AUTH: {}",
+            String::from_utf8_lossy(&resp.payload)
+        )));
+    }
+    Ok(())
+}
+
 /// Send a raw frame to a peer and read one response frame back.
 /// When a transport key is configured the outbound frame is sealed (peers
-/// share the key); the response is discarded, so it is not opened here.
+/// share the key); the response is opened before returning.
 pub async fn forward_frame(
     target: &str,
     frame: &Frame,
     key: Option<&crypto::TransportKey>,
+    auth: Option<&str>,
 ) -> std::io::Result<Frame> {
-    let mut stream = tokio::net::TcpStream::connect(target).await?;
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await??;
+    if let Some(token) = auth {
+        auth_on(&mut stream, token, key).await?;
+    }
     let frame = if let Some(k) = key {
         Frame {
             flags: frame.flags | crypto::FLAG_ENCRYPTED,
@@ -416,18 +628,10 @@ pub async fn forward_frame(
         frame.clone()
     };
     let bytes = frame.encode().map_err(std::io::Error::other)?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    let mut header = [0u8; proto::HEADER_LEN];
-    stream.read_exact(&mut header).await?;
-    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-    let mut buf = header.to_vec();
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
-    buf.extend_from_slice(&payload);
-    let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
-    Ok(f)
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    read_response_frame(&mut stream).await
 }
 
 /// Send one write to the replication upstream.
@@ -435,8 +639,12 @@ async fn forward_write(
     target: &str,
     sql: &str,
     key: Option<&crypto::TransportKey>,
+    auth: Option<&str>,
 ) -> std::io::Result<()> {
-    let mut stream = tokio::net::TcpStream::connect(target).await?;
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await??;
+    if let Some(token) = auth {
+        auth_on(&mut stream, token, key).await?;
+    }
     let mut frame = Frame::new(proto::REQ_SQL, proto::encode_sql(sql).unwrap_or_default());
     frame.flags = FLAG_REPLICATION;
     if let Some(k) = key {
@@ -444,20 +652,14 @@ async fn forward_write(
         frame.flags |= crypto::FLAG_ENCRYPTED;
     }
     let bytes = frame.encode().map_err(std::io::Error::other)?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    // Read the response header + payload and discard.
-    let mut header = [0u8; proto::HEADER_LEN];
-    stream.read_exact(&mut header).await?;
-    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
-    if header[6] == (proto::RESP_ERROR & 0xff) as u8 && header[7] == (proto::RESP_ERROR >> 8) as u8
-    {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let resp = read_response_frame(&mut stream).await?;
+    if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "replica rejected: {}",
-            String::from_utf8_lossy(&payload)
+            String::from_utf8_lossy(&resp.payload)
         )));
     }
     Ok(())
@@ -465,57 +667,71 @@ async fn forward_write(
 
 /// Fan one SQL write out to the replication upstream and every peer.
 pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str) {
+    let auth = state.auth_token.as_deref();
     if let Some(target) = state.replicate_to.lock().await.clone() {
-        if let Err(e) = forward_write(&target, sql, state.transport_key.as_ref()).await {
+        if let Err(e) = forward_write(&target, sql, state.transport_key.as_ref(), auth).await {
             eprintln!("replication to {target} failed: {e}");
         }
     }
     for peer in state.peers.lock().await.clone() {
-        if let Err(e) = forward_write(&peer, sql, state.transport_key.as_ref()).await {
+        if let Err(e) = forward_write(&peer, sql, state.transport_key.as_ref(), auth).await {
             eprintln!("peer replication to {peer} failed: {e}");
         }
     }
 }
 
 /// Fan one KV command frame out to the replication upstream and every peer.
+/// A peer's application-level rejection is logged as a divergence signal
+/// (same as the SQL path).
 pub async fn forward_kv_all(state: &Arc<ServerState>, frame: &Frame) {
     let mut fwd = frame.clone();
     fwd.flags = FLAG_REPLICATION;
+    let auth = state.auth_token.as_deref();
     if let Some(target) = state.replicate_to.lock().await.clone() {
-        if let Err(e) = forward_frame(&target, &fwd, state.transport_key.as_ref()).await {
-            eprintln!("kv replication to {target} failed: {e}");
+        match forward_frame(&target, &fwd, state.transport_key.as_ref(), auth).await {
+            Err(e) => eprintln!("kv replication to {target} failed: {e}"),
+            Ok(resp) if resp.frame_type == proto::RESP_ERROR => eprintln!(
+                "kv replication to {target} rejected: {}",
+                String::from_utf8_lossy(&resp.payload)
+            ),
+            Ok(_) => {}
         }
     }
     for peer in state.peers.lock().await.clone() {
-        if let Err(e) = forward_frame(&peer, &fwd, state.transport_key.as_ref()).await {
-            eprintln!("kv peer replication to {peer} failed: {e}");
+        match forward_frame(&peer, &fwd, state.transport_key.as_ref(), auth).await {
+            Err(e) => eprintln!("kv peer replication to {peer} failed: {e}"),
+            Ok(resp) if resp.frame_type == proto::RESP_ERROR => eprintln!(
+                "kv peer replication to {peer} rejected: {}",
+                String::from_utf8_lossy(&resp.payload)
+            ),
+            Ok(_) => {}
         }
     }
 }
 
-/// Forward everything buffered in the open transaction (SQL then KV, in
-/// execution order) and clear the buffer. Called after a successful COMMIT.
+/// Forward everything buffered in the open transaction (SQL and KV writes,
+/// in execution order) and clear the buffer. Called after a successful
+/// COMMIT.
 pub async fn drain_tx_pending(state: &Arc<ServerState>) {
     let mut pending = state.tx_pending.lock().await;
-    let sqls = std::mem::take(&mut pending.sqls);
-    let frames = std::mem::take(&mut pending.frames);
+    let writes = std::mem::take(&mut pending.writes);
     pending.marks.clear();
     drop(pending);
-    for sql in &sqls {
-        forward_sql_all(state, sql).await;
-    }
-    for frame in &frames {
-        forward_kv_all(state, frame).await;
+    for w in &writes {
+        match w {
+            PendingWrite::Sql(sql) => forward_sql_all(state, sql).await,
+            PendingWrite::Kv(frame) => forward_kv_all(state, frame).await,
+        }
     }
 }
 
 pub fn parse_kv_args(payload: &[u8]) -> Result<Vec<String>, String> {
     let text = std::str::from_utf8(payload).map_err(|e| e.to_string())?;
-    Ok(text
-        .split('\x00')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect())
+    // Tolerate the legacy leading NUL pad some clients send ("\0SET\0k\0v"):
+    // strip at most one, then split on the terminator so interior empty
+    // arguments are real values (LPUSH k "" v must keep 3 args).
+    let text = text.strip_prefix('\x00').unwrap_or(text);
+    Ok(text.split_terminator('\x00').map(String::from).collect())
 }
 
 pub fn kv_ok(parts: &[String]) -> Frame {

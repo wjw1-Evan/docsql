@@ -1,0 +1,16 @@
+# Keep the build context small: docker compose build (deploy/docker-compose.yml
+# context: ..) would otherwise ship .git, dotnet build outputs and a
+# multi-GB target/ into the daemon on every build.
+.git
+.gitignore
+target
+**/target
+dotnet/**/bin
+dotnet/**/obj
+deploy
+.github
+.mimosa
+.zcode
+.env
+*.md
+.dockerignore

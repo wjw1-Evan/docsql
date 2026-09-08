@@ -96,18 +96,25 @@ impl BTree {
             Some(p) => p.to_vec(),
             None => pager.read_page(id)?.to_vec(),
         };
+        // All offsets below come from the page bytes; a damaged file must
+        // surface as Corrupt, not as a slice panic.
+        fn take(page: &[u8], pos: usize, n: usize) -> Result<&[u8]> {
+            page.get(pos..pos + n)
+                .ok_or(BTreeError::Corrupt("truncated node cell"))
+        }
         let kind = page[0];
         let count = u16::from_le_bytes([page[1], page[2]]) as usize;
         match kind {
             LEAF => {
-                let mut cells = Vec::with_capacity(count);
+                let mut cells = Vec::with_capacity(count.min(PAGE_SIZE / 10));
                 let mut pos = 3;
                 for _ in 0..count {
-                    let klen = u16::from_le_bytes(page[pos..pos + 2].try_into().unwrap()) as usize;
+                    let klen =
+                        u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(&page[pos..pos + klen])?;
+                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
                     pos += used;
-                    let val = u64::from_le_bytes(page[pos..pos + 8].try_into().unwrap());
+                    let val = u64::from_le_bytes(take(&page, pos, 8)?.try_into().unwrap());
                     pos += 8;
                     cells.push((k, val));
                 }
@@ -116,13 +123,14 @@ impl BTree {
             INTERNAL => {
                 let leftmost = u32::from_le_bytes(page[3..7].try_into().unwrap());
                 let mut pos = 7;
-                let mut cells = Vec::with_capacity(count);
+                let mut cells = Vec::with_capacity(count.min(PAGE_SIZE / 10));
                 for _ in 0..count {
-                    let klen = u16::from_le_bytes(page[pos..pos + 2].try_into().unwrap()) as usize;
+                    let klen =
+                        u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(&page[pos..pos + klen])?;
+                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
                     pos += used;
-                    let child = u32::from_le_bytes(page[pos..pos + 4].try_into().unwrap());
+                    let child = u32::from_le_bytes(take(&page, pos, 4)?.try_into().unwrap());
                     pos += 4;
                     cells.push((k, child));
                 }

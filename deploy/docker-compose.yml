@@ -28,7 +28,7 @@ services:
     environment:
       DOCSQL_PEERS: "node-b:7600,node-c:7600"
     ports:
-      - "17601:7600"
+      - "127.0.0.1:17601:7600"
     volumes:
       - peer-a-data:/data
     networks: [docsql]
@@ -46,13 +46,13 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
     ports:
-      - "17602:7600"
+      - "127.0.0.1:17602:7600"
     volumes:
       - peer-b-data:/data
     networks: [docsql]
     depends_on:
       node-a:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "docsql-cli connect node-b:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
@@ -67,13 +67,13 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
     ports:
-      - "17603:7600"
+      - "127.0.0.1:17603:7600"
     volumes:
       - peer-c-data:/data
     networks: [docsql]
     depends_on:
       node-a:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "docsql-cli connect node-c:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
@@ -88,13 +88,13 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     ports:
-      - "17700:7700"
+      - "127.0.0.1:17700:7700"
     volumes:
       - web-data:/data
     networks: [docsql]
     depends_on:
       node-a:
-        condition: service_started
+        condition: service_healthy
 
   # ---- profile: single -------------------------------------------------
   # One standalone database node: no DOCSQL_PEERS, no replication — reads
@@ -109,7 +109,7 @@ services:
     container_name: docsql-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     ports:
-      - "17600:7600"
+      - "127.0.0.1:17600:7600"
     volumes:
       - single-data:/data
     networks: [docsql]
@@ -126,13 +126,13 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     ports:
-      - "17710:7700"
+      - "127.0.0.1:17710:7700"
     volumes:
       - web-single-data:/data
     networks: [docsql]
     depends_on:
       node-single:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   peer-a-data:

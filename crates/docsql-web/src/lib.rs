@@ -114,9 +114,27 @@ fn check_auth(state: &WebState, headers: &HeaderMap) -> Option<StatusCode> {
     let token = headers.get("X-Docsql-Token").and_then(|v| v.to_str().ok());
     match &state.token {
         None => None,
-        Some(expect) if token == Some(expect.as_str()) => None,
+        // Constant-time compare: a plain == short-circuits on the first
+        // differing byte and leaks a (noisy but real) timing oracle.
+        Some(expect)
+            if token.is_some_and(|t| constant_time_eq(t.as_bytes(), expect.as_bytes())) =>
+        {
+            None
+        }
         Some(_) => Some(StatusCode::UNAUTHORIZED),
     }
+}
+
+/// Length-guarded XOR fold (mirrors docsql-server's crypto helper).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn index() -> Html<&'static str> {
@@ -183,7 +201,7 @@ async fn api_sql(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let mut kv = state.kv.lock().unwrap();
+    let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
     Ok(Json(run_sql(&mut kv, &body.sql)))
 }
 
@@ -213,10 +231,10 @@ pub fn build_meta(kv: &mut Kv, db_path: &Path, started: Instant) -> serde_json::
     let mut tables = Vec::new();
     let mut total_rows = 0u64;
     for t in &catalog {
-        let row_count = match kv
-            .db
-            .execute(&format!("SELECT COUNT(*) FROM \"{}\"", t.name))
-        {
+        let row_count = match kv.db.execute(&format!(
+            "SELECT COUNT(*) FROM \"{}\"",
+            t.name.replace('"', "\"\"")
+        )) {
             Ok(ExecOutcome::Rows(r)) => {
                 r.rows.first().and_then(|row| row[0].as_i64()).unwrap_or(0) as u64
             }
@@ -288,7 +306,7 @@ async fn api_meta(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let mut kv = state.kv.lock().unwrap();
+    let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
     Ok(Json(build_meta(&mut kv, &state.db_path, state.started)))
 }
 
@@ -358,7 +376,7 @@ async fn api_keys(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let mut kv = state.kv.lock().unwrap();
+    let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
     let limit = params.limit.unwrap_or(500).min(5000);
     let all = list_keys(&mut kv, params.r#type.as_deref(), params.like.as_deref());
     let total = all.len();
@@ -446,7 +464,7 @@ async fn api_kvkey(
     let Some(key) = params.get("key") else {
         return Ok(Json(serde_json::json!({"error": "missing ?key="})));
     };
-    let mut kv = state.kv.lock().unwrap();
+    let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
     let now = docsql_kv::now_ms();
     let found = list_keys(&mut kv, None, None)
         .into_iter()
@@ -499,7 +517,7 @@ pub fn kv_dispatch(
                 } else if f == "XX" {
                     opts.xx = true;
                 } else if let Some(secs) = f.strip_prefix("EX=") {
-                    opts.ttl_ms = secs.parse::<i64>().ok().map(|s| s * 1000);
+                    opts.ttl_ms = secs.parse::<i64>().ok().and_then(|s| s.checked_mul(1000));
                 } else if let Some(ms) = f.strip_prefix("PX=") {
                     opts.ttl_ms = ms.parse::<i64>().ok();
                 }
@@ -560,7 +578,7 @@ pub fn kv_dispatch(
             }
         }
         "LPOP" | "RPOP" => {
-            let r = if command == "LPOP" {
+            let r = if command.eq_ignore_ascii_case("LPOP") {
                 kv.lpop(arg(0))
             } else {
                 kv.rpop(arg(0))
@@ -651,8 +669,8 @@ async fn api_kv(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let mut kv = state.kv.lock().unwrap();
-    let mut log = state.events.lock().unwrap();
+    let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
+    let mut log = state.events.lock().unwrap_or_else(|p| p.into_inner());
     Ok(Json(kv_dispatch(
         &mut kv,
         Some(&mut log),
@@ -668,7 +686,7 @@ async fn api_stats(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let mut kv = state.kv.lock().unwrap();
+    let mut kv = state.kv.lock().unwrap_or_else(|p| p.into_inner());
     let (kv_total, by_type) = kv_summary(&mut kv);
     let user_tables = kv
         .db
@@ -705,7 +723,7 @@ async fn api_publish(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let mut log = state.events.lock().unwrap();
+    let mut log = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let seq = log.push(&body.channel, &body.message);
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -726,7 +744,7 @@ async fn api_events(
         .get("after")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let log = state.events.lock().unwrap();
+    let log = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let latest = log.seq;
     let events: Vec<serde_json::Value> = log
         .since(after)

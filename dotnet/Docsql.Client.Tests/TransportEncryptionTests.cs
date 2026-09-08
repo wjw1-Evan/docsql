@@ -31,7 +31,7 @@ public sealed class TlsServer : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
-            CreateNoWindow = true, RedirectStandardError = true,
+            CreateNoWindow = true, RedirectStandardError = false,
         };
         if (keyHex is not null) psi.Environment["DOCSQL_KEY"] = keyHex;
         if (peers is not null) psi.Environment["DOCSQL_PEERS"] = peers;
@@ -129,17 +129,19 @@ public sealed class TransportEncryptionTests
         var psi = new ProcessStartInfo
         {
             FileName = exe, ArgumentList = { db, $"127.0.0.1:{bPort}" },
-            CreateNoWindow = true, RedirectStandardError = true,
+            CreateNoWindow = true, RedirectStandardError = false,
         };
         psi.Environment["DOCSQL_KEY"] = TlsServer.KeyHex;
         using var b = Process.Start(psi)!;
         try
         {
+            var up = false;
             for (var i = 0; i < 100; i++)
             {
-                try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", bPort); break; }
+                try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", bPort); up = true; break; }
                 catch { Thread.Sleep(50); }
             }
+            if (!up) throw new InvalidOperationException($"replica on port {bPort} never came up");
 
             // 通过 a(带 key)写入,b 同样用 key 连接读到复制数据
             Scalar(a.Cs, "CREATE TABLE esync (v INT)");

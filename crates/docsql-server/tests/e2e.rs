@@ -300,6 +300,46 @@ async fn sql_error_reaches_client() {
     assert_eq!(payload_str(&r), "pong");
 }
 
+/// The engine allows one global transaction: a BEGIN from a second
+/// connection queues behind the first connection's open transaction instead
+/// of erroring (concurrent EF SaveChanges, one connection per context,
+/// relies on this).
+#[tokio::test]
+async fn begin_on_second_connection_queues_behind_open_transaction() {
+    let (_dir, addr) = start_server(None).await;
+    let mut a = Client::connect(&addr).await;
+    let mut b = Client::connect(&addr).await;
+    let r = a.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    let r = a.sql("BEGIN").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    a.sql("INSERT INTO q VALUES (1)").await;
+
+    // B's BEGIN queues while A's transaction is open; the response must only
+    // arrive (successfully) once A has committed.
+    b.send(&Frame::new(
+        proto::REQ_SQL,
+        proto::encode_sql("BEGIN").unwrap(),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let r = a.sql("COMMIT").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    let r = b.recv().await;
+    assert_eq!(
+        r.frame_type,
+        proto::RESP_AFFECTED,
+        "queued BEGIN must succeed once the blocking transaction commits"
+    );
+
+    b.sql("INSERT INTO q VALUES (2)").await;
+    let r = b.sql("COMMIT").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    let r = a.sql("SELECT COUNT(*) FROM q").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS);
+    assert!(payload_str(&r).contains("[[2]]"), "{}", payload_str(&r));
+}
+
 /// Replication + failover: writes on the primary appear on the replica;
 /// killing the primary and promoting the replica restores write capability.
 #[tokio::test]
@@ -623,15 +663,15 @@ async fn shard_routing_distributes_kv_keys() {
     // Write through the router, read directly from each shard.
     let keys = ["shard-key-a", "shard-key-b", "shard-key-c", "shard-key-d"];
     for k in keys {
-        let resp = router.kv("SET", k).await.unwrap();
+        let resp = router.kv(&["SET", k, "routed"]).await.unwrap();
         assert_ne!(resp.frame_type, proto::RESP_ERROR, "SET {k} failed");
     }
     for k in keys {
         let target = router.shard_for(k);
         let mut c = Client::connect(target).await;
         let resp = c.kv(&["GET", k]).await;
-        // SET without a value writes an empty string — GET must succeed.
-        assert_ne!(resp.frame_type, proto::RESP_ERROR, "GET {k} on {target}");
+        // The value travels with the routed command.
+        assert_eq!(payload_str(&resp), "routed", "GET {k} on {target}");
     }
 
     // Same key always routes to the same shard (read-your-writes).

@@ -23,7 +23,7 @@ public sealed class ServerFixture : IDisposable
             FileName = exe,
             ArgumentList = { tmp, $"127.0.0.1:{Port}" },
             CreateNoWindow = true,
-            RedirectStandardError = true,
+            RedirectStandardError = false,
         })!;
         // wait for port
         for (int i = 0; i < 100; i++)

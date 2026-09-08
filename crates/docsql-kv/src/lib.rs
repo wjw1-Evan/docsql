@@ -103,10 +103,18 @@ impl Kv {
     pub fn get(&mut self, key: &str) -> Result<Option<String>> {
         let now = now_ms();
         match self.raw_row(key, now)? {
-            Some(o) => match o.get("value") {
-                Some(Value::Str(s)) => Ok(Some(s.clone())),
-                _ => err("wrong value type"),
-            },
+            Some(o) => {
+                match o.get("type").and_then(|v| v.as_str()) {
+                    Some("string") | None => {}
+                    Some(other) => {
+                        return err(format!("WRONGTYPE: key holds a {other}, not a string"))
+                    }
+                }
+                match o.get("value") {
+                    Some(Value::Str(s)) => Ok(Some(s.clone())),
+                    _ => err("wrong value type"),
+                }
+            }
             None => Ok(None),
         }
     }
@@ -126,10 +134,17 @@ impl Kv {
         if (opts.nx && exists) || (opts.xx && !exists) {
             return Ok(false);
         }
-        let expire_at = opts.ttl_ms.map(|t| now + t).unwrap_or(0);
+        let expire_at = match opts.ttl_ms.map(|t| now.checked_add(t)) {
+            Some(Some(at)) => at,
+            Some(None) => return err("invalid or out of range TTL"),
+            None => 0,
+        };
         if exists {
+            // Reset `type` too: SET over a collection key makes it a plain
+            // string again (stale kind metadata would mislead TYPE / web /
+            // later collection ops).
             self.db.execute(&format!(
-                "UPDATE {KV_TABLE} SET value = '{v}', expire_at = {e} WHERE \"key\" = '{k}'",
+                "UPDATE {KV_TABLE} SET value = '{v}', type = 'string', expire_at = {e} WHERE \"key\" = '{k}'",
                 v = escape(val),
                 e = expire_at,
                 k = escape(key)
@@ -176,9 +191,12 @@ impl Kv {
         if self.raw_row(key, now)?.is_none() {
             return Ok(false);
         }
+        let at = now
+            .checked_add(ttl_ms)
+            .ok_or_else(|| KvError::Message("invalid or out of range TTL".into()))?;
         self.db.execute(&format!(
             "UPDATE {KV_TABLE} SET expire_at = {at} WHERE \"key\" = '{k}'",
-            at = now + ttl_ms,
+            at = at,
             k = escape(key)
         ))?;
         Ok(true)
@@ -207,7 +225,9 @@ impl Kv {
             },
             None => 0,
         };
-        let next = cur + delta;
+        let next = cur
+            .checked_add(delta)
+            .ok_or_else(|| KvError::Message("increment or decrement would overflow".into()))?;
         if cur == 0 && self.raw_row(key, now)?.is_none() {
             self.db.execute(&format!(
                 "INSERT INTO {KV_TABLE} (\"key\", type, value, expire_at) VALUES ('{k}', 'string', '{v}', 0)",

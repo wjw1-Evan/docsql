@@ -8,9 +8,14 @@
 # Configure via deploy/.env (see .env.example):
 #   DOCSQL_IMAGE_TAG  image tag (default: latest; pin a released version for
 #                     reproducible deploys, e.g. v1.0.0)
-#   DOCSQL_TOKEN      web console auth token (empty = no auth)
+#   DOCSQL_TOKEN      auth token for the server protocol port AND the web
+#                     console/REST API (empty = no auth — loopback only!)
 #
 #   cp .env.example .env && edit, then pick a profile and up -d.
+#
+# All published ports default to loopback (127.0.0.1) so an unauthenticated
+# deploy is never exposed to the network. To serve externally, replace e.g.
+# "127.0.0.1:17601:7600" with "17601:7600" AND set DOCSQL_TOKEN.
 #
 # Dev vs prod share host ports (17600-17603, 17700, 17710): run only one of
 # them at a time and `down -v` before switching.
@@ -26,14 +31,17 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-b:7600,node-c:7600"
+      # The token applies to this node's SQL/KV port too (nodes authenticate
+      # to each other automatically during replication fan-out).
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "17601:7600"
+      - "127.0.0.1:17601:7600"
     volumes:
       - peer-a-data:/data
     networks: [docsql]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-a:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-a:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -48,17 +56,18 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "17602:7600"
+      - "127.0.0.1:17602:7600"
     volumes:
       - peer-b-data:/data
     networks: [docsql]
     depends_on:
       node-a:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-b:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-b:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -73,17 +82,18 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "17603:7600"
+      - "127.0.0.1:17603:7600"
     volumes:
       - peer-c-data:/data
     networks: [docsql]
     depends_on:
       node-a:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-c:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-c:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -102,13 +112,13 @@ services:
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "17700:7700"
+      - "127.0.0.1:17700:7700"
     volumes:
       - web-data:/data
     networks: [docsql]
     depends_on:
       node-a:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     logging:
       driver: json-file
@@ -122,14 +132,16 @@ services:
     image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
     container_name: docsql-prod-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]
+    environment:
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "17600:7600"
+      - "127.0.0.1:17600:7600"
     volumes:
       - single-data:/data
     networks: [docsql]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-single:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-single:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -146,13 +158,13 @@ services:
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "17710:7700"
+      - "127.0.0.1:17710:7700"
     volumes:
       - web-single-data:/data
     networks: [docsql]
     depends_on:
       node-single:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     logging:
       driver: json-file

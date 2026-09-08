@@ -32,7 +32,7 @@ public sealed class PeerNode : IDisposable
             FileName = exe,
             ArgumentList = { db, $"127.0.0.1:{port}" },
             CreateNoWindow = true,
-            RedirectStandardError = true,
+            RedirectStandardError = false,
         };
         psi.Environment["DOCSQL_PEERS"] = peers;
         var proc = Process.Start(psi) ?? throw new InvalidOperationException("启动失败");

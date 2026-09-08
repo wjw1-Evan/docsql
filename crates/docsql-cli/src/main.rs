@@ -1,13 +1,17 @@
 //! docsql shell.
 //!
-//! - `docsql <file.db>`      embedded mode (SQL from stdin)
-//! - `docsql :memory:`       embedded in-memory
-//! - `docsql connect <addr>` remote mode over the v1 protocol
+//! - `docsql <file.db>`             embedded mode (SQL from stdin)
+//! - `docsql :memory:`              embedded in-memory
+//! - `docsql connect <addr> [token]` remote mode over the v1 protocol
+//!   (`auth <token>;` also works mid-session)
 
 use docsql_core::engine::{Database, ExecOutcome, QueryResult};
 use docsql_core::proto::{self, Frame};
 use docsql_core::value::Value;
 use std::io::{BufRead, Read, Write};
+
+/// Cap on server-advertised frame sizes (mirrors the server's inbound cap).
+const RECV_CAP: usize = 64 * 1024 * 1024;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -16,7 +20,8 @@ fn main() {
             .get(2)
             .cloned()
             .unwrap_or_else(|| "127.0.0.1:7600".into());
-        remote_shell(&addr);
+        let token = args.get(3).cloned();
+        remote_shell(&addr, token.as_deref());
         return;
     }
     if args.get(1).map(String::as_str) == Some("kv") {
@@ -25,7 +30,7 @@ fn main() {
             .get(2)
             .cloned()
             .unwrap_or_else(|| "127.0.0.1:7600".into());
-        let rest: Vec<String> = args[3..].to_vec();
+        let rest: Vec<String> = args.get(3..).map(|s| s.to_vec()).unwrap_or_default();
         kv_one(&addr, &rest);
         return;
     }
@@ -71,36 +76,49 @@ fn main() {
     }
 }
 
+/// Send one frame and read one response frame. Both directions are checked:
+/// a decode failure or an oversized advertised length is an error, never a
+/// panic or a multi-GB allocation.
+fn round_trip(stream: &mut std::net::TcpStream, frame: &Frame) -> Result<Frame, String> {
+    let bytes = frame.encode().map_err(|e| e.to_string())?;
+    stream
+        .write_all(&bytes)
+        .and_then(|_| stream.flush())
+        .map_err(|e| e.to_string())?;
+    let mut header = [0u8; proto::HEADER_LEN];
+    stream
+        .read_exact(&mut header)
+        .map_err(|_| "connection closed".to_string())?;
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    if len > RECV_CAP {
+        return Err("server advertised an oversized frame".into());
+    }
+    let mut buf = header.to_vec();
+    let mut payload = vec![0u8; len];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|_| "connection closed".to_string())?;
+    buf.extend_from_slice(&payload);
+    Frame::decode(&buf)
+        .map(|(f, _)| f)
+        .map_err(|e| format!("protocol error: {e}"))
+}
+
 /// Send one KV command; print the NUL-joined reply payload.
 fn kv_one(addr: &str, args: &[String]) {
-    use std::io::Write as _;
     let Ok(mut stream) = std::net::TcpStream::connect(addr) else {
         eprintln!("docsql: cannot connect {addr}");
         std::process::exit(1);
     };
     let payload = args.join("\x00").into_bytes();
     let frame = Frame::new(proto::REQ_KV, payload);
-    let Ok(_) = stream
-        .write_all(&frame.encode().unwrap())
-        .and_then(|_| stream.flush())
-    else {
-        eprintln!("write failed");
-        std::process::exit(1);
+    let f = match round_trip(&mut stream, &frame) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     };
-    let mut header = [0u8; proto::HEADER_LEN];
-    if stream.read_exact(&mut header).is_err() {
-        eprintln!("connection closed");
-        std::process::exit(1);
-    }
-    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-    let mut buf = header.to_vec();
-    let mut payload = vec![0u8; len];
-    if stream.read_exact(&mut payload).is_err() {
-        eprintln!("connection closed");
-        std::process::exit(1);
-    }
-    buf.extend_from_slice(&payload);
-    let (f, _) = Frame::decode(&buf).unwrap();
     if f.frame_type == proto::RESP_ERROR {
         eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
         std::process::exit(2);
@@ -110,7 +128,23 @@ fn kv_one(addr: &str, args: &[String]) {
     println!("{}", decode_kv_payload(&f.payload));
 }
 
-fn remote_shell(addr: &str) {
+/// AUTH against a token-protected server. Returns success.
+fn kv_auth(stream: &mut std::net::TcpStream, token: &str) -> bool {
+    let payload = format!("AUTH\x00{token}").into_bytes();
+    match round_trip(stream, &Frame::new(proto::REQ_KV, payload)) {
+        Ok(f) if f.frame_type != proto::RESP_ERROR => true,
+        Ok(f) => {
+            eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
+            false
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            false
+        }
+    }
+}
+
+fn remote_shell(addr: &str, token: Option<&str>) {
     let mut stream = match std::net::TcpStream::connect(addr) {
         Ok(s) => s,
         Err(e) => {
@@ -118,11 +152,21 @@ fn remote_shell(addr: &str) {
             std::process::exit(1);
         }
     };
-    println!("docsql → {addr} — SQL over the wire, quit with exit;");
+    if let Some(t) = token {
+        if !kv_auth(&mut stream, t) {
+            std::process::exit(2);
+        }
+    }
+    println!(
+        "docsql → {addr} — SQL over the wire, quit with exit; (`auth <token>;` to authenticate)"
+    );
     let mut stmt = String::new();
     let stdin = std::io::BufReader::new(std::io::stdin().lock());
     for line in stdin.lines() {
-        let line = line.unwrap_or_default();
+        let line = line.unwrap_or_else(|e| {
+            eprintln!("read error: {e}");
+            std::process::exit(1);
+        });
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -130,35 +174,28 @@ fn remote_shell(addr: &str) {
         if trimmed == "exit" || trimmed == "exit;" {
             break;
         }
+        // Inline AUTH: forward as a KV command instead of SQL.
+        if let Some(tok) = trimmed
+            .strip_prefix("auth ")
+            .or_else(|| trimmed.strip_prefix("AUTH "))
+            .map(|t| t.trim().trim_end_matches(';').trim())
+            .filter(|t| !t.is_empty())
+        {
+            if kv_auth(&mut stream, tok) {
+                println!("ok");
+            }
+            continue;
+        }
         stmt.push_str(&line);
         stmt.push('\n');
         if !trimmed.ends_with(';') {
             continue;
         }
         let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(stmt.trim()).unwrap());
-        let bytes = frame.encode().unwrap();
-        if let Err(e) = stream.write_all(&bytes).and_then(|_| stream.flush()) {
-            eprintln!("write error: {e}");
-            break;
-        }
-        let mut buf = Vec::new();
-        let mut header = [0u8; proto::HEADER_LEN];
-        if stream.read_exact(&mut header).is_err() {
-            eprintln!("connection closed");
-            break;
-        }
-        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-        buf.extend_from_slice(&header);
-        let mut payload = vec![0u8; len];
-        if stream.read_exact(&mut payload).is_err() {
-            eprintln!("connection closed");
-            break;
-        }
-        buf.extend_from_slice(&payload);
-        let (f, _) = match Frame::decode(&buf) {
-            Ok(x) => x,
+        let f = match round_trip(&mut stream, &frame) {
+            Ok(f) => f,
             Err(e) => {
-                eprintln!("protocol error: {e}");
+                eprintln!("{e}");
                 break;
             }
         };
@@ -185,10 +222,16 @@ fn remote_shell(addr: &str) {
                         _ => vec![],
                     };
                     print_rows(&QueryResult { columns, rows });
+                } else {
+                    eprintln!("protocol error: undecodable rows payload");
                 }
             }
             proto::RESP_AFFECTED => {
-                let n = u64::from_le_bytes(f.payload[..8].try_into().unwrap_or([0; 8]));
+                let n = f
+                    .payload
+                    .get(..8)
+                    .and_then(|s| s.try_into().ok())
+                    .map_or(0, u64::from_le_bytes);
                 println!("({n} rows affected)");
             }
             _ => println!("error: {}", String::from_utf8_lossy(&f.payload)),
@@ -221,7 +264,10 @@ pub fn render_rows(r: &QueryResult) -> String {
         .collect();
     for row in &cells {
         for (i, c) in row.iter().enumerate() {
-            widths[i] = widths[i].max(c.len());
+            // Rows wider than the column list must not panic the client.
+            if let Some(w) = widths.get_mut(i) {
+                *w = (*w).max(c.len());
+            }
         }
     }
     let sep: String = widths

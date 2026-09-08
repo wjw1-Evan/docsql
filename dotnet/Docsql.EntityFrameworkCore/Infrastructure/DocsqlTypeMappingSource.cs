@@ -1,4 +1,4 @@
-// CLR ↔ docsql 列类型映射:INTEGER / REAL / TEXT / BLOB。
+// CLR ↔ docsql 列类型映射:INTEGER / REAL / TEXT。
 
 using Microsoft.EntityFrameworkCore.Storage;
 using System.Data;
@@ -19,9 +19,9 @@ public sealed class DocsqlTypeMappingSource(
     private static readonly FloatTypeMapping Float = new("REAL", DbType.Single);
     private static readonly StringTypeMapping Text = new("TEXT", DbType.String);
     private static readonly GuidTypeMapping Guid = new("TEXT", DbType.Guid);
-    private static readonly ByteArrayTypeMapping Blob = new("BLOB", DbType.Binary);
     private static readonly DecimalTypeMapping Decimal = new("TEXT", DbType.Decimal);
     private static readonly DateTimeTypeMapping DateTime = new("TEXT", DbType.DateTime);
+    private static readonly DateTimeOffsetTypeMapping DateTimeOffset = new("TEXT", DbType.DateTimeOffset);
     private static readonly TimeSpanTypeMapping TimeSpan = new("TEXT", DbType.Time);
 
     protected override RelationalTypeMapping? FindMapping(in RelationalTypeMappingInfo info)
@@ -37,9 +37,11 @@ public sealed class DocsqlTypeMappingSource(
         if (clrType == typeof(decimal)) return Decimal;
         if (clrType == typeof(Guid)) return Guid;
         if (clrType == typeof(DateTime)) return DateTime;
-        if (clrType == typeof(DateTimeOffset)) return DateTime;
+        if (clrType == typeof(DateTimeOffset)) return DateTimeOffset;
         if (clrType == typeof(TimeSpan)) return TimeSpan;
-        if (clrType == typeof(byte[])) return Blob;
+        // byte[] intentionally unmapped: the engine has no BLOB storage, and
+        // a BLOB mapping would silently round-trip garbage. No mapping makes
+        // EF fail at model build with a clear error instead.
         if (clrType == typeof(string)) return Text;
         return base.FindMapping(in info);
     }

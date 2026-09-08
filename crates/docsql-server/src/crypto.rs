@@ -22,6 +22,19 @@ pub fn parse_key_hex(s: &str) -> Result<TransportKey, String> {
         .map_err(|_| format!("DOCSQL_KEY must be 32 bytes (64 hex chars), got {n} bytes"))
 }
 
+/// Constant-time equality for secrets (AUTH tokens). The length check only
+/// leaks the length; byte comparison short-circuits nowhere.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if !s.len().is_multiple_of(2) {

@@ -8,16 +8,32 @@ use docsql_core::json;
 use docsql_core::value::{Object, Value};
 
 impl Kv {
-    fn load_value(&mut self, key: &str) -> Result<Option<Value>> {
+    /// Load a value only if the key's `type` column matches `kind`
+    /// (Redis-style WRONGTYPE on mismatch: an LPUSH on a SET key must not
+    /// silently convert it). None = key absent.
+    fn load_typed(&mut self, key: &str, kind: &str) -> Result<Option<Value>> {
         let now = now_ms();
-        match self.raw_row(key, now)? {
-            Some(o) => match o.get("value") {
-                Some(Value::Str(s)) => Ok(Some(
-                    json::from_str(s).map_err(|e| KvError::Message(e.to_string()))?,
-                )),
-                _ => Err(KvError::Message("wrong value type".into())),
-            },
-            None => Ok(None),
+        let Some(o) = self.raw_row(key, now)? else {
+            return Ok(None);
+        };
+        match o.get("type").and_then(|v| v.as_str()) {
+            Some(k) if k == kind => {}
+            Some(other) => {
+                return Err(KvError::Message(format!(
+                    "WRONGTYPE: key holds a {other}, not a {kind}"
+                )))
+            }
+            None => {
+                return Err(KvError::Message(format!(
+                    "WRONGTYPE: untyped entry is not a {kind}"
+                )))
+            }
+        }
+        match o.get("value") {
+            Some(Value::Str(s)) => Ok(Some(
+                json::from_str(s).map_err(|e| KvError::Message(e.to_string()))?,
+            )),
+            _ => Err(KvError::Message("wrong value type".into())),
         }
     }
 
@@ -49,9 +65,9 @@ impl Kv {
     // ---- LIST ----
 
     pub fn lpush(&mut self, key: &str, values: &[&str]) -> Result<u64> {
-        let mut list = match self.load_value(key)? {
+        let mut list = match self.load_typed(key, "list")? {
             Some(Value::Array(a)) => a,
-            Some(_) => return Err(KvError::Message("wrong type for LIST".into())),
+            Some(_) => return Err(KvError::Message("corrupt list value".into())),
             None => vec![],
         };
         for v in values.iter().rev() {
@@ -62,9 +78,9 @@ impl Kv {
     }
 
     pub fn rpush(&mut self, key: &str, values: &[&str]) -> Result<u64> {
-        let mut list = match self.load_value(key)? {
+        let mut list = match self.load_typed(key, "list")? {
             Some(Value::Array(a)) => a,
-            Some(_) => return Err(KvError::Message("wrong type for LIST".into())),
+            Some(_) => return Err(KvError::Message("corrupt list value".into())),
             None => vec![],
         };
         for v in values {
@@ -75,9 +91,9 @@ impl Kv {
     }
 
     fn pop(&mut self, key: &str, front: bool) -> Result<Option<String>> {
-        let mut list = match self.load_value(key)? {
+        let mut list = match self.load_typed(key, "list")? {
             Some(Value::Array(a)) => a,
-            Some(_) => return Err(KvError::Message("wrong type for LIST".into())),
+            Some(_) => return Err(KvError::Message("corrupt list value".into())),
             None => return Ok(None),
         };
         if list.is_empty() {
@@ -88,7 +104,17 @@ impl Kv {
         } else {
             list.pop().unwrap()
         };
-        self.store_value(key, "list", &Value::Array(list))?;
+        if list.is_empty() {
+            // Redis semantics: an emptied collection disappears.
+            self.db
+                .execute(&format!(
+                    "DELETE FROM _kv WHERE \"key\" = '{k}'",
+                    k = crate::escape(key)
+                ))
+                .map_err(KvError::from)?;
+        } else {
+            self.store_value(key, "list", &Value::Array(list))?;
+        }
         Ok(v.as_str().map(String::from))
     }
 
@@ -101,9 +127,9 @@ impl Kv {
     }
 
     pub fn lrange(&mut self, key: &str, start: i64, stop: i64) -> Result<Vec<String>> {
-        let list = match self.load_value(key)? {
+        let list = match self.load_typed(key, "list")? {
             Some(Value::Array(a)) => a,
-            Some(_) => return Err(KvError::Message("wrong type for LIST".into())),
+            Some(_) => return Err(KvError::Message("corrupt list value".into())),
             None => return Ok(vec![]),
         };
         let n = list.len() as i64;
@@ -130,9 +156,9 @@ impl Kv {
     }
 
     pub fn llen(&mut self, key: &str) -> Result<u64> {
-        match self.load_value(key)? {
+        match self.load_typed(key, "list")? {
             Some(Value::Array(a)) => Ok(a.len() as u64),
-            Some(_) => Err(KvError::Message("wrong type for LIST".into())),
+            Some(_) => Err(KvError::Message("corrupt list value".into())),
             None => Ok(0),
         }
     }
@@ -140,9 +166,9 @@ impl Kv {
     // ---- HASH ----
 
     pub fn hset(&mut self, key: &str, field: &str, value: &str) -> Result<u64> {
-        let mut hash = match self.load_value(key)? {
+        let mut hash = match self.load_typed(key, "hash")? {
             Some(Value::Object(o)) => o,
-            Some(_) => return Err(KvError::Message("wrong type for HASH".into())),
+            Some(_) => return Err(KvError::Message("corrupt hash value".into())),
             None => Default::default(),
         };
         let added = !hash.contains_key(field);
@@ -152,20 +178,20 @@ impl Kv {
     }
 
     pub fn hget(&mut self, key: &str, field: &str) -> Result<Option<String>> {
-        match self.load_value(key)? {
+        match self.load_typed(key, "hash")? {
             Some(Value::Object(o)) => Ok(o.get(field).and_then(|v| v.as_str()).map(String::from)),
-            Some(_) => Err(KvError::Message("wrong type for HASH".into())),
+            Some(_) => Err(KvError::Message("corrupt hash value".into())),
             None => Ok(None),
         }
     }
 
     pub fn hgetall(&mut self, key: &str) -> Result<Vec<(String, String)>> {
-        match self.load_value(key)? {
+        match self.load_typed(key, "hash")? {
             Some(Value::Object(o)) => Ok(o
                 .iter()
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()),
-            Some(_) => Err(KvError::Message("wrong type for HASH".into())),
+            Some(_) => Err(KvError::Message("corrupt hash value".into())),
             None => Ok(vec![]),
         }
     }
@@ -199,9 +225,9 @@ impl Kv {
     }
 
     fn set_members(&mut self, key: &str) -> Result<Vec<Value>> {
-        match self.load_value(key)? {
+        match self.load_typed(key, "set")? {
             Some(Value::Array(a)) => Ok(a),
-            Some(_) => Err(KvError::Message("wrong type for SET".into())),
+            Some(_) => Err(KvError::Message("corrupt set value".into())),
             None => Ok(vec![]),
         }
     }
@@ -210,6 +236,11 @@ impl Kv {
     // Stored as {"member": score} object; scores are floats.
 
     pub fn zadd(&mut self, key: &str, score: f64, member: &str) -> Result<u64> {
+        if !score.is_finite() {
+            return Err(KvError::Message(
+                "ZADD score must be a finite number".into(),
+            ));
+        }
         let mut z = self.zmap(key)?;
         let added = !z.contains_key(member);
         z.insert(member.into(), Value::Float(score));
@@ -251,9 +282,9 @@ impl Kv {
     }
 
     fn zmap(&mut self, key: &str) -> Result<Object> {
-        match self.load_value(key)? {
+        match self.load_typed(key, "zset")? {
             Some(Value::Object(o)) => Ok(o),
-            Some(_) => Err(KvError::Message("wrong type for ZSET".into())),
+            Some(_) => Err(KvError::Message("corrupt zset value".into())),
             None => Ok(Default::default()),
         }
     }
@@ -414,5 +445,81 @@ mod tests {
         assert!(kv.del("plain").unwrap());
         assert!(kv.zadd("plain", 1.0, "m").is_ok());
         assert_eq!(kv.type_of("plain").unwrap().as_deref(), Some("zset"));
+    }
+
+    #[test]
+    fn wrongtype_between_collection_kinds() {
+        let mut kv = Kv::in_memory().unwrap();
+        // JSON-shaped STRING values must not be adopted by collection ops.
+        kv.set("js", "{\"a\":1}", SetOpts::default()).unwrap();
+        assert!(kv.hset("js", "a", "2").is_err());
+        kv.set("arr", "[1,2]", SetOpts::default()).unwrap();
+        assert!(kv.lpush("arr", &["x"]).is_err());
+        // list <-> set must not silently convert each other.
+        kv.rpush("L", &["a", "b"]).unwrap();
+        assert!(kv.sadd("L", &["m"]).is_err());
+        kv.sadd("S", &["m"]).unwrap();
+        assert!(kv.lpush("S", &["x"]).is_err());
+        // hash <-> zset are both objects; the type column decides.
+        kv.hset("H", "f", "v").unwrap();
+        assert!(kv.zadd("H", 1.0, "m").is_err());
+        kv.zadd("Z", 1.0, "m").unwrap();
+        assert!(kv.hset("Z", "f", "v").is_err());
+        // GET on a collection key is WRONGTYPE, not raw JSON.
+        assert!(kv.get("L").is_err());
+    }
+
+    #[test]
+    fn set_over_collection_resets_type() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.rpush("L", &["a"]).unwrap();
+        kv.set("L", "plain", SetOpts::default()).unwrap();
+        assert_eq!(kv.type_of("L").unwrap().as_deref(), Some("string"));
+        assert_eq!(kv.get("L").unwrap(), Some("plain".into()));
+    }
+
+    #[test]
+    fn emptied_list_disappears() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.rpush("L", &["only"]).unwrap();
+        assert!(kv.exists("L").unwrap());
+        assert_eq!(kv.rpop("L").unwrap(), Some("only".into()));
+        assert!(!kv.exists("L").unwrap(), "emptied list must vanish");
+        assert_eq!(kv.llen("L").unwrap(), 0);
+        // The key is free for any type again.
+        assert!(kv.hset("L", "f", "v").is_ok());
+    }
+
+    #[test]
+    fn zadd_rejects_non_finite_scores() {
+        let mut kv = Kv::in_memory().unwrap();
+        assert!(kv.zadd("Z", f64::NAN, "m").is_err());
+        assert!(kv.zadd("Z", f64::INFINITY, "m").is_err());
+        assert!(kv.zadd("Z", 1.5, "m").is_ok());
+        assert_eq!(kv.zscore("Z", "m").unwrap(), Some(1.5));
+    }
+
+    #[test]
+    fn incr_and_ttl_overflow_rejected() {
+        let mut kv = Kv::in_memory().unwrap();
+        kv.set("k", "9223372036854775807", SetOpts::default())
+            .unwrap();
+        assert!(kv.incr_by("k", 1).is_err());
+        assert!(kv
+            .set(
+                "t",
+                "v",
+                SetOpts {
+                    ttl_ms: Some(i64::MAX),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        kv.set("t", "v", SetOpts::default()).unwrap();
+        assert!(kv.expire("t", i64::MAX).is_err());
+        // The failed statements left no partial state.
+        assert_eq!(kv.get("k").unwrap(), Some("9223372036854775807".into()));
+        assert!(kv.exists("t").unwrap());
+        assert_eq!(kv.ttl_ms("t").unwrap(), None);
     }
 }

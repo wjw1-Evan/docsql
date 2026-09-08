@@ -15,14 +15,32 @@ fi
 echo "== reset deployment (fresh volumes, both profiles) =="
 docker compose $PROFILES down -v --remove-orphans >/dev/null 2>&1 || true
 DOCSQL_IMAGE_TAG="$TAG" docker compose $PROFILES up -d >/dev/null
-echo "== wait for nodes =="
-for port in 17600 17601 17602 17603; do
+echo "== wait for nodes and web consoles =="
+for port in 17600 17601 17602 17603 17700 17710; do
+  ok=""
   for _ in $(seq 1 60); do
-    nc -z 127.0.0.1 "$port" 2>/dev/null && break
+    if nc -z 127.0.0.1 "$port" 2>/dev/null; then ok=1; break; fi
     sleep 0.5
   done
+  if [ -z "$ok" ]; then
+    echo "ERROR: port $port never came up" >&2
+    docker ps -a --filter name=docsql
+    exit 1
+  fi
 done
-sleep 2
+# Web console readiness: the port being open does not mean HTTP is served yet.
+for port in 17700 17710; do
+  ok=""
+  for _ in $(seq 1 30); do
+    if curl -fsS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then ok=1; break; fi
+    sleep 0.5
+  done
+  if [ -z "$ok" ]; then
+    echo "ERROR: web console on port $port never answered HTTP" >&2
+    docker ps -a --filter name=docsql
+    exit 1
+  fi
+done
 docker ps --filter name=docsql --format "{{.Names}}: {{.Status}}"
 cd ..
 echo

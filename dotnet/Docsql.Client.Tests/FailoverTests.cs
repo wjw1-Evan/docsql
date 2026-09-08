@@ -32,7 +32,7 @@ public sealed class NodeProcess : IDisposable
             FileName = exe,
             ArgumentList = { dbFile, $"127.0.0.1:{port}" },
             CreateNoWindow = true,
-            RedirectStandardError = true,
+            RedirectStandardError = false,
         };
         if (replicateTo is not null)
             psi.Environment["DOCSQL_REPLICATE_TO"] = replicateTo;

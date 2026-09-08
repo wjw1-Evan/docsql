@@ -60,12 +60,12 @@ CI(`.github/workflows/docker-image.yml`,push/PR 触发)执行同样三门禁 + d
 
 ## 红线与已知坑
 
-1. **索引键序依赖 `core/encode.rs` 的可比较有序编码**——新增值类型必须同步扩展编码,否则索引序被破坏。
+1. **索引排序不依赖编码字节序**——`core/encode.rs` 只保证往返一致;排序统一走 `Value::cmp_values`(B+树/ORDER BY/DISTINCT)。新增值类型必须同时扩展编码与 `cmp_values`,否则索引序被破坏。注意 Int(3) 与 Float(3.0) 比较相等但编码不同,DISTINCT/UNION 去重按编码字节判重,两者不会互相去重。
 2. **`docsql-web/src/console.html` 通过 `include_str!` 内嵌**——改 UI 后必须重新 `cargo build` 才生效。
-3. **deploy 有兼容性钉子**——`deploy/multinode-test.sh` 断言固定的 REST/协议接口;改协议或 REST 字段前先同步该脚本与 dotnet 客户端。
+3. **deploy 有兼容性钉子**——`deploy/multinode-test.sh` 断言固定的 REST/协议接口;改协议或 REST 字段前先同步该脚本与 dotnet 客户端。dotnet 客户端 KV 帧带前导 `\x00` 填充,服务端 `parse_kv_args` 必须容忍。
 4. **PK ≠ NOT NULL**:主键当前不隐含 NOT NULL,与主流数据库不同;动约束逻辑需全量回归约束测试。
-5. **部分不支持的 SQL 会被静默忽略而非报错**(如 `WITH`/CTAS/`ON CONFLICT`)。清理时应在解析器层显式报错,不要继续静默吞掉。
-6. **SQL 与 KV 共用同一会话事务系统**(`BEGIN/COMMIT` ≡ `MULTI/EXEC`);`_kv` 的 JSON 形状有测试钉住,改存储格式需同步测试。
+5. **不支持的 SQL 必须显式报错**——窗口函数(OVER)/DISTINCT ON/ON CONFLICT DO UPDATE/ON DUPLICATE KEY UPDATE/自定义 TRIM 字符集/FK 的 ON DELETE|UPDATE 动作均已显式报错;`PRAGMA` 是有意兼容垫片(接受并忽略)。新增不支持语法时在解析/执行层报错,不要静默吞掉。WITH(非递归)/CTAS/ON CONFLICT DO NOTHING|REPLACE 已支持。
+6. **SQL 与 KV 共用同一会话事务系统**(`BEGIN/COMMIT` ≡ `MULTI/EXEC`);`_kv` 的 JSON 形状有测试钉住,改存储格式需同步测试。事务内的页像延迟到 WAL fsync 后才落数据文件(pager `pending_writes`),动 pager 提交路径时保持该顺序。引擎是**单全局事务**:并发连接的 BEGIN/MULTI 在服务端排队等待(`BEGIN_QUEUE_WAIT` 30s 上限)而非立即报错,dotnet 端事务错误如实上抛——并发 EF SaveChanges 依赖该排队,别改成直接报错或吞错。
 7. **dotnet 的 bin/obj 不入库**(已在 .gitignore);新建 dotnet 项目注意沿用。
 8. 重部署 Docker 集群先带 profile 参数 `docker compose --profile single --profile cluster down -v` 清卷,避免旧状态干扰测试(所有服务都在 profile 内,不带参数的 down 不会清理)。
 
@@ -81,6 +81,7 @@ CI(`.github/workflows/docker-image.yml`,push/PR 触发)执行同样三门禁 + d
 
 ## 运行时环境变量
 
-- `DOCSQL_TOKEN`:web/server 认证 token。
-- `DOCSQL_PEERS`:对称集群节点表。注意:当前为对称集群、无反熵追赶,新加入副本不会自动补历史数据。
+- `DOCSQL_TOKEN`:server(SQL/KV 协议端口)与 web 控制台共用的认证 token;集群节点复制扇出会自动先 AUTH。
+- `DOCSQL_PEERS`:对称集群节点表。注意:当前为对称集群、无反熵追赶,新加入副本不会自动补历史数据;指向自身的条目会在启动时被忽略(防双写)。
 - `DOCSQL_IMAGE_TAG`:compose 使用的镜像标签(默认 `latest`;本地测试用 `local`/`ci`)。
+- compose 发布端口默认绑定 `127.0.0.1`(无认证部署不暴露到网络);对外服务需改端口映射并设置 `DOCSQL_TOKEN`。

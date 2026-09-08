@@ -5,7 +5,7 @@
 //! lives in the embedded layer; the server forwards to network subscribers.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,25 +20,50 @@ pub enum Event {
     },
 }
 
-/// Glob-style pattern: `*` matches any run, `?` one char.
+/// Glob-style pattern: `*` matches any run, `?` one char. Iterative
+/// two-pointer match — linear-ish, no exponential backtracking (patterns
+/// and channel names are user-supplied).
 pub fn pattern_matches(pattern: &str, s: &str) -> bool {
-    fn go(p: &[u8], s: &[u8]) -> bool {
-        match (p.first(), s.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => go(&p[1..], s) || (!s.is_empty() && go(p, &s[1..])),
-            (Some(b'?'), Some(_)) => go(&p[1..], &s[1..]),
-            (Some(a), Some(b)) if a == b => go(&p[1..], &s[1..]),
-            _ => false,
+    let p = pattern.as_bytes();
+    let s = s.as_bytes();
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = pi;
+            mark = si;
+            pi += 1;
+            continue;
         }
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+            continue;
+        }
+        if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            si = mark;
+            continue;
+        }
+        return false;
     }
-    go(pattern.as_bytes(), s.as_bytes())
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
+
+/// Per-subscriber queue bound: a slow consumer must not grow the server's
+/// memory without limit; overflow drops that subscriber's message (the bus
+/// is best-effort by design).
+const SUBSCRIBER_QUEUE: usize = 1024;
 
 #[derive(Default)]
 pub struct PubSub {
     /// channel -> subscriber senders
-    channels: Mutex<HashMap<String, Vec<Sender<Event>>>>,
-    patterns: Mutex<HashMap<String, Vec<Sender<Event>>>>,
+    channels: Mutex<HashMap<String, Vec<SyncSender<Event>>>>,
+    patterns: Mutex<HashMap<String, Vec<SyncSender<Event>>>>,
 }
 
 impl PubSub {
@@ -48,7 +73,7 @@ impl PubSub {
 
     /// Subscribe to an exact channel; returns the receiving end.
     pub fn subscribe(&self, channel: &str) -> Receiver<Event> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(SUBSCRIBER_QUEUE);
         self.channels
             .lock()
             .unwrap()
@@ -59,7 +84,7 @@ impl PubSub {
     }
 
     pub fn psubscribe(&self, pattern: &str) -> Receiver<Event> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(SUBSCRIBER_QUEUE);
         self.patterns
             .lock()
             .unwrap()
@@ -70,7 +95,7 @@ impl PubSub {
     }
 
     /// Drop a channel/pattern entry entirely (all its subscribers).
-    fn drop_key<T>(map: &mut HashMap<String, Vec<Sender<T>>>, key: &str) {
+    fn drop_key<T>(map: &mut HashMap<String, Vec<SyncSender<T>>>, key: &str) {
         // Senders whose receiver is dropped are detected lazily at publish
         // time (send fails); here we only prune now-empty entries.
         if let Some(v) = map.get(key) {
@@ -94,19 +119,32 @@ impl PubSub {
 
     /// Publish to all exact and pattern subscribers. Returns the number of
     /// clients the message was delivered to. Dead subscribers (dropped
-    /// receivers) are pruned when a send fails.
+    /// receivers) are pruned when a send fails; full-but-alive subscribers
+    /// keep their subscription but this message is dropped for them.
     pub fn publish(&self, channel: &str, payload: &str) -> u64 {
+        let send = |s: &SyncSender<Event>, ev: Event| -> bool {
+            use std::sync::mpsc::TrySendError;
+            match s.try_send(ev) {
+                Ok(()) => true,
+                // Queue full but the subscriber is alive: keep it, drop this
+                // message (best-effort bus, bounded memory).
+                Err(TrySendError::Full(_)) => true,
+                // Receiver dropped: prune the subscriber.
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        };
         let mut delivered = 0u64;
         {
             let mut chans = self.channels.lock().unwrap();
             if let Some(subs) = chans.get_mut(channel) {
                 subs.retain(|s| {
-                    let ok = s
-                        .send(Event::Message {
+                    let ok = send(
+                        s,
+                        Event::Message {
                             channel: channel.into(),
                             payload: payload.into(),
-                        })
-                        .is_ok();
+                        },
+                    );
                     delivered += ok as u64;
                     ok
                 });
@@ -123,13 +161,14 @@ impl PubSub {
             for pat in hits {
                 if let Some(subs) = pats.get_mut(&pat) {
                     subs.retain(|s| {
-                        let ok = s
-                            .send(Event::PMessage {
+                        let ok = send(
+                            s,
+                            Event::PMessage {
                                 pattern: pat.clone(),
                                 channel: channel.into(),
                                 payload: payload.into(),
-                            })
-                            .is_ok();
+                            },
+                        );
                         delivered += ok as u64;
                         ok
                     });

@@ -113,6 +113,16 @@ internal static partial class SchemaSync
             wanted.Add(iname);
             try
             {
+                // Unique drift: an existing index with the same name but
+                // without UNIQUE would be silently kept by IF NOT EXISTS,
+                // so the constraint never gets enforced. Drop and recreate.
+                if (index.IsUnique && ExistingIndexSql(conn, table, iname) is { } ddl
+                    && !ddl.Contains("UNIQUE", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var drop = conn.CreateCommand();
+                    drop.CommandText = $"DROP INDEX IF EXISTS {Quote(iname)}";
+                    drop.ExecuteNonQuery();
+                }
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText =
                     $"CREATE {(index.IsUnique ? "UNIQUE " : "")}INDEX IF NOT EXISTS " +
@@ -150,6 +160,17 @@ internal static partial class SchemaSync
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             yield return reader.GetString(0);
+    }
+
+    /// <summary>命名索引的 DDL(sqlite_master.sql),不存在返回 null。</summary>
+    private static string? ExistingIndexSql(DbConnection conn, string table, string indexName)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '" +
+            indexName.Replace("'", "''") + "' AND tbl_name = '" + table.Replace("'", "''") + "'";
+        var result = cmd.ExecuteScalar();
+        return result is string s && s.Length > 0 ? s : null;
     }
 
     private static string Quote(string id) => $"\"{id}\"";

@@ -16,12 +16,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Rapid pushes/PR updates: cancel the superseded run instead of racing full
+# pipelines (and concurrent publishes to the same tags).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test:
@@ -56,6 +61,10 @@ jobs:
     name: build & publish image
     needs: [test, dotnet]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Publish rights only where publishing happens — not on PR jobs.
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - name: Resolve platforms

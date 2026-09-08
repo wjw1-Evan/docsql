@@ -21,15 +21,17 @@ public sealed class QueryLogTests
         var psi = new ProcessStartInfo
         {
             FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
-            CreateNoWindow = true, RedirectStandardError = true,
+            CreateNoWindow = true, RedirectStandardError = false,
         };
         psi.Environment["DOCSQL_LOG_FILE"] = logFile;
         var proc = Process.Start(psi)!;
+        var up = false;
         for (var i = 0; i < 100; i++)
         {
-            try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", port); break; }
+            try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", port); up = true; break; }
             catch { Thread.Sleep(50); }
         }
+        if (!up) throw new InvalidOperationException($"server on port {port} never came up");
         return (proc, port, logFile);
     }
 

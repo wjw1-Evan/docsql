@@ -62,7 +62,7 @@ public sealed class EfServerFixture : IDisposable
         _proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
             FileName = exe, ArgumentList = { tmp, $"127.0.0.1:{Port}" },
-            CreateNoWindow = true, RedirectStandardError = true,
+            CreateNoWindow = true, RedirectStandardError = false,
         })!;
         for (int i = 0; i < 100; i++)
         {
@@ -698,7 +698,7 @@ public sealed class EfFailoverTests
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
-            CreateNoWindow = true, RedirectStandardError = true,
+            CreateNoWindow = true, RedirectStandardError = false,
         };
         if (replicateTo is not null) psi.Environment["DOCSQL_REPLICATE_TO"] = replicateTo;
         if (readOnly) psi.Environment["DOCSQL_READ_ONLY"] = "1";
@@ -795,7 +795,7 @@ public sealed class EfSymmetricClusterTests
             var psi = new ProcessStartInfo
             {
                 FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
-                CreateNoWindow = true, RedirectStandardError = true,
+                CreateNoWindow = true, RedirectStandardError = false,
             };
             psi.Environment["DOCSQL_PEERS"] = peers;
             var proc = Process.Start(psi)!;
@@ -882,7 +882,7 @@ public sealed class EfTransactionTests
         var proc = Process.Start(new ProcessStartInfo
         {
             FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
-            CreateNoWindow = true, RedirectStandardError = true,
+            CreateNoWindow = true, RedirectStandardError = false,
         })!;
         for (var i = 0; i < 100; i++)
         {
