@@ -231,6 +231,9 @@
   .dialog .foot { padding: 10px 14px; border-top: 1px solid var(--border2); display: flex;
                   justify-content: flex-end; gap: 8px; background: var(--chrome2); }
   .dialog .err-line { color: var(--err); min-height: 16px; }
+  /* 控制台账号:首次设置/登录遮罩(必须完成才能使用,不可点击关闭) */
+  #auth-ov { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 900;
+             display: none; align-items: center; justify-content: center; }
   /* 新建表:列编辑网格 */
   .dialog .hint { color: var(--txt3); line-height: 1.6; }
   table.colgrid { border-collapse: collapse; width: 100%; }
@@ -266,6 +269,7 @@
     <div data-act="new-table">新建表…</div>
     <hr>
     <div data-act="close-tab">关闭当前文档</div>
+    <div data-act="logout" style="display:none">退出登录</div>
   </div></div>
   <div class="menu" data-menu><span>视图</span><div class="menu-drop">
     <div data-act="refresh">刷新对象资源管理器<span class="kbd">Ctrl+R</span></div>
@@ -293,6 +297,21 @@
   <button id="btn-refresh" title="刷新对象资源管理器 (Ctrl+R)"><span class="tb-ico" data-ico="refresh"></span>刷新</button>
   <div class="spacer"></div>
   <span id="tb-server" class="meta" style="color:#888"></span>
+</div>
+
+<!-- 控制台账号:首次使用设置 / 登录(DOCSQL_WEB_AUTH_FILE 启用时) -->
+<div id="auth-ov" style="display:none">
+  <div class="dialog" style="min-width:380px">
+    <h3 id="auth-title">登录 DocSQL Studio</h3>
+    <div class="body">
+      <div class="row"><label>用户名</label><input type="text" id="auth-user" autocomplete="username"></div>
+      <div class="row"><label>密码</label><input type="password" id="auth-pass" autocomplete="current-password"></div>
+      <div class="row" id="auth-confirm-row" style="display:none"><label>确认密码</label><input type="password" id="auth-confirm" autocomplete="new-password"></div>
+      <div class="hint" id="auth-hint"></div>
+      <div class="err-line" id="auth-err"></div>
+    </div>
+    <div class="foot"><button id="auth-ok" class="primary">登录</button></div>
+  </div>
 </div>
 
 <div id="main">
@@ -377,9 +396,68 @@ const api = {
   },
   async _do(p) {
     const r = await p;
-    if (r.status === 401) { ui.connState('unauth'); throw new Error('未授权:请在工具栏填写正确的令牌'); }
+    if (r.status === 401) {
+      ui.connState('unauth');
+      // 账号门激活时会话过期/未登录:弹回登录遮罩而不是仅提示令牌。
+      if (authGate.active) authGate.show('login');
+      throw new Error('未授权:请在工具栏填写正确的令牌');
+    }
     ui.connState('ok');
     return r.json();
+  }
+};
+
+/* ================= 控制台账号(首次使用设置 + 登录) ================= */
+// 服务端启用 DOCSQL_WEB_AUTH_FILE 时:第一次使用强制创建账号,之后每次
+// 进入需登录(会话 Cookie,HttpOnly)。账号与密码哈希(PBKDF2)保存在控制台
+// 凭据文件中;off 模式维持原有令牌行为。
+const authGate = {
+  active: false,
+  mode: 'off',
+  lastUser: '',
+  async boot() {
+    let st = {mode: 'off'};
+    try { st = await fetch('/api/auth/status').then(r => r.json()); } catch { return true; }
+    this.active = st.mode && st.mode !== 'off';
+    if (!this.active) return true;
+    $('#token').style.display = 'none';
+    $('#btn-connect').style.display = 'none';
+    $('[data-act="logout"]').style.display = '';
+    this.show(st.mode, st.username);
+    return false;
+  },
+  show(mode, username) {
+    this.mode = mode;
+    if (username) this.lastUser = username;
+    $('#auth-ov').style.display = 'flex';
+    $('#auth-confirm-row').style.display = mode === 'setup' ? '' : 'none';
+    $('#auth-title').textContent = mode === 'setup' ? '初始设置 — 创建控制台账号' : '登录 DocSQL Studio';
+    $('#auth-hint').textContent = mode === 'setup'
+      ? '首次使用:设置控制台的用户名与密码(至少 8 位)。账号保存在控制台凭据文件中,数据本身仍全部位于数据库节点。'
+      : ('请以 ' + (this.lastUser || '控制台账号') + ' 登录');
+    $('#auth-user').value = mode === 'login' ? (this.lastUser || '') : '';
+    $('#auth-pass').value = '';
+    $('#auth-confirm').value = '';
+    $('#auth-err').textContent = '';
+    $('#auth-ok').textContent = mode === 'setup' ? '创建账号并进入' : '登录';
+    setTimeout(() => { $(mode === 'login' && this.lastUser ? '#auth-pass' : '#auth-user').focus(); }, 60);
+  },
+  async submit() {
+    const u = $('#auth-user').value.trim(), p = $('#auth-pass').value;
+    const err = (m) => { $('#auth-err').textContent = m; };
+    if (!u || !p) return err('请输入用户名与密码');
+    if (this.mode === 'setup' && p !== $('#auth-confirm').value) return err('两次输入的密码不一致');
+    const path = this.mode === 'setup' ? '/api/auth/setup' : '/api/auth/login';
+    try {
+      const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                   body: JSON.stringify({username: u, password: p})});
+      const out = await r.json();
+      if (!r.ok) return err(out.error || ('失败(' + r.status + ')'));
+      this.lastUser = out.username || u;
+      $('#auth-ov').style.display = 'none';
+      this.active = true;
+      startApp();
+    } catch (e) { err('请求失败:' + e.message); }
   }
 };
 
@@ -1732,6 +1810,7 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'dashboard') openDashboard();
     else if (act === 'cluster') openClusterTab();
     else if (act === 'logs') openLogsTab();
+    else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST'}).finally(() => location.reload());
     else if (act === 'about') dialog('关于 DocSQL Studio', [
       {name:'a', label: '产品', value: 'DocSQL Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},
     ], '确定', async () => {});
@@ -1739,11 +1818,16 @@ $$('.menu-drop [data-act]').forEach(item => {
 });
 
 /* ================= 启动 ================= */
+// 控制台账号门激活时,先完成 设置/登录(startApp 由 authGate 回调),
+// 否则直接进入。
+function startApp() { openDashboard(); explorer.refresh(); nodes.boot(); }
 $('#token').value = api.token;
 explorer.bind();
-openDashboard();
-explorer.refresh();
-nodes.boot();
+(async () => { if (await authGate.boot()) startApp(); })();
+$('#auth-ok').onclick = () => authGate.submit();
+$$('#auth-ov input').forEach(inp => inp.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') authGate.submit();
+}));
 </script>
 </body>
 </html>

@@ -7,7 +7,9 @@
 #
 # Configure via deploy/.env (see .env.example):
 #   DOCSQL_IMAGE_TAG  image tag (default: latest; pin a released version for
-#                     reproducible deploys, e.g. v1.0.0)
+#                     reproducible deploys, e.g. v1.0.0). Prod compose ONLY —
+#                     the dev compose reads DOCSQL_DEV_IMAGE_TAG instead, so
+#                     a value here never leaks into the dev stack.
 #   DOCSQL_TOKEN      auth token for the server protocol port AND the web
 #                     console/REST API (empty = no auth — loopback only!)
 #   DOCSQL_CLUSTER_TOKEN  inter-node credential for cluster profile: nodes
@@ -22,12 +24,16 @@
 #
 # All published ports default to loopback (127.0.0.1) so an unauthenticated
 # deploy is never exposed to the network. To serve externally, replace e.g.
-# "127.0.0.1:17601:7600" with "17601:7600" AND set DOCSQL_TOKEN.
+# "127.0.0.1:18601:7600" with "18601:7600" AND set DOCSQL_TOKEN.
 #
-# Dev vs prod share host ports (17600-17603, 17700, 17710): run only one of
-# them at a time (`docker compose ... down` before switching). They also
-# share the EXTERNAL data volumes below, so switching keeps your data;
-# `down -v` does NOT delete it — wipe via ./reset-data.sh.
+# Fully separated from the dev compose (docker-compose.yml, project
+# docsql-dev): prod runs under project docsql-prod on ports
+# 18600-18604/18700/18710 (+1000 vs dev) with its own data volumes, so both
+# stacks can run side by side. Prod keeps the historic docsql-data-* volumes
+# (the real accumulated data); the join profile's node-d uses
+# docsql-prod-data-d so a joining node always starts empty and bootstraps
+# cleanly. `down -v` does NOT delete any of them — wipe via ./reset-data.sh.
+name: docsql-prod
 services:
   # ---- profile: cluster ------------------------------------------------
   # Symmetric cluster: every node is equal — accepts writes and fans each
@@ -45,7 +51,7 @@ services:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
-      - "127.0.0.1:17601:7600"
+      - "127.0.0.1:18601:7600"
     volumes:
       - peer-a-data:/data
     networks: [docsql]
@@ -69,7 +75,7 @@ services:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
-      - "127.0.0.1:17602:7600"
+      - "127.0.0.1:18602:7600"
     volumes:
       - peer-b-data:/data
     networks: [docsql]
@@ -96,7 +102,7 @@ services:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
-      - "127.0.0.1:17603:7600"
+      - "127.0.0.1:18603:7600"
     volumes:
       - peer-c-data:/data
     networks: [docsql]
@@ -134,7 +140,7 @@ services:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
-      - "127.0.0.1:17604:7600"
+      - "127.0.0.1:18604:7600"
     volumes:
       - peer-d-data:/data
     networks: [docsql]
@@ -167,8 +173,13 @@ services:
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      # Console account (first-use username/password). Empty env disables
+      # the gate (run-tests.sh sets it so its raw curls stay unauthenticated).
+      DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+    volumes:
+      - web-auth:/auth
     ports:
-      - "127.0.0.1:17700:7700"
+      - "127.0.0.1:18700:7700"
     networks: [docsql]
     depends_on:
       node-a:
@@ -189,7 +200,7 @@ services:
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
     ports:
-      - "127.0.0.1:17600:7600"
+      - "127.0.0.1:18600:7600"
     volumes:
       - single-data:/data
     networks: [docsql]
@@ -215,8 +226,11 @@ services:
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_PEERS: "node-single:7600"
+      DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+    volumes:
+      - web-auth-single:/auth
     ports:
-      - "127.0.0.1:17710:7700"
+      - "127.0.0.1:18710:7700"
     networks: [docsql]
     depends_on:
       node-single:
@@ -226,10 +240,13 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
-# External data volumes (fixed docsql-data-* names, shared with the dev
-# compose): they survive `down -v`, image upgrades and container
-# recreation — releases never lose data. Create once with
-# `docker volume create`, wipe only via ./reset-data.sh.
+# External data volumes: they survive `down -v`, image upgrades and
+# container recreation — releases never lose data. The cluster/single nodes
+# keep the historic docsql-data-* volumes (the real accumulated data);
+# the join profile's node-d gets its own docsql-prod-data-d so a joining
+# node is always empty and bootstraps cleanly (dev's docsql-dev-data-* is
+# never touched). Create once with `docker volume create`, wipe only via
+# ./reset-data.sh.
 volumes:
   peer-a-data:
     external: true
@@ -240,9 +257,16 @@ volumes:
   peer-c-data:
     external: true
     name: docsql-data-c
+  peer-d-data:
+    external: true
+    name: docsql-prod-data-d
   single-data:
     external: true
     name: docsql-data-single
+  # Console account files (username/password hash): compose-managed named
+  # volumes — first-use setup survives redeploys and `down`.
+  web-auth:
+  web-auth-single:
 
 networks:
   docsql:

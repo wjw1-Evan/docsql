@@ -26,19 +26,20 @@ cargo test --workspace              # Rust 全量(约 290 用例)
 cd dotnet && dotnet test
 
 # 运行(仅 Docker;镜像来自 GHCR,由 CI 自动发布)
-# 单节点部署(compose single profile:独立节点 :17600 + web :17710)
+# 单节点部署(生产:compose single profile:独立节点 :18600 + web :18710)
 cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d
 docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600    # SQL shell
 
 # 多节点部署(compose cluster profile:3 节点对等集群 + web)
-cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产(GHCR 镜像 + .env)
-cd deploy && docker compose --profile cluster up -d --build   # 本地开发集群(源码构建镜像 :local)
-# 本地开发与生产同端口互斥;停止带相同 profile 参数:--profile single --profile cluster down
-# 数据卷是 external 卷(docsql-data-*):down/-v 都不清数据(发布不丢数据);
+cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产(GHCR 镜像 + .env,端口 :18601-18603 + web :18700)
+cd deploy && docker compose --profile cluster up -d --build   # 本地开发集群(源码构建镜像 :local,端口 :17601-17603 + web :17700)
+# 本地开发与生产完全分离(项目名 docsql-dev/docsql-prod、端口 dev 1760x+1770x / prod 1860x+1870x、卷 docsql-dev-data-* / docsql-data-*),两套可同时运行;
+# 停止带相同 profile 参数:--profile single --profile cluster down
+# 数据卷是 external 卷(dev docsql-dev-data-*,prod docsql-data-* + join 用 docsql-prod-data-d):down/-v 都不清数据(发布不丢数据);
 # 彻底清数据唯一入口 ./deploy/reset-data.sh;首次部署先 docker volume create(见 README)
 
 # 部署测试(改复制/部署逻辑后必跑;用本地开发 compose 文件):
-# 默认构建 :local 镜像(内置 cargo test 门禁);传 DOCSQL_IMAGE_TAG 复用已有镜像
+# 默认构建 :local 镜像(内置 cargo test 门禁);传 DOCSQL_DEV_IMAGE_TAG 复用已有镜像
 ./deploy/run-tests.sh            # 同时拉起 single + cluster 两个 profile:多节点 69 项 + 单节点 24 项
 ```
 
@@ -114,7 +115,8 @@ target/                 # 构建产物(git 忽略)
 
 | 文件 | 职责 |
 |---|---|
-| `lib.rs` / `main.rs` | REST API(`/api/sql` `/api/parse` `/api/meta` `/api/stats` `/api/cluster` `/api/logs`)、`DOCSQL_TOKEN` 认证。**纯管理工具、自身零存储**(不打开任何数据文件):启动参数/`DOCSQL_UPSTREAM`/首个 peer 指定**默认管理节点**,数据端点不带 `node` 时即连接它执行;`DOCSQL_PEERS` 节点探测(PING + REQ_STATUS,集群状态页数据源)兼作节点切换的允许列表,数据端点可带 `node` 参数切换管理目标(白名单仅放行 `DOCSQL_PEERS`,SSRF 防护;连接经 wire 协议 REQ_AUTH——用服务端自身 token,非浏览器提交值;批量 SQL 由 `stmt::split_statements` 逐句发 REQ_SQL,单连接保序;meta/stats 走 REQ_META/REQ_STATUS),未配置管理节点时数据端点 in-band 报配置缺失;**`/api/parse` 恒为本地静态检查**(纯解析,无存储);**`/api/logs`** 返回控制台自身提交语句的审计环(`record_console_sql`,peer=实际执行该语句的节点)+ 并发拉取各节点 REQ_LOGS(读缓冲上限 LOGS_RECV_CAP 4MB,limit 1..=1000 夹紧),不感知 `node`(日志页按来源聚合是它的本意) |
+| `lib.rs` / `main.rs` | REST API(`/api/sql` `/api/parse` `/api/meta` `/api/stats` `/api/cluster` `/api/logs` `/api/auth/*`)、`DOCSQL_TOKEN` 认证。**纯管理工具、自身零存储**(不打开任何数据文件):启动参数/`DOCSQL_UPSTREAM`/首个 peer 指定**默认管理节点**,数据端点不带 `node` 时即连接它执行;`DOCSQL_PEERS` 节点探测(PING + REQ_STATUS,集群状态页数据源)兼作节点切换的允许列表,数据端点可带 `node` 参数切换管理目标(白名单仅放行 `DOCSQL_PEERS`,SSRF 防护;连接经 wire 协议 REQ_AUTH——用服务端自身 token,非浏览器提交值;批量 SQL 由 `stmt::split_statements` 逐句发 REQ_SQL,单连接保序;meta/stats 走 REQ_META/REQ_STATUS),未配置管理节点时数据端点 in-band 报配置缺失;**`/api/parse` 恒为本地静态检查**(纯解析,无存储);**`/api/logs`** 返回控制台自身提交语句的审计环(`record_console_sql`,peer=实际执行该语句的节点)+ 并发拉取各节点 REQ_LOGS(读缓冲上限 LOGS_RECV_CAP 4MB,limit 1..=1000 夹紧),不感知 `node`(日志页按来源聚合是它的本意);**`/api/auth/*`** 控制台账号门(见 `auth.rs`),setup 一次性 / login / logout / status,数据端点凭 HttpOnly 会话 Cookie 或 `DOCSQL_TOKEN` 旁路通过,Setup 态且未配 token 时保持匿名可达(兼容窗口,setup 完成即关) |
+| `auth.rs` | 控制台账号:自带 SHA-256/HMAC/PBKDF2(RFC 180-4/2104/8018,有已知答案测试,勿引加密 crate 除非删除本实现)、凭据文件存储(盐化 PBKDF2-HMAC-SHA256,0600,损坏文件拒绝启动而非重置)、内存会话(滑动 12h)与登录锁定(10 次/60s → 锁 60s,按来源 IP)。`DOCSQL_WEB_AUTH_FILE` 未设或为空 = 整个门禁关闭(legacy;run-tests.sh 依赖此点),已设 = 首次使用强制 setup |
 | `console.html` | DocSQL Studio 单页 UI(通过 `include_str!` 内嵌进二进制,改完必须重新 `cargo build`);含集群状态页(5s 轮询 `/api/cluster`)、日志页(`openLogsTab`:数据/同步/仅错误类别 + 来源 + 关键词过滤,5s 激活时轮询,同步事件中文标签 SYNC_EVENTS)与工具栏节点切换器(`nodesel`:首项为「默认节点」即后端配置的管理目标,api 层统一携带 `node`,选择持久化 localStorage,节点从 peers 消失自动回落默认节点,节点不可达时资源管理器显示 in-band error) |
 
 **dotnet/**:
@@ -172,7 +174,7 @@ target/                 # 构建产物(git 忽略)
 5. **不支持的 SQL 必须显式报错**——窗口函数(OVER)/DISTINCT ON/ON CONFLICT DO UPDATE/ON DUPLICATE KEY UPDATE/自定义 TRIM 字符集/FK 的 ON DELETE|UPDATE 动作/相关子查询(限定引用外层表报 "correlated subqueries are not supported")/无 GROUP BY 的 HAVING 均已显式报错;`PRAGMA` 是有意兼容垫片(接受并忽略)。新增不支持语法时在解析/执行层报错,不要静默吞掉。WITH(非递归)/CTAS/ON CONFLICT DO NOTHING|REPLACE/`SELECT *, expr` 已支持。
 6. **会话事务是单全局事务**(单写者引擎):并发连接的 BEGIN 在服务端排队等待(`BEGIN_QUEUE_WAIT` 30s 上限)而非立即报错,dotnet 端事务错误如实上抛——并发 EF SaveChanges 依赖该排队,别改成直接报错或吞错。事务归 BEGIN 它的连接所有:非 owner 的写/复制写同样排队(见"会话事务与复制缓冲"),别改回"直接并入全局事务"的老行为。
 7. **dotnet 的 bin/obj 不入库**(已在 .gitignore);新建 dotnet 项目注意沿用。
-8. **数据卷是 external 卷(`docsql-data-*`,dev/prod 共享)`——`down -v` 不再清数据**:发布/重部署只重建容器,数据保留(用户明确要求发布不丢数据);测试的干净态由 `run-tests.sh` 显式 rm+`docker volume create` 保证;手动清数据唯一入口 `./deploy/reset-data.sh`。所有服务都在 profile 内,不带 profile 参数的 down 不会停任何容器。
+8. **数据卷是 external 卷且 dev/prod 已分离(2026-09-09:dev `docsql-dev-data-*`,prod 沿用 `docsql-data-*` + join 节点 `docsql-prod-data-d`;项目名 `docsql-dev`/`docsql-prod`,端口 dev 1760x+1770x / prod 1860x+1870x,两套可同时运行)**——`down -v` 不再清数据:发布/重部署只重建容器,数据保留(用户明确要求发布不丢数据);测试的干净态由 `run-tests.sh` 显式 rm+`docker volume create`(只动 dev 卷)保证;手动清数据唯一入口 `./deploy/reset-data.sh`。所有服务都在 profile 内,不带 profile 参数的 pull/up/down 是空集静默空操作(exit 0),必须带 profile 参数。
 9. **pub/sub 先落盘后推送**:PUBLISH 必须在引擎写路径提交(WAL)之后才能 notify 订阅者/扇出 peers,游标(id)续传依赖"已返回的 id 必可回放";改 handle_publish/store_insert 顺序时保持该约束。另外 catalog 持久化曾丢失 AUTOINCREMENT 标志(重启后插入 id 变 NULL,已修并有回归测试 `autoinc_column_survives_reopen`)——动 `save_catalog_into` 时注意 TableMeta 的每个字段都要写全。
 10. **分区测试重连必须带 `--alias`**——`docker network disconnect` 后裸 `docker network connect` 重连,`node-c` 别名不再注册进嵌入 DNS(a→node-c 与容器自名解析双双失效,healthcheck 持续红,`docker restart` 也不恢复),集群扇出到该节点从此静默失败;必须 `docker network connect --alias node-c <net> docsql-c` 显式重注册。multinode-test.sh 第 10 章已按此实现,改动分区逻辑时保持;测试中该节点侧查询一律走 127.0.0.1 回环。
 11. **随机生成值必须由写入节点定值下发**——auto-GUID 插入若把原文(缺 id 的 INSERT)直接扇出,对端会各自生成不同 GUID,数据静默分叉且无报错;engine 侧 `resolved_insert` 回写与 server 侧 `take_resolved_insert` 接线(execute_sql 的 db 锁内捕获、转发/tx_pending 用回写文本)缺一不可,动 execute_sql/事务缓冲/扇出路径时保持。今后新增任何非确定性默认值(随机、时间戳精度截断等)同理:要么显式定值回写,要么确定性可重算。
@@ -200,5 +202,6 @@ target/                 # 构建产物(git 忽略)
 - `DOCSQL_UPSTREAM`:docsql-web 的默认管理节点(`host:port`)。优先级:启动参数 > `DOCSQL_UPSTREAM` > `DOCSQL_PEERS` 首条。控制台自身零存储,所有数据操作连接该节点执行;compose 两个 profile 已分别配置(node-web → node-a,node-web-single → node-single)。未配置时控制台仍可起服务(状态页/日志页可用),数据端点 in-band 报「未配置管理目标节点」。
 - `DOCSQL_ADVERTISE`:加入集群时通告给其它节点的自身地址(`host:port`,须从 peer 侧可达)。未设置时 join 仍同步数据但不注册(仅静态 peers 配置的部署需要)。注意动态注册不落盘:原节点重启后丢失,长期成员请同步更新各节点的 `DOCSQL_PEERS`。
 - `DOCSQL_ASYNC_COMMIT=1`:组提交模式——语句提交跳过 WAL fsync,后台 flusher 每 ~2ms 批量刷盘(数据文件回写与 checkpoint 也由 flusher 驱动);断电丢最后 ~2ms 已确认写。PUBLISH 不受影响(推送前强制 fsync,先落盘后推送契约不变)。默认关闭(每写 fsync,全持久)。
-- `DOCSQL_IMAGE_TAG`:compose 使用的镜像标签(默认 `latest`;本地测试用 `local`/`ci`)。
+- `DOCSQL_DEV_IMAGE_TAG`:本地开发 compose(`docker-compose.yml`)的镜像标签(默认 `local`;部署测试用 `ci` 复用 CI 缓存镜像)。与生产的 `DOCSQL_IMAGE_TAG` 刻意分开——`.env` 里配 `DOCSQL_IMAGE_TAG` 只影响 `docker-compose.prod.yml`,绝不会改到开发栈(2026-09-09 修的泄漏坑:`.env` 曾用 `DOCSQL_IMAGE_TAG=latest` 让 dev compose 跑起生产镜像)。
+- `DOCSQL_IMAGE_TAG`:生产 compose(`docker-compose.prod.yml`)使用的镜像标签(默认 `latest`)。
 - compose 发布端口默认绑定 `127.0.0.1`(无认证部署不暴露到网络);对外服务需改端口映射并设置 `DOCSQL_TOKEN`。

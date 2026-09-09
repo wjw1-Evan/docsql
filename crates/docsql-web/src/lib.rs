@@ -31,18 +31,22 @@
 //!
 //! Auth v1: requests must send `X-Docsql-Token` when the server token is set.
 
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Html;
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use docsql_core::engine::Database;
 use docsql_core::proto::{self, Frame};
 use docsql_server::querylog::{self, LogEntry};
-use std::sync::Arc;
+use serde_json::json;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+pub mod auth;
 
 pub struct WebState {
     /// Default managed node: where data calls without an explicit `node`
@@ -59,6 +63,36 @@ pub struct WebState {
     /// Always empty here — the console never replicates — but the shared
     /// logs payload expects the pair.
     pub sync_log: querylog::SyncLog,
+    /// The console's own username/password account (first-use setup).
+    /// `None` when `DOCSQL_WEB_AUTH_FILE` is unset: legacy behavior, token
+    /// header gate only.
+    pub auth: Option<AuthShared>,
+}
+
+/// Shared auth surface: the credential file store, in-memory sessions, and
+/// per-source login-failure lockout.
+pub struct AuthShared {
+    store: Mutex<auth::AuthStore>,
+    sessions: auth::Sessions,
+    lockout: Mutex<auth::Lockout>,
+}
+
+impl AuthShared {
+    fn open(path: &str) -> Result<Self, String> {
+        Ok(AuthShared {
+            store: Mutex::new(auth::AuthStore::open(std::path::Path::new(path))?),
+            sessions: auth::Sessions::new(),
+            lockout: Mutex::new(auth::Lockout::new()),
+        })
+    }
+
+    fn mode(&self) -> auth::AuthMode {
+        self.store.lock().unwrap().mode()
+    }
+
+    fn username(&self) -> Option<String> {
+        self.store.lock().unwrap().username().map(String::from)
+    }
 }
 
 pub struct WebConfig {
@@ -67,21 +101,32 @@ pub struct WebConfig {
     pub token: Option<String>,
     /// Cluster nodes to monitor for the cluster status page.
     pub peers: Vec<String>,
+    /// Path of the console credential file. `None` (or empty) disables the
+    /// username/password gate entirely (legacy behavior).
+    pub auth_file: Option<String>,
 }
 
 pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
+    let auth = match cfg.auth_file.as_deref().filter(|p| !p.is_empty()) {
+        Some(path) => Some(AuthShared::open(path).map_err(std::io::Error::other)?),
+        None => None,
+    };
     let state = Arc::new(WebState {
         upstream: cfg.upstream,
         token: cfg.token,
         peers: cfg.peers,
         query_log: querylog::QueryLog::new(),
         sync_log: querylog::SyncLog::new(1),
+        auth,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app)
-        .await
-        .map_err(std::io::Error::other)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(std::io::Error::other)
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
@@ -93,22 +138,52 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/cluster", get(api_cluster))
         .route("/api/logs", get(api_logs))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/setup", post(auth_setup))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
         .with_state(state)
 }
 
+/// The API gate. Legacy behavior: `X-Docsql-Token` must match the server
+/// token when one is configured, nothing otherwise. With the console
+/// account active, a valid session cookie also passes; the token keeps
+/// working as the programmatic bypass; and until the account is set up,
+/// data endpoints stay reachable when no token is configured (the setup
+/// happens on first use and closes that window).
 fn check_auth(state: &WebState, headers: &HeaderMap) -> Option<StatusCode> {
     let token = headers.get("X-Docsql-Token").and_then(|v| v.to_str().ok());
-    match &state.token {
-        None => None,
+    let token_ok = match &state.token {
+        None => true,
         // Constant-time compare: a plain == short-circuits on the first
         // differing byte and leaks a (noisy but real) timing oracle.
-        Some(expect)
-            if token.is_some_and(|t| constant_time_eq(t.as_bytes(), expect.as_bytes())) =>
-        {
+        Some(expect) => token.is_some_and(|t| constant_time_eq(t.as_bytes(), expect.as_bytes())),
+    };
+    let Some(auth) = &state.auth else {
+        return if token_ok {
             None
-        }
-        Some(_) => Some(StatusCode::UNAUTHORIZED),
+        } else {
+            Some(StatusCode::UNAUTHORIZED)
+        };
+    };
+    if session_from(headers).is_some_and(|t| auth.sessions.verify(&t)) {
+        return None;
     }
+    if token_ok && state.token.is_some() {
+        return None;
+    }
+    if matches!(auth.mode(), auth::AuthMode::Setup) && state.token.is_none() {
+        return None;
+    }
+    Some(StatusCode::UNAUTHORIZED)
+}
+
+fn session_from(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';').find_map(|pair| {
+        let pair = pair.trim();
+        pair.strip_prefix("docsql_session=").map(String::from)
+    })
 }
 
 /// Length-guarded XOR fold (mirrors docsql-server's crypto helper).
@@ -125,6 +200,156 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("console.html"))
+}
+
+// ---- console account (first-use setup + login) ----
+
+#[derive(serde::Deserialize)]
+struct CredentialsBody {
+    username: String,
+    password: String,
+}
+
+fn session_cookie(token: &str) -> String {
+    format!(
+        "{}={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}",
+        auth::SESSION_COOKIE,
+        token,
+        auth::SESSION_TTL.as_secs()
+    )
+}
+
+fn with_session_cookie(resp: Response, token: &str) -> Response {
+    let mut resp = resp;
+    let value = HeaderValue::from_str(&session_cookie(token)).expect("cookie header value");
+    resp.headers_mut().append(header::SET_COOKIE, value);
+    resp
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    (status, Json(body)).into_response()
+}
+
+async fn auth_status(State(state): State<Arc<WebState>>) -> Response {
+    let Some(a) = &state.auth else {
+        return json_response(StatusCode::OK, json!({"mode": "off"}));
+    };
+    match a.mode() {
+        auth::AuthMode::Setup => json_response(StatusCode::OK, json!({"mode": "setup"})),
+        auth::AuthMode::Login => json_response(
+            StatusCode::OK,
+            json!({"mode": "login", "username": a.username().unwrap_or_default()}),
+        ),
+    }
+}
+
+/// First use: create the console account, then land the caller in a
+/// session. One-shot — once the credential file exists this endpoint only
+/// ever returns 409.
+async fn auth_setup(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<CredentialsBody>,
+) -> Response {
+    let Some(a) = &state.auth else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": "console account is not enabled"}),
+        );
+    };
+    if a.lockout.lock().unwrap().check(peer.ip()) {
+        return json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "尝试次数过多,请一分钟后再试"}),
+        );
+    }
+    let result = a.store.lock().unwrap().setup(&body.username, &body.password);
+    match result {
+        Ok(creds) => {
+            a.lockout.lock().unwrap().reset(peer.ip());
+            let token = a.sessions.create();
+            with_session_cookie(
+                json_response(
+                    StatusCode::OK,
+                    json!({"ok": true, "username": creds.username}),
+                ),
+                &token,
+            )
+        }
+        Err(auth::SetupError::Exists) => {
+            a.lockout.lock().unwrap().record_failure(peer.ip());
+            json_response(
+                StatusCode::CONFLICT,
+                json!({"error": "账号已存在,请直接登录"}),
+            )
+        }
+        Err(auth::SetupError::Invalid(msg)) => {
+            json_response(StatusCode::BAD_REQUEST, json!({"error": msg}))
+        }
+        Err(auth::SetupError::Io(msg)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": format!("凭据写入失败:{msg}")}),
+        ),
+    }
+}
+
+async fn auth_login(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<CredentialsBody>,
+) -> Response {
+    let Some(a) = &state.auth else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": "console account is not enabled"}),
+        );
+    };
+    if a.lockout.lock().unwrap().check(peer.ip()) {
+        return json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "尝试次数过多,请一分钟后再试"}),
+        );
+    }
+    let ok = a
+        .store
+        .lock()
+        .unwrap()
+        .verify(&body.username, &body.password);
+    if !ok {
+        // Same generic error for wrong username and wrong password —
+        // verify() burns a derivation either way, and the text must not
+        // narrow the guess.
+        a.lockout.lock().unwrap().record_failure(peer.ip());
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "用户名或密码不正确"}),
+        );
+    }
+    a.lockout.lock().unwrap().reset(peer.ip());
+    let username = a.username().unwrap_or_default();
+    let token = a.sessions.create();
+    with_session_cookie(
+        json_response(StatusCode::OK, json!({"ok": true, "username": username})),
+        &token,
+    )
+}
+
+async fn auth_logout(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+    if let Some(a) = &state.auth {
+        if let Some(token) = session_from(&headers) {
+            a.sessions.drop_session(&token);
+        }
+    }
+    let clear = format!(
+        "{}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
+        auth::SESSION_COOKIE
+    );
+    let mut resp = json_response(StatusCode::OK, json!({"ok": true}));
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear).expect("cookie header value"),
+    );
+    resp
 }
 
 #[derive(serde::Deserialize)]
@@ -806,6 +1031,7 @@ mod tests {
             peers: vec!["node-a:7600".into()],
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
+            auth: None,
         };
         assert_eq!(resolve_node(&state, &None).unwrap(), None);
         assert_eq!(resolve_node(&state, &Some(String::new())).unwrap(), None);
@@ -833,6 +1059,7 @@ mod tests {
             peers: vec!["node-a:7600".into(), "node-b:7600".into()],
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
+            auth: None,
         };
         assert_eq!(target_for(&state, &None).unwrap(), "node-a:7600");
         assert_eq!(
@@ -859,6 +1086,7 @@ mod tests {
             peers: Vec::new(),
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
+            auth: None,
         });
         let res = build_router(state)
             .oneshot(

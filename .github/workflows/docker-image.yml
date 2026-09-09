@@ -123,10 +123,10 @@ jobs:
         run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       # Rebuild the amd64 image from the shared GHA cache (fast) and load it
-      # locally; run-tests.sh picks it up via DOCSQL_IMAGE_TAG=ci.
+      # locally; run-tests.sh picks it up via DOCSQL_DEV_IMAGE_TAG=ci.
       - name: Load image from cache
         run: >
           docker buildx build --platform linux/amd64 --build-arg RUN_TESTS=false
           --cache-from type=gha --load -t "${IMAGE}:ci" .
       - name: Run deployment tests
-        run: DOCSQL_IMAGE_TAG=ci ./deploy/run-tests.sh
+        run: DOCSQL_DEV_IMAGE_TAG=ci ./deploy/run-tests.sh

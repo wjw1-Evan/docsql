@@ -13,6 +13,12 @@ async fn main() -> std::io::Result<()> {
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:7700".into());
     let token = std::env::var("DOCSQL_TOKEN").ok().filter(|t| !t.is_empty());
+    // The console's own username/password account. Unset (or empty) keeps
+    // the legacy token-only gate; set, the console forces first-use setup
+    // at the configured path and locks the data endpoints behind it.
+    let auth_file = std::env::var("DOCSQL_WEB_AUTH_FILE")
+        .ok()
+        .filter(|p| !p.is_empty());
     // Cluster nodes to monitor and switch between on the status page.
     let peers: Vec<String> = std::env::var("DOCSQL_PEERS")
         .unwrap_or_default()
@@ -47,6 +53,7 @@ async fn main() -> std::io::Result<()> {
             upstream,
             token,
             peers,
+            auth_file,
         },
         &listen,
     )

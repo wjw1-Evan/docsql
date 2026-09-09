@@ -9,16 +9,16 @@ Docker 是唯一的运行方式。镜像由 GitHub Actions 自动构建并发布
 ```bash
 # 单节点部署(compose,标准方式:独立节点 + web 控制台,数据落在命名卷)
 cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d
-#   db 127.0.0.1:17600,web 控制台 http://127.0.0.1:17710
+#   db 127.0.0.1:18600,web 控制台 http://127.0.0.1:18710
 
 # SQL 远程 shell(镜像自带 CLI,容器内执行)
 docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 
-# 多节点部署(生产,3 节点对等集群:node-a 17601 + node-b 17602 + node-c 17603 + web 17700)
+# 多节点部署(生产,3 节点对等集群:node-a 18601 + node-b 18602 + node-c 18603 + web 18700)
 cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
 ```
 
-> 私有仓库的 GHCR 镜像包默认不可匿名拉取,先 `docker login ghcr.io`。镜像 tag 可用环境变量 `DOCSQL_IMAGE_TAG` 覆盖。
+> 私有仓库的 GHCR 镜像包默认不可匿名拉取,先 `docker login ghcr.io`。镜像 tag 可用环境变量覆盖:生产用 `DOCSQL_IMAGE_TAG`,本地开发用 `DOCSQL_DEV_IMAGE_TAG`(两者互不影响)。
 
 ## 发布订阅(pub/sub,持久化)
 
@@ -78,6 +78,7 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 - **仪表盘**:表/行数/页与文件占用/运行时长一览
 - **集群状态**:按 `DOCSQL_PEERS` 只读探测各节点(PING 延迟 + REQ_STATUS 状态报告),展示在线/离线/只读、表与行数收敛、存储占用、LSN 收敛指标;5 秒自动刷新;未配置 peers 时显示单机模式
 - **日志**(视图 → 日志,或服务器右键):全部日志一览——**数据日志**为各处执行的 SQL 语句审计(控制台提交的语句 + 各集群节点,含耗时/影响行数/错误;来自对等节点扇出的语句带「复制」徽章),**同步日志**为集群同步事件(写扇出 publish/trim 扇出/PROMOTE/节点加入,逐目标记录成功与失败原因);条目按时间倒序合并,支持类别(全部/数据/同步/仅错误)、来源(控制台/各节点)、关键词过滤与 5 秒自动刷新;节点离线时显示离线清单
+- **控制台账号(首次使用设置用户名密码)**:web 控制台启用账号门(`DOCSQL_WEB_AUTH_FILE`,compose 部署默认开启)后,第一次打开页面强制**设置用户名与密码**(密码至少 8 位,拒绝单一字符重复),之后每次进入需登录;凭据以盐化 PBKDF2-HMAC-SHA256 哈希存于控制台凭据文件(数据仍全部在数据库节点,控制台依旧零数据存储),登录会话为 HttpOnly Cookie,连续输错触发锁定;「文件 → 退出登录」结束会话。携带 `DOCSQL_TOKEN` 的 API 调用不受登录门影响(脚本/程序化访问照旧);设空 `DOCSQL_WEB_AUTH_FILE` 可整体关闭该门禁
 - **节点切换**(工具栏「节点」下拉框):控制台是纯管理工具,**自身不存任何数据**——默认连接并管理启动时指定的节点(如 `node-a:7600`),配置了 `DOCSQL_PEERS` 时可一键切换到其它集群节点——查询、对象资源管理器、数据网格、建表/插入文档、仪表盘全部以数据库客户端身份连接所选节点执行(二进制协议直连,认证用服务端配置的 `DOCSQL_TOKEN`);在该节点上的写入按其集群配置正常扇出;切换仅允许 `DOCSQL_PEERS` 中配置的地址,节点离线时操作返回明确错误
 
 ## 能力总览
@@ -111,13 +112,13 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)
 
-两种部署拓扑,用 compose profile 切换,**同一套文件支持单节点与多节点**:
+两种部署拓扑,用 compose profile 切换,**同一套文件支持单节点与多节点**。本地开发(`docker-compose.yml`)与生产(`docker-compose.prod.yml`)完全分离——项目名、端口、数据卷、镜像 tag 变量互不相同,两套可同时运行:
 
-| profile | 节点 | 端口 |
-|---|---|---|
-| `single` | node-single(独立单节点,无复制)+ 独立 web 控制台 | 17600 / 17710 |
-| `cluster` | node-a + node-b + node-c 对等集群(任意节点可读写,SQL 写入自动扇出至 `DOCSQL_PEERS`)+ web 控制台(集群状态页监控三节点) | 17601-17603 / 17700 |
-| `join` | node-d(向运行中的集群加入第四数据节点:全新节点启动即自动拉取全量历史数据并注册进扇出网格;见下文"扩容") | 17604 |
+| profile | 节点 | 开发端口(`docsql-dev`) | 生产端口(`docsql-prod`) |
+|---|---|---|---|
+| `single` | node-single(独立单节点,无复制)+ 独立 web 控制台 | 17600 / 17710 | 18600 / 18710 |
+| `cluster` | node-a + node-b + node-c 对等集群(任意节点可读写,SQL 写入自动扇出至 `DOCSQL_PEERS`)+ web 控制台(集群状态页监控三节点) | 17601-17603 / 17700 | 18601-18603 / 18700 |
+| `join` | node-d(向运行中的集群加入第四数据节点:全新节点启动即自动拉取全量历史数据并注册进扇出网格;见下文"扩容") | 17604 | 18604 |
 
 两个 profile 端口不冲突,可同时运行(便于对比验证);命令均需带 profile 参数:
 
@@ -133,21 +134,22 @@ docker compose --profile single --profile cluster down    # 全部停止(数据�
 **扩容(新数据节点自动同步)**:集群已有数据时,起一个指向现有节点的全新节点即可——它会自动拉取全量历史(schema、约束、索引、数据、GUID 值),注册进各节点的扇出列表,随后与其它节点互相同步写入。compose 用 `join` profile:
 
 ```bash
-cd deploy && docker volume create docsql-data-d    # 一次性建卷
+cd deploy && docker volume create docsql-dev-data-d    # 一次性建卷(开发;生产 join 用 docsql-prod-data-d)
 docker compose --profile cluster --profile join up -d node-d
 ```
 
 新节点需要两个环境变量:`DOCSQL_PEERS`(现有节点地址表)与 `DOCSQL_ADVERTISE`(其它节点回连自己的地址)。注意:动态注册保存在原节点内存中,原节点重启后会丢失——要把 node-d 变成长期成员,请把它写进各节点的 `DOCSQL_PEERS` 并重建(数据保留,且不会重复同步)。另外,节点**离线/分区期间**其它节点的写仍不会补发(无反熵追赶,同步只发生在加入时)。
 
-**数据持久化**:每个节点的数据放在 external 卷(`docsql-data-a/b/c/d/web/single/web-single`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
+**数据持久化**:每个节点的数据放在 external 卷(生产 `docsql-data-a/b/c/single` + join 节点 `docsql-prod-data-d`;开发 `docsql-dev-data-a/b/c/d/single`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
 
 ```bash
-cd deploy && for v in a b c d web single web-single; do docker volume create docsql-data-$v; done
+cd deploy && for v in a b c single; do docker volume create docsql-data-$v; done && docker volume create docsql-prod-data-d  # 生产
+cd deploy && for v in a b c d single; do docker volume create docsql-dev-data-$v; done                                       # 开发
 ```
 
-**本地开发**(`deploy/docker-compose.yml`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`。上面的命令加 `--build` 即触发构建。
+**本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。
 
-**生产**(`deploy/docker-compose.prod.yml`):拉取 CI 发布的 GHCR 镜像(不本地构建),断线自动重启,日志轮转,Web 控制台可配 token:
+**生产**(`deploy/docker-compose.prod.yml`,项目名 `docsql-prod`):拉取 CI 发布的 GHCR 镜像(不本地构建),端口 +1000(18600-18604/18700/18710,与开发栈互不冲突),数据卷沿用历史命名 `docsql-data-*`(真实数据在此),断线自动重启,日志轮转,Web 控制台可配 token:
 
 ```bash
 cd deploy
@@ -156,7 +158,7 @@ docker compose -f docker-compose.prod.yml --profile single up -d    # 生产单�
 docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三节点集群
 ```
 
-> 本地开发与生产共享主机端口和数据卷(docsql-data-*),同一拓扑同一时间只能运行一套;切换前 `down` 停掉另一套即可,切换后数据仍在。
+> 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)互不相同,两套拓扑可同时运行、互不共享数据。
 
 部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 69 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线/网络分区/新节点加入自动同步)+ 单节点 24 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub)。
 
@@ -168,8 +170,8 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 
 | 控制项 | DocSQL 实现 |
 |---|---|
-| 身份标识与鉴别 | 协议层 token 认证(REQ_AUTH,常数时间比较防时序侧信道);三种凭据:`DOCSQL_TOKEN`(客户端)、`DOCSQL_READ_TOKEN`(只读客户端)、`DOCSQL_CLUSTER_TOKEN`(节点间,`FLAG_REPLICATION` 复制帧仅接受节点身份) |
-| 登录失败处理 | 同一来源 IP 在 60 秒窗口内认证失败达 10 次(阈值可按部署调严)即锁定 60 秒,期间任何 token(含正确值)均被拒绝;锁定事件写入审计日志 |
+| 身份标识与鉴别 | 协议层 token 认证(REQ_AUTH,常数时间比较防时序侧信道);三种凭据:`DOCSQL_TOKEN`(客户端)、`DOCSQL_READ_TOKEN`(只读客户端)、`DOCSQL_CLUSTER_TOKEN`(节点间,`FLAG_REPLICATION` 复制帧仅接受节点身份);Web 控制台账号门:首次使用强制设置用户名/密码(盐化 PBKDF2-HMAC-SHA256 存储,常数时间校验),HttpOnly 会话 Cookie,`DOCSQL_TOKEN` 可作为程序化旁路 |
+| 登录失败处理 | 同一来源 IP 在 60 秒窗口内认证失败达 10 次(阈值可按部署调严)即锁定 60 秒,期间任何 token(含正确值)均被拒绝;锁定事件写入审计日志;Web 控制台登录门同策略(10 次/60 秒窗口,锁定 60 秒,按来源 IP) |
 | 口令/凭据复杂度 | 服务器启动时校验所有已配置凭据:长度不足 8 或单一字符重复即拒绝启动(进程退出码 2) |
 | 访问控制(最小权限) | `DOCSQL_READ_TOKEN` 只读身份:可查询、可订阅,一切持久化写(SQL 写/`PUBLISH`/`PUBSUB TRIM`/`PROMOTE`)在协议层拒绝;副本模式 `DOCSQL_READ_ONLY=1` 整节点只读;Web 控制台独立 token 门禁 |
 | 安全审计 | 语句审计(`docsql_log` 环形缓冲,含语句文本/耗时/影响行数/是否复制/错误)、认证事件审计(成功与失败均记录,来源 IP + 授予身份/失败原因,web 控制台日志页可见)、`DOCSQL_LOG_FILE` 可同步落 JSONL 文件留存 |

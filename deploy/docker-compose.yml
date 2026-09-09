@@ -7,14 +7,18 @@
 #   docker compose --profile single --profile cluster up -d   # both at once
 #
 # Tear down with the same profile flags: docker compose --profile ... down
-# (down -v also works). Data lives in EXTERNAL volumes (fixed docsql-data-*
+# (down -v also works). Data lives in EXTERNAL volumes (fixed docsql-dev-data-*
 # names) that compose never removes — rebuilding/redeploying keeps data.
 # Wipe data only via ./reset-data.sh (or explicit docker volume rm).
-# Set DOCSQL_IMAGE_TAG to run against an existing image instead of building.
+# Set DOCSQL_DEV_IMAGE_TAG to run against an existing image instead of
+# building — deliberately NOT DOCSQL_IMAGE_TAG, which belongs to the prod
+# compose and its .env and must never silently retag the dev stack.
 #
-# Production deployment (CI-published image, no local build) — same two
-# profiles:
-#   docker compose -f docker-compose.prod.yml --profile single|cluster up -d
+# Fully separated from docker-compose.prod.yml (project docsql-prod): own
+# host ports (17600-17604/17700/17710) and own data volumes, so dev and prod
+# can run SIDE BY SIDE. Prod listens on 18600-18604/18700/18710 and keeps the
+# historic docsql-data-* volumes.
+name: docsql-dev
 services:
   # ---- profile: cluster ------------------------------------------------
   # Symmetric cluster: every node is equal — accepts writes and fans each
@@ -25,7 +29,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-a
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -48,7 +52,7 @@ services:
 
   node-b:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-b
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -70,7 +74,7 @@ services:
 
   node-c:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-c
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -101,7 +105,7 @@ services:
   # and recreate them (no data is lost, no re-sync happens).
   node-d:
     profiles: ["join"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-d
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -130,12 +134,17 @@ services:
   # probes and the node switcher.
   node-web:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-web
     command: ["node-a:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      # Console account (first-use username/password). Empty env disables
+      # the gate (run-tests.sh sets it so its raw curls stay unauthenticated).
+      DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+    volumes:
+      - web-auth:/auth
     ports:
       - "127.0.0.1:17700:7700"
     networks: [docsql]
@@ -152,7 +161,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     ports:
@@ -171,12 +180,15 @@ services:
   # data. DOCSQL_PEERS powers the cluster-status page (one node).
   node-web-single:
     profiles: ["single"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-web-single
     command: ["node-single:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_PEERS: "node-single:7600"
+      DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+    volumes:
+      - web-auth-single:/auth
     ports:
       - "127.0.0.1:17710:7700"
     networks: [docsql]
@@ -184,27 +196,33 @@ services:
       node-single:
         condition: service_healthy
 
-# External data volumes: created once (`docker volume create docsql-data-*`
+# External data volumes: created once (`docker volume create docsql-dev-data-*`
 # or any `docker compose up` precondition), they survive `down -v` and
-# container recreation — releases never lose data. dev and prod compose
-# share the same volumes (they share host ports, only one runs at a time).
-# ./reset-data.sh removes them; run-tests.sh recreates them per run.
+# container recreation — releases never lose data. Dev volumes are namespaced
+# docsql-dev-data-* and are fully separate from prod's docsql-data-*, so both
+# stacks can run at the same time. ./reset-data.sh removes them;
+# run-tests.sh recreates them per run.
 volumes:
+  # Console account files (username/password hash): compose-managed named
+  # volumes, so the first-use setup survives redeploys and `down` (only
+  # `down -v` or reset-data.sh clears them).
+  web-auth:
+  web-auth-single:
   peer-a-data:
     external: true
-    name: docsql-data-a
+    name: docsql-dev-data-a
   peer-b-data:
     external: true
-    name: docsql-data-b
+    name: docsql-dev-data-b
   peer-c-data:
     external: true
-    name: docsql-data-c
+    name: docsql-dev-data-c
   peer-d-data:
     external: true
-    name: docsql-data-d
+    name: docsql-dev-data-d
   single-data:
     external: true
-    name: docsql-data-single
+    name: docsql-dev-data-single
 
 networks:
   docsql:

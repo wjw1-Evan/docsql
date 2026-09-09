@@ -11,6 +11,16 @@ use tokio::net::TcpStream;
 
 /// Start the console alone (no managed node): pure-UI surface tests.
 async fn start_web(token: Option<&str>, peers: Vec<String>, upstream: Option<String>) -> String {
+    start_web_auth(token, peers, upstream, None).await
+}
+
+/// Same with the console account gate pointed at `auth_file` (None = off).
+async fn start_web_auth(
+    token: Option<&str>,
+    peers: Vec<String>,
+    upstream: Option<String>,
+    auth_file: Option<String>,
+) -> String {
     // Pick a free port by binding a listener first.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -20,6 +30,7 @@ async fn start_web(token: Option<&str>, peers: Vec<String>, upstream: Option<Str
         upstream,
         token: token.map(String::from),
         peers,
+        auth_file,
     };
     let listen = addr.clone();
     tokio::spawn(async move { docsql_web::run(cfg, &listen).await });
@@ -101,10 +112,35 @@ async fn http(
     token: Option<&str>,
     body: Option<&str>,
 ) -> HttpResponse {
+    http_full(addr, method, path, token, None, body).await
+}
+
+/// Same with a session cookie (the console account gate).
+async fn http_cookie(
+    addr: &str,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    body: Option<&str>,
+) -> HttpResponse {
+    http_full(addr, method, path, None, Some(cookie), body).await
+}
+
+async fn http_full(
+    addr: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    cookie: Option<&str>,
+    body: Option<&str>,
+) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     if let Some(t) = token {
         req.push_str(&format!("X-Docsql-Token: {t}\r\n"));
+    }
+    if let Some(c) = cookie {
+        req.push_str(&format!("Cookie: {c}\r\n"));
     }
     if let Some(b) = body {
         req.push_str("Content-Type: application/json\r\n");
@@ -828,4 +864,212 @@ async fn data_endpoints_without_upstream_report_config_error() {
     let body = serde_json::to_string(&json!({"sql": "SELECT 1"})).unwrap();
     let res = http(&addr, "POST", "/api/parse", None, Some(&body)).await;
     assert_eq!(res.json(), json!({"ok": true}));
+}
+
+/// Console account gate: first-use setup creates the account and a session,
+/// data endpoints lock afterwards, and login/logout manage the session.
+/// Every other test in this file runs without the auth file (legacy mode)
+/// and must keep working unchanged — that is the regression guard.
+#[tokio::test]
+async fn console_account_setup_login_and_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("console-auth.json");
+    let addr = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(auth_file.to_string_lossy().into_owned()),
+    )
+    .await;
+
+    // Setup mode; anonymous data calls still work until the account exists
+    // (no token configured to demand otherwise).
+    let st = http(&addr, "GET", "/api/auth/status", None, None).await.json();
+    assert_eq!(st["mode"], "setup");
+    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 200);
+
+    // Weak password rejected; the account does not exist yet.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(r#"{"username":"admin","password":"short"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    let st = http(&addr, "GET", "/api/auth/status", None, None).await.json();
+    assert_eq!(st["mode"], "setup");
+
+    // Create the account → session cookie; the file is written.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let cookie = r.header("set-cookie").expect("session cookie").to_string();
+    assert!(cookie.starts_with("docsql_session="), "{cookie}");
+    assert!(auth_file.exists(), "credential file written");
+
+    // One-shot: a second setup attempt is a conflict; anonymous data is now
+    // rejected; status flipped to login mode with the username.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(r#"{"username":"eve","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 409);
+    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 401);
+    let st = http(&addr, "GET", "/api/auth/status", None, None).await.json();
+    assert_eq!(st["mode"], "login");
+    assert_eq!(st["username"], "admin");
+
+    // Wrong password → 401 (generic message); right one → a new session.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(r#"{"username":"admin","password":"nope-nope"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let cookie2 = r.header("set-cookie").unwrap().to_string();
+
+    // A session cookie opens data endpoints; logging out closes that
+    // session while the independent one keeps working.
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie, None)
+            .await
+            .status,
+        200
+    );
+    let r = http_cookie(&addr, "POST", "/api/auth/logout", &cookie, None).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie, None)
+            .await
+            .status,
+        401
+    );
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie2, None)
+            .await
+            .status,
+        200
+    );
+}
+
+/// With both DOCSQL_TOKEN and the console account configured, token-carrying
+/// API clients keep working without any session (the programmatic bypass),
+/// and anonymous calls are rejected even before setup.
+#[tokio::test]
+async fn console_account_token_bypass() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("console-auth.json");
+    let addr = start_web_auth(
+        Some("node-secret"),
+        Vec::new(),
+        None,
+        Some(auth_file.to_string_lossy().into_owned()),
+    )
+    .await;
+
+    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 401);
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", Some("wrong"), None)
+            .await
+            .status,
+        401
+    );
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", Some("node-secret"), None)
+            .await
+            .status,
+        200
+    );
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 401);
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", Some("node-secret"), None)
+            .await
+            .status,
+        200
+    );
+}
+
+/// The credential file persists: a restarted console with the same file is
+/// in login mode and accepts the same credentials (sessions do not persist —
+/// a fresh login is required).
+#[tokio::test]
+async fn console_account_persists_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("console-auth.json");
+    let addr = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(path.to_string_lossy().into_owned()),
+    )
+    .await;
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    let addr2 = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(path.to_string_lossy().into_owned()),
+    )
+    .await;
+    let st = http(&addr2, "GET", "/api/auth/status", None, None).await.json();
+    assert_eq!(st["mode"], "login");
+    assert_eq!(st["username"], "admin");
+    let r = http(
+        &addr2,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let cookie = r.header("set-cookie").unwrap().to_string();
+    assert_eq!(
+        http_cookie(&addr2, "GET", "/api/meta", &cookie, None)
+            .await
+            .status,
+        200
+    );
 }
