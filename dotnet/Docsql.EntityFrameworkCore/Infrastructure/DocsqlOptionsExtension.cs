@@ -1,4 +1,4 @@
-// docsql 的 EF Core 选项扩展:携带连接信息并注册提供程序服务。
+// DocSQL 的 EF Core 选项扩展:携带连接信息并注册提供程序服务。
 // 不再借壳 SQLite —— 全部服务由本程序集实现。
 
 using System.Data.Common;
@@ -64,7 +64,7 @@ public sealed class DocsqlOptionsExtension : RelationalOptionsExtension
         : DbContextOptionsExtensionInfo(extension)
     {
         public override bool IsDatabaseProvider => true;
-        public override string LogFragment => "using docsql ";
+        public override string LogFragment => "using DocSQL ";
         public override int GetServiceProviderHashCode() => 0;
         public override bool ShouldUseSameServiceProvider(DbContextOptionsExtensionInfo other)
             => other is ExtensionInfo;

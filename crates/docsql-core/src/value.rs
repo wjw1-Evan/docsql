@@ -79,12 +79,20 @@ impl Value {
         match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            (Value::Int(_), Value::Int(_))
-            | (Value::Float(_), Value::Float(_))
+            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Float(_), Value::Float(_))
             | (Value::Int(_), Value::Float(_))
             | (Value::Float(_), Value::Int(_)) => {
+                // NaN needs a deterministic rank (above all finite numbers)
+                // or cmp_values would not be a total order — sort and unique
+                // checks rely on that.
                 let (x, y) = (num_as_f64(a), num_as_f64(b));
-                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+                match (x.is_nan(), y.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                }
             }
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
@@ -311,9 +319,18 @@ mod tests {
             ),
             Equal
         );
-        // float NaN falls back to Equal rather than panicking
+        // float NaN has a deterministic rank (above all finite numbers) so
+        // the total order stays usable for unique checks and sorting
         assert_eq!(
             Value::cmp_values(&Value::Float(f64::NAN), &Value::Float(1.0)),
+            Greater
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Float(1.0), &Value::Float(f64::NAN)),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Float(f64::NAN), &Value::Float(f64::NAN)),
             Equal
         );
     }

@@ -3,12 +3,15 @@ name = "docsql-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "docsql web console (REST API + embedded UI)"
+description = "DocSQL web console (REST API + embedded UI)"
 
 [dependencies]
 docsql-core = { path = "../docsql-core" }
+# Console-side statement audit reuses the server's query-log ring (one
+# LogEntry shape feeds the shared REQ_LOGS payload builder).
+docsql-server = { path = "../docsql-server" }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util"] }
 serde_json = "1.0.151"
 serde.workspace = true
 

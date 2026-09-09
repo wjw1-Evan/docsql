@@ -10,6 +10,13 @@
 #                     reproducible deploys, e.g. v1.0.0)
 #   DOCSQL_TOKEN      auth token for the server protocol port AND the web
 #                     console/REST API (empty = no auth — loopback only!)
+#   DOCSQL_CLUSTER_TOKEN  inter-node credential for cluster profile: nodes
+#                     authenticate to each other with it, and only
+#                     cluster-authed connections may send replication
+#                     frames (clients logged in with DOCSQL_TOKEN cannot
+#                     forge node traffic). Must match on every node; use a
+#                     value distinct from DOCSQL_TOKEN. Empty = legacy
+#                     behavior (replication shares DOCSQL_TOKEN).
 #
 #   cp .env.example .env && edit, then pick a profile and up -d.
 #
@@ -18,7 +25,9 @@
 # "127.0.0.1:17601:7600" with "17601:7600" AND set DOCSQL_TOKEN.
 #
 # Dev vs prod share host ports (17600-17603, 17700, 17710): run only one of
-# them at a time and `down -v` before switching.
+# them at a time (`docker compose ... down` before switching). They also
+# share the EXTERNAL data volumes below, so switching keeps your data;
+# `down -v` does NOT delete it — wipe via ./reset-data.sh.
 services:
   # ---- profile: cluster ------------------------------------------------
   # Symmetric cluster: every node is equal — accepts writes and fans each
@@ -34,6 +43,7 @@ services:
       # The token applies to this node's protocol port too (nodes authenticate
       # to each other automatically during replication fan-out).
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
       - "127.0.0.1:17601:7600"
     volumes:
@@ -57,6 +67,7 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
       - "127.0.0.1:17602:7600"
     volumes:
@@ -83,6 +94,7 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
     ports:
       - "127.0.0.1:17603:7600"
     volumes:
@@ -101,8 +113,49 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # ---- profile: join ----------------------------------------------------
+  # A fourth data node brought up against a running cluster: being fresh
+  # (empty volume), it pulls the cluster's full state automatically
+  # (REQ_SYNC bootstrap), registers itself cluster-wide via
+  # DOCSQL_ADVERTISE, and from then on takes part in normal fan-out.
+  # Start with: docker compose -f docker-compose.prod.yml --profile cluster
+  # --profile join up -d node-d
+  # Note: a/b/c keep the dynamic registration until they restart — to make
+  # node-d a permanent member, also list node-d:7600 in their DOCSQL_PEERS
+  # and recreate them (no data is lost, no re-sync happens).
+  node-d:
+    profiles: ["join"]
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
+    container_name: docsql-prod-d
+    command: ["/data/docsql.db", "0.0.0.0:7600"]
+    environment:
+      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
+      DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+    ports:
+      - "127.0.0.1:17604:7600"
+    volumes:
+      - peer-d-data:/data
+    networks: [docsql]
+    depends_on:
+      node-a:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "docsql-cli connect node-d:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
   # Web console (embedded engine on its own volume; REST + UI on :7700).
   # Set DOCSQL_TOKEN in .env to require auth for the console and REST API.
+  # DOCSQL_PEERS feeds the read-only cluster-status probes (the same token
+  # authenticates them when set); the console's own SQL/data operations stay
+  # on its embedded engine.
   node-web:
     profiles: ["cluster"]
     image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
@@ -111,6 +164,7 @@ services:
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
     ports:
       - "127.0.0.1:17700:7700"
     volumes:
@@ -170,13 +224,29 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+# External data volumes (fixed docsql-data-* names, shared with the dev
+# compose): they survive `down -v`, image upgrades and container
+# recreation — releases never lose data. Create once with
+# `docker volume create`, wipe only via ./reset-data.sh.
 volumes:
   peer-a-data:
+    external: true
+    name: docsql-data-a
   peer-b-data:
+    external: true
+    name: docsql-data-b
   peer-c-data:
+    external: true
+    name: docsql-data-c
   web-data:
+    external: true
+    name: docsql-data-web
   single-data:
+    external: true
+    name: docsql-data-single
   web-single-data:
+    external: true
+    name: docsql-data-web-single
 
 networks:
   docsql:

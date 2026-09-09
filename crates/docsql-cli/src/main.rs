@@ -1,9 +1,15 @@
-//! docsql shell.
+//! DocSQL shell.
 //!
 //! - `docsql <file.db>`             embedded mode (SQL from stdin)
 //! - `docsql :memory:`              embedded in-memory
 //! - `docsql connect <addr> [token]` remote mode over the v1 protocol
 //!   (`auth <token>;` also works mid-session)
+//!
+//! Remote mode supports the persistent pub/sub commands inline:
+//! `subscribe <ch> [earliest|latest|<id>];`, `psubscribe <pat> [from];`,
+//! `unsubscribe [ch];`, `punsubscribe [pat];`, `publish <ch> <msg...>;`,
+//! `pubsub channels|numsub|numpat|trim ...;`. Pushed messages print as
+//! `[pubsub] message <channel> #<id> <payload>` the moment they arrive.
 
 use docsql_core::engine::{Database, ExecOutcome, QueryResult};
 use docsql_core::proto::{self, Frame};
@@ -34,10 +40,10 @@ fn main() {
         Database::open(std::path::Path::new(&path))
     }
     .unwrap_or_else(|e| {
-        eprintln!("docsql: cannot open {path}: {e}");
+        eprintln!("DocSQL: cannot open {path}: {e}");
         std::process::exit(1);
     });
-    println!("docsql — type SQL statements ending with ';', quit with exit;");
+    println!("DocSQL — type SQL statements ending with ';', quit with exit;");
     let mut stmt = String::new();
     let stdin = std::io::BufReader::new(std::io::stdin().lock());
     for line in stdin.lines() {
@@ -66,40 +72,104 @@ fn main() {
     }
 }
 
-/// Send one frame and read one response frame. Both directions are checked:
-/// a decode failure or an oversized advertised length is an error, never a
-/// panic or a multi-GB allocation.
-fn round_trip(stream: &mut std::net::TcpStream, frame: &Frame) -> Result<Frame, String> {
-    let bytes = frame.encode().map_err(|e| e.to_string())?;
-    stream
-        .write_all(&bytes)
-        .and_then(|_| stream.flush())
-        .map_err(|e| e.to_string())?;
-    let mut header = [0u8; proto::HEADER_LEN];
-    stream
-        .read_exact(&mut header)
-        .map_err(|_| "connection closed".to_string())?;
-    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-    if len > RECV_CAP {
-        return Err("server advertised an oversized frame".into());
+/// Remote-mode connection. A dedicated reader thread pulls frames off the
+/// socket continuously: RESP_PUSH frames print as they arrive (pub/sub
+/// delivery), everything else queues for the pending round trip. Without
+/// this, a push would be misread as the next command's response.
+struct Remote {
+    writer: std::net::TcpStream,
+    queue: std::sync::mpsc::Receiver<Frame>,
+}
+
+impl Remote {
+    fn connect(addr: &str) -> Result<Remote, String> {
+        let stream = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        let reader = stream.try_clone().map_err(|e| e.to_string())?;
+        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        std::thread::spawn(move || reader_loop(reader, tx));
+        Ok(Remote {
+            writer: stream,
+            queue: rx,
+        })
     }
-    let mut buf = header.to_vec();
-    let mut payload = vec![0u8; len];
-    stream
-        .read_exact(&mut payload)
-        .map_err(|_| "connection closed".to_string())?;
-    buf.extend_from_slice(&payload);
-    Frame::decode(&buf)
-        .map(|(f, _)| f)
-        .map_err(|e| format!("protocol error: {e}"))
+
+    /// Send one frame and wait for its response frame.
+    fn round_trip(&mut self, frame: &Frame) -> Result<Frame, String> {
+        let bytes = frame.encode().map_err(|e| e.to_string())?;
+        self.writer
+            .write_all(&bytes)
+            .and_then(|_| self.writer.flush())
+            .map_err(|e| e.to_string())?;
+        loop {
+            match self.queue.recv() {
+                // Defensive: pushes normally print in the reader thread.
+                Ok(f) if f.frame_type == proto::RESP_PUSH => continue,
+                Ok(f) => return Ok(f),
+                Err(_) => return Err("connection closed".to_string()),
+            }
+        }
+    }
+}
+
+fn reader_loop(mut stream: std::net::TcpStream, tx: std::sync::mpsc::Sender<Frame>) {
+    loop {
+        let mut header = [0u8; proto::HEADER_LEN];
+        if stream.read_exact(&mut header).is_err() {
+            return;
+        }
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        if len > RECV_CAP {
+            eprintln!("error: server advertised an oversized frame");
+            return;
+        }
+        let mut buf = header.to_vec();
+        let mut payload = vec![0u8; len];
+        if stream.read_exact(&mut payload).is_err() {
+            return;
+        }
+        buf.extend_from_slice(&payload);
+        let f = match Frame::decode(&buf) {
+            Ok((f, _)) => f,
+            Err(e) => {
+                eprintln!("error: protocol error: {e}");
+                return;
+            }
+        };
+        if f.frame_type == proto::RESP_PUSH {
+            print_push(&f);
+            let _ = std::io::stdout().flush();
+            continue;
+        }
+        if tx.send(f).is_err() {
+            return; // main side closed
+        }
+    }
+}
+
+fn print_push(f: &Frame) {
+    if let Ok(Value::Object(o)) = docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
+    {
+        let s = |k: &str| o.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let id = o.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if s("kind") == "pmessage" {
+            println!(
+                "[pubsub] pmessage {} {} #{} {}",
+                s("pattern"),
+                s("channel"),
+                id,
+                s("payload")
+            );
+        } else {
+            println!("[pubsub] message {} #{} {}", s("channel"), id, s("payload"));
+        }
+        return;
+    }
+    println!("[pubsub] {}", String::from_utf8_lossy(&f.payload));
 }
 
 /// AUTH against a token-protected server (REQ_AUTH frame). Returns success.
-fn auth(stream: &mut std::net::TcpStream, token: &str) -> bool {
-    match round_trip(
-        stream,
-        &Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec()),
-    ) {
+fn auth(remote: &mut Remote, token: &str) -> bool {
+    match remote.round_trip(&Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec())) {
         Ok(f) if f.frame_type != proto::RESP_ERROR => true,
         Ok(f) => {
             eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
@@ -112,21 +182,211 @@ fn auth(stream: &mut std::net::TcpStream, token: &str) -> bool {
     }
 }
 
-fn remote_shell(addr: &str, token: Option<&str>) {
-    let mut stream = match std::net::TcpStream::connect(addr) {
-        Ok(s) => s,
+/// JSON string escaping for the pub/sub command payloads.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// One parsed inline pub/sub command (the `;` already stripped).
+#[derive(Debug)]
+enum PubsubCmd {
+    Subscribe {
+        name: String,
+        from: String,
+        pattern: bool,
+    },
+    Unsubscribe {
+        name: Option<String>,
+        pattern: bool,
+    },
+    Publish {
+        channel: String,
+        payload: String,
+    },
+    Channels {
+        filter: Option<String>,
+    },
+    Numsub,
+    Numpat,
+    Trim {
+        channel: String,
+        keep: i64,
+    },
+}
+
+fn parse_pubsub_command(line: &str) -> Option<PubsubCmd> {
+    let body = line.trim().trim_end_matches(';').trim();
+    let mut words = body.split_whitespace();
+    let cmd = words.next()?.to_ascii_lowercase();
+    let rest: Vec<&str> = words.collect();
+    match cmd.as_str() {
+        "subscribe" | "psubscribe" => {
+            let name = rest.first()?.to_string();
+            let from = rest
+                .get(1)
+                .map(|s| s.to_string())
+                .unwrap_or("latest".into());
+            Some(PubsubCmd::Subscribe {
+                name,
+                from,
+                pattern: cmd == "psubscribe",
+            })
+        }
+        "unsubscribe" | "punsubscribe" => Some(PubsubCmd::Unsubscribe {
+            name: rest.first().map(|s| s.to_string()),
+            pattern: cmd == "punsubscribe",
+        }),
+        "publish" => {
+            let channel = rest.first()?.to_string();
+            let payload = rest[1..].join(" ");
+            Some(PubsubCmd::Publish { channel, payload })
+        }
+        "pubsub" => match rest.first()?.to_ascii_lowercase().as_str() {
+            "channels" => Some(PubsubCmd::Channels {
+                filter: rest.get(1).map(|s| s.to_string()),
+            }),
+            "numsub" => Some(PubsubCmd::Numsub),
+            "numpat" => Some(PubsubCmd::Numpat),
+            "trim" => {
+                let channel = rest.get(1)?.to_string();
+                let keep: i64 = rest.get(2)?.parse().ok()?;
+                Some(PubsubCmd::Trim { channel, keep })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
+    let (frame_type, payload, confirm) = match &cmd {
+        PubsubCmd::Subscribe {
+            name,
+            from,
+            pattern,
+        } => {
+            let key = if *pattern { "pattern" } else { "channel" };
+            let body = format!(
+                r#"{{"{key}":"{}","from":"{}"}}"#,
+                json_escape(name),
+                json_escape(from)
+            );
+            (
+                if *pattern {
+                    proto::REQ_PSUBSCRIBE
+                } else {
+                    proto::REQ_SUBSCRIBE
+                },
+                body.into_bytes(),
+                "subscribed",
+            )
+        }
+        PubsubCmd::Unsubscribe { name, pattern } => {
+            let names = match name {
+                Some(n) => format!("[\"{}\"]", json_escape(n)),
+                None => "[]".to_string(),
+            };
+            (
+                if *pattern {
+                    proto::REQ_PUNSUBSCRIBE
+                } else {
+                    proto::REQ_UNSUBSCRIBE
+                },
+                names.into_bytes(),
+                "unsubscribed",
+            )
+        }
+        PubsubCmd::Publish { channel, payload } => (
+            proto::REQ_PUBLISH,
+            format!(
+                r#"{{"channel":"{}","payload":"{}"}}"#,
+                json_escape(channel),
+                json_escape(payload)
+            )
+            .into_bytes(),
+            "",
+        ),
+        PubsubCmd::Channels { filter } => (
+            proto::REQ_PUBSUB,
+            format!(
+                r#"{{"sub":"channels"{} }}"#,
+                filter
+                    .as_ref()
+                    .map(|p| format!(",\"pattern\":\"{}\"", json_escape(p)))
+                    .unwrap_or_default()
+            )
+            .into_bytes(),
+            "",
+        ),
+        PubsubCmd::Numsub => (proto::REQ_PUBSUB, br#"{"sub":"numsub"}"#.to_vec(), ""),
+        PubsubCmd::Numpat => (proto::REQ_PUBSUB, br#"{"sub":"numpat"}"#.to_vec(), ""),
+        PubsubCmd::Trim { channel, keep } => (
+            proto::REQ_PUBSUB,
+            format!(
+                r#"{{"sub":"trim","channel":"{}","keep":{keep}}}"#,
+                json_escape(channel)
+            )
+            .into_bytes(),
+            "trimmed",
+        ),
+    };
+    match remote.round_trip(&Frame::new(frame_type, payload)) {
+        Ok(f) if f.frame_type == proto::RESP_ERROR => {
+            println!("error: {}", String::from_utf8_lossy(&f.payload));
+        }
+        Ok(f) => {
+            if f.frame_type == proto::RESP_AFFECTED {
+                let n = f
+                    .payload
+                    .get(..8)
+                    .and_then(|s| s.try_into().ok())
+                    .map_or(0, u64::from_le_bytes);
+                match confirm {
+                    "subscribed" => println!("(subscribed; {n} active subscription(s))"),
+                    "unsubscribed" => println!("(unsubscribed; {n} remain)"),
+                    "trimmed" => println!("({n} message(s) trimmed)"),
+                    _ => println!("({n} rows affected)"),
+                }
+            } else {
+                print_frame(&f);
+            }
+        }
         Err(e) => {
-            eprintln!("docsql: cannot connect {addr}: {e}");
+            println!("{e}");
+            return false;
+        }
+    }
+    true
+}
+
+fn remote_shell(addr: &str, token: Option<&str>) {
+    let mut remote = match Remote::connect(addr) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("DocSQL: cannot connect {addr}: {e}");
             std::process::exit(1);
         }
     };
     if let Some(t) = token {
-        if !auth(&mut stream, t) {
+        if !auth(&mut remote, t) {
             std::process::exit(2);
         }
     }
     println!(
-        "docsql → {addr} — SQL over the wire, quit with exit; (`auth <token>;` to authenticate)"
+        "DocSQL → {addr} — SQL over the wire, quit with exit; \
+         (`auth <token>;`, `subscribe <ch>;`, `publish <ch> <msg>;`)"
     );
     let mut stmt = String::new();
     let stdin = std::io::BufReader::new(std::io::stdin().lock());
@@ -149,8 +409,15 @@ fn remote_shell(addr: &str, token: Option<&str>) {
             .map(|t| t.trim().trim_end_matches(';').trim())
             .filter(|t| !t.is_empty())
         {
-            if auth(&mut stream, tok) {
+            if auth(&mut remote, tok) {
                 println!("ok");
+            }
+            continue;
+        }
+        // Inline pub/sub commands (single line, `;`-terminated like SQL).
+        if let Some(cmd) = parse_pubsub_command(trimmed) {
+            if !run_pubsub_command(&mut remote, cmd) {
+                break;
             }
             continue;
         }
@@ -160,51 +427,56 @@ fn remote_shell(addr: &str, token: Option<&str>) {
             continue;
         }
         let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(stmt.trim()).unwrap());
-        let f = match round_trip(&mut stream, &frame) {
+        let f = match remote.round_trip(&frame) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("{e}");
                 break;
             }
         };
-        match f.frame_type {
-            proto::RESP_ROWS => {
-                if let Ok(Value::Object(o)) =
-                    docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
-                {
-                    let columns = match o.get("columns") {
-                        Some(Value::Array(a)) => a
-                            .iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect(),
-                        _ => vec![],
-                    };
-                    let rows: Vec<Vec<Value>> = match o.get("rows") {
-                        Some(Value::Array(a)) => a
-                            .iter()
-                            .map(|r| match r {
-                                Value::Array(items) => items.clone(),
-                                _ => vec![],
-                            })
-                            .collect(),
-                        _ => vec![],
-                    };
-                    print_rows(&QueryResult { columns, rows });
-                } else {
-                    eprintln!("protocol error: undecodable rows payload");
-                }
-            }
-            proto::RESP_AFFECTED => {
-                let n = f
-                    .payload
-                    .get(..8)
-                    .and_then(|s| s.try_into().ok())
-                    .map_or(0, u64::from_le_bytes);
-                println!("({n} rows affected)");
-            }
-            _ => println!("error: {}", String::from_utf8_lossy(&f.payload)),
-        }
+        print_frame(&f);
         stmt.clear();
+    }
+}
+
+/// Print one response frame (rows table / affected count / error).
+fn print_frame(f: &Frame) {
+    match f.frame_type {
+        proto::RESP_ROWS => {
+            if let Ok(Value::Object(o)) =
+                docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
+            {
+                let columns = match o.get("columns") {
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    _ => vec![],
+                };
+                let rows: Vec<Vec<Value>> = match o.get("rows") {
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .map(|r| match r {
+                            Value::Array(items) => items.clone(),
+                            _ => vec![],
+                        })
+                        .collect(),
+                    _ => vec![],
+                };
+                print_rows(&QueryResult { columns, rows });
+            } else {
+                eprintln!("protocol error: undecodable rows payload");
+            }
+        }
+        proto::RESP_AFFECTED => {
+            let n = f
+                .payload
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .map_or(0, u64::from_le_bytes);
+            println!("({n} rows affected)");
+        }
+        _ => println!("error: {}", String::from_utf8_lossy(&f.payload)),
     }
 }
 
@@ -300,6 +572,60 @@ mod tests {
         assert_eq!(lines[2].chars().count(), lines[3].chars().count());
         // 分隔线只含 - 与 +
         assert!(lines[1].chars().all(|c| c == '-' || c == '+'));
+    }
+
+    #[test]
+    fn pubsub_command_parsing() {
+        match parse_pubsub_command("subscribe news earliest;") {
+            Some(PubsubCmd::Subscribe {
+                name,
+                from,
+                pattern: false,
+            }) => {
+                assert_eq!((name.as_str(), from.as_str()), ("news", "earliest"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_pubsub_command("PSUBSCRIBE news.*") {
+            Some(PubsubCmd::Subscribe {
+                name,
+                from,
+                pattern: true,
+            }) => {
+                assert_eq!((name.as_str(), from.as_str()), ("news.*", "latest"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_pubsub_command("unsubscribe;") {
+            Some(PubsubCmd::Unsubscribe {
+                name: None,
+                pattern: false,
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        match parse_pubsub_command("publish ch hello wide world;") {
+            Some(PubsubCmd::Publish { channel, payload }) => {
+                assert_eq!(channel, "ch");
+                assert_eq!(payload, "hello wide world");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_pubsub_command("pubsub trim ch 2;") {
+            Some(PubsubCmd::Trim { channel, keep }) => {
+                assert_eq!((channel.as_str(), keep), ("ch", 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Not pub/sub: SQL falls through untouched.
+        assert!(parse_pubsub_command("SELECT * FROM t;").is_none());
+        assert!(parse_pubsub_command("publish").is_none());
+    }
+
+    #[test]
+    fn json_escape_specials() {
+        assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape("x\u{1}y"), "x\\u0001y");
     }
 
     #[test]

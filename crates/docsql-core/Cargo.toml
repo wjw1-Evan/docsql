@@ -3,7 +3,7 @@ name = "docsql-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "docsql embedded core: document storage engine + SQL execution"
+description = "DocSQL embedded core: document storage engine + SQL execution"
 
 [dependencies]
 thiserror.workspace = true

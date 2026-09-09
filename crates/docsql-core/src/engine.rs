@@ -18,6 +18,24 @@ use sqlparser::parser::Parser;
 use std::cmp::Ordering;
 
 pub const CATALOG_PAGE: u32 = 1;
+/// Catalog payload paginates across a chain of pages: page 1 carries
+/// `CATALOG_MAGIC`, the total payload length and the next overflow page id
+/// (0 = end); every overflow page repeats the same 16-byte header. The old
+/// single-page catalog capped a database at ~4 KB of metadata (one full page
+/// id list eats that in ~800 heap pages, i.e. a few MB of rows) and then
+/// failed every write that allocated a page. Pages are append-only and never
+/// reused, so overflow pages orphaned by a shrinking catalog are just dead
+/// space. The payload still contains each table's page-id list, so a save is
+/// O(catalog bytes) — acceptable because saves only fire on page allocation
+/// and DDL, both sublinear in row count.
+const CATALOG_MAGIC: &[u8; 8] = b"DOCSCAT2";
+const CATALOG_HDR: usize = 16;
+const CATALOG_CHUNK: usize = PAGE_SIZE - CATALOG_HDR;
+
+/// System table backing persistent pub/sub. Created by docsql-server at
+/// startup; hidden from user-facing catalogs (read through the server's
+/// `docsql_pubsub` view instead).
+pub const PUBSUB_TABLE: &str = "_pubsub_messages";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -64,6 +82,16 @@ pub enum TxControl {
     None,
 }
 
+/// One statement parsed once for a whole server round-trip: the AST feeds
+/// [`Database::execute_parsed`], while `tx`/`is_write` route the request
+/// (write path, transaction control, replication timing) without re-parsing
+/// the text.
+pub struct ParsedStatement {
+    pub stmt: Statement,
+    pub tx: TxControl,
+    pub is_write: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -78,6 +106,9 @@ pub struct ColumnInfo {
     pub primary_key: bool,
     pub unique: bool,
     pub autoinc: bool,
+    /// Declared type where the engine tracks one ("GUID" for auto-generated
+    /// GUID columns, "ANY" otherwise). Tooling uses it to round-trip DDL.
+    pub data_type: String,
 }
 
 /// Read-only catalog snapshot of one table.
@@ -88,7 +119,23 @@ pub struct TableInfo {
     /// Constraint indexes: PRIMARY KEY column first, then UNIQUE columns.
     pub keys: Vec<String>,
     pub indexes: Vec<String>,
+    /// CREATE INDEX definitions (name/column/unique) for tooling: the
+    /// explorer and the console's script generator need the column and
+    /// uniqueness behind each name, not just the name list.
+    pub index_defs: Vec<IndexInfo>,
     pub pages: usize,
+}
+
+/// One CREATE INDEX definition as recorded in the catalog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub column: String,
+    pub unique: bool,
+    /// PRIMARY KEY / UNIQUE constraint index, auto-created with the table
+    /// (SQLite-style `sqlite_autoindex_*` name). Derived, never persisted,
+    /// and not droppable/editable through DROP INDEX / CREATE INDEX.
+    pub auto: bool,
 }
 
 /// Outcome of a multi-statement batch: statements run in order and the run
@@ -119,6 +166,10 @@ struct TableMeta {
     unique: Vec<String>,
     not_null: Vec<String>,
     autoinc: Option<String>,
+    /// Auto-generated GUID column (GUID/UUID/UNIQUEIDENTIFIER/UUIDV7 type
+    /// plus AUTOINCREMENT/AUTOGENERATE): INSERT fills a time-ordered UUIDv7
+    /// when the value is omitted or NULL.
+    autoguid: Option<String>,
     /// Index names registered on this table (catalog-level v1; B+ tree
     /// backing arrives with the index-integration milestone).
     indexes: Vec<String>,
@@ -257,6 +308,12 @@ pub struct Database {
     /// heap). Invalidated by rewrites/deletes; not persisted — recomputed
     /// after restart, preserving max(existing)+1 semantics.
     autoinc_cache: std::collections::HashMap<String, i64>,
+    /// Canonical rewrite of the last executed statement when it auto-filled
+    /// GUID values (explicit generated ids embedded). Replicating callers
+    /// must forward this text instead of the original: random GUIDs cannot
+    /// be re-derived on peers the way AUTOINCREMENT's deterministic max+1
+    /// can. Reset at the start of every statement; see `take_resolved_insert`.
+    resolved_insert: Option<String>,
 }
 
 impl Database {
@@ -303,9 +360,37 @@ impl Database {
             pager.commit_tx(tx)?;
         }
         let mut tables = std::collections::BTreeMap::new();
-        let page = pager.read_page(CATALOG_PAGE)?.to_vec();
-        if page.iter().any(|&b| b != 0) {
-            let (v, _) = encode::decode_prefix(&page)?;
+        // New format: a magic-headed chain of pages. Legacy databases keep a
+        // raw encoded catalog on page 1 — decode it in place; the first
+        // catalog save rewrites it in the new format.
+        let raw = pager.read_page(CATALOG_PAGE)?.to_vec();
+        let cat_bytes: Option<Vec<u8>> = if raw.starts_with(CATALOG_MAGIC) {
+            let total = u32::from_le_bytes(raw[8..12].try_into().expect("header fits")) as usize;
+            let mut data = raw[CATALOG_HDR..].to_vec();
+            let mut next = u32::from_le_bytes(raw[12..16].try_into().expect("header fits"));
+            while next != 0 {
+                if next >= pager.num_pages() {
+                    return err("catalog chain is corrupt (dangling overflow page)");
+                }
+                let page = pager.read_page(next)?.to_vec();
+                if !page.starts_with(CATALOG_MAGIC) {
+                    return err("catalog chain is corrupt (overflow page without magic)");
+                }
+                data.extend_from_slice(&page[CATALOG_HDR..]);
+                next = u32::from_le_bytes(page[12..16].try_into().expect("header fits"));
+            }
+            if data.len() < total {
+                return err("catalog chain is corrupt (payload shorter than header length)");
+            }
+            data.truncate(total);
+            Some(data)
+        } else if raw.iter().any(|&b| b != 0) {
+            Some(raw)
+        } else {
+            None
+        };
+        if let Some(bytes) = cat_bytes {
+            let (v, _) = encode::decode_prefix(&bytes)?;
             if let Value::Object(o) = v {
                 if let Some(Value::Object(t)) = o.get("tables") {
                     for (name, meta) in t {
@@ -332,6 +417,8 @@ impl Database {
                             let not_null = str_list(m, "not_null");
                             let autoinc =
                                 m.get("autoinc").and_then(|v| v.as_str()).map(String::from);
+                            let autoguid =
+                                m.get("autoguid").and_then(|v| v.as_str()).map(String::from);
                             let index_defs = match m.get("index_defs") {
                                 Some(Value::Array(a)) => a
                                     .iter()
@@ -413,6 +500,7 @@ impl Database {
                                     unique,
                                     not_null,
                                     autoinc,
+                                    autoguid,
                                     indexes,
                                     index_defs,
                                     constraint_unique,
@@ -436,6 +524,7 @@ impl Database {
             tx_snapshot: None,
             ctes: std::collections::BTreeMap::new(),
             autoinc_cache: std::collections::HashMap::new(),
+            resolved_insert: None,
         })
     }
 
@@ -460,6 +549,17 @@ impl Database {
             );
             if let Some(pk) = &meta.primary_key {
                 m.insert("primary_key".into(), Value::Str(pk.clone()));
+            }
+            // AUTOINCREMENT column must survive reopen: dropping it silently
+            // turns the column into a plain nullable INT (inserts stop
+            // assigning ids after a restart).
+            if let Some(col) = &meta.autoinc {
+                m.insert("autoinc".into(), Value::Str(col.clone()));
+            }
+            // Auto-generated GUID column must survive reopen for the same
+            // reason as AUTOINCREMENT.
+            if let Some(col) = &meta.autoguid {
+                m.insert("autoguid".into(), Value::Str(col.clone()));
             }
             if !meta.unique.is_empty() {
                 m.insert(
@@ -558,18 +658,58 @@ impl Database {
         let mut cat = Object::new();
         cat.insert("tables".into(), Value::Object(tables));
         let bytes = encode::encode_to_vec(&Value::Object(cat))?;
-        if bytes.len() > PAGE_SIZE {
-            // The catalog is a single page; overflowing must be a clean
-            // error, not a slice panic that wedges every later write.
-            return err(format!(
-                "catalog too large ({} bytes, max {PAGE_SIZE}): too many tables or heap pages; \
-                 drop tables to shrink metadata",
-                bytes.len()
-            ));
+        self.write_catalog_pages(tx, &bytes)?;
+        Ok(())
+    }
+
+    /// Walk the committed catalog chain, starting at `CATALOG_PAGE`. A page 1
+    /// without the magic (a legacy single-page catalog, or an empty database)
+    /// is treated as a fresh one-page chain — its content is about to be
+    /// rewritten in the new format anyway.
+    fn catalog_chain(&mut self) -> Result<Vec<u32>> {
+        let first = self.pager.read_page(CATALOG_PAGE)?;
+        if !first.starts_with(CATALOG_MAGIC) {
+            return Ok(vec![CATALOG_PAGE]);
         }
-        let mut page = vec![0u8; PAGE_SIZE];
-        page[..bytes.len()].copy_from_slice(&bytes);
-        self.pager.write_page(tx, CATALOG_PAGE, 0, &page)?;
+        let mut chain = vec![CATALOG_PAGE];
+        loop {
+            let last = *chain.last().expect("seeded above");
+            let page = self.pager.read_page(last)?;
+            let next = u32::from_le_bytes(page[12..16].try_into().expect("header fits"));
+            if next == 0 {
+                return Ok(chain);
+            }
+            chain.push(next);
+            // A damaged chain must surface as an error, not loop forever:
+            // every link is a distinct page in the file.
+            if chain.len() > self.pager.num_pages() as usize {
+                return err("catalog chain is corrupt (cycle or dangling overflow page)");
+            }
+        }
+    }
+
+    /// Stage the catalog payload across its page chain inside `tx`, growing
+    /// the chain by freshly allocated pages when the payload outgrew it.
+    fn write_catalog_pages(&mut self, tx: &mut crate::pager::Tx, bytes: &[u8]) -> Result<()> {
+        let need = bytes.len().div_ceil(CATALOG_CHUNK).max(1);
+        let mut chain = self.catalog_chain()?;
+        while chain.len() < need {
+            let id = self.pager.allocate_page(tx)?;
+            chain.push(id);
+        }
+        for i in 0..need {
+            let start = i * CATALOG_CHUNK;
+            let end = (start + CATALOG_CHUNK).min(bytes.len());
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[..8].copy_from_slice(CATALOG_MAGIC);
+            if i == 0 {
+                page[8..12].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            }
+            let next = if i + 1 < need { chain[i + 1] } else { 0 };
+            page[12..16].copy_from_slice(&next.to_le_bytes());
+            page[CATALOG_HDR..CATALOG_HDR + (end - start)].copy_from_slice(&bytes[start..end]);
+            self.pager.write_page(tx, chain[i], 0, &page)?;
+        }
         Ok(())
     }
     fn save_catalog(&mut self) -> Result<()> {
@@ -579,15 +719,19 @@ impl Database {
         Ok(())
     }
 
-    fn snapshot_all(&mut self) -> std::collections::BTreeMap<String, (TableMeta, Vec<Object>)> {
+    fn snapshot_all(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, (TableMeta, Vec<Object>)>> {
         let names: Vec<String> = self.tables.keys().cloned().collect();
         let mut snap = std::collections::BTreeMap::new();
         for name in names {
             let meta = self.tables.get(&name).cloned().unwrap_or_default();
-            let docs = self.table_docs(&name).unwrap_or_default();
+            // A read failure must surface: snapshotting an unreadable table
+            // as empty would turn the next ROLLBACK into a permanent wipe.
+            let docs = self.table_docs(&name)?;
             snap.insert(name, (meta, docs));
         }
-        snap
+        Ok(snap)
     }
 
     fn rollback_tx(&mut self) -> Result<ExecOutcome> {
@@ -609,7 +753,7 @@ impl Database {
         if self.tx_snapshot.is_none() {
             return err("SAVEPOINT requires an active transaction");
         }
-        let snap = self.snapshot_all();
+        let snap = self.snapshot_all()?;
         self.savepoints.push((name.to_string(), snap));
         Ok(ExecOutcome::Affected(0))
     }
@@ -644,20 +788,59 @@ impl Database {
     pub fn is_write_statement(sql: &str) -> bool {
         match Parser::parse_sql(&GenericDialect {}, sql) {
             Ok(stmts) => match stmts.first() {
-                Some(Statement::Query(_)) | Some(Statement::Pragma { .. }) | None => false,
-                // Session-local transaction control: replicate only the data
-                // statements inside, never BEGIN/COMMIT/ROLLBACK themselves.
-                Some(
-                    Statement::StartTransaction { .. }
-                    | Statement::Commit { .. }
-                    | Statement::Rollback { .. }
-                    | Statement::Savepoint { .. }
-                    | Statement::ReleaseSavepoint { .. },
-                ) => false,
-                Some(_) => true,
+                Some(stmt) => Self::stmt_is_write(stmt),
+                // An empty batch writes nothing.
+                None => false,
             },
             Err(_) => true,
         }
+    }
+
+    /// Write classification of an already-parsed statement: everything
+    /// except queries, PRAGMA shims and session-local transaction control
+    /// mutates data (transaction control replicates only its inner data
+    /// statements, never BEGIN/COMMIT/ROLLBACK themselves).
+    fn stmt_is_write(stmt: &Statement) -> bool {
+        !matches!(
+            stmt,
+            Statement::Query(_)
+                | Statement::Pragma { .. }
+                | Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+                | Statement::Savepoint { .. }
+                | Statement::ReleaseSavepoint { .. }
+        )
+    }
+
+    /// Transaction-control classification of an already-parsed statement.
+    fn classify_tx(stmt: &Statement) -> TxControl {
+        match stmt {
+            Statement::StartTransaction { .. } => TxControl::Begin,
+            Statement::Commit { .. } => TxControl::Commit,
+            Statement::Rollback { savepoint, .. } => TxControl::Rollback {
+                savepoint: savepoint.as_ref().map(|i| i.value.clone()),
+            },
+            Statement::Savepoint { name } => TxControl::Savepoint(name.value.clone()),
+            Statement::ReleaseSavepoint { name } => TxControl::Release(name.value.clone()),
+            _ => TxControl::None,
+        }
+    }
+
+    /// Parse a single statement once and classify it in the same pass: the
+    /// AST feeds [`Database::execute_parsed`], the flags route the request
+    /// (write path, transaction control) without re-parsing the text.
+    pub fn parse_classified(sql: &str) -> Result<ParsedStatement> {
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)
+            .map_err(|e| SqlError::Parse(e.to_string()))?;
+        let stmt = match stmts.len() {
+            0 => return err("empty statement"),
+            1 => stmts.swap_remove(0),
+            _ => return err("exactly one statement per execute() call"),
+        };
+        let tx = Self::classify_tx(&stmt);
+        let is_write = Self::stmt_is_write(&stmt);
+        Ok(ParsedStatement { stmt, tx, is_write })
     }
 
     /// True when a session transaction is open.
@@ -673,29 +856,25 @@ impl Database {
             return TxControl::None;
         };
         match stmts.first() {
-            Some(Statement::StartTransaction { .. }) => TxControl::Begin,
-            Some(Statement::Commit { .. }) => TxControl::Commit,
-            Some(Statement::Rollback { savepoint, .. }) => TxControl::Rollback {
-                savepoint: savepoint.as_ref().map(|i| i.value.clone()),
-            },
-            Some(Statement::Savepoint { name }) => TxControl::Savepoint(name.value.clone()),
-            Some(Statement::ReleaseSavepoint { name }) => TxControl::Release(name.value.clone()),
-            _ => TxControl::None,
+            Some(stmt) => Self::classify_tx(stmt),
+            None => TxControl::None,
         }
     }
 
     /// Execute exactly one SQL statement.
     pub fn execute(&mut self, sql: &str) -> Result<ExecOutcome> {
-        let stmts = Parser::parse_sql(&GenericDialect {}, sql)
-            .map_err(|e| SqlError::Parse(e.to_string()))?;
-        match stmts.len() {
-            0 => err("empty statement"),
-            1 => {
-                self.ctes.clear();
-                self.exec_stmt(stmts.into_iter().next().unwrap())
-            }
-            _ => err("exactly one statement per execute() call"),
+        match Self::parse_classified(sql) {
+            Ok(parsed) => self.execute_parsed(parsed),
+            Err(e) => Err(e),
         }
+    }
+
+    /// Execute an already-parsed statement — the parse-once path servers
+    /// use after [`Database::parse_classified`] routed the request.
+    pub fn execute_parsed(&mut self, parsed: ParsedStatement) -> Result<ExecOutcome> {
+        self.ctes.clear();
+        self.resolved_insert = None;
+        self.exec_stmt(parsed.stmt)
     }
 
     /// Parse-check a statement batch without executing anything (the web
@@ -739,6 +918,7 @@ impl Database {
         let mut outcomes = Vec::new();
         for (i, stmt) in stmts.into_iter().enumerate() {
             self.ctes.clear();
+            self.resolved_insert = None;
             match self.exec_stmt(stmt) {
                 Ok(o) => outcomes.push(o),
                 Err(e) => {
@@ -760,33 +940,199 @@ impl Database {
         }
     }
 
+    /// Take the canonical rewrite of the last statement, present only when
+    /// it auto-filled GUID values. Replicating callers replace the original
+    /// statement text with this one so peers apply the exact generated ids.
+    pub fn take_resolved_insert(&mut self) -> Option<String> {
+        self.resolved_insert.take()
+    }
+
+    /// PRIMARY KEY / UNIQUE constraint indexes as named entries,
+    /// SQLite-style: `sqlite_autoindex_<table>_<n>`, PK column first.
+    /// Derived from table-declared constraints only — columns that got a
+    /// UNIQUE index through CREATE INDEX already have a named definition —
+    /// and never written to the catalog, so already-deployed databases
+    /// gain them on upgrade with no migration, and the names are identical
+    /// on every peer (recomputed from the replicated DDL).
+    fn autoindex_defs(table: &str, meta: &TableMeta) -> Vec<IndexInfo> {
+        let mut cols: Vec<&String> = Vec::new();
+        for c in meta.primary_key.iter().chain(meta.constraint_unique.iter()) {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
+        cols.into_iter()
+            .enumerate()
+            .map(|(i, c)| IndexInfo {
+                name: format!("sqlite_autoindex_{table}_{}", i + 1),
+                column: (*c).clone(),
+                unique: true,
+                auto: true,
+            })
+            .collect()
+    }
+
     /// Read-only catalog snapshot for tooling (object explorer, drivers).
     pub fn catalog(&self) -> Vec<TableInfo> {
         self.tables
             .iter()
-            .map(|(name, meta)| TableInfo {
-                name: name.clone(),
-                columns: meta
-                    .columns
-                    .iter()
-                    .map(|c| ColumnInfo {
-                        name: c.clone(),
-                        nullable: !meta.not_null.contains(c),
-                        primary_key: meta.primary_key.as_deref() == Some(c.as_str()),
-                        unique: meta.unique.contains(c),
-                        autoinc: meta.autoinc.as_deref() == Some(c.as_str()),
-                    })
-                    .collect(),
-                keys: meta
-                    .primary_key
-                    .iter()
-                    .chain(meta.unique.iter())
-                    .cloned()
-                    .collect(),
-                indexes: meta.indexes.clone(),
-                pages: meta.pages.len(),
+            .map(|(name, meta)| {
+                let auto = Self::autoindex_defs(name, meta);
+                TableInfo {
+                    name: name.clone(),
+                    columns: meta
+                        .columns
+                        .iter()
+                        .map(|c| ColumnInfo {
+                            name: c.clone(),
+                            nullable: !meta.not_null.contains(c),
+                            primary_key: meta.primary_key.as_deref() == Some(c.as_str()),
+                            unique: meta.unique.contains(c),
+                            autoinc: meta.autoinc.as_deref() == Some(c.as_str())
+                                || meta.autoguid.as_deref() == Some(c.as_str()),
+                            data_type: if meta.autoguid.as_deref() == Some(c.as_str()) {
+                                "GUID".to_string()
+                            } else {
+                                "ANY".to_string()
+                            },
+                        })
+                        .collect(),
+                    keys: meta
+                        .primary_key
+                        .iter()
+                        .chain(meta.unique.iter())
+                        .cloned()
+                        .collect(),
+                    indexes: auto
+                        .iter()
+                        .map(|i| i.name.clone())
+                        .chain(meta.indexes.iter().cloned())
+                        .collect(),
+                    index_defs: auto
+                        .into_iter()
+                        .chain(meta.index_defs.iter().map(|(n, c, u)| IndexInfo {
+                            name: n.clone(),
+                            column: c.clone(),
+                            unique: *u,
+                            auto: false,
+                        }))
+                        .collect(),
+                    pages: meta.pages.len(),
+                }
             })
             .collect()
+    }
+
+    /// Observed (data-derived) column names for one table: the union of
+    /// top-level field names across its documents — the same projection
+    /// `SELECT *` builds for a non-empty table. Declared columns
+    /// (`catalog()`) are the constraint/introspection surface and never
+    /// auto-sync with data; this is the data-side counterpart. It scans
+    /// the table, so only deliberate introspection surfaces (object
+    /// explorer) should call it. Unknown tables yield an empty list.
+    pub fn observed_columns(&mut self, table: &str) -> Vec<String> {
+        if !self.tables.contains_key(table) {
+            return Vec::new();
+        }
+        self.table_docs(table)
+            .map(|d| union_of_fields(&d))
+            .unwrap_or_default()
+    }
+
+    /// Full logical dump as a SQL script: all DDL first, then all data.
+    /// System storage (`_pubsub_messages`) is skipped — its ids are
+    /// node-local and it is not user data. The join protocol replays this
+    /// inside one transaction on a fresh node to bootstrap the cluster's
+    /// current state; every CREATE precedes every INSERT, so FOREIGN KEY
+    /// declarations are safe in the DDL phase (referential checks run at
+    /// insert time). Applying the script replaces tables wholesale
+    /// (DROP + CREATE prefix), so re-applying is idempotent.
+    pub fn dump_script(&mut self) -> Result<String> {
+        let names: Vec<String> = self
+            .tables
+            .keys()
+            .filter(|n| *n != PUBSUB_TABLE)
+            .cloned()
+            .collect();
+        let mut ddl = String::new();
+        for name in &names {
+            let meta = self.tables.get(name).cloned().unwrap();
+            ddl.push_str(&format!("DROP TABLE IF EXISTS {};\n", quote_ident(name)));
+            ddl.push_str(&format!("CREATE TABLE {} (\n", quote_ident(name)));
+            let mut parts: Vec<String> = Vec::new();
+            for col in &meta.columns {
+                let mut def = quote_ident(col);
+                if meta.autoguid.as_deref() == Some(col.as_str()) {
+                    def.push_str(" GUID AUTOINCREMENT");
+                } else if meta.autoinc.as_deref() == Some(col.as_str()) {
+                    def.push_str(" INT AUTOINCREMENT");
+                } else {
+                    // Declared types are not enforced (document storage);
+                    // TEXT round-trips the column shape without pretending
+                    // to preserve the original declaration.
+                    def.push_str(" TEXT");
+                }
+                if meta.primary_key.as_deref() == Some(col.as_str()) {
+                    def.push_str(" PRIMARY KEY");
+                }
+                if meta.constraint_unique.contains(col) {
+                    def.push_str(" UNIQUE");
+                }
+                if meta.not_null.contains(col) {
+                    def.push_str(" NOT NULL");
+                }
+                if let Some((_, expr)) = meta.defaults.iter().find(|(c, _)| c == col) {
+                    def.push_str(&format!(" DEFAULT ({expr})"));
+                }
+                parts.push(def);
+            }
+            for chk in &meta.checks {
+                parts.push(format!("CHECK ({chk})"));
+            }
+            for (lc, rt, rc) in &meta.foreign_keys {
+                parts.push(format!(
+                    "FOREIGN KEY ({}) REFERENCES {} ({})",
+                    quote_ident(lc),
+                    quote_ident(rt),
+                    quote_ident(rc)
+                ));
+            }
+            ddl.push_str(&parts.join(",\n"));
+            ddl.push_str("\n);\n");
+            for (iname, icol, unique) in &meta.index_defs {
+                ddl.push_str(&format!(
+                    "CREATE {}INDEX {} ON {} ({});\n",
+                    if *unique { "UNIQUE " } else { "" },
+                    quote_ident(iname),
+                    quote_ident(name),
+                    quote_ident(icol)
+                ));
+            }
+        }
+        // Insert order must respect FK dependencies: referenced tables
+        // first. Catalog iteration is alphabetical, so without this a
+        // child table's rows could replay before its parent's and fail
+        // the per-row FK check.
+        let mut dml = String::new();
+        for name in fk_dependency_order(&names, &self.tables) {
+            for doc in self.table_docs(&name)? {
+                let cols: Vec<String> = doc.keys().cloned().collect();
+                let vals = cols
+                    .iter()
+                    .map(|c| value_literal(&doc[c]))
+                    .collect::<Result<Vec<_>>>()?;
+                dml.push_str(&format!(
+                    "INSERT INTO {} ({}) VALUES ({});\n",
+                    quote_ident(&name),
+                    cols.iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    vals.join(", ")
+                ));
+            }
+        }
+        Ok(ddl + &dml)
     }
 
     /// Page size of the underlying storage file.
@@ -797,6 +1143,12 @@ impl Database {
     /// Number of allocated pages.
     pub fn num_pages(&self) -> u32 {
         self.pager.num_pages_now()
+    }
+
+    /// Last WAL LSN known durable; nodes that received the same writes should
+    /// report converging values.
+    pub fn durable_lsn(&self) -> u64 {
+        self.pager.durable_lsn()
     }
 
     fn exec_stmt(&mut self, stmt: Statement) -> Result<ExecOutcome> {
@@ -811,6 +1163,12 @@ impl Database {
                 if object_type == sqlparser::ast::ObjectType::Index {
                     for n in &names {
                         let iname = obj_name(n);
+                        // Constraint indexes are derived from the table's
+                        // PRIMARY KEY/UNIQUE declarations (SQLite semantics).
+                        if iname.starts_with("sqlite_autoindex_") {
+                            return err("index associated with UNIQUE or PRIMARY KEY constraint \
+                                 cannot be dropped");
+                        }
                         let mut found = false;
                         for meta in self.tables.values_mut() {
                             if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
@@ -846,11 +1204,38 @@ impl Database {
                 if object_type != sqlparser::ast::ObjectType::Table {
                     return err("only DROP TABLE/INDEX are supported");
                 }
-                for n in &names {
-                    let name = obj_name(n);
-                    if self.tables.remove(&name).is_none() && !if_exists {
+                // Validate every target before touching the catalog: a missing
+                // name mid-list must not leave earlier drops applied in memory
+                // only, and dropping a table other tables still reference
+                // leaves dangling FKs (their inserts fail and the join
+                // snapshot can never replay).
+                let dropping: Vec<String> = names.iter().map(obj_name).collect();
+                for name in &dropping {
+                    if !self.tables.contains_key(name) {
+                        if if_exists {
+                            continue;
+                        }
                         return err(format!("table {name} does not exist"));
                     }
+                    let referencing: Vec<&str> = self
+                        .tables
+                        .iter()
+                        .filter(|(t, m)| {
+                            t.as_str() != name.as_str()
+                                && !dropping.iter().any(|d| d == t.as_str())
+                                && m.foreign_keys.iter().any(|(_, rt, _)| rt == name)
+                        })
+                        .map(|(t, _)| t.as_str())
+                        .collect();
+                    if !referencing.is_empty() {
+                        return err(format!(
+                            "cannot drop table {name}: referenced by FOREIGN KEY in {}",
+                            referencing.join(", ")
+                        ));
+                    }
+                }
+                for name in &dropping {
+                    self.tables.remove(name);
                 }
                 self.save_catalog()?;
                 Ok(ExecOutcome::Affected(0))
@@ -876,7 +1261,7 @@ impl Database {
                 if self.tx_snapshot.is_some() {
                     return err("transaction already in progress");
                 }
-                self.tx_snapshot = Some(self.snapshot_all());
+                self.tx_snapshot = Some(self.snapshot_all()?);
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Commit { .. } => {
@@ -945,11 +1330,28 @@ impl Database {
             pairs.push((loc, doc.clone()));
         }
         let roots = self.build_trees(&mut tx, &pairs, &cols)?;
+        // Keep the previous catalog entry so a failed persist can restore the
+        // in-memory map — after `?` below the tx is dropped and its staged
+        // pages never reach the data file; the map must not keep pointing at
+        // them, or a later successful save would persist the ghost pages and
+        // orphan the real data.
+        let prev_meta = self.tables.get(table).cloned();
         meta.pages = heap.pages;
         meta.index_roots = roots;
         self.autoinc_cache.remove(table);
         self.tables.insert(table.to_string(), meta.clone());
-        self.save_catalog_into(&mut tx)?;
+        if let Err(e) = self.save_catalog_into(&mut tx) {
+            match prev_meta {
+                Some(old) => {
+                    *meta = old.clone();
+                    self.tables.insert(table.to_string(), old);
+                }
+                None => {
+                    self.tables.remove(table);
+                }
+            }
+            return Err(e);
+        }
         self.commit_pager_tx(tx)?;
         Ok(())
     }
@@ -998,11 +1400,12 @@ impl Database {
         }
         let mut max: i64 = 0;
         if let Some(col) = &meta.autoinc {
+            // Propagate read errors: defaulting to an empty scan would cache
+            // a reset counter and hand out ids that collide after restart.
             let docs = Heap {
                 pages: meta.pages.clone(),
             }
-            .scan(&mut self.pager)
-            .unwrap_or_default();
+            .scan(&mut self.pager)?;
             for d in &docs {
                 if let Some(Value::Int(i)) = d.get(col) {
                     max = max.max(*i);
@@ -1040,23 +1443,26 @@ impl Database {
         let tree = BTree::open(root);
         let pairs = match plan {
             ProbePlan::Eq(v) => {
-                // range_from + equal filter so non-unique trees return
+                // Bounded range + equal filter so non-unique trees return
                 // every duplicate match (get() would yield one entry).
+                // The hi bound lets the tree stop at the first key past v
+                // instead of walking the whole right side.
                 let mut p = tree
-                    .range_from(&mut self.pager, &tx, &v)
+                    .range_bounded(&mut self.pager, &tx, &v, Some((&v, true)))
                     .map_err(|e| index_err(&col, e))?;
                 p.retain(|(k, _)| Value::cmp_values(k, &v) == Ordering::Equal);
                 p
             }
             ProbePlan::Range { lo, hi } => {
+                let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
                 let mut pairs = match &lo {
                     Some((v, true)) => tree
-                        .range_from(&mut self.pager, &tx, v)
+                        .range_bounded(&mut self.pager, &tx, v, hi_ref)
                         .map_err(|e| index_err(&col, e))?,
                     Some((v, false)) => {
                         // strict lower bound: start at v, then drop the equal run
                         let mut p = tree
-                            .range_from(&mut self.pager, &tx, v)
+                            .range_bounded(&mut self.pager, &tx, v, hi_ref)
                             .map_err(|e| index_err(&col, e))?;
                         p.retain(|(k, _)| Value::cmp_values(k, v) != std::cmp::Ordering::Equal);
                         p
@@ -1276,6 +1682,10 @@ impl Database {
                 continue; // probe col matched; some other conjunct did not
             }
             let mut doc = doc;
+            // The pre-update image must be captured before assignments run —
+            // it drives reindex_replace's old-key removal; pushing the mutated
+            // doc as both old and new leaves stale index entries behind.
+            let old_doc = doc.clone();
             for a in assignments {
                 let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target else {
                     return err("unsupported assignment target");
@@ -1286,7 +1696,7 @@ impl Database {
             }
             meta.check(&doc)?;
             self.check_fks(&meta, &doc)?;
-            updates.push((loc, doc.clone(), doc));
+            updates.push((loc, old_doc, doc));
         }
         if updates.is_empty() {
             if let Some(ret) = update_returning {
@@ -1300,8 +1710,22 @@ impl Database {
         let old_docs: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
         let new_docs: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
         self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
-        // Pre-statement docs for the legacy whole-set unique check below.
-        let all_docs: Vec<Object> = self.table_docs(&tname)?;
+        // Pre-statement docs for the legacy whole-set unique check below —
+        // loaded only when that check can actually run (a constraint column
+        // without a tree). Tables with full trees enforce uniqueness via
+        // reindex_replace; loading every doc here made single-row UPDATE
+        // loops quadratic.
+        let legacy_check = (meta.primary_key.is_some() || !meta.unique.is_empty())
+            && meta
+                .primary_key
+                .iter()
+                .chain(meta.unique.iter())
+                .any(|c| !meta.index_roots.contains_key(c));
+        let all_docs: Option<Vec<Object>> = if legacy_check {
+            Some(self.table_docs(&tname)?)
+        } else {
+            None
+        };
         let mut heap = Heap {
             pages: meta.pages.clone(),
         };
@@ -1349,35 +1773,43 @@ impl Database {
         // Legacy files whose constraint columns predate trees keep the
         // whole-set duplicate check (mirrors the INSERT path); tables with
         // trees enforce uniqueness through reindex_replace above.
-        let has_constraints = meta.primary_key.is_some() || !meta.unique.is_empty();
-        if has_constraints {
-            let treeless = meta
-                .primary_key
-                .iter()
-                .chain(meta.unique.iter())
-                .any(|c| !roots.contains_key(c));
-            if treeless {
-                let combined: Vec<Object> = all_docs
-                    .into_iter()
-                    .map(|d| match updates.iter().find(|(_, old, _)| *old == d) {
-                        Some((_, _, new)) => new.clone(),
-                        None => d,
-                    })
-                    .collect();
-                if let Err(e) = meta.check_unique(&combined) {
-                    self.pager.abort_tx(tx)?;
-                    return Err(e);
-                }
+        if legacy_check {
+            let combined: Vec<Object> = all_docs
+                .expect("pre-statement docs loaded for the legacy check")
+                .into_iter()
+                .map(|d| match updates.iter().find(|(_, old, _)| *old == d) {
+                    Some((_, _, new)) => new.clone(),
+                    None => d,
+                })
+                .collect();
+            if let Err(e) = meta.check_unique(&combined) {
+                self.pager.abort_tx(tx)?;
+                return Err(e);
             }
         }
         let pages_changed = heap.pages != meta.pages;
         let roots_changed = roots != meta.index_roots;
         if pages_changed || roots_changed {
+            let prev = self
+                .tables
+                .get(&tname)
+                .map(|m| (m.pages.clone(), m.index_roots.clone()));
             if let Some(m) = self.tables.get_mut(&tname) {
                 m.pages = heap.pages.clone();
                 m.index_roots = roots;
             }
-            self.save_catalog_into(&mut tx)?;
+            if let Err(e) = self.save_catalog_into(&mut tx) {
+                // The tx is dropped on this path, so its staged pages never
+                // reach the data file; the catalog map must not keep pointing
+                // at them or a later successful save persists ghost pages.
+                if let Some((pages, index_roots)) = prev {
+                    if let Some(m) = self.tables.get_mut(&tname) {
+                        m.pages = pages;
+                        m.index_roots = index_roots;
+                    }
+                }
+                return Err(e);
+            }
         }
         self.commit_pager_tx(tx)?;
         // Explicit ids may bump the AUTOINCREMENT watermark.
@@ -1537,11 +1969,26 @@ impl Database {
         let pages_changed = heap.pages != meta.pages;
         let roots_changed = roots != meta.index_roots;
         if pages_changed || roots_changed {
+            let prev = self
+                .tables
+                .get(&tname)
+                .map(|m| (m.pages.clone(), m.index_roots.clone()));
             if let Some(m) = self.tables.get_mut(&tname) {
                 m.pages = heap.pages.clone();
                 m.index_roots = roots;
             }
-            self.save_catalog_into(&mut tx)?;
+            if let Err(e) = self.save_catalog_into(&mut tx) {
+                // The tx is dropped on this path, so its staged pages never
+                // reach the data file; the catalog map must not keep pointing
+                // at them or a later successful save persists ghost pages.
+                if let Some((pages, index_roots)) = prev {
+                    if let Some(m) = self.tables.get_mut(&tname) {
+                        m.pages = pages;
+                        m.index_roots = index_roots;
+                    }
+                }
+                return Err(e);
+            }
         }
         self.commit_pager_tx(tx)?;
         // Deleted rows may have held the AUTOINCREMENT watermark.
@@ -1561,6 +2008,14 @@ impl Database {
             .as_ref()
             .map(obj_name)
             .unwrap_or_else(|| format!("idx_{}", table));
+        // Reserved for the table's own PRIMARY KEY/UNIQUE constraint
+        // indexes; a user index with such a name would shadow them.
+        if iname.starts_with("sqlite_autoindex_") {
+            return err(
+                "index names beginning with sqlite_autoindex_ are reserved for \
+                 PRIMARY KEY/UNIQUE constraint indexes",
+            );
+        }
         if idx.columns.len() != 1 {
             return err("only single-column indexes are supported");
         }
@@ -1683,6 +2138,9 @@ impl Database {
                         if meta.autoinc.as_deref() == Some(name.as_str()) {
                             meta.autoinc = None;
                         }
+                        if meta.autoguid.as_deref() == Some(name.as_str()) {
+                            meta.autoguid = None;
+                        }
                         // Indexes over the dropped column lose their
                         // definitions (trees above were already removed).
                         let dead: Vec<String> = meta
@@ -1737,6 +2195,9 @@ impl Database {
                     if meta.autoinc.as_deref() == Some(old.as_str()) {
                         meta.autoinc = Some(new.clone());
                     }
+                    if meta.autoguid.as_deref() == Some(old.as_str()) {
+                        meta.autoguid = Some(new.clone());
+                    }
                     if let Some(root) = meta.index_roots.remove(old) {
                         meta.index_roots.insert(new.clone(), root);
                     }
@@ -1782,6 +2243,14 @@ impl Database {
                             }
                         })
                         .collect();
+                    // CHECK texts reference the old column name; leaving them
+                    // stale silently disables the constraint (a missing column
+                    // reads as NULL -> unknown -> check skipped).
+                    meta.checks = meta
+                        .checks
+                        .iter()
+                        .map(|c| rename_ident_in_text(c, old, new))
+                        .collect();
                     let docs = self.table_docs(&tname)?;
                     let renamed: Vec<Object> = docs
                         .into_iter()
@@ -1799,6 +2268,11 @@ impl Database {
                         sqlparser::ast::RenameTableNameKind::As(n)
                         | sqlparser::ast::RenameTableNameKind::To(n) => obj_name(n),
                     };
+                    // rewrite_table would silently replace the target's entry
+                    // and orphan its data pages.
+                    if self.tables.contains_key(&new_name) {
+                        return err(format!("table {new_name} already exists"));
+                    }
                     let docs = self.table_docs(&tname)?;
                     self.tables.remove(&tname);
                     self.rewrite_table(&new_name, &mut meta, docs)?;
@@ -1908,6 +2382,35 @@ impl Database {
     /// Run a subquery and return its rows (first column only matters for
     /// IN/ANY lists, but scalar casts use the full first cell).
     fn subquery_result(&mut self, q: &Query) -> Result<QueryResult> {
+        // Correlated references (`outer_table.column`) must error instead of
+        // falling into the inner query's schemaless column lookup, where a
+        // missing column reads as NULL and silently mis-filters (NOT IN ()
+        // over an empty list is vacuously true — that shape deletes rows).
+        let mut from_names = std::collections::BTreeSet::new();
+        collect_from_names(q, &mut from_names);
+        let mut hits = Vec::new();
+        if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
+            if let Some(sel_expr) = &sel.selection {
+                collect_correlated_refs(sel_expr, &from_names, &self.tables, &mut hits);
+            }
+            if let Some(having) = &sel.having {
+                collect_correlated_refs(having, &from_names, &self.tables, &mut hits);
+            }
+            for item in &sel.projection {
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        collect_correlated_refs(e, &from_names, &self.tables, &mut hits);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(qualifier) = hits.first() {
+            return err(format!(
+                "correlated subqueries are not supported (reference to outer table {qualifier})"
+            ));
+        }
         match self.exec_query(q.clone())? {
             ExecOutcome::Rows(r) => Ok(r),
             _ => err("subquery must be a SELECT"),
@@ -2114,7 +2617,13 @@ impl Database {
                             .collect::<Vec<_>>()
                             .join(" ");
                         if text.contains("AUTOINCREMENT") || text.contains("AUTO_INCREMENT") {
-                            meta.autoinc = Some(col.name.value.clone());
+                            if is_guid_type(&col.data_type) {
+                                // GUID columns treat the auto flag as
+                                // UUIDv7 generation instead of max+1.
+                                meta.autoguid = Some(col.name.value.clone());
+                            } else {
+                                meta.autoinc = Some(col.name.value.clone());
+                            }
                         } else {
                             return err("unsupported column constraint");
                         }
@@ -2233,10 +2742,21 @@ impl Database {
         if rows.is_empty() {
             return err("INSERT has no rows");
         }
+        // INSERT ... SELECT into an auto-GUID table cannot be replicated:
+        // peers re-run the SELECT and would each fill their own random
+        // GUIDs, silently diverging. VALUES is required.
+        if meta.autoguid.is_some() && matches!(&*source.body, SetExpr::Select(_)) {
+            return err(
+                "auto-generated GUID columns do not support INSERT ... SELECT \
+                 (use INSERT ... VALUES, with or without explicit ids)",
+            );
+        }
         // Build all documents first, validate, and only then write — a
         // failed statement must leave the table untouched.
         // AUTOINCREMENT: append the column when the INSERT omits it, then
-        // assign max(id)+1 to missing/NULL values per row.
+        // assign max(id)+1 to missing/NULL values per row. Auto-generated
+        // GUID columns follow the same omitted/NULL fill with fresh
+        // time-ordered UUIDv7 values.
         let autoinc_appended = match &meta.autoinc {
             Some(col) if !columns.contains(col) => {
                 columns.push(col.clone());
@@ -2244,6 +2764,14 @@ impl Database {
             }
             _ => false,
         };
+        let autoguid_appended = match &meta.autoguid {
+            Some(col) if !columns.contains(col) => {
+                columns.push(col.clone());
+                true
+            }
+            _ => false,
+        };
+        let mut guid_filled = autoguid_appended;
         let mut next_autoinc = self.autoinc_next_for(&table, &meta)?;
         let mut new_docs: Vec<Object> = Vec::new();
         for row in rows {
@@ -2251,6 +2779,9 @@ impl Database {
             if autoinc_appended {
                 row.push(Value::Int(next_autoinc));
                 next_autoinc = next_autoinc.saturating_add(1);
+            }
+            if autoguid_appended {
+                row.push(Value::Str(crate::guid::uuidv7()));
             }
             if row.len() != columns.len() {
                 return err(format!(
@@ -2265,6 +2796,16 @@ impl Database {
                         if matches!(row.get(idx), Some(Value::Null) | None) {
                             row[idx] = Value::Int(next_autoinc);
                             next_autoinc = next_autoinc.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            if !autoguid_appended {
+                if let Some(col) = &meta.autoguid {
+                    if let Some(idx) = columns.iter().position(|c| c == col) {
+                        if matches!(row.get(idx), Some(Value::Null) | None) {
+                            row[idx] = Value::Str(crate::guid::uuidv7());
+                            guid_filled = true;
                         }
                     }
                 }
@@ -2301,6 +2842,42 @@ impl Database {
             Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_))
         ) {
             return err("ON DUPLICATE KEY UPDATE is not supported");
+        }
+        // Replication-safe rewrite: the statement as written would let every
+        // peer fill its own random GUIDs. Emit a canonical INSERT carrying
+        // the generated ids explicitly — with the conflict clause preserved
+        // so peers resolve the same conflicts against identical state.
+        if guid_filled {
+            let policy = if replace {
+                "OR REPLACE "
+            } else if do_nothing {
+                "OR IGNORE "
+            } else {
+                ""
+            };
+            let mut sql = format!("INSERT {}INTO {} (", policy, quote_ident(&table));
+            let cols: Vec<String> = new_docs
+                .first()
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default();
+            sql.push_str(
+                &cols
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            sql.push_str(") VALUES ");
+            let mut rendered = Vec::with_capacity(new_docs.len());
+            for doc in &new_docs {
+                let vals = cols
+                    .iter()
+                    .map(|c| value_literal(doc.get(c).unwrap_or(&Value::Null)))
+                    .collect::<Result<Vec<_>>>()?;
+                rendered.push(format!("({})", vals.join(", ")));
+            }
+            sql.push_str(&rendered.join(", "));
+            self.resolved_insert = Some(sql);
         }
 
         // One pager transaction for heap pages and index trees alike: a
@@ -2437,11 +3014,18 @@ impl Database {
         // whole-set duplicate check; tables with no constraints skip it.
         let has_constraints = meta.primary_key.is_some() || !meta.unique.is_empty();
         if has_constraints && indexed.is_empty() && !placed.is_empty() {
-            let mut combined = Heap {
+            // A failed scan must abort, not silently skip the unique check.
+            let mut combined = match (Heap {
                 pages: meta.pages.clone(),
             }
-            .scan(&mut self.pager)
-            .unwrap_or_default();
+            .scan(&mut self.pager))
+            {
+                Ok(docs) => docs,
+                Err(e) => {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e.into());
+                }
+            };
             combined.extend(placed.iter().map(|(_, d)| d.clone()));
             if let Err(e) = meta.check_unique(&combined) {
                 self.pager.abort_tx(tx)?;
@@ -2452,13 +3036,27 @@ impl Database {
         let pages_changed = heap.pages != meta.pages;
         let roots_changed = roots != meta.index_roots;
         if pages_changed || roots_changed {
+            let prev = self
+                .tables
+                .get(&table)
+                .map(|m| (m.pages.clone(), m.index_roots.clone()));
             let m = self
                 .tables
                 .get_mut(&table)
                 .expect("table existed at statement start");
             m.pages = heap.pages.clone();
             m.index_roots = roots;
-            self.save_catalog_into(&mut tx)?;
+            if let Err(e) = self.save_catalog_into(&mut tx) {
+                // Same ghost-page hazard as the update/delete paths: the tx is
+                // dropped, so restore the map to the on-disk truth.
+                if let Some((pages, index_roots)) = prev {
+                    if let Some(m) = self.tables.get_mut(&table) {
+                        m.pages = pages;
+                        m.index_roots = index_roots;
+                    }
+                }
+                return Err(e);
+            }
         }
         self.commit_pager_tx(tx)?;
         // AUTOINCREMENT counter: never regress, follow explicit max.
@@ -2644,19 +3242,49 @@ impl Database {
                 .iter()
                 .map(|(_, e)| eval_expr(e, &empty))
                 .collect::<Result<Vec<_>>>()?;
-            return Ok(ExecOutcome::Rows(QueryResult {
-                columns,
-                rows: vec![row],
-            }));
+            // FROM-less SELECT still honors LIMIT/OFFSET (`SELECT 1 LIMIT 0`
+            // must return zero rows, not one). ORDER BY over a single row
+            // cannot reorder anything.
+            let mut rows = vec![row];
+            match &query.limit_clause {
+                Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+                    let n = match limit {
+                        Some(e) => match eval_const(e)?.as_i64() {
+                            Some(n) if n >= 0 => n as usize,
+                            // Negative LIMIT means "no limit" (SQLite).
+                            _ => usize::MAX,
+                        },
+                        None => usize::MAX,
+                    };
+                    let skip = match offset {
+                        Some(o) => eval_const(&o.value)?.as_i64().unwrap_or(0).max(0) as usize,
+                        None => 0,
+                    };
+                    rows = rows.into_iter().skip(skip).take(n).collect();
+                }
+                // MySQL form `LIMIT <offset>, <count>` (order reversed).
+                Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                    let skip = eval_const(offset)?.as_i64().unwrap_or(0).max(0) as usize;
+                    let n = match eval_const(limit)?.as_i64() {
+                        Some(n) if n >= 0 => n as usize,
+                        _ => usize::MAX,
+                    };
+                    rows = rows.into_iter().skip(skip).take(n).collect();
+                }
+                None => {}
+            }
+            return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
         }
         let mut rows = self.load_from(&select.from, &select.selection)?;
 
-        // WHERE
+        // WHERE — consuming pass: matching docs move into the kept vec
+        // instead of being whole-document cloned (the filtered set is
+        // often the whole table).
         if let Some(cond) = &select.selection {
-            let mut kept = Vec::new();
-            for doc in &rows {
-                if matches!(eval_expr(cond, doc)?, Value::Bool(true)) {
-                    kept.push(doc.clone());
+            let mut kept = Vec::with_capacity(rows.len());
+            for doc in rows.drain(..) {
+                if matches!(eval_expr(cond, &doc)?, Value::Bool(true)) {
+                    kept.push(doc);
                 }
             }
             rows = kept;
@@ -2669,6 +3297,10 @@ impl Database {
         };
         if !group_exprs.is_empty() || select.projection.iter().any(is_agg_item) {
             return self.exec_grouped_select(query, select, rows, group_exprs);
+        }
+        if select.having.is_some() {
+            // Silently dropping the filter would return unfiltered rows.
+            return err("HAVING requires GROUP BY or an aggregate");
         }
         self.exec_plain_select(query, select, rows)
     }
@@ -2797,7 +3429,12 @@ impl Database {
             }
         }
         let columns_out: Vec<String> = if want_star {
-            union_of_fields(&rows)
+            // SELECT *, expr: star fields first, then the explicit
+            // projections (SQLite semantics) — dropping the exprs silently
+            // returned fewer columns than the statement asked for.
+            let mut cols = union_of_fields(&rows);
+            cols.extend(project.iter().map(|(n, _)| n.clone()));
+            cols
         } else {
             project.iter().map(|(n, _)| n.clone()).collect()
         };
@@ -2806,12 +3443,16 @@ impl Database {
         let mut out: Vec<Vec<Value>> = Vec::new();
         for doc in &docs {
             if want_star {
-                out.push(
-                    columns_out
-                        .iter()
-                        .map(|c| doc.get(c).cloned().unwrap_or(Value::Null))
-                        .collect(),
-                );
+                let mut row: Vec<Value> = columns_out
+                    .iter()
+                    .map(|c| doc.get(c).cloned().unwrap_or(Value::Null))
+                    .collect();
+                // The trailing project.len() slots are the explicit exprs.
+                let base = columns_out.len() - project.len();
+                for (i, (_, e)) in project.iter().enumerate() {
+                    row[base + i] = eval_expr(e, doc)?;
+                }
+                out.push(row);
             } else {
                 let mut row = Vec::with_capacity(project.len());
                 for (_, e) in &project {
@@ -2901,10 +3542,15 @@ impl Database {
                 row.push(eval_agg(spec, docs, key)?);
             }
             // HAVING: aggregates evaluate over the group's rows directly;
-            // everything else evaluates against the output columns.
+            // everything else evaluates against the output columns, with
+            // GROUP BY expressions consulted before them so unprojected
+            // group keys resolve instead of reading as NULL.
             if let Some(having) = &select.having {
                 let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
-                if !matches!(eval_having(having, &doc, docs)?, Value::Bool(true)) {
+                if !matches!(
+                    eval_having(having, &doc, docs, &group_exprs)?,
+                    Value::Bool(true)
+                ) {
                     continue;
                 }
             }
@@ -2936,11 +3582,12 @@ impl Database {
         let SqlExpr::Function(f) = e else {
             return err(format!("unsupported aggregate projection: {e}"));
         };
-        let (op, inner, distinct) = agg_parts(f)?;
+        let (op, inner, distinct, sep) = agg_parts(f)?;
         Ok(AggSpec::Agg {
             op,
             arg: inner,
             distinct,
+            sep,
         })
     }
 
@@ -3054,7 +3701,17 @@ impl Database {
                                 .into(),
                             ),
                         ),
-                        ("data_type".into(), Value::Str("ANY".into())),
+                        (
+                            "data_type".into(),
+                            Value::Str(
+                                if meta.autoguid.as_deref() == Some(col.as_str()) {
+                                    "GUID"
+                                } else {
+                                    "ANY"
+                                }
+                                .into(),
+                            ),
+                        ),
                     ]));
                 }
             }
@@ -3129,7 +3786,11 @@ impl Database {
         match &query.limit_clause {
             Some(LimitClause::LimitOffset { limit, offset, .. }) => {
                 let n = match limit {
-                    Some(e) => eval_const(e)?.as_i64().unwrap_or(i64::MAX).max(0) as usize,
+                    Some(e) => match eval_const(e)?.as_i64() {
+                        Some(n) if n >= 0 => n as usize,
+                        // Negative LIMIT means "no limit" (SQLite).
+                        _ => usize::MAX,
+                    },
                     None => usize::MAX,
                 };
                 let skip = match offset {
@@ -3141,7 +3802,10 @@ impl Database {
             // MySQL form `LIMIT <offset>, <count>` (order reversed).
             Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
                 let skip = eval_const(offset)?.as_i64().unwrap_or(0).max(0) as usize;
-                let n = eval_const(limit)?.as_i64().unwrap_or(i64::MAX).max(0) as usize;
+                let n = match eval_const(limit)?.as_i64() {
+                    Some(n) if n >= 0 => n as usize,
+                    _ => usize::MAX,
+                };
                 rows = rows.into_iter().skip(skip).take(n).collect();
             }
             None => {}
@@ -3169,13 +3833,15 @@ enum AggSpec {
         op: AggOp,
         arg: SqlExpr,
         distinct: bool,
+        sep: Option<String>,
     },
 }
 
 /// Parse a scalar-aggregate call (`COUNT(*)`, `SUM(DISTINCT x)`, ...) into
-/// its operator, argument, and DISTINCT flag. `COUNT(*)` rewrites to a
-/// sentinel column so the executor counts rows instead of non-null values.
-fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool)> {
+/// its operator, argument, DISTINCT flag and — for GROUP_CONCAT/STRING_AGG —
+/// the optional constant separator. `COUNT(*)` rewrites to a sentinel column
+/// so the executor counts rows instead of non-null values.
+fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool, Option<String>)> {
     let fname = f.name.to_string().to_uppercase();
     // A window frame silently changes the result shape (one row per
     // partition); refusing is better than returning wrong numbers.
@@ -3184,24 +3850,28 @@ fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool)> {
             "window functions (OVER) are not supported: {fname}"
         ));
     }
-    let (distinct, inner) = match &f.args {
+    let (distinct, inner, second) = match &f.args {
         sqlparser::ast::FunctionArguments::List(list) => {
             let distinct = matches!(
                 list.duplicate_treatment,
                 Some(sqlparser::ast::DuplicateTreatment::Distinct)
             );
-            let inner = list.args.first().and_then(|a| match a {
+            let as_expr = |a: &sqlparser::ast::FunctionArg| match a {
                 sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
                     Some(e.clone())
                 }
+                _ => None,
+            };
+            let inner = list.args.first().and_then(|a| match a {
                 sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
                     Some(SqlExpr::Identifier(sqlparser::ast::Ident::new("__count__")))
                 }
-                _ => None,
+                other => as_expr(other),
             });
-            (distinct, inner)
+            let second = list.args.get(1).and_then(as_expr);
+            (distinct, inner, second)
         }
-        _ => (false, None),
+        _ => (false, None, None),
     };
     let Some(arg) = inner else {
         return err(format!("unsupported aggregate arguments: {fname}"));
@@ -3215,7 +3885,24 @@ fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool)> {
         "GROUP_CONCAT" | "STRING_AGG" => AggOp::GroupConcat,
         other => return err(format!("unknown function: {other}")),
     };
-    Ok((op, arg, distinct))
+    let sep = if matches!(op, AggOp::GroupConcat) {
+        match second {
+            Some(e) => match eval_const(&e)? {
+                Value::Str(s) => Some(s),
+                Value::Null => None,
+                other => {
+                    return err(format!(
+                        "group_concat separator must be a string literal, got {}",
+                        other.type_name()
+                    ))
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok((op, arg, distinct, sep))
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value> {
@@ -3262,7 +3949,12 @@ fn consume_one(counts: &mut std::collections::BTreeMap<Vec<u8>, usize>, row: &[V
 fn eval_agg(spec: &AggSpec, docs: &[&Object], key: &[Value]) -> Result<Value> {
     match spec {
         AggSpec::GroupKey { idx } => Ok(key.get(*idx).cloned().unwrap_or(Value::Null)),
-        AggSpec::Agg { op, arg, distinct } => {
+        AggSpec::Agg {
+            op,
+            arg,
+            distinct,
+            sep,
+        } => {
             let mut vals: Vec<Value> = Vec::new();
             for d in docs {
                 let v = eval_expr(arg, d)?;
@@ -3332,9 +4024,12 @@ fn eval_agg(spec: &AggSpec, docs: &[&Object], key: &[Value]) -> Result<Value> {
                         }
                     })
                     .unwrap_or(Value::Null),
-                AggOp::GroupConcat => {
-                    Value::Str(vals.iter().map(value_to_text).collect::<Vec<_>>().join(","))
-                }
+                AggOp::GroupConcat => Value::Str(
+                    vals.iter()
+                        .map(value_to_text)
+                        .collect::<Vec<_>>()
+                        .join(sep.as_deref().unwrap_or(",")),
+                ),
             })
         }
     }
@@ -3467,6 +4162,44 @@ fn str_list(m: &Object, key: &str) -> Vec<String> {
     }
 }
 
+/// Column types that declare a GUID. Values live as canonical lowercase
+/// UUID strings, so string order equals UUIDv7 time order.
+fn is_guid_type(dt: &sqlparser::ast::DataType) -> bool {
+    let t = dt.to_string().trim().to_uppercase();
+    matches!(t.as_str(), "GUID" | "UUID" | "UNIQUEIDENTIFIER" | "UUIDV7")
+}
+
+/// SQL literal for a value carried over into a replicated statement.
+fn value_literal(v: &Value) -> Result<String> {
+    match v {
+        Value::Null => Ok("NULL".into()),
+        Value::Bool(b) => Ok(if *b { "TRUE" } else { "FALSE" }.into()),
+        Value::Int(i) => Ok(i.to_string()),
+        Value::Float(f) => {
+            // Non-finite floats have no SQL literal form — rendering "inf"/
+            // "NaN" would produce statements the peer cannot parse (cluster
+            // divergence) and dumps that cannot replay. Debug formatting
+            // keeps integral floats distinguishable from Int ("3.0" vs "3"),
+            // preserving the type across resolved-INSERT replay.
+            if !f.is_finite() {
+                return err("cannot render a non-finite FLOAT value as a SQL literal");
+            }
+            Ok(format!("{f:?}"))
+        }
+        Value::Str(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
+        other => err(format!(
+            "cannot render a {} value as a SQL literal \
+             (replication and dump need scalar column values)",
+            other.type_name()
+        )),
+    }
+}
+
+/// Double-quoted SQL identifier.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 fn obj_name(name: &ObjectName) -> String {
     name.0
         .last()
@@ -3487,6 +4220,138 @@ fn expr_name(e: &SqlExpr) -> String {
             .join("."),
         other => other.to_string(),
     }
+}
+
+/// Replace identifier `old` with `new` in SQL text, matching whole
+/// identifiers only (adjacent word characters disqualify the match).
+fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
+    fn is_word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if text[i..].starts_with(old)
+            && (i == 0 || !is_word(bytes[i - 1]))
+            && !bytes.get(i + old.len()).copied().is_some_and(is_word)
+        {
+            out.extend_from_slice(new.as_bytes());
+            i += old.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// Collect the table names and aliases a query reads in its own FROM, so
+/// qualified references to anything else can be flagged as correlated.
+fn collect_from_names(q: &Query, out: &mut std::collections::BTreeSet<String>) {
+    if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
+        for twj in &sel.from {
+            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &twj.relation {
+                out.insert(obj_name(name));
+                if let Some(a) = alias {
+                    out.insert(a.name.value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Find `outer_table.column` references in `e` whose qualifier is a known
+/// catalog table but not one of the query's own FROM names/aliases — the
+/// correlated-reference shape. Unqualified outer references cannot be told
+/// apart from legitimate schemaless fields, so only qualified ones flag.
+fn collect_correlated_refs(
+    e: &SqlExpr,
+    from_names: &std::collections::BTreeSet<String>,
+    catalog: &std::collections::BTreeMap<String, TableMeta>,
+    hits: &mut Vec<String>,
+) {
+    match e {
+        SqlExpr::CompoundIdentifier(parts) => {
+            if parts.len() >= 2 {
+                let qualifier = &parts[0].value;
+                if !from_names.contains(qualifier) && catalog.contains_key(qualifier) {
+                    hits.push(qualifier.clone());
+                }
+            }
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_correlated_refs(left, from_names, catalog, hits);
+            collect_correlated_refs(right, from_names, catalog, hits);
+        }
+        SqlExpr::UnaryOp { expr, .. } => collect_correlated_refs(expr, from_names, catalog, hits),
+        SqlExpr::Nested(inner) => collect_correlated_refs(inner, from_names, catalog, hits),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_correlated_refs(expr, from_names, catalog, hits);
+            collect_correlated_refs(low, from_names, catalog, hits);
+            collect_correlated_refs(high, from_names, catalog, hits);
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            collect_correlated_refs(expr, from_names, catalog, hits);
+            collect_correlated_refs(pattern, from_names, catalog, hits);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_correlated_refs(expr, from_names, catalog, hits);
+            for item in list {
+                collect_correlated_refs(item, from_names, catalog, hits);
+            }
+        }
+        SqlExpr::InSubquery { expr, .. } => {
+            collect_correlated_refs(expr, from_names, catalog, hits);
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_correlated_refs(op, from_names, catalog, hits);
+            }
+            for w in conditions {
+                collect_correlated_refs(&w.condition, from_names, catalog, hits);
+                collect_correlated_refs(&w.result, from_names, catalog, hits);
+            }
+            if let Some(el) = else_result {
+                collect_correlated_refs(el, from_names, catalog, hits);
+            }
+        }
+        SqlExpr::Cast { expr, .. } => collect_correlated_refs(expr, from_names, catalog, hits),
+        _ => {}
+    }
+}
+
+/// Dump-replay insert order: referenced tables before referencing ones
+/// (FK checks run per row during replay). Picks the first satisfiable
+/// table in catalog order each round; an FK cycle falls back to catalog
+/// order for its members (a true cycle needs deferred constraints).
+fn fk_dependency_order(
+    names: &[String],
+    tables: &std::collections::BTreeMap<String, TableMeta>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    let mut remaining: Vec<String> = names.to_vec();
+    while !remaining.is_empty() {
+        let next = remaining.iter().position(|n| {
+            tables.get(n).is_none_or(|m| {
+                m.foreign_keys.iter().all(|(_, rt, _)| {
+                    rt == n || !names.iter().any(|x| x == rt) || out.iter().any(|o| o == rt)
+                })
+            })
+        });
+        match next {
+            Some(i) => out.push(remaining.remove(i)),
+            None => out.append(&mut remaining),
+        }
+    }
+    out
 }
 
 /// Evaluate a constant expression (literal / arithmetic on literals).
@@ -4337,19 +5202,61 @@ fn reindex_replace(
 }
 
 /// HAVING evaluation: aggregate subexpressions are computed over the group's
-/// rows; non-aggregate parts evaluate against the already-projected columns.
-fn eval_having(e: &SqlExpr, out: &Object, docs: &[&Object]) -> Result<Value> {
+/// rows; bare columns matching a GROUP BY expression resolve to the group key
+/// (via the group's rows — every row shares the key value); everything else
+/// evaluates against the already-projected columns.
+fn eval_having(
+    e: &SqlExpr,
+    out: &Object,
+    docs: &[&Object],
+    group_exprs: &[SqlExpr],
+) -> Result<Value> {
     match e {
         SqlExpr::Function(f) if contains_agg(&SqlExpr::Function(f.clone())) => {
-            let (op, arg, distinct) = agg_parts(f)?;
-            eval_agg(&AggSpec::Agg { op, arg, distinct }, docs, &[])
+            let (op, arg, distinct, sep) = agg_parts(f)?;
+            eval_agg(
+                &AggSpec::Agg {
+                    op,
+                    arg,
+                    distinct,
+                    sep,
+                },
+                docs,
+                &[],
+            )
+        }
+        SqlExpr::Identifier(i) => {
+            if let Some(g) = group_exprs
+                .iter()
+                .find(|g| matches!(g, SqlExpr::Identifier(gi) if gi.value == i.value))
+            {
+                return match docs.first() {
+                    Some(d) => eval_expr(g, d),
+                    None => Ok(Value::Null),
+                };
+            }
+            eval_expr(e, out)
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            let name = parts
+                .iter()
+                .map(|p| p.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            if let Some(g) = group_exprs.iter().find(|g| expr_name(g) == name) {
+                return match docs.first() {
+                    Some(d) => eval_expr(g, d),
+                    None => Ok(Value::Null),
+                };
+            }
+            eval_expr(e, out)
         }
         SqlExpr::BinaryOp { left, op, right } => {
-            let l = eval_having(left, out, docs)?;
-            let r = eval_having(right, out, docs)?;
+            let l = eval_having(left, out, docs, group_exprs)?;
+            let r = eval_having(right, out, docs, group_exprs)?;
             binop(l, op, r)
         }
-        SqlExpr::Nested(inner) => eval_having(inner, out, docs),
+        SqlExpr::Nested(inner) => eval_having(inner, out, docs, group_exprs),
         other => eval_expr(other, out),
     }
 }
@@ -4857,6 +5764,191 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_constraint_index_is_derived_and_protected() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE)",
+        );
+        let t = &db.catalog()[0];
+        // Table-declared PK/UNIQUE surface as named auto-indexes (PK
+        // first); their B+ trees exist from CREATE TABLE on.
+        assert_eq!(
+            t.indexes,
+            vec![
+                "sqlite_autoindex_t_1".to_string(),
+                "sqlite_autoindex_t_2".to_string(),
+            ]
+        );
+        assert_eq!(t.index_defs[0].column, "id");
+        assert_eq!(t.index_defs[1].column, "v");
+        assert!(t.index_defs.iter().all(|d| d.auto && d.unique));
+
+        // Hidden from sqlite_master (SQLite semantics: autoindexes have
+        // no CREATE INDEX row there) — tooling reads them from the catalog.
+        let r = rows(
+            &mut db,
+            "SELECT name FROM sqlite_master WHERE type = 'index'",
+        );
+        assert!(r.rows.is_empty());
+
+        // Not droppable (with or without IF EXISTS), and the name prefix
+        // is reserved against user indexes shadowing constraint ones.
+        let e = db.execute("DROP INDEX sqlite_autoindex_t_1").unwrap_err();
+        assert!(e.to_string().contains("cannot be dropped"), "{e}");
+        let e = db
+            .execute("DROP INDEX IF EXISTS sqlite_autoindex_t_1")
+            .unwrap_err();
+        assert!(e.to_string().contains("cannot be dropped"), "{e}");
+        let e = db
+            .execute("CREATE INDEX sqlite_autoindex_x_1 ON t (v)")
+            .unwrap_err();
+        assert!(e.to_string().contains("reserved"), "{e}");
+        // The constraint itself stays enforced through the backing tree.
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        let e = db.execute("INSERT INTO t VALUES (1, 'b')").unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+    }
+
+    #[test]
+    fn constraint_autoindex_survives_reopen_without_catalog_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autoix.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        // Derived from the persisted constraint, never stored in the
+        // catalog: reopening lists it — as do databases created before
+        // the feature shipped (external volumes keep their old catalogs).
+        let db = Database::open(&path).unwrap();
+        let t = &db.catalog()[0];
+        assert_eq!(t.indexes, vec!["sqlite_autoindex_t_1".to_string()]);
+        assert_eq!(t.index_defs[0].column, "id");
+        assert!(t.index_defs[0].auto);
+    }
+
+    #[test]
+    fn autoindex_dedupes_column_declared_pk_and_unique() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY UNIQUE, v TEXT)",
+        );
+        assert_eq!(
+            db.catalog()[0].indexes,
+            vec!["sqlite_autoindex_t_1".to_string()]
+        );
+    }
+
+    #[test]
+    fn autoindex_covers_table_level_constraints() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a), UNIQUE (b))",
+        );
+        let t = &db.catalog()[0];
+        assert_eq!(
+            t.indexes,
+            vec![
+                "sqlite_autoindex_t_1".to_string(),
+                "sqlite_autoindex_t_2".to_string(),
+            ]
+        );
+        assert_eq!(t.index_defs[0].column, "a");
+        assert_eq!(t.index_defs[1].column, "b");
+    }
+
+    #[test]
+    fn autoindex_follows_column_and_table_renames() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        // Column renames move the constraint metadata (and the backing
+        // tree), so the derived entries track the new names…
+        run(&mut db, "ALTER TABLE t RENAME COLUMN id TO gid");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN email TO mail");
+        // …and the table rename feeds the derived names themselves.
+        run(&mut db, "ALTER TABLE t RENAME TO u");
+        let t = &db.catalog()[0];
+        assert_eq!(t.name, "u");
+        assert_eq!(
+            t.indexes,
+            vec![
+                "sqlite_autoindex_u_1".to_string(),
+                "sqlite_autoindex_u_2".to_string(),
+            ]
+        );
+        assert_eq!(t.index_defs[0].column, "gid");
+        assert_eq!(t.index_defs[1].column, "mail");
+        // The constraint keeps enforcing through the moved tree.
+        let e = db.execute("INSERT INTO u VALUES (1, 'b')").unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+    }
+
+    #[test]
+    fn dropping_unique_column_drops_its_autoindex() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)",
+        );
+        run(&mut db, "ALTER TABLE t DROP COLUMN email");
+        let t = &db.catalog()[0];
+        assert_eq!(t.indexes, vec!["sqlite_autoindex_t_1".to_string()]);
+        assert_eq!(t.index_defs[0].column, "id");
+        // PK enforcement is untouched by the UNIQUE column's removal.
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let e = db.execute("INSERT INTO t VALUES (1)").unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+    }
+
+    #[test]
+    fn autoindex_names_identical_on_replica_replay() {
+        // Symmetric-cluster peers re-derive constraint indexes from the
+        // replayed DDL; the names must come out identical on both sides.
+        let ddl = "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE); \
+                   CREATE INDEX ix_v ON t (email)";
+        let mut a = Database::in_memory().unwrap();
+        let mut b = Database::in_memory().unwrap();
+        for db in [&mut a, &mut b] {
+            db.execute_batch(ddl);
+        }
+        let (ca, cb) = (a.catalog(), b.catalog());
+        assert_eq!(ca[0].name, cb[0].name);
+        assert_eq!(ca[0].indexes, cb[0].indexes);
+        assert_eq!(ca[0].index_defs, cb[0].index_defs);
+        assert_eq!(
+            ca[0].indexes,
+            vec![
+                "sqlite_autoindex_t_1".to_string(),
+                "sqlite_autoindex_t_2".to_string(),
+                "ix_v".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn autoinc_and_autoguid_primary_keys_get_autoindex() {
+        for ddl in [
+            "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v TEXT)",
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        ] {
+            let mut db = Database::in_memory().unwrap();
+            run(&mut db, ddl);
+            let t = &db.catalog()[0];
+            assert_eq!(t.indexes, vec!["sqlite_autoindex_t_1".to_string()], "{ddl}");
+            assert_eq!(t.index_defs[0].column, "id", "{ddl}");
+            assert!(t.index_defs[0].auto, "{ddl}");
+        }
+    }
+
+    #[test]
     fn indexes_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("idx.db");
@@ -4933,6 +6025,20 @@ mod tests {
         assert_eq!(r.columns, vec!["extra", "id"]); // BTreeMap order
         assert_eq!(r.rows[0][0], Value::Str("has-extra".into()));
         assert_eq!(r.rows[1][0], Value::Null);
+    }
+
+    #[test]
+    fn observed_columns_track_document_keys() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE docs (id INT)");
+        // Empty table: nothing observed yet (SELECT * projects nothing).
+        assert!(db.observed_columns("docs").is_empty());
+        run(&mut db, "INSERT INTO docs (id, extra) VALUES (1, 'x')");
+        run(&mut db, "INSERT INTO docs (id, note) VALUES (2, 'y')");
+        // Data-side union, independent of the declared column list.
+        assert_eq!(db.observed_columns("docs"), vec!["extra", "id", "note"]);
+        // Unknown tables are not an error on this introspection surface.
+        assert!(db.observed_columns("nope").is_empty());
     }
 
     #[test]
@@ -5372,6 +6478,256 @@ mod tests {
     }
 
     #[test]
+    fn guid_autoincrement_generates_ordered_uuidv7() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        for i in 0..5 {
+            run(&mut db, &format!("INSERT INTO t (v) VALUES ('x{i}')"));
+        }
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        let ids: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 5);
+        let set: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(set.len(), ids.len(), "guids must be unique");
+        for id in &ids {
+            assert_eq!(id.len(), 36);
+            assert_eq!(&id[14..15], "7", "version nibble");
+            assert!(
+                matches!(&id[19..20], "8" | "9" | "a" | "b"),
+                "variant bits in {id}"
+            );
+        }
+        // Canonical lowercase string order == generation order (time-ordered).
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, ids);
+    }
+
+    #[test]
+    fn guid_explicit_and_null_values() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        // Explicit value passes through untouched.
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES ('00000000-0000-7000-8000-000000000001', 'e')",
+        );
+        // Explicit NULL is filled like an omitted column.
+        run(&mut db, "INSERT INTO t (id, v) VALUES (NULL, 'n')");
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(
+            r.rows[0][0],
+            Value::Str("00000000-0000-7000-8000-000000000001".into())
+        );
+        let filled = r.rows[1][0].as_str().unwrap();
+        assert_eq!(filled.len(), 36);
+        assert_eq!(&filled[14..15], "7");
+        // Positional insert without a column list fills NULL the same way.
+        run(&mut db, "INSERT INTO t VALUES (NULL, 'pos')");
+        let r = rows(&mut db, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(3));
+    }
+
+    #[test]
+    fn guid_resolved_insert_replays_identically() {
+        let mut a = Database::in_memory().unwrap();
+        run(
+            &mut a,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        a.execute("INSERT INTO t (v) VALUES ('it''s quoted'), ('b')")
+            .unwrap();
+        let resolved = a.take_resolved_insert().expect("resolved rewrite");
+        assert!(resolved.starts_with("INSERT INTO "));
+        assert!(resolved.contains("'it''s quoted'"), "in {resolved}");
+        // Replication replay: a second node applies the rewrite verbatim.
+        let mut b = Database::in_memory().unwrap();
+        run(
+            &mut b,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        b.execute(&resolved).unwrap();
+        assert!(b.take_resolved_insert().is_none(), "no re-generation");
+        let ra = rows(&mut a, "SELECT id, v FROM t ORDER BY v");
+        let rb = rows(&mut b, "SELECT id, v FROM t ORDER BY v");
+        assert_eq!(ra.rows, rb.rows);
+        // Conflict policy survives the rewrite.
+        a.execute("INSERT OR IGNORE INTO t (v) VALUES ('c')")
+            .unwrap();
+        let resolved = a.take_resolved_insert().unwrap();
+        assert!(
+            resolved.starts_with("INSERT OR IGNORE INTO "),
+            "in {resolved}"
+        );
+        // Statements without generation produce no rewrite.
+        a.execute("INSERT INTO t (id, v) VALUES ('00000000-0000-7000-8000-000000000009', 'x')")
+            .unwrap();
+        assert!(a.take_resolved_insert().is_none());
+    }
+
+    #[test]
+    fn guid_or_replace_resolved_preserves_policy() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT UNIQUE)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES ('00000000-0000-7000-8000-000000000001', 'dup')",
+        );
+        db.execute("INSERT OR REPLACE INTO t (v) VALUES ('dup')")
+            .unwrap();
+        let resolved = db.take_resolved_insert().expect("resolved rewrite");
+        assert!(
+            resolved.starts_with("INSERT OR REPLACE INTO "),
+            "in {resolved}"
+        );
+        // The peer replay honors the same policy: the old row is displaced,
+        // the generated guid from the origin lands verbatim.
+        let mut peer = Database::in_memory().unwrap();
+        run(
+            &mut peer,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT UNIQUE)",
+        );
+        run(
+            &mut peer,
+            "INSERT INTO t (id, v) VALUES ('00000000-0000-7000-8000-000000000001', 'dup')",
+        );
+        peer.execute(&resolved).unwrap();
+        let r = rows(&mut peer, "SELECT id, v FROM t");
+        assert_eq!(r.rows.len(), 1);
+        assert_ne!(
+            r.rows[0][0],
+            Value::Str("00000000-0000-7000-8000-000000000001".into())
+        );
+        assert_eq!(&r.rows[0][0].as_str().unwrap()[14..15], "7");
+    }
+
+    #[test]
+    fn guid_mixed_explicit_and_null_rows_resolve_all() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        db.execute(
+            "INSERT INTO t (id, v) VALUES \
+             ('00000000-0000-7000-8000-000000000005', 'e'), (NULL, 'g')",
+        )
+        .unwrap();
+        let resolved = db.take_resolved_insert().expect("resolved rewrite");
+        // Both rows carry explicit ids in the rewrite — the NULL was filled.
+        assert!(
+            resolved.contains("'00000000-0000-7000-8000-000000000005'"),
+            "in {resolved}"
+        );
+        let generated = {
+            let r = rows(&mut db, "SELECT id FROM t WHERE v = 'g'");
+            r.rows[0][0].as_str().unwrap().to_string()
+        };
+        assert!(
+            resolved.contains(&format!("'{generated}'")),
+            "generated id missing from rewrite: {resolved}"
+        );
+        // Sorting: explicit id sorts before the generated UUIDv7 (time
+        // prefix of the all-zero guid is smaller than any real timestamp).
+        let r = rows(&mut db, "SELECT v FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("e".into())], vec![Value::Str("g".into())]]
+        );
+    }
+
+    #[test]
+    fn guid_autoguid_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guid.db");
+        let mut db = Database::open(&path).unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES ('a')");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        run(&mut db, "INSERT INTO t (v) VALUES ('b')");
+        let r = rows(&mut db, "SELECT id FROM t");
+        assert_eq!(r.rows.len(), 2);
+        for row in &r.rows {
+            let id = row[0].as_str().unwrap();
+            assert_eq!(&id[14..15], "7", "still generating after reopen: {id}");
+        }
+    }
+
+    #[test]
+    fn guid_insert_select_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        run(&mut db, "CREATE TABLE src (v TEXT)");
+        run(&mut db, "INSERT INTO src VALUES ('x')");
+        let e = db
+            .execute("INSERT INTO t (v) SELECT v FROM src")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("INSERT ... VALUES"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn guid_type_keyword_variants() {
+        for ty in ["GUID", "UUID", "UNIQUEIDENTIFIER", "UUIDV7"] {
+            let mut db = Database::in_memory().unwrap();
+            run(
+                &mut db,
+                &format!("CREATE TABLE t (id {ty} PRIMARY KEY AUTOINCREMENT, v TEXT)"),
+            );
+            run(&mut db, "INSERT INTO t (v) VALUES ('a')");
+            let r = rows(&mut db, "SELECT id FROM t");
+            assert_eq!(&r.rows[0][0].as_str().unwrap()[14..15], "7", "type {ty}");
+        }
+        // AUTO_INCREMENT is accepted like AUTOINCREMENT (existing alias).
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTO_INCREMENT, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES ('a')");
+        let r = rows(&mut db, "SELECT id FROM t");
+        assert_eq!(&r.rows[0][0].as_str().unwrap()[14..15], "7");
+    }
+
+    #[test]
+    fn guid_rename_and_drop_column() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id GUID AUTOINCREMENT, v TEXT)");
+        run(&mut db, "INSERT INTO t (v) VALUES ('a')");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN id TO gid");
+        run(&mut db, "INSERT INTO t (v) VALUES ('b')");
+        let r = rows(&mut db, "SELECT gid FROM t ORDER BY gid");
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(&r.rows[1][0].as_str().unwrap()[14..15], "7");
+        // Dropping the column stops generation (mirrors AUTOINCREMENT).
+        run(&mut db, "ALTER TABLE t DROP COLUMN gid");
+        run(&mut db, "INSERT INTO t (v) VALUES ('c')");
+        let r = rows(&mut db, "SELECT v, gid FROM t ORDER BY v");
+        assert_eq!(r.rows[2], vec![Value::Str("c".into()), Value::Null]);
+    }
+
+    #[test]
     fn returning_on_update_and_delete() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE t (id INT, v TEXT)");
@@ -5428,7 +6784,38 @@ mod tests {
         let t = &tables[0];
         assert_eq!(t.name, "users");
         assert_eq!(t.keys, vec!["id".to_string(), "email".to_string()]);
-        assert_eq!(t.indexes, vec!["idx_users_name".to_string()]);
+        // Constraint indexes come first with reserved names, then user ones.
+        assert_eq!(
+            t.indexes,
+            vec![
+                "sqlite_autoindex_users_1".to_string(),
+                "sqlite_autoindex_users_2".to_string(),
+                "idx_users_name".to_string(),
+            ]
+        );
+        assert_eq!(
+            t.index_defs,
+            vec![
+                IndexInfo {
+                    name: "sqlite_autoindex_users_1".into(),
+                    column: "id".into(),
+                    unique: true,
+                    auto: true,
+                },
+                IndexInfo {
+                    name: "sqlite_autoindex_users_2".into(),
+                    column: "email".into(),
+                    unique: true,
+                    auto: true,
+                },
+                IndexInfo {
+                    name: "idx_users_name".into(),
+                    column: "name".into(),
+                    unique: false,
+                    auto: false,
+                },
+            ]
+        );
         let id = t.columns.iter().find(|c| c.name == "id").unwrap();
         assert!(id.primary_key && id.autoinc && !id.nullable);
         let email = t.columns.iter().find(|c| c.name == "email").unwrap();
@@ -5437,6 +6824,40 @@ mod tests {
         assert!(!name.nullable);
         assert_eq!(db.page_size(), PAGE_SIZE);
         assert!(db.num_pages() >= 2);
+    }
+
+    #[test]
+    fn catalog_reports_index_defs() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, b TEXT)");
+        run(&mut db, "CREATE UNIQUE INDEX ux_a ON t (a)");
+        run(&mut db, "CREATE INDEX ix_b ON t (b)");
+        let t = &db.catalog()[0];
+        // UNIQUE via CREATE INDEX is a named definition, not a constraint
+        // autoindex: t declares no PK/UNIQUE, so no sqlite_autoindex_* rows.
+        assert_eq!(
+            t.index_defs,
+            vec![
+                IndexInfo {
+                    name: "ux_a".into(),
+                    column: "a".into(),
+                    unique: true,
+                    auto: false,
+                },
+                IndexInfo {
+                    name: "ix_b".into(),
+                    column: "b".into(),
+                    unique: false,
+                    auto: false,
+                },
+            ]
+        );
+        // DROP INDEX keeps the definitions in sync.
+        run(&mut db, "DROP INDEX ux_a");
+        let t = &db.catalog()[0];
+        assert_eq!(t.indexes, vec!["ix_b".to_string()]);
+        assert_eq!(t.index_defs.len(), 1);
+        assert_eq!(t.index_defs[0].column, "b");
     }
 
     #[test]
@@ -5489,6 +6910,145 @@ mod tests {
         let mut db = Database::open(&path).unwrap();
         let r = rows(&mut db, "SELECT a FROM keep");
         assert_eq!(r.rows, vec![vec![Value::Int(42)]]);
+    }
+
+    #[test]
+    fn autoinc_column_survives_reopen() {
+        // Regression: the catalog used to drop the AUTOINCREMENT flag on
+        // save, so post-restart inserts left the id column NULL.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autoinc.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(
+                &mut db,
+                "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, v TEXT)",
+            );
+            run(&mut db, "INSERT INTO t (v) VALUES ('before')");
+            let r = rows(&mut db, "SELECT id FROM t");
+            assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        }
+        let mut db = Database::open(&path).unwrap();
+        run(&mut db, "INSERT INTO t (v) VALUES ('after')");
+        let r = rows(&mut db, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Str("before".into())],
+                vec![Value::Int(2), Value::Str("after".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_overflows_across_pages_and_survives_reopen() {
+        // The old single-page catalog died at ~4 KB of metadata (a few
+        // hundred table metas or page ids) and failed every later write.
+        // Metadata now paginates across an overflow chain.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            for i in 0..120 {
+                run(
+                    &mut db,
+                    &format!("CREATE TABLE t{i} (id INT PRIMARY KEY, v TEXT)"),
+                );
+                run(&mut db, &format!("INSERT INTO t{i} VALUES (1, 'row{i}')"));
+            }
+        }
+        let mut db = Database::open(&path).unwrap();
+        // Page 1 carries the chain magic; the chain actually spilled.
+        let page1 = db.pager.read_page(CATALOG_PAGE).unwrap().to_vec();
+        assert!(page1.starts_with(CATALOG_MAGIC));
+        assert_ne!(
+            u32::from_le_bytes(page1[12..16].try_into().unwrap()),
+            0,
+            "expected overflow pages"
+        );
+        assert_eq!(db.catalog().len(), 120);
+        let r = rows(&mut db, "SELECT v FROM t77");
+        assert_eq!(r.rows, vec![vec![Value::Str("row77".into())]]);
+        // Writes keep working past the old wall.
+        run(&mut db, "INSERT INTO t0 VALUES (2, 'more')");
+    }
+
+    #[test]
+    fn catalog_chain_shrinks_after_drops_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shrink.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            for i in 0..120 {
+                run(&mut db, &format!("CREATE TABLE t{i} (id INT)"));
+            }
+        }
+        let mut db = Database::open(&path).unwrap();
+        for i in 0..110 {
+            run(&mut db, &format!("DROP TABLE t{i}"));
+        }
+        let chain_after = db.catalog_chain().unwrap();
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.catalog().len(), 10);
+        // The truncated chain no longer references dropped overflow pages.
+        assert_eq!(chain_after.len(), 1, "10 tables should fit one page");
+        let page1 = db.pager.read_page(CATALOG_PAGE).unwrap().to_vec();
+        assert_eq!(u32::from_le_bytes(page1[12..16].try_into().unwrap()), 0);
+        run(&mut db, "INSERT INTO t115 VALUES (9)");
+    }
+
+    #[test]
+    fn legacy_single_page_catalog_still_loads_and_migrates() {
+        // A volume written by the pre-chain format (raw encoded catalog on
+        // page 1) must keep loading, and migrate to the chain format on its
+        // first catalog save.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let legacy: Object = [(
+            "tables".to_string(),
+            Value::Object(
+                [(
+                    "legacy".to_string(),
+                    Value::Object(
+                        [
+                            (
+                                "columns".to_string(),
+                                Value::Array(vec![Value::Str("id".to_string())]),
+                            ),
+                            ("pages".to_string(), Value::Array(vec![])),
+                            ("primary_key".to_string(), Value::Str("id".to_string())),
+                        ]
+                        .into(),
+                    ),
+                )]
+                .into(),
+            ),
+        )]
+        .into();
+        {
+            let mut pager = crate::pager::Pager::open(&path).unwrap();
+            let mut tx = pager.begin_tx();
+            while pager.num_pages() <= CATALOG_PAGE {
+                pager.allocate_page(&mut tx).unwrap();
+            }
+            let bytes = encode::encode_to_vec(&Value::Object(legacy)).unwrap();
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[..bytes.len()].copy_from_slice(&bytes);
+            pager.write_page(&mut tx, CATALOG_PAGE, 0, &page).unwrap();
+            pager.commit_tx(tx).unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        let r = rows(&mut db, "SELECT id FROM legacy");
+        assert!(r.rows.is_empty());
+        // Any catalog save rewrites page 1 in the chain format.
+        run(&mut db, "INSERT INTO legacy VALUES (5)");
+        let page1 = db.pager.read_page(CATALOG_PAGE).unwrap().to_vec();
+        assert!(page1.starts_with(CATALOG_MAGIC));
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        let r = rows(&mut db, "SELECT id FROM legacy");
+        assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
     }
 
     #[test]
@@ -7811,8 +9371,8 @@ mod tx_rollback_tests {
         let r = rows(&mut db, "SELECT GROUP_CONCAT(s, ',') FROM gc GROUP BY id");
         assert_eq!(r.rows[0][0], Value::Str("a,c".into()));
         let r = rows(&mut db, "SELECT STRING_AGG(b, '|') FROM gc GROUP BY id");
-        // bool 参与拼接走 value_to_text;分隔符参数沿用默认 ','
-        assert_eq!(r.rows[0][0], Value::Str("true,false,true".into()));
+        // bool 参与拼接走 value_to_text;分隔符参数生效
+        assert_eq!(r.rows[0][0], Value::Str("true|false|true".into()));
     }
 
     #[test]
@@ -7848,5 +9408,594 @@ mod tx_rollback_tests {
                 .len()
                 == 1
         );
+    }
+
+    // ---- dump_script (join bootstrap) ----
+
+    /// Apply a dump script the way the join protocol does: one transaction,
+    /// replace tables wholesale. Returns the target database.
+    fn apply_dump(script: &str) -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "BEGIN");
+        let batch = db.execute_batch(script);
+        assert!(
+            batch.error.is_none(),
+            "dump replay failed: {:?}",
+            batch.error
+        );
+        run(&mut db, "COMMIT");
+        db
+    }
+
+    #[test]
+    fn dump_script_roundtrips_schema_constraints_and_data() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE parent (pid INT PRIMARY KEY, tag TEXT UNIQUE NOT NULL)",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE child (id INT PRIMARY KEY AUTOINCREMENT, \
+             gid GUID AUTOINCREMENT, pid INT, note TEXT DEFAULT ('n/a'), extra TEXT, \
+             CHECK (id >= 0), FOREIGN KEY (pid) REFERENCES parent (pid))",
+        );
+        run(&mut db, "CREATE INDEX ix_child_note ON child (note)");
+        run(&mut db, "CREATE UNIQUE INDEX ux_parent_tag ON parent (tag)");
+        run(
+            &mut db,
+            "INSERT INTO parent VALUES (1, 'a'), (2, '中文''引号')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO child (pid, note, extra, bonus) VALUES \
+             (1, 'line1\nx', 'declared', 'schemaless 字段')",
+        );
+        run(&mut db, "INSERT INTO child (pid) VALUES (2)");
+        let script = db.dump_script().unwrap();
+        assert!(!script.to_lowercase().contains(super::PUBSUB_TABLE));
+
+        let mut dst = apply_dump(&script);
+        // Data round-trips (undeclared schemaless field included).
+        assert_eq!(
+            rows(
+                &mut dst,
+                "SELECT pid, note, extra, bonus FROM child ORDER BY id"
+            )
+            .rows,
+            vec![
+                vec![
+                    Value::Int(1),
+                    Value::Str("line1\nx".into()),
+                    Value::Str("declared".into()),
+                    Value::Str("schemaless 字段".into())
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Str("n/a".into()),
+                    Value::Null,
+                    Value::Null
+                ],
+            ]
+        );
+        // Constraints round-trip: UNIQUE still enforced...
+        assert!(db.execute("INSERT INTO parent VALUES (3, 'a')").is_err());
+        assert!(dst.execute("INSERT INTO parent VALUES (3, 'a')").is_err());
+        // ...CHECK still enforced, FK still enforced (parent must exist)...
+        assert!(dst.execute("INSERT INTO child (pid) VALUES (99)").is_err());
+        // ...and NOT NULL still enforced.
+        assert!(dst.execute("INSERT INTO parent (pid) VALUES (4)").is_err());
+        // Declared column lists match (incl. GUID marker surfaced as GUID).
+        let cols = |d: &mut Database| {
+            d.catalog()
+                .into_iter()
+                .map(|t| {
+                    (
+                        t.name,
+                        t.columns
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c.name,
+                                    c.primary_key,
+                                    c.unique,
+                                    c.nullable,
+                                    c.autoinc,
+                                    c.data_type,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cols(&mut db), cols(&mut dst));
+        // Index definitions round-trip by name/uniqueness.
+        let idx = |d: &mut Database| {
+            d.catalog()
+                .into_iter()
+                .map(|t| (t.name, t.index_defs))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(idx(&mut db), idx(&mut dst));
+        // AUTOINCREMENT continues from the replicated max on the joiner.
+        run(&mut dst, "INSERT INTO child (pid) VALUES (1)");
+        assert_eq!(
+            rows(&mut dst, "SELECT COUNT(id) FROM child").rows[0][0],
+            Value::Int(3)
+        );
+        let ids = rows(&mut dst, "SELECT id FROM child ORDER BY id").rows;
+        assert_eq!(ids.last().unwrap()[0].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn dump_script_is_reapplied_wholesale() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')");
+        let script = db.dump_script().unwrap();
+        // Re-apply onto a database that already has the table (with drift):
+        // the DROP prefix replaces it wholesale, no duplicate rows.
+        let mut dst = apply_dump(&script);
+        run(&mut dst, "INSERT INTO t VALUES (3, 'drift')");
+        run(&mut dst, "BEGIN");
+        assert!(dst.execute_batch(&script).error.is_none());
+        run(&mut dst, "COMMIT");
+        assert_eq!(
+            rows(&mut dst, "SELECT COUNT(v) FROM t").rows[0][0],
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn dump_script_skips_pubsub_store() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE _pubsub_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             channel TEXT, ts INT, payload TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO _pubsub_messages VALUES (1, 'ch', 1, 'p')",
+        );
+        run(&mut db, "CREATE TABLE user_t (v INT)");
+        let script = db.dump_script().unwrap();
+        let dst = apply_dump(&script);
+        assert_eq!(dst.catalog().len(), 1);
+        assert_eq!(dst.catalog()[0].name, "user_t");
+    }
+}
+
+// ---- complex query combinations -------------------------------------
+
+#[cfg(test)]
+mod complex_query_tests {
+    use super::*;
+
+    fn run(db: &mut Database, sql: &str) -> ExecOutcome {
+        db.execute(sql)
+            .unwrap_or_else(|e| panic!("SQL failed: {sql}\n{e}"))
+    }
+
+    fn rows(db: &mut Database, sql: &str) -> QueryResult {
+        match run(db, sql) {
+            ExecOutcome::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn complex_db() -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT, region TEXT)",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount INT, status TEXT, placed TEXT)",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE items (id INT PRIMARY KEY, order_id INT, product TEXT, qty INT, price INT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO customers VALUES (1, 'Alice', 'east'), (2, 'Bob', 'west'), (3, 'Cara', 'east'), (4, 'Dan', NULL)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO orders VALUES (100, 1, 250, 'paid', '2026-01-05'), \
+             (101, 1, 90, 'open', '2026-01-07'), \
+             (102, 2, 300, 'paid', '2026-01-09'), \
+             (103, 3, 40, 'void', '2026-01-11'), \
+             (104, 3, 120, 'paid', '2026-02-01'), \
+             (105, 1, 60, 'paid', NULL)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO items VALUES (1, 100, 'widget', 2, 50), (2, 100, 'gadget', 1, 150), \
+             (3, 101, 'widget', 1, 90), (4, 102, 'gizmo', 3, 100), \
+             (5, 103, 'widget', 1, 40), (6, 104, 'gadget', 2, 60), \
+             (7, 105, 'widget', 3, 20)",
+        );
+        db
+    }
+
+    #[test]
+    fn complex_cte_join_group_having_order_limit_stack() {
+        let mut db = complex_db();
+        // Paid orders -> customers -> items, grouped by region, HAVING over
+        // the join aggregate, ordered by alias, paged.
+        let r = rows(
+            &mut db,
+            "WITH paid AS (
+                 SELECT o.id AS order_id, o.customer_id AS cid
+                 FROM orders o WHERE o.status = 'paid'
+             )
+             SELECT c.region, COUNT(*) AS line_items, SUM(i.qty * i.price) AS items_gmv
+             FROM paid p
+             JOIN customers c ON c.id = p.cid
+             JOIN items i ON i.order_id = p.order_id
+             GROUP BY c.region
+             HAVING SUM(i.qty * i.price) > 300
+             ORDER BY items_gmv DESC
+             LIMIT 5",
+        );
+        // east: o100 (250) + o104 (120) + o105 (60), 2+1+1 item rows.
+        // west: o102 (300) fails the HAVING.
+        assert_eq!(r.columns, vec!["c.region", "line_items", "items_gmv"]);
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                Value::Str("east".into()),
+                Value::Int(4),
+                Value::Int(430)
+            ]]
+        );
+    }
+
+    #[test]
+    fn complex_cte_joined_with_base_table_and_itself() {
+        let mut db = complex_db();
+        let r = rows(
+            &mut db,
+            "WITH east AS (SELECT id, name FROM customers WHERE region = 'east')
+             SELECT e.name, o.amount
+             FROM east e JOIN orders o ON o.customer_id = e.id
+             ORDER BY o.id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into()), Value::Int(250)],
+                vec![Value::Str("Alice".into()), Value::Int(90)],
+                vec![Value::Str("Cara".into()), Value::Int(40)],
+                vec![Value::Str("Cara".into()), Value::Int(120)],
+                vec![Value::Str("Alice".into()), Value::Int(60)],
+            ]
+        );
+        // A CTE can also be self-joined (pairwise same-customer paid orders).
+        let r = rows(
+            &mut db,
+            "WITH paid AS (SELECT id, customer_id FROM orders WHERE status = 'paid')
+             SELECT a.id, b.id
+             FROM paid a JOIN paid b ON a.customer_id = b.customer_id AND a.id < b.id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(100), Value::Int(105)]]);
+    }
+
+    #[test]
+    fn complex_cte_of_aggregates_joined_back() {
+        let mut db = complex_db();
+        let r = rows(
+            &mut db,
+            "WITH totals AS (
+                 SELECT customer_id AS cid, SUM(amount) AS total
+                 FROM orders GROUP BY customer_id
+             )
+             SELECT c.name, t.total
+             FROM totals t JOIN customers c ON c.id = t.cid
+             WHERE t.total > 100
+             ORDER BY t.total DESC",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into()), Value::Int(400)],
+                vec![Value::Str("Bob".into()), Value::Int(300)],
+                vec![Value::Str("Cara".into()), Value::Int(160)],
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_derived_table_joined_and_aggregated() {
+        let mut db = complex_db();
+        let r = rows(
+            &mut db,
+            "SELECT c.name, d.total
+             FROM customers c
+             JOIN (SELECT customer_id AS cid, SUM(amount) AS total
+                   FROM orders GROUP BY customer_id) d ON d.cid = c.id
+             ORDER BY d.total DESC",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into()), Value::Int(400)],
+                vec![Value::Str("Bob".into()), Value::Int(300)],
+                vec![Value::Str("Cara".into()), Value::Int(160)],
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_nested_subqueries() {
+        let mut db = complex_db();
+        // Scalar inside scalar: biggest order -> its customer's name.
+        let r = rows(
+            &mut db,
+            "SELECT name FROM customers WHERE id = (
+                 SELECT customer_id FROM orders
+                 WHERE amount = (SELECT MAX(amount) FROM orders))",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("Bob".into())]]);
+        // Scalar inside scalar, resolving through two hops to a region set.
+        let r = rows(
+            &mut db,
+            "SELECT name FROM customers
+             WHERE region = (SELECT region FROM customers
+                             WHERE id = (SELECT customer_id FROM orders WHERE id = 101))
+             ORDER BY name",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Cara".into())]
+            ]
+        );
+        // Aggregate inside IN-subquery: customers with an above-average order.
+        let r = rows(
+            &mut db,
+            "SELECT name FROM customers
+             WHERE id IN (SELECT customer_id FROM orders
+                          WHERE amount > (SELECT AVG(amount) FROM orders))
+             ORDER BY id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Bob".into())]
+            ]
+        );
+        // NOT IN over a subquery excludes Cara (the void order).
+        let r = rows(
+            &mut db,
+            "SELECT name FROM customers
+             WHERE id NOT IN (SELECT customer_id FROM orders WHERE status = 'void')
+             ORDER BY id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Bob".into())],
+                vec![Value::Str("Dan".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_correlated_subqueries_currently_yield_empty() {
+        // Known limitation, pinned so a change here is a conscious one:
+        // subqueries are rewritten uncorrelated (evaluated once, hoisted to
+        // literals/IN-lists). An outer reference inside the subquery resolves
+        // as a missing document column, the inner WHERE filters everything
+        // out, and the predicate quietly turns false — no error.
+        let mut db = complex_db();
+        for sql in [
+            "SELECT c.name FROM customers c WHERE 300 = (
+                 SELECT MAX(o.amount) FROM orders o WHERE o.customer_id = c.id)",
+            "SELECT c.name FROM customers c WHERE EXISTS (
+                 SELECT 1 FROM orders o WHERE o.customer_id = c.id)",
+            // Bob matches by region, but the outer `c.region` reference has
+            // no rows to bind to inside the standalone subquery, so the IN
+            // list comes back empty for every row.
+            "SELECT c.name FROM customers c WHERE c.region IN (
+                 SELECT o.status FROM orders o WHERE o.amount > 200 AND c.region = 'west')",
+        ] {
+            let r = rows(&mut db, sql);
+            assert!(r.rows.is_empty(), "expected empty for correlated: {sql}");
+        }
+        // The same intent expressed decorrelated works.
+        let r = rows(
+            &mut db,
+            "SELECT name FROM customers
+             WHERE id IN (SELECT customer_id FROM orders WHERE amount >= 120)
+             ORDER BY id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Bob".into())],
+                vec![Value::Str("Cara".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_case_in_order_by_and_conditional_aggregates() {
+        let mut db = complex_db();
+        // NULL region sorts last via a CASE key.
+        let r = rows(
+            &mut db,
+            "SELECT name FROM customers
+             ORDER BY CASE WHEN region IS NULL THEN 1 ELSE 0 END, name",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Bob".into())],
+                vec![Value::Str("Cara".into())],
+                vec![Value::Str("Dan".into())],
+            ]
+        );
+        // PIVOT-style conditional aggregation.
+        let r = rows(
+            &mut db,
+            "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid_sum, \
+                    SUM(CASE WHEN status = 'open' THEN amount ELSE 0 END) AS open_sum \
+             FROM orders",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(730), Value::Int(90)]]);
+    }
+
+    #[test]
+    fn complex_aggregates_over_joins_incl_zero_groups() {
+        let mut db = complex_db();
+        // Items GMV restricted to paid orders, computed across a 3-way join
+        // shape (order side filtered, item side summed).
+        let r = rows(
+            &mut db,
+            "SELECT SUM(i.qty * i.price)
+             FROM orders o JOIN items i ON i.order_id = o.id
+             WHERE o.status = 'paid'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(730)]]);
+        // LEFT JOIN keeps customers without orders: COUNT(inner) yields 0,
+        // and DESC ordering puts them last deterministically.
+        let r = rows(
+            &mut db,
+            "SELECT c.name, COUNT(o.id) AS orders
+             FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+             GROUP BY c.name
+             ORDER BY orders DESC, c.name",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into()), Value::Int(3)],
+                vec![Value::Str("Cara".into()), Value::Int(2)],
+                vec![Value::Str("Bob".into()), Value::Int(1)],
+                vec![Value::Str("Dan".into()), Value::Int(0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_where_predicate_stack_over_join() {
+        let mut db = complex_db();
+        // Parenthesized OR over join keys + IN + NOT LIKE + IS NOT NULL, all
+        // feeding a DISTINCT projection.
+        let r = rows(
+            &mut db,
+            "SELECT DISTINCT c.region
+             FROM customers c
+             JOIN orders o ON o.customer_id = c.id
+             WHERE (o.status = 'paid' OR o.amount BETWEEN 80 AND 120)
+               AND c.region IN ('east', 'west')
+               AND c.name NOT LIKE 'D%'
+               AND o.placed IS NOT NULL
+             ORDER BY 1",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("east".into())],
+                vec![Value::Str("west".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_setop_with_global_order_and_limit() {
+        let mut db = complex_db();
+        // ORDER BY + LIMIT apply to the whole UNION, not a branch.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM orders WHERE amount > 200
+             UNION
+             SELECT id FROM orders WHERE amount < 50
+             ORDER BY id DESC LIMIT 2",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(103)], vec![Value::Int(102)]]);
+    }
+
+    #[test]
+    fn complex_grouped_paging_with_having_alias() {
+        let mut db = complex_db();
+        // HAVING accepts the output alias...
+        let r = rows(
+            &mut db,
+            "SELECT customer_id, SUM(amount) AS total
+             FROM orders GROUP BY customer_id
+             HAVING total > 200
+             ORDER BY total DESC",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(400)],
+                vec![Value::Int(2), Value::Int(300)],
+            ]
+        );
+        // ...and paging over grouped rows resolves ties by the second key.
+        let r = rows(
+            &mut db,
+            "SELECT status, COUNT(*) AS n
+             FROM orders GROUP BY status
+             ORDER BY n DESC, status
+             LIMIT 1 OFFSET 1",
+        );
+        // paid(3) is skipped by OFFSET; open and void tie at 1, 'open' first.
+        assert_eq!(r.rows, vec![vec![Value::Str("open".into()), Value::Int(1)]]);
+    }
+
+    #[test]
+    fn complex_grouping_edges_error_explicitly() {
+        let mut db = complex_db();
+        // CASE as a grouped projection is not supported (searched or simple).
+        for sql in [
+            "SELECT CASE WHEN amount >= 200 THEN 'big' ELSE 'small' END AS bucket, COUNT(*) AS n \
+             FROM orders GROUP BY bucket",
+            "SELECT CASE status WHEN 'paid' THEN 1 ELSE 2 END AS code, COUNT(*) AS n \
+             FROM orders GROUP BY code",
+        ] {
+            let e = db.execute(sql).unwrap_err();
+            assert!(
+                e.to_string().contains("unsupported aggregate projection"),
+                "{sql}\n{e}"
+            );
+        }
+        // Arithmetic mixing aggregates is not supported either.
+        let e = db
+            .execute("SELECT MAX(amount) - MIN(amount) FROM orders")
+            .unwrap_err();
+        assert!(e.to_string().contains("not allowed in this context"), "{e}");
+        // ORDER BY must use an alias, not a bare aggregate expression.
+        let e = db
+            .execute(
+                "SELECT customer_id, SUM(amount) AS total FROM orders \
+                 GROUP BY customer_id ORDER BY SUM(amount)",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("unknown ORDER BY key"), "{e}");
+        // GROUP BY by alias or ordinal is not supported (unlike HAVING).
+        for sql in [
+            "SELECT status AS s, COUNT(*) FROM orders GROUP BY s",
+            "SELECT status, COUNT(*) FROM orders GROUP BY 1",
+        ] {
+            let e = db.execute(sql).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("must appear in GROUP BY or an aggregate"),
+                "{sql}\n{e}"
+            );
+        }
     }
 }

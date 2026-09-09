@@ -57,7 +57,7 @@ public sealed class DocsqlModificationCommandBatch(
         }
         if (rows == 0)
         {
-            throw new DbUpdateConcurrencyException("docsql: 预期影响 1 行,实际 0 行");
+            throw new DbUpdateConcurrencyException("DocSQL: 预期影响 1 行,实际 0 行");
         }
     }
 }

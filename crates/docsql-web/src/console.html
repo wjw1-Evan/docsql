@@ -2,10 +2,10 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="description" content="docsql console">
-<title>docsql Studio — 管理控制台</title>
+<meta name="description" content="DocSQL console">
+<title>DocSQL Studio — 管理控制台</title>
 <style>
-  /* ============ docsql Studio(SSMS 风格)============ */
+  /* ============ DocSQL Studio(SSMS 风格)============ */
   :root {
     --chrome: #f0f0f0; --chrome2: #f7f7f7; --border: #d4d4d4; --border2: #e4e4e4;
     --accent: #0072c6; --accent-dk: #005a9e;
@@ -35,11 +35,11 @@
   button.primary { background: var(--accent); border-color: var(--accent-dk); color: #fff; }
   button.primary:hover { background: #1a86d4; }
   button.danger { color: var(--err); }
-  input[type=text], textarea {
+  input[type=text], textarea, select {
     border: 1px solid var(--border); border-radius: 2px; padding: 3px 6px; background: #fff;
     -webkit-user-select: text; user-select: text;
   }
-  input[type=text]:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  input[type=text]:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
 
   /* ---------- 菜单栏 ---------- */
   #menubar {
@@ -97,6 +97,9 @@
   .tnode .tlabel .cnt { color: var(--txt3); }
   .tnode .badge { font-size: 10px; color: var(--accent-dk); border: 1px solid #b8d7f0;
                   border-radius: 6px; padding: 0 4px; margin-left: 4px; background: #eef6fd; }
+  .tnode .badge.obs { color: #5f7d3a; border-color: #d3e3c0; background: #f2f8ea; }
+  .tnode .badge.pk { color: #6a4fa3; border-color: #ddd0ee; background: #f4effc; }
+  .tnode .tlabel .obs-col { color: var(--txt3); }
   .tnode .ttl-flag { color: var(--warn); margin-left: 3px; font-size: 11px; }
   .tchildren { padding-left: 15px; }
   .tchildren.collapsed { display: none; }
@@ -125,6 +128,8 @@
   .doc-bar .title { font-weight: 600; color: var(--txt2); margin-right: 6px; }
   .doc-bar .meta { color: var(--txt3); }
   .doc-bar .spacer { flex: 1; }
+  /* 日志页类别切换按钮(doc-bar 内的 segmented control) */
+  .doc-bar .catbtn.on { background: var(--accent); border-color: var(--accent-dk); color: #fff; }
 
   /* ---------- 查询编辑器 ---------- */
   .q-wrap { flex: 1; display: flex; flex-direction: column; min-height: 120px; }
@@ -226,6 +231,21 @@
   .dialog .foot { padding: 10px 14px; border-top: 1px solid var(--border2); display: flex;
                   justify-content: flex-end; gap: 8px; background: var(--chrome2); }
   .dialog .err-line { color: var(--err); min-height: 16px; }
+  /* 新建表:列编辑网格 */
+  .dialog .hint { color: var(--txt3); line-height: 1.6; }
+  table.colgrid { border-collapse: collapse; width: 100%; }
+  .colgrid th, .colgrid td { border: 1px solid var(--border2); padding: 2px 5px; text-align: left; }
+  .colgrid th { background: var(--grid-hd); color: var(--txt2); font-weight: 600; }
+  .colgrid input[type=text] { width: 100%; border-color: transparent; background: transparent; }
+  .colgrid input[type=text]:focus { border-color: var(--accent); background: #fff; }
+  .colgrid input[type=checkbox], .colgrid select { vertical-align: middle; }
+  .colgrid .delcol { border: 0; background: none; padding: 0 4px; color: var(--txt3); }
+  .colgrid .delcol:hover { color: var(--err); }
+  /* 插入文档:JSON 编辑域 */
+  .dialog textarea.json-edit {
+    width: 100%; min-height: 190px; resize: vertical;
+    font: 12.5px/1.55 var(--mono); white-space: pre; tab-size: 2;
+  }
   #toasts { position: fixed; right: 14px; bottom: 34px; z-index: 700; display: flex;
             flex-direction: column; gap: 6px; }
   .toast { background: #323130; color: #fff; border-radius: 4px; padding: 8px 14px; max-width: 380px;
@@ -240,18 +260,21 @@
 <body>
 
 <div id="menubar">
-  <span class="brand">docsql <small>Studio</small></span>
+  <span class="brand">DocSQL <small>Studio</small></span>
   <div class="menu" data-menu><span>文件</span><div class="menu-drop">
     <div data-act="new-query">新建查询<span class="kbd">Ctrl+N</span></div>
+    <div data-act="new-table">新建表…</div>
     <hr>
     <div data-act="close-tab">关闭当前文档</div>
   </div></div>
   <div class="menu" data-menu><span>视图</span><div class="menu-drop">
     <div data-act="refresh">刷新对象资源管理器<span class="kbd">Ctrl+R</span></div>
     <div data-act="dashboard">服务器仪表盘</div>
+    <div data-act="cluster">集群状态</div>
+    <div data-act="logs">日志</div>
   </div></div>
   <div class="menu" data-menu><span>帮助</span><div class="menu-drop">
-    <div data-act="about">关于 docsql Studio</div>
+    <div data-act="about">关于 DocSQL Studio</div>
   </div></div>
 </div>
 
@@ -259,6 +282,9 @@
   <span title="连接状态" id="conn-dot" style="font-weight:700;color:#e81123">●</span>
   <input id="token" type="text" placeholder="令牌 X-Docsql-Token" title="服务器开启认证时填写令牌">
   <button id="btn-connect">连接</button>
+  <div class="sep"></div>
+  <span style="color:var(--txt2)">节点</span>
+  <select id="nodesel" style="display:none;max-width:190px" title="切换管理目标:本机内嵌引擎或 DOCSQL_PEERS 集群节点。远程节点经控制台后端代理执行(协议直连),认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
   <div class="sep"></div>
   <button id="btn-newq" title="新建查询编辑器 (Ctrl+N)"><span class="tb-ico" data-ico="query"></span>新建查询</button>
   <button id="btn-exec" class="primary" title="执行 (F5)"><span class="tb-ico" data-ico="run"></span>执行</button>
@@ -273,7 +299,10 @@
   <div id="explorer">
     <div class="panel-title">
       <span class="tb-ico" data-ico="explorer"></span>对象资源管理器
-      <span class="mini"><button id="exp-collapse" title="全部折叠">⊖</button></span>
+      <span class="mini">
+        <button id="exp-newtable" title="新建表">＋表</button>
+        <button id="exp-collapse" title="全部折叠">⊖</button>
+      </span>
     </div>
     <div id="tree"></div>
   </div>
@@ -285,7 +314,7 @@
 
 <div id="statusbar">
   <span id="st-conn">未连接</span>
-  <span id="st-server">docsql</span>
+  <span id="st-server">DocSQL</span>
   <span id="st-last" style="display:none"></span>
   <span class="grow"></span>
   <span id="st-ready">就绪</span>
@@ -325,15 +354,26 @@ const ICONS = {
   explorer: SVG(`<rect x="2" y="3" width="12" height="10" rx="1" stroke="#888" stroke-width="1.1"/><path d="M6 3v10" stroke="#888" stroke-width="1.1"/>`),
   chart: SVG(`<path d="M2.5 13V3M2.5 13h11" stroke="#666" stroke-width="1.2"/><rect x="4.5" y="8" width="2.2" height="4" fill="#0072c6"/><rect x="7.6" y="5.5" width="2.2" height="6.5" fill="#0072c6"/><rect x="10.7" y="7" width="2.2" height="5" fill="#0072c6"/>`),
   dashboard: SVG(`<path d="M3 12a5 5 0 0 1 10 0" stroke="#0072c6" stroke-width="1.3"/><path d="M8 12l2.6-3.4" stroke="#e81123" stroke-width="1.4" stroke-linecap="round"/>`),
+  cluster: SVG(`<path d="M8 5.2 3.9 10.7M8 5.2l4.1 5.5" stroke="#4a7a54" stroke-width="1.1"/><circle cx="8" cy="3.2" r="2" fill="#cfe3f7" stroke="#4a7a54" stroke-width="1.1"/><circle cx="3" cy="12.4" r="2" fill="#cfe3f7" stroke="#4a7a54" stroke-width="1.1"/><circle cx="13" cy="12.4" r="2" fill="#cfe3f7" stroke="#4a7a54" stroke-width="1.1"/>`),
+  log: SVG(`<path d="M3 2h7l3 3v9H3z" fill="#fff" stroke="#8a6db8" stroke-width="1.1"/><path d="M5.5 6.5h5M5.5 9h5M5.5 11.5h3" stroke="#8a6db8" stroke-width="1"/>`),
 };
 $$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
 
 /* ================= API 层 ================= */
 const api = {
   token: localStorage.getItem('docsql.token') || '',
+  // 当前管理目标节点('' = 本机内嵌引擎;否则为 DOCSQL_PEERS 中的地址)。
+  node: localStorage.getItem('docsql.node') || '',
   headers() { const h = {'Content-Type': 'application/json'}; if (this.token) h['X-Docsql-Token'] = this.token; return h; },
-  async get(path) { return this._do(fetch(path, {headers: this.headers()})); },
-  async post(path, body) { return this._do(fetch(path, {method: 'POST', headers: this.headers(), body: JSON.stringify(body||{})})); },
+  async get(path) {
+    if (this.node) path += (path.includes('?') ? '&' : '?') + 'node=' + encodeURIComponent(this.node);
+    return this._do(fetch(path, {headers: this.headers()}));
+  },
+  async post(path, body) {
+    body = body || {};
+    if (this.node) body = Object.assign({node: this.node}, body);
+    return this._do(fetch(path, {method: 'POST', headers: this.headers(), body: JSON.stringify(body)}));
+  },
   async _do(p) {
     const r = await p;
     if (r.status === 401) { ui.connState('unauth'); throw new Error('未授权:请在工具栏填写正确的令牌'); }
@@ -368,6 +408,51 @@ const ui = {
   }
 };
 
+/* ================= 节点切换 ================= */
+// 管理目标节点选择器:本机内嵌引擎 + DOCSQL_PEERS 中的集群节点。
+// 远程节点的 SQL/meta/stats 由控制台后端经二进制协议代理执行(带 node 参数),
+// 与在本机操作同构;选择会持久化,重启控制台后自动恢复。
+const nodes = {
+  known: [], // [{addr, reachable}] — 来自 /api/cluster 探测
+  sel() { return $('#nodesel'); },
+  // 用 /api/cluster 的探测结果刷新下拉框(● 在线 ○ 离线);保存的节点
+  // 若已不在 DOCSQL_PEERS 中,自动回落到本机。
+  sync(list) {
+    if (!Array.isArray(list)) return;
+    this.known = list.map(n => ({addr: n.addr, reachable: !!n.reachable}));
+    const sel = this.sel();
+    if (!this.known.length) { sel.style.display = 'none'; if (api.node) this.apply(''); return; }
+    sel.style.display = '';
+    // 集群页每 5s 轮询都会走到这里;内容没变就不重建 DOM,避免打断正在
+    // 展开的下拉框。
+    const html = '<option value="">本机(内嵌引擎)</option>' +
+      this.known.map(n => `<option value="${esc(n.addr)}">${n.reachable ? '● ' : '○ '}${esc(n.addr)}</option>`).join('');
+    if (sel.innerHTML !== html) sel.innerHTML = html;
+    const cur = api.node;
+    sel.value = this.known.some(n => n.addr === cur) ? cur : '';
+    if (sel.value !== cur) this.apply('');
+  },
+  apply(addr) {
+    if (api.node === addr) return;
+    api.node = addr;
+    localStorage.setItem('docsql.node', addr);
+    $('#st-server').textContent = addr ? `节点 ${addr}` : 'DocSQL';
+    explorer.refresh();
+    // 已打开的仪表盘/数据页跟随切换到新目标节点。
+    tabs.byKind('dash').forEach(t => t.load && t.load());
+    tabs.byKind('data').forEach(t => t.load && t.load());
+  },
+  async boot() {
+    try { const r = await api.get('/api/cluster'); this.sync(r.nodes || []); }
+    catch (e) { /* 首次探测失败(未授权/网络):选择器保持隐藏 */ }
+  }
+};
+$('#nodesel').onchange = (e) => {
+  const addr = e.target.value;
+  nodes.apply(addr);
+  ui.toast(addr ? `已切换到节点 ${addr},对象资源管理器已刷新` : '已切换回本机内嵌引擎');
+};
+
 /* ================= 右键菜单 ================= */
 const ctx = {
   open(items, x, y) {
@@ -386,22 +471,390 @@ document.addEventListener('click', () => ctx.close());
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('#tree')) ctx.close(); });
 
 /* ================= 弹窗表单 ================= */
-function dialog(title, fields, okText, onOk) {
+function closeModal() { const ov = $('#overlay'); ov.style.display = 'none'; ov.innerHTML = ''; ov.onkeydown = null; }
+function showModal(html, focusSel) {
   const ov = $('#overlay');
-  ov.innerHTML = `<div class="dialog"><h3>${esc(title)}</h3><div class="body">` +
-    fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="text" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
-    `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`;
+  ov.innerHTML = html;
   ov.style.display = 'flex';
-  const first = $('input[data-f]', ov); if (first) first.focus();
-  $('[data-cancel]', ov).onclick = () => { ov.style.display = 'none'; ov.innerHTML = ''; };
-  ov.onmousedown = (e) => { if (e.target === ov) { ov.style.display = 'none'; ov.innerHTML = ''; } };
+  $('[data-cancel]', ov).onclick = closeModal;
+  ov.onmousedown = (e) => { if (e.target === ov) closeModal(); };
+  const f = focusSel && $(focusSel, ov); if (f) f.focus();
+  return ov;
+}
+function dialog(title, fields, okText, onOk) {
+  const ov = showModal(`<div class="dialog"><h3>${esc(title)}</h3><div class="body">` +
+    fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="text" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
+    `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`,
+    'input[data-f]');
   $('[data-ok]', ov).onclick = async () => {
     const vals = {};
     fields.forEach(f => { vals[f.name] = $(`input[data-f="${f.name}"]`, ov).value.trim(); });
-    try { await onOk(vals, (m) => { $('[data-err]', ov).textContent = m || ''; }); 
-      ov.style.display = 'none'; ov.innerHTML = ''; } catch (e) { /* handled */ }
+    try { await onOk(vals, (m) => { $('[data-err]', ov).textContent = m || ''; });
+      closeModal(); } catch (e) { /* handled */ }
   };
   ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
+}
+
+/* ---------- 新建表(mongo-express 式入口 + 列编辑网格)---------- */
+const COL_TYPES = ['ANY', 'INT', 'TEXT', 'REAL', 'BOOLEAN', 'GUID'];
+function newTableDialog() {
+  const colRow = (c) => `<tr data-col>
+    <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="列名"></td>
+    <td><select data-c="type">${COL_TYPES.map(t => `<option${t === (c.type || 'ANY') ? ' selected' : ''}>${t}</option>`).join('')}</select></td>
+    <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}></td>
+    <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}></td>
+    <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}></td>
+    <td><button class="delcol" data-delcol title="删除此列">✕</button></td></tr>`;
+  const ov = showModal(`<div class="dialog" style="min-width:580px;max-width:640px"><h3>新建表</h3><div class="body">
+    <div class="row"><label>表名</label><input type="text" data-t="name" placeholder="如 users"></div>
+    <div>
+      <table class="colgrid"><thead><tr><th style="width:38%">列名</th><th style="width:24%">类型</th>
+        <th title="主键">PK</th><th title="非空">NOT NULL</th><th title="自增">AUTO</th><th></th></tr></thead>
+      <tbody data-cols>${colRow({name: 'id', type: 'INT', pk: true, nn: true})}${colRow({})}</tbody></table>
+      <div style="margin-top:6px"><button data-addcol>+ 添加列</button></div>
+    </div>
+    <div class="hint">GUID + AUTO:主键自动生成时序有序 UUIDv7(INSERT 省略即可);INT + AUTO 为自增整数。其余类型仅作文档用途(无模式文档存储,类型不被强制);PK 不隐含 NOT NULL,勾选 PK 会自动勾上 NOT NULL。</div>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>创建</button></div></div>`,
+    '[data-t="name"]');
+  const readCols = () => $$('tr[data-col]', ov).map(tr => ({
+    name: $('[data-c="name"]', tr).value.trim(),
+    type: $('[data-c="type"]', tr).value,
+    pk: $('[data-c="pk"]', tr).checked,
+    nn: $('[data-c="nn"]', tr).checked,
+    ai: $('[data-c="ai"]', tr).checked,
+  }));
+  $('[data-addcol]', ov).onclick = () => {
+    $('[data-cols]', ov).insertAdjacentHTML('beforeend', colRow({}));
+    const rows = $$('tr[data-col]', ov);
+    $('input[data-c="name"]', rows[rows.length - 1]).focus();
+  };
+  ov.addEventListener('click', (e) => {
+    const del = e.target.closest('[data-delcol]');
+    if (del) { const tr = del.closest('tr'); tr.parentElement.removeChild(tr); }
+  });
+  // PK 隐含 NOT NULL 的联动(DocSQL 的 PK 不隐含 NOT NULL,这里替用户勾上,可手动取消)
+  ov.addEventListener('change', (e) => {
+    if (e.target.matches('[data-c="pk"]') && e.target.checked) {
+      $('[data-c="nn"]', e.target.closest('tr')).checked = true;
+    }
+    if (e.target.matches('[data-c="ai"]') && e.target.checked) {
+      // AUTO 的含义随类型:GUID → 时序 UUIDv7,INT → 自增整数;
+      // 已选 GUID/INT 时保持不变,其余切到 INT。
+      const sel = $('[data-c="type"]', e.target.closest('tr'));
+      if (sel.value !== 'GUID' && sel.value !== 'INT') sel.value = 'INT';
+    }
+  });
+  $('[data-ok]', ov).onclick = async () => {
+    const err = (m) => { $('[data-err]', ov).textContent = m; };
+    const name = $('[data-t="name"]', ov).value.trim();
+    if (!name) return err('请输入表名');
+    const cols = readCols();
+    if (!cols.length) return err('至少需要一列');
+    const names = new Set();
+    for (const c of cols) {
+      if (!c.name) return err('存在空列名');
+      if (names.has(c.name)) return err(`列名重复:${c.name}`);
+      names.add(c.name);
+    }
+    let sql = `CREATE TABLE "${qident(name)}" (\n` + cols.map(c => {
+      let s = `  "${qident(c.name)}" ${c.type}`;
+      if (c.pk) s += ' PRIMARY KEY';
+      if (c.nn) s += ' NOT NULL';
+      if (c.ai) s += ' AUTOINCREMENT';
+      return s;
+    }).join(',\n') + '\n);';
+    ui.status(`正在创建表 ${name}…`, 'busy');
+    let r;
+    try { r = await api.post('/api/sql', {sql}); }
+    catch (e) { ui.status('创建失败', 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status('创建失败', 'err'); return err(r.message); }
+    ui.toast(`已创建表 ${name}`);
+    explorer.refreshSoon();
+    closeModal();
+  };
+  ov.onkeydown = (e) => {
+    if (e.key === 'Enter' && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
+  };
+}
+
+/* ---------- 编辑表(与新建表同一列编辑网格;ALTER 落地) ---------- */
+// 已有列:可改名(RENAME COLUMN)/删除(DROP COLUMN,主键列除外),类型与
+// 约束锁定——引擎不支持在线改约束/类型,如需重建请另建表迁移。新增列仅
+// 类型生效(ADD COLUMN 不支持 PK/UNIQUE/自增;NOT NULL 需 DEFAULT,不在本界面)。
+function editTableDialog(tableName, meta, after) {
+  if (!meta || !meta.columns) { ui.toast('没有表元数据,先刷新对象资源管理器', true); return; }
+  const colRow = (c, orig) => {
+    const ex = !!orig; // 已有列:锁定类型与约束,可改名/删除
+    const lock = ex ? ' disabled title="已有列的类型/约束不可在线修改(SQL 层不支持 ALTER 改约束;如需变更请重建表)"' : '';
+    const delBtn = ex && c.pk
+      ? '<button class="delcol" disabled title="主键列不能删除">✕</button>'
+      : '<button class="delcol" data-delcol title="删除此列">✕</button>';
+    return `<tr data-col${ex ? ` data-orig="${esc(orig)}"` : ''}>
+    <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="列名"></td>
+    <td><select data-c="type"${lock}>${COL_TYPES.map(t => `<option${t === (c.type || 'ANY') ? ' selected' : ''}>${t}</option>`).join('')}</select></td>
+    <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}${lock}></td>
+    <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}${lock}></td>
+    <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}${lock}></td>
+    <td>${delBtn}</td></tr>`;
+  };
+  const rowsHTML = meta.columns.map(c => colRow({
+    name: c.name, type: c.data_type || 'ANY', pk: c.primary_key,
+    nn: !c.nullable, ai: c.autoinc,
+  }, c.name)).join('');
+  const ov = showModal(`<div class="dialog" style="min-width:580px;max-width:640px"><h3>编辑表 — ${esc(tableName)}</h3><div class="body">
+    <div class="row"><label>表名</label><input type="text" value="${esc(tableName)}" disabled title="重命名表请使用 ALTER TABLE ... RENAME TO"></div>
+    <div>
+      <table class="colgrid"><thead><tr><th style="width:38%">列名</th><th style="width:24%">类型</th>
+        <th title="主键">PK</th><th title="非空">NOT NULL</th><th title="自增">AUTO</th><th></th></tr></thead>
+      <tbody data-cols>${rowsHTML}</tbody></table>
+      <div style="margin-top:6px"><button data-addcol>+ 添加列</button></div>
+    </div>
+    <div class="hint">已有列可改名与删除(主键列除外),类型/约束不可在线修改;新增列仅类型生效(ADD COLUMN 不支持 PK/UNIQUE/自增,NOT NULL 需 DEFAULT)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。</div>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`);
+  $('[data-addcol]', ov).onclick = () => {
+    $('[data-cols]', ov).insertAdjacentHTML('beforeend', colRow({}));
+    const rows = $$('tr[data-col]', ov);
+    $('input[data-c="name"]', rows[rows.length - 1]).focus();
+  };
+  ov.addEventListener('click', (e) => {
+    const del = e.target.closest('button[data-delcol]');
+    if (del) { const tr = del.closest('tr'); tr.parentElement.removeChild(tr); }
+  });
+  $('[data-ok]', ov).onclick = async () => {
+    const err = (m) => { $('[data-err]', ov).textContent = m; };
+    const cols = $$('tr[data-col]', ov).map(tr => ({
+      name: $('[data-c="name"]', tr).value.trim(),
+      type: $('[data-c="type"]', tr).value,
+      orig: tr.dataset.orig || null,
+    }));
+    if (cols.some(c => !c.name)) return err('存在空列名');
+    const names = new Set();
+    for (const c of cols) {
+      if (names.has(c.name)) return err(`列名重复:${c.name}`);
+      names.add(c.name);
+    }
+    const qt = `"${qident(tableName)}"`;
+    const stmts = [];
+    // 1) 改名(按原列名匹配)
+    for (const c of cols) {
+      if (c.orig && c.orig !== c.name)
+        stmts.push(`ALTER TABLE ${qt} RENAME COLUMN "${qident(c.orig)}" TO "${qident(c.name)}"`);
+    }
+    // 2) 删除(原列不再出现在网格中;主键列在 UI 已禁删,服务端兜底报错)
+    for (const o of meta.columns) {
+      if (!cols.some(c => c.orig === o.name))
+        stmts.push(`ALTER TABLE ${qt} DROP COLUMN "${qident(o.name)}"`);
+    }
+    // 3) 新增(仅类型)
+    for (const c of cols) {
+      if (!c.orig) stmts.push(`ALTER TABLE ${qt} ADD COLUMN "${qident(c.name)}" ${c.type}`);
+    }
+    if (!stmts.length) return err('没有变更');
+    ui.status(`正在更新表 ${tableName}…`, 'busy');
+    let r;
+    try { r = await api.post('/api/sql', {sql: stmts.join(';\n') + ';'}); }
+    catch (e) { ui.status('保存失败', 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status('保存失败', 'err'); return err(r.message); }
+    if (r.kind === 'batch' && r.error) {
+      // 批次顺序执行,出错前的语句已生效——刷新树并指出失败语句。
+      explorer.refreshSoon();
+      if (after) after();
+      ui.status('部分保存', 'err');
+      return err(`第 ${r.error.statement + 1} 条失败:${r.error.message}(其前的语句已生效)`);
+    }
+    ui.toast(`已更新表 ${tableName}`);
+    explorer.refreshSoon();
+    if (after) after();
+    closeModal();
+  };
+  ov.onkeydown = (e) => {
+    if (e.key === 'Enter' && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
+  };
+}
+
+/* ---------- 插入文档(JSON → INSERT;对象单行,数组批量)---------- */
+// JSON 值 → SQL 字面量:嵌套对象/数组以 JSON 文本字符串存储(DocSQL 文档式存储支持声明外字段)。
+function sqlLiteral(v) {
+  if (v === null) return 'NULL';
+  const t = typeof v;
+  if (t === 'number') return Number.isFinite(v) ? String(v) : 'NULL';
+  if (t === 'boolean') return v ? 'TRUE' : 'FALSE';
+  if (t === 'string') return "'" + v.replace(/'/g, "''") + "'";
+  return "'" + JSON.stringify(v).replace(/'/g, "''") + "'";
+}
+
+function insertDocDialog(tableName, meta, after) {
+  const cols = meta && meta.columns ? meta.columns.filter(c => !c.autoinc) : [];
+  const tpl = JSON.stringify(Object.fromEntries(cols.map(c => [c.name, c.primary_key || !c.nullable ? 1 : ''])), null, 2) || '{}';
+  const ov = showModal(`<div class="dialog" style="min-width:540px;max-width:680px"><h3>插入文档 — ${esc(tableName)}</h3><div class="body">
+    <div class="hint">输入 JSON 文档:对象插入一行,数组批量插入多行。允许包含未在表结构中声明的字段(文档式存储)。</div>
+    <textarea class="json-edit" data-t="doc" spellcheck="false">${esc(tpl)}</textarea>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><span class="hint" style="margin-right:auto">Ctrl+Enter 插入</span><button data-cancel>取消</button><button class="primary" data-ok>插入</button></div></div>`,
+    'textarea.json-edit');
+  const submit = async () => {
+    const err = (m) => { $('[data-err]', ov).textContent = m; };
+    let doc;
+    try { doc = JSON.parse($('textarea[data-t="doc"]', ov).value); }
+    catch (e) { return err('JSON 解析失败:' + e.message); }
+    const docs = Array.isArray(doc) ? doc : [doc];
+    if (!docs.length) return err('数组为空');
+    if (docs.some(d => !d || typeof d !== 'object' || Array.isArray(d))) return err('需要 JSON 对象(或对象数组)');
+    const stmts = docs.map(d => {
+      const ks = Object.keys(d);
+      if (!ks.length) return null;
+      return `INSERT INTO "${qident(tableName)}" (${ks.map(k => `"${qident(k)}"`).join(', ')}) VALUES (${ks.map(k => sqlLiteral(d[k])).join(', ')})`;
+    });
+    if (stmts.includes(null)) return err('存在空对象 {}');
+    ui.status(`正在插入 ${docs.length} 行到 ${tableName}…`, 'busy');
+    let r;
+    try { r = await api.post('/api/sql', {sql: stmts.join(';\n') + ';'}); }
+    catch (e) { ui.status('插入失败', 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status('插入失败', 'err'); return err(r.message); }
+    if (r.kind === 'batch' && r.error) { ui.status('插入失败', 'err'); return err(`第 ${r.error.statement + 1} 条:${r.error.message}`); }
+    ui.toast(`已插入 ${docs.length} 行到 ${tableName}`);
+    explorer.refreshSoon();
+    closeModal();
+    if (after) after();
+  };
+  $('[data-ok]', ov).onclick = submit;
+  ov.onkeydown = (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.matches('textarea')) { e.preventDefault(); submit(); }
+  };
+}
+
+/* ---------- 索引管理(引擎仅支持单列;修改 = 按新定义重建)---------- */
+const indexCreateSql = (t, name, col, uniq) =>
+  `CREATE ${uniq ? 'UNIQUE ' : ''}INDEX "${qident(name)}" ON "${qident(t)}" ("${qident(col)}")`;
+
+function indexDef(tableName, indexName) {
+  const m = explorer.tableMeta(tableName);
+  return m && m.index_defs ? m.index_defs.find(d => d.name === indexName) : null;
+}
+
+// 约束自动索引只读脚本:引擎不接受对 sqlite_autoindex_* 的
+// CREATE/DROP,脚本以注释说明来源,避免给出无法执行的 DDL。
+function autoIndexScript(tableName, name, d) {
+  const m = explorer.tableMeta(tableName);
+  const pkCol = m && (m.columns.find(c => c.primary_key) || {}).name;
+  const kind = d.column === pkCol ? 'PRIMARY KEY' : 'UNIQUE';
+  openQueryTab(`脚本: ${name}`,
+    `-- ${name}:由表 ${tableName} 的 ${kind} 约束自动创建(列 ${d.column})。\n` +
+    `-- 随表定义创建与维护,不能单独创建、修改或删除;调整约束请编辑表定义。`);
+}
+
+// 索引名是库级命名空间(任一表占用即全库不可用)。
+function indexNameTaken(name, exceptTable) {
+  return ((explorer.meta && explorer.meta.tables) || [])
+    .some(t => t.name !== exceptTable && (t.indexes || []).includes(name));
+}
+
+// UNIQUE 预检:与引擎口径一致(NULL 不算重复)。同名修改必须「先删旧再建新」,
+// 预检可以在不动旧索引的前提下挡掉必然失败的重建。
+async function duplicateCheck(tableName, col, err) {
+  const sql = `SELECT "${qident(col)}" AS v, COUNT(*) AS n FROM "${qident(tableName)}"` +
+    ` WHERE "${qident(col)}" IS NOT NULL GROUP BY "${qident(col)}" HAVING COUNT(*) > 1 LIMIT 1`;
+  let r;
+  try { r = await api.post('/api/sql', {sql}); }
+  catch (e) { err(e.message); return false; }
+  if (r.kind === 'error') { err(r.message); return false; }
+  if (r.kind === 'rows' && r.rows.length) {
+    err(`列 ${col} 存在重复值(如 ${r.rows[0][0]}),无法创建 UNIQUE 索引`);
+    return false;
+  }
+  return true;
+}
+
+// def: {name, column, unique};oldName 非空 = 修改模式(按新定义重建)。
+function indexDialog(tableName, def, oldName) {
+  const editing = !!oldName;
+  const m = explorer.tableMeta(tableName);
+  const cols = m && m.columns ? m.columns.map(c => c.name) : [];
+  if (!cols.length) { ui.toast(`表 ${tableName} 没有声明列,无法管理索引`, true); return; }
+  const ov = showModal(`<div class="dialog"><h3>${editing ? '修改索引' : '新建索引'} — ${esc(tableName)}</h3><div class="body">
+    <div class="row"><label>索引名</label><input type="text" data-f="name" value="${esc(def.name || '')}" placeholder="如 idx_${esc(def.column || 'col')}"></div>
+    <div class="row"><label>列</label><select data-f="col" style="flex:1">${cols.map(c => `<option${c === def.column ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
+    <div class="row"><label>唯一索引</label><label style="display:inline-flex;align-items:center;gap:5px;color:var(--txt);cursor:pointer">
+      <input type="checkbox" data-f="uniq"${def.unique ? ' checked' : ''}>UNIQUE(拒绝重复值;NULL 不算重复)</label></div>
+    <div class="hint">仅支持单列索引。${editing
+      ? '修改按新定义重建:改名时先建新索引再删旧的(建新失败则原索引保持不变);同名修改先校验数据,再以「删旧 → 建新」重建。'
+      : 'UNIQUE 索引创建时会校验既有数据,存在重复值将被拒绝。'}</div>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${editing ? '重建' : '创建'}</button></div></div>`,
+    'input[data-f="name"]');
+  const fail = (msg) => { ui.status(editing ? '重建索引失败' : '创建索引失败', 'err'); $('[data-err]', ov).textContent = msg; };
+  $('[data-ok]', ov).onclick = async () => {
+    const err = (msg) => { $('[data-err]', ov).textContent = msg || ''; };
+    const name = $('input[data-f="name"]', ov).value.trim();
+    const col = $('select[data-f="col"]', ov).value;
+    const uniq = $('[data-f="uniq"]', ov).checked;
+    if (!name) return err('请输入索引名');
+    if (indexNameTaken(name, tableName) || (!editing || name !== oldName) && indexDef(tableName, name)) {
+      return err(`索引名 ${name} 已被占用(索引名为全库命名空间)`);
+    }
+    try {
+      if (!editing) {
+        ui.status(`正在创建索引 ${name}…`, 'busy');
+        const r = await api.post('/api/sql', {sql: indexCreateSql(tableName, name, col, uniq) + ';'});
+        if (r.kind === 'error') return fail(r.message);
+        ui.toast(`已创建索引 ${name}(${tableName}.${col})`);
+      } else {
+        if (name === oldName && col === def.column && uniq === !!def.unique) return err('未修改任何内容');
+        if (name !== oldName) {
+          // 改名重建:先建新(失败则旧索引原样保留),成功后再删旧。
+          ui.status(`正在重建索引 ${oldName} → ${name}…`, 'busy');
+          let r = await api.post('/api/sql', {sql: indexCreateSql(tableName, name, col, uniq) + ';'});
+          if (r.kind === 'error') return fail(r.message);
+          r = await api.post('/api/sql', {sql: `DROP INDEX "${qident(oldName)}";`});
+          if (r.kind === 'error') ui.toast(`新索引 ${name} 已创建,但删除旧索引 ${oldName} 失败:${r.message}`, true);
+          else ui.toast(`已重建索引 ${oldName} → ${name}`);
+        } else {
+          // 同名重建:先查重挡掉必然失败,再按「删旧 → 建新」顺序重建。
+          if (uniq && !(await duplicateCheck(tableName, col, err))) return;
+          ui.status(`正在重建索引 ${name}…`, 'busy');
+          const r = await api.post('/api/sql', {sql: `DROP INDEX "${qident(oldName)}";\n${indexCreateSql(tableName, name, col, uniq)};`});
+          if (r.kind === 'error') return fail(r.message);
+          if (r.kind === 'batch' && r.error) {
+            return fail(r.error.statement === 1
+              ? `旧索引已删除,但新定义创建失败:${r.error.message}`
+              : `删除旧索引失败:${r.error.message}`);
+          }
+          ui.toast(`已按新定义重建索引 ${name}(${tableName}.${col})`);
+        }
+      }
+      ui.status('');
+      explorer.refreshSoon();
+      closeModal();
+    } catch (e) { fail(e.message); }
+  };
+  ov.onkeydown = (e) => {
+    if (e.key === 'Enter' && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
+  };
+}
+
+function newIndexDialog(tableName) {
+  const m = explorer.tableMeta(tableName);
+  const cols = m && m.columns ? m.columns.map(c => c.name) : [];
+  if (!cols.length) { ui.toast(`表 ${tableName} 没有声明列,无法创建索引`, true); return; }
+  indexDialog(tableName, {name: '', column: cols[0], unique: false}, null);
+}
+
+function editIndexDialog(tableName, indexName) {
+  const d = indexDef(tableName, indexName);
+  if (!d) { ui.toast('未找到该索引的定义,请刷新对象资源管理器后重试', true); explorer.refreshSoon(); return; }
+  indexDialog(tableName, {name: d.name, column: d.column, unique: !!d.unique}, indexName);
+}
+
+function dropIndex(tableName, indexName) {
+  dialog('删除索引', [{name: 'name', label: '索引名', value: indexName, ph: '输入索引名以确认'}], '删除', async (v, err) => {
+    if (v.name !== indexName) { err('索引名不匹配'); throw new Error('cancel'); }
+    const r = await api.post('/api/sql', {sql: `DROP INDEX "${qident(indexName)}";`});
+    if (r.kind === 'error') { ui.toast(r.message, true); return; }
+    ui.toast(`已删除索引 ${indexName}(${tableName})`);
+    explorer.refreshSoon();
+  });
 }
 
 /* ================= 标签页管理 ================= */
@@ -427,7 +880,7 @@ const tabs = {
     this.activate(t);
     return t;
   },
-  kindIcon(kind) { return { query: 'query', data: 'table', dash: 'dashboard' }[kind] || 'view'; },
+  kindIcon(kind) { return { query: 'query', data: 'table', dash: 'dashboard', cluster: 'cluster', logs: 'log' }[kind] || 'view'; },
   activate(t) {
     this.active = t;
     $$('.tab').forEach(el => el.classList.remove('active'));
@@ -449,7 +902,8 @@ const tabs = {
 /* ================= SQL 高亮编辑器 ================= */
 const KW = ('SELECT FROM WHERE AND OR NOT NULL IS IN LIKE BETWEEN ORDER BY GROUP HAVING LIMIT OFFSET AS ASC DESC ' +
   'INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE ALTER ADD DROP INDEX VIEW PRIMARY KEY UNIQUE AUTOINCREMENT ' +
-  'AUTO_INCREMENT INT INTEGER TEXT REAL FLOAT BOOLEAN BOOL BEGIN COMMIT ROLLBACK TRANSACTION JOIN INNER LEFT CROSS ' +
+  'AUTO_INCREMENT INT INTEGER TEXT REAL FLOAT BOOLEAN BOOL GUID UUID UUIDV7 UNIQUEIDENTIFIER ' +
+  'BEGIN COMMIT ROLLBACK TRANSACTION JOIN INNER LEFT CROSS ' +
   'ON USING UNION ALL DISTINCT COUNT SUM AVG MIN MAX RETURNING IF EXISTS CASCADE CONSTRAINT CHECK DEFAULT FOREIGN ' +
   'REFERENCES EXPLAIN PRAGMA CASE WHEN THEN ELSE END EXISTS').split(/\s+/);
 const FN = ['COUNT','SUM','AVG','MIN','MAX','UPPER','LOWER','LENGTH','ABS','ROUND','COALESCE'];
@@ -662,6 +1116,8 @@ function openDataTab(tableName, meta) {
         <button data-do="next">下一页 ▶</button>
         <span class="meta" data-range></span>
         <div class="spacer"></div>
+        <button data-do="edit" title="编辑表结构(列编辑网格)">编辑表…</button>
+        <button data-do="insert" class="primary" title="插入文档(JSON)">插入文档…</button>
         <button data-do="query">生成查询</button>
         <button data-do="drop" class="danger">删除表…</button>
       </div><div class="res-wrap"><div class="res-pane active grid-host" style="display:block"></div></div>`;
@@ -686,6 +1142,8 @@ function openDataTab(tableName, meta) {
     $('[data-do="refresh"]', t.el).onclick = t.load;
     $('[data-do="prev"]', t.el).onclick = () => { t.offset = Math.max(0, t.offset - t.limit); t.load(); };
     $('[data-do="next"]', t.el).onclick = () => { t.offset += t.limit; t.load(); };
+    $('[data-do="edit"]', t.el).onclick = () => editTableDialog(tableName, explorer.tableMeta(tableName) || meta, t.load);
+    $('[data-do="insert"]', t.el).onclick = () => insertDocDialog(tableName, meta, t.load);
     $('[data-do="query"]', t.el).onclick = () => openQueryTab(`查询: ${tableName}`, `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
     $('[data-do="drop"]', t.el).onclick = () => dropTable(tableName, () => tabs.close(t));
     t.load();
@@ -696,8 +1154,8 @@ function openDataTab(tableName, meta) {
 function openDashboard() {
   tabs.open('dash', 'dash', '服务器仪表盘', (t) => {
     t.el.innerHTML = `<div class="dash">
-      <h2>docsql 服务器仪表盘</h2>
-      <div class="sub">文档数据库 · 文档存储 + SQL · 管理控制台 v1.0(SSMS 风格)</div>
+      <h2>DocSQL 服务器仪表盘</h2>
+      <div class="sub"></div>
       <div class="dash-actions">
         <button class="primary" data-do="newq">新建查询</button>
         <button data-do="refresh">刷新</button>
@@ -707,19 +1165,249 @@ function openDashboard() {
     $('[data-do="newq"]', t.el).onclick = () => openQueryTab();
     $('[data-do="refresh"]', t.el).onclick = t.load;
     t.load = async () => {
+      // 统计对象随节点选择器切换:本机内嵌引擎或远程集群节点。
+      $('.sub', t.el).textContent = api.node
+        ? `统计对象为远程节点 ${api.node}(控制台经协议代理;写在该节点上执行并按其集群配置扇出)`
+        : '统计对象为本控制台内嵌数据库(集群部署时与各节点数据无关;集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v1.0';
       try {
         const m = await api.get('/api/meta');
+        if (m && m.error) {
+          $('[data-cards]', t.el).innerHTML =
+            `<div class="card" style="max-width:520px"><div class="v" style="font-size:15px;color:var(--err)">节点不可用</div><div class="k">${esc(m.error)}</div></div>`;
+          return;
+        }
         const s = m.storage, sv = m.server;
+        // 远程节点的 meta 载荷不受本机控制,所有字段过 esc 再进 innerHTML。
         const cards = [
-          [`${m.totals.tables}<small> 张</small>`, '用户表'],
-          [`${m.totals.rows}<small> 行</small>`, '表数据总行数'],
-          [`${s.num_pages}<small> 页 × ${s.page_size / 1024}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, '已分配页'],
+          [`${esc(m.totals.tables)}<small> 张</small>`, '用户表'],
+          [`${esc(m.totals.rows)}<small> 行</small>`, '表数据总行数'],
+          [`${esc(s.num_pages)}<small> 页 × ${esc(s.page_size / 1024)}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, '已分配页'],
           [`${fmtBytes(s.db_bytes)}<small> / WAL ${fmtBytes(s.wal_bytes)}</small>`, '数据文件 / WAL'],
-          [`${fmtDur(sv.uptime_ms)}<small> · v${sv.version}</small>`, '服务运行时长 · 版本'],
+          [`${fmtDur(sv.uptime_ms)}<small> · v${esc(sv.version)}</small>`, '服务运行时长 · 版本'],
         ];
         $('[data-cards]', t.el).innerHTML = cards.map(c => `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('');
       } catch (e) { ui.toast(e.message, true); }
     };
+    t.load();
+  });
+}
+
+/* ================= 集群状态 ================= */
+function openClusterTab() {
+  tabs.open('cluster', 'cluster', '集群状态', (t) => {
+    t.auto = true;
+    t.el.innerHTML = `<div class="dash">
+      <h2>集群状态</h2>
+      <div class="sub">DOCSQL_PEERS 对等节点 · 只读探测(PING 存活 + STATUS 状态报告),不影响集群数据</div>
+      <div class="dash-actions">
+        <button class="primary" data-do="refresh">立即刷新</button>
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
+          <input type="checkbox" data-do="auto" checked>每 5 秒自动刷新</label>
+        <span class="meta" data-at style="color:var(--txt3)"></span>
+      </div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)">正在探测节点…</div></div>
+    </div>`;
+    $('[data-do="refresh"]', t.el).onclick = () => t.load();
+    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
+    t.render = (data) => {
+      const body = $('[data-body]', t.el);
+      const nodes = data.nodes || [];
+      if (!nodes.length) {
+        body.innerHTML = `<div class="card" style="max-width:600px">
+          <div class="v" style="font-size:15px">单机模式</div>
+          <div class="k" style="line-height:1.7">未配置集群(DOCSQL_PEERS 为空),本控制台以内嵌单机引擎运行,
+          可在「视图 → 服务器仪表盘」查看本机状态。集群部署时为 web 服务设置
+          DOCSQL_PEERS(逗号分隔的节点地址,如 node-a:7600,node-b:7600),即可在此监控各节点。</div></div>`;
+        return;
+      }
+      const reachable = nodes.filter(n => n.reachable).length;
+      const down = nodes.length - reachable;
+      const st = nodes.filter(n => n.status);
+      const maxTables = st.reduce((m, n) => Math.max(m, (n.status.totals && n.status.totals.tables) || 0), 0);
+      const maxRows = st.reduce((m, n) => Math.max(m, (n.status.totals && n.status.totals.rows) || 0), 0);
+      // 收敛信号用行数一致性:各节点 WAL LSN 在 checkpoint/重启后不在同一
+      // 基准上,跨节点比较 LSN 会误报分歧。
+      const consistent = st.filter(n => (n.status.totals && n.status.totals.rows) === maxRows).length;
+      const ro = st.filter(n => n.status.read_only).length;
+      const cards = [
+        [`${nodes.length}<small> 个</small>`, '配置节点'],
+        [`${reachable}<small> / ${nodes.length}</small>`, '在线(可达)'],
+        [`${down}<small> 个</small>`, '离线(不可达)', down ? ' style="color:var(--err)"' : ''],
+        [`${maxTables}<small> 张</small>`, '集群表数(节点最大值)'],
+        [`${maxRows}<small> 行</small>`, '集群总行数(节点最大值)'],
+        [`${consistent}<small> / ${st.length}</small>`, '行数一致的节点'],
+        [ro ? `${ro}<small> 个</small>` : '无', '只读节点(PROMOTE 可提升)'],
+      ];
+      let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
+        `<div class="card"><div class="v"${c[2] || ''}>${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
+      html += `<table class="grid"><thead><tr>
+        <th>节点</th><th>状态</th><th>延迟</th><th>只读</th><th>事务中</th><th>表</th><th>行数</th>
+        <th>数据 / WAL</th><th title="节点本机 WAL 写入位置;checkpoint 或重启后回绕,不作跨节点比较">WAL LSN</th><th>运行时长</th><th>Peers</th><th>备注</th></tr></thead><tbody>`;
+      const dash = '<span class="null">—</span>';
+      for (const n of nodes) {
+        const s = n.status;
+        let state;
+        if (!n.reachable) state = '<span style="color:var(--err);font-weight:600">● 离线</span>';
+        else if (!s) state = '<span style="color:var(--warn);font-weight:600">● 在线</span>';
+        else if (s.read_only) state = '<span style="color:var(--warn);font-weight:600">● 只读</span>';
+        else state = '<span style="color:var(--ok);font-weight:600">● 在线</span>';
+        html += `<tr>
+          <td style="font-family:var(--mono)">${esc(n.addr)}</td>
+          <td>${state}</td>
+          <td>${n.latency_ms === null || n.latency_ms === undefined ? dash : esc(n.latency_ms.toFixed(1)) + ' ms'}</td>
+          <td>${s ? (s.read_only ? '是' : '否') : dash}</td>
+          <td>${s ? (s.in_transaction ? '<span style="color:var(--warn)">是</span>' : '否') : dash}</td>
+          <td>${s && s.totals ? esc(s.totals.tables) : dash}</td>
+          <td>${s && s.totals ? esc(s.totals.rows) : dash}</td>
+          <td>${s && s.storage ? fmtBytes(s.storage.db_bytes) + ' / ' + fmtBytes(s.storage.wal_bytes) : dash}</td>
+          <td>${s ? esc(s.durable_lsn) : dash}</td>
+          <td>${s ? fmtDur(s.uptime_ms) : dash}</td>
+          <td>${s ? esc((s.peers || []).length) : dash}</td>
+          <td style="max-width:260px" title="${n.error ? esc(n.error) : ''}">${n.error ? esc(n.error) : dash}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      body.innerHTML = html;
+    };
+    t.load = async () => {
+      try {
+        const data = await api.get('/api/cluster');
+        nodes.sync(data.nodes || []); // 顺带刷新节点切换器的在线状态
+        t.render(data);
+        $('[data-at]', t.el).textContent = '上次刷新 ' + new Date().toTimeString().slice(0, 8);
+      } catch (e) { ui.toast('集群状态刷新失败:' + e.message, true); }
+    };
+    // 只在 tab 激活时轮询,后台 tab 不产生探测流量。
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
+    t.onClose = () => clearInterval(t.timer);
+    t.load();
+  });
+}
+
+/* ================= 日志(数据 / 同步)================== */
+// 全部日志:本机控制台的语句审计 + 各节点 REQ_LOGS 报告(语句审计 + 同步
+// 事件),按时间倒序合并展示;支持类别(全部/数据/同步/仅错误)、来源、
+// 关键词过滤与 5 秒自动刷新(仅激活时轮询)。
+const SYNC_EVENTS = {
+  forward: '写扇出', publish: '发布扇出', trim: 'TRIM 扇出',
+  promote: 'PROMOTE', join: '节点加入',
+};
+const fmtTs = (ms) => { const d = new Date(ms), p = (n, w) => String(n).padStart(w || 2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`; };
+
+function openLogsTab() {
+  tabs.open('logs', 'logs', '日志', (t) => {
+    t.cat = 'all'; t.src = 'all'; t.q = ''; t.limit = 200; t.auto = true;
+    t.rows = []; t.offline = [];
+    const CATS = [['all', '全部'], ['data', '数据日志'], ['sync', '同步日志'], ['err', '仅错误']];
+    t.el.innerHTML = `<div class="doc-bar">
+        <span class="title">日志</span>
+        <span data-cats>${CATS.map(([id, label]) => `<button class="catbtn${id === 'all' ? ' on' : ''}" data-cat="${id}">${label}</button>`).join('')}</span>
+        <select data-do="src" title="日志来源" style="max-width:170px"><option value="all">全部来源</option></select>
+        <input type="text" data-do="q" placeholder="过滤:语句 / 错误 / 目标" style="width:160px">
+        <select data-do="limit" title="每来源拉取条数"><option value="100">100 条</option><option value="200" selected>200 条</option><option value="500">500 条</option></select>
+        <div class="spacer"></div>
+        <button class="primary" data-do="refresh">刷新</button>
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
+          <input type="checkbox" data-do="auto" checked>5s 自动刷新</label>
+      </div>
+      <div class="res-wrap"><div class="res-pane active" data-body style="display:block;padding:0"></div></div>`;
+    $$('[data-cat]', t.el).forEach(b => b.onclick = () => {
+      t.cat = b.dataset.cat;
+      $$('[data-cat]', t.el).forEach(x => x.classList.toggle('on', x === b));
+      t.render();
+    });
+    $('[data-do="src"]', t.el).onchange = (e) => { t.src = e.target.value; t.render(); };
+    let qTimer;
+    $('[data-do="q"]', t.el).oninput = (e) => {
+      clearTimeout(qTimer);
+      qTimer = setTimeout(() => { t.q = e.target.value.trim(); t.render(); }, 200);
+    };
+    $('[data-do="limit"]', t.el).onchange = (e) => { t.limit = +e.target.value; t.load(); };
+    $('[data-do="refresh"]', t.el).onclick = () => t.load();
+    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
+    t.render = () => {
+      const body = $('[data-body]', t.el);
+      const counts = { data: 0, sync: 0, err: 0 };
+      for (const r of t.rows) { counts[r.cat]++; if (!r.ok) counts.err++; }
+      const rows = t.rows.filter(r => {
+        if ((t.cat === 'data' || t.cat === 'sync') && r.cat !== t.cat) return false;
+        if (t.cat === 'err' && r.ok) return false;
+        if (t.src !== 'all' && r.srcKey !== t.src) return false;
+        if (t.q) {
+          const hay = (r.text + ' ' + (r.error || '') + ' ' + (r.target || '')).toLowerCase();
+          if (!hay.includes(t.q.toLowerCase())) return false;
+        }
+        return true;
+      });
+      let html = `<div style="padding:5px 10px;color:var(--txt3)">共 ${t.rows.length} 条 · 数据 ${counts.data} · 同步 ${counts.sync} · 错误 ${counts.err}`
+        + (t.offline.length ? ` · <span style="color:var(--err)">离线节点 ${t.offline.length} 个(${t.offline.map(n => esc(n.addr)).join(', ')})</span>` : '') + '</div>';
+      if (!rows.length) {
+        html += '<div class="msg-list" style="color:var(--txt3)">没有匹配的日志条目。单机部署时只有本机控制台的语句审计;集群部署会汇总各节点的语句与同步日志。</div>';
+      } else {
+        html += `<table class="grid"><thead><tr><th style="width:104px">时间</th><th>来源</th><th>类别</th><th>内容</th><th>结果</th></tr></thead><tbody>`;
+        for (const r of rows) {
+          const isData = r.cat === 'data';
+          const cat = isData
+            ? `<span style="color:var(--accent-dk)">数据</span>${r.replicated ? '<span style="font-size:10px;color:#6a4fa3;border:1px solid #ddd0ee;border-radius:6px;padding:0 4px;margin-left:4px;background:#f4effc" title="来自对等节点扇出的复制应用">复制</span>' : ''}`
+            : `<span style="color:#4a7a54">同步</span>`;
+          const content = isData
+            ? esc(r.text)
+            : `<b style="font-weight:600">${esc(SYNC_EVENTS[r.event] || r.event)}</b>${r.target ? ` → <span style="font-family:var(--mono)">${esc(r.target)}</span>` : ''}${r.text ? ` · ${esc(r.text)}` : ''}`;
+          const result = !r.ok
+            ? `<span style="color:var(--err)" title="${esc(r.error || '')}">${esc((r.error || '失败').slice(0, 80))}</span>`
+            : isData
+              ? `${r.ms != null ? r.ms.toFixed(1) + ' ms' : ''}${r.affected != null ? (r.ms != null ? ' · ' : '') + r.affected + ' 行' : ''}` || '成功'
+              : '成功';
+          html += `<tr>
+            <td style="font-family:var(--mono)">${esc(fmtTs(r.ts))}</td>
+            <td>${esc(r.src)}</td>
+            <td>${cat}</td>
+            <td style="max-width:480px;overflow:hidden;text-overflow:ellipsis" title="${esc(isData ? r.text : (r.event + ' ' + (r.target || '') + ' ' + r.text))}">${content}</td>
+            <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${result}</td>
+          </tr>`;
+        }
+        html += '</tbody></table>';
+      }
+      body.innerHTML = html;
+    };
+    t.load = async () => {
+      try {
+        const data = await api.get('/api/logs?limit=' + t.limit);
+        const rows = [];
+        const pushQuery = (list, src, srcKey) => (list || []).forEach(e => rows.push({
+          ts: e.ts_ms, src, srcKey, cat: 'data', text: e.sql || '',
+          ok: !e.error, ms: e.ms, affected: e.affected, error: e.error || null,
+          replicated: !!e.replicated,
+        }));
+        pushQuery(data.local && data.local.query, '本机控制台', 'local');
+        const srcSel = $('[data-do="src"]', t.el);
+        const opts = ['<option value="all">全部来源</option>', '<option value="local"' + (t.src === 'local' ? ' selected' : '') + '>本机控制台</option>'];
+        for (const n of data.nodes || []) {
+          if (!n.reachable || !n.logs) continue;
+          const hit = (n.logs.query || []).length + (n.logs.sync || []).length;
+          opts.push(`<option value="${esc(n.addr)}"${t.src === n.addr ? ' selected' : ''}>${esc(n.addr)}(${hit})</option>`);
+          pushQuery(n.logs.query, n.addr, n.addr);
+          (n.logs.sync || []).forEach(e => rows.push({
+            ts: e.ts_ms, src: n.addr, srcKey: n.addr, cat: 'sync',
+            event: e.event, target: e.target || '', text: e.sql || '',
+            ok: e.ok !== false, error: e.detail || null,
+          }));
+        }
+        srcSel.innerHTML = opts.join('');
+        if (t.src !== 'all' && !opts.some(o => o.includes(`value="${t.src}"`))) {
+          t.src = 'all';
+          srcSel.value = 'all';
+        }
+        rows.sort((a, b) => b.ts - a.ts);
+        t.rows = rows;
+        t.offline = (data.nodes || []).filter(n => !n.reachable);
+        t.render();
+      } catch (e) { ui.toast('日志刷新失败:' + e.message, true); }
+    };
+    // 与集群页同策略:仅在 tab 激活时轮询。
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
+    t.onClose = () => clearInterval(t.timer);
     t.load();
   });
 }
@@ -730,9 +1418,18 @@ const explorer = {
   _timer: null,
   async refresh() {
     try {
-      this.meta = await api.get('/api/meta');
+      const meta = await api.get('/api/meta');
+      // 远程节点代理失败(不可达/拒绝认证)走 in-band error,不点亮整页。
+      if (meta && meta.error) {
+        this.meta = null;
+        $('#tree').innerHTML = `<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:var(--err)">${api.node ? `节点 ${esc(api.node)} 不可用:` : ''}${esc(meta.error)}</span></div>`;
+        $('#st-server').textContent = api.node ? `节点 ${api.node} · 不可用` : 'DocSQL';
+        ui.status('对象资源管理器刷新失败', 'err');
+        return;
+      }
+      this.meta = meta;
       this.render();
-      $('#st-server').textContent = `docsql v${this.meta.server.version} · ${this.meta.totals.tables} 表`;
+      $('#st-server').textContent = `${api.node ? esc(api.node) + ' · ' : ''}DocSQL v${this.meta.server.version} · ${this.meta.totals.tables} 表`;
     } catch (e) { ui.toast('刷新失败:' + e.message, true); }
   },
   refreshSoon() { clearTimeout(this._timer); this._timer = setTimeout(() => this.refresh(), 250); },
@@ -748,15 +1445,17 @@ const explorer = {
   render() {
     const m = this.meta;
     if (!m) return;
-    const host = location.host || 'localhost';
+    const host = api.node || (location.host || 'localhost');
     const branch = [];
-    branch.push(['server', ICONS.server, `<b>${esc(host)}</b> <span class="cnt">docsql v${m.server.version}</span>`, {}]);
+    branch.push(['server', ICONS.server, api.node
+      ? `<b>${esc(host)}</b> <span class="cnt" title="远程节点 — 控制台经协议代理,写在该节点上执行并按其集群配置扇出">远程节点</span>`
+      : `<b>${esc(host)}</b> <span class="cnt">DocSQL v${esc(m.server.version)}</span>`, {}]);
 
     // 表
     const tablesInner = m.tables.map(t =>
-      this.node('table:' + t.name, ICONS.table, `${esc(t.name)} <span class="cnt">(${t.row_count})</span>`,
+      this.node('table:' + t.name, ICONS.table, `${esc(t.name)} <span class="cnt">(${esc(t.row_count)})</span>`,
         {kind: 'table', name: t.name, more: t.row_count, children: true}));
-    branch.push(['tables', ICONS.folder, `表 <span class="cnt">(${m.totals.tables})</span>`, {kind: 'tables', children: true}]);
+    branch.push(['tables', ICONS.folder, `表 <span class="cnt">(${esc(m.totals.tables)})</span>`, {kind: 'tables', children: true}]);
 
     // 系统视图
     branch.push(['sys', ICONS.folder, '系统视图', {kind: 'sys', children: true}]);
@@ -776,18 +1475,38 @@ const explorer = {
           return this.node('col:' + t.name + '.' + c.name, c.primary_key ? ICONS.key : ICONS.column,
             `${esc(c.name)}${badges}`, {kind: 'column', name: c.name, more: t.name});
         }).join('');
-        const idxs = t.indexes.length ? t.indexes.map(i =>
-          this.node('idx:' + t.name + '.' + i, ICONS.index, esc(i), {kind: 'index', name: i, more: t.name})).join('')
+        // 观测列:仅见于数据、未在表定义中声明的顶层字段(schemaless 写入
+        // 不会改写列定义)。SELECT * 会返回它们,声明列不会。
+        const declared = new Set(t.columns.map(c => c.name));
+        const obsCols = (t.observed || []).filter(n => !declared.has(n)).map(n =>
+          this.node('col:' + t.name + '.' + n, ICONS.column,
+            `<span class="obs-col">${esc(n)}</span><span class="badge obs" title="仅见于数据,未在表定义中声明;SELECT * 会返回它">数据</span>`,
+            {kind: 'column', name: n, more: t.name})).join('');
+        const obsN = (t.observed || []).length;
+        const colLabel = obsN !== t.columns.length ? `声明 ${t.columns.length} / 实测 ${obsN}` : `${t.columns.length}`;
+        const defOf = (n) => (t.index_defs || []).find(d => d.name === n);
+        const pkCol = (t.columns.find(c => c.primary_key) || {}).name;
+        const idxs = t.indexes.length ? t.indexes.map(i => {
+          const d = defOf(i);
+          // 约束自动索引:随 PRIMARY KEY/UNIQUE 声明创建,只读展示。
+          const label = d && d.auto
+            ? `${esc(i)} <span class="cnt">(${esc(d.column)})</span>` +
+              `<span class="badge${d.column === pkCol ? ' pk' : ''}" title="${d.column === pkCol ? 'PRIMARY KEY' : 'UNIQUE'} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除">${d.column === pkCol ? 'PK' : 'UQ'}</span>`
+            : d
+            ? `${esc(i)} <span class="cnt">(${esc(d.column)})</span>${d.unique ? '<span class="badge" title="唯一索引">UQ</span>' : ''}`
+            : esc(i);
+          return this.node('idx:' + t.name + '.' + i, ICONS.index, label, {kind: 'index', name: i, more: t.name});
+        }).join('')
           : '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无索引)</span></div>';
         const keys = t.keys.length ? t.keys.map(kk =>
           this.node('key:' + t.name + '.' + kk, ICONS.key, esc(kk), {kind: 'key', name: kk, more: t.name})).join('')
           : '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无键)</span></div>';
         const el = $(`[data-ch="${CSS.escape(p)}"]`, tree);
         if (el) el.innerHTML =
-          this.node(p + '/columns', ICONS.folder, `列 <span class="cnt">(${t.columns.length})</span>`, {children: true}) +
-          this.node(p + '/indexes', ICONS.folder, `索引 <span class="cnt">(${t.indexes.length})</span>`, {children: true}) +
+          this.node(p + '/columns', ICONS.folder, `列 <span class="cnt" title="声明 ${t.columns.length} 列,数据中实测 ${(t.observed || []).length} 个顶层字段">(${colLabel})</span>`, {children: true}) +
+          this.node(p + '/indexes', ICONS.folder, `索引 <span class="cnt">(${t.indexes.length})</span>`, {kind: 'indexes', name: t.name, children: true}) +
           this.node(p + '/keys', ICONS.folder, `键 <span class="cnt">(${t.keys.length})</span>`, {children: true});
-        const cEl = $(`[data-ch="${CSS.escape(p + '/columns')}"]`, tree); if (cEl) cEl.innerHTML = cols;
+        const cEl = $(`[data-ch="${CSS.escape(p + '/columns')}"]`, tree); if (cEl) cEl.innerHTML = cols + obsCols;
         const iEl = $(`[data-ch="${CSS.escape(p + '/indexes')}"]`, tree); if (iEl) iEl.innerHTML = idxs;
         const kEl = $(`[data-ch="${CSS.escape(p + '/keys')}"]`, tree); if (kEl) kEl.innerHTML = keys;
       });
@@ -830,6 +1549,11 @@ const explorer = {
       if (!node) return;
       const kind = node.dataset.kind, name = node.dataset.name;
       if (kind === 'table') openDataTab(name, explorer.tableMeta(name));
+      else if (kind === 'index') {
+        const d = indexDef(node.dataset.more, name);
+        if (d && d.auto) autoIndexScript(node.dataset.more, name, d);
+        else editIndexDialog(node.dataset.more, name);
+      }
       else if (kind === 'sysview') openQueryTab(`查询: ${name}`, `SELECT * FROM ${name} LIMIT 100;`, true);
       else if (hasChildren(node)) toggle(node);
     });
@@ -851,6 +1575,9 @@ const explorer = {
         {id: 'newq', label: '新建查询', kbd: 'Ctrl+N', act: () => openQueryTab(`查询: ${name}`)},
         {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, `查询: ${name}`)},
         {id: 'data', label: '查看数据(编辑前 200 行)', act: () => openDataTab(name, m)},
+        {id: 'edittable', label: '编辑表…', act: () => editTableDialog(name, m)},
+        {id: 'insertdoc', label: '插入文档…', act: () => insertDocDialog(name, m)},
+        {id: 'newidx', label: '新建索引…', act: () => newIndexDialog(name)},
         '-',
         {id: 'creategen', label: '编写表脚本为 CREATE TO →', act: () => openQueryTab(`脚本: ${name}`, ddl)},
         {id: 'dropgen', label: '编写表脚本为 DROP TO →', act: () => openQueryTab(`脚本: ${name}`, `-- 删除表 ${name}\nDROP TABLE IF EXISTS "${qident(name)}";`)},
@@ -858,19 +1585,50 @@ const explorer = {
         {id: 'drop', label: `删除表 ${name}…`, act: () => dropTable(name)},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
-    } else if (kind === 'column' || kind === 'index' || kind === 'key' || kind === 'sysview') {
+    } else if (kind === 'index') {
+      const tname = more; // 宿主表名
+      const d = indexDef(tname, name);
+      if (d && d.auto) {
+        // 约束自动索引:只读,不提供修改/删除。
+        ctx.open([
+          {id: 'idxgen', label: '编写索引脚本为 CREATE TO →', act: () => autoIndexScript(tname, name, d)},
+          '-',
+          {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
+        ], x, y);
+        return;
+      }
+      ctx.open([
+        {id: 'editidx', label: '修改索引…', act: () => editIndexDialog(tname, name)},
+        {id: 'dropidx', label: `删除索引 ${name}…`, act: () => dropIndex(tname, name)},
+        {id: 'idxgen', label: '编写索引脚本为 CREATE TO →', act: () => {
+          const d = indexDef(tname, name);
+          openQueryTab(`脚本: ${name}`, d ? indexCreateSql(tname, name, d.column, !!d.unique) + ';' : `-- 未找到索引 ${name} 的定义`);
+        }},
+        '-',
+        {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
+      ], x, y);
+    } else if (kind === 'indexes') {
+      ctx.open([
+        {id: 'newidx', label: '新建索引…', act: () => newIndexDialog(name)},
+        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+      ], x, y);
+    } else if (kind === 'column' || kind === 'key' || kind === 'sysview') {
       ctx.open([
         {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
         ...(kind === 'sysview' ? [{id: 'sel', label: '选择前 100 行', act: () => q(`SELECT * FROM ${name} LIMIT 100;`, `查询: ${name}`)}] : []),
       ], x, y);
     } else if (kind === 'tables') {
       ctx.open([
+        {id: 'newtable', label: '新建表…', act: () => newTableDialog()},
         {id: 'newq', label: '新建查询', act: () => openQueryTab()},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'server') {
       ctx.open([
+        {id: 'newtable', label: '新建表…', act: () => newTableDialog()},
         {id: 'dash', label: '服务器仪表盘', act: () => openDashboard()},
+        {id: 'cluster', label: '集群状态', act: () => openClusterTab()},
+        {id: 'logs', label: '日志', act: () => openLogsTab()},
         {id: 'newq', label: '新建查询', act: () => openQueryTab()},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
@@ -879,7 +1637,7 @@ const explorer = {
 
   createScript(m) {
     const cols = m.columns.map(c => {
-      let s = `  ${c.name} ANY`;
+      let s = `  ${c.name} ${c.data_type || 'ANY'}`;
       if (c.primary_key) s += ' PRIMARY KEY';
       if (c.unique) s += ' UNIQUE';
       if (!c.nullable) s += ' NOT NULL';
@@ -887,7 +1645,12 @@ const explorer = {
       return s;
     }).join(',\n');
     let s = `-- 表 ${m.name}(${m.row_count} 行,${m.pages} 页)\nCREATE TABLE ${m.name} (\n${cols}\n);`;
-    for (const i of m.indexes) s += `\nCREATE INDEX ${i} ON ${m.name} (${m.columns[0] ? m.columns[0].name : '*'});`;
+    // 索引 DDL 用 index_defs 还原列与唯一性(仅名字不足以重建)。
+    const defs = m.index_defs || [];
+    for (const i of m.indexes) {
+      const d = defs.find(x => x.name === i);
+      s += `\nCREATE ${d && d.unique ? 'UNIQUE ' : ''}INDEX ${i} ON ${m.name} (${d ? d.column : (m.columns[0] ? m.columns[0].name : '*')});`;
+    }
     return s;
   }
 };
@@ -900,7 +1663,7 @@ document.addEventListener('keydown', (e) => {
   const inField = /INPUT|TEXTAREA/.test(document.activeElement.tagName);
   if (e.key === 'F5') { e.preventDefault(); if (e.ctrlKey) parseActive(); else execActive(); }
   else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); execActive(); }
-  else if (e.key === 'Escape') { ctx.close(); }
+  else if (e.key === 'Escape') { ctx.close(); if ($('#overlay').style.display === 'flex') closeModal(); }
   else if (!inField && (e.key === 'n' || e.key === 'N') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openQueryTab(); }
   else if (!inField && (e.key === 'r' || e.key === 'R') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); explorer.refresh(); }
 });
@@ -909,6 +1672,7 @@ $('#btn-exec').onclick = execActive;
 $('#btn-parse').onclick = parseActive;
 $('#btn-newq').onclick = () => openQueryTab();
 $('#btn-refresh').onclick = () => explorer.refresh();
+$('#exp-newtable').onclick = () => newTableDialog();
 $('#exp-collapse').onclick = () => { explorer.expanded.clear(); explorer.render(); };
 
 $('#btn-connect').onclick = async () => {
@@ -917,6 +1681,7 @@ $('#btn-connect').onclick = async () => {
   try {
     await api.get('/api/meta');
     ui.toast('连接成功');
+    nodes.boot(); // 认证通过后再取一次节点列表(填充切换器)
     explorer.refresh();
   } catch (e) { ui.toast(e.message, true); }
 };
@@ -938,11 +1703,14 @@ $$('.menu-drop [data-act]').forEach(item => {
   item.onclick = () => {
     const act = item.dataset.act;
     if (act === 'new-query') openQueryTab();
+    else if (act === 'new-table') newTableDialog();
     else if (act === 'close-tab') { if (tabs.active) tabs.close(tabs.active); }
     else if (act === 'refresh') explorer.refresh();
     else if (act === 'dashboard') openDashboard();
-    else if (act === 'about') dialog('关于 docsql Studio', [
-      {name:'a', label: '产品', value: 'docsql Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},
+    else if (act === 'cluster') openClusterTab();
+    else if (act === 'logs') openLogsTab();
+    else if (act === 'about') dialog('关于 DocSQL Studio', [
+      {name:'a', label: '产品', value: 'DocSQL Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},
     ], '确定', async () => {});
   };
 });
@@ -952,6 +1720,7 @@ $('#token').value = api.token;
 explorer.bind();
 openDashboard();
 explorer.refresh();
+nodes.boot();
 </script>
 </body>
 </html>

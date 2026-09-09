@@ -53,6 +53,9 @@ public sealed class PeerNode : IDisposable
     public void Dispose()
     {
         try { if (!Proc.HasExited) Proc.Kill(); } catch { }
+        // 等待进程真正退出:重启类测试会立刻复用同一端口,旧进程未死透时
+        // 就绪探测可能连到垂死的旧监听器,随后读到 connection reset。
+        try { Proc.WaitForExit(5000); } catch { }
         Proc.Dispose();
     }
 }
@@ -147,7 +150,8 @@ public sealed class SymmetricClusterTests
             // C 宕机:A、B 依旧可写可读(扇出对死节点只记日志)
             c.Kill();
             Exec(b.Cs, "INSERT INTO tol VALUES (2)");
-            Assert.Equal(2L, Long(a.Cs, "SELECT COUNT(id) FROM tol"));
+            // 节点可能仍在 bootstrap 窗口内,扇出落点有短暂延迟,轮询等待。
+            Eventually(() => Assert.Equal(2L, Long(a.Cs, "SELECT COUNT(id) FROM tol")), "A 收到 B 的写入");
 
             // C 复活(独立进程拉起会丢内存态,这里验证的是其余节点不受影响)
             Assert.Equal(2L, Long(b.Cs, "SELECT COUNT(id) FROM tol"));

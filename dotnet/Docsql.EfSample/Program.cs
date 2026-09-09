@@ -1,4 +1,4 @@
-// EF Core 调用 docsql 的完整示例。
+// EF Core 调用 DocSQL 的完整示例。
 //
 // 前置:target/debug/docsql-server 已编译。示例自动在临时端口拉起一个
 // server(临时 db 文件),跑完即清理,直接 `dotnet run` 即可。
@@ -82,7 +82,7 @@ public static class Program
         {
             db.Blogs.Add(new Blog
             {
-                Title = "docsql 博客",
+                Title = "DocSQL 博客",
                 Posts = { new Post { Content = "第一篇" }, new Post { Content = "第二篇" } },
             });
             db.Blogs.Add(new Blog { Title = "另一个博客" });
@@ -95,7 +95,7 @@ public static class Program
         {
             var blog = db.Blogs
                 .Include(b => b.Posts)
-                .Where(b => b.Title == "docsql 博客")
+                .Where(b => b.Title == "DocSQL 博客")
                 .First();
             Console.WriteLine($"3) Include 查询:「{blog.Title}」有 {blog.Posts.Count} 篇文章");
 

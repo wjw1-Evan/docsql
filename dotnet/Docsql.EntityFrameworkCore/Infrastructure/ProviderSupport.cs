@@ -1,5 +1,5 @@
 // 提供程序支撑件:注解、日志定义、约定集、LINQ 字符串方法翻译,
-// 以及"EF Migrations 不受支持"的显式报错桩(docsql 的建表走
+// 以及"EF Migrations 不受支持"的显式报错桩(DocSQL 的建表走
 // EnsureCreated/惰性建表拦截器与 SchemaSync,不提供迁移管线)。
 
 using System.Reflection;
@@ -17,7 +17,7 @@ namespace Docsql.EntityFrameworkCore.Infrastructure;
 
 /// <summary>
 /// EF Migrations(Add-Migration / Database.Migrate)不受支持:
-/// docsql 用 EnsureCreated + AutoCreate/SchemaSync 自动同步模型。
+/// DocSQL 用 EnsureCreated + AutoCreate/SchemaSync 自动同步模型。
 /// 显式报错,而不是让通用 ANSI 生成器产出引擎方言外的 SQL。
 /// </summary>
 public sealed class DocsqlUnsupportedMigrationsSqlGenerator(
@@ -31,7 +31,7 @@ public sealed class DocsqlUnsupportedMigrationsSqlGenerator(
         => throw NotSupported();
 
     private static NotSupportedException NotSupported() => new(
-        "docsql 不支持 EF Migrations;请使用 EnsureCreated(建表/索引随模型自动同步)");
+        "DocSQL 不支持 EF Migrations;请使用 EnsureCreated(建表/索引随模型自动同步)");
 }
 
 /// <summary>
@@ -42,7 +42,7 @@ public sealed class DocsqlUnsupportedMigrationsSqlGenerator(
 public sealed class DocsqlUnsupportedHistoryRepository : IHistoryRepository
 {
     private static NotSupportedException NotSupported() => new(
-        "docsql 不支持 EF Migrations;请使用 EnsureCreated(建表/索引随模型自动同步)");
+        "DocSQL 不支持 EF Migrations;请使用 EnsureCreated(建表/索引随模型自动同步)");
 
     public LockReleaseBehavior LockReleaseBehavior => throw NotSupported();
     public IMigrationsDatabaseLock AcquireDatabaseLock() => throw NotSupported();

@@ -130,7 +130,7 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
     [Fact]
     public void Database_Migrate_is_unsupported_and_fails_explicitly()
     {
-        // docsql 的建表走 EnsureCreated/AutoCreate/SchemaSync,不提供迁移
+        // DocSQL 的建表走 EnsureCreated/AutoCreate/SchemaSync,不提供迁移
         // 管线;Migrate() 必须显式报错并指向替代方案,而非生成方言外的 SQL。
         using var db = new TagDb(Cs);
         var ex = Assert.ThrowsAny<NotSupportedException>(() => db.Database.Migrate());
@@ -852,10 +852,19 @@ public sealed class EfSymmetricClusterTests
             db.SaveChanges();
         }
 
-        using (var db = new AppDb($"host=127.0.0.1;port={portP}"))
+        // P 可能还在 bootstrap 窗口内,扇出落点有短暂延迟,轮询等待。
+        var counted = false;
+        for (var i = 0; i < 100 && !counted; i++)
         {
-            Assert.Equal(2, db.Blogs.Count());
+            try
+            {
+                using var db = new AppDb($"host=127.0.0.1;port={portP}");
+                counted = db.Blogs.Count() == 2;
+            }
+            catch { }
+            Thread.Sleep(30);
         }
+        Assert.True(counted, "节点 P 未见节点 Q 的 EF 写入");
     }
 }
 

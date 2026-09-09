@@ -1,7 +1,8 @@
-// CLR ↔ docsql 列类型映射:INTEGER / REAL / TEXT。
+// CLR ↔ DocSQL 列类型映射:INTEGER / REAL / TEXT。
 
 using Microsoft.EntityFrameworkCore.Storage;
 using System.Data;
+using System.Globalization;
 
 namespace Docsql.EntityFrameworkCore.Infrastructure;
 
@@ -20,9 +21,39 @@ public sealed class DocsqlTypeMappingSource(
     private static readonly StringTypeMapping Text = new("TEXT", DbType.String);
     private static readonly GuidTypeMapping Guid = new("TEXT", DbType.Guid);
     private static readonly DecimalTypeMapping Decimal = new("TEXT", DbType.Decimal);
-    private static readonly DateTimeTypeMapping DateTime = new("TEXT", DbType.DateTime);
-    private static readonly DateTimeOffsetTypeMapping DateTimeOffset = new("TEXT", DbType.DateTimeOffset);
-    private static readonly TimeSpanTypeMapping TimeSpan = new("TEXT", DbType.Time);
+
+    // Date/time literals must be plain ISO-8601 strings: the base mappings
+    // render `TIMESTAMP '...'` / `TIME '...'`, which the engine rejects as
+    // unsupported expressions — inline constants in LINQ would then fail
+    // while closure-parameterized equivalents work. The text form matches
+    // the ADO parameter path exactly, so both paths store one format.
+    private static readonly IsoDateTimeMapping DateTime = new();
+    private static readonly IsoDateTimeOffsetMapping DateTimeOffset = new();
+    private static readonly IsoTimeSpanMapping TimeSpan = new();
+
+    private sealed class IsoDateTimeMapping : DateTimeTypeMapping
+    {
+        public IsoDateTimeMapping() : base("TEXT", System.Data.DbType.DateTime) { }
+
+        protected override string GenerateNonNullSqlLiteral(object value) =>
+            $"'{((System.DateTime)value).ToString("O", CultureInfo.InvariantCulture)}'";
+    }
+
+    private sealed class IsoDateTimeOffsetMapping : DateTimeOffsetTypeMapping
+    {
+        public IsoDateTimeOffsetMapping() : base("TEXT", System.Data.DbType.DateTimeOffset) { }
+
+        protected override string GenerateNonNullSqlLiteral(object value) =>
+            $"'{((DateTimeOffset)value).ToString("O", CultureInfo.InvariantCulture)}'";
+    }
+
+    private sealed class IsoTimeSpanMapping : TimeSpanTypeMapping
+    {
+        public IsoTimeSpanMapping() : base("TEXT", System.Data.DbType.Time) { }
+
+        protected override string GenerateNonNullSqlLiteral(object value) =>
+            $"'{((System.TimeSpan)value).ToString("c", CultureInfo.InvariantCulture)}'";
+    }
 
     protected override RelationalTypeMapping? FindMapping(in RelationalTypeMappingInfo info)
     {
@@ -36,9 +67,9 @@ public sealed class DocsqlTypeMappingSource(
         if (clrType == typeof(double)) return Real;
         if (clrType == typeof(decimal)) return Decimal;
         if (clrType == typeof(Guid)) return Guid;
-        if (clrType == typeof(DateTime)) return DateTime;
+        if (clrType == typeof(System.DateTime)) return DateTime;
         if (clrType == typeof(DateTimeOffset)) return DateTimeOffset;
-        if (clrType == typeof(TimeSpan)) return TimeSpan;
+        if (clrType == typeof(System.TimeSpan)) return TimeSpan;
         // byte[] intentionally unmapped: the engine has no BLOB storage, and
         // a BLOB mapping would silently round-trip garbage. No mapping makes
         // EF fail at model build with a clear error instead.

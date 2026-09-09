@@ -1,4 +1,4 @@
-// 原生 docsql EF Core 提供程序入口:不借壳 SQLite,仅依赖
+// 原生 DocSQL EF Core 提供程序入口:不借壳 SQLite,仅依赖
 // Microsoft.EntityFrameworkCore.Relational 的通用管线。
 //
 // SQL 生成(Infrastructure/)、更新执行、类型映射、EnsureCreated 全部
@@ -13,7 +13,7 @@ namespace Docsql.EntityFrameworkCore;
 
 public static class DocsqlDbContextOptionsExtensions
 {
-    /// <summary>连接 docsql:连接串 "host=..;port=..;token=..;key=.."。</summary>
+    /// <summary>连接 DocSQL:连接串 "host=..;port=..;token=..;key=.."。</summary>
     public static DbContextOptionsBuilder UseDocsql(
         this DbContextOptionsBuilder options,
         string connectionString)

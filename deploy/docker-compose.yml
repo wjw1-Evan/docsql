@@ -6,7 +6,10 @@
 #   docker compose --profile cluster up -d   # 3 symmetric peers + web (see below)
 #   docker compose --profile single --profile cluster up -d   # both at once
 #
-# Tear down with the same profile flags: docker compose --profile ... down -v
+# Tear down with the same profile flags: docker compose --profile ... down
+# (down -v also works). Data lives in EXTERNAL volumes (fixed docsql-data-*
+# names) that compose never removes — rebuilding/redeploying keeps data.
+# Wipe data only via ./reset-data.sh (or explicit docker volume rm).
 # Set DOCSQL_IMAGE_TAG to run against an existing image instead of building.
 #
 # Production deployment (CI-published image, no local build) — same two
@@ -27,6 +30,11 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-b:7600,node-c:7600"
+      # Inter-node credential: fan-out authenticates with it and only
+      # cluster-authed connections may send replication frames. Dev value
+      # is public on purpose (nothing secret on a loopback dev cluster);
+      # production sets its own via docker-compose.prod.yml/.env.
+      DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
     ports:
       - "127.0.0.1:17601:7600"
     volumes:
@@ -45,6 +53,7 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
+      DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
     ports:
       - "127.0.0.1:17602:7600"
     volumes:
@@ -66,6 +75,7 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
+      DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
     ports:
       - "127.0.0.1:17603:7600"
     volumes:
@@ -80,13 +90,49 @@ services:
       timeout: 3s
       retries: 10
 
+  # ---- profile: join ----------------------------------------------------
+  # A fourth data node brought up against a running cluster: being fresh
+  # (empty volume), it pulls the cluster's full state automatically
+  # (REQ_SYNC bootstrap), registers itself cluster-wide via
+  # DOCSQL_ADVERTISE, and from then on takes part in normal fan-out.
+  # Start it with: docker compose --profile cluster --profile join up -d
+  # Note: a/b/c keep the dynamic registration until they restart — to make
+  # node-d a permanent member, also list node-d:7600 in their DOCSQL_PEERS
+  # and recreate them (no data is lost, no re-sync happens).
+  node-d:
+    profiles: ["join"]
+    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
+    container_name: docsql-d
+    command: ["/data/docsql.db", "0.0.0.0:7600"]
+    environment:
+      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
+      DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+    ports:
+      - "127.0.0.1:17604:7600"
+    volumes:
+      - peer-d-data:/data
+    networks: [docsql]
+    depends_on:
+      node-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "docsql-cli connect node-d:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # Web console (embedded engine on its own volume; REST + UI on :7700).
+  # DOCSQL_PEERS feeds the read-only cluster-status probes — the console's
+  # own SQL/data operations stay on its embedded engine.
   node-web:
     profiles: ["cluster"]
     image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-local}"
     container_name: docsql-web
     command: ["/data/docsql.db", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
+    environment:
+      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
     ports:
       - "127.0.0.1:17700:7700"
     volumes:
@@ -134,13 +180,33 @@ services:
       node-single:
         condition: service_healthy
 
+# External data volumes: created once (`docker volume create docsql-data-*`
+# or any `docker compose up` precondition), they survive `down -v` and
+# container recreation — releases never lose data. dev and prod compose
+# share the same volumes (they share host ports, only one runs at a time).
+# ./reset-data.sh removes them; run-tests.sh recreates them per run.
 volumes:
   peer-a-data:
+    external: true
+    name: docsql-data-a
   peer-b-data:
+    external: true
+    name: docsql-data-b
   peer-c-data:
+    external: true
+    name: docsql-data-c
+  peer-d-data:
+    external: true
+    name: docsql-data-d
   web-data:
+    external: true
+    name: docsql-data-web
   single-data:
+    external: true
+    name: docsql-data-single
   web-single-data:
+    external: true
+    name: docsql-data-web-single
 
 networks:
   docsql:

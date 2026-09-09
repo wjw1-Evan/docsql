@@ -3,7 +3,7 @@ name = "docsql-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "docsql interactive shell"
+description = "DocSQL interactive shell"
 
 [dependencies]
 docsql-core = { path = "../docsql-core" }

@@ -22,9 +22,55 @@ use std::cmp::Ordering;
 
 const LEAF: u8 = 1;
 const INTERNAL: u8 = 2;
-/// Max keys per node — chosen so worst-case cells (long string keys are
-// rejected as oversized) always fit in a page.
-const MAX_KEYS: usize = 64;
+
+/// A cell that cannot occupy at most half a page leaves no split point with
+/// both halves inside a page, so such keys are rejected up front.
+const HALF_PAGE: usize = PAGE_SIZE / 2;
+
+/// Serialized node size — `header` is 3 (leaf) or 7 (internal), `payload`
+/// the per-cell locator width (8 or 4).
+fn node_bytes<T>(cells: &[(Value, T)], header: usize, payload: usize) -> Result<usize> {
+    let mut n = header;
+    for (k, _) in cells {
+        n += 2 + encode::encode_to_vec(k)?.len() + payload;
+    }
+    Ok(n)
+}
+
+/// Choose a split index for an overflowing node whose new cell sits at
+/// `at` (its insert position). Prefers `min(byte_boundary, at)`: splitting
+/// at the insert position makes the right half start with the new cell,
+/// which keeps equal-key entries ordered by insertion across leaves — a
+/// split that strands old equal-key cells in a far-right leaf interleaves
+/// old and new locators within one key run. When the suffix from `at`
+/// would not fit a page the index walks up toward the byte boundary,
+/// which always fits (every cell is capped at half a page).
+fn split_at_for_insert<T>(
+    cells: &[(Value, T)],
+    at: usize,
+    header: usize,
+    payload: usize,
+) -> Result<usize> {
+    let mut prefix = Vec::with_capacity(cells.len() + 1);
+    prefix.push(header);
+    for (k, _) in cells {
+        let last = *prefix.last().unwrap();
+        prefix.push(last + 2 + encode::encode_to_vec(k)?.len() + payload);
+    }
+    let total = *prefix.last().unwrap();
+    debug_assert!(total > PAGE_SIZE, "only overflowing nodes split");
+    // Largest prefix that still fits a page (>= 1 cell: cells are capped).
+    let boundary = prefix
+        .iter()
+        .position(|&p| p > PAGE_SIZE)
+        .map(|i| i.max(1))
+        .unwrap_or(cells.len() - 1);
+    let mut m = boundary.min(at).max(1);
+    while m < boundary && total - prefix[m] > PAGE_SIZE {
+        m += 1;
+    }
+    Ok(m.min(cells.len() - 1))
+}
 
 /// Route `key` to a child page: go right at the first separator >= key
 /// (matches split behavior, where the separator is the right leaf's first
@@ -38,6 +84,37 @@ fn descend(cells: &[(Value, u32)], leftmost: u32, key: &Value) -> u32 {
     } else {
         cells[idx - 1].1
     }
+}
+
+/// Children that may contain `key`, descended (primary) child first.
+/// Nominal ranges say exactly one child brackets `key`, but a split can
+/// leave keys EQUAL to a separator in the child left of it (see
+/// range_from_rec), so every child whose nominal range brackets `key` is
+/// a candidate — lookup and delete must not miss the left siblings.
+fn candidate_children(cells: &[(Value, u32)], leftmost: u32, key: &Value) -> Vec<u32> {
+    let primary = descend(cells, leftmost, key);
+    let mut out = vec![primary];
+    let leftmost_upper_ge = match cells.first() {
+        Some((k, _)) => Value::cmp_values(k, key) != Ordering::Less,
+        None => true,
+    };
+    if leftmost_upper_ge && leftmost != primary {
+        out.push(leftmost);
+    }
+    for (i, (_, child)) in cells.iter().enumerate() {
+        if *child == primary {
+            continue;
+        }
+        let lower_le = Value::cmp_values(&cells[i].0, key) != Ordering::Greater;
+        let upper_ge = match cells.get(i + 1) {
+            Some((k, _)) => Value::cmp_values(k, key) != Ordering::Less,
+            None => true,
+        };
+        if lower_le && upper_ge {
+            out.push(*child);
+        }
+    }
+    out
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -92,9 +169,12 @@ impl BTree {
     }
 
     fn read_node(pager: &mut Pager, tx: &Tx, id: u32) -> Result<Node> {
-        let page = match tx.staged_page(id) {
-            Some(p) => p.to_vec(),
-            None => pager.read_page(id)?.to_vec(),
+        // Borrow the page bytes in place (staged image or pool) — decoding
+        // only reads them, and a full-page copy here would run on every
+        // node visit of every tree operation.
+        let page: &[u8] = match tx.staged_page(id) {
+            Some(p) => p,
+            None => pager.read_page(id)?,
         };
         // All offsets below come from the page bytes; a damaged file must
         // surface as Corrupt, not as a slice panic.
@@ -109,12 +189,11 @@ impl BTree {
                 let mut cells = Vec::with_capacity(count.min(PAGE_SIZE / 10));
                 let mut pos = 3;
                 for _ in 0..count {
-                    let klen =
-                        u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
+                    let klen = u16::from_le_bytes(take(page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
+                    let (k, used) = encode::decode_prefix(take(page, pos, klen)?)?;
                     pos += used;
-                    let val = u64::from_le_bytes(take(&page, pos, 8)?.try_into().unwrap());
+                    let val = u64::from_le_bytes(take(page, pos, 8)?.try_into().unwrap());
                     pos += 8;
                     cells.push((k, val));
                 }
@@ -125,12 +204,11 @@ impl BTree {
                 let mut pos = 7;
                 let mut cells = Vec::with_capacity(count.min(PAGE_SIZE / 10));
                 for _ in 0..count {
-                    let klen =
-                        u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
+                    let klen = u16::from_le_bytes(take(page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
+                    let (k, used) = encode::decode_prefix(take(page, pos, klen)?)?;
                     pos += used;
-                    let child = u32::from_le_bytes(take(&page, pos, 4)?.try_into().unwrap());
+                    let child = u32::from_le_bytes(take(page, pos, 4)?.try_into().unwrap());
                     pos += 4;
                     cells.push((k, child));
                 }
@@ -189,18 +267,22 @@ impl BTree {
 
     /// Exact lookup.
     pub fn get(&self, pager: &mut Pager, tx: &Tx, key: &Value) -> Result<Option<u64>> {
-        let mut id = self.root;
-        loop {
-            match Self::read_node(pager, tx, id)? {
-                Node::Leaf { cells } => {
-                    return Ok(cells
-                        .iter()
-                        .find(|(k, _)| Value::cmp_values(k, key) == Ordering::Equal)
-                        .map(|(_, v)| *v));
+        Self::get_at(pager, tx, self.root, key)
+    }
+
+    fn get_at(pager: &mut Pager, tx: &Tx, id: u32, key: &Value) -> Result<Option<u64>> {
+        match Self::read_node(pager, tx, id)? {
+            Node::Leaf { cells } => Ok(cells
+                .iter()
+                .find(|(k, _)| Value::cmp_values(k, key) == Ordering::Equal)
+                .map(|(_, v)| *v)),
+            Node::Internal { leftmost, cells } => {
+                for child in candidate_children(&cells, leftmost, key) {
+                    if let Some(v) = Self::get_at(pager, tx, child, key)? {
+                        return Ok(Some(v));
+                    }
                 }
-                Node::Internal { leftmost, cells } => {
-                    id = descend(&cells, leftmost, key);
-                }
+                Ok(None)
             }
         }
     }
@@ -247,14 +329,18 @@ impl BTree {
                 if unique && at > 0 && Value::cmp_values(&cells[at - 1].0, key) == Ordering::Equal {
                     return Err(BTreeError::Duplicate);
                 }
+                let kb = encode::encode_to_vec(key)?;
+                if 2 + kb.len() + 8 > HALF_PAGE {
+                    return Err(BTreeError::KeyTooLarge(kb.len()));
+                }
                 cells.insert(at, (key.clone(), val));
-                if cells.len() <= MAX_KEYS {
+                if node_bytes(&cells, 3, 8)? <= PAGE_SIZE {
                     Self::write_node(ctx.pager, ctx.tx, id, &Node::Leaf { cells })?;
                     Ok(None)
                 } else {
-                    let mid = cells.len() / 2;
-                    let mid_key = cells[mid].0.clone();
-                    let right_cells = cells.split_off(mid);
+                    let m = split_at_for_insert(&cells, at, 3, 8)?;
+                    let mid_key = cells[m].0.clone();
+                    let right_cells = cells.split_off(m);
                     let right = ctx.pager.allocate_page(ctx.tx)?;
                     Self::write_node(ctx.pager, ctx.tx, id, &Node::Leaf { cells })?;
                     Self::write_node(ctx.pager, ctx.tx, right, &Node::Leaf { cells: right_cells })?;
@@ -275,8 +361,12 @@ impl BTree {
                     // split into parents); binary_search would panic on Ok.
                     let at = cells
                         .partition_point(|(k, _)| Value::cmp_values(k, &mid) != Ordering::Greater);
+                    let mb = encode::encode_to_vec(&mid)?;
+                    if 2 + mb.len() + 4 > HALF_PAGE {
+                        return Err(BTreeError::KeyTooLarge(mb.len()));
+                    }
                     cells.insert(at, (mid, right));
-                    if cells.len() <= MAX_KEYS {
+                    if node_bytes(&cells, 7, 4)? <= PAGE_SIZE {
                         Self::write_node(
                             ctx.pager,
                             ctx.tx,
@@ -285,7 +375,7 @@ impl BTree {
                         )?;
                         Ok(None)
                     } else {
-                        let m = cells.len() / 2;
+                        let m = split_at_for_insert(&cells, at, 7, 4)?;
                         let mid_key = cells[m].0.clone();
                         let right_cells = cells.split_off(m);
                         let new_leftmost = right_cells[0].1;
@@ -374,8 +464,12 @@ impl BTree {
                 Ok(false)
             }
             Node::Internal { leftmost, cells } => {
-                let child = descend(&cells, leftmost, key);
-                Self::delete_entry_rec(pager, tx, child, key, loc)
+                for child in candidate_children(&cells, leftmost, key) {
+                    if Self::delete_entry_rec(pager, tx, child, key, loc)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
         }
     }
@@ -429,6 +523,88 @@ impl BTree {
         Ok(())
     }
 
+    /// Entries with key >= `lo`, optionally stopping early at `hi` —
+    /// `(bound, inclusive)`. Subtrees whose guaranteed lower bound lies
+    /// beyond `hi` are skipped whole, so an equality probe visits only the
+    /// leaves that can hold equal keys instead of materializing the entire
+    /// right side of the tree.
+    pub fn range_bounded(
+        &self,
+        pager: &mut Pager,
+        tx: &Tx,
+        lo: &Value,
+        hi: Option<(&Value, bool)>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let mut out = Vec::new();
+        Self::range_bounded_rec(pager, tx, self.root, lo, hi, &mut out)?;
+        Ok(out)
+    }
+
+    /// True when a key at or past `hi` ends the in-order scan.
+    fn beyond_hi(k: &Value, hi: Option<(&Value, bool)>) -> bool {
+        match hi {
+            None => false,
+            Some((h, true)) => Value::cmp_values(k, h) == Ordering::Greater,
+            Some((h, false)) => Value::cmp_values(k, h) != Ordering::Less,
+        }
+    }
+
+    fn range_bounded_rec(
+        pager: &mut Pager,
+        tx: &Tx,
+        id: u32,
+        lo: &Value,
+        hi: Option<(&Value, bool)>,
+        out: &mut Vec<(Value, u64)>,
+    ) -> Result<()> {
+        match Self::read_node(pager, tx, id)? {
+            Node::Leaf { cells } => {
+                for (k, v) in cells {
+                    if Self::beyond_hi(&k, hi) {
+                        break; // cells are in key order; the rest is beyond too
+                    }
+                    if Value::cmp_values(&k, lo) != Ordering::Less {
+                        out.push((k, v));
+                    }
+                }
+            }
+            Node::Internal { leftmost, cells } => {
+                // Same ordering caveat as range_from_rec — a split can leave
+                // keys equal to a separator in the child LEFT of it, so a
+                // child is skipped only when its own keys are guaranteed
+                // beyond hi (lower separator > hi, or == hi when exclusive):
+                // every key of the child is >= its lower separator.
+                let skip_by_hi = |sep: &Value| -> bool {
+                    match hi {
+                        None => false,
+                        Some((h, true)) => Value::cmp_values(sep, h) == Ordering::Greater,
+                        Some((h, false)) => Value::cmp_values(sep, h) != Ordering::Less,
+                    }
+                };
+                let leftmost_upper_ge = match cells.first() {
+                    Some((k, _)) => Value::cmp_values(k, lo) != Ordering::Less,
+                    None => true,
+                };
+                if leftmost_upper_ge {
+                    Self::range_bounded_rec(pager, tx, leftmost, lo, hi, out)?;
+                }
+                for (i, (sep, child)) in cells.iter().enumerate() {
+                    if skip_by_hi(sep) {
+                        continue;
+                    }
+                    let upper_ge = match cells.get(i + 1) {
+                        Some((k, _)) => Value::cmp_values(k, lo) != Ordering::Less,
+                        None => true,
+                    };
+                    if upper_ge {
+                        Self::range_bounded_rec(pager, tx, *child, lo, hi, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn delete_rec(pager: &mut Pager, tx: &mut Tx, id: u32, key: &Value) -> Result<bool> {
         match Self::read_node(pager, tx, id)? {
             Node::Leaf { mut cells } => {
@@ -442,8 +618,12 @@ impl BTree {
                 }
             }
             Node::Internal { leftmost, cells } => {
-                let child = descend(&cells, leftmost, key);
-                Self::delete_rec(pager, tx, child, key)
+                for child in candidate_children(&cells, leftmost, key) {
+                    if Self::delete_rec(pager, tx, child, key)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
         }
     }
@@ -506,8 +686,8 @@ mod tests {
         let (_d, mut pager) = fresh("bt9.db");
         let mut tx = pager.begin_tx();
         let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
-        // Only 10 distinct keys; runs far exceed MAX_KEYS, forcing splits
-        // with equal separators.
+        // Only 10 distinct keys; runs far exceed page capacity, forcing
+        // splits with equal separators.
         let mut model = std::collections::BTreeMap::<i64, usize>::new();
         for i in 0..500i64 {
             let k = i % 10;
@@ -769,6 +949,67 @@ mod tests {
         let all = tree.range_from(&mut pager, &tx, &Value::Int(0)).unwrap();
         assert_eq!(all.len(), 750);
         assert!(all.iter().all(|(k, _)| k.as_i64().unwrap() % 2 == 1));
+        pager.abort_tx(tx).unwrap();
+    }
+
+    #[test]
+    fn medium_string_keys_split_by_bytes() {
+        // ~90 字节编码的键在 ~43 个时就会占满一页——远低于任何条数阈值;
+        // 分裂必须按字节驱动,否则这些完全合法的键会让索引建不起来。
+        let (_d, mut pager) = fresh("bt_medkey.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        let key = |i: i64| Value::Str(format!("k{i:06}-{}", "x".repeat(80)));
+        for i in 0..200i64 {
+            tree.insert(&mut pager, &mut tx, key(i), i as u64, true)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        for i in 0..200i64 {
+            assert_eq!(
+                tree.get(&mut pager, &tx, &key(i)).unwrap(),
+                Some(i as u64),
+                "key {i}"
+            );
+        }
+        let all = tree.scan(&mut pager, &tx).unwrap();
+        assert_eq!(all.len(), 200);
+        let mut sorted = all.clone();
+        sorted.sort_by(|a, b| Value::cmp_values(&a.0, &b.0));
+        assert_eq!(all, sorted, "scan must stay in key order");
+        pager.abort_tx(tx).unwrap();
+    }
+
+    #[test]
+    fn delete_entry_across_equal_separator_splits() {
+        // 非唯一等键 run 横跨分裂点后,条目可能落在与 separator 相等的
+        // 左子树里(descend 只往右路由)——delete_entry 必须找得到它们。
+        let (_d, mut pager) = fresh("bt_eqdel.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&mut pager, &mut tx).unwrap();
+        for i in 0..500i64 {
+            let k = i % 10;
+            tree.insert(&mut pager, &mut tx, Value::Int(k), i as u64, false)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        for i in 0..500i64 {
+            let mut tx = pager.begin_tx();
+            let k = Value::Int(i % 10);
+            assert!(
+                tree.delete_entry(&mut pager, &mut tx, &k, i as u64)
+                    .unwrap(),
+                "entry (k={}, loc={i}) must be found",
+                i % 10
+            );
+            pager.commit_tx(tx).unwrap();
+        }
+        let tx = pager.begin_tx();
+        assert!(
+            tree.scan(&mut pager, &tx).unwrap().is_empty(),
+            "no ghost entries may survive"
+        );
         pager.abort_tx(tx).unwrap();
     }
 }

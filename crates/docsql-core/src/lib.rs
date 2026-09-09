@@ -6,10 +6,13 @@
 pub mod btree;
 pub mod encode;
 pub mod engine;
+pub mod guid;
 pub mod heap;
 pub mod json;
+pub mod meta;
 pub mod pager;
 pub mod proto;
+pub mod stmt;
 pub mod value;
 pub mod wal;
 

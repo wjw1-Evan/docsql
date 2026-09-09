@@ -30,6 +30,68 @@ pub const REQ_PING: u16 = 0x0006;
 /// Failover promotion: clears read-only mode on this node (requires an
 /// authenticated session). Replaces the former KV `PROMOTE` command.
 pub const REQ_PROMOTE: u16 = 0x0007;
+/// Node status report for cluster monitoring (requires an authenticated
+/// session): responds with RESP_STATUS whose payload is a JSON object
+/// (uptime / read-only / peers / storage / durable LSN / table totals).
+pub const REQ_STATUS: u16 = 0x0008;
+/// Pub/sub: subscribe to a channel (authenticated). Payload = JSON
+/// `{"channel": str, "from": "latest"|"earliest"|"<id>"}`. Responds
+/// RESP_AFFECTED (the connection's subscription count); when `from` asks
+/// for history, RESP_PUSH replay frames follow the confirmation in id
+/// order before live pushes resume.
+pub const REQ_SUBSCRIBE: u16 = 0x0009;
+/// Pub/sub: pattern subscribe with Redis-style glob (`*`, `?`, `[...]`).
+/// Payload = JSON `{"pattern": str, "from": ...}` like REQ_SUBSCRIBE.
+pub const REQ_PSUBSCRIBE: u16 = 0x000A;
+/// Pub/sub: unsubscribe. Payload = JSON array of channel names; an empty
+/// array unsubscribes everything on this connection. Responds
+/// RESP_AFFECTED (remaining subscription count).
+pub const REQ_UNSUBSCRIBE: u16 = 0x000B;
+/// Pub/sub: pattern unsubscribe. Payload = JSON array of patterns; empty
+/// array removes all pattern subscriptions.
+pub const REQ_PUNSUBSCRIBE: u16 = 0x000C;
+/// Pub/sub: publish (authenticated). Payload = JSON
+/// `{"channel": str, "payload": str}`. The message is persisted in the
+/// engine before any push leaves this node. Responds RESP_ROWS with
+/// columns `[id, receivers]` — the persisted message id on this node and
+/// the number of live connections that received the push (this node plus
+/// replicated peers).
+pub const REQ_PUBLISH: u16 = 0x000D;
+/// Pub/sub introspection / retention (authenticated). Payload = JSON
+/// `{"sub": "channels"|"numsub"|"numpat"|"trim", ...}`; the first three
+/// respond RESP_ROWS, `trim` (keep the newest N messages of a channel,
+/// replicated like a write) responds RESP_AFFECTED.
+pub const REQ_PUBSUB: u16 = 0x000E;
+/// Node logs report for the web console's logs page (requires an
+/// authenticated session). Payload = optional JSON `{"limit": n}`
+/// (default 200, capped at 1000); responds RESP_LOGS whose payload is
+/// JSON `{"query": [...], "sync": [...]}` — recent statement audit
+/// entries (the docsql_log ring) and replication/sync events, newest
+/// first.
+pub const REQ_LOGS: u16 = 0x000F;
+/// Cluster join: a fresh node asks a peer for the cluster's current state.
+/// Payload = the joiner's advertised `host:port` (empty when it does not
+/// want to be registered, e.g. static-config deployments). The peer
+/// quiesces the cluster (see REQ_HOLD), captures a full dump, registers
+/// the joiner everywhere, then streams RESP_SYNC chunk frames terminated
+/// by RESP_AFFECTED (user-table count).
+pub const REQ_SYNC: u16 = 0x0010;
+/// Cluster-join helper sent by the node serving REQ_SYNC to each of its
+/// peers: acquire the write path (waiting out in-flight writes), register
+/// the joiner from the payload, and hold until REQ_RELEASE (or an expiry
+/// watchdog) so no write slips between the dump snapshot and the
+/// joiner's registration. Responds RESP_AFFECTED carrying the hold id
+/// (u64 LE) used by the matching REQ_RELEASE.
+pub const REQ_HOLD: u16 = 0x0011;
+/// Drop one hold acquired via REQ_HOLD. Payload = hold id (u64 LE).
+/// The joiner stays registered as a peer.
+pub const REQ_RELEASE: u16 = 0x0012;
+/// Object-explorer metadata for the web console's node switching (requires
+/// an authenticated session). No payload. Responds RESP_META whose payload
+/// is the console `/api/meta` JSON (server/storage/totals/tables) assembled
+/// by `core::meta::build_meta` — identical in shape to what the console
+/// builds for its own embedded engine.
+pub const REQ_META: u16 = 0x0013;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
@@ -38,6 +100,24 @@ pub const RESP_ERROR: u16 = 0x0103;
 /// Cluster redirect: payload = "host:port" (reserved, M12+).
 pub const RESP_REDIRECT: u16 = 0x0104;
 pub const RESP_PONG: u16 = 0x0105;
+/// Node status report: payload = JSON object (see REQ_STATUS).
+pub const RESP_STATUS: u16 = 0x0106;
+/// Pub/sub push (server-initiated; only sent to connections that
+/// subscribed). Payload = JSON `{"kind":"message"|"pmessage", "pattern"?,
+/// "channel", "id", "ts", "payload"}` — `pmessage` carries the matched
+/// pattern. `id` is the persisted message id on the delivering node
+/// (monotonic; usable as a resume cursor against that node).
+pub const RESP_PUSH: u16 = 0x0107;
+/// Node logs report: payload = JSON object (see REQ_LOGS).
+pub const RESP_LOGS: u16 = 0x0108;
+/// One chunk of the cluster-join dump (see REQ_SYNC): payload is
+/// length-prefixed SQL text (encode_sql). Chunks are byte slices of the
+/// full script; the joiner concatenates them before replaying. RESP_SYNC
+/// frames are followed by a final RESP_AFFECTED terminator.
+pub const RESP_SYNC: u16 = 0x0109;
+/// Console metadata report (see REQ_META): payload = JSON object built by
+/// `core::meta::build_meta`.
+pub const RESP_META: u16 = 0x010A;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

@@ -1,4 +1,4 @@
-// docsql wire protocol v1 client.
+// DocSQL wire protocol v1 client.
 // Frame: magic "DSQ1" | flags:u16 | type:u16 | topology_version:u64 | len:u32 | payload
 
 using System.Buffers.Binary;
@@ -13,13 +13,48 @@ public enum FrameType : ushort
     ReqSql = 0x0001,
     /// <summary>会话认证:载荷为 token 原始字节。</summary>
     ReqAuth = 0x0002,
+    ReqPrepare = 0x0003,
+    ReqExecute = 0x0004,
+    ReqCloseStmt = 0x0005,
+    ReqPing = 0x0006,
     /// <summary>故障转移提升:清除只读副本模式(需已认证会话)。</summary>
     ReqPromote = 0x0007,
-    ReqPing = 0x0006,
+    ReqStatus = 0x0008,
+    /// <summary>订阅频道:JSON {"channel","from"};确认 RESP_AFFECTED,历史以 RESP_PUSH 回放。</summary>
+    ReqSubscribe = 0x0009,
+    /// <summary>模式订阅(glob):JSON {"pattern","from"}。</summary>
+    ReqPsubscribe = 0x000A,
+    /// <summary>退订:JSON 数组(空 = 全部);回剩余订阅数。</summary>
+    ReqUnsubscribe = 0x000B,
+    ReqPunsubscribe = 0x000C,
+    /// <summary>发布:JSON {"channel","payload"};先落盘再推送,回 RESP_ROWS [id, receivers]。</summary>
+    ReqPublish = 0x000D,
+    /// <summary>内省/保留:JSON {"sub":"channels|numsub|numpat|trim",...}。</summary>
+    ReqPubsub = 0x000E,
+    /// <summary>日志报告:查询日志 + 同步日志两环最新条目(需认证)。</summary>
+    ReqLogs = 0x000F,
+    /// <summary>cluster join:请求全量快照(节点间复制帧)。</summary>
+    ReqSync = 0x0010,
+    /// <summary>cluster join:冻结写路径(排空在途写)。</summary>
+    ReqHold = 0x0011,
+    /// <summary>cluster join:解除冻结。</summary>
+    ReqRelease = 0x0012,
+    /// <summary>对象浏览器元数据(与 web /api/meta 同构)。</summary>
+    ReqMeta = 0x0013,
     RespRows = 0x0101,
     RespAffected = 0x0102,
     RespError = 0x0103,
+    RespRedirect = 0x0104,
     RespPong = 0x0105,
+    RespStatus = 0x0106,
+    /// <summary>服务端主动推送(pub/sub):JSON {"kind","pattern"?,"channel","id","ts","payload"}。</summary>
+    RespPush = 0x0107,
+    /// <summary>REQ_LOGS 的应答载荷。</summary>
+    RespLogs = 0x0108,
+    /// <summary>REQ_SYNC 的分块应答(≤4MB 流式回传)。</summary>
+    RespSync = 0x0109,
+    /// <summary>REQ_META 的应答载荷。</summary>
+    RespMeta = 0x010A,
 }
 
 public readonly record struct Frame(FrameType Type, ushort Flags, ulong TopologyVersion, byte[] Payload)
@@ -66,6 +101,13 @@ public sealed class ProtocolConnection : IDisposable
 
     public Frame Send(Frame request)
     {
+        Write(request);
+        return Receive();
+    }
+
+    /// <summary>仅发送一帧(订阅连接拆开用:响应帧与推送帧需分别接收)。</summary>
+    public void Write(Frame request)
+    {
         if (_key is not null)
         {
             request = request with
@@ -76,8 +118,10 @@ public sealed class ProtocolConnection : IDisposable
         }
         _stream.Write(request.Encode());
         _stream.Flush();
-        return ReadFrame();
     }
+
+    /// <summary>仅接收一帧(已解密);阻塞直至一帧完整到达。</summary>
+    public Frame Receive() => ReadFrame();
 
     /// <summary>AES-256-GCM:nonce(12) ‖ 密文 ‖ tag(16)。</summary>
     private static byte[] Seal(byte[] key, byte[] plaintext)

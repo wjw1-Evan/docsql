@@ -132,11 +132,17 @@ fn repack(page: &mut [u8]) -> Vec<(usize, usize)> {
     moves
 }
 
-/// Read the page image to mutate (staged version if this tx already wrote it).
-fn staged_or_file_page(pager: &mut Pager, tx: &Tx, id: u32) -> Result<Vec<u8>> {
+/// Read the page image to mutate (staged version if this tx already wrote
+/// it). Borrowed in place — callers that mutate call `to_mut()`, so pure
+/// readers never pay a full-page copy.
+fn staged_or_file_page<'a>(
+    pager: &'a mut Pager,
+    tx: &'a Tx,
+    id: u32,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
     Ok(match tx.staged_page(id) {
-        Some(p) => p.to_vec(),
-        None => pager.read_page(id)?.to_vec(),
+        Some(p) => std::borrow::Cow::Borrowed(p),
+        None => std::borrow::Cow::Borrowed(pager.read_page(id)?),
     })
 }
 
@@ -173,10 +179,10 @@ impl Heap {
     pub fn scan(&self, pager: &mut Pager) -> Result<Vec<Object>> {
         let mut out = Vec::new();
         for &pid in &self.pages {
-            let page = pager.read_page(pid)?.to_vec();
-            validate_page(&page, pid)?;
-            for i in 0..count_of(&page) {
-                let (off, len) = slot(&page, i);
+            let page = pager.read_page(pid)?;
+            validate_page(page, pid)?;
+            for i in 0..count_of(page) {
+                let (off, len) = slot(page, i);
                 if len == 0 {
                     continue; // tombstone
                 }
@@ -212,12 +218,12 @@ impl Heap {
     /// One document by locator; None for a tombstone/empty slot.
     pub fn doc_at(&self, pager: &mut Pager, loc: u64) -> Result<Option<Object>> {
         let (page, slot_i) = unpack_loc(loc);
-        let buf = pager.read_page(page)?.to_vec();
-        validate_page(&buf, page)?;
-        if slot_i >= count_of(&buf) {
+        let buf = pager.read_page(page)?;
+        validate_page(buf, page)?;
+        if slot_i >= count_of(buf) {
             return Err(HeapError::Page(page, "slot out of range"));
         }
-        let (off, len) = slot(&buf, slot_i);
+        let (off, len) = slot(buf, slot_i);
         if len == 0 {
             return Ok(None);
         }
@@ -242,7 +248,7 @@ impl Heap {
         // page may not be on disk yet).
         let mut placed = None;
         if let Some(&last) = self.pages.last() {
-            let mut page = staged_or_file_page(pager, tx, last)?;
+            let mut page = staged_or_file_page(pager, tx, last)?.into_owned();
             validate_page(&page, last)?;
             if free_space(&page) >= bytes.len() + SLOT_SIZE {
                 let off = content_start(&page) - bytes.len();
@@ -284,7 +290,7 @@ impl Heap {
             ));
         }
         let (page_id, slot_i) = unpack_loc(loc);
-        let mut page = staged_or_file_page(pager, tx, page_id)?;
+        let mut page = staged_or_file_page(pager, tx, page_id)?.into_owned();
         validate_page(&page, page_id)?;
         let n = count_of(&page);
         if slot_i >= n {
@@ -315,6 +321,9 @@ impl Heap {
             // append the new document at the heap's end.
             tombstone(&mut page, slot_i);
             let moves = repack(&mut page);
+            if count_of(&page) == 0 {
+                self.pages.retain(|&p| p != page_id);
+            }
             let moved = moves
                 .iter()
                 .map(|(old, new)| (pack_loc(page_id, *old), pack_loc(page_id, *new)))
@@ -366,7 +375,7 @@ impl Heap {
         for (page_id, mut slots) in by_page {
             slots.sort_unstable();
             slots.dedup();
-            let mut page = staged_or_file_page(pager, tx, page_id)?;
+            let mut page = staged_or_file_page(pager, tx, page_id)?.into_owned();
             validate_page(&page, page_id)?;
             let n = count_of(&page);
             for &s in &slots {

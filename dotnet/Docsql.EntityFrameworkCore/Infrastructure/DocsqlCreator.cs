@@ -18,8 +18,8 @@ public sealed class DocsqlDatabaseCreator(
     public void Create() { }
     public Task CreateAsync(CancellationToken ct = default) => Task.CompletedTask;
 
-    public void Delete() => throw new NotSupportedException("docsql: 请用 DROP TABLE 管理对象");
-    public Task DeleteAsync(CancellationToken ct = default) => throw new NotSupportedException("docsql: 请用 DROP TABLE 管理对象");
+    public void Delete() => throw new NotSupportedException("DocSQL: 请用 DROP TABLE 管理对象");
+    public Task DeleteAsync(CancellationToken ct = default) => throw new NotSupportedException("DocSQL: 请用 DROP TABLE 管理对象");
 
     public void CreateTables()
     {

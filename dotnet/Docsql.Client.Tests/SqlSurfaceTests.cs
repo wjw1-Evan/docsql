@@ -1,4 +1,4 @@
-// SQL 全覆盖测试:按 README 能力矩阵逐项验证 docsql 支持的 SQL 面。
+// SQL 全覆盖测试:按 README 能力矩阵逐项验证 DocSQL 支持的 SQL 面。
 // 通过 ADO 客户端直连服务端执行,每个用例使用独立表名避免相互干扰。
 
 using Docsql.Client;

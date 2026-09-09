@@ -3,7 +3,7 @@ name = "docsql-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "docsql network server: SQL protocol + auth + replication"
+description = "DocSQL network server: SQL protocol + auth + replication"
 
 [dependencies]
 docsql-core = { path = "../docsql-core" }

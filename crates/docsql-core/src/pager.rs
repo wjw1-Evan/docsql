@@ -13,6 +13,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const PAGE_SIZE: usize = 4096;
+/// Buffer pool target in pages (32 MB). A working set that fits avoids
+/// re-reading data-file pages entirely; the old 4 MB default thrashed on
+/// any table scan larger than a few thousand rows.
+const DEFAULT_POOL_PAGES: usize = 8 * 1024;
 const MAGIC: &[u8; 8] = b"DOCSQLP1";
 /// header: magic(8) page_size:u32(4) num_pages:u32(4) reserved
 const HEADER_LEN: usize = 16;
@@ -38,7 +42,7 @@ pub struct Pager {
     num_pages: u32,
     next_txid: u64,
     pool: HashMap<u32, Page>,
-    pool_order: Vec<u32>, // simple FIFO eviction track
+    pool_order: std::collections::VecDeque<u32>, // FIFO eviction track
     max_pool: usize,
     /// Committed page images not yet written to the data file (deferred
     /// commits). They are WAL-logged but the data file must not see them
@@ -92,8 +96,8 @@ impl Pager {
             num_pages,
             next_txid: 1,
             pool: HashMap::new(),
-            pool_order: Vec::new(),
-            max_pool: 1024,
+            pool_order: std::collections::VecDeque::new(),
+            max_pool: DEFAULT_POOL_PAGES,
             pending_writes: std::collections::BTreeMap::new(),
         };
         pager.recover()?;
@@ -106,6 +110,12 @@ impl Pager {
 
     pub fn num_pages(&self) -> u32 {
         self.num_pages
+    }
+
+    /// Last WAL LSN known durable (fsynced). Cluster monitoring uses it as a
+    /// per-node convergence indicator.
+    pub fn durable_lsn(&self) -> u64 {
+        self.wal.durable_lsn
     }
 
     /// Crash recovery: replay after-images of committed transactions, in LSN
@@ -187,30 +197,31 @@ impl Pager {
                 self.read_file_page(id)?
             };
             self.evict_if_full();
-            self.pool_order.push(id);
+            self.pool_order.push_back(id);
             self.pool.insert(id, Page { data, dirty: false });
         }
         Ok(&self.pool.get(&id).unwrap().data)
     }
 
     fn evict_if_full(&mut self) {
-        while self.pool.len() >= self.max_pool {
-            // Evict oldest clean page from the front of pool_order.
-            let mut evict: Option<u32> = None;
-            for &id in &self.pool_order {
-                if let Some(p) = self.pool.get(&id) {
-                    if !p.dirty {
-                        evict = Some(id);
-                        break;
+        // Evict the oldest clean page. Dirty pages rotate to the back so
+        // the scan stays O(1) amortized per eviction (no full-track pass,
+        // no allocation); if everything is dirty the pool grows past the
+        // target rather than lose data.
+        let mut scanned = 0usize;
+        while self.pool.len() >= self.max_pool && scanned < self.pool_order.len() {
+            match self.pool_order.front().copied() {
+                Some(id) => {
+                    let clean = self.pool.get(&id).map(|p| !p.dirty).unwrap_or(true);
+                    if clean {
+                        self.pool_order.pop_front();
+                        self.pool.remove(&id);
+                    } else {
+                        self.pool_order.rotate_left(1);
+                        scanned += 1;
                     }
                 }
-            }
-            match evict {
-                Some(id) => {
-                    self.pool.remove(&id);
-                    self.pool_order.retain(|&x| x != id);
-                }
-                None => break, // all dirty; grow beyond target rather than lose data
+                None => break,
             }
         }
     }

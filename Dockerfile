@@ -1,4 +1,4 @@
-# docsql multi-arch build.
+# DocSQL multi-arch build.
 # docker.io is unreachable in this environment, so the build runs on the
 # Azure Linux base from mcr.microsoft.com (already available locally) with
 # the Rust toolchain installed from rustup inside the image.

@@ -1,4 +1,4 @@
-// ADO.NET provider surface for docsql.
+// ADO.NET provider surface for DocSQL.
 
 using System.Data;
 using System.Data.Common;
@@ -52,7 +52,7 @@ public sealed class DocsqlConnection : DbConnection
 
     public DocsqlConnection() { }
 
-    /// <param name="connectionString">docsql endpoint ("host=..;port=..;token=..") or,
+    /// <param name="connectionString">DocSQL endpoint ("host=..;port=..;token=..") or,
     /// for EF-compatible callers, any string whose endpoint parts live in EndpointOverride.</param>
     public DocsqlConnection(string connectionString)
     {
@@ -68,7 +68,7 @@ public sealed class DocsqlConnection : DbConnection
     public string? KeyOverride { get; set; }
 
     /// <summary>hex 密钥 → 32 字节;空串返回 null(明文模式)。</summary>
-    private static byte[]? ParseKey(string hex)
+    internal static byte[]? ParseKey(string hex)
     {
         hex = hex.Trim();
         if (hex.Length == 0) return null;
@@ -105,6 +105,42 @@ public sealed class DocsqlConnection : DbConnection
             throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
         }
     }
+
+    /// <summary>
+    /// 发布一条持久化 pub/sub 消息(REQ_PUBLISH):服务端先落盘(WAL)再向
+    /// 订阅者推送。返回 (消息 id, 实时收到的连接数);id 单调递增,可作为
+    /// 断线续传的游标(DocsqlSubscriber 的 from 参数)。
+    /// </summary>
+    public (long Id, long Receivers) Publish(string channel, string payload)
+    {
+        var body = JsonSerializer.Serialize(new { channel, payload });
+        var resp = Proto.Send(new Frame(FrameType.ReqPublish, 0, 0, Encoding.UTF8.GetBytes(body)));
+        if (resp.Type == FrameType.RespError)
+        {
+            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
+        }
+        using var doc = JsonDocument.Parse(Encoding.UTF8.GetString(resp.Payload));
+        var row = doc.RootElement.GetProperty("rows")[0];
+        return (row[0].GetInt64(), row[1].GetInt64());
+    }
+
+    /// <summary>
+    /// 保留某频道最新 keep 条消息,更早的删除(REQ_PUBSUB trim,随写复制)。
+    /// 返回删除的条数。keep 必须 ≥ 1(清空会破坏 id 单调性)。
+    /// </summary>
+    public long PubsubTrim(string channel, long keep)
+    {
+        var body = JsonSerializer.Serialize(new { sub = "trim", channel, keep });
+        var resp = Proto.Send(new Frame(FrameType.ReqPubsub, 0, 0, Encoding.UTF8.GetBytes(body)));
+        return resp.Type switch
+        {
+            FrameType.RespAffected => DecodeLong(resp.Payload),
+            _ => throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload)),
+        };
+    }
+
+    internal static long DecodeLong(byte[] payload) =>
+        payload.Length >= 8 ? BitConverter.ToInt64(payload, 0) : 0;
 
     public override void Open()
     {
@@ -347,6 +383,13 @@ public sealed class DocsqlCommand : DbCommand
         // lose precision beyond ~15-16 significant digits (no decimal type).
         decimal m => m.ToString(System.Globalization.CultureInfo.InvariantCulture),
         bool b => b ? "TRUE" : "FALSE",
+        // Date/time values must round-trip in a culture-invariant,
+        // lexicographically sortable text form (the engine stores TEXT):
+        // a culture-dependent ToString() sorts wrongly and cannot be parsed
+        // back by GetDateTime on machines with another culture.
+        DateTime dt => $"'{dt.ToString("O", System.Globalization.CultureInfo.InvariantCulture)}'",
+        DateTimeOffset dto => $"'{dto.ToString("O", System.Globalization.CultureInfo.InvariantCulture)}'",
+        TimeSpan ts => $"'{ts.ToString("c", System.Globalization.CultureInfo.InvariantCulture)}'",
         // No BLOB storage in the engine; storing ToString() would corrupt
         // data silently — refuse loudly instead.
         byte[] => throw new NotSupportedException(
@@ -645,7 +688,7 @@ public sealed class DocsqlFactory : DbProviderFactory
         new DocsqlConnectionStringBuilder();
 }
 
-/// Concrete DbException for docsql errors.
+/// Concrete DbException for DocSQL errors.
 public sealed class DocsqlException : DbException
 {
     public DocsqlException(string message) : base(message) { }

@@ -27,7 +27,13 @@ pub enum EncodeError {
     UnknownTag(u8),
     #[error("invalid bool byte {0:#x}")]
     BadBool(u8),
+    #[error("nesting exceeds {MAX_DEPTH} levels")]
+    TooDeep,
 }
+
+/// Matches json.rs — the decoder runs on network payloads, so recursion
+/// must be bounded to keep hostile nesting from overflowing the stack.
+const MAX_DEPTH: usize = 128;
 
 #[derive(Debug)]
 pub struct Decoder<'a> {
@@ -88,6 +94,13 @@ impl<'a> Decoder<'a> {
     }
 
     fn value(&mut self) -> Result<Value, EncodeError> {
+        self.value_at(0)
+    }
+
+    fn value_at(&mut self, depth: usize) -> Result<Value, EncodeError> {
+        if depth > MAX_DEPTH {
+            return Err(EncodeError::TooDeep);
+        }
         Ok(match self.u8()? {
             0 => Value::Null,
             1 => Value::Bool(match self.u8()? {
@@ -103,7 +116,7 @@ impl<'a> Decoder<'a> {
                 let len = self.u32()? as usize;
                 let mut items = Vec::with_capacity(len.min(1024));
                 for _ in 0..len {
-                    items.push(self.value()?);
+                    items.push(self.value_at(depth + 1)?);
                 }
                 Value::Array(items)
             }
@@ -112,7 +125,7 @@ impl<'a> Decoder<'a> {
                 let mut obj = Object::new();
                 for _ in 0..len {
                     let k = self.string()?;
-                    let v = self.value()?;
+                    let v = self.value_at(depth + 1)?;
                     obj.insert(k, v);
                 }
                 Value::Object(obj)
@@ -266,6 +279,19 @@ mod tests {
         let (v, n) = decode_prefix(&buf).unwrap();
         assert_eq!(v, Value::Str("abcd".into()));
         assert_eq!(n, buf.len() - 3);
+    }
+
+    #[test]
+    fn deep_nesting_rejected_instead_of_stack_overflow() {
+        // Each array level costs 7 bytes; a few hundred KB of nested arrays
+        // used to recurse unboundedly and abort the process.
+        let mut buf = Vec::new();
+        for _ in 0..10_000 {
+            buf.extend_from_slice(&[6, 1, 0, 0, 0]);
+        }
+        buf.push(0);
+        let err = decode(&buf).unwrap_err();
+        assert!(matches!(err, EncodeError::TooDeep), "{err:?}");
     }
 
     /// Cheap fuzz-ish sweep: truncated encodings of nested docs must never

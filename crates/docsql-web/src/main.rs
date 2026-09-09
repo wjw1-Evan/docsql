@@ -11,11 +11,20 @@ async fn main() -> std::io::Result<()> {
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:7700".into());
     let token = std::env::var("DOCSQL_TOKEN").ok().filter(|t| !t.is_empty());
+    // Cluster nodes to monitor on the status page (read-only probes; the
+    // console never replicates writes to them).
+    let peers: Vec<String> = std::env::var("DOCSQL_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
     eprintln!("docsql web console on http://{listen}");
     docsql_web::run(
         docsql_web::WebConfig {
             db_path: std::path::PathBuf::from(db_path),
             token,
+            peers,
         },
         &listen,
     )

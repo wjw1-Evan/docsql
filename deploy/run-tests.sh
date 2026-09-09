@@ -13,7 +13,22 @@ if [ -z "${DOCSQL_IMAGE_TAG:-}" ]; then
   DOCSQL_IMAGE_TAG="$TAG" docker compose $PROFILES build >/dev/null
 fi
 echo "== reset deployment (fresh volumes, both profiles) =="
-docker compose $PROFILES down -v --remove-orphans >/dev/null 2>&1 || true
+# `join` (node-d) must be included: its container would otherwise keep the
+# docsql-data-d volume attached and the clean-slate check below fails.
+docker compose --profile single --profile cluster --profile join down -v --remove-orphans >/dev/null 2>&1 || true
+# Data lives in external volumes that `down -v` cannot remove — recreate
+# them explicitly so every test run starts from a clean slate (and so they
+# exist at all on a fresh CI runner).
+for v in docsql-data-a docsql-data-b docsql-data-c docsql-data-d docsql-data-web docsql-data-single docsql-data-web-single; do
+  docker volume rm -f "$v" >/dev/null 2>&1 || true
+  # A failed rm (volume still in use by a straggler container) must abort,
+  # not silently continue on stale data that then breaks count assertions.
+  if docker volume inspect "$v" >/dev/null 2>&1; then
+    echo "ERROR: volume $v still exists after rm (in use?)" >&2
+    exit 1
+  fi
+  docker volume create "$v" >/dev/null
+done
 DOCSQL_IMAGE_TAG="$TAG" docker compose $PROFILES up -d >/dev/null
 echo "== wait for nodes and web consoles =="
 for port in 17600 17601 17602 17603 17700 17710; do
