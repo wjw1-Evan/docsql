@@ -52,6 +52,14 @@ cargo test --workspace
 
 改动 dotnet 或协议相关时,加跑 `cd dotnet && dotnet test`。
 
+### Mimosa 安全门禁(ZCode 插件,只作用于 AI 会话内的 commit/push)
+
+ZCode 的 Mimosa 插件在 `git commit`/`git push` 前做 L3 静态扫描,high 拦截、medium 询问、low 提示。**已知现状:native 引擎的 C# 规则对任何 `Process.Start`/`ProcessStartInfo` 无差别报「命令注入」high(全字面量也报;`mimosa-ignore` 注释与 `validate` Oracle 均不适用)**,而集成测试必须在 C# 内启动 `docsql-server` 二进制,故 dotnet 测试基建的 12 条命中(File: EfTests.cs ×4、TransportEncryptionTests.cs ×2、AdoNetTests/AsyncCommitTests/FailoverTests/QueryLogTests/SymmetricClusterTests/EfSample Program.cs 各 1)是已裁定误报,代码层面无法消除。本机配置 `MIMOSA_GIT_GATE_MODE=warn`(见 `~/.zshrc`):门禁保持扫描与记录,high 只告警不拦截。面向该标准的代码约定:
+
+- **生产代码**(core/server/web/cli)不启动子进程,天然无此类 finding;今后任何生产代码里的进程执行都必须参数列表传递、禁止拼接 shell 字符串,且不得有用户可控输入流入。
+- **测试基建**启动 server 的代码集中在各测试文件的既有辅助方法(`FindServer`/`StartServer` 形态,`ProcessStartInfo` + `UseShellExecute=false` + `ArgumentList`),新测试复用,不在测试体内新增散落的 `Process.Start`;不要为绕过扫描改写 API 形状(反射/P-Invoke 等是掩盖不是修复)。
+- 改动上述 spawn 辅助方法的提交,在 `warn` 模式下会看到对应告警,属预期,忽略即可;若换新机器/重装插件后提交被拦,检查该环境变量是否生效(需从终端启动 ZCode)。
+
 CI(`.github/workflows/docker-image.yml`,push/PR 触发)执行同样三门禁 + dotnet 测试,通过后构建多架构镜像(amd64/arm64,`RUN_TESTS=false`)发布到 `ghcr.io/wjw1-evan/docsql`;main 分支另跑 compose 部署测试(多节点 69 项 + 单节点 24 项)。
 
 测试层次(约 290 个 Rust 用例):
