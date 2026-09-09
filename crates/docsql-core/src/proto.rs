@@ -92,6 +92,10 @@ pub const REQ_RELEASE: u16 = 0x0012;
 /// by `core::meta::build_meta` — identical in shape to what the console
 /// builds for its own embedded engine.
 pub const REQ_META: u16 = 0x0013;
+/// Per-table replication fingerprints for the cluster rejoin repair
+/// (requires an authenticated session; rides FLAG_REPLICATION like every
+/// node-internal frame). No payload. Responds RESP_DIGEST.
+pub const REQ_DIGEST: u16 = 0x0014;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
@@ -118,6 +122,9 @@ pub const RESP_SYNC: u16 = 0x0109;
 /// Console metadata report (see REQ_META): payload = JSON object built by
 /// `core::meta::build_meta`.
 pub const RESP_META: u16 = 0x010A;
+/// Table digest report (see REQ_DIGEST): payload = JSON array of
+/// `{name, rows, rows_hash, schema_hash}` objects (`core::engine::TableDigest`).
+pub const RESP_DIGEST: u16 = 0x010B;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

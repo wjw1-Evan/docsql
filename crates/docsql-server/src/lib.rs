@@ -16,6 +16,9 @@
 //!   console's logs page
 //! - REQ_SYNC      → RESP_SYNC chunks + RESP_AFFECTED: cluster join — a
 //!   fresh node pulls the cluster's full state (see the join section)
+//! - REQ_DIGEST    → RESP_DIGEST: per-table replication fingerprints; the
+//!   rejoin repair compares these to find writes a node missed while
+//!   offline and pulls a fresh snapshot from a majority peer
 //! - REQ_HOLD / REQ_RELEASE → cluster-join quiesce helpers exchanged
 //!   between nodes while a snapshot is taken
 //!
@@ -26,7 +29,7 @@ pub mod crypto;
 pub mod pubsub;
 pub mod querylog;
 
-use docsql_core::engine::{Database, ExecOutcome, TxControl};
+use docsql_core::engine::{Database, ExecOutcome, TableDigest, TxControl};
 use docsql_core::proto::{self, Frame};
 use docsql_core::value::Value;
 use std::path::PathBuf;
@@ -170,8 +173,9 @@ pub const FLAG_REPLICATION: u16 = 0x0002;
 const ASYNC_COMMIT_INTERVAL_MS: u64 = 2;
 
 /// Join-intake queue state; see [ServerState::sync_queue]. Opens (closed =
-/// false) only on a node that starts fresh with peers configured; every
-/// other node starts closed and never queues.
+/// false) on a node that starts with peers configured — fresh (join
+/// bootstrap) or holding data (rejoin repair); every other node starts
+/// closed and never queues.
 #[derive(Default)]
 pub struct SyncGate {
     /// Replication writes acknowledged but not yet applied.
@@ -264,9 +268,15 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             );
         }
     }
-    // A fresh node (only the pubsub system table exists) with peers
-    // configured bootstraps the cluster state: pull a snapshot, register.
-    let joining = !peers.is_empty() && !db.catalog().iter().any(|t| t.name != pubsub::PUBSUB_TABLE);
+    // A node with peers configured syncs at startup: a fresh one (only the
+    // pubsub system table exists) bootstraps the cluster state; one that
+    // already holds data compares table digests with the peers and, if it
+    // missed writes while it was away, adopts the cluster's snapshot
+    // (rejoin repair). The sync gate stays open until the startup flow
+    // concludes, so replication writes arriving mid-flow queue and land
+    // after the snapshot — snapshot < queued < direct is the total order.
+    let peers_configured = !peers.is_empty();
+    let fresh = peers_configured && !db.catalog().iter().any(|t| t.name != pubsub::PUBSUB_TABLE);
     let state = Arc::new(ServerState {
         db: Mutex::new(db),
         auth_token: cfg.auth_token,
@@ -287,7 +297,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         next_hold_id: std::sync::atomic::AtomicU64::new(1),
         sync_queue: tokio::sync::Mutex::new(SyncGate {
             pending: Vec::new(),
-            closed: !joining,
+            closed: !peers_configured,
         }),
         advertise: cfg.advertise.clone(),
         listen: cfg.listen.clone(),
@@ -301,10 +311,14 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     });
     let listener = TcpListener::bind(&cfg.listen).await?;
     eprintln!("docsql-server listening on {}", cfg.listen);
-    if joining {
-        eprintln!("fresh node with peers configured: bootstrapping cluster state");
+    if peers_configured {
+        if fresh {
+            eprintln!("fresh node with peers configured: bootstrapping cluster state");
+        } else {
+            eprintln!("node with peers configured: comparing cluster digests (rejoin repair)");
+        }
         let st = state.clone();
-        tokio::spawn(bootstrap_sync(st));
+        tokio::spawn(bootstrap_sync(st, fresh));
     }
     if cfg.async_commit {
         // Group commit: statements committed deferred since the last tick
@@ -832,6 +846,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 }
                 proto::REQ_RELEASE if authed && frame.flags & FLAG_REPLICATION != 0 => {
                     Some(handle_release(&state, &frame).await)
+                }
+                proto::REQ_DIGEST if authed && frame.flags & FLAG_REPLICATION != 0 => {
+                    Some(handle_digest(&state).await)
                 }
                 _ => Some(Frame::new(
                     proto::RESP_ERROR,
@@ -1977,8 +1994,8 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                 // committing writes either — its pre-outage writes already
                 // fanned to the surviving peers and are in the snapshot.
                 // Skipping keeps joins working in a cluster with a dead
-                // node (the down node re-syncs nothing on return, same
-                // no-catch-up rule as ever).
+                // node (the down node catches up through the rejoin repair
+                // on its own restart).
                 eprintln!("sync: hold on {target} skipped, peer unreachable ({detail})");
                 querylog::sync_event(
                     &state.sync_log,
@@ -2168,6 +2185,21 @@ async fn handle_release(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     )
 }
 
+/// REQ_DIGEST: per-table replication fingerprints for the rejoin repair
+/// (see `repair_sync`). Read-only over the engine lock; the node
+/// answering holds its writes for the O(data) hashing — a startup-time
+/// cost, same class as serving a join dump.
+async fn handle_digest(state: &Arc<ServerState>) -> Frame {
+    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    match db.digests() {
+        Ok(list) => match serde_json::to_vec(&list) {
+            Ok(payload) => Frame::new(proto::RESP_DIGEST, payload),
+            Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&format!("digest: {e}"))),
+        },
+        Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&format!("digest: {e}"))),
+    }
+}
+
 /// Terminal outcome of replaying a dump on the joining node.
 enum JoinApply {
     /// Dump applied; syncing gate lifted.
@@ -2306,15 +2338,21 @@ async fn drain_sync_queue(state: &Arc<ServerState>) {
     }
 }
 
-/// Fresh-node bootstrap: pull the cluster state from a peer that already
-/// holds data, retrying while peers come up. Probing first keeps a
-/// born-empty cluster (full simultaneous start) from quiescing itself for
-/// the hold timeouts — such meshes are covered by static peer config, and
-/// nodes that hold data fan every later write to the registered joiner.
-/// Every terminal state drains the join-intake queue: acknowledged writes
-/// land no matter how the bootstrap concluded.
-async fn bootstrap_sync(state: Arc<ServerState>) {
+/// Startup sync: a fresh node pulls the cluster state from a peer that
+/// already holds data, retrying while peers come up; a node that already
+/// holds data runs the rejoin repair (digest compare, snapshot adopt on
+/// divergence). Probing first keeps a born-empty cluster (full
+/// simultaneous start) from quiescing itself for the hold timeouts —
+/// such meshes are covered by static peer config, and nodes that hold
+/// data fan every later write to the registered joiner. Every terminal
+/// state drains the join-intake queue: acknowledged writes land no
+/// matter how the flow concluded.
+async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
     let peers = state.peers.lock().await.clone();
+    if !fresh {
+        repair_sync(state, peers).await;
+        return;
+    }
     let mut last_err = String::from("no peer answered");
     for _round in 0..SYNC_ROUNDS {
         let mut saw_data = false;
@@ -2381,6 +2419,267 @@ async fn join_from(state: &Arc<ServerState>, peer: &str) -> JoinApply {
     apply_sync(state, &script, peer).await
 }
 
+/// Rejoin-repair rounds before giving up. Must outlast a peer's own
+/// startup-sync window (~5s of fresh-bootstrap rounds, during which it
+/// refuses to serve a snapshot) so mutually-restarting nodes cannot
+/// starve each other's pull. Probes run concurrently, so a round costs
+/// one connect timeout at worst.
+const REPAIR_ROUNDS: usize = 20;
+
+/// Rejoin repair (anti-entropy at restart): a node that already holds
+/// data compares table digests with every reachable peer and, when no
+/// peer agrees with it, replaces its state with the cluster's snapshot —
+/// the same quiesce + dump flow a fresh join uses, minus the LocalData
+/// guard (replacing local data is the point). Fan-out never back-fills:
+/// writes a node missed while offline would stay missing forever without
+/// this.
+///
+/// Reference choice is election-based over the digest reports, and every
+/// node evaluates the same rules, so the mesh agrees on one direction:
+/// a peer reporting our exact state means we serve as-is; a group of
+/// ≥2 peers reporting identical digests is a surviving majority and is
+/// adopted wholesale (its members see each other and serve, non-members
+/// pull); with no majority (every state unique — a full split), the
+/// reference is elected by more rows first (the common rejoin shape: the
+/// stale node is behind), ties by serialized digests so nodes never have
+/// to compare addresses across namespaces. A lone node behind (offline
+/// restart), a partition minority, and a fan-out-failure loser all
+/// converge here; the cost is that minority-side writes are overwritten
+/// by the adopted snapshot — there is no row-level merge (no vector
+/// clocks to order conflicting writes). Partition divergence without a
+/// restart is not repaired (no startup event); the next restart of any
+/// divergent node heals the mesh.
+///
+/// An empty reference state is never adopted — a node holding the only
+/// copy of data must not erase it because every peer lost theirs.
+async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
+    for round in 0..REPAIR_ROUNDS {
+        let mut probes = Vec::new();
+        for peer in &peers {
+            let st = state.clone();
+            let target = peer.clone();
+            probes.push(tokio::spawn(async move {
+                (target.clone(), probe_peer_digests(&st, &target).await)
+            }));
+        }
+        let mut reports: Vec<(String, Vec<TableDigest>)> = Vec::new();
+        for probe in probes {
+            match probe.await {
+                Ok((peer, Ok(digests))) => reports.push((peer, digests)),
+                Ok((peer, Err(e))) => {
+                    eprintln!("repair: digest probe of {peer} failed: {e}");
+                }
+                Err(e) => eprintln!("repair: digest probe task failed: {e}"),
+            }
+        }
+        if reports.is_empty() {
+            // Nobody reachable: peers may still be coming up after a full
+            // cluster restart — retry before serving possibly-stale state
+            // (the majority signal needs more than zero witnesses).
+            eprintln!("repair: no peer reachable (round {})", round + 1);
+            tokio::time::sleep(SYNC_RETRY_DELAY).await;
+            continue;
+        }
+        let local = {
+            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.digests()
+        };
+        let local = match local {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("repair: local digests failed: {e}");
+                break;
+            }
+        };
+        match decide_repair(&local, &reports) {
+            RepairDecision::Converged => {
+                drain_sync_queue(&state).await;
+                return;
+            }
+            RepairDecision::Serve => {
+                eprintln!(
+                    "rejoin repair (round {}): no agreeing peer; election \
+                     picked this node's state as the reference",
+                    round + 1
+                );
+                drain_sync_queue(&state).await;
+                return;
+            }
+            RepairDecision::Pull(source) => {
+                eprintln!(
+                    "rejoin repair (round {}): state differs from peers; \
+                     adopting snapshot from {source}",
+                    round + 1
+                );
+                let applied = match request_sync(&state, &source).await {
+                    Ok(script) => match apply_repair_sync(&state, &script, &source).await {
+                        JoinApply::Applied => Ok(()),
+                        JoinApply::Failed(e) => Err(e),
+                        JoinApply::LocalData => Err("unexpected local-data outcome".into()),
+                    },
+                    Err(e) => Err(e.to_string()),
+                };
+                match applied {
+                    Ok(()) => return,
+                    Err(e) => {
+                        eprintln!("rejoin repair from {source} failed: {e}");
+                        querylog::sync_event(
+                            &state.sync_log,
+                            "repair",
+                            &source,
+                            None,
+                            false,
+                            Some(e),
+                        );
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(SYNC_RETRY_DELAY).await;
+    }
+    eprintln!(
+        "rejoin repair gave up; serving local state (divergent peers \
+         repair on their own restart)"
+    );
+    drain_sync_queue(&state).await;
+    querylog::sync_event(
+        &state.sync_log,
+        "repair",
+        "",
+        None,
+        false,
+        Some("gave up".into()),
+    );
+}
+
+/// Outcome of comparing the local digests with the peers' reports (see
+/// `repair_sync`).
+enum RepairDecision {
+    /// A reachable peer reports the same state: nothing to repair.
+    Converged,
+    /// No peer agrees, but the election picked this node's state as the
+    /// reference: close the sync gate and serve — the divergent peers
+    /// pull from here.
+    Serve,
+    /// Adopt this peer's snapshot.
+    Pull(String),
+}
+
+/// Election ordering key for one state: more rows first (a richer state
+/// beats a sparser one — the common rejoin shape is a node that is
+/// simply behind), ties by the serialized digests so every node computes
+/// the same order without comparing addresses across namespaces.
+fn digest_state_key(digests: &[TableDigest]) -> (u64, Vec<u8>) {
+    (
+        digests.iter().map(|t| t.rows).sum(),
+        serde_json::to_vec(digests).unwrap_or_default(),
+    )
+}
+
+/// `true` when `candidate` outranks `incumbent` under the election key.
+fn state_key_better(candidate: &(u64, Vec<u8>), incumbent: &(u64, Vec<u8>)) -> bool {
+    candidate.0 > incumbent.0 || (candidate.0 == incumbent.0 && candidate.1 < incumbent.1)
+}
+
+/// Decide what the rejoin repair should do (see `repair_sync` for the
+/// election rules). Every node runs the same rules over its own view, so
+/// the mesh converges on one reference without cross-node negotiation.
+fn decide_repair(local: &[TableDigest], reports: &[(String, Vec<TableDigest>)]) -> RepairDecision {
+    if reports.iter().any(|(_, d)| d == local) {
+        return RepairDecision::Converged;
+    }
+    // Group peers by identical report; a group of ≥2 agreeing peers is a
+    // surviving majority and always wins — unless it holds no data (never
+    // adopt emptiness: a lone remaining copy must survive the others'
+    // loss).
+    let mut groups: Vec<(&Vec<TableDigest>, Vec<&str>)> = Vec::new();
+    for (peer, digests) in reports {
+        match groups.iter_mut().find(|(d, _)| *d == digests) {
+            Some((_, members)) => members.push(peer.as_str()),
+            None => groups.push((digests, vec![peer.as_str()])),
+        }
+    }
+    groups.sort_by(|a, b| {
+        b.1.len().cmp(&a.1.len()).then_with(|| {
+            let (ka, kb) = (digest_state_key(a.0), digest_state_key(b.0));
+            kb.0.cmp(&ka.0).then_with(|| ka.1.cmp(&kb.1))
+        })
+    });
+    if let Some((digests, members)) = groups.first() {
+        if members.len() >= 2 && digests.iter().map(|t| t.rows).sum::<u64>() > 0 {
+            // Any member serves the same snapshot; picking the smallest
+            // address is only for stable logs. Addresses come from this
+            // node's own peer config, so no cross-namespace comparison is
+            // needed.
+            return RepairDecision::Pull(members.iter().min().unwrap().to_string());
+        }
+    }
+    // Residue: no majority (every reachable state unique). Elect the
+    // reference over local + all reports; the winner serves, everyone
+    // else pulls.
+    let local_key = digest_state_key(local);
+    let mut best: Option<(&str, (u64, Vec<u8>))> = None;
+    for (peer, digests) in reports {
+        let key = digest_state_key(digests);
+        let better = match &best {
+            None => true,
+            Some((_, bk)) => state_key_better(&key, bk),
+        };
+        if better {
+            best = Some((peer.as_str(), key));
+        }
+    }
+    match best {
+        Some((peer, key)) if state_key_better(&key, &local_key) => {
+            RepairDecision::Pull(peer.to_string())
+        }
+        _ => RepairDecision::Serve,
+    }
+}
+
+/// Replace this node's whole user state with the cluster snapshot:
+/// inside one transaction, wipe the local catalog (bypassing DROP's FK
+/// guards — the snapshot defines the entire truth) and replay the dump.
+/// A failure rolls back to the pre-repair state, divergence and all.
+/// Inbound replication writes queue on the open sync gate meanwhile and
+/// replay in arrival order right after — snapshot < queued < direct is
+/// the total order (see [ServerState::sync_queue]).
+async fn apply_repair_sync(state: &Arc<ServerState>, script: &str, peer: &str) -> JoinApply {
+    let Some(_order) = lock_engine_for_write(state).await else {
+        return JoinApply::Failed("timed out waiting for the open transaction".into());
+    };
+    {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = db.execute("BEGIN") {
+            return JoinApply::Failed(format!("BEGIN: {e}"));
+        }
+        if let Err(e) = db.wipe_user_tables() {
+            let _ = db.execute("ROLLBACK");
+            return JoinApply::Failed(format!("catalog wipe: {e}"));
+        }
+        let batch = db.execute_batch(script);
+        if let Some(err) = batch.error {
+            let _ = db.execute("ROLLBACK");
+            return JoinApply::Failed(format!("statement {}: {}", err.statement, err.message));
+        }
+        if let Err(e) = db.execute("COMMIT") {
+            let _ = db.execute("ROLLBACK");
+            return JoinApply::Failed(format!("COMMIT: {e}"));
+        }
+    }
+    drain_sync_queue(state).await;
+    eprintln!("rejoin repair from {peer} complete");
+    querylog::sync_event(
+        &state.sync_log,
+        "repair",
+        peer,
+        None,
+        true,
+        Some(format!("{} bytes", script.len())),
+    );
+    JoinApply::Applied
+}
+
 /// One peer's user-table count over REQ_STATUS. Errors mean "unknown"
 /// (unreachable / auth mismatch), never "empty". The frame rides
 /// FLAG_REPLICATION like every node-internal frame — under cluster-token
@@ -2413,6 +2712,40 @@ async fn probe_peer_tables(state: &Arc<ServerState>, peer: &str) -> std::io::Res
     let v: serde_json::Value = serde_json::from_slice(&resp.payload)
         .map_err(|e| std::io::Error::other(format!("bad status payload: {e}")))?;
     Ok(v["totals"]["tables"].as_u64().unwrap_or(0))
+}
+
+/// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
+/// mean "unknown" (unreachable / auth mismatch), never "divergent". The
+/// frame rides FLAG_REPLICATION like every node-internal frame — under
+/// cluster-token auth a peer-role connection only accepts replication
+/// traffic.
+async fn probe_peer_digests(
+    state: &Arc<ServerState>,
+    peer: &str,
+) -> std::io::Result<Vec<TableDigest>> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
+    if let Some(token) = fanout_auth(state) {
+        auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
+    }
+    let mut frame = Frame::new(proto::REQ_DIGEST, vec![]);
+    frame.flags = FLAG_REPLICATION;
+    if let Some(k) = state.transport_key.as_ref() {
+        frame.payload = crypto::seal(k, &frame.payload);
+        frame.flags |= crypto::FLAG_ENCRYPTED;
+    }
+    let bytes = frame.encode().map_err(std::io::Error::other)?;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let resp = read_response_frame(&mut stream).await?;
+    if resp.frame_type != proto::RESP_DIGEST {
+        return Err(std::io::Error::other(format!(
+            "{peer}: digest probe answered {} {}",
+            resp.frame_type,
+            String::from_utf8_lossy(&resp.payload)
+        )));
+    }
+    serde_json::from_slice(&resp.payload)
+        .map_err(|e| std::io::Error::other(format!("bad digest payload: {e}")))
 }
 
 #[cfg(test)]

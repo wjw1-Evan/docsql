@@ -64,7 +64,7 @@ INSERT INTO orders (id, note)
 cargo build --workspace
 cargo test --workspace          # Rust 全量测试(开发门禁;本地 Docker 构建亦内置)
 cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二进制)
-./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 69 项 + 单节点 24 项)
+./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 76 项 + 单节点 26 项)
 ```
 
 ## DocSQL Studio(Web 管理控制台)
@@ -106,9 +106,9 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 ## 测试
 
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
-- Docker:compose 双 profile 部署测试全绿——多节点 69 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线/网络分区/新节点加入自动同步)+ 单节点 24 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放)
+- Docker:compose 双 profile 部署测试全绿——多节点 76 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 26 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放)
 - .NET:xUnit(ADO.NET Client 43 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub)
-- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(69 + 24 项)
+- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(76 + 26 项)
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)
 
@@ -138,7 +138,9 @@ cd deploy && docker volume create docsql-dev-data-d    # 一次性建卷(开发;
 docker compose --profile cluster --profile join up -d node-d
 ```
 
-新节点需要两个环境变量:`DOCSQL_PEERS`(现有节点地址表)与 `DOCSQL_ADVERTISE`(其它节点回连自己的地址)。注意:动态注册保存在原节点内存中,原节点重启后会丢失——要把 node-d 变成长期成员,请把它写进各节点的 `DOCSQL_PEERS` 并重建(数据保留,且不会重复同步)。另外,节点**离线/分区期间**其它节点的写仍不会补发(无反熵追赶,同步只发生在加入时)。
+新节点需要两个环境变量:`DOCSQL_PEERS`(现有节点地址表)与 `DOCSQL_ADVERTISE`(其它节点回连自己的地址)。注意:动态注册保存在原节点内存中,原节点重启后会丢失——要把 node-d 变成长期成员,请把它写进各节点的 `DOCSQL_PEERS` 并重建(数据保留,且不会重复同步)。
+
+**离线自动补齐(重启反熵修复)**:节点离线/分区期间,其它节点的写不会实时补发;但离线节点**重启时会自动修复**——对比各节点的表数据摘要,发现分歧即采纳集群多数方(在线幸存节点)的最新快照,离线期间错过的增删改全部自动补齐,全网恢复一致。两点边界:没有行级合并,分区期间**少数方独有**的写会被多数方快照覆盖(多数方在线节点上的数据为准);修复由重启触发,仅网络分区而各节点未重启时不自动收敛(任一分歧节点重启即收敛)。
 
 **数据持久化**:每个节点的数据放在 external 卷(生产 `docsql-data-a/b/c/single` + join 节点 `docsql-prod-data-d`;开发 `docsql-dev-data-a/b/c/d/single`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
 
@@ -160,7 +162,7 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 
 > 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)互不相同,两套拓扑可同时运行、互不共享数据。
 
-部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 69 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线/网络分区/新节点加入自动同步)+ 单节点 24 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub)。
+部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 76 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 26 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub)。
 
 > 注:镜像基于 mcr.microsoft.com/azurelinux(本环境 docker.io 不可达)。
 

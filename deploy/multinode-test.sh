@@ -201,13 +201,20 @@ done
 out=$(sql "$C" "SELECT host FROM nodes WHERE id = 4;")
 echo "$out" | grep -q "c-write" && ok "c retains pre-outage data (id=4)" || bad "c lost pre-outage data: $out"
 
-# 9.5 已知限制(特征化断言):离线期间的写对 c 永久丢失——无反熵追赶。
-#     确定性依据:扇出在写响应返回前同步完成,失败发生在 c 停机期间,
-#     不存在迟到的补发路径。
-absent "$C" "SELECT id FROM nodes WHERE id = 20;" "^[[:space:]]*20[[:space:]]*$" \
-  && ok "c permanently misses outage write id=20 (no catch-up)" || bad "c unexpectedly caught up id=20"
-absent "$C" "SELECT id FROM nodes WHERE id = 21;" "^[[:space:]]*21[[:space:]]*$" \
-  && ok "c permanently misses outage tx id=21 (no catch-up)" || bad "c unexpectedly caught up id=21"
+# 9.5 反熵修复(重启加入时触发):c 起来后对比各 peer 的表摘要,发现分歧
+#     即经 hold 冻结→快照→单事务清空重放,整体采纳集群状态——离线期间
+#     a/b 的增删改自动补齐(旧行为「无追赶,永久丢失」已由修复取代)。
+wait_row "$C" "SELECT id FROM nodes WHERE id = 20;" "^[[:space:]]*20[[:space:]]*$" \
+  && ok "c auto-caught-up outage write id=20 (rejoin repair)" || bad "c did not catch up id=20"
+wait_row "$C" "SELECT id FROM nodes WHERE id = 21;" "^[[:space:]]*21[[:space:]]*$" \
+  && ok "c auto-caught-up outage tx id=21 (rejoin repair)" || bad "c did not catch up id=21"
+# CLI 输出带连接横幅(含端口数字),计数只认「整行纯数字」的结果行。
+cnt_a=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | grep -E '^[[:space:]]*[0-9]+[[:space:]]*$' | head -1 | tr -d '[:space:]')
+cnt_b=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E '^[[:space:]]*[0-9]+[[:space:]]*$' | head -1 | tr -d '[:space:]')
+cnt_c=$(sql "$C" "SELECT COUNT(id) FROM nodes;" | grep -E '^[[:space:]]*[0-9]+[[:space:]]*$' | head -1 | tr -d '[:space:]')
+[ -n "$cnt_a" ] && [ "$cnt_a" = "$cnt_b" ] && [ "$cnt_b" = "$cnt_c" ] \
+  && ok "a/b/c row counts converged after repair ($cnt_a)" \
+  || bad "post-repair divergence: a=$cnt_a b=$cnt_b c=$cnt_c"
 
 # 9.6 恢复后 a 的新写重新到达 c(每次写新建连接,peer 可达即恢复)。
 out=$(sql "$A" "INSERT INTO nodes VALUES (22, 'after-recovery');")
@@ -220,7 +227,7 @@ wait_row "$A" "SELECT id FROM nodes WHERE id = 23;" "^[[:space:]]*23[[:space:]]*
   && wait_row "$B" "SELECT id FROM nodes WHERE id = 23;" "^[[:space:]]*23[[:space:]]*$" \
   && ok "rejoined c's write reaches a and b" || bad "rejoined c's write did not fan out"
 
-echo "== 10. partition: both sides accept writes, silent divergence on rejoin =="
+echo "== 10. partition: both sides accept writes, divergence until a restart heals it =="
 # 分区周期后 c 的自名解析(容器内解析 node-c)可能持续损坏,直到 compose 网络
 # 被重建(down -v)才恢复——分区测试中所有 c 侧交互一律走 127.0.0.1 回环。
 sqlc() { printf "%s\nexit;\n" "$1" | docker exec -i docsql-c docsql-cli connect 127.0.0.1:7600 2>/dev/null; }
@@ -279,6 +286,29 @@ out=$(sql "$A" "INSERT INTO nodes VALUES (32, 'after-rejoin');")
 wait_row "$B" "SELECT id FROM nodes WHERE id = 32;" "^[[:space:]]*32[[:space:]]*$" \
   && wait_row_c "SELECT id FROM nodes WHERE id = 32;" "^[[:space:]]*32[[:space:]]*$" \
   && ok "post-rejoin write reaches all nodes" || bad "post-rejoin write did not fan out"
+
+# 10.5 反熵修复的触发点是重启:仅重连(10.3)不修,重启才对齐。c 重启后
+#     对比 a/b(双方一致,构成多数方)并整体采纳其快照:c 分区期间的独有
+#     写 id=31 被多数方状态覆盖(策略:无行级合并,少数方独有写不保留),
+#     全网恢复一致。
+docker restart docsql-c >/dev/null
+up=""
+for _ in $(seq 1 40); do
+  sqlc "SELECT 1;" >/dev/null 2>&1 && { up=1; break; }
+  sleep 0.5
+done
+[ -n "$up" ] && ok "c back online after partition-repair restart" || bad "c did not come back after restart"
+wait_row_c "SELECT id FROM nodes WHERE id = 30;" "^[[:space:]]*30[[:space:]]*$" \
+  && ok "c adopts majority state (id=30) on restart" || bad "c did not adopt majority id=30"
+absent_c "SELECT id FROM nodes WHERE id = 31;" "^[[:space:]]*31[[:space:]]*$" \
+  && ok "minority-only partition write id=31 overwritten by majority (documented policy)" \
+  || bad "id=31 unexpectedly survived the repair"
+cnt_a=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | grep -E '^[[:space:]]*[0-9]+[[:space:]]*$' | head -1 | tr -d '[:space:]')
+cnt_b=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E '^[[:space:]]*[0-9]+[[:space:]]*$' | head -1 | tr -d '[:space:]')
+cnt_c=$(sqlc "SELECT COUNT(id) FROM nodes;" | grep -E '^[[:space:]]*[0-9]+[[:space:]]*$' | head -1 | tr -d '[:space:]')
+[ -n "$cnt_a" ] && [ "$cnt_a" = "$cnt_b" ] && [ "$cnt_b" = "$cnt_c" ] \
+  && ok "cluster fully converged after partition repair ($cnt_a rows)" \
+  || bad "post-partition-repair divergence: a=$cnt_a b=$cnt_b c=$cnt_c"
 
 echo "== 11. auto-GUID primary keys converge across nodes =="
 # 随机 GUID 不能像 INT AUTOINCREMENT 的 max+1 那样在对端确定性重算:

@@ -1118,11 +1118,11 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
 
 /// Peer offline → writes on the surviving node → peer back online. The
 /// fire-and-forget fan-out must neither fail nor wedge local writes while the
-/// peer is down; the rebooted peer keeps its pre-outage data and receives new
-/// writes again — but the writes that happened during the outage are lost for
-/// it (no anti-entropy catch-up; documented cluster limitation).
+/// peer is down; the rebooted peer keeps its pre-outage data, receives new
+/// writes again, and — since the rejoin repair (anti-entropy at restart) —
+/// catches up the writes it missed during the outage.
 #[tokio::test]
-async fn peer_offline_then_online_resumes_new_writes_without_catchup() {
+async fn peer_offline_then_online_catches_up_missed_writes() {
     let dir = tempfile::tempdir().unwrap();
     let free = || {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1214,16 +1214,24 @@ async fn peer_offline_then_online_resumes_new_writes_without_catchup() {
     }
     let mut b = Client::connect(&b_addr).await;
 
-    // b kept its pre-outage row, and the outage writes are gone for it:
-    // nothing re-sends them. Deterministic — fan-out runs before the write
-    // responds, so the failed deliveries for ids 2/3 already completed while
-    // b was still down.
-    let resp = b.sql("SELECT id FROM off ORDER BY id").await;
-    let text = payload_str(&resp);
-    assert!(text.contains("[[1]]"), "b lost its pre-outage data: {text}");
+    // b kept its pre-outage row, and the rejoin repair caught it up with
+    // everything it missed while down: inserts from autocommit and from a
+    // committed transaction alike. Deterministic — the failed fan-outs for
+    // ids 2/3 completed while b was still down, so only the repair can
+    // bring them in.
     assert!(
-        !text.contains("[[2]]") && !text.contains("[[3]]"),
-        "outage writes unexpectedly reached b: {text}"
+        wait_seen(&b_addr, "SELECT id FROM off WHERE id = 2", "[[2]]").await,
+        "rejoin repair did not catch up the outage insert (id=2)"
+    );
+    assert!(
+        wait_seen(&b_addr, "SELECT id FROM off WHERE id = 3", "[[3]]").await,
+        "rejoin repair did not catch up the outage transaction (id=3)"
+    );
+    let resp = b.sql("SELECT id FROM off WHERE id = 1").await;
+    assert!(
+        payload_str(&resp).contains("[[1]]"),
+        "b lost its pre-outage data: {}",
+        payload_str(&resp)
     );
 
     // New writes flow to the rejoined peer again (fresh connection per write).
@@ -1240,7 +1248,8 @@ async fn peer_offline_then_online_resumes_new_writes_without_catchup() {
         "rejoined peer's write did not reach a"
     );
 
-    // Final state: a saw everything; b is missing exactly the outage writes.
+    // Final state: the repair made b converge, so both nodes hold all
+    // five rows — base, outage, and post-rejoin writes alike.
     let resp = a.sql("SELECT COUNT(id) FROM off").await;
     assert!(
         payload_str(&resp).contains("[[5]]"),
@@ -1249,8 +1258,8 @@ async fn peer_offline_then_online_resumes_new_writes_without_catchup() {
     );
     let resp = b.sql("SELECT COUNT(id) FROM off").await;
     assert!(
-        payload_str(&resp).contains("[[3]]"),
-        "b should hold exactly the three non-outage rows: {}",
+        payload_str(&resp).contains("[[5]]"),
+        "b should hold all five rows after the repair: {}",
         payload_str(&resp)
     );
 }
@@ -2187,4 +2196,194 @@ async fn join_with_concurrent_writes_converges() {
             "node {addr} did not converge across the join"
         );
     }
+}
+
+// ---- cluster rejoin repair (anti-entropy at restart) ----
+
+/// Like [`spawn_node`], but returns the server task handle so a test can
+/// abort it to simulate a node going down: memory state is lost, the
+/// on-disk database survives — exactly a crash. Callers must not hold
+/// client connections across the abort (a live connection task would keep
+/// the old engine instance alive over the same file).
+async fn spawn_node_handle(
+    dir: &tempfile::TempDir,
+    name: &str,
+    addr: &str,
+    peers: Vec<String>,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    let handle = tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join(format!("{name}.db")),
+        listen: addr.to_string(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers,
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+    }));
+    for _ in 0..200 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return handle;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("node {name} did not come up");
+}
+
+async fn wait_port_down(addr: &str) {
+    for _ in 0..200 {
+        if TcpStream::connect(addr).await.is_err() {
+            // Give a lingering connection task one tick to finish exiting
+            // so the respawn opens the database file unshared.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("node at {addr} still accepts connections");
+}
+
+/// The headline anti-entropy scenario: a node that was down while its peer
+/// wrote must catch up automatically on restart — inserts, updates, and
+/// deletes that happened during the outage all land, and the mesh fans out
+/// both ways afterwards. Fan-out never back-fills, so this only works
+/// because the restarting node compares digests and adopts the snapshot.
+#[tokio::test]
+async fn rejoin_repair_catches_up_writes_missed_while_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr) = (free(), free());
+    let a_peers = vec![b_addr.clone()];
+    let b_peers = vec![a_addr.clone()];
+    let a = spawn_node_handle(&dir, "ra", &a_addr, a_peers).await;
+    let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers.clone()).await;
+
+    // Base state on both nodes.
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    ca.sql("INSERT INTO t VALUES (1, 'one')").await;
+    ca.sql("INSERT INTO t VALUES (2, 'two')").await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM t", "[[2]]", 200).await,
+        "base rows did not reach b"
+    );
+    drop(ca);
+
+    // b goes down; a keeps writing (fan-out to the dead peer logs, never
+    // blocks).
+    b.abort();
+    wait_port_down(&b_addr).await;
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("INSERT INTO t VALUES (3, 'three')").await;
+    ca.sql("UPDATE t SET v = 'uno' WHERE id = 1").await;
+    ca.sql("DELETE FROM t WHERE id = 2").await;
+    ca.sql("INSERT INTO t VALUES (4, 'four')").await;
+    drop(ca);
+
+    // b rejoins: the startup digest compare must adopt a's snapshot with
+    // every missed write applied. The first rounds can overlap a's own
+    // startup-sync window (it refuses to serve a snapshot while its gate
+    // is open), so the repair may need several seconds — poll patiently.
+    let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers).await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT v FROM t WHERE id = 1", "uno", 1000).await,
+        "missed UPDATE not repaired on rejoin"
+    );
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM t", "[[3]]", 400).await,
+        "missed INSERT/DELETE not repaired on rejoin"
+    );
+    assert!(
+        wait_seen_n(&b_addr, "SELECT v FROM t WHERE id = 4", "four", 100).await,
+        "missed INSERT id=4 not repaired on rejoin"
+    );
+
+    // The repaired mesh fans out both ways.
+    let mut cb = Client::connect(&b_addr).await;
+    let r = cb.sql("INSERT INTO t VALUES (5, 'five')").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    assert!(
+        wait_seen_n(&a_addr, "SELECT v FROM t WHERE id = 5", "five", 200).await,
+        "write on the repaired node did not fan out"
+    );
+    drop(cb);
+    let mut ca = Client::connect(&a_addr).await;
+    let r = ca.sql("INSERT INTO t VALUES (6, 'six')").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    drop(ca);
+    assert!(
+        wait_seen_n(&b_addr, "SELECT v FROM t WHERE id = 6", "six", 200).await,
+        "post-repair write on a did not reach b"
+    );
+    a.abort();
+    b.abort();
+}
+
+/// A restart without divergence must be a no-op: digests agree, the node
+/// keeps its data (no wipe, no resync) and rejoins the fan-out mesh.
+#[tokio::test]
+async fn restart_without_divergence_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr) = (free(), free());
+    let a_peers = vec![b_addr.clone()];
+    let b_peers = vec![a_addr.clone()];
+    let a = spawn_node_handle(&dir, "ra", &a_addr, a_peers).await;
+    let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers.clone()).await;
+
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE keep (id INT PRIMARY KEY, v TEXT)")
+        .await;
+    ca.sql("INSERT INTO keep VALUES (1, 'a'), (2, 'b')").await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM keep", "[[2]]", 200).await,
+        "base rows did not reach b"
+    );
+    drop(ca);
+
+    b.abort();
+    wait_port_down(&b_addr).await;
+    let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers).await;
+
+    // Data survived the restart untouched.
+    let mut cb = Client::connect(&b_addr).await;
+    let r = cb.sql("SELECT v FROM keep WHERE id = 1").await;
+    assert!(
+        String::from_utf8_lossy(&r.payload).contains("\"a\""),
+        "restart lost data: {}",
+        payload_str(&r)
+    );
+    // And the mesh is intact in both directions.
+    let r = cb.sql("INSERT INTO keep VALUES (3, 'c')").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    drop(cb);
+    assert!(
+        wait_seen_n(&a_addr, "SELECT v FROM keep WHERE id = 3", "\"c\"", 200).await,
+        "write after clean restart did not fan out"
+    );
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("INSERT INTO keep VALUES (4, 'd')").await;
+    drop(ca);
+    assert!(
+        wait_seen_n(&b_addr, "SELECT v FROM keep WHERE id = 4", "\"d\"", 200).await,
+        "post-restart write on a did not reach b"
+    );
+    a.abort();
+    b.abort();
 }

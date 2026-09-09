@@ -16,6 +16,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub const CATALOG_PAGE: u32 = 1;
 /// Catalog payload paginates across a chain of pages: page 1 carries
@@ -287,6 +289,37 @@ fn expr_has_null_ref(e: &SqlExpr, doc: &Object) -> bool {
         }
         _ => false,
     }
+}
+
+/// Replication fingerprint of one table (cluster rejoin repair): row
+/// count, an order-independent hash over every row's documents, and a
+/// hash over the catalog fields that shape replay.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TableDigest {
+    pub name: String,
+    pub rows: u64,
+    pub rows_hash: u64,
+    pub schema_hash: u64,
+}
+
+/// Hash over every replay-relevant catalog field of a table. Physical
+/// fields (heap page ids, index root pages) are deliberately excluded:
+/// they legitimately differ between nodes holding identical data.
+fn schema_hash(meta: &TableMeta) -> u64 {
+    let mut h = DefaultHasher::new();
+    meta.columns.hash(&mut h);
+    meta.primary_key.hash(&mut h);
+    meta.unique.hash(&mut h);
+    meta.not_null.hash(&mut h);
+    meta.autoinc.hash(&mut h);
+    meta.autoguid.hash(&mut h);
+    meta.indexes.hash(&mut h);
+    meta.index_defs.hash(&mut h);
+    meta.constraint_unique.hash(&mut h);
+    meta.defaults.hash(&mut h);
+    meta.checks.hash(&mut h);
+    meta.foreign_keys.hash(&mut h);
+    h.finish()
 }
 
 pub struct Database {
@@ -1045,6 +1078,59 @@ impl Database {
         self.table_docs(table)
             .map(|d| union_of_fields(&d))
             .unwrap_or_default()
+    }
+
+    /// Replication fingerprints for every user table, sorted by name;
+    /// `_pubsub_messages` is skipped (node-local queue state, like
+    /// [Database::dump_script]). `rows_hash` is a wrapping sum of
+    /// per-row hashes over the documents' canonical encoded bytes, so it
+    /// is independent of heap layout: nodes holding the same logical
+    /// data agree regardless of which node applied a row first. The
+    /// cluster rejoin repair compares these to decide whether a node
+    /// that was offline missed writes.
+    pub fn digests(&mut self) -> Result<Vec<TableDigest>> {
+        let mut names: Vec<String> = self
+            .tables
+            .keys()
+            .filter(|n| *n != PUBSUB_TABLE)
+            .cloned()
+            .collect();
+        names.sort();
+        let mut out = Vec::with_capacity(names.len());
+        for name in &names {
+            let meta = self.tables.get(name).cloned().unwrap();
+            let docs = self.table_docs(name)?;
+            let mut rows_hash: u64 = 0;
+            for doc in &docs {
+                let mut h = DefaultHasher::new();
+                for (k, v) in doc {
+                    k.hash(&mut h);
+                    let mut buf = Vec::new();
+                    encode::encode(v, &mut buf)?;
+                    h.write(&buf);
+                }
+                rows_hash = rows_hash.wrapping_add(h.finish());
+            }
+            out.push(TableDigest {
+                name: name.clone(),
+                rows: docs.len() as u64,
+                rows_hash,
+                schema_hash: schema_hash(&meta),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Remove every user table from the catalog, bypassing DROP TABLE's
+    /// FOREIGN KEY guards. Cluster rejoin repair replaces the node's
+    /// whole state with the cluster snapshot inside one transaction:
+    /// tables the snapshot no longer contains must go too, and no
+    /// removal order satisfies DROP's "referenced by FOREIGN KEY" check
+    /// for every mixed state (cycles included). Runs inside the
+    /// caller's transaction — rollback restores the pre-wipe catalog.
+    pub fn wipe_user_tables(&mut self) -> Result<()> {
+        self.tables.retain(|name, _| name == PUBSUB_TABLE);
+        self.save_catalog()
     }
 
     /// Full logical dump as a SQL script: all DDL first, then all data.
@@ -10123,5 +10209,119 @@ mod complex_query_tests {
                 "{sql}\n{e}"
             );
         }
+    }
+
+    // ---- rejoin repair: table digests + transactional wipe ----
+
+    fn digests_of(db: &mut Database) -> Vec<TableDigest> {
+        db.digests().unwrap()
+    }
+
+    #[test]
+    fn digests_agree_regardless_of_row_order() {
+        // Nodes apply the same logical rows in different arrival orders;
+        // heap layout differs, the digest must not.
+        let mut a = Database::in_memory().unwrap();
+        let mut b = Database::in_memory().unwrap();
+        {
+            let pair: [(&mut Database, [i64; 3]); 2] = [(&mut a, [1, 2, 3]), (&mut b, [3, 1, 2])];
+            for (db, order) in pair {
+                run(db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+                for id in order {
+                    run(db, &format!("INSERT INTO t VALUES ({id}, 'v{id}')"));
+                }
+            }
+        }
+        assert_eq!(digests_of(&mut a), digests_of(&mut b));
+        // One changed row breaks the agreement (update path).
+        run(&mut b, "UPDATE t SET v = 'x' WHERE id = 2");
+        assert_ne!(digests_of(&mut a), digests_of(&mut b));
+        // And the delete path moves it back only when mirrored.
+        run(&mut b, "DELETE FROM t WHERE id = 2");
+        assert_ne!(digests_of(&mut a), digests_of(&mut b));
+        run(&mut a, "DELETE FROM t WHERE id = 2");
+        assert_eq!(digests_of(&mut a), digests_of(&mut b));
+    }
+
+    #[test]
+    fn digests_reflect_schema_and_skip_pubsub() {
+        let mut a = Database::in_memory().unwrap();
+        let mut b = Database::in_memory().unwrap();
+        run(&mut a, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut b, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE)");
+        assert_ne!(digests_of(&mut a), digests_of(&mut b), "schema differs");
+        // Column DEFAULT is part of the replayed DDL — it must show up.
+        run(&mut a, "CREATE TABLE d (x TEXT DEFAULT ('n/a'))");
+        run(&mut b, "CREATE TABLE d (x TEXT)");
+        assert_ne!(digests_of(&mut a), digests_of(&mut b));
+        // The pubsub system table is node-local queue state, never compared.
+        run(
+            &mut a,
+            "CREATE TABLE _pubsub_messages \
+             (id INT PRIMARY KEY AUTOINCREMENT, payload TEXT)",
+        );
+        let base = digests_of(&mut a);
+        run(
+            &mut a,
+            "INSERT INTO _pubsub_messages (payload) VALUES ('m')",
+        );
+        assert_eq!(
+            digests_of(&mut a),
+            base,
+            "pubsub rows must not move the digest"
+        );
+    }
+
+    #[test]
+    fn wipe_user_tables_is_transactional() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE parent (id INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "CREATE TABLE child (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES parent (id))",
+        );
+        run(&mut db, "INSERT INTO parent VALUES (1)");
+        run(&mut db, "INSERT INTO child VALUES (10, 1)");
+        // DROP cannot take this state apart in any order (child references
+        // parent); the wipe bypasses the FK guard.
+        run(&mut db, "BEGIN");
+        db.wipe_user_tables().unwrap();
+        assert!(db.catalog().iter().all(|t| t.name == PUBSUB_TABLE));
+        run(&mut db, "ROLLBACK");
+        assert!(db.catalog().iter().any(|t| t.name == "parent"));
+        let r = rows(&mut db, "SELECT COUNT(*) FROM child");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "rollback restores data");
+    }
+
+    #[test]
+    fn snapshot_adoption_replaces_divergent_state() {
+        // The repair flow: wipe + dump replay inside one transaction makes
+        // the stale node digest-identical to the reference, and tables the
+        // snapshot no longer contains are gone.
+        let mut truth = Database::in_memory().unwrap();
+        run(&mut truth, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut truth, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+        let script = truth.dump_script().unwrap();
+
+        let mut stale = Database::in_memory().unwrap();
+        run(&mut stale, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut stale, "CREATE TABLE extra (x INT)");
+        run(
+            &mut stale,
+            "INSERT INTO t VALUES (1, 'stale'), (9, 'zombie')",
+        );
+        assert_ne!(digests_of(&mut truth), digests_of(&mut stale));
+
+        run(&mut stale, "BEGIN");
+        stale.wipe_user_tables().unwrap();
+        let batch = stale.execute_batch(&script);
+        assert!(batch.error.is_none(), "{:?}", batch.error);
+        run(&mut stale, "COMMIT");
+        assert_eq!(digests_of(&mut truth), digests_of(&mut stale));
+        assert!(
+            !stale.catalog().iter().any(|t| t.name == "extra"),
+            "table absent from the snapshot must go"
+        );
     }
 }
