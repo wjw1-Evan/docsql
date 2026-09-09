@@ -580,6 +580,82 @@ async fn fanout_authenticates_with_cluster_token() {
 }
 
 #[tokio::test]
+async fn default_fill_converges_across_peers() {
+    // Red line 11, default flavor: peers replay the fanout INSERT text, so
+    // DEFAULT fills must be deterministic. Plain defaults are re-filled
+    // identically on every peer; auto-GUID inserts ride the canonical
+    // resolved-INSERT rewrite that pins the default-filled columns too.
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let a_addr = free();
+    let b_addr = free();
+    let cfg_for = |listen: &str, peers: Vec<String>, db: &str| docsql_server::ServerConfig {
+        db_path: dir.path().join(db),
+        listen: listen.to_string(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some("cluster-tok".into()),
+        advertise: None,
+        replicate_to: None,
+        peers,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+    };
+    tokio::spawn(docsql_server::run(cfg_for(
+        &a_addr,
+        vec![b_addr.clone()],
+        "dfla.db",
+    )));
+    tokio::spawn(docsql_server::run(cfg_for(
+        &b_addr,
+        vec![a_addr.clone()],
+        "dflb.db",
+    )));
+    for addr in [&a_addr, &b_addr] {
+        for _ in 0..100 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let mut a = Client::connect(&a_addr).await;
+    a.sql("CREATE TABLE pl (id INT PRIMARY KEY, tag TEXT DEFAULT 'seed')")
+        .await;
+    a.sql(
+        "CREATE TABLE g (id GUID PRIMARY KEY AUTOINCREMENT, tag TEXT DEFAULT 'seed', n INT NOT NULL DEFAULT 3)",
+    )
+    .await;
+    // Plain default: both nodes fill the same constant.
+    a.sql("INSERT INTO pl (id) VALUES (1)").await;
+    assert!(
+        wait_seen(&b_addr, "SELECT tag FROM pl WHERE id = 1", "[[\"seed\"]]").await,
+        "plain default fill did not converge"
+    );
+    // GUID + defaults: the source's resolved INSERT must reach b with the
+    // generated id and filled defaults pinned explicitly.
+    a.sql("INSERT INTO g (id) VALUES (NULL)").await;
+    assert!(
+        wait_seen(&b_addr, "SELECT tag, n FROM g", "[[\"seed\",3]]").await,
+        "GUID + default fill did not converge"
+    );
+    assert!(
+        wait_seen(&a_addr, "SELECT COUNT(*) FROM g", "[[1]]").await,
+        "guid insert did not land once on a"
+    );
+}
+
+#[tokio::test]
 async fn sql_error_reaches_client() {
     let (_dir, addr) = start_server(None).await;
     let mut c = Client::connect(&addr).await;

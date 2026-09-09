@@ -8266,6 +8266,99 @@ mod tests {
     }
 
     #[test]
+    fn column_defaults_survive_reopen() {
+        // Defaults live in the catalog (saved as SQL text); like every
+        // TableMeta field they must round-trip the reopen (red line 9).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("defaults.db");
+        let mut db = Database::open(&path).unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, s TEXT DEFAULT 'seed', n INT NOT NULL DEFAULT 7)",
+        );
+        run(&mut db, "INSERT INTO t (id) VALUES (1)");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        // Still filling omitted columns after reopen...
+        run(&mut db, "INSERT INTO t (id) VALUES (2)");
+        let r = rows(&mut db, "SELECT s, n FROM t WHERE id = 2");
+        assert_eq!(r.rows, vec![vec![Value::Str("seed".into()), Value::Int(7)]]);
+        // ...and the tooling surface still reports the declarations.
+        let cols = db
+            .catalog()
+            .into_iter()
+            .find(|t| t.name == "t")
+            .unwrap()
+            .columns;
+        assert_eq!(cols[1].default_value.as_deref(), Some("'seed'"));
+        assert_eq!(cols[2].default_value.as_deref(), Some("7"));
+        assert_eq!(cols[0].default_value, None);
+    }
+
+    #[test]
+    fn default_follows_rename_and_drop() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, s TEXT DEFAULT 'x')",
+        );
+        // RENAME COLUMN carries the default to the new name.
+        run(&mut db, "ALTER TABLE t RENAME COLUMN s TO note");
+        run(&mut db, "INSERT INTO t (id) VALUES (1)");
+        let r = rows(&mut db, "SELECT note FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Str("x".into())]]);
+        let col = &db
+            .catalog()
+            .into_iter()
+            .find(|t| t.name == "t")
+            .unwrap()
+            .columns[1];
+        assert_eq!(col.name, "note");
+        assert_eq!(col.default_value.as_deref(), Some("'x'"));
+        // DROP COLUMN removes the default bookkeeping along with the column.
+        run(&mut db, "ALTER TABLE t DROP COLUMN note");
+        let t = db.catalog().into_iter().find(|t| t.name == "t").unwrap();
+        assert_eq!(t.columns.len(), 1, "only id remains: {:?}", t.columns);
+        assert_eq!(t.columns[0].name, "id");
+        // Row 2's document carries no stale fill.
+        run(&mut db, "INSERT INTO t (id) VALUES (2)");
+        let r = rows(&mut db, "SELECT id FROM t WHERE id = 2");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn guid_and_default_fill_writeback_together() {
+        // Red line 11: the fanout/transaction buffer must carry the
+        // canonical INSERT — generated GUIDs AND default-filled columns as
+        // explicit values — so peers replay deterministically instead of
+        // re-filling on their own.
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT DEFAULT 'd', n INT NOT NULL DEFAULT 5)",
+        );
+        run(&mut db, "INSERT INTO t (n) VALUES (7)");
+        // Take the writeback before any other statement — it resets per
+        // statement (take_resolved_insert is the server's fanout hook).
+        let resolved = db.take_resolved_insert().expect("resolved insert text");
+        let r = rows(&mut db, "SELECT id, v, n FROM t");
+        let row = &r.rows[0];
+        assert_eq!(&row[0].as_str().unwrap()[14..15], "7");
+        assert_eq!(row[1], Value::Str("d".into()));
+        assert_eq!(row[2], Value::Int(7));
+        // The resolved writeback covers the generated id and the
+        // default-filled column explicitly.
+        assert!(
+            resolved.contains("(\"id\", \"n\", \"v\")"),
+            "explicit column list: {resolved}"
+        );
+        assert!(resolved.contains("'d'"), "default pinned: {resolved}");
+        assert!(resolved.contains(" 7, 'd'"), "values pinned: {resolved}");
+        // Consuming the writeback clears it.
+        assert!(db.take_resolved_insert().is_none());
+    }
+
+    #[test]
     fn check_constraint_enforced() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE t (n INT CHECK (n > 0))");
