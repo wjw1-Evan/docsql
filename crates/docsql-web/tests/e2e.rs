@@ -283,7 +283,7 @@ async fn meta_and_stats_report_live_catalog() {
     sql(
         &addr,
         None,
-        "CREATE TABLE m (id INT PRIMARY KEY, name TEXT); INSERT INTO m VALUES (1, 'a'), (2, 'b')",
+        "CREATE TABLE m (id INT PRIMARY KEY, name TEXT DEFAULT 'anon'); INSERT INTO m VALUES (1, 'a'), (2, 'b')",
     )
     .await;
 
@@ -296,6 +296,10 @@ async fn meta_and_stats_report_live_catalog() {
     let cols = t["columns"].as_array().unwrap();
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[0]["primary_key"], true);
+    // Declared DEFAULT round-trips as SQL text (edit-table grid reads it);
+    // columns without one report null.
+    assert_eq!(cols[0]["default"], json!(null));
+    assert_eq!(cols[1]["default"], "'anon'");
     assert_eq!(meta["storage"]["page_size"], 4096);
 
     // Schemaless write: a top-level field no column declares. Meta must
@@ -373,13 +377,14 @@ async fn edit_table_alter_batch_over_http() {
     )
     .await;
 
-    // Rename a, drop b, add c — exactly what the dialog emits, in its order.
+    // Rename a, drop b, add c (NOT NULL + DEFAULT, as the dialog emits for
+    // a defaulted new column) — in the dialog's order.
     let r = sql(
         &addr,
         None,
         "ALTER TABLE ed RENAME COLUMN a TO a2;\n\
          ALTER TABLE ed DROP COLUMN b;\n\
-         ALTER TABLE ed ADD COLUMN c INT;",
+         ALTER TABLE ed ADD COLUMN c INT NOT NULL DEFAULT 9;",
     )
     .await;
     assert_eq!(r["kind"], "batch");
@@ -397,7 +402,16 @@ async fn edit_table_alter_batch_over_http() {
     // The GUID auto PK survives structural edits untouched.
     assert_eq!(t["columns"][0]["data_type"], "GUID");
     assert_eq!(t["columns"][0]["autoinc"], true);
+    // The defaulted new column reports its DEFAULT and NOT NULL, and the
+    // pre-existing row was backfilled with the default.
+    assert_eq!(t["columns"][2]["default"], "9");
+    assert_eq!(t["columns"][2]["nullable"], false);
     sql(&addr, None, "INSERT INTO ed (a2) VALUES ('still works')").await;
+    let r = sql(&addr, None, "SELECT c FROM ed ORDER BY id").await;
+    assert_eq!(r["kind"], "rows");
+    for row in r["rows"].as_array().unwrap() {
+        assert_eq!(row[0].as_i64(), Some(9), "DEFAULT backfill + insert fill");
+    }
     let r = sql(&addr, None, "SELECT id FROM ed ORDER BY id DESC LIMIT 1").await;
     assert_eq!(r["kind"], "rows");
     assert_eq!(&r["rows"][0][0].as_str().unwrap()[14..15], "7");

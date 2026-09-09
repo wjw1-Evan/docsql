@@ -508,25 +508,27 @@ function newTableDialog() {
   const colRow = (c) => `<tr data-col>
     <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="列名"></td>
     <td><select data-c="type">${COL_TYPES.map(t => `<option${t === (c.type || 'ANY') ? ' selected' : ''}>${t}</option>`).join('')}</select></td>
+    <td><input type="text" data-c="dflt" value="${esc(c.dflt || '')}" placeholder="如 'abc'、7、true" title="DEFAULT:SQL 字面量,字符串需带单引号;留空表示无默认值"></td>
     <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}></td>
     <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}></td>
     <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}></td>
     <td><button class="delcol" data-delcol title="删除此列">✕</button></td></tr>`;
-  const ov = showModal(`<div class="dialog" style="min-width:580px;max-width:640px"><h3>新建表</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>新建表</h3><div class="body">
     <div class="row"><label>表名</label><input type="text" data-t="name" placeholder="如 users"></div>
     <div>
-      <table class="colgrid"><thead><tr><th style="width:38%">列名</th><th style="width:24%">类型</th>
+      <table class="colgrid"><thead><tr><th style="width:30%">列名</th><th style="width:16%">类型</th><th style="width:26%">默认值</th>
         <th title="主键">PK</th><th title="非空">NOT NULL</th><th title="自增">AUTO</th><th></th></tr></thead>
       <tbody data-cols>${colRow({name: 'id', type: 'INT', pk: true, nn: true})}${colRow({})}</tbody></table>
       <div style="margin-top:6px"><button data-addcol>+ 添加列</button></div>
     </div>
-    <div class="hint">GUID + AUTO:主键自动生成时序有序 UUIDv7(INSERT 省略即可);INT + AUTO 为自增整数。其余类型仅作文档用途(无模式文档存储,类型不被强制);PK 不隐含 NOT NULL,勾选 PK 会自动勾上 NOT NULL。</div>
+    <div class="hint">GUID + AUTO:主键自动生成时序有序 UUIDv7(INSERT 省略即可);INT + AUTO 为自增整数。其余类型仅作文档用途(无模式文档存储,类型不被强制);PK 不隐含 NOT NULL,勾选 PK 会自动勾上 NOT NULL。默认值填 SQL 字面量(字符串需带引号,如 'n/a';数字/布尔直接写),INSERT 省略该列时自动填入。</div>
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>创建</button></div></div>`,
     '[data-t="name"]');
   const readCols = () => $$('tr[data-col]', ov).map(tr => ({
     name: $('[data-c="name"]', tr).value.trim(),
     type: $('[data-c="type"]', tr).value,
+    dflt: $('[data-c="dflt"]', tr).value.trim(),
     pk: $('[data-c="pk"]', tr).checked,
     nn: $('[data-c="nn"]', tr).checked,
     ai: $('[data-c="ai"]', tr).checked,
@@ -569,6 +571,7 @@ function newTableDialog() {
       if (c.pk) s += ' PRIMARY KEY';
       if (c.nn) s += ' NOT NULL';
       if (c.ai) s += ' AUTOINCREMENT';
+      if (c.dflt) s += ` DEFAULT ${c.dflt}`;
       return s;
     }).join(',\n') + '\n);';
     ui.status(`正在创建表 ${name}…`, 'busy');
@@ -586,38 +589,45 @@ function newTableDialog() {
 }
 
 /* ---------- 编辑表(与新建表同一列编辑网格;ALTER 落地) ---------- */
-// 已有列:可改名(RENAME COLUMN)/删除(DROP COLUMN,主键列除外),类型与
-// 约束锁定——引擎不支持在线改约束/类型,如需重建请另建表迁移。新增列仅
-// 类型生效(ADD COLUMN 不支持 PK/UNIQUE/自增;NOT NULL 需 DEFAULT,不在本界面)。
+// 已有列:可改名(RENAME COLUMN)/删除(DROP COLUMN,主键列除外),类型、
+// 约束与默认值锁定——引擎不支持在线改约束/类型(ALTER COLUMN SET DEFAULT
+// 亦不支持),如需重建请另建表迁移。新增列支持类型 + DEFAULT + NOT NULL
+// (ADD COLUMN 以默认值回填存量行;NOT NULL 必须带 DEFAULT),不支持
+// PK/UNIQUE/自增。
 function editTableDialog(tableName, meta, after) {
   if (!meta || !meta.columns) { ui.toast('没有表元数据,先刷新对象资源管理器', true); return; }
   const colRow = (c, orig) => {
-    const ex = !!orig; // 已有列:锁定类型与约束,可改名/删除
-    const lock = ex ? ' disabled title="已有列的类型/约束不可在线修改(SQL 层不支持 ALTER 改约束;如需变更请重建表)"' : '';
+    const ex = !!orig; // 已有列:锁定类型/约束/默认值,可改名/删除
+    const lock = ex ? ' disabled title="已有列的类型/约束/默认值不可在线修改(引擎不支持 ALTER COLUMN SET DEFAULT;如需变更请重建表)"' : '';
+    // 新增列:PK/自增在 ADD COLUMN 上不可用;NOT NULL 配默认值可用。
+    const pkLock = ex ? lock : ' disabled title="ADD COLUMN 不支持主键"';
+    const aiLock = ex ? lock : ' disabled title="ADD COLUMN 不支持自增"';
+    const dfltPh = ex ? '' : ' placeholder="如 \'abc\'、7、true"';
     const delBtn = ex && c.pk
       ? '<button class="delcol" disabled title="主键列不能删除">✕</button>'
       : '<button class="delcol" data-delcol title="删除此列">✕</button>';
     return `<tr data-col${ex ? ` data-orig="${esc(orig)}"` : ''}>
     <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="列名"></td>
     <td><select data-c="type"${lock}>${COL_TYPES.map(t => `<option${t === (c.type || 'ANY') ? ' selected' : ''}>${t}</option>`).join('')}</select></td>
-    <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}${lock}></td>
+    <td><input type="text" data-c="dflt" value="${esc(c.dflt || '')}"${ex ? ' disabled' : ''}${dfltPh} title="DEFAULT:SQL 字面量,字符串需带单引号;已有列的默认值不可在线修改"></td>
+    <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}${pkLock}></td>
     <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}${lock}></td>
-    <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}${lock}></td>
+    <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}${aiLock}></td>
     <td>${delBtn}</td></tr>`;
   };
   const rowsHTML = meta.columns.map(c => colRow({
     name: c.name, type: c.data_type || 'ANY', pk: c.primary_key,
-    nn: !c.nullable, ai: c.autoinc,
+    nn: !c.nullable, ai: c.autoinc, dflt: c.default || '',
   }, c.name)).join('');
-  const ov = showModal(`<div class="dialog" style="min-width:580px;max-width:640px"><h3>编辑表 — ${esc(tableName)}</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>编辑表 — ${esc(tableName)}</h3><div class="body">
     <div class="row"><label>表名</label><input type="text" value="${esc(tableName)}" disabled title="重命名表请使用 ALTER TABLE ... RENAME TO"></div>
     <div>
-      <table class="colgrid"><thead><tr><th style="width:38%">列名</th><th style="width:24%">类型</th>
+      <table class="colgrid"><thead><tr><th style="width:30%">列名</th><th style="width:16%">类型</th><th style="width:26%">默认值</th>
         <th title="主键">PK</th><th title="非空">NOT NULL</th><th title="自增">AUTO</th><th></th></tr></thead>
       <tbody data-cols>${rowsHTML}</tbody></table>
       <div style="margin-top:6px"><button data-addcol>+ 添加列</button></div>
     </div>
-    <div class="hint">已有列可改名与删除(主键列除外),类型/约束不可在线修改;新增列仅类型生效(ADD COLUMN 不支持 PK/UNIQUE/自增,NOT NULL 需 DEFAULT)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。</div>
+    <div class="hint">已有列可改名与删除(主键列除外),类型/约束/默认值不可在线修改;新增列支持类型 + 默认值 + NOT NULL(带默认值时自动回填存量行,NOT NULL 必须带默认值;ADD COLUMN 不支持 PK/UNIQUE/自增)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。</div>
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`);
   $('[data-addcol]', ov).onclick = () => {
@@ -634,6 +644,8 @@ function editTableDialog(tableName, meta, after) {
     const cols = $$('tr[data-col]', ov).map(tr => ({
       name: $('[data-c="name"]', tr).value.trim(),
       type: $('[data-c="type"]', tr).value,
+      dflt: $('[data-c="dflt"]', tr).value.trim(),
+      nn: $('[data-c="nn"]', tr).checked,
       orig: tr.dataset.orig || null,
     }));
     if (cols.some(c => !c.name)) return err('存在空列名');
@@ -654,9 +666,12 @@ function editTableDialog(tableName, meta, after) {
       if (!cols.some(c => c.orig === o.name))
         stmts.push(`ALTER TABLE ${qt} DROP COLUMN "${qident(o.name)}"`);
     }
-    // 3) 新增(仅类型)
+    // 3) 新增(类型 + 默认值 + NOT NULL;NN 必须带 DEFAULT,引擎以默认值回填存量行)
     for (const c of cols) {
-      if (!c.orig) stmts.push(`ALTER TABLE ${qt} ADD COLUMN "${qident(c.name)}" ${c.type}`);
+      if (!c.orig) {
+        if (c.nn && !c.dflt) return err(`新增 NOT NULL 列 ${c.name} 必须填默认值`);
+        stmts.push(`ALTER TABLE ${qt} ADD COLUMN "${qident(c.name)}" ${c.type}${c.nn ? ' NOT NULL' : ''}${c.dflt ? ` DEFAULT ${c.dflt}` : ''}`);
+      }
     }
     if (!stmts.length) return err('没有变更');
     ui.status(`正在更新表 ${tableName}…`, 'busy');
@@ -1649,6 +1664,7 @@ const explorer = {
       if (c.unique) s += ' UNIQUE';
       if (!c.nullable) s += ' NOT NULL';
       if (c.autoinc) s += ' AUTOINCREMENT';
+      if (c.default) s += ` DEFAULT ${c.default}`;
       return s;
     }).join(',\n');
     let s = `-- 表 ${m.name}(${m.row_count} 行,${m.pages} 页)\nCREATE TABLE ${m.name} (\n${cols}\n);`;

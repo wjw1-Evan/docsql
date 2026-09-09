@@ -109,6 +109,9 @@ pub struct ColumnInfo {
     /// Declared type where the engine tracks one ("GUID" for auto-generated
     /// GUID columns, "ANY" otherwise). Tooling uses it to round-trip DDL.
     pub data_type: String,
+    /// Declared DEFAULT expression as SQL text (None when the column has
+    /// none). Tooling uses it to round-trip DDL.
+    pub default_value: Option<String>,
 }
 
 /// Read-only catalog snapshot of one table.
@@ -995,6 +998,11 @@ impl Database {
                             } else {
                                 "ANY".to_string()
                             },
+                            default_value: meta
+                                .defaults
+                                .iter()
+                                .find(|(dc, _)| dc == c)
+                                .map(|(_, t)| t.clone()),
                         })
                         .collect(),
                     keys: meta
@@ -2074,23 +2082,17 @@ impl Database {
                         meta.columns.push(col.clone());
                     }
                     // Column-level DEFAULT / CHECK ride along with ADD COLUMN.
+                    // NOT NULL is validated after the loop: the conventional
+                    // spelling `NOT NULL DEFAULT x` registers the default in
+                    // a later option, so the "NOT NULL needs a DEFAULT" rule
+                    // can only be judged once all options are in.
+                    let mut add_not_null = false;
                     for opt in &column_def.options {
                         use sqlparser::ast::ColumnOption as CO;
                         match &opt.option {
                             CO::Default(e) => meta.defaults.push((col.clone(), format!("{e}"))),
                             CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
-                            CO::NotNull => {
-                                // SQLite rule: a NOT NULL column needs a default
-                                // to backfill existing rows, else every later
-                                // UPDATE of a pre-existing row would fail.
-                                let has_default = meta.defaults.iter().any(|(c, _)| c == &col);
-                                if !has_default {
-                                    return err(format!(
-                                        "cannot add NOT NULL column {col} without a DEFAULT"
-                                    ));
-                                }
-                                meta.not_null.push(col.clone());
-                            }
+                            CO::NotNull => add_not_null = true,
                             // Same parity as CREATE TABLE: these options on
                             // ADD COLUMN would dangle (no tree, no backfill).
                             CO::PrimaryKey { .. }
@@ -2103,6 +2105,17 @@ impl Database {
                             }
                             _ => {}
                         }
+                    }
+                    // SQLite rule: a NOT NULL column needs a default to
+                    // backfill existing rows, else every later UPDATE of a
+                    // pre-existing row would fail.
+                    if add_not_null && !meta.defaults.iter().any(|(c, _)| c == &col) {
+                        return err(format!(
+                            "cannot add NOT NULL column {col} without a DEFAULT"
+                        ));
+                    }
+                    if add_not_null {
+                        meta.not_null.push(col.clone());
                     }
                     // ADD COLUMN with DEFAULT backfills existing rows.
                     if let Some((_, text)) = meta.defaults.iter().find(|(c, _)| c == &col).cloned()
@@ -8230,6 +8243,26 @@ mod tests {
         run(&mut db, "ALTER TABLE t ADD COLUMN flag INT DEFAULT 1");
         let r = rows(&mut db, "SELECT flag FROM t ORDER BY id");
         assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(1)]]);
+        // Conventional option order `NOT NULL DEFAULT ...`: the NOT NULL
+        // rule must be judged after all options are registered, not hit a
+        // false "without a DEFAULT" while walking the options in order.
+        run(
+            &mut db,
+            "ALTER TABLE t ADD COLUMN tag TEXT NOT NULL DEFAULT 'z'",
+        );
+        let r = rows(&mut db, "SELECT tag FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("z".into())], vec![Value::Str("z".into())]]
+        );
+        run(&mut db, "INSERT INTO t (id) VALUES (3)");
+        let r = rows(&mut db, "SELECT tag FROM t WHERE id = 3");
+        assert_eq!(r.rows, vec![vec![Value::Str("z".into())]]);
+        // ...while NOT NULL without a DEFAULT stays rejected.
+        let e = db
+            .execute("ALTER TABLE t ADD COLUMN bad INT NOT NULL")
+            .unwrap_err();
+        assert!(e.to_string().contains("without a DEFAULT"), "{e}");
     }
 
     #[test]

@@ -61,6 +61,16 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
                     ("unique".into(), Value::Bool(c.unique)),
                     ("autoinc".into(), Value::Bool(c.autoinc)),
                     ("data_type".into(), str(&c.data_type)),
+                    // Declared DEFAULT as SQL text; Null when the column has
+                    // none (the console's edit-table grid reads it to show
+                    // and round-trip defaults).
+                    (
+                        "default".into(),
+                        match &c.default_value {
+                            Some(d) => str(d),
+                            None => Value::Null,
+                        },
+                    ),
                 ]))
             })
             .collect();
@@ -150,7 +160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meta.db");
         let mut d = Database::open(&path).unwrap();
-        d.execute("CREATE TABLE m (id INT PRIMARY KEY, name TEXT)")
+        d.execute("CREATE TABLE m (id INT PRIMARY KEY, name TEXT DEFAULT 'anon')")
             .unwrap();
         d.execute("INSERT INTO m VALUES (1, 'a'), (2, 'b')")
             .unwrap();
@@ -181,10 +191,24 @@ mod tests {
             Value::Object(o) => (
                 o.get("name").cloned(),
                 o.get("primary_key").cloned().unwrap_or(Value::Bool(false)),
+                o.get("default").cloned().unwrap_or(Value::Bool(false)),
             ),
             _ => panic!("column not an object"),
         };
-        assert_eq!(id_col, (Some(str("id")), Value::Bool(true)));
+        assert_eq!(
+            id_col,
+            (Some(str("id")), Value::Bool(true), Value::Null),
+            "PK column carries no default"
+        );
+        let name_default = match &cols[1] {
+            Value::Object(o) => o.get("default").cloned().unwrap_or(Value::Bool(false)),
+            _ => panic!("column not an object"),
+        };
+        assert_eq!(
+            name_default,
+            str("'anon'"),
+            "declared DEFAULT round-trips as SQL text"
+        );
         let defs = match fields(&tables[0], "index_defs") {
             Value::Array(a) => a,
             _ => panic!("index_defs missing"),
