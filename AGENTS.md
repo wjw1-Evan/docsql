@@ -8,7 +8,7 @@ DocSQL:Rust 实现的原生文档数据库 + .NET 客户端栈。约 1.3 万行 
 
 - **文档式存储**:JSON 文档整体存储,无强制 schema
 - **完整 SQL**:DDL/DML/JOIN/聚合/事务/约束/系统视图
-- **Web 管理控制台**:DocSQL Studio(SSMS 风格)
+- **Web 管理控制台**:DocSQL Studio(SSMS 风格;纯管理工具,自身零存储,所有数据操作连接指定节点执行)
 - **.NET 生态**:ADO.NET 提供程序 + EF Core 提供程序
 - **集群**:对称集群复制(任意节点可写)、主从写转发、PROMOTE 故障转移
 - **发布订阅**:持久化 pub/sub(消息先落盘再推送,at-least-once,glob 模式订阅,跨节点扇出)
@@ -58,7 +58,7 @@ ZCode 的 Mimosa 插件在 `git commit`/`git push` 前做 L3 静态扫描,high �
 
 - **生产代码**(core/server/web/cli)不启动子进程,天然无此类 finding;今后任何生产代码里的进程执行都必须参数列表传递、禁止拼接 shell 字符串,且不得有用户可控输入流入。
 - **测试基建**启动 server 的代码集中在各测试文件的既有辅助方法(`FindServer`/`StartServer` 形态,`ProcessStartInfo` + `UseShellExecute=false` + `ArgumentList`),新测试复用,不在测试体内新增散落的 `Process.Start`;不要为绕过扫描改写 API 形状(反射/P-Invoke 等是掩盖不是修复)。
-- 改动上述 spawn 辅助方法的提交,在 `warn` 模式下会看到对应告警,属预期,忽略即可;若换新机器/重装插件后提交被拦,检查该环境变量是否生效(需从终端启动 ZCode)。
+- 改动上述 spawn 辅助方法的提交,在 `warn` 模式下会看到对应告警,属预期,忽略即可;若换新机器/重装插件后提交被拦,检查该环境变量是否生效。注意 `~/.zshrc` 的 export 只对终端直启 ZCode 生效,GUI(Dock/Finder/`open`)启动继承 launchd 环境——已用 `launchctl setenv MIMOSA_GIT_GATE_MODE warn` 注入,并由 `~/Library/LaunchAgents/com.user.mimosa-gate-mode.plist`(登录时自动 setenv)持久化;新机器需重建这两处。验证:`launchctl getenv MIMOSA_GIT_GATE_MODE`,然后重启 ZCode。
 
 CI(`.github/workflows/docker-image.yml`,push/PR 触发)执行同样三门禁 + dotnet 测试,通过后构建多架构镜像(amd64/arm64,`RUN_TESTS=false`)发布到 `ghcr.io/wjw1-evan/docsql`;main 分支另跑 compose 部署测试(多节点 69 项 + 单节点 24 项)。
 
@@ -98,8 +98,8 @@ target/                 # 构建产物(git 忽略)
 | `engine.rs` | SQL 执行器:AST → 计划 → 执行;约束、事务、SAVEPOINT、RETURNING、DISTINCT、外键检查、批量执行 |
 | `guid.rs` | 时序有序 GUID(UUIDv7)生成:48bit 毫秒时间戳 + 毫秒内 12bit 计数器(新毫秒随机重播种,节点内严格单调、时钟回退不回退)+ 62bit 随机位(std `RandomState` 做随机源,无 rand 依赖);GUID 主键自动生成用 |
 | `proto.rs` | 自定义二进制协议 v1 帧编解码(预留拓扑版本/重定向字段) |
-| `meta.rs` | `/api/meta` 对象浏览器元数据组装(server/storage/totals/tables):web 本地路径与 server 的 REQ_META 帧共用同一实现,远程节点 meta 与本地同构由此保证 |
-| `stmt.rs` | 语句拆分 `split_statements`:批量 SQL → 逐句文本(单句原文直通,多句按 AST 重渲染);wire 协议一句一帧,web 节点代理的发送侧用 |
+| `meta.rs` | 对象浏览器元数据组装(server/storage/totals/tables):server 的 REQ_META 帧用该实现组装(控制台对象树的后端数据源由此与 UI 渲染形状稳定) |
+| `stmt.rs` | 语句拆分 `split_statements`:批量 SQL → 逐句文本(单句原文直通,多句按 AST 重渲染);wire 协议一句一帧,控制台到节点的发送侧用 |
 | `lib.rs` | AST/解析器入口 |
 
 **docsql-server**:
@@ -114,8 +114,8 @@ target/                 # 构建产物(git 忽略)
 
 | 文件 | 职责 |
 |---|---|
-| `lib.rs` / `main.rs` | REST API(`/api/sql` `/api/parse` `/api/meta` `/api/stats` `/api/cluster` `/api/logs`)、`DOCSQL_TOKEN` 认证、`DOCSQL_PEERS` 节点探测(PING + REQ_STATUS,集群状态页数据源)、**节点切换代理**:数据端点(/api/sql /api/meta /api/stats)接受可选 `node` 参数,`resolve_node` 白名单仅放行 `DOCSQL_PEERS` 中的地址(SSRF 防护),后端经 wire 协议代理(REQ_AUTH——用服务端自身 token,非浏览器提交值;批量 SQL 由 `stmt::split_statements` 逐句发 REQ_SQL,单连接保序;meta/stats 走 REQ_META/REQ_STATUS),响应形状与本地路径逐字段一致;`/api/parse` 恒为本地静态检查;**`/api/logs`** 返回本机控制台审计环(`record_console_sql`,peer=console 或代理目标节点)+ 并发拉取各节点 REQ_LOGS(读缓冲上限 LOGS_RECV_CAP 4MB,limit 1..=1000 夹紧),不感知 `node`(日志页按来源聚合是它的本意) |
-| `console.html` | DocSQL Studio 单页 UI(通过 `include_str!` 内嵌进二进制,改完必须重新 `cargo build`);含集群状态页(5s 轮询 `/api/cluster`)、日志页(`openLogsTab`:数据/同步/仅错误类别 + 来源 + 关键词过滤,5s 激活时轮询,同步事件中文标签 SYNC_EVENTS)与工具栏节点切换器(`nodesel`:api 层统一携带 `node`,选择持久化 localStorage,节点从 peers 消失自动回落本机,远程不可达时资源管理器显示 in-band error) |
+| `lib.rs` / `main.rs` | REST API(`/api/sql` `/api/parse` `/api/meta` `/api/stats` `/api/cluster` `/api/logs`)、`DOCSQL_TOKEN` 认证。**纯管理工具、自身零存储**(不打开任何数据文件):启动参数/`DOCSQL_UPSTREAM`/首个 peer 指定**默认管理节点**,数据端点不带 `node` 时即连接它执行;`DOCSQL_PEERS` 节点探测(PING + REQ_STATUS,集群状态页数据源)兼作节点切换的允许列表,数据端点可带 `node` 参数切换管理目标(白名单仅放行 `DOCSQL_PEERS`,SSRF 防护;连接经 wire 协议 REQ_AUTH——用服务端自身 token,非浏览器提交值;批量 SQL 由 `stmt::split_statements` 逐句发 REQ_SQL,单连接保序;meta/stats 走 REQ_META/REQ_STATUS),未配置管理节点时数据端点 in-band 报配置缺失;**`/api/parse` 恒为本地静态检查**(纯解析,无存储);**`/api/logs`** 返回控制台自身提交语句的审计环(`record_console_sql`,peer=实际执行该语句的节点)+ 并发拉取各节点 REQ_LOGS(读缓冲上限 LOGS_RECV_CAP 4MB,limit 1..=1000 夹紧),不感知 `node`(日志页按来源聚合是它的本意) |
+| `console.html` | DocSQL Studio 单页 UI(通过 `include_str!` 内嵌进二进制,改完必须重新 `cargo build`);含集群状态页(5s 轮询 `/api/cluster`)、日志页(`openLogsTab`:数据/同步/仅错误类别 + 来源 + 关键词过滤,5s 激活时轮询,同步事件中文标签 SYNC_EVENTS)与工具栏节点切换器(`nodesel`:首项为「默认节点」即后端配置的管理目标,api 层统一携带 `node`,选择持久化 localStorage,节点从 peers 消失自动回落默认节点,节点不可达时资源管理器显示 in-band error) |
 
 **dotnet/**:
 
@@ -138,12 +138,12 @@ target/                 # 构建产物(git 忽略)
 ### 会话事务与复制缓冲
 
 - SQL 事务 `BEGIN/COMMIT/ROLLBACK` + `SAVEPOINT`(`SAVEPOINT/ROLLBACK TO/RELEASE`);引擎是单全局事务(单写者),并发连接的 BEGIN 在服务端排队(`BEGIN_QUEUE_WAIT` 30s 上限)
-- **全局事务有连接所有权**(`ServerState::tx_owner`):BEGIN 的连接成为 owner,其写语句缓冲在 `tx_pending`,提交时按执行顺序转发给上游/对等节点,回滚即丢弃;**非 owner 连接的写与复制写不并入打开的事务**——像 BEGIN 一样有界排队等待事务关闭(超时报错),否则 owner 的 ROLLBACK 会丢掉别人已确认的写造成静默分叉;COMMIT/ROLLBACK/SAVEPOINT 来自非 owner 直接报错;owner 连接断开时服务端自动 ROLLBACK 其未提交事务并清 `tx_pending`(web 代理的短连接因此不会在远程节点悬挂事务;cluster join 的 drain 路径持 write_order 直用,复用 `execute_sql` 的 `order_held` 参数防自锁)
+- **全局事务有连接所有权**(`ServerState::tx_owner`):BEGIN 的连接成为 owner,其写语句缓冲在 `tx_pending`,提交时按执行顺序转发给上游/对等节点,回滚即丢弃;**非 owner 连接的写与复制写不并入打开的事务**——像 BEGIN 一样有界排队等待事务关闭(超时报错),否则 owner 的 ROLLBACK 会丢掉别人已确认的写造成静默分叉;COMMIT/ROLLBACK/SAVEPOINT 来自非 owner 直接报错;owner 连接断开时服务端自动 ROLLBACK 其未提交事务并清 `tx_pending`(控制台的短连接因此不会在节点上悬挂事务;cluster join 的 drain 路径持 write_order 直用,复用 `execute_sql` 的 `order_held` 参数防自锁)
 - 写执行与扇出经 `write_order` 互斥串行化,保证对等节点按本节点执行顺序应用
 
 ### 网络与复制
 
-- 自定义二进制协议 v1(`core/proto.rs`),帧头预留拓扑版本/重定向字段;请求帧:REQ_SQL、REQ_AUTH(token 认证)、REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT(参数化语句)、REQ_PING、REQ_PROMOTE(故障转移提升)、REQ_STATUS(节点状态 JSON 报告,需认证;web 控制台集群页的探测数据源)、REQ_LOGS(日志报告,需认证;载荷可选 `{"limit":n}` 默认 200 上限 1000,返回查询日志+同步日志两环最新条目,web 日志页数据源)、REQ_META(对象浏览器元数据,需认证;web 节点切换的远程 meta 数据源,`core/meta.rs` 与 `/api/meta` 共用组装,远程与本地同构)、REQ_SUBSCRIBE/REQ_PSUBSCRIBE/REQ_UNSUBSCRIBE/REQ_PUNSUBSCRIBE、REQ_PUBLISH、REQ_PUBSUB(内省/trim)、REQ_SYNC/REQ_HOLD/REQ_RELEASE(新节点加入,见下),推送帧 RESP_PUSH(仅发给订阅过的连接)。**REQ_SQL 执行全文不截断**:查询日志自行截断显示;曾在执行路径截 512 字符,超过 512 字符的语句被无声截断(节点切换代理发长文档 INSERT 即触发),已修并有回归测试
+- 自定义二进制协议 v1(`core/proto.rs`),帧头预留拓扑版本/重定向字段;请求帧:REQ_SQL、REQ_AUTH(token 认证)、REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT(参数化语句)、REQ_PING、REQ_PROMOTE(故障转移提升)、REQ_STATUS(节点状态 JSON 报告,需认证;web 控制台集群页的探测数据源)、REQ_LOGS(日志报告,需认证;载荷可选 `{"limit":n}` 默认 200 上限 1000,返回查询日志+同步日志两环最新条目,web 日志页数据源)、REQ_META(对象浏览器元数据,需认证;控制台对象树的数据源,`core/meta.rs` 组装)、REQ_SUBSCRIBE/REQ_PSUBSCRIBE/REQ_UNSUBSCRIBE/REQ_PUNSUBSCRIBE、REQ_PUBLISH、REQ_PUBSUB(内省/trim)、REQ_SYNC/REQ_HOLD/REQ_RELEASE(新节点加入,见下),推送帧 RESP_PUSH(仅发给订阅过的连接)。**REQ_SQL 执行全文不截断**:查询日志自行截断显示;曾在执行路径截 512 字符,超过 512 字符的语句被无声截断(控制台发长文档 INSERT 即触发),已修并有回归测试
 - 复制两种形态:**对称集群**(`DOCSQL_PEERS` 互相扇出,任意节点可写)与**主从写转发**(`replicate_to` 指向主,副本只读);`PROMOTE` 提升副本为主
 - **新节点自动同步(cluster join)**:全新节点(无用户表)配置了 `DOCSQL_PEERS` 即在启动后自动 bootstrap——先经 REQ_STATUS 探测(带 FLAG_REPLICATION),从首个有数据的 peer 发 REQ_SYNC(可带 `DOCSQL_ADVERTISE` 通告自身地址);服务端持自身 `write_order` → 向每个 peer 发 REQ_HOLD(对端 5s 内排空在途写后冻结并注册 joiner,抢不到锁回 busy,60s 看门狗防泄漏)→ **任一 hold 失败整体中止**(部分冻结的网格会漏写,joiner 下轮重试)→ 全网静止时 `Database::dump_script()` 取快照(DDL 全部在前、INSERT 在后,FK 延迟到插入期检查所以建表顺序无关;跳过 `_pubsub_messages`)→ 注册 joiner → REQ_RELEASE 解冻 → 以 ≤4MB 的 RESP_SYNC 块流式回传。joiner 在单事务内整体重放(失败即回滚保持全新)。**加入期间的复制写入队即确认**(`sync_queue`):扇出在源节点写路径内执行,若让扇出在门上等待会占死源节点 write_order、与 REQ_SYNC 互锁(实测过的活锁);快照 → 队列按到达序 → 闭队后直用,构成收敛所需全序,入队写按构造晚于快照不会重复;bootstrap 的每个终态(Applied/LocalData/放弃/空集群)都必须 drain 队列。加入前若本地已有客户端写入则放弃 bootstrap 保留本地数据(注册仍生效,后续写靠扇出收敛)。空集群(所有 peer 都 0 表)不互相 sync,静态 peers 配置即覆盖;离线/分区期间其它节点的写依旧不会补发(无反熵追赶,仅 join 时全量)
 - 动态注册只存在于内存:原节点重启后会丢失 joiner 注册,要长期保留把 joiner 写进各节点 `DOCSQL_PEERS` 并重建(不丢数据、不会重复同步——非空节点不 bootstrap)
@@ -196,7 +196,8 @@ target/                 # 构建产物(git 忽略)
 - 认证失败锁定:同源 IP 60s 窗口内失败 ≥ `AUTH_LOCK_THRESHOLD`(常量 10)锁定 60s(`AUTH_LOCKOUT`),期间正确 token 也被拒("account locked");认证成功/失败/锁定均写 sync_log("auth" 事件,web 日志页可见)。ServerConfig 字段 `auth_lock_threshold` 供测试调小;0 关闭锁定。
 - 凭据强度:server 二进制启动时校验所有 token(长度 ≥ `MIN_TOKEN_LEN` 8、非单字符重复),不合规拒绝启动(exit 2)——e2e 直构 `ServerConfig` 不受影响;非回环绑定且无 `DOCSQL_KEY` 时启动告警。
 - `DOCSQL_CLUSTER_TOKEN`:节点间集群凭据。配置后:扇出用它认证、`FLAG_REPLICATION` 复制帧仅接受用它认证过的连接(peer 身份)、peer 连接不能跑普通客户端语句;集群所有节点必须同值,且应与 `DOCSQL_TOKEN` 不同(相同会启动告警)。不配置则复制沿用 `DOCSQL_TOKEN` 的历史行为。dev compose 集群固定为 `dev-cluster-secret`,生产经 `.env` 的 `DOCSQL_CLUSTER_TOKEN` 传入。
-- `DOCSQL_PEERS`:对称集群节点表。全新节点(无用户表)启动时自动从有数据的 peer 同步全量状态并注册自己(见"网络与复制"的 cluster join);指向自身的条目会在启动时被忽略(防双写)。PROMOTE(故障转移提升)走 REQ_PROMOTE 帧。docsql-web 也读取该变量(cluster profile 的 node-web 已配置),仅用于集群状态页的只读探测,web 自身的 SQL/数据操作仍走内嵌引擎。
+- `DOCSQL_PEERS`:对称集群节点表。全新节点(无用户表)启动时自动从有数据的 peer 同步全量状态并注册自己(见"网络与复制"的 cluster join);指向自身的条目会在启动时被忽略(防双写)。PROMOTE(故障转移提升)走 REQ_PROMOTE 帧。docsql-web 也读取该变量:集群状态页探测 + 节点切换允许列表(SSRF 白名单)。
+- `DOCSQL_UPSTREAM`:docsql-web 的默认管理节点(`host:port`)。优先级:启动参数 > `DOCSQL_UPSTREAM` > `DOCSQL_PEERS` 首条。控制台自身零存储,所有数据操作连接该节点执行;compose 两个 profile 已分别配置(node-web → node-a,node-web-single → node-single)。未配置时控制台仍可起服务(状态页/日志页可用),数据端点 in-band 报「未配置管理目标节点」。
 - `DOCSQL_ADVERTISE`:加入集群时通告给其它节点的自身地址(`host:port`,须从 peer 侧可达)。未设置时 join 仍同步数据但不注册(仅静态 peers 配置的部署需要)。注意动态注册不落盘:原节点重启后丢失,长期成员请同步更新各节点的 `DOCSQL_PEERS`。
 - `DOCSQL_ASYNC_COMMIT=1`:组提交模式——语句提交跳过 WAL fsync,后台 flusher 每 ~2ms 批量刷盘(数据文件回写与 checkpoint 也由 flusher 驱动);断电丢最后 ~2ms 已确认写。PUBLISH 不受影响(推送前强制 fsync,先落盘后推送契约不变)。默认关闭(每写 fsync,全持久)。
 - `DOCSQL_IMAGE_TAG`:compose 使用的镜像标签(默认 `latest`;本地测试用 `local`/`ci`)。

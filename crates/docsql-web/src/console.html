@@ -284,7 +284,7 @@
   <button id="btn-connect">连接</button>
   <div class="sep"></div>
   <span style="color:var(--txt2)">节点</span>
-  <select id="nodesel" style="display:none;max-width:190px" title="切换管理目标:本机内嵌引擎或 DOCSQL_PEERS 集群节点。远程节点经控制台后端代理执行(协议直连),认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
+  <select id="nodesel" style="display:none;max-width:190px" title="切换管理的节点:默认节点(控制台启动时指定的管理目标)或 DOCSQL_PEERS 集群节点。控制台不存数据,所有操作以数据库客户端身份连接所选节点执行,认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
   <div class="sep"></div>
   <button id="btn-newq" title="新建查询编辑器 (Ctrl+N)"><span class="tb-ico" data-ico="query"></span>新建查询</button>
   <button id="btn-exec" class="primary" title="执行 (F5)"><span class="tb-ico" data-ico="run"></span>执行</button>
@@ -362,7 +362,8 @@ $$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
 /* ================= API 层 ================= */
 const api = {
   token: localStorage.getItem('docsql.token') || '',
-  // 当前管理目标节点('' = 本机内嵌引擎;否则为 DOCSQL_PEERS 中的地址)。
+  // 当前管理的节点('' = 默认节点,即控制台启动时指定的管理目标;
+  // 否则为 DOCSQL_PEERS 中的地址)。
   node: localStorage.getItem('docsql.node') || '',
   headers() { const h = {'Content-Type': 'application/json'}; if (this.token) h['X-Docsql-Token'] = this.token; return h; },
   async get(path) {
@@ -409,14 +410,15 @@ const ui = {
 };
 
 /* ================= 节点切换 ================= */
-// 管理目标节点选择器:本机内嵌引擎 + DOCSQL_PEERS 中的集群节点。
-// 远程节点的 SQL/meta/stats 由控制台后端经二进制协议代理执行(带 node 参数),
-// 与在本机操作同构;选择会持久化,重启控制台后自动恢复。
+// 管理节点选择器:默认管理节点 + DOCSQL_PEERS 中的集群节点。控制台是
+// 管理工具、不存数据:'' 表示默认节点,显式选择则以 node 参数经控制台
+// 后端用二进制协议连接该节点执行;选择会持久化,重启控制台后自动恢复。
 const nodes = {
   known: [], // [{addr, reachable}] — 来自 /api/cluster 探测
+  default: '', // 控制台后端配置的默认管理节点(/api/cluster 的 default)
   sel() { return $('#nodesel'); },
   // 用 /api/cluster 的探测结果刷新下拉框(● 在线 ○ 离线);保存的节点
-  // 若已不在 DOCSQL_PEERS 中,自动回落到本机。
+  // 若已不在 DOCSQL_PEERS 中,自动回落到默认节点。
   sync(list) {
     if (!Array.isArray(list)) return;
     this.known = list.map(n => ({addr: n.addr, reachable: !!n.reachable}));
@@ -425,7 +427,8 @@ const nodes = {
     sel.style.display = '';
     // 集群页每 5s 轮询都会走到这里;内容没变就不重建 DOM,避免打断正在
     // 展开的下拉框。
-    const html = '<option value="">本机(内嵌引擎)</option>' +
+    const def = this.default ? `默认节点 (${esc(this.default)})` : '默认节点';
+    const html = `<option value="">${def}</option>` +
       this.known.map(n => `<option value="${esc(n.addr)}">${n.reachable ? '● ' : '○ '}${esc(n.addr)}</option>`).join('');
     if (sel.innerHTML !== html) sel.innerHTML = html;
     const cur = api.node;
@@ -436,21 +439,25 @@ const nodes = {
     if (api.node === addr) return;
     api.node = addr;
     localStorage.setItem('docsql.node', addr);
-    $('#st-server').textContent = addr ? `节点 ${addr}` : 'DocSQL';
+    $('#st-server').textContent = addr ? `节点 ${addr}` : (this.default ? `默认 ${this.default}` : 'DocSQL');
     explorer.refresh();
     // 已打开的仪表盘/数据页跟随切换到新目标节点。
     tabs.byKind('dash').forEach(t => t.load && t.load());
     tabs.byKind('data').forEach(t => t.load && t.load());
   },
   async boot() {
-    try { const r = await api.get('/api/cluster'); this.sync(r.nodes || []); }
+    try {
+      const r = await api.get('/api/cluster');
+      this.default = r.default || '';
+      this.sync(r.nodes || []);
+    }
     catch (e) { /* 首次探测失败(未授权/网络):选择器保持隐藏 */ }
   }
 };
 $('#nodesel').onchange = (e) => {
   const addr = e.target.value;
   nodes.apply(addr);
-  ui.toast(addr ? `已切换到节点 ${addr},对象资源管理器已刷新` : '已切换回本机内嵌引擎');
+  ui.toast(addr ? `已切换到节点 ${addr},对象资源管理器已刷新` : `已切换到默认节点${nodes.default ? ` ${nodes.default}` : ''}`);
 };
 
 /* ================= 右键菜单 ================= */
@@ -1165,10 +1172,10 @@ function openDashboard() {
     $('[data-do="newq"]', t.el).onclick = () => openQueryTab();
     $('[data-do="refresh"]', t.el).onclick = t.load;
     t.load = async () => {
-      // 统计对象随节点选择器切换:本机内嵌引擎或远程集群节点。
+      // 统计对象随节点选择器切换:默认管理节点或其它集群节点。
       $('.sub', t.el).textContent = api.node
-        ? `统计对象为远程节点 ${api.node}(控制台经协议代理;写在该节点上执行并按其集群配置扇出)`
-        : '统计对象为本控制台内嵌数据库(集群部署时与各节点数据无关;集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v1.0';
+        ? `统计对象为节点 ${api.node}(写在该节点上执行并按其集群配置扇出)`
+        : `统计对象为默认管理节点${nodes.default ? ` ${nodes.default}` : ''}(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v1.0`;
       try {
         const m = await api.get('/api/meta');
         if (m && m.error) {
@@ -1177,7 +1184,7 @@ function openDashboard() {
           return;
         }
         const s = m.storage, sv = m.server;
-        // 远程节点的 meta 载荷不受本机控制,所有字段过 esc 再进 innerHTML。
+        // 节点返回的 meta 载荷不受控制台控制,所有字段过 esc 再进 innerHTML。
         const cards = [
           [`${esc(m.totals.tables)}<small> 张</small>`, '用户表'],
           [`${esc(m.totals.rows)}<small> 行</small>`, '表数据总行数'],
@@ -1215,8 +1222,8 @@ function openClusterTab() {
       if (!nodes.length) {
         body.innerHTML = `<div class="card" style="max-width:600px">
           <div class="v" style="font-size:15px">单机模式</div>
-          <div class="k" style="line-height:1.7">未配置集群(DOCSQL_PEERS 为空),本控制台以内嵌单机引擎运行,
-          可在「视图 → 服务器仪表盘」查看本机状态。集群部署时为 web 服务设置
+          <div class="k" style="line-height:1.7">未配置集群(DOCSQL_PEERS 为空),控制台管理默认节点${nodes.default ? ` <b>${esc(nodes.default)}</b>` : '(未配置,请在启动参数或 DOCSQL_UPSTREAM 指定)'},
+          可在「视图 → 服务器仪表盘」查看其状态。集群部署时为 web 服务设置
           DOCSQL_PEERS(逗号分隔的节点地址,如 node-a:7600,node-b:7600),即可在此监控各节点。</div></div>`;
         return;
       }
@@ -1285,8 +1292,8 @@ function openClusterTab() {
 }
 
 /* ================= 日志(数据 / 同步)================== */
-// 全部日志:本机控制台的语句审计 + 各节点 REQ_LOGS 报告(语句审计 + 同步
-// 事件),按时间倒序合并展示;支持类别(全部/数据/同步/仅错误)、来源、
+// 全部日志:控制台自身提交语句的审计 + 各节点 REQ_LOGS 报告(语句审计 +
+// 同步事件),按时间倒序合并展示;支持类别(全部/数据/同步/仅错误)、来源、
 // 关键词过滤与 5 秒自动刷新(仅激活时轮询)。
 const SYNC_EVENTS = {
   forward: '写扇出', publish: '发布扇出', trim: 'TRIM 扇出',
@@ -1343,7 +1350,7 @@ function openLogsTab() {
       let html = `<div style="padding:5px 10px;color:var(--txt3)">共 ${t.rows.length} 条 · 数据 ${counts.data} · 同步 ${counts.sync} · 错误 ${counts.err}`
         + (t.offline.length ? ` · <span style="color:var(--err)">离线节点 ${t.offline.length} 个(${t.offline.map(n => esc(n.addr)).join(', ')})</span>` : '') + '</div>';
       if (!rows.length) {
-        html += '<div class="msg-list" style="color:var(--txt3)">没有匹配的日志条目。单机部署时只有本机控制台的语句审计;集群部署会汇总各节点的语句与同步日志。</div>';
+        html += '<div class="msg-list" style="color:var(--txt3)">没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。</div>';
       } else {
         html += `<table class="grid"><thead><tr><th style="width:104px">时间</th><th>来源</th><th>类别</th><th>内容</th><th>结果</th></tr></thead><tbody>`;
         for (const r of rows) {
@@ -1380,9 +1387,9 @@ function openLogsTab() {
           ok: !e.error, ms: e.ms, affected: e.affected, error: e.error || null,
           replicated: !!e.replicated,
         }));
-        pushQuery(data.local && data.local.query, '本机控制台', 'local');
+        pushQuery(data.local && data.local.query, '控制台', 'local');
         const srcSel = $('[data-do="src"]', t.el);
-        const opts = ['<option value="all">全部来源</option>', '<option value="local"' + (t.src === 'local' ? ' selected' : '') + '>本机控制台</option>'];
+        const opts = ['<option value="all">全部来源</option>', '<option value="local"' + (t.src === 'local' ? ' selected' : '') + '>控制台</option>'];
         for (const n of data.nodes || []) {
           if (!n.reachable || !n.logs) continue;
           const hit = (n.logs.query || []).length + (n.logs.sync || []).length;

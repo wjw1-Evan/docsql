@@ -1,27 +1,32 @@
-//! DocSQL Studio — web console backend (SSMS-style management UI).
+//! DocSQL Studio — web console backend (SSMS-style management tool).
 //!
-//! REST API over the shared engine:
+//! The console keeps no data of its own: it is a management client for
+//! DocSQL nodes, and every data operation runs on a real node over the
+//! wire protocol:
+//!
 //! - `GET  /`                embedded single-page console
 //! - `POST /api/sql`         {sql, node?} batch → results / affected / error
 //!   (single-statement responses keep the legacy shape)
-//! - `POST /api/parse`       {sql} parse-check without executing
+//! - `POST /api/parse`       {sql} parse-check without executing (pure
+//!   syntax check, stays local — no storage involved)
 //! - `GET  /api/meta`        object-explorer metadata (tables/columns/keys/
 //!   indexes/row counts + storage stats; `observed` per table lists the
 //!   data-derived field union next to the declared columns)
 //! - `GET  /api/stats`       server + storage + data counters
 //! - `GET  /api/cluster`     probe every DOCSQL_PEERS node over the wire
-//!   protocol (PING liveness + REQ_STATUS report) for the cluster page
+//!   protocol (PING liveness + REQ_STATUS report) for the cluster page,
+//!   plus `default` — the console's default managed node
 //! - `GET  /api/logs`        logs page data: the console's own statement
 //!   audit ring + every DOCSQL_PEERS node's REQ_LOGS report (statement
 //!   audit + replication/sync events)
 //!
-//! Node switching: every data endpoint above accepts an optional `node`
-//! (`?node=` query / JSON field) naming one of the configured DOCSQL_PEERS
-//! addresses. The backend then proxies the call to that node over the wire
-//! protocol (REQ_AUTH + REQ_SQL / REQ_META / REQ_STATUS) instead of the
-//! embedded engine — the console UI switches its whole surface between
-//! 本机 and cluster nodes. Proxy targets are restricted to DOCSQL_PEERS
-//! (SSRF guard); the node connection authenticates with the server's own
+//! Managed nodes: data endpoints accept an optional `node` (`?node=` query
+//! / JSON field) naming one of the configured DOCSQL_PEERS addresses;
+//! without it the call lands on the default managed node (startup argument
+//! / DOCSQL_UPSTREAM, else the first peer). The console connects to nodes
+//! as a database client — it stores nothing itself, so all data lives in
+//! the cluster. Targets are restricted to operator configuration (SSRF
+//! guard); node connections authenticate with the server's own
 //! DOCSQL_TOKEN, never with a browser-supplied value.
 //!
 //! Auth v1: requests must send `X-Docsql-Token` when the server token is set.
@@ -31,50 +36,43 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use docsql_core::engine::{Database, ExecOutcome};
+use docsql_core::engine::Database;
 use docsql_core::proto::{self, Frame};
-use docsql_core::value::Value;
 use docsql_server::querylog::{self, LogEntry};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub const CONSOLE_VERSION: &str = "1.0";
-
 pub struct WebState {
-    pub db: Mutex<Database>,
+    /// Default managed node: where data calls without an explicit `node`
+    /// land. A client connection target, not local storage — the console
+    /// holds no database of its own.
+    pub upstream: Option<String>,
     pub token: Option<String>,
-    pub db_path: PathBuf,
-    pub started: Instant,
-    /// Cluster nodes to monitor (DOCSQL_PEERS). The console never writes to
-    /// them — probes only.
+    /// Cluster nodes to monitor and switch between (DOCSQL_PEERS).
     pub peers: Vec<String>,
-    /// Console-side statement audit (the logs page's 本机控制台 source).
+    /// Console-side statement audit (the logs page's 控制台 source).
     /// Same ring type as the server's docsql_log so one payload builder
     /// serves both.
     pub query_log: querylog::QueryLog,
-    /// Always empty here — the embedded engine never replicates — but the
-    /// shared logs payload expects the pair.
+    /// Always empty here — the console never replicates — but the shared
+    /// logs payload expects the pair.
     pub sync_log: querylog::SyncLog,
 }
 
 pub struct WebConfig {
-    pub db_path: PathBuf,
+    /// Default managed node (see `WebState::upstream`).
+    pub upstream: Option<String>,
     pub token: Option<String>,
     /// Cluster nodes to monitor for the cluster status page.
     pub peers: Vec<String>,
 }
 
 pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
-    let db =
-        Database::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?;
     let state = Arc::new(WebState {
-        db: Mutex::new(db),
+        upstream: cfg.upstream,
         token: cfg.token,
-        db_path: cfg.db_path,
-        started: Instant::now(),
         peers: cfg.peers,
         query_log: querylog::QueryLog::new(),
         sync_log: querylog::SyncLog::new(1),
@@ -132,7 +130,7 @@ async fn index() -> Html<&'static str> {
 #[derive(serde::Deserialize)]
 struct SqlBody {
     sql: String,
-    /// Proxy target (node switching): must be one of DOCSQL_PEERS.
+    /// Managed-node override (node switching): must be one of DOCSQL_PEERS.
     node: Option<String>,
 }
 
@@ -142,53 +140,6 @@ struct NodeParams {
     node: Option<String>,
 }
 
-/// Run a batch and shape the JSON response. Single-statement batches keep the
-/// legacy one-result shape; multi-statement batches return `kind:"batch"`.
-pub fn run_sql(db: &mut Database, sql: &str) -> serde_json::Value {
-    let batch = db.execute_batch(sql);
-    // Single-statement batches (including failures) keep the legacy shape.
-    if batch.statements <= 1 {
-        if let Some(e) = &batch.error {
-            return serde_json::json!({"kind": "error", "message": e.message});
-        }
-        if let Some(o) = batch.outcomes.first() {
-            return outcome_json(o);
-        }
-    }
-    serde_json::json!({
-        "kind": "batch",
-        "results": batch.outcomes.iter().map(outcome_json).collect::<Vec<_>>(),
-        "error": batch.error.as_ref().map(|e| serde_json::json!({
-            "statement": e.statement,
-            "message": e.message,
-        })),
-    })
-}
-
-fn outcome_json(o: &ExecOutcome) -> serde_json::Value {
-    match o {
-        ExecOutcome::Rows(r) => serde_json::json!({
-            "kind": "rows",
-            "columns": r.columns,
-            "rows": r.rows.iter().map(|row| row.iter().map(value_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
-        }),
-        ExecOutcome::Affected(n) => {
-            serde_json::json!({"kind": "affected", "count": n})
-        }
-    }
-}
-
-pub fn value_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => serde_json::json!(i),
-        Value::Float(f) => serde_json::json!(f),
-        Value::Str(s) => serde_json::json!(s),
-        other => serde_json::json!(other.to_string()),
-    }
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -196,10 +147,10 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// One console SQL call → one audit entry. `peer` is "console" for the
-/// embedded engine or the target node's address when the call was proxied
-/// (node switching). Affected/error are read back from the response shape
-/// the client already sees.
+/// One console SQL call → one audit entry. `peer` is the node the statement
+/// actually ran on (default managed node or the explicit `node` target).
+/// Affected/error are read back from the response shape the client already
+/// sees.
 fn record_console_sql(
     log: &querylog::QueryLog,
     peer: &str,
@@ -247,33 +198,15 @@ async fn api_sql(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let node = match resolve_node(&state, &body.node) {
-        Ok(n) => n,
+    let target = match target_for(&state, &body.node) {
+        Ok(t) => t,
         Err(e) => return Ok(Json(e)),
     };
     let started = Instant::now();
-    let out = match &node {
-        // Node switching: proxy the batch to the target node. The audit
-        // ring records which node the statement actually ran on.
-        Some(addr) => remote_sql(addr, state.token.as_deref(), &body.sql).await,
-        None => {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-            let out = run_sql(&mut db, &body.sql);
-            // The console has no session across requests: a batch ending
-            // with the engine transaction still open (a lone BEGIN) would
-            // buffer every later write into a transaction nobody can ever
-            // commit. Roll it back so the engine returns to autocommit.
-            // (Remote nodes get the same guarantee from the server's
-            // disconnect cleanup on the proxy's short-lived connections.)
-            if db.in_transaction() {
-                let _ = db.execute("ROLLBACK");
-            }
-            out
-        }
-    };
+    let out = remote_sql(&target, state.token.as_deref(), &body.sql).await;
     record_console_sql(
         &state.query_log,
-        node.as_deref().unwrap_or("console"),
+        &target,
         &body.sql,
         started.elapsed().as_secs_f64() * 1000.0,
         &out,
@@ -295,45 +228,6 @@ async fn api_parse(
     }
 }
 
-/// Assemble the object-explorer payload (server / storage / tables). The
-/// walk lives in `core::meta` and is shared with the server's REQ_META
-/// frame, so local and remote object explorers are shape-identical by
-/// construction.
-pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant) -> serde_json::Value {
-    core_to_serde(&docsql_core::meta::build_meta(
-        db,
-        db_path,
-        started,
-        CONSOLE_VERSION,
-    ))
-}
-
-/// Convert a core `Value` tree to serde JSON (objects/arrays recursively;
-/// leaves through `value_json`).
-fn core_to_serde(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Object(o) => {
-            let mut m = serde_json::Map::new();
-            for (k, val) in o {
-                m.insert(k.clone(), core_to_serde(val));
-            }
-            serde_json::Value::Object(m)
-        }
-        Value::Array(a) => serde_json::Value::Array(a.iter().map(core_to_serde).collect()),
-        other => value_json(other),
-    }
-}
-
-fn file_bytes(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
-
-fn wal_path(db: &Path) -> PathBuf {
-    let mut s = db.as_os_str().to_os_string();
-    s.push(".wal");
-    PathBuf::from(s)
-}
-
 async fn api_meta(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -342,12 +236,8 @@ async fn api_meta(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    match resolve_node(&state, &params.node) {
-        Ok(Some(addr)) => Ok(Json(remote_meta(&addr, state.token.as_deref()).await)),
-        Ok(None) => {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-            Ok(Json(build_meta(&mut db, &state.db_path, state.started)))
-        }
+    match target_for(&state, &params.node) {
+        Ok(addr) => Ok(Json(remote_meta(&addr, state.token.as_deref()).await)),
         Err(e) => Ok(Json(e)),
     }
 }
@@ -360,26 +250,8 @@ async fn api_stats(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    match resolve_node(&state, &params.node) {
-        Ok(Some(addr)) => Ok(Json(remote_stats(&addr, state.token.as_deref()).await)),
-        Ok(None) => {
-            let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-            let user_tables = db
-                .catalog()
-                .iter()
-                .filter(|t| t.name != docsql_core::engine::PUBSUB_TABLE)
-                .count();
-            let num_pages = db.num_pages();
-            let page_size = db.page_size();
-            Ok(Json(serde_json::json!({
-                "tables": user_tables,
-                "pages": num_pages,
-                "page_size": page_size,
-                "db_bytes": file_bytes(&state.db_path),
-                "wal_bytes": file_bytes(&wal_path(&state.db_path)),
-                "uptime_ms": state.started.elapsed().as_millis() as u64,
-            })))
-        }
+    match target_for(&state, &params.node) {
+        Ok(addr) => Ok(Json(remote_stats(&addr, state.token.as_deref()).await)),
         Err(e) => Ok(Json(e)),
     }
 }
@@ -514,8 +386,7 @@ async fn api_cluster(
         return Err(code);
     }
     let token = state.token.clone();
-    // Probes run concurrently; collecting the handles in configured order
-    // keeps the node list stable between refreshes.
+    // Probes run concurrently, collected in configured order.
     let handles: Vec<_> = state
         .peers
         .iter()
@@ -538,7 +409,10 @@ async fn api_cluster(
         });
         nodes.push(node);
     }
-    Ok(Json(serde_json::json!({ "nodes": nodes })))
+    Ok(Json(serde_json::json!({
+        "nodes": nodes,
+        "default": state.upstream,
+    })))
 }
 
 /// Fetch one node's logs report (REQ_LOGS, read-only like the status
@@ -659,9 +533,9 @@ async fn api_logs(
     Ok(Json(serde_json::json!({ "local": local, "nodes": nodes })))
 }
 
-/* ================= Node switching (remote-node proxy) ================= */
+/* ================= Node switching (managed-node selection) ================= */
 
-/// Validate a requested proxy target: only addresses configured in
+/// Validate a requested managed node: only addresses configured in
 /// DOCSQL_PEERS are dialable from the console backend. This is both an
 /// authorization check and an SSRF guard — the browser never picks
 /// arbitrary hosts for the backend to connect to.
@@ -678,11 +552,26 @@ fn resolve_node(
     }
 }
 
-/// Remote-node proxy budget: SQL can be heavier than a status probe
-/// (scans, big result sets), so the budget is wider than the probe's.
+/// Resolve the effective target for a data call: an explicit `node` (one of
+/// DOCSQL_PEERS) wins, otherwise the default managed node. Without either,
+/// the console has nowhere to send the call — a configuration gap reported
+/// in-band.
+fn target_for(state: &WebState, node: &Option<String>) -> Result<String, serde_json::Value> {
+    match resolve_node(state, node)? {
+        Some(addr) => Ok(addr),
+        None => state.upstream.clone().ok_or_else(|| {
+            serde_json::json!({
+                "error": "未配置管理目标节点:启动参数或 DOCSQL_UPSTREAM 指定要管理的节点地址后才能执行数据操作",
+            })
+        }),
+    }
+}
+
+/// Remote-node budget: SQL can be heavier than a status probe (scans, big
+/// result sets), so the budget is wider than the probe's.
 const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const NODE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Mirrors the server's inbound frame cap (64 MiB) so large SELECTs
+/// Mirrors the server's inbound frame cap (64 MiB) so large result sets
 /// round-trip untruncated.
 const NODE_RECV_CAP: usize = 64 * 1024 * 1024;
 
@@ -711,7 +600,7 @@ async fn node_read_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
     Ok(f)
 }
 
-/// Connect to a cluster node and authenticate with the server's own
+/// Connect to a managed node and authenticate with the server's own
 /// DOCSQL_TOKEN (never a browser-supplied value). A missing token on an
 /// unauthenticated node is fine; a mismatch surfaces as an error.
 async fn node_connect(addr: &str, token: Option<&str>) -> Result<TcpStream, String> {
@@ -739,12 +628,12 @@ async fn node_connect(addr: &str, token: Option<&str>) -> Result<TcpStream, Stri
     Ok(stream)
 }
 
-/// Execute a batch on a remote node over the wire protocol and shape the
-/// response exactly like `run_sql`: single statements keep the legacy
-/// shape, batches report per-statement results plus the first-error index.
-/// All statements run in order on one connection, so BEGIN/COMMIT spans
-/// the batch and the remote session's transaction semantics match the
-/// embedded path.
+/// Execute a batch on a managed node over the wire protocol and shape the
+/// response: single statements keep the legacy shape, batches report
+/// per-statement results plus the first-error index. All statements run in
+/// order on one connection, so BEGIN/COMMIT spans the batch; separate calls
+/// get separate connections (the server rolls an abandoned transaction back
+/// when its connection closes).
 /// One remote multi-statement batch: per-statement outcomes plus the first
 /// statement error, if any — transport failures abort the whole call as a
 /// single error object instead.
@@ -754,7 +643,7 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
     let stmts = match docsql_core::stmt::split_statements(sql) {
         Ok(s) => s,
         // Same parser + dialect as the engine, so the message matches what
-        // the embedded path would have produced — no need to hit the wire.
+        // execution would have produced — no need to hit the wire.
         Err(m) => return serde_json::json!({"kind": "error", "message": m}),
     };
     // (per-statement outcomes, first statement error) — transport failures
@@ -822,11 +711,9 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
     }
 }
 
-/// Fetch a remote node's object-explorer metadata (REQ_META). The server
+/// Fetch a managed node's object-explorer metadata (REQ_META). The server
 /// assembles it with the same `core::meta::build_meta` walk the console
-/// uses locally, so the payload is shape-identical to `/api/meta` — the
-/// UI needs no special-casing for remote nodes. Failures come back as
-/// `{"error": ...}` for the frontend to surface.
+/// UI renders, so the payload is shape-stable for the frontend surface.
 pub async fn remote_meta(addr: &str, token: Option<&str>) -> serde_json::Value {
     let run: Result<serde_json::Value, String> = async {
         let mut stream = node_connect(addr, token).await?;
@@ -849,7 +736,7 @@ pub async fn remote_meta(addr: &str, token: Option<&str>) -> serde_json::Value {
     }
 }
 
-/// Fetch a remote node's counters (REQ_STATUS) and map them onto the local
+/// Fetch a managed node's counters (REQ_STATUS) and map them onto the
 /// `/api/stats` shape, so the dashboard card builder works unchanged.
 pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value {
     let run: Result<serde_json::Value, String> = async {
@@ -886,10 +773,6 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
 
-    fn db() -> Database {
-        Database::in_memory().unwrap()
-    }
-
     #[tokio::test]
     async fn console_page_served() {
         let html = include_str!("console.html");
@@ -910,100 +793,69 @@ mod tests {
         assert!(html.contains("openLogsTab"));
         assert!(html.contains("数据日志"));
         assert!(html.contains("同步日志"));
+        // No embedded engine: the selector's fallback is the default managed
+        // node, never a local database.
+        assert!(!html.contains("内嵌引擎"));
     }
 
     #[test]
-    fn value_json_mapping() {
-        assert_eq!(value_json(&Value::Int(3)), serde_json::json!(3));
-        assert_eq!(value_json(&Value::Str("x".into())), serde_json::json!("x"));
-        assert_eq!(value_json(&Value::Null), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn run_sql_single_statement_keeps_legacy_shape() {
-        let mut d = db();
-        let r = run_sql(&mut d, "CREATE TABLE t (id INT PRIMARY KEY)");
-        assert_eq!(r, serde_json::json!({"kind": "affected", "count": 0}));
-        let r = run_sql(&mut d, "INSERT INTO t VALUES (1)");
-        assert_eq!(r, serde_json::json!({"kind": "affected", "count": 1}));
-        let r = run_sql(&mut d, "SELECT id FROM t");
-        assert_eq!(r["kind"], "rows");
-        assert_eq!(r["rows"][0][0], 1);
-        let r = run_sql(&mut d, "SELECT * FROM missing");
-        assert_eq!(r["kind"], "error");
-        assert!(r["message"].as_str().unwrap().contains("missing"));
-    }
-
-    #[test]
-    fn run_sql_batch_reports_each_statement() {
-        let mut d = db();
-        let r = run_sql(
-            &mut d,
-            "CREATE TABLE b (id INT); INSERT INTO b VALUES (1), (2); SELECT id FROM b ORDER BY id",
-        );
-        assert_eq!(r["kind"], "batch");
-        let results = r["results"].as_array().unwrap();
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[2]["rows"].as_array().unwrap().len(), 2);
-        assert!(r["error"].is_null());
-
-        // Error mid-batch: partial results + statement index.
-        let r = run_sql(&mut d, "INSERT INTO b VALUES (3); SELECT * FROM nope");
-        assert_eq!(r["kind"], "batch");
-        assert_eq!(r["error"]["statement"], 1);
-        assert_eq!(r["results"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn build_meta_reports_tables() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("meta.db");
-        let mut d = Database::open(&path).unwrap();
-        d.execute("CREATE TABLE m (id INT PRIMARY KEY, name TEXT)")
-            .unwrap();
-        d.execute("INSERT INTO m VALUES (1, 'a'), (2, 'b')")
-            .unwrap();
-        let meta = build_meta(&mut d, &path, Instant::now());
-        assert_eq!(meta["totals"]["tables"], 1);
-        assert_eq!(meta["tables"][0]["row_count"], 2);
-        assert_eq!(meta["tables"][0]["columns"].as_array().unwrap().len(), 2);
-        assert_eq!(meta["tables"][0]["keys"][0], "id");
-        assert_eq!(meta["storage"]["page_size"], 4096);
-        assert!(meta["storage"]["num_pages"].as_u64().unwrap() >= 2);
-
-        // Index definitions ride along for the console's index management.
-        d.execute("CREATE INDEX mi ON m (name)").unwrap();
-        d.execute("CREATE UNIQUE INDEX mu ON m (id)").unwrap();
-        let meta = build_meta(&mut d, &path, Instant::now());
-        let defs = meta["tables"][0]["index_defs"].as_array().unwrap();
-        // PK constraint index first (derived, read-only), then user indexes.
-        assert_eq!(defs.len(), 3);
-        assert_eq!(defs[0]["name"], "sqlite_autoindex_m_1");
-        assert_eq!(defs[0]["column"], "id");
-        assert_eq!(defs[0]["unique"], true);
-        assert_eq!(defs[0]["auto"], true);
-        assert_eq!(defs[1]["name"], "mi");
-        assert_eq!(defs[1]["column"], "name");
-        assert_eq!(defs[1]["unique"], false);
-        assert_eq!(defs[1]["auto"], false);
-        assert_eq!(defs[2]["name"], "mu");
-        assert_eq!(defs[2]["column"], "id");
-        assert_eq!(defs[2]["unique"], true);
-        assert_eq!(defs[2]["auto"], false);
-        let meta = build_meta(&mut d, &path, Instant::now());
+    fn resolve_node_only_allows_configured_peers() {
+        let state = WebState {
+            upstream: Some("node-a:7600".into()),
+            token: None,
+            peers: vec!["node-a:7600".into()],
+            query_log: querylog::QueryLog::new(),
+            sync_log: querylog::SyncLog::new(1),
+        };
+        assert_eq!(resolve_node(&state, &None).unwrap(), None);
+        assert_eq!(resolve_node(&state, &Some(String::new())).unwrap(), None);
         assert_eq!(
-            meta["tables"][0]["indexes"],
-            serde_json::json!(["sqlite_autoindex_m_1", "mi", "mu"])
+            resolve_node(&state, &Some("node-a:7600".into())).unwrap(),
+            Some("node-a:7600".into())
         );
+        // Trimmed input still matches.
+        assert_eq!(
+            resolve_node(&state, &Some(" node-a:7600 ".into())).unwrap(),
+            Some("node-a:7600".into())
+        );
+        // Anything outside DOCSQL_PEERS is refused (SSRF guard).
+        assert!(resolve_node(&state, &Some("127.0.0.1:1".into())).is_err());
+        assert!(resolve_node(&state, &Some("evil.example:7600".into())).is_err());
+    }
+
+    /// Data calls land on the explicit node when given, else on the default
+    /// managed node; with neither configured there is nothing to manage.
+    #[test]
+    fn target_for_prefers_explicit_node_then_upstream() {
+        let state = WebState {
+            upstream: Some("node-a:7600".into()),
+            token: None,
+            peers: vec!["node-a:7600".into(), "node-b:7600".into()],
+            query_log: querylog::QueryLog::new(),
+            sync_log: querylog::SyncLog::new(1),
+        };
+        assert_eq!(target_for(&state, &None).unwrap(), "node-a:7600");
+        assert_eq!(
+            target_for(&state, &Some("node-b:7600".into())).unwrap(),
+            "node-b:7600"
+        );
+        // Explicit targets stay validated even when an upstream exists.
+        assert!(target_for(&state, &Some("evil.example:7600".into())).is_err());
+
+        let unconfigured = WebState {
+            upstream: None,
+            peers: Vec::new(),
+            ..state
+        };
+        let e = target_for(&unconfigured, &None).unwrap_err();
+        assert!(e["error"].as_str().unwrap().contains("未配置管理目标节点"));
     }
 
     #[tokio::test]
-    async fn cluster_endpoint_with_no_peers_reports_standalone() {
+    async fn cluster_endpoint_reports_default_node() {
         let state = Arc::new(WebState {
-            db: Mutex::new(db()),
+            upstream: Some("node-a:7600".into()),
             token: None,
-            db_path: PathBuf::from("/nonexistent/unused.db"),
-            started: Instant::now(),
             peers: Vec::new(),
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
@@ -1023,59 +875,7 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["nodes"], serde_json::json!([]));
-    }
-
-    /// /api/sql calls land in the console's own audit ring; /api/logs
-    /// serves them as the local section (sync always empty — the embedded
-    /// engine never replicates).
-    #[tokio::test]
-    async fn logs_endpoint_reports_console_audit_ring() {
-        let state = Arc::new(WebState {
-            db: Mutex::new(db()),
-            token: None,
-            db_path: PathBuf::from("/nonexistent/unused.db"),
-            started: Instant::now(),
-            peers: Vec::new(),
-            query_log: querylog::QueryLog::new(),
-            sync_log: querylog::SyncLog::new(1),
-        });
-        let post = |uri: &str, body: &str| {
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap()
-        };
-        let res = build_router(state.clone())
-            .oneshot(post("/api/sql", r#"{"sql": "CREATE TABLE l (id INT)"}"#))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let res = build_router(state)
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/logs")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["nodes"], serde_json::json!([]));
-        let query = v["local"]["query"].as_array().unwrap();
-        assert!(
-            query
-                .iter()
-                .any(|e| e["sql"].as_str() == Some("CREATE TABLE l (id INT)")),
-            "local audit missing the console statement: {v}"
-        );
-        assert_eq!(query[0]["peer"], "console");
-        assert!(v["local"]["sync"].as_array().unwrap().is_empty());
+        assert_eq!(v["default"], "node-a:7600");
     }
 
     #[tokio::test]
@@ -1091,8 +891,9 @@ mod tests {
     async fn probe_live_server_fetches_status_report() {
         let dir = tempfile::tempdir().unwrap();
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+        let port = l.local_addr().unwrap().port();
         drop(l);
+        let addr = format!("127.0.0.1:{port}");
         tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
             db_path: dir.path().join("probe.db"),
             listen: addr.clone(),
@@ -1128,10 +929,10 @@ mod tests {
     async fn spawn_node(dir: &tempfile::TempDir, token: Option<&str>) -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        let addr = format!("127.0.0.1:{port}");
         drop(l);
+        let addr = format!("127.0.0.1:{port}");
         let cfg = docsql_server::ServerConfig {
-            db_path: dir.path().join(format!("node-{port}.db")),
+            db_path: dir.path().join("node.db"),
             listen: addr.clone(),
             auth_token: token.map(String::from),
             read_token: None,
@@ -1156,35 +957,8 @@ mod tests {
         addr
     }
 
-    #[test]
-    fn resolve_node_only_allows_configured_peers() {
-        let state = WebState {
-            db: Mutex::new(db()),
-            token: None,
-            db_path: PathBuf::from("/nonexistent/unused.db"),
-            started: Instant::now(),
-            peers: vec!["node-a:7600".into()],
-            query_log: querylog::QueryLog::new(),
-            sync_log: querylog::SyncLog::new(1),
-        };
-        assert_eq!(resolve_node(&state, &None).unwrap(), None);
-        assert_eq!(resolve_node(&state, &Some(String::new())).unwrap(), None);
-        assert_eq!(
-            resolve_node(&state, &Some("node-a:7600".into())).unwrap(),
-            Some("node-a:7600".into())
-        );
-        // Trimmed input still matches.
-        assert_eq!(
-            resolve_node(&state, &Some(" node-a:7600 ".into())).unwrap(),
-            Some("node-a:7600".into())
-        );
-        // Anything outside DOCSQL_PEERS is refused (SSRF guard).
-        assert!(resolve_node(&state, &Some("127.0.0.1:1".into())).is_err());
-        assert!(resolve_node(&state, &Some("evil.example:7600".into())).is_err());
-    }
-
-    /// The remote proxy reproduces `run_sql`'s response shapes statement for
-    /// statement, including >512-char SQL (the REQ_SQL text cap regression).
+    /// The remote proxy reproduces one response shape per statement count,
+    /// including >512-char SQL (the REQ_SQL text cap regression).
     #[tokio::test]
     async fn remote_sql_proxies_batch_shapes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1257,8 +1031,8 @@ mod tests {
         assert!(r["message"].as_str().unwrap().contains("不可达"), "{r}");
     }
 
-    /// Remote meta/stats mirror the local /api/meta + /api/stats shapes
-    /// (dashboard and object explorer render remote nodes unchanged).
+    /// Remote meta/stats mirror the /api/meta + /api/stats shapes
+    /// (dashboard and object explorer render managed nodes unchanged).
     #[tokio::test]
     async fn remote_meta_and_stats_mirror_local_shapes() {
         let dir = tempfile::tempdir().unwrap();

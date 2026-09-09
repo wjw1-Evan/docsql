@@ -7,6 +7,9 @@ set -eu
 cd "$(dirname "$0")"
 docker compose --profile single --profile cluster --profile join down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose -f docker-compose.prod.yml --profile single --profile cluster --profile join down -v --remove-orphans >/dev/null 2>&1 || true
+# docsql-data-web / docsql-data-web-single are legacy side-store volumes of
+# the old embedded-engine console (no longer mounted by any service) —
+# wiping them here clears historical leftovers too.
 for v in docsql-data-a docsql-data-b docsql-data-c docsql-data-d docsql-data-web docsql-data-single docsql-data-web-single; do
   docker volume rm -f "$v" >/dev/null 2>&1 || true
 done

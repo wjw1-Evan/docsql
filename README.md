@@ -77,8 +77,8 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 - **新建表 / 编辑表 / 插入文档**(参考 mongo-express 的写入面):对象资源管理器「＋表」按钮 / 右键 / 「文件 → 新建表…」打开列编辑网格(列名/类型/PK/NOT NULL/自增,PK 自动联动 NOT NULL;类型含 GUID——勾自增即建时序有序 UUIDv7 主键,INSERT 省略该列即可)一键 CREATE TABLE;已有表右键「编辑表…」(数据页工具栏同入口)复用同一网格——已有列可改名/删除(主键列除外,类型与约束锁定为只读,SQL 层不支持在线改约束),新增列选类型即加,保存时按「重命名 → 删除 → 新增」生成 ALTER 批次执行,失败语句与已生效前缀明确提示;数据网格「插入文档…」或表右键打开 JSON 编辑域——对象插入一行、数组批量插入,允许表结构之外的字段(文档式存储),嵌套对象/数组以 JSON 文本存储
 - **仪表盘**:表/行数/页与文件占用/运行时长一览
 - **集群状态**:按 `DOCSQL_PEERS` 只读探测各节点(PING 延迟 + REQ_STATUS 状态报告),展示在线/离线/只读、表与行数收敛、存储占用、LSN 收敛指标;5 秒自动刷新;未配置 peers 时显示单机模式
-- **日志**(视图 → 日志,或服务器右键):全部日志一览——**数据日志**为各处执行的 SQL 语句审计(本机控制台 + 各集群节点,含耗时/影响行数/错误;来自对等节点扇出的语句带「复制」徽章),**同步日志**为集群同步事件(写扇出 publish/trim 扇出/PROMOTE/节点加入,逐目标记录成功与失败原因);条目按时间倒序合并,支持类别(全部/数据/同步/仅错误)、来源(本机控制台/各节点)、关键词过滤与 5 秒自动刷新;节点离线时显示离线清单
-- **节点切换**(工具栏「节点」下拉框):控制台默认管理自身内嵌引擎,配置了 `DOCSQL_PEERS` 时可在「本机(内嵌引擎)」与各集群节点之间一键切换——查询、对象资源管理器、数据网格、建表/插入文档、仪表盘全部改经控制台后端代理到所选节点执行(二进制协议直连,认证用服务端配置的 `DOCSQL_TOKEN`);在该节点上的写入按其集群配置正常扇出,远程 meta 与本地完全同构;切换仅允许 `DOCSQL_PEERS` 中配置的地址,节点离线时操作返回明确错误
+- **日志**(视图 → 日志,或服务器右键):全部日志一览——**数据日志**为各处执行的 SQL 语句审计(控制台提交的语句 + 各集群节点,含耗时/影响行数/错误;来自对等节点扇出的语句带「复制」徽章),**同步日志**为集群同步事件(写扇出 publish/trim 扇出/PROMOTE/节点加入,逐目标记录成功与失败原因);条目按时间倒序合并,支持类别(全部/数据/同步/仅错误)、来源(控制台/各节点)、关键词过滤与 5 秒自动刷新;节点离线时显示离线清单
+- **节点切换**(工具栏「节点」下拉框):控制台是纯管理工具,**自身不存任何数据**——默认连接并管理启动时指定的节点(如 `node-a:7600`),配置了 `DOCSQL_PEERS` 时可一键切换到其它集群节点——查询、对象资源管理器、数据网格、建表/插入文档、仪表盘全部以数据库客户端身份连接所选节点执行(二进制协议直连,认证用服务端配置的 `DOCSQL_TOKEN`);在该节点上的写入按其集群配置正常扇出;切换仅允许 `DOCSQL_PEERS` 中配置的地址,节点离线时操作返回明确错误
 
 ## 能力总览
 
@@ -88,7 +88,7 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | SQL | CREATE/ALTER/DROP TABLE+INDEX、INSERT(多行/RETURNING)、UPDATE/DELETE(RETURNING)、SELECT(WHERE/ORDER/LIMIT/OFFSET/GROUP BY+HAVING/COUNT/SUM/AVG/MIN/MAX/JOIN:INNER/LEFT/CROSS/USING/子查询派生表/UNION(ALL)/IN)、事务 BEGIN/COMMIT/ROLLBACK、PRIMARY KEY/UNIQUE/NOT NULL/AUTOINCREMENT、GUID 主键(UUIDv7 时序有序自动生成)、information_schema、sqlite_master 兼容视图、PRAGMA 兼容 |
 | 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告 |
 | 发布订阅 | 持久化 pub/sub(参考 Redis 命令面):PUBLISH/SUBSCRIBE/PSUBSCRIBE(glob `*` `?` `[...]`)/UNSUBSCRIBE/PUBSUB CHANNELS·NUMSUB·NUMPAT·TRIM;消息先经 WAL 落盘再推送,重启不丢;订阅可指定起点(`earliest` 全量回放 / `latest` 仅新消息 / 指定 id 续传),断线用最后收到的 id 重新订阅即补齐(at-least-once);集群内发布自动扇出到全部节点,各节点本地落盘并推送本地订阅者;`docsql_pubsub` 系统视图可查消息历史 |
-| Web | **DocSQL Studio**(SSMS 风格管理控制台):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/删行)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、节点切换(本机内嵌引擎 ↔ 任意 `DOCSQL_PEERS` 节点,后端协议代理);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs,其中数据端点 /api/sql /api/meta /api/stats 可带 `node` 参数指定目标节点) |
+| Web | **DocSQL Studio**(SSMS 风格管理控制台,纯管理工具、自身不存数据,默认连接并管理指定节点):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/删行)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、节点切换(默认管理节点 ↔ 任意 `DOCSQL_PEERS` 节点);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs,其中数据端点 /api/sql /api/meta /api/stats 可带 `node` 参数指定目标节点) |
 | EF Core | `UseDocsql(connectionString)`(复用 SQLite 管线 + Docsql ADO.NET):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引(含唯一索引;模型增删索引均自动同步,免迁移) |
 | 集群 | 对等集群(`DOCSQL_PEERS`:任意节点可写,SQL 写入扇出至全部对等节点;节点之间用独立集群凭据互相认证)、主从复制(写转发)、只读副本、PROMOTE 故障转移 |
 
@@ -99,7 +99,7 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | docsql-core | 存储引擎(pager/WAL/B+树/heap)+ SQL 解析执行 + 协议帧 + JSON |
 | docsql-server | TCP 服务器、认证、复制、持久化发布订阅(pub/sub) |
 | docsql-cli | 嵌入式 + 远程 shell |
-| docsql-web | Web 管理控制台(SSMS 风格 UI + REST API) |
+| docsql-web | Web 管理控制台(SSMS 风格 UI + REST API;纯管理工具,自身不存数据,所有数据操作连接指定节点执行) |
 | dotnet/ | Docsql.Client(ADO.NET)与 Docsql.EntityFrameworkCore |
 
 ## 测试
@@ -120,6 +120,8 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | `join` | node-d(向运行中的集群加入第四数据节点:全新节点启动即自动拉取全量历史数据并注册进扇出网格;见下文"扩容") | 17604 |
 
 两个 profile 端口不冲突,可同时运行(便于对比验证);命令均需带 profile 参数:
+
+> **架构说明(控制台无本地存储)**:DocSQL Studio 是纯管理工具——web 容器不挂数据卷、不内嵌数据库,启动参数即**默认管理节点**(`docsql-web node-a:7600 …`,或 `DOCSQL_UPSTREAM` / 首个 `DOCSQL_PEERS` 条目),所有数据操作都以客户端身份连接该节点执行,写入落在集群数据卷并正常扇出。界面里的「节点」下拉框只切换管理目标,不存在独立的控制台数据库。从旧版本升级:web 容器会自动重建(不再挂 `docsql-data-web*` 卷),旧内嵌引擎卷成为遗留数据,可用 `./deploy/reset-data.sh` 一并清除。
 
 ```bash
 cd deploy

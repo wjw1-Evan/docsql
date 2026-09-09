@@ -1,21 +1,23 @@
-//! End-to-end tests: real web console on a random port, plain HTTP/1.1
-//! client over TcpStream (no external HTTP dependency, mirroring the
-//! wire-protocol e2e suite in docsql-server).
+//! End-to-end tests: real web console on a random port managing a real
+//! wire-protocol node, plain HTTP/1.1 client over TcpStream (no external
+//! HTTP dependency, mirroring the wire-protocol e2e suite in docsql-server).
+//! The console stores nothing — every data call must land on the managed
+//! node, which these tests prove by asserting against the node's own state.
 
 use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-async fn start_web(token: Option<&str>, peers: Vec<String>) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().unwrap();
+/// Start the console alone (no managed node): pure-UI surface tests.
+async fn start_web(token: Option<&str>, peers: Vec<String>, upstream: Option<String>) -> String {
     // Pick a free port by binding a listener first.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     drop(l);
     let addr = format!("127.0.0.1:{port}");
     let cfg = docsql_web::WebConfig {
-        db_path: dir.path().join("web-e2e.db"),
+        upstream,
         token: token.map(String::from),
         peers,
     };
@@ -23,11 +25,48 @@ async fn start_web(token: Option<&str>, peers: Vec<String>) -> (tempfile::TempDi
     tokio::spawn(async move { docsql_web::run(cfg, &listen).await });
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
-            return (dir, addr);
+            return addr;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("web console did not come up");
+}
+
+/// One real node behind `token` + the console managing it as its default
+/// target. Returns (node data dir, web addr, node addr).
+async fn start_stack(
+    token: Option<&str>,
+    peers: Vec<String>,
+) -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let node_addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join("node.db"),
+        listen: node_addr.clone(),
+        auth_token: token.map(String::from),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let web = start_web(token, peers, Some(node_addr.clone())).await;
+    (dir, web, node_addr)
 }
 
 struct HttpResponse {
@@ -136,7 +175,7 @@ async fn sql(addr: &str, token: Option<&str>, sql: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn console_page_served_over_http() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let addr = start_web(None, Vec::new(), None).await;
     let res = http(&addr, "GET", "/", None, None).await;
     assert_eq!(res.status, 200);
     assert!(res.header("content-type").unwrap().starts_with("text/html"));
@@ -154,7 +193,7 @@ async fn console_page_served_over_http() {
 
 #[tokio::test]
 async fn sql_roundtrip_over_http() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     // Single statements keep the legacy one-result shape.
     assert_eq!(
         sql(
@@ -197,7 +236,7 @@ async fn sql_roundtrip_over_http() {
 
 #[tokio::test]
 async fn parse_endpoint_validates_without_executing() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     let ok = serde_json::to_string(&json!({"sql": "CREATE TABLE p (id INT)"})).unwrap();
     let res = http(&addr, "POST", "/api/parse", None, Some(&ok)).await;
     assert_eq!(res.status, 200);
@@ -210,14 +249,15 @@ async fn parse_endpoint_validates_without_executing() {
     assert_eq!(v["ok"], false);
     assert!(!v["message"].as_str().unwrap().is_empty());
 
-    // Parse-check must not execute: the table never comes into existence.
+    // Parse-check must not execute: the table never comes into existence
+    // on the managed node.
     let meta = http(&addr, "GET", "/api/meta", None, None).await.json();
     assert_eq!(meta["totals"]["tables"], 0);
 }
 
 #[tokio::test]
 async fn token_gates_api_surface_but_not_console_page() {
-    let (_dir, addr) = start_web(Some("sekrit"), Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(Some("sekrit"), Vec::new()).await;
     // The console page must load without a token (the UI collects it).
     assert_eq!(http(&addr, "GET", "/", None, None).await.status, 200);
 
@@ -239,7 +279,7 @@ async fn token_gates_api_surface_but_not_console_page() {
 
 #[tokio::test]
 async fn meta_and_stats_report_live_catalog() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     sql(
         &addr,
         None,
@@ -283,7 +323,7 @@ async fn meta_and_stats_report_live_catalog() {
 /// script generation round-trips the DDL from it).
 #[tokio::test]
 async fn guid_autogen_pk_over_http() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     assert_eq!(
         sql(
             &addr,
@@ -324,7 +364,7 @@ async fn guid_autogen_pk_over_http() {
 /// (no PK drop, no constraint options on ADD COLUMN) surfacing to the UI.
 #[tokio::test]
 async fn edit_table_alter_batch_over_http() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     sql(
         &addr,
         None,
@@ -380,7 +420,7 @@ async fn edit_table_alter_batch_over_http() {
 /// the full definitions (name/column/unique) the edit dialog works against.
 #[tokio::test]
 async fn index_management_over_http() {
-    let (_dir, addr) = start_web(None, Vec::new()).await;
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     sql(
         &addr,
         None,
@@ -489,14 +529,18 @@ async fn cluster_page_probes_live_and_dead_nodes() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let (_dir, addr) = start_web(
+    let addr = start_web(
         Some("sekrit"),
         vec![node_addr.clone(), "127.0.0.1:1".into()],
+        Some(node_addr.clone()),
     )
     .await;
     let res = http(&addr, "GET", "/api/cluster", Some("sekrit"), None).await;
     assert_eq!(res.status, 200);
-    let nodes = res.json()["nodes"].as_array().unwrap().clone();
+    let v = res.json();
+    // The default managed node is surfaced so the UI can name the fallback.
+    assert_eq!(v["default"], node_addr);
+    let nodes = v["nodes"].as_array().unwrap().clone();
 
     // Live node: full status report (AUTH + REQ_STATUS over the wire).
     assert_eq!(nodes[0]["addr"], node_addr);
@@ -511,12 +555,12 @@ async fn cluster_page_probes_live_and_dead_nodes() {
     assert!(nodes[1]["status"].is_null());
 }
 
-/// /api/logs: token-gated; serves the console's own audit ring as the
+/// /api/logs: token-gated; serves the console's own statement audit as the
 /// local section and fetches each peer's REQ_LOGS report over the wire.
 #[tokio::test]
 async fn logs_endpoint_serves_local_and_node_reports() {
     // Token gate first.
-    let (_ddir, daddr) = start_web(Some("sekrit"), Vec::new()).await;
+    let daddr = start_web(Some("sekrit"), Vec::new(), None).await;
     let res = http(&daddr, "GET", "/api/logs", None, None).await;
     assert_eq!(res.status, 401);
 
@@ -549,16 +593,17 @@ async fn logs_endpoint_serves_local_and_node_reports() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let (_dir, addr) = start_web(
+    let addr = start_web(
         Some("sekrit"),
         vec![node_addr.clone(), "127.0.0.1:1".into()],
+        Some(node_addr.clone()),
     )
     .await;
 
-    // Console statement → local section; a node-side write → its query log.
+    // Console statement → local audit ring (tagged with the node it ran
+    // on); a node-side write → its query log.
     sql(&addr, Some("sekrit"), "CREATE TABLE wl (id INT)").await;
     {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut s = TcpStream::connect(&node_addr).await.unwrap();
         let auth = docsql_core::proto::Frame::new(docsql_core::proto::REQ_AUTH, b"sekrit".to_vec());
         s.write_all(&auth.encode().unwrap()).await.unwrap();
@@ -597,14 +642,13 @@ async fn logs_endpoint_serves_local_and_node_reports() {
     let res = http(&addr, "GET", "/api/logs?limit=50", Some("sekrit"), None).await;
     assert_eq!(res.status, 200);
     let v = res.json();
-    assert!(
-        v["local"]["query"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["sql"].as_str() == Some("CREATE TABLE wl (id INT)")),
-        "local section missing console statement: {v}"
-    );
+    let local_query = v["local"]["query"].as_array().unwrap();
+    let console_entry = local_query
+        .iter()
+        .find(|e| e["sql"].as_str() == Some("CREATE TABLE wl (id INT)"))
+        .expect("local section missing console statement");
+    // The console audit names the node the statement actually ran on.
+    assert_eq!(console_entry["peer"], node_addr, "{v}");
     assert!(v["local"]["sync"].as_array().unwrap().is_empty());
     let nodes = v["nodes"].as_array().unwrap();
     assert_eq!(nodes[0]["addr"], node_addr);
@@ -616,7 +660,7 @@ async fn logs_endpoint_serves_local_and_node_reports() {
             .any(|e| e["sql"].as_str() == Some("CREATE TABLE nl (id INT)")),
         "node section missing its statement: {nodes:?}"
     );
-    // The proxy's AUTH to this node is audited in its sync ring; only
+    // The console's AUTH to this node is audited in its sync ring; only
     // auth events may be there, no data-plane fan-out.
     assert!(
         nodes[0]["logs"]["sync"]
@@ -633,12 +677,12 @@ async fn logs_endpoint_serves_local_and_node_reports() {
     assert!(!nodes[1]["error"].as_str().unwrap().is_empty());
 }
 
-/// Node switching over HTTP: a `node` field/param routes the call through
-/// the backend's wire-protocol proxy to that DOCSQL_PEERS node while the
-/// embedded engine stays untouched; unconfigured targets are refused.
+/// Managed-node selection over HTTP: without a `node` the call lands on
+/// the default managed node; an explicit `node` routes to that DOCSQL_PEERS
+/// peer; unconfigured targets are refused; an offline peer errors in-band.
 #[tokio::test]
-async fn node_switch_proxies_sql_meta_stats_to_peer() {
-    // A real node behind the same token + a dead configured address.
+async fn node_selection_routes_sql_meta_stats() {
+    // The managed node behind the token + a dead configured address.
     let node_dir = tempfile::tempdir().unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -653,9 +697,9 @@ async fn node_switch_proxies_sql_meta_stats_to_peer() {
         idle_timeout_secs: 0,
         auth_lock_threshold: 10,
         cluster_token: None,
-        advertise: None,
         replicate_to: None,
         peers: Vec::new(),
+        advertise: None,
         read_only: false,
         transport_key: None,
         async_commit: false,
@@ -666,15 +710,33 @@ async fn node_switch_proxies_sql_meta_stats_to_peer() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-
-    let (_dir, addr) = start_web(
+    let addr = start_web(
         Some("sekrit"),
         vec![node_addr.clone(), "127.0.0.1:1".into()],
+        Some(node_addr.clone()),
     )
     .await;
 
-    // Remote DDL/DML through the proxy (backend authenticates with the
-    // server-side token, not anything the browser sent).
+    // Default target: statements without a node land on the managed node.
+    let r = sql(
+        &addr,
+        Some("sekrit"),
+        "CREATE TABLE sw (id INT PRIMARY KEY, v TEXT)",
+    )
+    .await;
+    assert_eq!(r["kind"], "affected", "{r}");
+    let r = sql(
+        &addr,
+        Some("sekrit"),
+        "INSERT INTO sw VALUES (1, 'from-console'); INSERT INTO sw VALUES (2, 'also')",
+    )
+    .await;
+    assert_eq!(r["kind"], "batch", "{r}");
+    assert_eq!(r["results"].as_array().unwrap().len(), 2);
+    let r = sql(&addr, Some("sekrit"), "SELECT v FROM sw ORDER BY id").await;
+    assert_eq!(r["rows"][0][0], "from-console");
+
+    // Explicit node selection routes to that peer (same node here).
     let sql_node = |s: &str| {
         let body = serde_json::to_string(&json!({ "sql": s, "node": node_addr })).unwrap();
         let addr = addr.clone();
@@ -684,57 +746,26 @@ async fn node_switch_proxies_sql_meta_stats_to_peer() {
                 .json()
         }
     };
-    let r = sql_node("CREATE TABLE sw (id INT PRIMARY KEY, v TEXT)").await;
-    assert_eq!(r["kind"], "affected", "{r}");
-    let r =
-        sql_node("INSERT INTO sw VALUES (1, 'remote'); INSERT INTO sw VALUES (2, 'also')").await;
-    assert_eq!(r["kind"], "batch", "{r}");
-    assert_eq!(r["results"].as_array().unwrap().len(), 2);
-    let r = sql_node("SELECT v FROM sw ORDER BY id").await;
-    assert_eq!(r["rows"][0][0], "remote");
-    assert_eq!(r["rows"][1][0], "also");
+    let r = sql_node("SELECT COUNT(*) AS n FROM sw").await;
+    assert_eq!(r["rows"][0][0], 2, "{r}");
 
-    // Routing proof: the embedded engine never saw the remote table.
-    let local = sql(&addr, Some("sekrit"), "SELECT * FROM sw").await;
-    assert_eq!(local["kind"], "error", "{local}");
-    let local = sql(&addr, Some("sekrit"), "CREATE TABLE embedded_only (id INT)").await;
-    assert_eq!(local["kind"], "affected");
-
-    // Remote meta: same shape as local /api/meta, remote tables only.
-    let res = http(
-        &addr,
-        "GET",
-        &format!("/api/meta?node={node_addr}"),
-        Some("sekrit"),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, 200);
-    let m = res.json();
+    // Default meta/stats render the managed node's state.
+    let m = http(&addr, "GET", "/api/meta", Some("sekrit"), None)
+        .await
+        .json();
     assert!(m.get("error").is_none(), "{m}");
     let tables = m["tables"].as_array().unwrap();
-    assert!(tables.iter().any(|t| t["name"] == "sw"), "{m}");
-    assert!(!tables.iter().any(|t| t["name"] == "embedded_only"), "{m}");
     let sw = tables.iter().find(|t| t["name"] == "sw").unwrap();
     assert_eq!(sw["row_count"], 2);
     assert!(!sw["index_defs"].as_array().unwrap().is_empty());
     assert!(m["storage"]["page_size"].as_u64().is_some());
-
-    // Remote stats: local shape, remote counters.
-    let res = http(
-        &addr,
-        "GET",
-        &format!("/api/stats?node={node_addr}"),
-        Some("sekrit"),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, 200);
-    let s = res.json();
+    let s = http(&addr, "GET", "/api/stats", Some("sekrit"), None)
+        .await
+        .json();
     assert_eq!(s["tables"], 1, "{s}");
     assert!(s["uptime_ms"].as_u64().is_some());
 
-    // Unconfigured targets are refused (proxy allow-list = DOCSQL_PEERS).
+    // Unconfigured targets are refused (allow-list = DOCSQL_PEERS).
     let body = serde_json::to_string(&json!({"sql": "SELECT 1", "node": "127.0.0.1:9"})).unwrap();
     let r = http(&addr, "POST", "/api/sql", Some("sekrit"), Some(&body))
         .await
@@ -758,8 +789,29 @@ async fn node_switch_proxies_sql_meta_stats_to_peer() {
     assert_eq!(r["kind"], "error", "{r}");
     assert!(r["message"].as_str().unwrap().contains("不可达"), "{r}");
 
-    // The console token gate applies before any proxying.
+    // The console token gate applies before any node connection.
     let body = serde_json::to_string(&json!({"sql": "SELECT 1", "node": node_addr})).unwrap();
     let res = http(&addr, "POST", "/api/sql", None, Some(&body)).await;
     assert_eq!(res.status, 401);
+}
+
+/// No managed node configured: data endpoints report the configuration gap
+/// in-band instead of failing silently.
+#[tokio::test]
+async fn data_endpoints_without_upstream_report_config_error() {
+    let addr = start_web(None, Vec::new(), None).await;
+    let r = sql(&addr, None, "SELECT 1").await;
+    assert!(r.get("error").is_some(), "{r}");
+    assert!(
+        r["error"].as_str().unwrap().contains("未配置管理目标节点"),
+        "{r}"
+    );
+    let m = http(&addr, "GET", "/api/meta", None, None).await.json();
+    assert!(m.get("error").is_some(), "{m}");
+    let s = http(&addr, "GET", "/api/stats", None, None).await.json();
+    assert!(s.get("error").is_some(), "{s}");
+    // Pure syntax check still works — it needs no node.
+    let body = serde_json::to_string(&json!({"sql": "SELECT 1"})).unwrap();
+    let res = http(&addr, "POST", "/api/parse", None, Some(&body)).await;
+    assert_eq!(res.json(), json!({"ok": true}));
 }

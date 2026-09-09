@@ -1,9 +1,11 @@
 #!/bin/bash
 # Single-node deployment test against the compose `single` profile.
 # Nodes: one standalone node — node-single (:17600), web console (:17710).
-# No peers configured: reads and writes stay local. When the cluster profile
-# is also up (node-a), additionally verifies data isolation between the
-# standalone node and the cluster.
+# No peers configured on the node: reads and writes stay local. The web
+# console manages node-single over the wire protocol (no side store), and
+# its DOCSQL_PEERS entry feeds the cluster-status page. When the cluster
+# profile is also up (node-a), additionally verifies data isolation between
+# the standalone node and the cluster.
 set -u
 # All traffic runs inside the compose network via the image's own CLI
 # (no host toolchain needed); host ports stay mapped for external access.
@@ -59,7 +61,16 @@ echo "$r" | grep -q '"fromweb"' && ok "web sql select" || bad "web sql select: $
 r=$(curl -s "$W/api/stats")
 echo "$r" | grep -q '"tables"' && ok "web stats" || bad "web stats: $r"
 r=$(curl -s "$W/api/cluster")
-echo "$r" | grep -q '"nodes":\[\]' && ok "web cluster page standalone (no peers)" || bad "web cluster: $r"
+echo "$r" | grep -q '"node-single:7600"' && echo "$r" | grep -q '"reachable":true' \
+  && ok "web cluster page probes node-single" || bad "web cluster: $r"
+# 控制台是管理工具、不落库:web 写入的数据必须从节点原生端口可见。
+out=$(sql "$A" "SELECT note FROM web_solo WHERE id = 1;")
+echo "$out" | grep -q "fromweb" && ok "web writes land on the node (visible via :17600)" || bad "web data not on node: $out"
+# 反向:节点上建的表对 web 同样可见(同一份存储,无独立小库)。
+sql "$A" "CREATE TABLE cli_side (id INT PRIMARY KEY);" >/dev/null
+sql "$A" "INSERT INTO cli_side VALUES (7);" >/dev/null
+r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"SELECT COUNT(id) AS n FROM cli_side"}')
+echo "$r" | grep -q '"rows":\[\[1\]\]' && ok "node tables visible via web (same store)" || bad "cli table via web: $r"
 
 echo "== 5. isolation from the cluster profile =="
 if docker ps --filter "name=docsql-a" --format "{{.Names}}" | grep -q .; then

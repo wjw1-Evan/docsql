@@ -94,6 +94,11 @@ r=$(curl -s -X POST "$W/api/sql" -H "Content-Type: application/json" -d "{\"sql\
 echo "$r" | grep -q '"count":1' && ok "web sql insert" || bad "web sql insert: $r"
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"SELECT id, note FROM web_check"}')
 echo "$r" | grep -q '"fromweb"' && ok "web sql select" || bad "web sql select: $r"
+# 控制台不落库:web 的默认写入落在管理目标 node-a,并按集群拓扑扇出收敛。
+out=$(sql "$A" "SELECT note FROM web_check WHERE id = 1;")
+echo "$out" | grep -q "fromweb" && ok "web writes land on managed node-a" || bad "web data not on node-a: $out"
+wait_row "$C" "SELECT COUNT(id) FROM web_check;" "^[[:space:]]*1[[:space:]]*$" \
+  && ok "web-created data converged cluster-wide" || bad "web data not converged on node-c"
 # SQL 错误返回错误而非崩溃
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"sql":"SELECT * FROM missing"}')
 echo "$r" | grep -q '"error"' && ok "web sql error surfaced" || bad "web sql error: $r"
@@ -107,23 +112,23 @@ echo "$r" | grep -q '"reachable":true' && echo "$r" | grep -q '"durable_lsn"' &&
 # 认证开关(DOCSQL_TOKEN 未设置时应放行;此处仅验证无 token 可访问)
 code=$(curl -s -o /dev/null -w "%{http_code}" "$W/api/stats")
 [ "$code" = "200" ] && ok "web no-auth mode accessible" || bad "web http code: $code"
-# 节点切换:控制台经二进制协议代理到指定 DOCSQL_PEERS 节点(REQ_AUTH + REQ_SQL)
+# 节点切换:控制台以客户端身份连接指定 DOCSQL_PEERS 节点执行(REQ_AUTH + REQ_SQL)
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"node":"node-a:7600","sql":"CREATE TABLE via_proxy (id INT PRIMARY KEY, src TEXT)"}')
-echo "$r" | grep -q '"affected"' && ok "node switch: create on node-a via proxy" || bad "proxy create: $r"
-# 多语句批次逐句代理,批次形状与本地一致
+echo "$r" | grep -q '"affected"' && ok "node switch: create on node-a" || bad "switch create: $r"
+# 多语句批次逐句发送,批次形状与默认目标一致
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d "{\"node\":\"node-b:7600\",\"sql\":\"INSERT INTO via_proxy VALUES (1, 'from-b'); INSERT INTO via_proxy VALUES (2, 'also-b');\"}")
-echo "$r" | grep -q '"kind":"batch"' && echo "$r" | grep -q '"count":1' && ok "node switch: batch insert on node-b" || bad "proxy batch: $r"
+echo "$r" | grep -q '"kind":"batch"' && echo "$r" | grep -q '"count":1' && ok "node switch: batch insert on node-b" || bad "switch batch: $r"
 # 写在 b 上执行并按其集群配置扇出;从 c 经控制台读回(同步扇出,立即可见)
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"node":"node-c:7600","sql":"SELECT COUNT(*) FROM via_proxy"}')
-echo "$r" | grep -q '"rows":\[\[2\]\]' && ok "node switch: read from node-c (converged)" || bad "proxy read: $r"
-# 远程 meta 与本地 /api/meta 同构(REQ_META 共享同一组装代码)
+echo "$r" | grep -q '"rows":\[\[2\]\]' && ok "node switch: read from node-c (converged)" || bad "switch read: $r"
+# 远程 meta 与默认目标 /api/meta 同构(REQ_META 共享同一组装代码)
 r=$(curl -s "$W/api/meta?node=node-a:7600")
-echo "$r" | grep -q '"via_proxy"' && echo "$r" | grep -q '"index_defs"' && ok "node switch: remote meta same shape" || bad "proxy meta: $r"
+echo "$r" | grep -q '"via_proxy"' && echo "$r" | grep -q '"index_defs"' && ok "node switch: remote meta same shape" || bad "switch meta: $r"
 r=$(curl -s "$W/api/stats?node=node-a:7600")
-echo "$r" | grep -q '"uptime_ms"' && ok "node switch: remote stats" || bad "proxy stats: $r"
-# 未配置的节点地址必须拒绝(代理目标仅限 DOCSQL_PEERS)
+echo "$r" | grep -q '"uptime_ms"' && ok "node switch: remote stats" || bad "switch stats: $r"
+# 未配置的节点地址必须拒绝(可连接目标仅限 DOCSQL_PEERS)
 r=$(curl -s -X POST "$W/api/sql" -H 'Content-Type: application/json' -d '{"node":"10.0.0.1:7600","sql":"SELECT 1"}')
-echo "$r" | grep -q '"error"' && ok "node switch: unconfigured node rejected" || bad "proxy guard: $r"
+echo "$r" | grep -q '"error"' && ok "node switch: unconfigured node rejected" || bad "switch guard: $r"
 
 echo "== 8. persistent pub/sub across nodes =="
 # 8.1 实时投递:node-a 后台订阅(输出落宿主临时文件),node-b 发布。

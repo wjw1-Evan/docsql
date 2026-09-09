@@ -151,24 +151,24 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
-  # Web console (embedded engine on its own volume; REST + UI on :7700).
-  # Set DOCSQL_TOKEN in .env to require auth for the console and REST API.
-  # DOCSQL_PEERS feeds the read-only cluster-status probes (the same token
-  # authenticates them when set); the console's own SQL/data operations stay
-  # on its embedded engine.
+  # Web console (management tool; REST + UI on :7700). It stores nothing:
+  # the first argument is the default managed node — every data operation
+  # connects to it (or to an explicitly selected DOCSQL_PEERS node) over
+  # the wire protocol, so console-created data lives in the cluster's
+  # volumes, never in a side store. Set DOCSQL_TOKEN in .env to require
+  # auth for the console and REST API; the same token authenticates the
+  # console's connections to the managed nodes.
   node-web:
     profiles: ["cluster"]
     image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
     container_name: docsql-prod-web
-    command: ["/data/docsql.db", "0.0.0.0:7700"]
+    command: ["node-a:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
     ports:
       - "127.0.0.1:17700:7700"
-    volumes:
-      - web-data:/data
     networks: [docsql]
     depends_on:
       node-a:
@@ -203,18 +203,20 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # Web console for the single node: manages node-single over the wire
+  # protocol, so the UI and native-protocol clients on :17600 see the same
+  # data. DOCSQL_PEERS powers the cluster-status page (one node).
   node-web-single:
     profiles: ["single"]
     image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_IMAGE_TAG:-latest}"
     container_name: docsql-prod-web-single
-    command: ["/data/docsql.db", "0.0.0.0:7700"]
+    command: ["node-single:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      DOCSQL_PEERS: "node-single:7600"
     ports:
       - "127.0.0.1:17710:7700"
-    volumes:
-      - web-single-data:/data
     networks: [docsql]
     depends_on:
       node-single:
@@ -238,15 +240,9 @@ volumes:
   peer-c-data:
     external: true
     name: docsql-data-c
-  web-data:
-    external: true
-    name: docsql-data-web
   single-data:
     external: true
     name: docsql-data-single
-  web-single-data:
-    external: true
-    name: docsql-data-web-single
 
 networks:
   docsql:

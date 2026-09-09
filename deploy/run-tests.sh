@@ -19,7 +19,7 @@ docker compose --profile single --profile cluster --profile join down -v --remov
 # Data lives in external volumes that `down -v` cannot remove — recreate
 # them explicitly so every test run starts from a clean slate (and so they
 # exist at all on a fresh CI runner).
-for v in docsql-data-a docsql-data-b docsql-data-c docsql-data-d docsql-data-web docsql-data-single docsql-data-web-single; do
+for v in docsql-data-a docsql-data-b docsql-data-c docsql-data-d docsql-data-single; do
   docker volume rm -f "$v" >/dev/null 2>&1 || true
   # A failed rm (volume still in use by a straggler container) must abort,
   # not silently continue on stale data that then breaks count assertions.
