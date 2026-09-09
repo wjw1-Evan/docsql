@@ -263,7 +263,11 @@ async fn auth_setup(
             json!({"error": "尝试次数过多,请一分钟后再试"}),
         );
     }
-    let result = a.store.lock().unwrap().setup(&body.username, &body.password);
+    let result = a
+        .store
+        .lock()
+        .unwrap()
+        .setup(&body.username, &body.password);
     match result {
         Ok(creds) => {
             a.lockout.lock().unwrap().reset(peer.ip());

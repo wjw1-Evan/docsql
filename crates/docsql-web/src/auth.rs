@@ -51,6 +51,12 @@ pub struct Sha256 {
     total: u64,
 }
 
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sha256 {
     pub fn new() -> Self {
         Sha256 {
@@ -113,8 +119,8 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (i, chunk) in block.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+        w[i] = u32::from_be_bytes(*chunk);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -333,11 +339,21 @@ fn parse_creds(bytes: &[u8]) -> Result<Creds, String> {
         .as_str()
         .ok_or("corrupt credential file: username")?
         .to_string();
-    let salt = unhex(v["salt_hex"].as_str().ok_or("corrupt credential file: salt")?)
-        .ok_or("corrupt credential file: salt hex")?;
-    let hash = unhex(v["hash_hex"].as_str().ok_or("corrupt credential file: hash")?)
-        .ok_or("corrupt credential file: hash hex")?;
-    let salt: [u8; 16] = salt.try_into().map_err(|_| "corrupt credential file: salt len")?;
+    let salt = unhex(
+        v["salt_hex"]
+            .as_str()
+            .ok_or("corrupt credential file: salt")?,
+    )
+    .ok_or("corrupt credential file: salt hex")?;
+    let hash = unhex(
+        v["hash_hex"]
+            .as_str()
+            .ok_or("corrupt credential file: hash")?,
+    )
+    .ok_or("corrupt credential file: hash hex")?;
+    let salt: [u8; 16] = salt
+        .try_into()
+        .map_err(|_| "corrupt credential file: salt len")?;
     let hash: [u8; 32] = hash
         .try_into()
         .map_err(|_| "corrupt credential file: hash len")?;
@@ -407,7 +423,7 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len() / 2)
@@ -419,6 +435,12 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 pub struct Sessions {
     map: Mutex<HashMap<String, Instant>>,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Sessions {
@@ -460,6 +482,12 @@ impl Sessions {
 
 pub struct Lockout {
     failures: HashMap<IpAddr, (Vec<Instant>, Option<Instant>)>,
+}
+
+impl Default for Lockout {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Lockout {
@@ -575,7 +603,7 @@ mod tests {
         let path = dir.path().join("console-auth.json");
         let mut store = AuthStore::open(&path).unwrap();
         assert!(matches!(store.mode(), AuthMode::Setup));
-        assert!(store.verify("admin", "whatever") == false);
+        assert!(!store.verify("admin", "whatever"));
         store.setup("admin", "s3cret-pw").unwrap();
         assert!(matches!(store.mode(), AuthMode::Login));
         assert!(store.verify("admin", "s3cret-pw"));

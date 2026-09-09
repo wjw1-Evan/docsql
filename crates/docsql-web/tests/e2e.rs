@@ -884,9 +884,14 @@ async fn console_account_setup_login_and_gate() {
 
     // Setup mode; anonymous data calls still work until the account exists
     // (no token configured to demand otherwise).
-    let st = http(&addr, "GET", "/api/auth/status", None, None).await.json();
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
     assert_eq!(st["mode"], "setup");
-    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 200);
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", None, None).await.status,
+        200
+    );
 
     // Weak password rejected; the account does not exist yet.
     let r = http(
@@ -898,7 +903,9 @@ async fn console_account_setup_login_and_gate() {
     )
     .await;
     assert_eq!(r.status, 400);
-    let st = http(&addr, "GET", "/api/auth/status", None, None).await.json();
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
     assert_eq!(st["mode"], "setup");
 
     // Create the account → session cookie; the file is written.
@@ -926,8 +933,13 @@ async fn console_account_setup_login_and_gate() {
     )
     .await;
     assert_eq!(r.status, 409);
-    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 401);
-    let st = http(&addr, "GET", "/api/auth/status", None, None).await.json();
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", None, None).await.status,
+        401
+    );
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
     assert_eq!(st["mode"], "login");
     assert_eq!(st["username"], "admin");
 
@@ -991,7 +1003,10 @@ async fn console_account_token_bypass() {
     )
     .await;
 
-    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 401);
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", None, None).await.status,
+        401
+    );
     assert_eq!(
         http(&addr, "GET", "/api/meta", Some("wrong"), None)
             .await
@@ -1013,7 +1028,10 @@ async fn console_account_token_bypass() {
     )
     .await;
     assert_eq!(r.status, 200);
-    assert_eq!(http(&addr, "GET", "/api/meta", None, None).await.status, 401);
+    assert_eq!(
+        http(&addr, "GET", "/api/meta", None, None).await.status,
+        401
+    );
     assert_eq!(
         http(&addr, "GET", "/api/meta", Some("node-secret"), None)
             .await
@@ -1053,7 +1071,9 @@ async fn console_account_persists_across_restart() {
         Some(path.to_string_lossy().into_owned()),
     )
     .await;
-    let st = http(&addr2, "GET", "/api/auth/status", None, None).await.json();
+    let st = http(&addr2, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
     assert_eq!(st["mode"], "login");
     assert_eq!(st["username"], "admin");
     let r = http(
