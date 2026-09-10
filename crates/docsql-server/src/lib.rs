@@ -192,6 +192,17 @@ pub const FLAG_REPLICATION: u16 = 0x0002;
 /// loss window on power failure).
 const ASYNC_COMMIT_INTERVAL_MS: u64 = 2;
 
+/// One replication write acknowledged while the sync gate was open.
+#[derive(Debug, Clone)]
+pub struct QueuedWrite {
+    /// Journal origin and seq when the write arrived sequenced
+    /// (REQ_SQL_SEQ). The drain uses it to skip ops the adopted snapshot
+    /// already covers and to advance the origin's position as entries
+    /// apply; plain REQ_SQL re-fanouts (legacy peers) carry none.
+    pub origin: Option<(String, u64)>,
+    pub sql: String,
+}
+
 /// Join-intake queue state; see [ServerState::sync_queue]. Opens (closed =
 /// false) on a node that starts with peers configured — fresh (join
 /// bootstrap) or holding data (rejoin repair); every other node starts
@@ -199,7 +210,7 @@ const ASYNC_COMMIT_INTERVAL_MS: u64 = 2;
 #[derive(Default)]
 pub struct SyncGate {
     /// Replication writes acknowledged but not yet applied.
-    pub pending: Vec<String>,
+    pub pending: Vec<QueuedWrite>,
     /// True once bootstrap concluded: no more queuing, direct applies.
     pub closed: bool,
 }
@@ -835,7 +846,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             {
                                 let mut gate = state.sync_queue.lock().await;
                                 if !gate.closed {
-                                    gate.pending.push(sql.clone());
+                                    gate.pending.push(QueuedWrite {
+                                        origin: None,
+                                        sql: sql.clone(),
+                                    });
                                     Some(Frame::new(
                                         proto::RESP_AFFECTED,
                                         1u64.to_le_bytes().to_vec(),
@@ -896,24 +910,57 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // falls back to snapshot repair), never a missed one.
                     match parse_seq_frame(&frame.payload) {
                         Some((seq, node_id, sql)) => {
-                            let started = std::time::Instant::now();
-                            let resp = execute_sql(&state, &sql, false, true, None, false).await;
-                            if resp.frame_type != proto::RESP_ERROR {
-                                let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Err(e) = db.position_set(&node_id, seq) {
-                                    eprintln!("catchup position update failed: {e}");
+                            // Join intake: while the sync gate is open,
+                            // sequenced writes queue and are acknowledged
+                            // on the spot, exactly like plain REQ_SQL —
+                            // applying directly would land on a snapshot
+                            // that is still replaying (or abort the
+                            // bootstrap as seeming local data). The origin
+                            // rides along so the drain can skip ops the
+                            // snapshot already covers and keep the
+                            // position exact.
+                            let queued = if docsql_core::engine::Database::is_write_statement(&sql)
+                            {
+                                let mut gate = state.sync_queue.lock().await;
+                                if !gate.closed {
+                                    gate.pending.push(QueuedWrite {
+                                        origin: Some((node_id.clone(), seq)),
+                                        sql: sql.clone(),
+                                    });
+                                    Some(Frame::new(
+                                        proto::RESP_AFFECTED,
+                                        1u64.to_le_bytes().to_vec(),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            match queued {
+                                // Audited later by the drain replay.
+                                Some(f) => Some(f),
+                                None => {
+                                    let started = std::time::Instant::now();
+                                    let resp =
+                                        execute_sql(&state, &sql, false, true, None, false).await;
+                                    if resp.frame_type != proto::RESP_ERROR {
+                                        let mut db =
+                                            state.db.lock().unwrap_or_else(|p| p.into_inner());
+                                        advance_position(&mut db, &node_id, seq);
+                                    }
+                                    // Same audit trail as plain REQ_SQL applies.
+                                    querylog::record(
+                                        &state,
+                                        &peer,
+                                        &sql,
+                                        started.elapsed().as_secs_f64() * 1000.0,
+                                        &resp,
+                                        true,
+                                    );
+                                    Some(resp)
                                 }
                             }
-                            // Same audit trail as plain REQ_SQL applies.
-                            querylog::record(
-                                &state,
-                                &peer,
-                                &sql,
-                                started.elapsed().as_secs_f64() * 1000.0,
-                                &resp,
-                                true,
-                            );
-                            Some(resp)
                         }
                         None => Some(Frame::new(
                             proto::RESP_ERROR,
@@ -1532,6 +1579,15 @@ fn fanout_auth(state: &ServerState) -> Option<&str> {
 /// when journaling failed — peers then cannot place the op in the origin's
 /// journal and fall back to snapshot repair on divergence.
 async fn journal_local_write(state: &Arc<ServerState>, sql: &str) -> Option<u64> {
+    // No fan-out target (single node: no peers, no upstream): nobody can
+    // ever pull this journal, and appending is an engine write of its own
+    // — it would double every write's fsync cost for nothing. Peers
+    // arriving via a later config change re-enable journaling at that
+    // restart; convergence then runs through digest repair, whose
+    // snapshot fallback never needed the journal.
+    if state.replicate_to.lock().await.is_none() && state.peers.lock().await.is_empty() {
+        return None;
+    }
     let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
     match db.journal_append(sql) {
         Ok(seq) => {
@@ -1548,6 +1604,22 @@ async fn journal_local_write(state: &Arc<ServerState>, sql: &str) -> Option<u64>
         Err(e) => {
             eprintln!("catchup journal append failed: {e}");
             None
+        }
+    }
+}
+
+/// Advance an origin's position to `seq`, never backwards. Catch-up
+/// (records the served head after applying a batch) and live REQ_SQL_SEQ
+/// receipts interleave, and a late low seq must not roll the position
+/// back over an op already counted as applied — the next pull would
+/// replay it, error on duplicate keys, and degrade to snapshot repair.
+fn advance_position(db: &mut docsql_core::engine::Database, node_id: &str, seq: u64) {
+    match db.position_get(node_id) {
+        Ok(Some(pos)) if pos >= seq => {}
+        _ => {
+            if let Err(e) = db.position_set(node_id, seq) {
+                eprintln!("catchup position update failed: {e}");
+            }
         }
     }
 }
@@ -2466,7 +2538,7 @@ async fn apply_sync(
     peer: &str,
     heads: &[(String, u64)],
 ) -> JoinApply {
-    let Some(_order) = lock_engine_for_write(state).await else {
+    let Some(order) = lock_engine_for_write(state).await else {
         return JoinApply::Failed("timed out waiting for the open transaction".into());
     };
     {
@@ -2488,8 +2560,21 @@ async fn apply_sync(
             return JoinApply::Failed(format!("COMMIT: {e}"));
         }
     }
-    drain_sync_queue(state).await;
+    // Seed the probe-round heads before the drain: they predate the
+    // freeze, so every queued sequenced write at or under them is
+    // guaranteed to be inside the snapshot and the drain can skip it
+    // instead of replaying it onto its own copy (duplicate-key noise).
     seed_positions(state, heads);
+    drain_sync_queue(state).await;
+    // Free the write path before re-probing: the probes are network
+    // round-trips and must not stall client writes.
+    drop(order);
+    // Then raise the positions to the origins' current heads. The probe
+    // floor is stale by the whole transfer; leaving it low makes the
+    // next rejoin replay snapshot-covered ops, error, and degrade to the
+    // snapshot fallback — the incremental path would never engage after
+    // a join.
+    seed_fresh_positions(state).await;
     eprintln!("bootstrap sync from {peer} complete");
     querylog::sync_event(
         &state.sync_log,
@@ -2521,8 +2606,26 @@ async fn drain_sync_queue(state: &Arc<ServerState>) {
         if batch.is_empty() {
             return;
         }
-        for sql in batch {
-            let resp = execute_sql(state, &sql, false, true, None, true).await;
+        for q in batch {
+            // A sequenced write the adopted snapshot already covers (seq
+            // at or under the position seeded from the probe round) is
+            // skipped, not replayed — replaying it would only error on
+            // the snapshot's own rows. Applied sequenced writes advance
+            // their origin's position (apply-then-record, the same
+            // invariant the live REQ_SQL_SEQ path keeps).
+            if let Some((origin, seq)) = &q.origin {
+                let covered = {
+                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                    db.position_get(origin)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|pos| pos >= *seq)
+                };
+                if covered {
+                    continue;
+                }
+            }
+            let resp = execute_sql(state, &q.sql, false, true, None, true).await;
             if resp.frame_type == proto::RESP_ERROR {
                 let msg = String::from_utf8_lossy(&resp.payload).into_owned();
                 eprintln!("sync: queued replay failed: {msg}");
@@ -2530,12 +2633,16 @@ async fn drain_sync_queue(state: &Arc<ServerState>) {
                     &state.sync_log,
                     "bootstrap",
                     "",
-                    Some(&sql),
+                    Some(&q.sql),
                     false,
                     Some(msg),
                 );
             } else {
-                querylog::record(state, "sync", &sql, 0.0, &resp, true);
+                if let Some((origin, seq)) = &q.origin {
+                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                    advance_position(&mut db, origin, *seq);
+                }
+                querylog::record(state, "sync", &q.sql, 0.0, &resp, true);
             }
         }
     }
@@ -2739,10 +2846,14 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                         // postdate the pulled range), so drain before the
                         // digest re-check — otherwise the queued writes
                         // would read as divergence and trigger a snapshot.
-                        // NOTE: queued writes do not advance positions (a
-                        // position may lag its origin until the next pull;
-                        // replays are order-idempotent, and any residual
-                        // divergence still lands in the snapshot fallback).
+                        // Sequenced queued writes skip ops the pulled
+                        // range (or the seeded position) already covers
+                        // and advance positions as they apply; plain
+                        // queued writes replay as-is and leave positions
+                        // untouched (a position may lag its origin until
+                        // the next pull; replays are order-idempotent,
+                        // and any residual divergence still lands in the
+                        // snapshot fallback).
                         drain_sync_queue(&state).await;
                         // Fresh digest check: the mesh kept writing while
                         // the backlog replayed.
@@ -2923,24 +3034,48 @@ async fn run_catchup(state: &Arc<ServerState>, plan: &[CatchupTask]) -> Result<(
             .map_err(|e| format!("pull from {}: {e}", task.addr))?;
         {
             let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-            db.position_set(&task.node_id, head)
-                .map_err(|e| format!("position update: {e}"))?;
+            advance_position(&mut db, &task.node_id, head);
         }
     }
     Ok(())
 }
 
-/// After an adoption replaces the whole state, seed positions from the
-/// heads sampled during the probe round: the snapshot contains every op
-/// up to the freeze, and later writes arrive through the live fan-out
-/// with higher seqs. Origins that could not be probed stay position-less
-/// (no incremental trust) and are covered by snapshot repair.
+/// Seed the catch-up positions from the heads sampled during the probe
+/// round: they predate the snapshot freeze, so they are a conservative
+/// floor — everything at or under them is guaranteed to be inside the
+/// adopted snapshot, which lets the queue drain skip those sequenced
+/// writes. The floor is deliberately stale; seed_fresh_positions raises
+/// it to the origins' current heads once the snapshot and the queue
+/// landed. Origins that could not be probed stay position-less (no
+/// incremental trust) and are covered by snapshot repair.
 fn seed_positions(state: &Arc<ServerState>, heads: &[(String, u64)]) {
     let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
     for (node_id, head) in heads {
         if let Err(e) = db.position_set(node_id, *head) {
             eprintln!("catchup position seed failed: {e}");
         }
+    }
+}
+
+/// After a snapshot + queue replay landed, raise every origin's position
+/// to its journal head as of now (see apply_sync for why the probe-round
+/// floor must not survive). A freshly probed head can exceed what this
+/// node actually holds only when a fan-out was lost inside the transfer
+/// window — the same trust the live REQ_SQL_SEQ receipts already get,
+/// healed by digest repair on divergence. Probes that fail leave that
+/// origin's position untouched (no incremental trust).
+async fn seed_fresh_positions(state: &Arc<ServerState>) {
+    let peers = state.peers.lock().await.clone();
+    for peer in &peers {
+        let info = match probe_peer_info(state, peer).await {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+        let (Some(node_id), Some(head)) = (&info.node_id, info.journal_head) else {
+            continue;
+        };
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        advance_position(&mut db, node_id, head);
     }
 }
 
@@ -3036,15 +3171,17 @@ fn decide_repair(local: &[TableDigest], reports: &[(String, Vec<TableDigest>)]) 
 /// Inbound replication writes queue on the open sync gate meanwhile and
 /// replay in arrival order right after — snapshot < queued < direct is
 /// the total order (see [ServerState::sync_queue]). On success the
-/// catch-up positions are seeded from the probe-round journal heads, so
-/// later rejoins can pull increments instead of snapshots.
+/// catch-up positions are re-established: the probe-round floor seeds
+/// before the drain (letting it skip snapshot-covered sequenced writes),
+/// and the origins' freshly probed heads raise it afterwards, so later
+/// rejoins can pull increments instead of snapshots.
 async fn apply_repair_sync(
     state: &Arc<ServerState>,
     script: &str,
     peer: &str,
     heads: &[(String, u64)],
 ) -> JoinApply {
-    let Some(_order) = lock_engine_for_write(state).await else {
+    let Some(order) = lock_engine_for_write(state).await else {
         return JoinApply::Failed("timed out waiting for the open transaction".into());
     };
     {
@@ -3065,9 +3202,22 @@ async fn apply_repair_sync(
             let _ = db.execute("ROLLBACK");
             return JoinApply::Failed(format!("COMMIT: {e}"));
         }
+        // The adopted snapshot replaces the state the old positions
+        // described — drop them (a stale-high survivor would over-claim
+        // coverage of a snapshot that no longer contains those ops)
+        // before the floor and fresh-head re-seeding below.
+        if let Err(e) = db.positions_clear() {
+            eprintln!("repair position reset failed: {e}");
+        }
     }
-    drain_sync_queue(state).await;
+    // Probe-round floor before the drain, fresh heads after — same order
+    // and same reasoning as the join path (see apply_sync).
     seed_positions(state, heads);
+    drain_sync_queue(state).await;
+    // Free the write path before re-probing: the probes are network
+    // round-trips and must not stall client writes.
+    drop(order);
+    seed_fresh_positions(state).await;
     eprintln!("rejoin repair from {peer} complete");
     querylog::sync_event(
         &state.sync_log,
@@ -3230,6 +3380,16 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
         return;
     };
     const BUDGET: usize = 4 * 1024 * 1024;
+    // The terminating head is the position the requester will adopt, so
+    // it is sampled up front and the stream never serves past it: a head
+    // taken after the batches could cover entries appended while the pull
+    // ran, and the requester would count ops it never received (positions
+    // may lag, never lead). Anything committed past the head simply waits
+    // for the next pull.
+    let head = {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.journal_head().unwrap_or(0)
+    };
     let mut after = after;
     loop {
         let batch = {
@@ -3248,12 +3408,15 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
                 return;
             }
         };
-        if batch.is_empty() {
+        // Batches are seq-ordered, so the first entry past the sampled
+        // head ends both the batch and the pull.
+        let served = batch.iter().take_while(|(seq, _)| *seq <= head).count();
+        if served == 0 {
             break;
         }
         let mut idx = 0;
-        while idx < batch.len() {
-            let (payload, packed) = pack_catchup_entries(&batch[idx..], BUDGET);
+        while idx < served {
+            let (payload, packed) = pack_catchup_entries(&batch[idx..served], BUDGET);
             if tx
                 .send(Frame::new(proto::RESP_CATCHUP, payload))
                 .await
@@ -3263,13 +3426,11 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
             }
             idx += packed;
         }
+        if served < batch.len() {
+            break;
+        }
         after = batch.last().expect("non-empty batch").0;
     }
-    let head = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-        db.journal_head()
-    };
-    let head = head.unwrap_or(0);
     let _ = tx
         .send(Frame::new(
             proto::RESP_AFFECTED,

@@ -2566,6 +2566,194 @@ async fn catchup_falls_back_to_snapshot_after_window_trim() {
     b.abort();
 }
 
+/// A sequenced fan-out arriving while the joiner's sync gate is open must
+/// be queued and acknowledged — not applied directly over the
+/// still-replaying snapshot, where it would error ("no such table") and
+/// be lost despite the ack. After the join the write must have landed
+/// exactly once and its origin's position must have advanced with it.
+/// (Regression: REQ_SQL_SEQ used to bypass the gate entirely.)
+#[tokio::test]
+async fn sequenced_write_during_join_queues_instead_of_applying() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, d_addr) = (free(), free());
+    spawn_node(&dir, "sja", &a_addr, vec![], None).await;
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    for i in 0..50 {
+        ca.sql(&format!("INSERT INTO t VALUES ({i}, 'v{i}')")).await;
+    }
+    drop(ca);
+
+    // The joiner comes up with its gate open; the frame below is sent
+    // before its snapshot can have landed, so a direct apply would hit a
+    // database without the table at all.
+    spawn_node(&dir, "sjd", &d_addr, vec![a_addr.clone()], None).await;
+    let mut cd = Client::connect(&d_addr).await;
+    let mut sql = Vec::with_capacity(64);
+    sql.extend_from_slice(&7u64.to_le_bytes());
+    sql.extend_from_slice(&("test-origin".len() as u32).to_le_bytes());
+    sql.extend_from_slice(b"test-origin");
+    sql.extend_from_slice(&proto::encode_sql("INSERT INTO t VALUES (999, 'late')").unwrap());
+    let mut f = Frame::new(proto::REQ_SQL_SEQ, sql);
+    f.flags = docsql_server::FLAG_REPLICATION;
+    cd.send(&f).await;
+    let r = cd.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    drop(cd);
+
+    // The queued write replays after the snapshot and lands once.
+    assert!(
+        wait_seen_n(&d_addr, "SELECT v FROM t WHERE id = 999", "late", 400).await,
+        "queued sequenced write never replayed after the join"
+    );
+    assert!(
+        wait_seen_n(&d_addr, "SELECT COUNT(id) FROM t", "[[51]]", 200).await,
+        "joiner did not converge to snapshot + queued write"
+    );
+    // The drain records the origin's position (apply-then-record, same as
+    // the live path).
+    assert!(
+        wait_seen_n(
+            &d_addr,
+            "SELECT seq FROM _cluster_pos WHERE node_id = 'test-origin'",
+            "[[7]]",
+            200
+        )
+        .await,
+        "drained sequenced write did not advance its origin's position"
+    );
+}
+
+/// After a join the joiner's catch-up positions must equal the origins'
+/// current journal heads. The probe-round heads are stale by the whole
+/// snapshot transfer; leaving them low made the next rejoin replay
+/// snapshot-covered ops (duplicate-key errors) and degrade to snapshot
+/// adoption even when a cheap incremental pull would have sufficed.
+#[tokio::test]
+async fn joined_node_tracks_origin_head_and_rejoin_pulls_incrementally() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr, d_addr) = (free(), free(), free());
+    let a = spawn_node_handle(&dir, "jta", &a_addr, vec![b_addr.clone()]).await;
+    let b = spawn_node_handle(&dir, "jtb", &b_addr, vec![a_addr.clone()]).await;
+
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE t (id INT PRIMARY KEY)").await;
+    for i in 1..=30 {
+        ca.sql(&format!("INSERT INTO t VALUES ({i})")).await;
+    }
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM t", "[[30]]", 400).await,
+        "base rows did not reach b"
+    );
+
+    // d joins, then the mesh goes quiet: a's journal head freezes at 30.
+    let d = spawn_node_handle(&dir, "jtd", &d_addr, vec![a_addr.clone()]).await;
+    assert!(
+        wait_seen_n(&d_addr, "SELECT COUNT(id) FROM t", "[[30]]", 500).await,
+        "joiner did not converge"
+    );
+    let mut ca = Client::connect(&a_addr).await;
+    ca.send(&Frame::new(proto::REQ_STATUS, vec![])).await;
+    let r = ca.recv().await;
+    let v: serde_json::Value = serde_json::from_slice(&r.payload).unwrap();
+    let a_id = v["cluster_id"].as_str().expect("a reported cluster_id");
+    // The origin's journal head covers every write incl. the CREATE TABLE.
+    let rh = ca.sql("SELECT MAX(seq) FROM _cluster_log").await;
+    assert_eq!(rh.frame_type, proto::RESP_ROWS, "{}", payload_str(&rh));
+    let head = payload_str(&rh);
+    let head = head.trim_matches(|c: char| !c.is_ascii_digit()).to_string();
+    assert!(!head.is_empty(), "origin journal head unread: {head}");
+    let mut ok = false;
+    for _ in 0..200 {
+        let mut cd = Client::connect(&d_addr).await;
+        let r = cd
+            .sql(&format!(
+                "SELECT seq FROM _cluster_pos WHERE node_id = '{a_id}'"
+            ))
+            .await;
+        drop(cd);
+        if r.frame_type == proto::RESP_ROWS && payload_str(&r).contains(&format!("[[{head}]]")) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        ok,
+        "joiner's position ({head} expected) did not reach the origin's journal head"
+    );
+    drop(ca);
+
+    // d goes down; a writes a small gap on top.
+    d.abort();
+    wait_port_down(&d_addr).await;
+    let mut ca = Client::connect(&a_addr).await;
+    for i in 31..=33 {
+        ca.sql(&format!("INSERT INTO t VALUES ({i})")).await;
+    }
+    drop(ca);
+
+    // d rejoins: exactly that gap must pull incrementally (catchup), not
+    // via snapshot adoption (repair).
+    let d = spawn_node_handle(&dir, "jtd", &d_addr, vec![a_addr.clone()]).await;
+    assert!(
+        wait_seen_n(&d_addr, "SELECT COUNT(id) FROM t", "[[33]]", 400).await,
+        "rejoined node did not converge to the gap"
+    );
+    let logs = sync_log_text(&d_addr).await;
+    assert!(
+        logs.contains("\"event\":\"catchup\""),
+        "expected the rejoin to pull the gap incrementally: {logs}"
+    );
+    assert!(
+        !logs.contains("\"event\":\"repair\""),
+        "rejoin degraded to snapshot adoption despite fresh positions: {logs}"
+    );
+    a.abort();
+    b.abort();
+    d.abort();
+}
+
+/// A node with no fan-out target can never have its journal pulled, and
+/// appending is an engine write of its own: journaling there doubled
+/// every write's fsync cost for nothing. Regression: single-node writes
+/// must leave the catch-up journal empty.
+#[tokio::test]
+async fn single_node_does_not_journal_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+    drop(l);
+    spawn_node(&dir, "solo", &addr, vec![], None).await;
+
+    let mut c = Client::connect(&addr).await;
+    let r = c.sql("CREATE TABLE t (id INT PRIMARY KEY)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    for i in 1..=3 {
+        let r = c.sql(&format!("INSERT INTO t VALUES ({i})")).await;
+        assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    }
+    let r = c.sql("SELECT COUNT(*) FROM _cluster_log").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    assert!(
+        payload_str(&r).contains("[[0]]"),
+        "single-node writes must not journal: {}",
+        payload_str(&r)
+    );
+}
+
 /// Server with automatic backups enabled on a 1s cadence. Returns
 /// (data dir, default backup dir, addr) — the backup dir is derived from
 /// the db path exactly like production (`<db dir>/backups`).
@@ -2848,25 +3036,31 @@ async fn backup_restore_round_trip() {
         assert_eq!(r.frame_type, proto::RESP_ERROR, "expected refusal: {bad}");
     }
 
-    // Restore: acknowledged at once, outcome polled via list.
+    // Restore: acknowledged at once, outcome polled via list. The status
+    // reports progress: every statement of the script (DROP + CREATE +
+    // one INSERT per row) applied exactly once.
     let payload = format!(r#"{{"action":"restore","file":"{name}"}}"#);
     c.send(&Frame::new(proto::REQ_BACKUP, payload.into_bytes()))
         .await;
     let r = c.recv().await;
     assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
 
-    let mut done = false;
+    let mut applied = 0u64;
+    let mut total = 0u64;
     for _ in 0..250 {
         let v = backup_list(&addr, Some("s3cret")).await;
         if let Some(rs) = v["restore"].as_object() {
             if rs["running"] == false && rs["ok"] == true && rs["file"] == name {
-                done = true;
+                applied = rs["applied"].as_u64().unwrap_or(0);
+                total = rs["total"].as_u64().unwrap_or(0);
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(done, "restore never completed");
+    assert!(applied > 0, "restore never completed");
+    assert_eq!(applied, total, "progress != script size");
+    assert!(total >= 3, "suspiciously small script: {total} statements");
 
     // The dropped table is back with its backup rows...
     let r = c.sql("SELECT v FROM s WHERE id = 2").await;
