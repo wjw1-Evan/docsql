@@ -101,7 +101,7 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | docsql-server | TCP 服务器、认证、复制、持久化发布订阅(pub/sub) |
 | docsql-cli | 嵌入式 + 远程 shell |
 | docsql-web | Web 管理控制台(SSMS 风格 UI + REST API;纯管理工具,自身不存数据,所有数据操作连接指定节点执行) |
-| dotnet/ | Docsql.Client(ADO.NET)与 Docsql.EntityFrameworkCore |
+| dotnet/ | Docsql.Client(ADO.NET)与 Docsql.EntityFrameworkCore;示例:Docsql.Sample(ADO.NET 数据操作实例,连已运行节点)、Docsql.EfSample(EF Core 端到端) |
 
 ## 测试
 

@@ -128,6 +128,7 @@ target/                 # 构建产物(git 忽略)
 | `Docsql.EntityFrameworkCore` | 复用 SQLite 管线 + Docsql ADO.NET;`UseDocsql(connectionString)`;惰性建表/索引同步默认开启(`AutoCreate`/`SchemaSync`/`Infrastructure/`) |
 | `Docsql.Client.Tests` / `Docsql.EntityFrameworkCore.Tests` | xUnit 套件 |
 | `Docsql.EfSample` | 一键端到端示例 |
+| `Docsql.Sample` | ADO.NET 数据操作实例(连接已运行节点,不拉起进程):分章演示 CRUD/参数化与 CLR 类型/GUID 时序主键/事务与 SAVEPOINT/RETURNING/JOIN 聚合分页/文档式无 schema/DataReader/pub/sub 续传/错误处理与异步 |
 
 ## 关键内部机制
 
