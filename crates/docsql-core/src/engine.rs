@@ -39,6 +39,37 @@ const CATALOG_CHUNK: usize = PAGE_SIZE - CATALOG_HDR;
 /// `docsql_pubsub` view instead).
 pub const PUBSUB_TABLE: &str = "_pubsub_messages";
 
+/// System table backing catch-up replication (rejoin repair): every
+/// locally-committed write, in commit order, with a node-local monotonic
+/// `seq`. Peers record the last seq they applied per origin (see
+/// [`Database::position_set`]) and pull the range after it when they
+/// rejoin — sync exactly what's missing instead of adopting a full
+/// snapshot. Node-local by design: an op's canonical sequence is its
+/// origin's.
+pub const CLUSTER_LOG_TABLE: &str = "_cluster_log";
+
+/// System table backing catch-up replication positions: per origin node
+/// id, the last applied journal seq. Updated right after each applied
+/// replicated write; a crash between apply and update leaves the position
+/// behind the data, so a later catch-up replays an already-applied op —
+/// that errors, and the repair falls back to a full snapshot (the safe
+/// direction: positions can only lag the data, never lead it).
+pub const CLUSTER_POS_TABLE: &str = "_cluster_pos";
+
+/// System table holding this node's persistent random identity: the key
+/// positions are stored under, stable across restarts and independent of
+/// reachable addresses.
+pub const CLUSTER_ID_TABLE: &str = "_cluster_id";
+
+/// True for the engine-managed system tables: excluded from user-facing
+/// catalogs, digests, dumps and snapshot wipes.
+pub fn is_system_table(name: &str) -> bool {
+    name == PUBSUB_TABLE
+        || name == CLUSTER_LOG_TABLE
+        || name == CLUSTER_POS_TABLE
+        || name == CLUSTER_ID_TABLE
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
     #[error("heap error: {0}")]
@@ -350,6 +381,14 @@ pub struct Database {
     /// be re-derived on peers the way AUTOINCREMENT's deterministic max+1
     /// can. Reset at the start of every statement; see `take_resolved_insert`.
     resolved_insert: Option<String>,
+    /// Next seq for the catch-up journal ([`Database::journal_append`]).
+    /// Seeded lazily from MAX(seq)+1 (in-memory counter under the write
+    /// lock; gaps from failed statements are harmless — positions pull
+    /// ranges, not counts).
+    journal_next: Option<u64>,
+    /// This node's persistent random identity (see CLUSTER_ID_TABLE),
+    /// cached after first read.
+    cluster_id: Option<String>,
 }
 
 impl Database {
@@ -561,6 +600,8 @@ impl Database {
             ctes: std::collections::BTreeMap::new(),
             autoinc_cache: std::collections::HashMap::new(),
             resolved_insert: None,
+            journal_next: None,
+            cluster_id: None,
         })
     }
 
@@ -1092,7 +1133,7 @@ impl Database {
         let mut names: Vec<String> = self
             .tables
             .keys()
-            .filter(|n| *n != PUBSUB_TABLE)
+            .filter(|n| !is_system_table(n))
             .cloned()
             .collect();
         names.sort();
@@ -1128,9 +1169,212 @@ impl Database {
     /// removal order satisfies DROP's "referenced by FOREIGN KEY" check
     /// for every mixed state (cycles included). Runs inside the
     /// caller's transaction — rollback restores the pre-wipe catalog.
+    /// Engine-managed system tables survive: the journal and positions
+    /// describe stream-applied ops, which the snapshot adoption
+    /// accounting (positions reset to the sampled heads) keeps valid.
     pub fn wipe_user_tables(&mut self) -> Result<()> {
-        self.tables.retain(|name, _| name == PUBSUB_TABLE);
+        self.tables.retain(|name, _| is_system_table(name));
         self.save_catalog()
+    }
+
+    // ---- catch-up replication: journal + positions ----
+
+    /// Create the catch-up system tables if missing. Called by the server
+    /// at startup, before any journal or position access.
+    pub fn ensure_cluster_tables(&mut self) -> Result<()> {
+        if self.tables.contains_key(CLUSTER_LOG_TABLE)
+            && self.tables.contains_key(CLUSTER_POS_TABLE)
+            && self.tables.contains_key(CLUSTER_ID_TABLE)
+        {
+            return Ok(());
+        }
+        self.execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {CLUSTER_LOG_TABLE} (seq INT PRIMARY KEY, sql TEXT)"
+        ))?;
+        self.execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {CLUSTER_POS_TABLE} (node_id TEXT PRIMARY KEY, seq INT)"
+        ))?;
+        self.execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {CLUSTER_ID_TABLE} (id TEXT)"
+        ))?;
+        Ok(())
+    }
+
+    /// This node's persistent random identity: the key other nodes store
+    /// this node's journal position under. Generated once, then stable.
+    pub fn cluster_id(&mut self) -> Result<String> {
+        self.ensure_cluster_tables()?;
+        if let Some(id) = &self.cluster_id {
+            return Ok(id.clone());
+        }
+        let existing = self.execute(&format!("SELECT id FROM {CLUSTER_ID_TABLE} LIMIT 1"))?;
+        if let ExecOutcome::Rows(r) = existing {
+            if let Some(row) = r.rows.first() {
+                if let Some(Value::Str(id)) = row.first() {
+                    self.cluster_id = Some(id.clone());
+                    return Ok(id.clone());
+                }
+            }
+        }
+        let id = crate::guid::uuidv7();
+        self.execute(&format!(
+            "INSERT INTO {CLUSTER_ID_TABLE} VALUES ({})",
+            value_literal(&Value::Str(id.clone()))?
+        ))?;
+        self.cluster_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append one locally-committed write to the journal and return its
+    /// seq. Call immediately after the write commits, before fanning out:
+    /// the entry then exists for every peer that ever pulls catch-up,
+    /// whatever happens to the fan-out itself. The insert is its own
+    /// statement (a crash between the data commit and this append loses
+    /// the entry — the repair's digest re-check catches the resulting
+    /// divergence and falls back to a snapshot).
+    pub fn journal_append(&mut self, sql: &str) -> Result<u64> {
+        self.ensure_cluster_tables()?;
+        let next = match self.journal_next {
+            Some(n) => n,
+            None => {
+                let r = self.execute(&format!("SELECT MAX(seq) FROM {CLUSTER_LOG_TABLE}"))?;
+                let max = match r {
+                    ExecOutcome::Rows(rows) => rows
+                        .rows
+                        .first()
+                        .and_then(|row| row.first())
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                (max as u64) + 1
+            }
+        };
+        self.execute(&format!(
+            "INSERT INTO {CLUSTER_LOG_TABLE} (seq, sql) VALUES ({next}, {})",
+            value_literal(&Value::Str(sql.to_string()))?
+        ))?;
+        self.journal_next = Some(next + 1);
+        Ok(next)
+    }
+
+    /// Highest journal seq (0 when empty).
+    pub fn journal_head(&mut self) -> Result<u64> {
+        self.ensure_cluster_tables()?;
+        let r = self.execute(&format!("SELECT MAX(seq) FROM {CLUSTER_LOG_TABLE}"))?;
+        Ok(match r {
+            ExecOutcome::Rows(rows) => rows
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Value::as_i64)
+                .unwrap_or(0) as u64,
+            _ => 0,
+        })
+    }
+
+    /// Lowest journal seq still retained (0 when empty). A position below
+    /// this minus one means the needed range was trimmed away and the
+    /// peer must fall back to a full snapshot.
+    pub fn journal_oldest(&mut self) -> Result<u64> {
+        self.ensure_cluster_tables()?;
+        let r = self.execute(&format!("SELECT MIN(seq) FROM {CLUSTER_LOG_TABLE}"))?;
+        Ok(match r {
+            ExecOutcome::Rows(rows) => rows
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Value::as_i64)
+                .unwrap_or(0) as u64,
+            _ => 0,
+        })
+    }
+
+    /// Journal entries with seq > `after`, in order, capped at `limit`
+    /// entries per call. Callers loop, advancing `after` to the last
+    /// returned seq, until the result is empty.
+    pub fn journal_range(&mut self, after: u64, limit: usize) -> Result<Vec<(u64, String)>> {
+        self.ensure_cluster_tables()?;
+        let r = self.execute(&format!(
+            "SELECT seq, sql FROM {CLUSTER_LOG_TABLE} WHERE seq > {after} \
+             ORDER BY seq ASC LIMIT {limit}"
+        ))?;
+        let mut out = Vec::new();
+        if let ExecOutcome::Rows(rows) = r {
+            for row in &rows.rows {
+                let (Some(Value::Int(seq)), Some(Value::Str(sql))) = (row.first(), row.get(1))
+                else {
+                    return err("journal row has unexpected shape");
+                };
+                out.push((*seq as u64, sql.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop journal entries beyond the newest `keep` — the catch-up
+    /// window. Peers positioned older than the window's start fall back
+    /// to a full snapshot. `keep == 0` keeps everything.
+    pub fn journal_trim(&mut self, keep: u64) -> Result<()> {
+        self.ensure_cluster_tables()?;
+        if keep == 0 {
+            return Ok(());
+        }
+        let head = self.journal_head()?;
+        if head <= keep {
+            return Ok(());
+        }
+        self.execute(&format!(
+            "DELETE FROM {CLUSTER_LOG_TABLE} WHERE seq <= {}",
+            head - keep
+        ))
+        .map(|_| ())
+    }
+
+    /// Last applied journal seq for the origin `node_id`.
+    pub fn position_get(&mut self, node_id: &str) -> Result<Option<u64>> {
+        self.ensure_cluster_tables()?;
+        let r = self.execute(&format!(
+            "SELECT seq FROM {CLUSTER_POS_TABLE} WHERE node_id = {}",
+            value_literal(&Value::Str(node_id.to_string()))?
+        ))?;
+        Ok(match r {
+            ExecOutcome::Rows(rows) => rows
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Value::as_i64)
+                .map(|s| s as u64),
+            _ => None,
+        })
+    }
+
+    /// Record that everything up to `seq` from origin `node_id` is
+    /// applied here. Called after a replicated write commits (advancing)
+    /// and after an adoption samples the origin's head (establishing).
+    pub fn position_set(&mut self, node_id: &str, seq: u64) -> Result<()> {
+        self.ensure_cluster_tables()?;
+        let key = value_literal(&Value::Str(node_id.to_string()))?;
+        let updated = match self.execute(&format!(
+            "UPDATE {CLUSTER_POS_TABLE} SET seq = {seq} WHERE node_id = {key}"
+        ))? {
+            ExecOutcome::Affected(n) => n,
+            ExecOutcome::Rows(_) => 0,
+        };
+        if updated == 0 {
+            self.execute(&format!(
+                "INSERT INTO {CLUSTER_POS_TABLE} (node_id, seq) VALUES ({key}, {seq})"
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Forget all positions: used when an adoption replaces the state in
+    /// a way the sampled heads cannot account for.
+    pub fn positions_clear(&mut self) -> Result<()> {
+        self.ensure_cluster_tables()?;
+        self.execute(&format!("DELETE FROM {CLUSTER_POS_TABLE}"))
+            .map(|_| ())
     }
 
     /// Full logical dump as a SQL script: all DDL first, then all data.
@@ -1145,7 +1389,7 @@ impl Database {
         let names: Vec<String> = self
             .tables
             .keys()
-            .filter(|n| *n != PUBSUB_TABLE)
+            .filter(|n| !is_system_table(n))
             .cloned()
             .collect();
         let mut ddl = String::new();
@@ -10323,5 +10567,83 @@ mod complex_query_tests {
             !stale.catalog().iter().any(|t| t.name == "extra"),
             "table absent from the snapshot must go"
         );
+    }
+
+    #[test]
+    fn catchup_journal_and_positions_round_trip() {
+        let mut a = Database::in_memory().unwrap();
+        let id = a.cluster_id().unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(a.cluster_id().unwrap(), id, "identity is stable");
+        let s1 = a.journal_append("INSERT INTO t VALUES (1)").unwrap();
+        let s2 = a.journal_append("UPDATE t SET v = 2").unwrap();
+        assert_eq!(s2, s1 + 1, "seqs are consecutive");
+        assert_eq!(a.journal_head().unwrap(), s2);
+        assert_eq!(a.journal_oldest().unwrap(), s1);
+        let range = a.journal_range(s1 - 1, 10).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].0, s1);
+        assert!(range[0].1.contains("INSERT INTO t"));
+        assert!(
+            a.journal_range(s2, 10).unwrap().is_empty(),
+            "range is exclusive of `after`"
+        );
+        // Positions round-trip per origin and advance in place.
+        assert_eq!(a.position_get("origin-1").unwrap(), None);
+        a.position_set("origin-1", 7).unwrap();
+        a.position_set("origin-2", 9).unwrap();
+        assert_eq!(a.position_get("origin-1").unwrap(), Some(7));
+        a.position_set("origin-1", 8).unwrap();
+        assert_eq!(a.position_get("origin-1").unwrap(), Some(8));
+        a.positions_clear().unwrap();
+        assert_eq!(a.position_get("origin-2").unwrap(), None);
+        // Trim keeps exactly the newest `keep` entries.
+        a.journal_trim(1).unwrap();
+        assert_eq!(a.journal_head().unwrap(), s2);
+        assert_eq!(a.journal_oldest().unwrap(), s2);
+        assert_eq!(a.journal_range(0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn system_tables_are_excluded_from_user_surfaces() {
+        let mut db = Database::in_memory().unwrap();
+        db.ensure_cluster_tables().unwrap();
+        run(&mut db, "CREATE TABLE user_t (id INT)");
+        db.journal_append("INSERT INTO user_t VALUES (1)").unwrap();
+        let d = db.digests().unwrap();
+        assert_eq!(d.len(), 1, "only user_t: {d:?}");
+        let script = db.dump_script().unwrap();
+        assert!(!script.contains("_cluster_log"), "{script}");
+        assert!(!script.contains("_cluster_pos"), "{script}");
+        run(&mut db, "BEGIN");
+        db.wipe_user_tables().unwrap();
+        run(&mut db, "COMMIT");
+        assert!(
+            db.catalog().iter().all(|t| is_system_table(&t.name)),
+            "wipe keeps system tables, got {:?}",
+            db.catalog()
+        );
+    }
+
+    #[test]
+    fn journal_and_positions_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.db");
+        let (id, seq) = {
+            let mut db = Database::open(&path).unwrap();
+            db.ensure_cluster_tables().unwrap();
+            let id = db.cluster_id().unwrap();
+            let seq = db.journal_append("INSERT INTO t VALUES (1)").unwrap();
+            db.position_set("origin-x", 42).unwrap();
+            (id, seq)
+        };
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.cluster_id().unwrap(), id, "identity persists");
+        assert_eq!(
+            db.journal_append("INSERT INTO t VALUES (2)").unwrap(),
+            seq + 1,
+            "journal seq continues after reopen"
+        );
+        assert_eq!(db.position_get("origin-x").unwrap(), Some(42));
     }
 }

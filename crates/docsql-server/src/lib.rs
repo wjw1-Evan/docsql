@@ -120,6 +120,13 @@ pub struct ServerState {
     /// Live pub/sub subscribers (messages persist in the engine's
     /// `_pubsub_messages` table; this tracks who gets pushed).
     pub pubsub: pubsub::PubSub,
+    /// This node's persistent random identity (see CLUSTER_ID_TABLE):
+    /// sent with every sequenced replication write so peers can record
+    /// catch-up positions under a stable key.
+    pub cluster_id: String,
+    /// Catch-up journal window in entries (0 = unbounded); the journal
+    /// is trimmed periodically as it grows past this.
+    pub catchup_window: u64,
     /// Data file location (status reports its size on disk).
     pub db_path: PathBuf,
     /// Server start time (status reports uptime).
@@ -238,6 +245,11 @@ pub struct ServerConfig {
     /// background flusher batches fsyncs every ~2ms (MongoDB-style
     /// journal interval). Bounded loss window on power failure.
     pub async_commit: bool,
+    /// Catch-up journal window in entries: how many locally-committed
+    /// writes `_cluster_log` retains for rejoined peers to incrementally
+    /// catch up (DOCSQL_CATCHUP_WINDOW). A peer positioned older than the
+    /// window falls back to a full snapshot. 0 = unbounded.
+    pub catchup_window: u64,
 }
 
 pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
@@ -246,6 +258,15 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     db.set_async_commit(cfg.async_commit);
     pubsub::ensure_table(&mut db)
         .map_err(|e| std::io::Error::other(format!("pubsub store: {e}")))?;
+    db.ensure_cluster_tables()
+        .map_err(|e| std::io::Error::other(format!("catchup store: {e}")))?;
+    if cfg.catchup_window > 0 {
+        db.journal_trim(cfg.catchup_window)
+            .map_err(|e| std::io::Error::other(format!("catchup trim: {e}")))?;
+    }
+    let cluster_id = db
+        .cluster_id()
+        .map_err(|e| std::io::Error::other(format!("cluster id: {e}")))?;
     // Drop peer entries that point at ourselves: forwarding to self would
     // double-apply every write locally.
     let peers: Vec<String> = cfg
@@ -276,7 +297,11 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     // concludes, so replication writes arriving mid-flow queue and land
     // after the snapshot — snapshot < queued < direct is the total order.
     let peers_configured = !peers.is_empty();
-    let fresh = peers_configured && !db.catalog().iter().any(|t| t.name != pubsub::PUBSUB_TABLE);
+    let fresh = peers_configured
+        && !db
+            .catalog()
+            .iter()
+            .any(|t| !docsql_core::engine::is_system_table(&t.name));
     let state = Arc::new(ServerState {
         db: Mutex::new(db),
         auth_token: cfg.auth_token,
@@ -306,6 +331,8 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         query_log: querylog::QueryLog::new(),
         sync_log: querylog::SyncLog::new(1000),
         pubsub: pubsub::PubSub::new(),
+        cluster_id,
+        catchup_window: cfg.catchup_window,
         db_path: cfg.db_path,
         started: std::time::Instant::now(),
     });
@@ -818,6 +845,45 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     }
                     Some(resp)
                 }
+                proto::REQ_SQL_SEQ if authed && frame.flags & FLAG_REPLICATION != 0 => {
+                    // Sequenced replication write: apply it like any
+                    // replicated write, then record (origin node_id, seq)
+                    // so a rejoin can pull exactly the ops it missed. The
+                    // position update is a separate commit — a crash in
+                    // between leaves the position behind the data, which
+                    // only ever causes a redundant replay (an error that
+                    // falls back to snapshot repair), never a missed one.
+                    match parse_seq_frame(&frame.payload) {
+                        Some((seq, node_id, sql)) => {
+                            let started = std::time::Instant::now();
+                            let resp = execute_sql(&state, &sql, false, true, None, false).await;
+                            if resp.frame_type != proto::RESP_ERROR {
+                                let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Err(e) = db.position_set(&node_id, seq) {
+                                    eprintln!("catchup position update failed: {e}");
+                                }
+                            }
+                            // Same audit trail as plain REQ_SQL applies.
+                            querylog::record(
+                                &state,
+                                &peer,
+                                &sql,
+                                started.elapsed().as_secs_f64() * 1000.0,
+                                &resp,
+                                true,
+                            );
+                            Some(resp)
+                        }
+                        None => Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("malformed REQ_SQL_SEQ payload"),
+                        )),
+                    }
+                }
+                proto::REQ_CATCHUP if authed && frame.flags & FLAG_REPLICATION != 0 => {
+                    handle_catchup(&state, &frame, &tx).await;
+                    None
+                }
                 proto::REQ_PUBLISH if authed => Some(handle_publish(&state, &frame).await),
                 proto::REQ_SUBSCRIBE if authed => {
                     handle_subscribe(&state, conn_id, &frame, &tx, pubsub::SubKind::Channel).await;
@@ -939,8 +1005,9 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
     let mut total_rows = 0u64;
     let mut user_tables = 0usize;
     for t in &db.catalog() {
-        // The pubsub backing table is system storage, not a user object.
-        if t.name == pubsub::PUBSUB_TABLE {
+        // The pubsub backing table and the catch-up journal/positions are
+        // system storage, not user objects.
+        if docsql_core::engine::is_system_table(&t.name) {
             continue;
         }
         user_tables += 1;
@@ -971,6 +1038,9 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         },
         "durable_lsn": db.durable_lsn(),
         "totals": {"tables": user_tables, "rows": total_rows},
+        "cluster_id": state.cluster_id,
+        "journal_head": db.journal_head().unwrap_or(0),
+        "journal_oldest": db.journal_oldest().unwrap_or(0),
     })
 }
 
@@ -1016,7 +1086,7 @@ async fn execute_sql(
 ) -> Frame {
     if !allow_system_table && sql.to_ascii_lowercase().contains(pubsub::PUBSUB_TABLE) {
         // Catalog views (information_schema / sqlite_master) only read
-        // metadata — allow them to mention the system table.
+        // metadata — allow them to mention the pubsub backing store.
         let lower = sql.to_ascii_lowercase();
         let catalog_read = lower.trim_start().starts_with("select")
             && (lower.contains("information_schema") || lower.contains("sqlite_master"));
@@ -1027,6 +1097,18 @@ async fn execute_sql(
                     "system table _pubsub_messages is internal: \
                      query the docsql_pubsub view, trim with PUBSUB TRIM",
                 ),
+            );
+        }
+    }
+    for internal in [
+        docsql_core::engine::CLUSTER_LOG_TABLE,
+        docsql_core::engine::CLUSTER_POS_TABLE,
+        docsql_core::engine::CLUSTER_ID_TABLE,
+    ] {
+        if sql.to_ascii_lowercase().contains(internal) {
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload("system table is internal to catch-up replication"),
             );
         }
     }
@@ -1194,7 +1276,11 @@ async fn execute_sql(
                         .writes
                         .push(forward.to_string());
                 } else {
-                    forward_sql_all(state, forward).await;
+                    // Journal the committed write so rejoined peers can
+                    // pull exactly it later, then fan out carrying the
+                    // journal seq (their positions advance with it).
+                    let seq = journal_local_write(state, forward).await;
+                    forward_sql_all(state, forward, seq).await;
                 }
             }
             _ => {}
@@ -1317,13 +1403,42 @@ async fn send_frame_on(
 async fn forward_write(
     target: &str,
     sql: &str,
+    seq: Option<u64>,
+    node_id: &str,
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
 ) -> std::io::Result<()> {
-    let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
-    forward_frame(target, proto::REQ_SQL, &payload, key, auth)
-        .await
-        .map(|_| ())
+    match seq {
+        None => {
+            let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
+            forward_frame(target, proto::REQ_SQL, &payload, key, auth)
+                .await
+                .map(|_| ())
+        }
+        Some(seq) => {
+            // Sequenced fan-out: the receiver records the position so a
+            // later rejoin can pull exactly the ops it missed. Peers
+            // predating REQ_SQL_SEQ reject the frame; fall back to the
+            // legacy plain-SQL write (catch-up then never trusts that
+            // peer's position, which is the safe direction).
+            let mut payload = Vec::with_capacity(sql.len() + 64);
+            payload.extend_from_slice(&seq.to_le_bytes());
+            payload.extend_from_slice(&(node_id.len() as u32).to_le_bytes());
+            payload.extend_from_slice(node_id.as_bytes());
+            payload.extend_from_slice(&proto::encode_sql(sql).map_err(std::io::Error::other)?);
+            let sequenced = forward_frame(target, proto::REQ_SQL_SEQ, &payload, key, auth).await;
+            match sequenced {
+                Ok(resp) if resp.frame_type == proto::RESP_ERROR => {
+                    let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
+                    forward_frame(target, proto::REQ_SQL, &payload, key, auth)
+                        .await
+                        .map(|_| ())
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
 }
 
 /// One-shot (connect, auth, send, read response) replication frame.
@@ -1360,7 +1475,33 @@ fn fanout_auth(state: &ServerState) -> Option<&str> {
 /// shows the replication trail (target, statement, ok/error). Per-target
 /// ordering is untouched: fan-out runs under `write_order`, so the next
 /// write's fan-out only starts after this one finished everywhere.
-pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str) {
+/// Journal one locally-committed write (autocommit path: the write has
+/// already committed when this runs; the drained-transaction path calls
+/// it per buffered write after COMMIT). Returns the journal seq, or None
+/// when journaling failed — peers then cannot place the op in the origin's
+/// journal and fall back to snapshot repair on divergence.
+async fn journal_local_write(state: &Arc<ServerState>, sql: &str) -> Option<u64> {
+    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    match db.journal_append(sql) {
+        Ok(seq) => {
+            // Amortized window trim: keep the journal bounded so positions
+            // older than the window force snapshot fallback instead of
+            // unbounded growth.
+            if state.catchup_window > 0 && seq % 512 == 0 {
+                if let Err(e) = db.journal_trim(state.catchup_window) {
+                    eprintln!("catchup journal trim failed: {e}");
+                }
+            }
+            Some(seq)
+        }
+        Err(e) => {
+            eprintln!("catchup journal append failed: {e}");
+            None
+        }
+    }
+}
+
+pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u64>) {
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
     let mut targets: Vec<String> = Vec::new();
@@ -1372,8 +1513,10 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str) {
     for target in targets {
         let sql = sql.to_string();
         let auth = auth.clone();
+        let node_id = state.cluster_id.clone();
         tasks.spawn(async move {
-            let res = forward_write(&target, &sql, key.as_ref(), auth.as_deref()).await;
+            let res =
+                forward_write(&target, &sql, seq, &node_id, key.as_ref(), auth.as_deref()).await;
             (target, sql, res)
         });
     }
@@ -1406,7 +1549,8 @@ pub async fn drain_tx_pending(state: &Arc<ServerState>) {
     pending.marks.clear();
     drop(pending);
     for sql in &writes {
-        forward_sql_all(state, sql).await;
+        let seq = journal_local_write(state, sql).await;
+        forward_sql_all(state, sql, seq).await;
     }
 }
 
@@ -1865,7 +2009,9 @@ const SYNC_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 
 /// True when the database holds anything beyond the pubsub system table.
 fn has_user_tables(db: &Database) -> bool {
-    db.catalog().iter().any(|t| t.name != pubsub::PUBSUB_TABLE)
+    db.catalog()
+        .iter()
+        .any(|t| !docsql_core::engine::is_system_table(&t.name))
 }
 
 /// Why a REQ_HOLD did not grant. `Unreachable` means the peer could not be
@@ -2263,7 +2409,12 @@ async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<S
 /// rolls back and leaves the node fresh for the next attempt). On success
 /// the join-intake queue replays right after the dump (still under the
 /// write path) and the gate closes.
-async fn apply_sync(state: &Arc<ServerState>, script: &str, peer: &str) -> JoinApply {
+async fn apply_sync(
+    state: &Arc<ServerState>,
+    script: &str,
+    peer: &str,
+    heads: &[(String, u64)],
+) -> JoinApply {
     let Some(_order) = lock_engine_for_write(state).await else {
         return JoinApply::Failed("timed out waiting for the open transaction".into());
     };
@@ -2287,6 +2438,7 @@ async fn apply_sync(state: &Arc<ServerState>, script: &str, peer: &str) -> JoinA
         }
     }
     drain_sync_queue(state).await;
+    seed_positions(state, heads);
     eprintln!("bootstrap sync from {peer} complete");
     querylog::sync_event(
         &state.sync_log,
@@ -2357,23 +2509,30 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
     for _round in 0..SYNC_ROUNDS {
         let mut saw_data = false;
         let mut saw_empty = false;
+        let mut heads: Vec<(String, u64)> = Vec::new();
         for peer in &peers {
-            match probe_peer_tables(&state, peer).await {
-                Ok(n) if n > 0 => {
-                    saw_data = true;
-                    match join_from(&state, peer).await {
-                        JoinApply::Applied => return,
-                        JoinApply::LocalData => {
-                            drain_sync_queue(&state).await;
-                            return;
+            match probe_peer_info(&state, peer).await {
+                Ok(info) => {
+                    if let (Some(node_id), Some(head)) = (&info.node_id, info.journal_head) {
+                        heads.push((node_id.clone(), head));
+                    }
+                    if info.tables > 0 {
+                        saw_data = true;
+                        match join_from(&state, peer, &heads).await {
+                            JoinApply::Applied => return,
+                            JoinApply::LocalData => {
+                                drain_sync_queue(&state).await;
+                                return;
+                            }
+                            JoinApply::Failed(e) => {
+                                eprintln!("bootstrap sync from {peer} failed: {e}");
+                                last_err = e;
+                            }
                         }
-                        JoinApply::Failed(e) => {
-                            eprintln!("bootstrap sync from {peer} failed: {e}");
-                            last_err = e;
-                        }
+                    } else {
+                        saw_empty = true;
                     }
                 }
-                Ok(_) => saw_empty = true,
                 Err(e) => {
                     eprintln!("bootstrap probe of {peer} failed: {e}");
                     last_err = e.to_string();
@@ -2411,12 +2570,12 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
 }
 
 /// Pull and apply the cluster state from one peer.
-async fn join_from(state: &Arc<ServerState>, peer: &str) -> JoinApply {
+async fn join_from(state: &Arc<ServerState>, peer: &str, heads: &[(String, u64)]) -> JoinApply {
     let script = match request_sync(state, peer).await {
         Ok(s) => s,
         Err(e) => return JoinApply::Failed(e.to_string()),
     };
-    apply_sync(state, &script, peer).await
+    apply_sync(state, &script, peer, heads).await
 }
 
 /// Rejoin-repair rounds before giving up. Must outlast a peer's own
@@ -2454,22 +2613,35 @@ const REPAIR_ROUNDS: usize = 20;
 /// copy of data must not erase it because every peer lost theirs.
 async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
     for round in 0..REPAIR_ROUNDS {
+        // Probe every peer for digests + journal info, concurrently.
         let mut probes = Vec::new();
         for peer in &peers {
             let st = state.clone();
             let target = peer.clone();
             probes.push(tokio::spawn(async move {
-                (target.clone(), probe_peer_digests(&st, &target).await)
+                let digests = probe_peer_digests(&st, &target).await;
+                let info = probe_peer_info(&st, &target).await;
+                (target, digests, info)
             }));
         }
         let mut reports: Vec<(String, Vec<TableDigest>)> = Vec::new();
+        let mut infos: Vec<(String, PeerInfo)> = Vec::new();
         for probe in probes {
             match probe.await {
-                Ok((peer, Ok(digests))) => reports.push((peer, digests)),
-                Ok((peer, Err(e))) => {
+                Ok((peer, Ok(digests), Ok(info))) => {
+                    reports.push((peer.clone(), digests));
+                    infos.push((peer, info));
+                }
+                Ok((peer, Ok(digests), Err(e))) => {
+                    // Digests arrived, journal info did not: this peer can
+                    // still serve a snapshot, never incremental catch-up.
+                    eprintln!("repair: journal probe of {peer} failed: {e}");
+                    reports.push((peer, digests));
+                }
+                Ok((peer, Err(e), _)) => {
                     eprintln!("repair: digest probe of {peer} failed: {e}");
                 }
-                Err(e) => eprintln!("repair: digest probe task failed: {e}"),
+                Err(e) => eprintln!("repair: probe task failed: {e}"),
             }
         }
         if reports.is_empty() {
@@ -2491,6 +2663,101 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                 break;
             }
         };
+        if reports.iter().any(|(_, d)| d == &local) {
+            drain_sync_queue(&state).await;
+            return;
+        }
+
+        // Phase 1 — incremental catch-up ("sync exactly what's missing"):
+        // when every peer reports its journal window and every position is
+        // known and inside it, pull the missed op ranges and re-check.
+        let plan = catchup_plan(&state, &infos).await;
+        match &plan {
+            Some(plan) if !plan.is_empty() => {
+                let total: u64 = plan.iter().map(|t| t.to - t.from).sum();
+                eprintln!(
+                    "rejoin repair (round {}): pulling {} missed op(s) from {} origin journal(s)",
+                    round + 1,
+                    total,
+                    plan.len()
+                );
+                match run_catchup(&state, plan).await {
+                    Ok(()) => {
+                        // Landing the backlog lets the live writes queued on
+                        // the open gate apply right after it (their seqs
+                        // postdate the pulled range), so drain before the
+                        // digest re-check — otherwise the queued writes
+                        // would read as divergence and trigger a snapshot.
+                        // NOTE: queued writes do not advance positions (a
+                        // position may lag its origin until the next pull;
+                        // replays are order-idempotent, and any residual
+                        // divergence still lands in the snapshot fallback).
+                        drain_sync_queue(&state).await;
+                        // Fresh digest check: the mesh kept writing while
+                        // the backlog replayed.
+                        let mut fresh_probes = Vec::new();
+                        for peer in &peers {
+                            let st = state.clone();
+                            let target = peer.clone();
+                            fresh_probes.push(tokio::spawn(async move {
+                                let d = probe_peer_digests(&st, &target).await;
+                                (target, d)
+                            }));
+                        }
+                        let mut fresh: Vec<(String, Vec<TableDigest>)> = Vec::new();
+                        for probe in fresh_probes {
+                            if let Ok((peer, Ok(d))) = probe.await {
+                                fresh.push((peer, d));
+                            }
+                        }
+                        let fresh_local = {
+                            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                            db.digests()
+                        };
+                        if let Ok(fresh_local) = fresh_local {
+                            if fresh.iter().any(|(_, d)| d == &fresh_local) {
+                                eprintln!(
+                                    "rejoin repair: incremental catch-up complete — \
+                                     cluster converged without a snapshot"
+                                );
+                                querylog::sync_event(
+                                    &state.sync_log,
+                                    "catchup",
+                                    "",
+                                    None,
+                                    true,
+                                    Some(format!("{total} ops from {} origins", plan.len())),
+                                );
+                                drain_sync_queue(&state).await;
+                                return;
+                            }
+                        }
+                        eprintln!(
+                            "rejoin repair: digests still differ after catch-up; \
+                             falling back to snapshot"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("rejoin repair: catch-up failed: {e}; falling back to snapshot");
+                        querylog::sync_event(&state.sync_log, "catchup", "", None, false, Some(e));
+                    }
+                }
+            }
+            Some(_) => {}
+            None if round == 0 => {
+                eprintln!(
+                    "rejoin repair: no usable journal positions (new/old peer or \
+                     trimmed window); snapshot repair"
+                );
+            }
+            None => {}
+        }
+
+        // Phase 2 — snapshot election and adoption (the safe fallback).
+        let heads: Vec<(String, u64)> = infos
+            .iter()
+            .filter_map(|(_, info)| Some((info.node_id.clone()?, info.journal_head?)))
+            .collect();
         match decide_repair(&local, &reports) {
             RepairDecision::Converged => {
                 drain_sync_queue(&state).await;
@@ -2512,7 +2779,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                     round + 1
                 );
                 let applied = match request_sync(&state, &source).await {
-                    Ok(script) => match apply_repair_sync(&state, &script, &source).await {
+                    Ok(script) => match apply_repair_sync(&state, &script, &source, &heads).await {
                         JoinApply::Applied => Ok(()),
                         JoinApply::Failed(e) => Err(e),
                         JoinApply::LocalData => Err("unexpected local-data outcome".into()),
@@ -2550,6 +2817,80 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
         false,
         Some("gave up".into()),
     );
+}
+
+/// One origin's missed-op range: pull journal entries (from, to] from
+/// `addr` and apply them in order.
+struct CatchupTask {
+    addr: String,
+    node_id: String,
+    from: u64,
+    to: u64,
+}
+
+/// Build the incremental catch-up plan, or None when catch-up is
+/// impossible: any peer without journal info (old version, probe
+/// failure), any unknown position (never adopted from that origin), or
+/// any position outside the peer's retained window (trimmed past) all
+/// force the snapshot path. Positions can only lag the data, so a
+/// partial catch-up is always safe — the digest re-check after it
+/// decides whether a snapshot is still needed.
+async fn catchup_plan(
+    state: &Arc<ServerState>,
+    infos: &[(String, PeerInfo)],
+) -> Option<Vec<CatchupTask>> {
+    let mut plan = Vec::new();
+    for (addr, info) in infos {
+        let node_id = info.node_id.clone()?;
+        let head = info.journal_head?;
+        let oldest = info.journal_oldest?;
+        let pos = {
+            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.position_get(&node_id).ok().flatten()
+        }?;
+        if pos > head || pos + 1 < oldest {
+            return None;
+        }
+        if head > pos {
+            plan.push(CatchupTask {
+                addr: addr.clone(),
+                node_id,
+                from: pos,
+                to: head,
+            });
+        }
+    }
+    Some(plan)
+}
+
+/// Execute a catch-up plan: pull each origin's missed range in order and
+/// record the origin's head as the new position.
+async fn run_catchup(state: &Arc<ServerState>, plan: &[CatchupTask]) -> Result<(), String> {
+    for task in plan {
+        let head = catch_up_from(state, &task.addr, task.from)
+            .await
+            .map_err(|e| format!("pull from {}: {e}", task.addr))?;
+        {
+            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.position_set(&task.node_id, head)
+                .map_err(|e| format!("position update: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// After an adoption replaces the whole state, seed positions from the
+/// heads sampled during the probe round: the snapshot contains every op
+/// up to the freeze, and later writes arrive through the live fan-out
+/// with higher seqs. Origins that could not be probed stay position-less
+/// (no incremental trust) and are covered by snapshot repair.
+fn seed_positions(state: &Arc<ServerState>, heads: &[(String, u64)]) {
+    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    for (node_id, head) in heads {
+        if let Err(e) = db.position_set(node_id, *head) {
+            eprintln!("catchup position seed failed: {e}");
+        }
+    }
 }
 
 /// Outcome of comparing the local digests with the peers' reports (see
@@ -2643,8 +2984,15 @@ fn decide_repair(local: &[TableDigest], reports: &[(String, Vec<TableDigest>)]) 
 /// A failure rolls back to the pre-repair state, divergence and all.
 /// Inbound replication writes queue on the open sync gate meanwhile and
 /// replay in arrival order right after — snapshot < queued < direct is
-/// the total order (see [ServerState::sync_queue]).
-async fn apply_repair_sync(state: &Arc<ServerState>, script: &str, peer: &str) -> JoinApply {
+/// the total order (see [ServerState::sync_queue]). On success the
+/// catch-up positions are seeded from the probe-round journal heads, so
+/// later rejoins can pull increments instead of snapshots.
+async fn apply_repair_sync(
+    state: &Arc<ServerState>,
+    script: &str,
+    peer: &str,
+    heads: &[(String, u64)],
+) -> JoinApply {
     let Some(_order) = lock_engine_for_write(state).await else {
         return JoinApply::Failed("timed out waiting for the open transaction".into());
     };
@@ -2668,6 +3016,7 @@ async fn apply_repair_sync(state: &Arc<ServerState>, script: &str, peer: &str) -
         }
     }
     drain_sync_queue(state).await;
+    seed_positions(state, heads);
     eprintln!("rejoin repair from {peer} complete");
     querylog::sync_event(
         &state.sync_log,
@@ -2678,40 +3027,6 @@ async fn apply_repair_sync(state: &Arc<ServerState>, script: &str, peer: &str) -
         Some(format!("{} bytes", script.len())),
     );
     JoinApply::Applied
-}
-
-/// One peer's user-table count over REQ_STATUS. Errors mean "unknown"
-/// (unreachable / auth mismatch), never "empty". The frame rides
-/// FLAG_REPLICATION like every node-internal frame — under cluster-token
-/// auth a peer-role connection only accepts replication traffic.
-async fn probe_peer_tables(state: &Arc<ServerState>, peer: &str) -> std::io::Result<u64> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
-    // Same credential order as fan-out: the probe rides FLAG_REPLICATION, so
-    // a cluster-token peer rejects a client-token handshake outright and the
-    // bootstrap would never succeed in dual-token deployments.
-    if let Some(token) = fanout_auth(state) {
-        auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
-    }
-    let mut frame = Frame::new(proto::REQ_STATUS, vec![]);
-    frame.flags = FLAG_REPLICATION;
-    if let Some(k) = state.transport_key.as_ref() {
-        frame.payload = crypto::seal(k, &frame.payload);
-        frame.flags |= crypto::FLAG_ENCRYPTED;
-    }
-    let bytes = frame.encode().map_err(std::io::Error::other)?;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
-    let resp = read_response_frame(&mut stream).await?;
-    if resp.frame_type != proto::RESP_STATUS {
-        return Err(std::io::Error::other(format!(
-            "{peer}: status probe answered {} {}",
-            resp.frame_type,
-            String::from_utf8_lossy(&resp.payload)
-        )));
-    }
-    let v: serde_json::Value = serde_json::from_slice(&resp.payload)
-        .map_err(|e| std::io::Error::other(format!("bad status payload: {e}")))?;
-    Ok(v["totals"]["tables"].as_u64().unwrap_or(0))
 }
 
 /// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
@@ -2746,6 +3061,223 @@ async fn probe_peer_digests(
     }
     serde_json::from_slice(&resp.payload)
         .map_err(|e| std::io::Error::other(format!("bad digest payload: {e}")))
+}
+
+/// What one peer reported about itself over REQ_STATUS: its user-table
+/// count (fresh-join probe), its persistent identity, and its journal
+/// window. `node_id`/journal fields are None from peers predating
+/// catch-up replication — incremental repair is impossible against them
+/// and the snapshot path takes over.
+#[derive(Debug, Clone)]
+struct PeerInfo {
+    tables: u64,
+    node_id: Option<String>,
+    journal_head: Option<u64>,
+    journal_oldest: Option<u64>,
+}
+
+/// One peer's status + journal window over REQ_STATUS.
+async fn probe_peer_info(state: &Arc<ServerState>, peer: &str) -> std::io::Result<PeerInfo> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
+    if let Some(token) = fanout_auth(state) {
+        auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
+    }
+    let mut frame = Frame::new(proto::REQ_STATUS, vec![]);
+    frame.flags = FLAG_REPLICATION;
+    if let Some(k) = state.transport_key.as_ref() {
+        frame.payload = crypto::seal(k, &frame.payload);
+        frame.flags |= crypto::FLAG_ENCRYPTED;
+    }
+    let bytes = frame.encode().map_err(std::io::Error::other)?;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let resp = read_response_frame(&mut stream).await?;
+    if resp.frame_type != proto::RESP_STATUS {
+        return Err(std::io::Error::other(format!(
+            "{peer}: status probe answered {} {}",
+            resp.frame_type,
+            String::from_utf8_lossy(&resp.payload)
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&resp.payload)
+        .map_err(|e| std::io::Error::other(format!("bad status payload: {e}")))?;
+    Ok(PeerInfo {
+        tables: v["totals"]["tables"].as_u64().unwrap_or(0),
+        node_id: v["cluster_id"].as_str().map(String::from),
+        journal_head: v["journal_head"].as_u64(),
+        journal_oldest: v["journal_oldest"].as_u64(),
+    })
+}
+
+/// Parse a REQ_SQL_SEQ payload: [u64 seq][u32 len][node_id][sql].
+fn parse_seq_frame(payload: &[u8]) -> Option<(u64, String, String)> {
+    if payload.len() < 12 {
+        return None;
+    }
+    let seq = u64::from_le_bytes(payload[..8].try_into().ok()?);
+    let id_len = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
+    let rest = payload.get(12..)?;
+    let node_id = std::str::from_utf8(rest.get(..id_len)?).ok()?.to_string();
+    let sql = proto::decode_sql(rest.get(id_len..)?).ok()?;
+    Some((seq, node_id, sql))
+}
+
+/// Pack journal entries into one RESP_CATCHUP payload, respecting the
+/// frame budget but always making progress (at least one entry).
+/// Returns the payload and the number of entries packed.
+fn pack_catchup_entries(entries: &[(u64, String)], budget: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut count = 0usize;
+    for (seq, sql) in entries {
+        let entry_len = 8 + 4 + sql.len();
+        if count > 0 && out.len() + entry_len > budget {
+            break;
+        }
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&(sql.len() as u32).to_le_bytes());
+        out.extend_from_slice(sql.as_bytes());
+        count += 1;
+    }
+    (out, count)
+}
+
+/// Decode one RESP_CATCHUP payload.
+fn decode_catchup_entries(payload: &[u8]) -> std::io::Result<Vec<(u64, String)>> {
+    let mut out = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        if rest.len() < 12 {
+            return Err(std::io::Error::other("truncated catchup entry"));
+        }
+        let seq = u64::from_le_bytes(rest[..8].try_into().unwrap());
+        let len = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
+        let sql_bytes = rest
+            .get(12..12 + len)
+            .ok_or_else(|| std::io::Error::other("truncated catchup sql"))?;
+        let sql = String::from_utf8(sql_bytes.to_vec())
+            .map_err(|e| std::io::Error::other(format!("catchup sql utf8: {e}")))?;
+        out.push((seq, sql));
+        rest = &rest[12 + len..];
+    }
+    Ok(out)
+}
+
+/// REQ_CATCHUP: serve journal entries after the requester's position so a
+/// rejoined peer can catch up incrementally ("sync exactly what's
+/// missing"). Read-only over the journal table; chunks ride the
+/// connection's frame channel, terminated by RESP_AFFECTED(head).
+async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<Frame>) {
+    let after = if frame.payload.len() == 8 {
+        u64::from_le_bytes(frame.payload[..8].try_into().unwrap())
+    } else {
+        let _ = tx
+            .send(Frame::new(
+                proto::RESP_ERROR,
+                err_payload("malformed REQ_CATCHUP payload"),
+            ))
+            .await;
+        return;
+    };
+    const BUDGET: usize = 4 * 1024 * 1024;
+    let mut after = after;
+    loop {
+        let batch = {
+            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.journal_range(after, 512)
+        };
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx
+                    .send(Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload(&format!("catchup read: {e}")),
+                    ))
+                    .await;
+                return;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let mut idx = 0;
+        while idx < batch.len() {
+            let (payload, packed) = pack_catchup_entries(&batch[idx..], BUDGET);
+            if tx
+                .send(Frame::new(proto::RESP_CATCHUP, payload))
+                .await
+                .is_err()
+            {
+                return; // requester went away mid-stream
+            }
+            idx += packed;
+        }
+        after = batch.last().expect("non-empty batch").0;
+    }
+    let head = {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.journal_head()
+    };
+    let head = head.unwrap_or(0);
+    let _ = tx
+        .send(Frame::new(
+            proto::RESP_AFFECTED,
+            head.to_le_bytes().to_vec(),
+        ))
+        .await;
+}
+
+/// Pull journal entries after `from_seq` from one origin and apply them
+/// in order. Returns the origin's journal head at serve time; the caller
+/// records it as the new position. Any apply error aborts the pull —
+/// the repair then falls back to snapshot adoption.
+async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std::io::Result<u64> {
+    let attempt = async {
+        let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
+        if let Some(token) = fanout_auth(state) {
+            auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
+        }
+        let mut frame = Frame::new(proto::REQ_CATCHUP, after.to_le_bytes().to_vec());
+        frame.flags = FLAG_REPLICATION;
+        if let Some(k) = state.transport_key.as_ref() {
+            frame.payload = crypto::seal(k, &frame.payload);
+            frame.flags |= crypto::FLAG_ENCRYPTED;
+        }
+        let bytes = frame.encode().map_err(std::io::Error::other)?;
+        tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+        tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+        loop {
+            let f = tokio::time::timeout(IO_TIMEOUT, read_response_frame(&mut stream)).await??;
+            match f.frame_type {
+                proto::RESP_CATCHUP => {
+                    for (_, sql) in decode_catchup_entries(&f.payload)? {
+                        let resp = execute_sql(state, &sql, false, true, None, false).await;
+                        if resp.frame_type == proto::RESP_ERROR {
+                            return Err(std::io::Error::other(format!(
+                                "catch-up replay failed: {}",
+                                String::from_utf8_lossy(&resp.payload)
+                            )));
+                        }
+                    }
+                }
+                proto::RESP_AFFECTED if f.payload.len() == 8 => {
+                    return Ok(u64::from_le_bytes(f.payload[..8].try_into().unwrap()));
+                }
+                proto::RESP_ERROR => {
+                    return Err(std::io::Error::other(format!(
+                        "{peer} rejected catch-up: {}",
+                        String::from_utf8_lossy(&f.payload)
+                    )));
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "{peer}: unexpected frame {other:#06x} during catch-up"
+                    )));
+                }
+            }
+        }
+    };
+    tokio::time::timeout(SYNC_ATTEMPT_TIMEOUT, attempt).await?
 }
 
 #[cfg(test)]

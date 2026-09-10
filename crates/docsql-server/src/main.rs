@@ -43,6 +43,11 @@
 //!     DOCSQL_ASYNC_COMMIT=1           group fsyncs every ~2ms instead of
 //!                                     one fsync per write (higher write
 //!                                     throughput, ms-scale loss window)
+//!     DOCSQL_CATCHUP_WINDOW=<n>       catch-up journal retention in
+//!                                     entries (default 100000; 0 =
+//!                                     unbounded) — how far a rejoined
+//!                                     peer can incrementally catch up
+//!                                     before a full snapshot is needed
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -103,6 +108,10 @@ async fn main() -> std::io::Result<()> {
     let async_commit = std::env::var("DOCSQL_ASYNC_COMMIT")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let catchup_window = std::env::var("DOCSQL_CATCHUP_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(100_000);
     let transport_key = match std::env::var("DOCSQL_KEY") {
         Ok(k) if !k.trim().is_empty() => Some(
             docsql_server::crypto::parse_key_hex(&k).unwrap_or_else(|e| panic!("DOCSQL_KEY: {e}")),
@@ -141,6 +150,7 @@ async fn main() -> std::io::Result<()> {
         read_only,
         transport_key,
         async_commit,
+        catchup_window,
     })
     .await
 }

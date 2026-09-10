@@ -1141,6 +1141,7 @@ mod tests {
             read_only: false,
             transport_key: None,
             async_commit: false,
+            catchup_window: 0,
         }));
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(&addr).await.is_ok() {
@@ -1178,6 +1179,7 @@ mod tests {
             read_only: false,
             transport_key: None,
             async_commit: false,
+            catchup_window: 0,
         };
         tokio::spawn(docsql_server::run(cfg));
         for _ in 0..100 {

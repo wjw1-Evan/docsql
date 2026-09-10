@@ -69,6 +69,7 @@ async fn start_stack(
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -571,6 +572,7 @@ async fn cluster_page_probes_live_and_dead_nodes() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -635,6 +637,7 @@ async fn logs_endpoint_serves_local_and_node_reports() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -753,6 +756,7 @@ async fn node_selection_routes_sql_meta_stats() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {

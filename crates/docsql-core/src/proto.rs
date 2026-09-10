@@ -96,6 +96,18 @@ pub const REQ_META: u16 = 0x0013;
 /// (requires an authenticated session; rides FLAG_REPLICATION like every
 /// node-internal frame). No payload. Responds RESP_DIGEST.
 pub const REQ_DIGEST: u16 = 0x0014;
+/// A replication write that carries its origin's journal position:
+/// payload = [u64 seq][u32 node_id len][node_id bytes][encode_sql(sql)].
+/// The receiver records (node_id, seq) after applying, so a rejoin can
+/// pull exactly the ops it missed (see REQ_CATCHUP). Peers that predate
+/// this frame answer RESP_ERROR; the sender then resends as plain
+/// REQ_SQL, giving up incremental catch-up against old peers.
+pub const REQ_SQL_SEQ: u16 = 0x0015;
+/// Catch-up pull for the rejoin repair (authenticated +
+/// FLAG_REPLICATION): payload = [u64 after_seq]. The origin streams its
+/// journal entries with seq > after_seq as RESP_CATCHUP chunks and
+/// terminates with RESP_AFFECTED carrying its journal head.
+pub const REQ_CATCHUP: u16 = 0x0016;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
@@ -125,6 +137,11 @@ pub const RESP_META: u16 = 0x010A;
 /// Table digest report (see REQ_DIGEST): payload = JSON array of
 /// `{name, rows, rows_hash, schema_hash}` objects (`core::engine::TableDigest`).
 pub const RESP_DIGEST: u16 = 0x010B;
+/// One chunk of the catch-up journal stream (see REQ_CATCHUP): payload is
+/// a sequence of packed entries `[u64 seq][u32 sql len][sql bytes]`,
+/// concatenated up to the frame-size budget. Terminated by RESP_AFFECTED
+/// carrying the origin's journal head (u64 LE).
+pub const RESP_CATCHUP: u16 = 0x010C;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

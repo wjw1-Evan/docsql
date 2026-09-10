@@ -51,6 +51,7 @@ async fn start_server_sec(
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     };
     tokio::spawn(docsql_server::run(cfg));
     // Wait for the port to accept.
@@ -87,6 +88,7 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         read_only: false,
         transport_key: None,
         async_commit: true,
+        catchup_window: 0,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -526,6 +528,7 @@ async fn fanout_authenticates_with_cluster_token() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -609,6 +612,7 @@ async fn default_fill_converges_across_peers() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -878,6 +882,7 @@ async fn replication_and_failover() {
         read_only: true,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     // Primary: forwards writes to the replica.
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
@@ -895,6 +900,7 @@ async fn replication_and_failover() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for addr in [&primary_addr, &replica_addr] {
         for _ in 0..100 {
@@ -997,6 +1003,7 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             read_only: false,
             transport_key: None,
             async_commit: false,
+            catchup_window: 0,
         }));
     }
     for addr in &addrs {
@@ -1067,6 +1074,7 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             read_only: false,
             transport_key: None,
             async_commit: false,
+            catchup_window: 0,
         }));
     }
     for addr in &addrs {
@@ -1147,6 +1155,7 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     };
 
     // Two-node symmetric cluster; keep b's handle so the test can take it down.
@@ -1325,6 +1334,7 @@ async fn query_log_records_statements() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -1669,6 +1679,7 @@ async fn pubsub_cross_node_delivery() {
             read_only: false,
             transport_key: None,
             async_commit: false,
+            catchup_window: 0,
         }));
     }
     for addr in &addrs {
@@ -1745,6 +1756,7 @@ async fn symmetric_cluster_guid_autogen_converges() {
             read_only: false,
             transport_key: None,
             async_commit: false,
+            catchup_window: 0,
         }));
     }
     for addr in &addrs {
@@ -1882,6 +1894,7 @@ async fn logs_frame_over_wire() {
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     };
     // a fans out to the live peer b and a dead address: both attempts must
     // show up in the sync log (ok and error respectively).
@@ -1982,6 +1995,7 @@ async fn spawn_node(
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2211,6 +2225,19 @@ async fn spawn_node_handle(
     addr: &str,
     peers: Vec<String>,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    spawn_node_window(dir, name, addr, peers, 0).await
+}
+
+/// [`spawn_node_handle`] with a catch-up journal window (entries): used
+/// to exercise the snapshot fallback when a rejoining peer's position is
+/// older than the origin's retained window.
+async fn spawn_node_window(
+    dir: &tempfile::TempDir,
+    name: &str,
+    addr: &str,
+    peers: Vec<String>,
+    window: u64,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
     let handle = tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join(format!("{name}.db")),
         listen: addr.to_string(),
@@ -2226,6 +2253,7 @@ async fn spawn_node_handle(
         read_only: false,
         transport_key: None,
         async_commit: false,
+        catchup_window: window,
     }));
     for _ in 0..200 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2234,6 +2262,14 @@ async fn spawn_node_handle(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("node {name} did not come up");
+}
+
+/// The node's sync-log entries (REQ_LOGS), as raw JSON text.
+async fn sync_log_text(addr: &str) -> String {
+    let mut c = Client::connect(addr).await;
+    c.send(&Frame::new(proto::REQ_LOGS, vec![])).await;
+    let r = c.recv().await;
+    String::from_utf8_lossy(&r.payload).to_string()
 }
 
 async fn wait_port_down(addr: &str) {
@@ -2326,6 +2362,16 @@ async fn rejoin_repair_catches_up_writes_missed_while_offline() {
         wait_seen_n(&b_addr, "SELECT v FROM t WHERE id = 6", "six", 200).await,
         "post-repair write on a did not reach b"
     );
+    // The repair took the incremental journal path, not a snapshot.
+    let logs = sync_log_text(&b_addr).await;
+    assert!(
+        logs.contains("\"event\":\"catchup\""),
+        "expected a catchup sync event on the rejoined node: {logs}"
+    );
+    assert!(
+        !logs.contains("\"event\":\"repair\""),
+        "snapshot adoption should not have run: {logs}"
+    );
     a.abort();
     b.abort();
 }
@@ -2383,6 +2429,62 @@ async fn restart_without_divergence_keeps_data() {
     assert!(
         wait_seen_n(&b_addr, "SELECT v FROM keep WHERE id = 4", "\"d\"", 200).await,
         "post-restart write on a did not reach b"
+    );
+    a.abort();
+    b.abort();
+}
+
+/// When the rejoining peer's position is older than the origin's retained
+/// journal window (the window trimmed mid-flight), incremental catch-up
+/// is impossible — the repair must fall back to snapshot adoption and
+/// still converge.
+#[tokio::test]
+async fn catchup_falls_back_to_snapshot_after_window_trim() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr) = (free(), free());
+    let a_peers = vec![b_addr.clone()];
+    let b_peers = vec![a_addr.clone()];
+    // a keeps only a 4-entry journal window (trimmed as it passes each
+    // 512-entry mark); b unlimited.
+    let a = spawn_node_window(&dir, "ra", &a_addr, a_peers, 4).await;
+    let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers.clone()).await;
+
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE big (id INT PRIMARY KEY)").await;
+    ca.sql("INSERT INTO big VALUES (1)").await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM big", "[[1]]", 200).await,
+        "base row did not reach b"
+    );
+    drop(ca);
+
+    // b goes down; a writes far past the window (512-entry trim mark).
+    b.abort();
+    wait_port_down(&b_addr).await;
+    let mut ca = Client::connect(&a_addr).await;
+    for i in 2..=540 {
+        let r = ca.sql(&format!("INSERT INTO big VALUES ({i})")).await;
+        assert_eq!(r.frame_type, proto::RESP_AFFECTED, "insert {i} failed");
+    }
+    drop(ca);
+
+    // b rejoins: its position (1) is far below a's oldest retained seq —
+    // snapshot adoption is the only way out, and it must converge.
+    let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers).await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM big", "[[540]]", 1000).await,
+        "b did not converge via the snapshot fallback"
+    );
+    let logs = sync_log_text(&b_addr).await;
+    assert!(
+        logs.contains("\"event\":\"repair\""),
+        "expected a repair (snapshot adoption) event: {logs}"
     );
     a.abort();
     b.abort();

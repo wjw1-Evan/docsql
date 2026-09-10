@@ -5,7 +5,7 @@
 //! builds locally — including index definitions, observed columns, and
 //! storage counters.
 
-use crate::engine::{Database, ExecOutcome, PUBSUB_TABLE};
+use crate::engine::{is_system_table, Database, ExecOutcome};
 use crate::value::{Object, Value};
 use std::path::Path;
 use std::time::Instant;
@@ -34,8 +34,9 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
     let catalog: Vec<_> = db
         .catalog()
         .into_iter()
-        // The pub/sub backing table is system storage, not a user object.
-        .filter(|t| t.name != PUBSUB_TABLE)
+        // The pub/sub backing table and the catch-up replication tables
+        // are system storage, not user objects.
+        .filter(|t| !is_system_table(&t.name))
         .collect();
     let mut tables = Vec::new();
     let mut total_rows = 0u64;
@@ -231,7 +232,7 @@ mod tests {
     fn meta_hides_pubsub_backing_table() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = Database::open(&dir.path().join("m.db")).unwrap();
-        d.execute(&format!("CREATE TABLE {PUBSUB_TABLE} (payload TEXT)"))
+        d.execute("CREATE TABLE _pubsub_messages (payload TEXT)")
             .unwrap();
         let v = build_meta(&mut d, &dir.path().join("m.db"), Instant::now(), "1.0");
         match &v {
