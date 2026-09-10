@@ -1645,6 +1645,10 @@ const explorer = {
         {kind: 'table', name: t.name, more: t.row_count, children: true}));
     branch.push(['tables', ICONS.folder, `表 <span class="cnt">(${esc(m.totals.tables)})</span>`, {kind: 'tables', children: true}]);
 
+    // 系统表(引擎内部存储,只读;双击以普通 SELECT 结果查看)
+    const sysTables = m.system_tables || [];
+    branch.push(['systables', ICONS.folder, `系统表 <span class="cnt">(${esc(sysTables.length)})</span>`, {kind: 'systables', children: true}]);
+
     // 系统视图
     branch.push(['sys', ICONS.folder, '系统视图', {kind: 'sys', children: true}]);
 
@@ -1699,6 +1703,14 @@ const explorer = {
         const kEl = $(`[data-ch="${CSS.escape(p + '/keys')}"]`, tree); if (kEl) kEl.innerHTML = keys;
       });
     }
+    if (this.expanded.has('systables')) {
+      const el = $('[data-ch="systables"]', tree);
+      if (el) el.innerHTML = sysTables.map(t =>
+        this.node('systable:' + t.name, ICONS.table,
+          `${esc(t.name)} <span class="cnt" title="引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据">(${esc(t.row_count)})</span>`,
+          {kind: 'systable', name: t.name, more: t.row_count})).join('')
+        || '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无系统表)</span></div>';
+    }
     if (this.expanded.has('sys')) {
       const sysViews = [
         ['information_schema.tables', '表清单(名称/页数)'],
@@ -1743,6 +1755,7 @@ const explorer = {
         else editIndexDialog(node.dataset.more, name);
       }
       else if (kind === 'sysview') openQueryTab(`查询: ${name}`, `SELECT * FROM ${name} LIMIT 100;`, true);
+      else if (kind === 'systable') openQueryTab(`系统表: ${name}`, `SELECT * FROM "${qident(name)}" LIMIT 1000;`, true);
       else if (hasChildren(node)) toggle(node);
     });
     tree.addEventListener('contextmenu', (e) => {
@@ -1798,6 +1811,14 @@ const explorer = {
     } else if (kind === 'indexes') {
       ctx.open([
         {id: 'newidx', label: '新建索引…', act: () => newIndexDialog(name)},
+        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+      ], x, y);
+    } else if (kind === 'systable') {
+      // 引擎内部表:只读,不提供编辑/删除入口。
+      ctx.open([
+        {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, `系统表: ${name}`)},
+        '-',
+        {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'column' || kind === 'key' || kind === 'sysview') {

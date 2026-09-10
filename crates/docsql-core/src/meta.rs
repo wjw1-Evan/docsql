@@ -28,17 +28,15 @@ fn wal_path(db: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
-/// The `/api/meta` payload: server identity, storage counters, totals, and
-/// one entry per user table (the pub/sub backing store is filtered out).
+/// The `/api/meta` payload: server identity, storage counters, totals, one
+/// entry per user table, and the engine-managed system tables (pub/sub
+/// backing store, catch-up journal/positions/identity) under
+/// `system_tables` — excluded from `tables`/`totals`, reported separately
+/// so the console's object tree can show them as a read-only branch.
 pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: &str) -> Value {
-    let catalog: Vec<_> = db
-        .catalog()
-        .into_iter()
-        // The pub/sub backing table and the catch-up replication tables
-        // are system storage, not user objects.
-        .filter(|t| !is_system_table(&t.name))
-        .collect();
+    let catalog: Vec<_> = db.catalog().into_iter().collect();
     let mut tables = Vec::new();
+    let mut system_tables = Vec::new();
     let mut total_rows = 0u64;
     for t in &catalog {
         let row_count = match db.execute(&format!(
@@ -50,6 +48,13 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
             }
             _ => 0,
         };
+        if is_system_table(&t.name) {
+            system_tables.push(Value::Object(Object::from([
+                ("name".into(), str(&t.name)),
+                ("row_count".into(), int(row_count)),
+            ])));
+            continue;
+        }
         total_rows += row_count;
         let columns: Vec<Value> = t
             .columns
@@ -149,12 +154,29 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
             ])),
         ),
         ("tables".into(), Value::Array(tables)),
+        ("system_tables".into(), Value::Array(system_tables)),
     ]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Find `key` → table entry by name → field, for payload assertions.
+    fn meta_table_field(v: &Value, key: &str, name: &str, field: &str) -> Option<Value> {
+        match v {
+            Value::Object(o) => match o.get(key) {
+                Some(Value::Array(a)) => a.iter().find_map(|t| match t {
+                    Value::Object(o) if o.get("name") == Some(&Value::Str(name.to_string())) => {
+                        o.get(field).cloned()
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 
     #[test]
     fn meta_reports_tables_columns_and_index_defs() {
@@ -241,6 +263,42 @@ mod tests {
                 _ => panic!("tables missing"),
             },
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn meta_lists_system_tables_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let mut d = Database::open(&path).unwrap();
+        d.execute("CREATE TABLE user_t (id INT)").unwrap();
+        d.execute("INSERT INTO user_t VALUES (1)").unwrap();
+        d.ensure_cluster_tables().unwrap();
+        d.journal_append("INSERT INTO user_t VALUES (1)").unwrap();
+        let v = build_meta(&mut d, &path, Instant::now(), "1.0");
+        // User surfaces stay user-only...
+        assert_eq!(
+            meta_table_field(&v, "tables", "user_t", "row_count"),
+            Some(Value::Int(1))
+        );
+        assert!(meta_table_field(&v, "tables", "_cluster_log", "name").is_none());
+        // ...and the journal shows up under system_tables with its own
+        // census instead.
+        assert_eq!(
+            meta_table_field(&v, "system_tables", "_cluster_log", "row_count"),
+            Some(Value::Int(1))
+        );
+        assert!(meta_table_field(&v, "system_tables", "_cluster_pos", "name").is_some());
+        // Totals keep counting user storage only.
+        match &v {
+            Value::Object(o) => assert_eq!(
+                o.get("totals").cloned().unwrap_or(Value::Null),
+                Value::Object(Object::from([
+                    ("tables".into(), Value::Int(1)),
+                    ("rows".into(), Value::Int(1)),
+                ]))
+            ),
+            _ => unreachable!(),
         }
     }
 }

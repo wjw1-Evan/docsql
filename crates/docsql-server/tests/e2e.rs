@@ -740,6 +740,25 @@ async fn meta_frame_reports_catalog_for_console() {
     assert!(!v["tables"][0]["index_defs"].as_array().unwrap().is_empty());
     assert!(v["storage"]["page_size"].as_u64().is_some());
     assert!(v["server"]["version"].as_str().is_some());
+    // System tables are reported under their own key (the console's
+    // read-only 系统表 branch), never mixed into the user catalog.
+    let sys_names: Vec<&str> = v["system_tables"]
+        .as_array()
+        .expect("system_tables array")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    assert!(sys_names.contains(&"_pubsub_messages"), "{sys_names:?}");
+    assert!(!sys_names.contains(&"mt"), "{sys_names:?}");
+    assert_eq!(
+        v["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["name"] == "_pubsub_messages")
+            .count(),
+        0
+    );
 }
 
 /// The engine allows one global transaction: a BEGIN from a second
@@ -1618,11 +1637,23 @@ async fn pubsub_trim_view_and_system_guard() {
     }
     c.publish("other", "keepme").await;
 
-    // The backing table is invisible to SQL clients...
-    let r = c.sql("SELECT * FROM _pubsub_messages").await;
+    // The backing table accepts no mutations...
+    let r = c
+        .sql("INSERT INTO _pubsub_messages (channel, payload) VALUES ('x', 'y')")
+        .await;
     assert_eq!(r.frame_type, proto::RESP_ERROR);
     assert!(payload_str(&r).contains("internal"), "{}", payload_str(&r));
-    // ...but the docsql_pubsub view reads it with full SQL.
+    // ...while read-only queries go through (the console's 系统表 branch).
+    let r = c.sql("SELECT COUNT(*) FROM _pubsub_messages").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    assert!(payload_str(&r).contains("[[6]]"), "{}", payload_str(&r));
+    // Catch-up journal: same policy, own message.
+    let r = c
+        .sql("INSERT INTO _cluster_log (seq, sql) VALUES (1, 'x')")
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR);
+    assert!(payload_str(&r).contains("internal"), "{}", payload_str(&r));
+    // ...and the docsql_pubsub view reads it with full SQL.
     let r = c.sql("SELECT COUNT(*) FROM docsql_pubsub").await;
     assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
     assert!(payload_str(&r).contains("[[6]]"), "{}", payload_str(&r));

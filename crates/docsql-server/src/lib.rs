@@ -1120,11 +1120,13 @@ pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: toki
     }
 }
 
-/// Execute one SQL statement. `allow_system_table` is set only for the
-/// rewritten `docsql_pubsub` view; everything else is rejected before
-/// touching the pubsub backing store. `conn` identifies the client
-/// connection (None for replication applies); `order_held` marks the
-/// cluster-join drain path, which already holds `write_order`.
+/// Execute one SQL statement. `allow_system_table` marks the rewritten
+/// `docsql_pubsub` view; system tables are otherwise blocked for anything
+/// that could mutate them, while read-only queries may reference them (the
+/// console's object tree shows them as a read-only 系统表 branch). `conn`
+/// identifies the client connection (None for replication applies);
+/// `order_held` marks the cluster-join drain path, which already holds
+/// `write_order`.
 async fn execute_sql(
     state: &Arc<ServerState>,
     sql: &str,
@@ -1133,34 +1135,6 @@ async fn execute_sql(
     conn: Option<u64>,
     order_held: bool,
 ) -> Frame {
-    if !allow_system_table && sql.to_ascii_lowercase().contains(pubsub::PUBSUB_TABLE) {
-        // Catalog views (information_schema / sqlite_master) only read
-        // metadata — allow them to mention the pubsub backing store.
-        let lower = sql.to_ascii_lowercase();
-        let catalog_read = lower.trim_start().starts_with("select")
-            && (lower.contains("information_schema") || lower.contains("sqlite_master"));
-        if !catalog_read {
-            return Frame::new(
-                proto::RESP_ERROR,
-                err_payload(
-                    "system table _pubsub_messages is internal: \
-                     query the docsql_pubsub view, trim with PUBSUB TRIM",
-                ),
-            );
-        }
-    }
-    for internal in [
-        docsql_core::engine::CLUSTER_LOG_TABLE,
-        docsql_core::engine::CLUSTER_POS_TABLE,
-        docsql_core::engine::CLUSTER_ID_TABLE,
-    ] {
-        if sql.to_ascii_lowercase().contains(internal) {
-            return Frame::new(
-                proto::RESP_ERROR,
-                err_payload("system table is internal to catch-up replication"),
-            );
-        }
-    }
     // One parse for the whole round-trip: the AST executes at the bottom,
     // the classification routes the request here (parse errors surface with
     // the same message `execute` would have produced).
@@ -1171,6 +1145,34 @@ async fn execute_sql(
     let p = parsed.as_ref().expect("parsed just above");
     let is_write = p.is_write;
     let tx_kind = p.tx.clone();
+    // System tables are shielded from anything that could mutate them; the
+    // check runs on the classified AST (exactly one statement per frame),
+    // so a SELECT prefix can't smuggle a write past it, and read-only
+    // queries go through to the console's read-only 系统表 branch.
+    if !allow_system_table && is_write {
+        let lower = sql.to_ascii_lowercase();
+        if lower.contains(pubsub::PUBSUB_TABLE) {
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload(
+                    "system table _pubsub_messages is internal: \
+                     query the docsql_pubsub view, trim with PUBSUB TRIM",
+                ),
+            );
+        }
+        for internal in [
+            docsql_core::engine::CLUSTER_LOG_TABLE,
+            docsql_core::engine::CLUSTER_POS_TABLE,
+            docsql_core::engine::CLUSTER_ID_TABLE,
+        ] {
+            if lower.contains(internal) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload("system table is internal to catch-up replication"),
+                );
+            }
+        }
+    }
     // Replica read-only gate (replication-internal frames pass through).
     let read_only = state.read_only.load(std::sync::atomic::Ordering::SeqCst);
     if read_only && !is_replication && is_write {

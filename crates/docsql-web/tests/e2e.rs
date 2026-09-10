@@ -341,6 +341,32 @@ async fn meta_and_stats_report_live_catalog() {
     assert_eq!(cols[0]["default"], json!(null));
     assert_eq!(cols[1]["default"], "'anon'");
     assert_eq!(meta["storage"]["page_size"], 4096);
+    // The engine's system tables surface under their own key (the console's
+    // read-only 系统表 branch), never inside the user tables array.
+    let sys: Vec<&str> = meta["system_tables"]
+        .as_array()
+        .expect("system_tables array")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    assert!(sys.contains(&"_pubsub_messages"), "{sys:?}");
+    assert!(!meta["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == "_pubsub_messages"));
+    // Read-only queries on a system table pass through the proxy (what the
+    // 系统表 branch double-click issues); writes stay rejected.
+    let r = sql(&addr, None, "SELECT COUNT(*) FROM _pubsub_messages").await;
+    assert_eq!(r["kind"], "rows");
+    let r = sql(
+        &addr,
+        None,
+        "INSERT INTO _pubsub_messages (channel, payload) VALUES ('x', 'y')",
+    )
+    .await;
+    assert_eq!(r["kind"], "error");
+    assert!(r["message"].as_str().unwrap().contains("internal"));
 
     // Schemaless write: a top-level field no column declares. Meta must
     // surface it as observed without touching the declared column list.
