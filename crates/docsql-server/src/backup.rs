@@ -441,8 +441,8 @@ fn list_backups(dir: &Path) -> Vec<serde_json::Value> {
 /// backup naming pattern are ever touched).
 fn prune_backups(dir: &Path, keep: usize) {
     let keep = keep.max(1);
+    // read_backup_files is sorted ascending: the head is the oldest.
     let mut names = read_backup_files(dir);
-    names.sort();
     while names.len() > keep {
         let victim = names.remove(0);
         if let Err(e) = std::fs::remove_file(dir.join(&victim)) {
@@ -456,11 +456,15 @@ fn read_backup_files(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    entries
+    // Sorted: read_dir order is arbitrary, and every caller (retention,
+    // listing, tests) reasons in name = time order.
+    let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("backup-") && n.ends_with(".sql"))
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 fn file_bytes(p: &Path) -> u64 {
@@ -516,6 +520,31 @@ mod tests {
         assert!(!valid_backup_name("other-1.sql"));
         assert!(!valid_backup_name(""));
         assert!(!valid_backup_name(&"backup-1.sql".repeat(30)));
+    }
+
+    #[test]
+    fn prune_keeps_newest_and_never_touches_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |name: &str| {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        };
+        put("backup-a.sql");
+        put("backup-a.sql.tmp"); // atomic-rename side file: not a backup
+        put("backup-b.sql");
+        put("backup-c.sql");
+        put("notes.txt"); // not ours: retention must leave it alone
+        assert_eq!(read_backup_files(dir.path()).len(), 3);
+
+        prune_backups(dir.path(), 2);
+        let left = read_backup_files(dir.path());
+        assert_eq!(left, vec!["backup-b.sql", "backup-c.sql"]);
+        // Foreign files survive: retention only ever deletes its own pattern.
+        assert!(dir.path().join("notes.txt").is_file());
+        assert!(dir.path().join("backup-a.sql.tmp").is_file());
+
+        // keep=0 clamps to 1 (a deployment can never prune everything).
+        prune_backups(dir.path(), 0);
+        assert_eq!(read_backup_files(dir.path()), vec!["backup-c.sql"]);
     }
 
     #[test]

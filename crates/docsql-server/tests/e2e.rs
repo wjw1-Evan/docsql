@@ -3079,3 +3079,483 @@ async fn backup_restore_round_trip() {
     let logs = String::from_utf8_lossy(&cl.recv().await.payload).to_string();
     assert!(logs.contains("\"restore\""), "no restore event: {logs}");
 }
+
+/// Restore's headline property is cluster convergence: replaying the
+/// snapshot on one node fans every statement out to the peers, so writes
+/// made everywhere after the backup are replaced by the backup's state
+/// cluster-wide.
+#[tokio::test]
+async fn backup_restore_converges_the_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr) = (free(), free());
+    let a = spawn_node_handle(&dir, "ra", &a_addr, vec![b_addr.clone()]).await;
+    let b = spawn_node_handle(&dir, "rb", &b_addr, vec![a_addr.clone()]).await;
+
+    // Base state, replicated.
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    ca.sql("INSERT INTO t VALUES (1, 'base')").await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM t", "[[1]]", 200).await,
+        "base row did not reach b"
+    );
+
+    // Backup on a, then diverge from it on both nodes.
+    ca.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(ca.recv().await.frame_type, proto::RESP_AFFECTED);
+    let backups = dir.path().join("backups");
+    let mut name = String::new();
+    for _ in 0..250 {
+        let names = backup_names(&backups);
+        if let Some(n) = names.first() {
+            if std::fs::read_to_string(backups.join(n))
+                .unwrap_or_default()
+                .contains("base")
+            {
+                name = n.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "backup never appeared");
+    ca.sql("INSERT INTO t VALUES (2, 'post-a')").await;
+    let mut cb = Client::connect(&b_addr).await;
+    cb.sql("INSERT INTO t VALUES (3, 'post-b')").await;
+    assert!(
+        wait_seen_n(&a_addr, "SELECT COUNT(id) FROM t", "[[3]]", 200).await,
+        "post-backup writes did not replicate both ways"
+    );
+
+    // Restore on a: both nodes end up at the backup's state.
+    let payload = format!(r#"{{"action":"restore","file":"{name}"}}"#);
+    ca.send(&Frame::new(proto::REQ_BACKUP, payload.clone().into_bytes()))
+        .await;
+    assert_eq!(
+        ca.recv().await.frame_type,
+        proto::RESP_AFFECTED,
+        "{}",
+        payload
+    );
+    assert!(
+        wait_seen_n(&a_addr, "SELECT v FROM t WHERE id = 1", "base", 400).await,
+        "restored row missing on a"
+    );
+    assert!(
+        wait_seen_n(&b_addr, "SELECT v FROM t WHERE id = 1", "base", 400).await,
+        "restore did not reach b"
+    );
+    let ra = ca.sql("SELECT COUNT(id) FROM t").await;
+    assert!(
+        payload_str(&ra).contains("[[1]]"),
+        "a: {}",
+        payload_str(&ra)
+    );
+    let rb = cb.sql("SELECT COUNT(id) FROM t").await;
+    assert!(
+        payload_str(&rb).contains("[[1]]"),
+        "b: {}",
+        payload_str(&rb)
+    );
+    a.abort();
+    b.abort();
+}
+
+/// Backup and restore contend for the same write path: while a restore
+/// replays, a backup trigger (timer or manual) and a second restore are
+/// refused; afterwards both work again.
+#[tokio::test]
+async fn backup_and_restore_are_mutually_exclusive() {
+    let (_dir, addr) = start_server(Some("s3cret")).await;
+    let mut c = Client::connect(&addr).await;
+    c.auth("s3cret").await;
+    c.sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    // One fat statement keeps the test fast; the dump still yields one
+    // INSERT per row, so replaying takes long enough to make the busy
+    // window deterministic.
+    let mut values = String::new();
+    for i in 1..=3000 {
+        values.push_str(&format!("({i}, 'v{i}'),"));
+    }
+    values.pop(); // trailing comma
+    c.sql(&format!("INSERT INTO t VALUES {values}")).await;
+
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    let dir = backup_list(&addr, Some("s3cret")).await["dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = std::path::PathBuf::from(dir);
+    let mut name = String::new();
+    for _ in 0..500 {
+        let names = backup_names(&dir);
+        if let Some(n) = names.first() {
+            if std::fs::read_to_string(dir.join(n))
+                .unwrap_or_default()
+                .contains("v3000")
+            {
+                name = n.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "backup never appeared");
+
+    // Start the restore; while it replays, both a backup trigger and a
+    // second restore are refused (thousands of fsync'd statements give a
+    // wide busy window).
+    let payload = format!(r#"{{"action":"restore","file":"{name}"}}"#);
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.clone().into_bytes()))
+        .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "backup during restore");
+    assert!(
+        payload_str(&r).contains("already in progress"),
+        "{}",
+        payload_str(&r)
+    );
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.into_bytes()))
+        .await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "double restore");
+
+    // The restore completes and the node is functional again.
+    let mut ok = false;
+    for _ in 0..2000 {
+        let v = backup_list(&addr, Some("s3cret")).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false && rs["ok"] == true {
+                ok = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ok, "restore never completed");
+    let r = c.sql("SELECT COUNT(id) FROM t").await;
+    assert!(
+        payload_str(&r).contains("[[3000]]"),
+        "restored rows missing: {}",
+        payload_str(&r)
+    );
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+}
+
+/// A backup file whose script fails partway: a parse-broken script is
+/// rejected wholesale before anything runs, and an execution failure
+/// (duplicate primary key) stops the replay at that statement — the
+/// status and sync log attribute the failure, statements before it are
+/// applied (partial replay is documented), and the node keeps serving.
+#[tokio::test]
+async fn backup_restore_failure_is_reported_and_audited() {
+    let (_dir, addr) = start_server(Some("s3cret")).await;
+    let dir = backup_list(&addr, Some("s3cret")).await["dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut c = Client::connect(&addr).await;
+    c.auth("s3cret").await;
+
+    // Parse-broken: nothing runs at all (the whole script is pre-parsed).
+    std::fs::write(
+        dir.join("backup-broken.sql"),
+        "CREATE TABLE ok1 (id INT PRIMARY KEY);\nTHIS IS NOT SQL;\n",
+    )
+    .unwrap();
+    let payload = br#"{"action":"restore","file":"backup-broken.sql"}"#.to_vec();
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.clone()))
+        .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    for _ in 0..250 {
+        let v = backup_list(&addr, Some("s3cret")).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false {
+                assert_eq!(rs["ok"], false);
+                assert!(
+                    rs["error"].as_str().unwrap().contains("restore parse"),
+                    "{}",
+                    rs["error"].as_str().unwrap()
+                );
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let r = c.sql("SELECT COUNT(id) FROM ok1").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "nothing must be applied");
+
+    // Execution-broken: the replay stops at the failing statement.
+    std::fs::write(
+        dir.join("backup-half.sql"),
+        "CREATE TABLE ok1 (id INT PRIMARY KEY);\n\
+         INSERT INTO ok1 VALUES (1);\n\
+         INSERT INTO ok1 VALUES (1);\n",
+    )
+    .unwrap();
+    let payload = br#"{"action":"restore","file":"backup-half.sql"}"#.to_vec();
+    c.send(&Frame::new(proto::REQ_BACKUP, payload)).await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+
+    let mut err = String::new();
+    let mut applied = 0u64;
+    for _ in 0..500 {
+        let v = backup_list(&addr, Some("s3cret")).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false {
+                err = rs["error"].as_str().unwrap_or_default().to_string();
+                applied = rs["applied"].as_u64().unwrap_or(0);
+                assert_eq!(rs["ok"], false, "broken script must not restore ok");
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        err.contains("statement 3"),
+        "failure not attributed to the broken statement: {err}"
+    );
+    assert_eq!(applied, 2, "progress lost on failure");
+
+    // Statements before the failure are applied; the audit trail records
+    // the failed restore with its reason.
+    let r = c.sql("SELECT COUNT(id) FROM ok1").await;
+    assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
+    c.send(&Frame::new(proto::REQ_LOGS, vec![])).await;
+    let logs = String::from_utf8_lossy(&c.recv().await.payload).to_string();
+    assert!(
+        logs.contains("\"restore\"") && logs.contains("statement 3"),
+        "failed restore not audited: {logs}"
+    );
+}
+
+/// A read-only replica refuses restores (every replayed statement would be
+/// refused anyway) while backups stay allowed — a dump is read-only.
+#[tokio::test]
+async fn backup_restore_refused_on_read_only_replica() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join("replica.db"),
+        listen: addr.clone(),
+        auth_token: Some("s3cret".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: true,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&addr).await;
+    c.auth("s3cret").await;
+
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"restore","file":"backup-1.sql"}"#.to_vec(),
+    ))
+    .await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR);
+    assert!(
+        payload_str(&r).contains("read-only replica"),
+        "{}",
+        payload_str(&r)
+    );
+
+    // Backups remain allowed on a replica.
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+}
+
+/// Restore statements queue behind an open client transaction like every
+/// other write: the replay waits it out and proceeds once it closes — it
+/// never interleaves into a transaction that could still roll back.
+#[tokio::test]
+async fn backup_restore_waits_for_open_transaction() {
+    let (_dir, addr) = start_server(Some("s3cret")).await;
+    let mut c = Client::connect(&addr).await;
+    c.auth("s3cret").await;
+    c.sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO t VALUES (1, 'snap')").await;
+
+    // Backup first (with no transaction open), then open a transaction —
+    // its writes are buffered and only commit at COMMIT.
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    let dir = backup_list(&addr, Some("s3cret")).await["dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = std::path::PathBuf::from(dir);
+    let mut name = String::new();
+    for _ in 0..250 {
+        let names = backup_names(&dir);
+        if let Some(n) = names.first() {
+            if std::fs::read_to_string(dir.join(n))
+                .unwrap_or_default()
+                .contains("snap")
+            {
+                name = n.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "backup never appeared");
+
+    let mut tx = Client::connect(&addr).await;
+    tx.auth("s3cret").await;
+    tx.sql("BEGIN").await;
+    tx.sql("INSERT INTO t VALUES (2, 'uncommitted')").await;
+
+    // The restore's first statement queues behind the open transaction.
+    let payload = format!(r#"{{"action":"restore","file":"{name}"}}"#);
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.into_bytes()))
+        .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // While the transaction is open the restore cannot have finished.
+    let v = backup_list(&addr, Some("s3cret")).await;
+    if let Some(rs) = v["restore"].as_object() {
+        if rs["running"] == false && rs["ok"] == true {
+            panic!("restore ran inside someone else's open transaction");
+        }
+    }
+
+    // Closing the transaction unblocks the replay.
+    tx.sql("ROLLBACK").await;
+    let mut done = false;
+    for _ in 0..500 {
+        let v = backup_list(&addr, Some("s3cret")).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false && rs["ok"] == true {
+                done = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(done, "restore never proceeded after ROLLBACK");
+    // The rolled-back write stays gone; the backup state is intact.
+    let r = c.sql("SELECT COUNT(id) FROM t").await;
+    assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
+}
+
+/// `DOCSQL_BACKUP_DIR` moves the backups out of the default `<db
+/// dir>/backups` location; the node reports and uses exactly that path.
+#[tokio::test]
+async fn backup_dir_override_is_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    let snaps = dir.path().join("snaps");
+    let default_backups = dir.path().join("backups");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join("e2e.db"),
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: Some(snaps.clone()),
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE t (id INT PRIMARY KEY)").await;
+
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    let mut listed_dir = String::new();
+    let mut ok = false;
+    for _ in 0..250 {
+        let v = backup_list(&addr, None).await;
+        if v["last"]["ok"] == true {
+            listed_dir = v["dir"].as_str().unwrap().to_string();
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ok, "backup never completed");
+    assert_eq!(std::path::Path::new(&listed_dir), snaps.as_path());
+    assert_eq!(backup_names(&snaps).len(), 1);
+    // The default location is never created behind the override's back.
+    assert!(!default_backups.exists(), "default backups dir appeared");
+}

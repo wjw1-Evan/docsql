@@ -1321,13 +1321,14 @@ async fn backup_restore_endpoint_round_trip() {
     }
     assert!(!name.is_empty(), "backup never appeared");
 
-    // Drop the table, then restore the backup.
+    // Drop the table, then restore the backup — explicitly targeting the
+    // peer via ?node= (the restore endpoint honors the query param too).
     sql(&web, Some("sekrit"), "DROP TABLE s").await;
     let body = serde_json::to_string(&json!({ "file": name })).unwrap();
     let res = http(
         &web,
         "POST",
-        "/api/backup/restore",
+        &format!("/api/backup/restore?node={node_addr}"),
         Some("sekrit"),
         Some(&body),
     )
