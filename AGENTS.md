@@ -69,7 +69,7 @@ CI(`.github/workflows/docker-image.yml`,push/PR 触发)执行同样三门禁 + d
 - **SQL 集成 / 协议**:各 crate tests
 - **端到端**:`crates/docsql-server/tests/e2e.rs`(含 pub/sub 实时/回放/续传/trim/跨节点、peer 离线→再上线补齐(反熵修复)、无分歧重启不动数据、自动备份定时/保留/REQ_BACKUP 触发/restore 恢复往返)与 `crates/docsql-web/tests/e2e.rs`(随机端口起真实 web 服务 + 手写 HTTP/1.1 客户端,覆盖控制台页、`/api/sql` 单语句/批量、`/api/parse`、token 门禁全端点、meta/stats、cluster 对活/死节点探测、/api/backup 列表+触发+恢复)
 - **多节点部署**:Docker compose 内 76 项测试(CI 对 main 分支在镜像发布后执行;本地 `./deploy/run-tests.sh` 会先构建带测试门禁的本地镜像),改动部署/复制相关逻辑后必跑;测试的干净态由 run-tests.sh 自己 rm+重建 external 卷保证
-- **.NET**:`dotnet test`(ADO.NET Client 43 项 + EF Core 22 项)
+- **.NET**:`dotnet test`(ADO.NET Client 59 项 + EF Core 22 项)
 
 ## 仓库结构与模块地图
 

@@ -262,17 +262,21 @@ public sealed class DocsqlCommand : DbCommand
         var v = reader.GetValue(0);
         if (v is double or float or decimal)
         {
-            // Only narrow to long when exactly representable; out-of-range
-            // doubles (1e300, SUM overflow) must not throw OverflowException.
-            try
+            // Only narrow to long when the value is an exact integer;
+            // fractional doubles (3.5, AVG results) must keep their type.
+            // Comparing two roundings of the same value — the previous
+            // check — was always true and rounded 3.5 to 4.
+            var d = Convert.ToDouble(v);
+            if (Math.Floor(d) == d)
             {
-                if (((IConvertible)v).ToInt64(null) == Convert.ToInt64(v))
+                try
                 {
-                    return Convert.ToInt64(v);
+                    return Convert.ToInt64(d);
                 }
-            }
-            catch (OverflowException)
-            {
+                catch (OverflowException)
+                {
+                    // out-of-range doubles (1e300, SUM overflow) return as-is
+                }
             }
         }
         return v;
@@ -508,7 +512,10 @@ public sealed class DocsqlDataReader : DbDataReader
 
     private static object? ElemToValue(JsonElement e) => e.ValueKind switch
     {
-        JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
+        // (object) cast: without it the ternary's type is the common type
+        // double — every JSON integer silently became a Double, losing
+        // precision past 2^53 (int64 IDs from other stores corrupt).
+        JsonValueKind.Number => e.TryGetInt64(out var l) ? (object)l : e.GetDouble(),
         JsonValueKind.String => e.GetString(),
         JsonValueKind.True => true,
         JsonValueKind.False => false,

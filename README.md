@@ -107,7 +107,7 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
 - Docker:compose 双 profile 部署测试全绿——多节点 76 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
-- .NET:xUnit(ADO.NET Client 43 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub)
+- .NET:xUnit(ADO.NET Client 59 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型与长语句契约)
 - CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(76 + 34 项)
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)

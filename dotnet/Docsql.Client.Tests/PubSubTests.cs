@@ -176,6 +176,63 @@ public sealed class PubSubTests : IClassFixture<ServerFixture>
     }
 
     [Fact]
+    public void Unsubscribe_stops_delivery_and_unsubscribe_all_clears_everything()
+    {
+        var bag = new ConcurrentBag<DocsqlMessage>();
+        using var sub = new DocsqlSubscriber(Cs);
+        Assert.Equal(1, sub.Subscribe("unch1", bag.Add));
+        Assert.Equal(2, sub.Subscribe("unch2", bag.Add)); // 返回值为活跃订阅总数
+
+        using var pub = new DocsqlConnection(Cs);
+        pub.Open();
+        pub.Publish("unch1", "one");
+        Assert.Equal("one", WaitOne(bag).Payload);
+
+        // 退订 unch1:其后的发布不再投递,unch2 不受影响
+        Assert.Equal(1, sub.Unsubscribe("unch1"));
+        pub.Publish("unch1", "dropped");
+        pub.Publish("unch2", "kept");
+        Assert.Equal("kept", WaitOne(bag).Payload);
+        AssertSilent(bag);
+
+        // 退订全部:任何发布都不再投递
+        Assert.Equal(0, sub.UnsubscribeAll());
+        pub.Publish("unch2", "dropped2");
+        AssertSilent(bag);
+    }
+
+    [Fact]
+    public void OnError_fires_when_server_dies_and_later_subscribe_throws()
+    {
+        // 独立节点:断线通知要求真实杀掉服务端(共享 fixture 不能动)。
+        using var l = new System.Net.Sockets.TcpListener(
+            System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        var port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
+        using var server = PeerNode.Start(port, "");
+
+        var errored = new System.Threading.ManualResetEventSlim();
+        var bag = new ConcurrentBag<DocsqlMessage>();
+        using var sub = new DocsqlSubscriber(server.Cs);
+        sub.OnError = _ => errored.Set();
+        Assert.Equal(1, sub.Subscribe("doomed", bag.Add));
+
+        using (var pub = new DocsqlConnection(server.Cs))
+        {
+            pub.Open();
+            pub.Publish("doomed", "last");
+        }
+        Assert.Equal("last", WaitOne(bag).Payload);
+
+        server.Proc.Kill();
+        server.Proc.WaitForExit(5000);
+        Assert.True(errored.Wait(TimeSpan.FromSeconds(10)), "服务端死亡后应触发 OnError");
+        // 断线后订阅停止且不会自愈:再订阅必须立即报错而不是静默假活
+        Assert.Throws<DocsqlException>(() => sub.Subscribe("doomed2", _ => { }));
+    }
+
+    [Fact]
     public void Encrypted_transport_delivers_pushes()
     {
         using var server = TlsServer.Start();
