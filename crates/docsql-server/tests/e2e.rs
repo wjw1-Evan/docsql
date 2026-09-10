@@ -2372,6 +2372,89 @@ async fn wait_port_down(addr: &str) {
     panic!("node at {addr} still accepts connections");
 }
 
+/// [`spawn_node`] with async-commit mode on: statement fsyncs defer to the
+/// background flusher, and the fused write units are disabled (their
+/// immediate `end` sync would re-impose one fsync per clustered write).
+async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers: Vec<String>) {
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join(format!("{name}.db")),
+        listen: addr.to_string(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers,
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: true,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..200 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("node {name} did not come up");
+}
+
+/// Async-commit mode must not weaken the clustered write path: with the
+/// fused units disabled, the journal append, the sequenced fan-out and the
+/// receiver's position tracking all take the plain deferred path — writes
+/// converge, the origin's `_cluster_log` records them, the peer's
+/// `_cluster_pos` tracks the origin, and a transaction's drain lands its
+/// buffered writes with journal entries.
+#[tokio::test]
+async fn async_commit_cluster_journals_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a, b) = (free(), free());
+    spawn_node_async(&dir, "aa", &a, vec![b.clone()]).await;
+    spawn_node_async(&dir, "ab", &b, vec![a.clone()]).await;
+
+    let mut ca = Client::connect(&a).await;
+    ca.sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    ca.sql("INSERT INTO t VALUES (1, 'x')").await;
+    assert!(
+        wait_seen_n(&b, "SELECT COUNT(id) FROM t", "[[1]]", 200).await,
+        "write did not converge to the async peer"
+    );
+    // DDL and DML both journaled on the origin (flusher-owned durability).
+    assert!(
+        wait_seen_n(&a, "SELECT COUNT(*) FROM _cluster_log", "[[2]]", 200).await,
+        "journal entries missing in async mode"
+    );
+    // The receiver tracked the origin's position through REQ_SQL_SEQ.
+    assert!(
+        wait_seen_n(&b, "SELECT COUNT(*) FROM _cluster_pos", "[[1]]", 200).await,
+        "position row missing in async mode"
+    );
+    // Transactional drain: buffered write lands on the peer with journal.
+    ca.sql("BEGIN").await;
+    ca.sql("INSERT INTO t VALUES (2, 'y')").await;
+    ca.sql("COMMIT").await;
+    assert!(
+        wait_seen_n(&b, "SELECT COUNT(id) FROM t", "[[2]]", 200).await,
+        "transactional write did not converge in async mode"
+    );
+    assert!(
+        wait_seen_n(&a, "SELECT COUNT(*) FROM _cluster_log", "[[3]]", 200).await,
+        "drain did not journal the buffered write in async mode"
+    );
+}
+
 /// The headline anti-entropy scenario: a node that was down while its peer
 /// wrote must catch up automatically on restart — inserts, updates, and
 /// deletes that happened during the outage all land, and the mesh fans out

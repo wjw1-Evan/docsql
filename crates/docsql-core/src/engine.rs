@@ -4291,11 +4291,14 @@ impl std::ops::DerefMut for WriteUnit<'_> {
 
 impl WriteUnit<'_> {
     /// Close the unit and make its statements durable with one WAL fsync.
-    /// No-op when nothing deferred a commit.
+    /// No-op when nothing deferred a commit. Async-commit mode never fsyncs
+    /// here: durability belongs to the background flusher's batching, and a
+    /// per-unit sync would defeat it — the unit then only groups the
+    /// statements' commits (the same deferred path they take anyway).
     pub fn end(self) -> Result<()> {
         let result = {
             self.db.write_unit = self.db.write_unit.saturating_sub(1);
-            if !self.db.pending_sync {
+            if self.db.async_commit || !self.db.pending_sync {
                 Ok(())
             } else {
                 self.db
@@ -11004,6 +11007,36 @@ mod complex_query_tests {
         assert!(
             matches!(&out, ExecOutcome::Rows(r) if r.rows[0][0].as_i64() == Some(2)),
             "both rows survive: the leaked unit's deferred pages were flushed by the next durable commit"
+        );
+    }
+
+    #[test]
+    fn write_unit_defers_to_flusher_in_async_mode() {
+        // Group commit owns the fsync in async-commit mode: a unit's `end`
+        // must not sync the WAL itself (that would re-impose one fsync per
+        // unit and defeat the flusher's batching), only group the commits.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("async-unit.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            db.set_async_commit(true);
+            let mut unit = db.write_unit();
+            unit.execute("INSERT INTO t VALUES (1)").unwrap();
+            let seq = unit.journal_append("INSERT INTO t VALUES (1)").unwrap();
+            unit.end().unwrap();
+            assert!(
+                db.has_pending_sync(),
+                "async mode: the flusher still owns the pending fsync"
+            );
+            db.sync_pending().unwrap(); // what the background task does
+            assert!(!db.has_pending_sync());
+            assert_eq!(db.journal_head().unwrap(), seq);
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert!(
+            matches!(db.execute("SELECT id FROM t"), Ok(ExecOutcome::Rows(r)) if !r.rows.is_empty()),
+            "durable after the flusher ran"
         );
     }
 }

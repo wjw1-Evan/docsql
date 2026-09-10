@@ -426,6 +426,11 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                 let n = gate.pending.len();
                 gate.pending = Vec::new();
                 gate.closed = true;
+                // Acknowledged writes that will never be applied: keep the
+                // divergence observable in REQ_STATUS like any other
+                // failed replay, not only in stderr.
+                st.replay_failures
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
                 eprintln!(
                     "sync: could not acquire the write path within {SYNC_WATCHDOG_GRACE:?}; \
                      gate hard-closed with {n} unapplied queued write(s) — restart this node"
@@ -1378,6 +1383,10 @@ async fn execute_sql(
             // engine commit of its own — two fsyncs per clustered write —
             // and a crash between them leaves bookkeeping lagging the data.
             // The unit lands both atomically (all-or-nothing prefix).
+            // Async-commit mode keeps the unit (bookkeeping still runs,
+            // grouped): the engine's `end` is async-aware and leaves the
+            // fsync to the background flusher instead of imposing one per
+            // write — group-commit batching stays intact.
             let fuse = !db.in_transaction() && (journal_wanted || (seq_pos.is_some() && is_write));
             let (out, resolved, seq, sync_failed) = if fuse {
                 let mut unit = db.write_unit();
@@ -1777,10 +1786,19 @@ pub async fn drain_tx_pending(state: &Arc<ServerState>) {
             .iter()
             .map(|sql| journal_append_trimmed(&mut unit, state, sql))
             .collect();
-        if let Err(e) = unit.end() {
-            eprintln!("transaction drain journal sync failed: {e}");
+        match unit.end() {
+            Ok(()) => seqs,
+            Err(e) => {
+                // The journal entries may never have become durable — the
+                // assigned seqs could make a peer adopt a position over
+                // entries that vanish on crash (catch-up's continuity audit
+                // would bounce it to a snapshot, but the plain fan-out must
+                // not carry the seq at all). Forward unsequenced; the data
+                // writes themselves were already committed by COMMIT.
+                eprintln!("transaction drain journal sync failed: {e}");
+                vec![None; writes.len()]
+            }
         }
-        seqs
     } else {
         Vec::new()
     };
