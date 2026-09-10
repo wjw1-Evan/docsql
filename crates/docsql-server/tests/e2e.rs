@@ -3106,13 +3106,30 @@ async fn backup_restore_converges_the_cluster() {
         "base row did not reach b"
     );
 
-    // Backup on a, then diverge from it on both nodes.
-    ca.send(&Frame::new(
-        proto::REQ_BACKUP,
-        br#"{"action":"trigger"}"#.to_vec(),
-    ))
-    .await;
-    assert_eq!(ca.recv().await.frame_type, proto::RESP_AFFECTED);
+    // Backup on a, then diverge from it on both nodes. The trigger is
+    // refused while the node's startup sync gate is open ("retry later") —
+    // in release timing the bootstrap probe loop can still be running here,
+    // so honor the refusal and retry instead of failing.
+    let mut triggered = false;
+    for _ in 0..250 {
+        ca.send(&Frame::new(
+            proto::REQ_BACKUP,
+            br#"{"action":"trigger"}"#.to_vec(),
+        ))
+        .await;
+        let resp = ca.recv().await;
+        if resp.frame_type == proto::RESP_AFFECTED {
+            triggered = true;
+            break;
+        }
+        let msg = String::from_utf8_lossy(&resp.payload).into_owned();
+        assert!(
+            msg.contains("startup sync"),
+            "backup trigger refused unexpectedly: {msg}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(triggered, "backup trigger never accepted (startup sync never closed)");
     let backups = dir.path().join("backups");
     let mut name = String::new();
     for _ in 0..250 {
