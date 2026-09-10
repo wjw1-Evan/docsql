@@ -52,6 +52,9 @@ async fn start_server_sec(
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     // Wait for the port to accept.
@@ -89,6 +92,9 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         transport_key: None,
         async_commit: true,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -529,6 +535,9 @@ async fn fanout_authenticates_with_cluster_token() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -613,6 +622,9 @@ async fn default_fill_converges_across_peers() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -883,6 +895,9 @@ async fn replication_and_failover() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     // Primary: forwards writes to the replica.
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
@@ -901,6 +916,9 @@ async fn replication_and_failover() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for addr in [&primary_addr, &replica_addr] {
         for _ in 0..100 {
@@ -1004,6 +1022,9 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             transport_key: None,
             async_commit: false,
             catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 7,
+            backup_dir: None,
         }));
     }
     for addr in &addrs {
@@ -1075,6 +1096,9 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             transport_key: None,
             async_commit: false,
             catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 7,
+            backup_dir: None,
         }));
     }
     for addr in &addrs {
@@ -1156,6 +1180,9 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     };
 
     // Two-node symmetric cluster; keep b's handle so the test can take it down.
@@ -1335,6 +1362,9 @@ async fn query_log_records_statements() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -1680,6 +1710,9 @@ async fn pubsub_cross_node_delivery() {
             transport_key: None,
             async_commit: false,
             catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 7,
+            backup_dir: None,
         }));
     }
     for addr in &addrs {
@@ -1757,6 +1790,9 @@ async fn symmetric_cluster_guid_autogen_converges() {
             transport_key: None,
             async_commit: false,
             catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 7,
+            backup_dir: None,
         }));
     }
     for addr in &addrs {
@@ -1895,6 +1931,9 @@ async fn logs_frame_over_wire() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     };
     // a fans out to the live peer b and a dead address: both attempts must
     // show up in the sync log (ok and error respectively).
@@ -1996,6 +2035,9 @@ async fn spawn_node(
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2254,6 +2296,9 @@ async fn spawn_node_window(
         transport_key: None,
         async_commit: false,
         catchup_window: window,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..200 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2488,4 +2533,217 @@ async fn catchup_falls_back_to_snapshot_after_window_trim() {
     );
     a.abort();
     b.abort();
+}
+
+/// Server with automatic backups enabled on a 1s cadence. Returns
+/// (data dir, default backup dir, addr) — the backup dir is derived from
+/// the db path exactly like production (`<db dir>/backups`).
+async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+    let db = dir.path().join("e2e.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 1,
+        backup_keep: keep,
+        backup_dir: None,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            return (dir, backups, addr);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("server did not come up");
+}
+
+/// Backup file names in `dir`, newest first (the UTC stamp is fixed-width,
+/// so name order is time order).
+fn backup_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("backup-") && n.ends_with(".sql"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.reverse();
+    names
+}
+
+async fn backup_list(addr: &str, token: Option<&str>) -> serde_json::Value {
+    let mut c = Client::connect(addr).await;
+    if let Some(t) = token {
+        c.auth(t).await;
+    }
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"list"}"#.to_vec(),
+    ))
+    .await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_BACKUP, "{}", payload_str(&r));
+    serde_json::from_slice(&r.payload).unwrap()
+}
+
+/// Automatic backups: the timer dumps the full logical state on a cadence
+/// (the first tick fires immediately, so the file materializes without any
+/// client traffic), retention prunes to `keep`, REQ_STATUS reports the
+/// state, and the attempt lands in the sync log for the console's logs page.
+#[tokio::test]
+async fn backup_periodic_with_retention_and_status() {
+    let (_dir, backups, addr) = start_server_backup(2).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE s (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO s VALUES (1, 'hello')").await;
+
+    // The earliest tick can land before the writes; a later one must carry
+    // them. Retention keeps exactly `keep` files once the third backup exists.
+    let mut newest = String::new();
+    let mut names: Vec<String> = Vec::new();
+    for _ in 0..250 {
+        names = backup_names(&backups);
+        if let Some(n) = names.first() {
+            newest = std::fs::read_to_string(backups.join(n)).unwrap_or_default();
+            if newest.contains("hello") && names.len() == 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        newest.contains("CREATE TABLE") && newest.contains("hello"),
+        "no backup carries the data; files: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        2,
+        "retention did not prune to keep=2: {names:?}"
+    );
+    // No temp residue: `.tmp` side files never count as backups.
+    assert!(
+        std::fs::read_dir(&backups)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| e.file_name().to_string_lossy().ends_with(".sql")),
+        "stray files in backup dir"
+    );
+
+    let v = backup_list(&addr, None).await;
+    assert_eq!(v["interval_secs"], 1);
+    assert_eq!(v["keep"], 2);
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["last"]["ok"], true);
+
+    c.send(&Frame::new(proto::REQ_STATUS, vec![])).await;
+    let r = c.recv().await;
+    let v: serde_json::Value = serde_json::from_slice(&r.payload).unwrap();
+    assert_eq!(v["backup"]["interval_secs"], 1);
+    assert_eq!(v["backup"]["count"], 2);
+    assert_eq!(v["backup"]["last"]["ok"], true);
+
+    let logs = sync_log_text(&addr).await;
+    assert!(logs.contains("\"backup\""), "no backup event: {logs}");
+}
+
+/// REQ_BACKUP trigger: runs one backup immediately on demand (interval off),
+/// and read-only tokens may list but not trigger.
+#[tokio::test]
+async fn backup_trigger_over_wire() {
+    let (_dir, addr) = start_server_sec(Some("s3cret"), Some("readonly1"), None, 0, 0, 10).await;
+    let mut c = Client::connect(&addr).await;
+    c.auth("s3cret").await;
+    c.sql("CREATE TABLE s (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO s VALUES (1, 'snap')").await;
+
+    // Read-only: list allowed, trigger refused.
+    let mut ro = Client::connect(&addr).await;
+    ro.auth("readonly1").await;
+    ro.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"list"}"#.to_vec(),
+    ))
+    .await;
+    let r = ro.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_BACKUP);
+    ro.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    let r = ro.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR);
+    assert!(
+        payload_str(&r).contains("read-only"),
+        "unexpected error: {}",
+        payload_str(&r)
+    );
+
+    // Trigger: acknowledged at once, the file lands asynchronously.
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+
+    let dir = backup_list(&addr, Some("s3cret")).await["dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = std::path::PathBuf::from(dir);
+    let mut done = false;
+    for _ in 0..250 {
+        let names = backup_names(&dir);
+        if let Some(n) = names.first() {
+            if std::fs::read_to_string(dir.join(n))
+                .unwrap_or_default()
+                .contains("snap")
+            {
+                done = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(done, "triggered backup never appeared");
+    let v = backup_list(&addr, Some("s3cret")).await;
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["last"]["ok"], true);
+    assert_eq!(v["interval_secs"], 0);
+
+    // Unknown action and malformed payloads are explicit errors.
+    let mut c2 = Client::connect(&addr).await;
+    c2.auth("s3cret").await;
+    c2.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"restore"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c2.recv().await.frame_type, proto::RESP_ERROR);
+    c2.send(&Frame::new(proto::REQ_BACKUP, b"not json".to_vec()))
+        .await;
+    assert_eq!(c2.recv().await.frame_type, proto::RESP_ERROR);
 }

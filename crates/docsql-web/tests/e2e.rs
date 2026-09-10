@@ -70,6 +70,9 @@ async fn start_stack(
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -573,6 +576,9 @@ async fn cluster_page_probes_live_and_dead_nodes() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -638,6 +644,9 @@ async fn logs_endpoint_serves_local_and_node_reports() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -757,6 +766,9 @@ async fn node_selection_routes_sql_meta_stats() {
         transport_key: None,
         async_commit: false,
         catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -1096,4 +1108,117 @@ async fn console_account_persists_across_restart() {
             .status,
         200
     );
+}
+
+/// /api/backup: token-gated; GET lists the managed node's backup state
+/// (REQ_BACKUP over the wire) and POST triggers one backup, whose file then
+/// shows up in the next poll. `?node=` targets an explicit whitelisted peer.
+#[tokio::test]
+async fn backup_endpoint_lists_and_triggers() {
+    // Token gate first.
+    let daddr = start_web(Some("sekrit"), Vec::new(), None).await;
+    let res = http(&daddr, "GET", "/api/backup", None, None).await;
+    assert_eq!(res.status, 401);
+
+    // Real node as default managed target AND whitelisted peer; some data.
+    let node_dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let node_addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: node_dir.path().join("node.db"),
+        listen: node_addr.clone(),
+        auth_token: Some("sekrit".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let web = start_web(
+        Some("sekrit"),
+        vec![node_addr.clone()],
+        Some(node_addr.clone()),
+    )
+    .await;
+    sql(
+        &web,
+        Some("sekrit"),
+        "CREATE TABLE s (id INT PRIMARY KEY, v TEXT)",
+    )
+    .await;
+    sql(&web, Some("sekrit"), "INSERT INTO s VALUES (1, 'bkp')").await;
+
+    // GET: no backups yet (the interval is off in tests).
+    let res = http(&web, "GET", "/api/backup", Some("sekrit"), None).await;
+    assert_eq!(res.status, 200);
+    let v = res.json();
+    assert!(v["error"].is_null(), "{v}");
+    assert_eq!(v["count"], 0);
+
+    // POST: trigger; the node acknowledges and runs the backup async.
+    let res = http(&web, "POST", "/api/backup", Some("sekrit"), Some("{}")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["ok"], true);
+
+    let mut ok = false;
+    for _ in 0..250 {
+        let v = http(&web, "GET", "/api/backup", Some("sekrit"), None)
+            .await
+            .json();
+        if v["count"] == 1 && v["last"]["ok"] == true {
+            assert!(v["files"][0]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("backup-"));
+            assert!(v["files"][0]["bytes"].as_u64().unwrap() > 0);
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ok, "triggered backup never showed up in the list");
+
+    // Explicit node override lands on the whitelisted peer itself.
+    let res = http(
+        &web,
+        "GET",
+        &format!("/api/backup?node={node_addr}"),
+        Some("sekrit"),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    let v = res.json();
+    assert!(v["error"].is_null(), "{v}");
+    assert_eq!(v["count"], 1);
+
+    // Unlisted nodes stay refused (SSRF guard).
+    let res = http(
+        &web,
+        "GET",
+        "/api/backup?node=evil.example:7600",
+        Some("sekrit"),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    assert!(res.json()["error"].as_str().unwrap().contains("未知节点"));
 }

@@ -19,6 +19,12 @@
 #                     forge node traffic). Must match on every node; use a
 #                     value distinct from DOCSQL_TOKEN. Empty = legacy
 #                     behavior (replication shares DOCSQL_TOKEN).
+#   DOCSQL_BACKUP_INTERVAL_SECS  automatic backup cadence in seconds
+#                     (default 86400 = daily; 0 = off). Each backup is a
+#                     consistent logical SQL snapshot written under
+#                     /data/backups inside the node's data volume.
+#   DOCSQL_BACKUP_KEEP  backups retained per node, oldest pruned
+#                     (default 7).
 #
 #   cp .env.example .env && edit, then pick a profile and up -d.
 #
@@ -50,6 +56,11 @@ services:
       # to each other automatically during replication fan-out).
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      # Automatic backups (logical SQL dumps under /data/backups, inside the
+      # node's data volume). Empty = server default (daily, keep 7); 0
+      # disables. See .env.example.
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:18601:7600"
     volumes:
@@ -74,6 +85,8 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:18602:7600"
     volumes:
@@ -101,6 +114,8 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:18603:7600"
     volumes:
@@ -139,6 +154,8 @@ services:
       DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:18604:7600"
     volumes:
@@ -199,6 +216,9 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      # Automatic backups: same semantics as the cluster nodes above.
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:18600:7600"
     volumes:

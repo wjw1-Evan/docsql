@@ -156,6 +156,81 @@ else
   bad "node did not come back for guid restart check"
 fi
 
+echo "== 8. automatic backups (interval 5s via run-tests.sh) =="
+# 自动备份:定时逻辑 SQL 快照落在节点数据卷的 /data/backups(随卷持久);
+# 恢复 = 重放备份文件(整库替换,集群内会经扇出传播收敛)。
+# 容器内文件一律 docker exec cat 中转,命令走参数列表,不拼 shell 字符串。
+BK="/data/backups"
+backup_names() { docker exec "$CTR" ls "$BK" 2>/dev/null | grep -E '^backup-.*\.sql$' | sort; }
+newest() { backup_names | tail -1; }
+# 备份文件出现(首拍即触发,栈就绪后应已有;轮询兜底)。
+bk=""
+for _ in $(seq 1 60); do
+  bk=$(newest)
+  [ -n "$bk" ] && break
+  sleep 1
+done
+[ -n "$bk" ] && ok "backup file created" || bad "no backup file appeared"
+# 内容是完整 SQL 快照(DDL + 数据)。
+if [ -n "$bk" ]; then
+  out=$(docker exec "$CTR" cat "$BK/$bk")
+  echo "$out" | grep -q "CREATE TABLE" && echo "$out" | grep -q "INSERT" \
+    && ok "backup contains DDL + data" || bad "backup content: $(echo "$out" | head -c 120)"
+else
+  bad "backup content (no file)"
+fi
+# 定时器持续产出,保留策略不超上限(keep 默认 7)。
+n=0
+for _ in $(seq 1 30); do
+  n=$(backup_names | wc -l | tr -d " ")
+  [ "${n:-0}" -ge 2 ] && break
+  sleep 1
+done
+if [ "${n:-0}" -ge 2 ] && [ "${n:-0}" -le 7 ]; then
+  ok "timer keeps producing, retention holds ($n files, keep=7)"
+else
+  bad "backup count out of range: '$n'"
+fi
+# web 控制台备份页数据源(GET /api/backup)与手动触发(POST,节点异步执行)。
+r=$(curl -s "$W/api/backup")
+echo "$r" | grep -q '"count"' && echo "$r" | grep -q 'backup-' \
+  && ok "web backup list" || bad "web backup list: $r"
+r=$(curl -s -X POST "$W/api/backup")
+echo "$r" | grep -q '"ok":true' && ok "web backup trigger" || bad "web backup trigger: $r"
+# 恢复演练:取一份含 sg 全部行的快照 → DROP 该表 → 重放备份 → 行数回来。
+sgbk=""
+for _ in $(seq 1 30); do
+  bk=$(newest)
+  [ -n "$bk" ] || { sleep 1; continue; }
+  out=$(docker exec "$CTR" cat "$BK/$bk")
+  echo "$out" | grep -q "after-restart" && { sgbk="$bk"; break; }
+  sleep 1
+done
+if [ -n "$sgbk" ]; then
+  sql "$A" "DROP TABLE sg;" >/dev/null 2>&1
+  gone=""
+  for _ in $(seq 1 10); do
+    out=$(sql "$A" "SELECT COUNT(id) FROM sg;" 2>&1)
+    echo "$out" | grep -qi "does not exist" && { gone=1; break; }
+    sleep 0.3
+  done
+  if [ -n "$gone" ]; then
+    docker exec "$CTR" cat "$BK/$sgbk" | docker exec -i "$CTR" docsql-cli connect "$A" >/dev/null 2>&1
+    restored=""
+    for _ in $(seq 1 20); do
+      out=$(sql "$A" "SELECT COUNT(id) FROM sg;" 2>/dev/null)
+      echo "$out" | grep -qE "^[[:space:]]*3[[:space:]]*$" && { restored=1; break; }
+      sleep 0.5
+    done
+    [ -n "$restored" ] && ok "restore drill: dropped table back with 3 rows" \
+      || bad "restore drill: $(sql "$A" "SELECT COUNT(id) FROM sg;" 2>&1)"
+  else
+    bad "restore drill: drop did not take effect"
+  fi
+else
+  bad "restore drill: no snapshot carrying sg rows"
+fi
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

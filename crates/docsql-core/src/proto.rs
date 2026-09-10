@@ -108,6 +108,11 @@ pub const REQ_SQL_SEQ: u16 = 0x0015;
 /// journal entries with seq > after_seq as RESP_CATCHUP chunks and
 /// terminates with RESP_AFFECTED carrying its journal head.
 pub const REQ_CATCHUP: u16 = 0x0016;
+/// Backup management (authenticated): payload = JSON
+/// `{"action": "list"|"trigger"}`. `list` reports the node's backup
+/// directory contents and last-attempt status; `trigger` runs one backup
+/// now (rejected for read-only connections). Both respond RESP_BACKUP.
+pub const REQ_BACKUP: u16 = 0x0017;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
@@ -142,6 +147,10 @@ pub const RESP_DIGEST: u16 = 0x010B;
 /// concatenated up to the frame-size budget. Terminated by RESP_AFFECTED
 /// carrying the origin's journal head (u64 LE).
 pub const RESP_CATCHUP: u16 = 0x010C;
+/// Backup report (see REQ_BACKUP): payload = JSON object
+/// `{dir, interval_secs, keep, count, files: [{name, bytes, ts_ms}],
+/// last: {ts_ms, file, ok, error}?}`.
+pub const RESP_BACKUP: u16 = 0x010D;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

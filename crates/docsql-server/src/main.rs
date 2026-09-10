@@ -48,6 +48,18 @@
 //!                                     unbounded) — how far a rejoined
 //!                                     peer can incrementally catch up
 //!                                     before a full snapshot is needed
+//!     DOCSQL_BACKUP_INTERVAL_SECS=<n> automatic backup cadence in
+//!                                     seconds (default 86400 = daily;
+//!                                     0 = disabled). Each backup is a
+//!                                     logical SQL dump written under
+//!                                     the write path, so it is a
+//!                                     consistent point-in-time snapshot
+//!     DOCSQL_BACKUP_KEEP=<n>          backups retained per node, oldest
+//!                                     pruned (default 7)
+//!     DOCSQL_BACKUP_DIR=<path>        backup directory (default
+//!                                     <db-dir>/backups — /data/backups
+//!                                     in the containers, inside the
+//!                                     data volume)
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -112,6 +124,18 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(100_000);
+    let backup_interval_secs = std::env::var("DOCSQL_BACKUP_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(86_400);
+    let backup_keep = std::env::var("DOCSQL_BACKUP_KEEP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(7);
+    let backup_dir = std::env::var("DOCSQL_BACKUP_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
     let transport_key = match std::env::var("DOCSQL_KEY") {
         Ok(k) if !k.trim().is_empty() => Some(
             docsql_server::crypto::parse_key_hex(&k).unwrap_or_else(|e| panic!("DOCSQL_KEY: {e}")),
@@ -151,6 +175,9 @@ async fn main() -> std::io::Result<()> {
         transport_key,
         async_commit,
         catchup_window,
+        backup_interval_secs,
+        backup_keep,
+        backup_dir,
     })
     .await
 }

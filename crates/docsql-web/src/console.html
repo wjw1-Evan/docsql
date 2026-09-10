@@ -276,6 +276,7 @@
     <div data-act="dashboard">服务器仪表盘</div>
     <div data-act="cluster">集群状态</div>
     <div data-act="logs">日志</div>
+    <div data-act="backup">备份管理</div>
   </div></div>
   <div class="menu" data-menu><span>帮助</span><div class="menu-drop">
     <div data-act="about">关于 DocSQL Studio</div>
@@ -519,9 +520,10 @@ const nodes = {
     localStorage.setItem('docsql.node', addr);
     $('#st-server').textContent = addr ? `节点 ${addr}` : (this.default ? `默认 ${this.default}` : 'DocSQL');
     explorer.refresh();
-    // 已打开的仪表盘/数据页跟随切换到新目标节点。
+    // 已打开的仪表盘/数据页/备份页跟随切换到新目标节点。
     tabs.byKind('dash').forEach(t => t.load && t.load());
     tabs.byKind('data').forEach(t => t.load && t.load());
+    tabs.byKind('backup').forEach(t => t.load && t.load());
   },
   async boot() {
     try {
@@ -1384,13 +1386,99 @@ function openClusterTab() {
   });
 }
 
+/* ================= 备份管理 ================= */
+// 当前管理目标(节点切换器选定)的自动备份状态与备份文件列表(GET
+// /api/backup),「立即备份」触发一次手动备份(POST /api/backup,节点异步
+// 执行,状态经轮询回显)。恢复是整库覆盖操作,控制台不提供按钮:备份文件
+// 是完整 SQL 快照,在节点上重放即还原(集群内会经扇出传播收敛),手册见
+// README「数据持久化」。
+function openBackupTab() {
+  tabs.open('backup', 'backup', '备份管理', (t) => {
+    t.auto = true;
+    t.el.innerHTML = `<div class="dash">
+      <h2>备份管理</h2>
+      <div class="sub">自动备份为逻辑 SQL 快照(整库一致点,含全部表结构与数据)· 文件在节点的数据卷内(/data/backups)</div>
+      <div class="dash-actions">
+        <button class="primary" data-do="trigger">立即备份</button>
+        <button data-do="refresh">刷新</button>
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
+          <input type="checkbox" data-do="auto" checked>每 5 秒自动刷新</label>
+        <span class="meta" data-at style="color:var(--txt3)"></span>
+      </div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)">正在读取备份状态…</div></div>
+    </div>`;
+    $('[data-do="trigger"]', t.el).onclick = async (e) => {
+      const b = e.target;
+      b.disabled = true;
+      try {
+        const r = await api.post('/api/backup');
+        if (r.error) ui.toast('备份触发失败:' + r.error, true);
+        else { ui.toast('备份已开始'); t.load(); }
+      } catch (err) { ui.toast('备份触发失败:' + err.message, true); }
+      b.disabled = false;
+    };
+    $('[data-do="refresh"]', t.el).onclick = () => t.load();
+    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
+    t.render = (v) => {
+      const body = $('[data-body]', t.el);
+      if (v.error) {
+        body.innerHTML = `<div class="card" style="max-width:600px"><div class="v" style="color:var(--err);font-size:14px">${esc(v.error)}</div><div class="k">节点不可达或拒绝请求,可切换节点后重试</div></div>`;
+        return;
+      }
+      const dash = '<span class="null">—</span>';
+      const last = v.last;
+      const lastHtml = !last ? '<span class="null">尚无备份</span>'
+        : (last.ok
+          ? `<span style="color:var(--ok)">● 成功</span> <span style="font-family:var(--mono)">${esc(last.file || '')}</span>${last.ts_ms ? ' · ' + esc(new Date(last.ts_ms).toLocaleString()) : ''}`
+          : `<span style="color:var(--err)">● 失败</span> ${esc(last.error || '')}`);
+      const iv = +v.interval_secs || 0;
+      const ivHtml = !iv ? '<span class="null">关闭</span>'
+        : (iv % 86400 === 0 ? `${iv / 86400}<small> 天</small>` : `${iv}<small> 秒</small>`);
+      const cards = [
+        [ivHtml, '自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)'],
+        [`${esc(v.keep === undefined ? dash : v.keep)}<small> 份</small>`, '保留份数(DOCSQL_BACKUP_KEEP)'],
+        [`${esc(v.count || 0)}<small> 份</small>`, '现有备份'],
+        [v.running ? '<span style="color:var(--warn)">进行中…</span>' : lastHtml, '最近一次'],
+      ];
+      let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
+        `<div class="card"><div class="v"${c[2] || ''}>${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
+      const files = v.files || [];
+      if (!files.length) {
+        html += `<div class="card" style="max-width:680px">
+          <div class="v" style="font-size:15px">暂无备份</div>
+          <div class="k" style="line-height:1.7">节点尚未产生备份文件(目录:${esc(v.dir || dash)})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。
+          备份是完整的 SQL 快照(DROP + CREATE + INSERT),在节点上重放即整库还原;集群内任一节点重放会经复制扇出传播到全网,操作手册见 README「数据持久化」。</div></div>`;
+      } else {
+        html += `<table class="grid"><thead><tr><th>备份文件</th><th>大小</th><th>时间</th></tr></thead><tbody>` +
+          files.map(f => `<tr>
+            <td style="font-family:var(--mono)">${esc(f.name)}</td>
+            <td>${fmtBytes(f.bytes)}</td>
+            <td>${f.ts_ms ? esc(new Date(f.ts_ms).toLocaleString()) : dash}</td>
+          </tr>`).join('') + `</tbody></table>`;
+      }
+      body.innerHTML = html;
+    };
+    t.load = async () => {
+      try {
+        const v = await api.get('/api/backup');
+        t.render(v);
+        $('[data-at]', t.el).textContent = '上次刷新 ' + new Date().toTimeString().slice(0, 8);
+      } catch (e) { ui.toast('备份状态读取失败:' + e.message, true); }
+    };
+    // 只在 tab 激活时轮询,后台 tab 不产生请求。
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
+    t.onClose = () => clearInterval(t.timer);
+    t.load();
+  });
+}
+
 /* ================= 日志(数据 / 同步)================== */
 // 全部日志:控制台自身提交语句的审计 + 各节点 REQ_LOGS 报告(语句审计 +
 // 同步事件),按时间倒序合并展示;支持类别(全部/数据/同步/仅错误)、来源、
 // 关键词过滤与 5 秒自动刷新(仅激活时轮询)。
 const SYNC_EVENTS = {
   forward: '写扇出', publish: '发布扇出', trim: 'TRIM 扇出',
-  promote: 'PROMOTE', join: '节点加入',
+  promote: 'PROMOTE', join: '节点加入', backup: '备份',
 };
 const fmtTs = (ms) => { const d = new Date(ms), p = (n, w) => String(n).padStart(w || 2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`; };
@@ -1729,6 +1817,7 @@ const explorer = {
         {id: 'dash', label: '服务器仪表盘', act: () => openDashboard()},
         {id: 'cluster', label: '集群状态', act: () => openClusterTab()},
         {id: 'logs', label: '日志', act: () => openLogsTab()},
+        {id: 'backup', label: '备份管理', act: () => openBackupTab()},
         {id: 'newq', label: '新建查询', act: () => openQueryTab()},
         {id: 'refresh', label: '刷新', act: () => this.refresh()},
       ], x, y);
@@ -1810,6 +1899,7 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'dashboard') openDashboard();
     else if (act === 'cluster') openClusterTab();
     else if (act === 'logs') openLogsTab();
+    else if (act === 'backup') openBackupTab();
     else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST'}).finally(() => location.reload());
     else if (act === 'about') dialog('关于 DocSQL Studio', [
       {name:'a', label: '产品', value: 'DocSQL Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},

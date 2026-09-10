@@ -19,6 +19,10 @@
 //! - `GET  /api/logs`        logs page data: the console's own statement
 //!   audit ring + every DOCSQL_PEERS node's REQ_LOGS report (statement
 //!   audit + replication/sync events)
+//! - `GET  /api/backup`      backup management page data for a managed node
+//!   (`?node=`): the node's backup directory listing + last attempt
+//! - `POST /api/backup`      trigger one backup now on the managed node
+//!   (`?node=`); the outcome is polled back through GET
 //!
 //! Managed nodes: data endpoints accept an optional `node` (`?node=` query
 //! / JSON field) naming one of the configured DOCSQL_PEERS addresses;
@@ -138,6 +142,7 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/cluster", get(api_cluster))
         .route("/api/logs", get(api_logs))
+        .route("/api/backup", get(api_backup).post(api_backup_trigger))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/setup", post(auth_setup))
         .route("/api/auth/login", post(auth_login))
@@ -997,6 +1002,83 @@ pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value 
     }
 }
 
+/// Fetch a managed node's backup report / trigger a backup (REQ_BACKUP).
+/// `trigger` is acknowledged when the node accepts the request; the backup
+/// itself completes asynchronously and its outcome shows up in the next
+/// `list` (or REQ_STATUS) poll.
+pub async fn remote_backup(addr: &str, token: Option<&str>, trigger: bool) -> serde_json::Value {
+    let run: Result<serde_json::Value, String> = async {
+        let mut stream = node_connect(addr, token).await?;
+        let action = if trigger { "trigger" } else { "list" };
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"action": action})).unwrap_or_default();
+        node_write_frame(&mut stream, &Frame::new(proto::REQ_BACKUP, payload))
+            .await
+            .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
+        let f = node_read_frame(&mut stream)
+            .await
+            .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
+        match f.frame_type {
+            proto::RESP_BACKUP => serde_json::from_slice(&f.payload)
+                .map_err(|e| format!("节点 {addr} 的 backup 载荷无法解析: {e}")),
+            proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
+            proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
+            other => Err(format!("节点 {addr} 返回了意外帧: {other:#06x}")),
+        }
+    }
+    .await;
+    match run {
+        Ok(v) => v,
+        Err(m) => serde_json::json!({"error": m}),
+    }
+}
+
+/// Backup management page data for one managed node (list; `?node=`).
+async fn api_backup(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(params): Query<NodeParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    match target_for(&state, &params.node) {
+        Ok(addr) => Ok(Json(
+            remote_backup(&addr, state.token.as_deref(), false).await,
+        )),
+        Err(e) => Ok(Json(e)),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BackupTriggerBody {
+    /// Managed-node override (the console's api.post merges the selected
+    /// node into the JSON body).
+    node: Option<String>,
+}
+
+/// Trigger one backup now on the managed node (`?node=` or JSON body).
+async fn api_backup_trigger(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(params): Query<NodeParams>,
+    body: Option<Json<BackupTriggerBody>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    let node = match body {
+        Some(Json(b)) => b.node.or(params.node),
+        None => params.node,
+    };
+    match target_for(&state, &node) {
+        Ok(addr) => Ok(Json(
+            remote_backup(&addr, state.token.as_deref(), true).await,
+        )),
+        Err(e) => Ok(Json(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,6 +1104,11 @@ mod tests {
         assert!(html.contains("openLogsTab"));
         assert!(html.contains("数据日志"));
         assert!(html.contains("同步日志"));
+        // Backup management surface: status + files + manual trigger over
+        // /api/backup.
+        assert!(html.contains("openBackupTab"));
+        assert!(html.contains("备份管理"));
+        assert!(html.contains("立即备份"));
         // No embedded engine: the selector's fallback is the default managed
         // node, never a local database.
         assert!(!html.contains("内嵌引擎"));
@@ -1142,6 +1229,9 @@ mod tests {
             transport_key: None,
             async_commit: false,
             catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 7,
+            backup_dir: None,
         }));
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(&addr).await.is_ok() {
@@ -1180,6 +1270,9 @@ mod tests {
             transport_key: None,
             async_commit: false,
             catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 7,
+            backup_dir: None,
         };
         tokio::spawn(docsql_server::run(cfg));
         for _ in 0..100 {

@@ -39,6 +39,11 @@ services:
       # is public on purpose (nothing secret on a loopback dev cluster);
       # production sets its own via docker-compose.prod.yml/.env.
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      # Automatic backups (logical SQL dumps under /data/backups, inside
+      # the node's data volume). Empty = server default (daily, keep 7);
+      # 0 disables. run-tests.sh overrides the interval for its assertions.
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:17601:7600"
     volumes:
@@ -58,6 +63,8 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:17602:7600"
     volumes:
@@ -80,6 +87,8 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:17603:7600"
     volumes:
@@ -112,6 +121,8 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
       DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:17604:7600"
     volumes:
@@ -164,6 +175,10 @@ services:
     image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]
+    environment:
+      # Automatic backups: same semantics as the cluster nodes above.
+      DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+      DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
       - "127.0.0.1:17600:7600"
     volumes:

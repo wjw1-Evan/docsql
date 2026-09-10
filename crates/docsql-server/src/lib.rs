@@ -14,6 +14,9 @@
 //! - REQ_LOGS      → RESP_LOGS: recent statement-audit entries + sync
 //!   events (query-log ring + replication fan-out trail) for the web
 //!   console's logs page
+//! - REQ_BACKUP    → RESP_BACKUP: backup directory listing + last attempt,
+//!   or trigger one backup now (automatic backups run on a timer, see
+//!   backup.rs)
 //! - REQ_SYNC      → RESP_SYNC chunks + RESP_AFFECTED: cluster join — a
 //!   fresh node pulls the cluster's full state (see the join section)
 //! - REQ_DIGEST    → RESP_DIGEST: per-table replication fingerprints; the
@@ -25,6 +28,7 @@
 //! Every connection shares one engine instance behind a mutex (single-writer
 //! v1; the cluster milestone brings per-shard concurrency).
 
+pub mod backup;
 pub mod crypto;
 pub mod pubsub;
 pub mod querylog;
@@ -127,6 +131,15 @@ pub struct ServerState {
     /// Catch-up journal window in entries (0 = unbounded); the journal
     /// is trimmed periodically as it grows past this.
     pub catchup_window: u64,
+    /// Automatic backup cadence in seconds (0 = disabled).
+    pub backup_interval_secs: u64,
+    /// Backups retained per node (oldest pruned after each backup).
+    pub backup_keep: usize,
+    /// Backup directory (default `<db dir>/backups`).
+    pub backup_dir: PathBuf,
+    /// Backup shared state: in-flight flag + last attempt outcome.
+    /// Never held while acquiring `write_order`/the engine (see backup.rs).
+    pub backup: Mutex<backup::BackupShared>,
     /// Data file location (status reports its size on disk).
     pub db_path: PathBuf,
     /// Server start time (status reports uptime).
@@ -250,6 +263,14 @@ pub struct ServerConfig {
     /// catch up (DOCSQL_CATCHUP_WINDOW). A peer positioned older than the
     /// window falls back to a full snapshot. 0 = unbounded.
     pub catchup_window: u64,
+    /// Automatic backup cadence in seconds (0 = disabled;
+    /// DOCSQL_BACKUP_INTERVAL_SECS, default 86400 = daily).
+    pub backup_interval_secs: u64,
+    /// Backups retained per node, oldest pruned (DOCSQL_BACKUP_KEEP).
+    pub backup_keep: usize,
+    /// Backup directory override; None = `<db dir>/backups`
+    /// (DOCSQL_BACKUP_DIR).
+    pub backup_dir: Option<PathBuf>,
 }
 
 pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
@@ -302,6 +323,15 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             .catalog()
             .iter()
             .any(|t| !docsql_core::engine::is_system_table(&t.name));
+    let backup_dir = cfg.backup_dir.clone().unwrap_or_else(|| {
+        let mut dir = cfg
+            .db_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        dir.push("backups");
+        dir
+    });
     let state = Arc::new(ServerState {
         db: Mutex::new(db),
         auth_token: cfg.auth_token,
@@ -333,6 +363,10 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         pubsub: pubsub::PubSub::new(),
         cluster_id,
         catchup_window: cfg.catchup_window,
+        backup_interval_secs: cfg.backup_interval_secs,
+        backup_keep: cfg.backup_keep,
+        backup_dir,
+        backup: Mutex::new(backup::BackupShared::default()),
         db_path: cfg.db_path,
         started: std::time::Instant::now(),
     });
@@ -369,6 +403,13 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                 }
             }
         });
+    }
+    if cfg.backup_interval_secs > 0 {
+        // Automatic backups: a logical dump on a timer (first tick is
+        // immediate, so a restart yields a fresh backup). Ticks during the
+        // startup sync are skipped inside the task.
+        let st = state.clone();
+        tokio::spawn(backup::backup_task(st, cfg.backup_interval_secs));
     }
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -900,6 +941,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     handle_unsubscribe(&state, conn_id, &frame, pubsub::SubKind::Pattern).await,
                 ),
                 proto::REQ_PUBSUB if authed => Some(handle_pubsub_cmd(&state, &frame).await),
+                proto::REQ_BACKUP if authed => {
+                    Some(backup::handle_backup(&state, role, &frame).await)
+                }
                 // Cluster-join frames are node-internal: they always ride
                 // FLAG_REPLICATION (peer connections under cluster-token
                 // auth), so a plain client cannot freeze or dump a node.
@@ -1001,6 +1045,10 @@ pub fn check_token_strength(name: &str, token: &str) -> Result<(), String> {
 pub async fn status_payload(state: &ServerState) -> serde_json::Value {
     let peers = state.peers.lock().await.clone();
     let replicate_to = state.replicate_to.lock().await.clone();
+    // Backup state first: it must be read without the engine lock held
+    // (backup.rs never nests the two, keep it that way).
+    let backup = serde_json::from_slice::<serde_json::Value>(&backup::backup_payload(state))
+        .unwrap_or(serde_json::json!({}));
     let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
     let mut total_rows = 0u64;
     let mut user_tables = 0usize;
@@ -1041,6 +1089,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "cluster_id": state.cluster_id,
         "journal_head": db.journal_head().unwrap_or(0),
         "journal_oldest": db.journal_oldest().unwrap_or(0),
+        "backup": backup,
     })
 }
 

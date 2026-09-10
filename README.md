@@ -64,7 +64,7 @@ INSERT INTO orders (id, note)
 cargo build --workspace
 cargo test --workspace          # Rust 全量测试(开发门禁;本地 Docker 构建亦内置)
 cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二进制)
-./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 76 项 + 单节点 26 项)
+./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 76 项 + 单节点 32 项)
 ```
 
 ## DocSQL Studio(Web 管理控制台)
@@ -87,9 +87,9 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 |---|---|
 | 存储 | JSON 文档整体存储(无强制 schema)、WAL 崩溃恢复、手写分页器与 B+ 树 |
 | SQL | CREATE/ALTER/DROP TABLE+INDEX、INSERT(多行/RETURNING)、UPDATE/DELETE(RETURNING)、SELECT(WHERE/ORDER/LIMIT/OFFSET/GROUP BY+HAVING/COUNT/SUM/AVG/MIN/MAX/JOIN:INNER/LEFT/CROSS/USING/子查询派生表/UNION(ALL)/IN)、事务 BEGIN/COMMIT/ROLLBACK、PRIMARY KEY/UNIQUE/NOT NULL/AUTOINCREMENT、GUID 主键(UUIDv7 时序有序自动生成)、information_schema、sqlite_master 兼容视图、PRAGMA 兼容 |
-| 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告 |
+| 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告、REQ_BACKUP 备份管理与手动触发 |
 | 发布订阅 | 持久化 pub/sub(参考 Redis 命令面):PUBLISH/SUBSCRIBE/PSUBSCRIBE(glob `*` `?` `[...]`)/UNSUBSCRIBE/PUBSUB CHANNELS·NUMSUB·NUMPAT·TRIM;消息先经 WAL 落盘再推送,重启不丢;订阅可指定起点(`earliest` 全量回放 / `latest` 仅新消息 / 指定 id 续传),断线用最后收到的 id 重新订阅即补齐(at-least-once);集群内发布自动扇出到全部节点,各节点本地落盘并推送本地订阅者;`docsql_pubsub` 系统视图可查消息历史 |
-| Web | **DocSQL Studio**(SSMS 风格管理控制台,纯管理工具、自身不存数据,默认连接并管理指定节点):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/删行)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、节点切换(默认管理节点 ↔ 任意 `DOCSQL_PEERS` 节点);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs,其中数据端点 /api/sql /api/meta /api/stats 可带 `node` 参数指定目标节点) |
+| Web | **DocSQL Studio**(SSMS 风格管理控制台,纯管理工具、自身不存数据,默认连接并管理指定节点):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/删行)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、备份管理页(备份状态/文件列表/立即备份)、节点切换(默认管理节点 ↔ 任意 `DOCSQL_PEERS` 节点);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs /api/backup,其中数据端点 /api/sql /api/meta /api/stats /api/backup 可带 `node` 参数指定目标节点) |
 | EF Core | `UseDocsql(connectionString)`(复用 SQLite 管线 + Docsql ADO.NET):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引(含唯一索引;模型增删索引均自动同步,免迁移) |
 | 集群 | 对等集群(`DOCSQL_PEERS`:任意节点可写,SQL 写入扇出至全部对等节点;节点之间用独立集群凭据互相认证)、主从复制(写转发)、只读副本、PROMOTE 故障转移 |
 
@@ -106,9 +106,9 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 ## 测试
 
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
-- Docker:compose 双 profile 部署测试全绿——多节点 76 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 26 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放)
+- Docker:compose 双 profile 部署测试全绿——多节点 76 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 32 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
 - .NET:xUnit(ADO.NET Client 43 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub)
-- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(76 + 26 项)
+- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(76 + 32 项)
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)
 
@@ -149,6 +149,19 @@ cd deploy && for v in a b c single; do docker volume create docsql-data-$v; done
 cd deploy && for v in a b c d single; do docker volume create docsql-dev-data-$v; done                                       # 开发
 ```
 
+**自动备份**:每个节点默认**每日一次**自动生成备份——整库的逻辑 SQL 快照(全部表的 DROP/CREATE/INSERT 脚本,不含系统表),写在节点数据卷的 `backups/` 子目录(容器内 `/data/backups`),随卷持久、发布/重建容器不丢。间隔与保留由 `DOCSQL_BACKUP_INTERVAL_SECS`(秒,默认 86400,0=关闭;节点重启后立即出一份新备份)与 `DOCSQL_BACKUP_KEEP`(保留份数,默认 7,超出删最旧)控制。备份在写路径静止时取快照,是整库一致点;集群为每节点独立备份(任一节点的备份都可恢复整库)。备份状态在 `REQ_STATUS` 的 `backup` 字段与 Web 控制台「备份管理」页可见,页面上可随时手动触发一次;每次备份成败也写入同步日志(控制台日志页可见)。
+
+**恢复**:备份文件是完整 SQL 脚本,以 `DROP TABLE IF EXISTS` 开头,**重放即整库还原**(幂等,可在现有数据上直接重放):
+
+```bash
+# 单节点:把某个备份重放进节点(容器内文件,经 docker exec 管道)
+bk=$(docker exec docsql-prod-single ls /data/backups | grep -E '^backup-.*\.sql$' | sort | tail -1)
+docker exec docsql-prod-single cat "/data/backups/$bk" | docker exec -i docsql-prod-single docsql-cli connect 127.0.0.1:7600
+# 集群:挑一个节点重放即可,每条语句会经复制扇出传播到全网,整体收敛到备份时点
+```
+
+恢复注意事项:恢复期间最好停写(恢复后到达的写正常落库,不会回滚);AUTOINCREMENT 计数器按恢复后现存最大值 +1 续推;备份不改动数据卷里的库文件本身,重放失败重试即可。要把备份带到主机侧归档,`docker cp docsql-prod-single:/data/backups .` 即可。
+
 **本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。
 
 **生产**(`deploy/docker-compose.prod.yml`,项目名 `docsql-prod`):拉取 CI 发布的 GHCR 镜像(不本地构建),端口 +1000(18600-18604/18700/18710,与开发栈互不冲突),数据卷沿用历史命名 `docsql-data-*`(真实数据在此),断线自动重启,日志轮转,Web 控制台可配 token:
@@ -162,7 +175,7 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 
 > 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)互不相同,两套拓扑可同时运行、互不共享数据。
 
-部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 76 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 26 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub)。
+部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 76 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 32 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub、自动备份与恢复演练)。
 
 > 注:镜像基于 mcr.microsoft.com/azurelinux(本环境 docker.io 不可达)。
 
@@ -181,6 +194,7 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 | 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);绑定非回环地址且未配置 `DOCSQL_KEY` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1` |
 | SQL 注入防护 | 参数化语句面(REQ_PREPARE/REQ_EXECUTE,ADO.NET/EF Core 参数绑定);服务端不拼接外部输入;系统表 `_pubsub_messages` 对 SQL 客户端隐藏 |
 | 数据完整性 | WAL 先写日志后落数据、崩溃恢复;节点间复制依赖独立集群凭据防伪造 |
+| 数据备份 | 自动定时备份(默认每日,`DOCSQL_BACKUP_INTERVAL_SECS`/`DOCSQL_BACKUP_KEEP` 可调):整库一致点逻辑快照,随数据卷持久;恢复为整库重放,控制台备份页可手动触发;备份成败计入审计日志 |
 
 已知边界:审计环形缓冲在内存(重启丢失,需要长期留存请启用 `DOCSQL_LOG_FILE` 外发);静态数据加密(TDE)暂未内置(可部署在加密卷之上)。
 
