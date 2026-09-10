@@ -149,19 +149,19 @@ cd deploy && for v in a b c single; do docker volume create docsql-data-$v; done
 cd deploy && for v in a b c d single; do docker volume create docsql-dev-data-$v; done                                       # 开发
 ```
 
-**自动备份**:每个节点默认**每日一次**自动生成备份——整库的逻辑 SQL 快照(全部表的 DROP/CREATE/INSERT 脚本,不含系统表),写在节点数据卷的 `backups/` 子目录(容器内 `/data/backups`),随卷持久、发布/重建容器不丢。间隔与保留由 `DOCSQL_BACKUP_INTERVAL_SECS`(秒,默认 86400,0=关闭;节点重启后立即出一份新备份)与 `DOCSQL_BACKUP_KEEP`(保留份数,默认 7,超出删最旧)控制。备份在写路径静止时取快照,是整库一致点;集群为每节点独立备份(任一节点的备份都可恢复整库)。备份状态在 `REQ_STATUS` 的 `backup` 字段与 Web 控制台「备份管理」页可见,页面上可随时手动触发一次;每次备份成败也写入同步日志(控制台日志页可见)。
+**自动备份**:每个节点默认**每日一次**自动生成备份——整库的逻辑 SQL 快照(全部表的 DROP/CREATE/INSERT 脚本,不含系统表),写在节点数据卷的 `backups/` 子目录(容器内 `/data/backups`),随卷持久、发布/重建容器不丢。间隔与保留由 `DOCSQL_BACKUP_INTERVAL_SECS`(秒,默认 86400,0=关闭;节点重启后若无备份或最新备份已超一个间隔则立即出一份新备份,频繁重启不会把保留窗口挤成近同快照)与 `DOCSQL_BACKUP_KEEP`(保留份数,默认 7,超出删最旧)控制。备份在写路径静止时取快照,是整库一致点;集群为每节点独立备份(任一节点的备份都可恢复整库)。备份状态在 `REQ_STATUS` 的 `backup` 字段与 Web 控制台「备份管理」页可见,页面上可随时手动触发一次;每次备份成败也写入同步日志(控制台日志页可见)。
 
-**恢复**:内置两条路,语义相同——备份文件是完整 SQL 脚本(以 `DROP TABLE IF EXISTS` 开头,重放即整库还原、幂等),由节点逐条语句经正常写路径重放,**每条语句扇出到集群全网,整体收敛到备份时点**:
+**恢复**:内置两条路,语义相同——备份文件是完整 SQL 脚本(以一条多表 `DROP TABLE IF EXISTS` 开头,重放即整库还原、幂等),由节点逐条语句经正常写路径重放,**每条语句扇出到集群全网,整体收敛到备份时点**:
 
-- **Web 控制台**:「备份管理」页每行「恢复」按钮,输入完整备份文件名确认即触发;恢复进行中显示进度,完成后回显结果。
-- **API/手工**:`POST /api/backup/restore {"file": "backup-….sql"}`;或把备份文件重放进节点(容器内文件经 docker exec 管道):
+- **Web 控制台**:「备份管理」页每行「恢复」按钮,输入完整备份文件名确认即触发(对话框标明目标节点;API 调用同样要求 `confirm` 字段逐字重复文件名);恢复进行中显示进度,完成后回显结果并标注**集群收敛是否已验证**。
+- **API/手工**:`POST /api/backup/restore {"file": "backup-….sql", "confirm": "backup-….sql"}`;或把备份文件重放进节点(容器内文件经 docker exec 管道):
 
 ```bash
 bk=$(docker exec docsql-prod-single ls /data/backups | grep -E '^backup-.*\.sql$' | sort | tail -1)
 docker exec docsql-prod-single cat "/data/backups/$bk" | docker exec -i docsql-prod-single docsql-cli connect 127.0.0.1:7600
 ```
 
-恢复语义与注意事项:恢复**覆盖备份中包含的所有表**(整表替换);备份之后新建的表不受影响,如需完全对齐请先手动删除;恢复期间及之后到达的新写正常落库、不会回滚,建议恢复前停写;AUTOINCREMENT 计数器按恢复后现存最大值 +1 续推;恢复在所选节点发起即可,重放经扇出传播全网(离线节点重启后按反熵机制自动补齐);只读连接/只读副本拒绝恢复。要把备份带到主机侧归档,`docker cp docsql-prod-single:/data/backups .` 即可。
+恢复语义与注意事项:恢复**覆盖备份中包含的所有表**(整表替换);备份之后新建的表不受影响,如需完全对齐请先手动删除;**恢复重放期间发起节点持写路径**——本地新写在恢复期间排队(超过 30 秒报错),恢复完成后照常落库、不会回滚;重放期间其它节点错过扇入的写由发起节点在恢复完成后自动增量补拉,并逐一比对全网摘要,`converged=false` 时按提示让仍分歧的节点重启一次即自动修复;AUTOINCREMENT 计数器按恢复后现存最大值 +1 续推;恢复在所选节点发起即可,重放经扇出传播全网(全网同时只允许一个恢复:发起节点会探测各 peer,他节点恢复进行中即拒绝);只读连接/只读副本拒绝恢复。要把备份带到主机侧归档,`docker cp docsql-prod-single:/data/backups .` 即可。
 
 **本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。
 

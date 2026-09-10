@@ -10195,6 +10195,77 @@ mod tx_rollback_tests {
         assert_eq!(dst.catalog().len(), 1);
         assert_eq!(dst.catalog()[0].name, "user_t");
     }
+
+    /// Snapshot adoption must leave the adopter's digests equal to the
+    /// origin's: schema_hash covers the DEFAULT expression text, which the
+    /// dump renders as `DEFAULT (expr)` — without storing a normalized
+    /// form, the replayed catalog kept the parens (`('anon')`), digests
+    /// never matched again, and every rejoin degraded to a full snapshot.
+    #[test]
+    fn dump_restore_digest_roundtrip_is_stable_with_defaults_and_fk() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT DEFAULT 'anon')",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE orders (id INT PRIMARY KEY AUTOINCREMENT, uid INT, \
+             FOREIGN KEY (uid) REFERENCES users (id))",
+        );
+        run(&mut db, "INSERT INTO users VALUES (1, 'a')");
+        run(&mut db, "INSERT INTO users (id) VALUES (2)");
+        run(&mut db, "INSERT INTO orders (uid) VALUES (1), (2)");
+        let script = db.dump_script().unwrap();
+        assert!(script.contains("DEFAULT ('anon')"), "{script}");
+
+        let mut restored = apply_dump(&script);
+        assert_eq!(
+            db.digests().unwrap(),
+            restored.digests().unwrap(),
+            "source and restored digests must agree (schema and rows)"
+        );
+        // And the restored node's dump is a fixed point: no paren growth
+        // across dump cycles.
+        let script2 = restored.dump_script().unwrap();
+        assert_eq!(script, script2, "dump must be a fixed point");
+    }
+
+    /// Backup restore replays the dump over LIVE data, statement by
+    /// statement, without a wipe. Per-table DROP+CREATE interleaved
+    /// alphabetically used to abort it: the recreated child table
+    /// referenced the parent whose old copy was still to be dropped, and
+    /// DROP's FK guard rejected it. One multi-table DROP (whose co-dropped
+    /// tables the guard exempts) makes the replay FK-safe.
+    #[test]
+    fn dump_replays_over_live_fk_data() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE users (id INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "CREATE TABLE orders (id INT PRIMARY KEY, uid INT, \
+             FOREIGN KEY (uid) REFERENCES users (id))",
+        );
+        run(&mut db, "INSERT INTO users VALUES (1)");
+        run(&mut db, "INSERT INTO orders VALUES (100, 1)");
+        let script = db.dump_script().unwrap();
+
+        // Live drift after the snapshot, then the restore-style replay:
+        // autocommit statements over the live database, in script order.
+        run(&mut db, "INSERT INTO users VALUES (2)");
+        run(&mut db, "INSERT INTO orders VALUES (101, 2)");
+        for stmt in script.split(";\n").filter(|s| !s.trim().is_empty()) {
+            run(&mut db, stmt);
+        }
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM users").rows[0][0],
+            Value::Int(1)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT id FROM orders").rows[0][0],
+            Value::Int(100)
+        );
+    }
 }
 
 // ---- complex query combinations -------------------------------------

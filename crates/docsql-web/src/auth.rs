@@ -321,12 +321,40 @@ impl AuthStore {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
+        // Create with 0600 from the start: write-then-chmod leaves a
+        // world-readable window on the password hash, and a chmod that
+        // fails silently (non-chmod-able volume) would keep it readable
+        // forever — surface that failure instead.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)
+                .map_err(|e| format!("cannot open {}: {e}", self.path.display()))?;
+            f.write_all(serde_json::to_vec(&doc).unwrap().as_slice())
+                .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(&self.path, serde_json::to_vec(&doc).unwrap())
             .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            // The volume may not honor chmod (some network mounts); say so
+            // instead of letting the file keep its mount default.
+            if let Err(e) =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+            {
+                eprintln!(
+                    "warning: cannot chmod 600 {}: {e} (credential file may be over-readable)",
+                    self.path.display()
+                );
+            }
         }
         Ok(())
     }

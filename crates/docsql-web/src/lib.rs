@@ -74,6 +74,11 @@ pub struct WebState {
     /// `None` when `DOCSQL_WEB_AUTH_FILE` is unset: legacy behavior, token
     /// header gate only.
     pub auth: Option<AuthShared>,
+    /// Behind a trusted reverse proxy (`DOCSQL_WEB_TRUST_PROXY=1`), key
+    /// login lockout on the forwarded client IP instead of the proxy's —
+    /// otherwise every user shares one bucket and ten wrong passwords from
+    /// anyone lock out everybody.
+    pub trust_proxy: bool,
 }
 
 /// Shared auth surface: the credential file store, in-memory sessions, and
@@ -125,6 +130,9 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         query_log: querylog::QueryLog::new(),
         sync_log: querylog::SyncLog::new(1),
         auth,
+        trust_proxy: std::env::var("DOCSQL_WEB_TRUST_PROXY")
+            .ok()
+            .is_some_and(|v| v.trim() == "1"),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -156,10 +164,13 @@ fn build_router(state: Arc<WebState>) -> Router {
 
 /// The API gate. Legacy behavior: `X-Docsql-Token` must match the server
 /// token when one is configured, nothing otherwise. With the console
-/// account active, a valid session cookie also passes; the token keeps
-/// working as the programmatic bypass; and until the account is set up,
-/// data endpoints stay reachable when no token is configured (the setup
-/// happens on first use and closes that window).
+/// account active, a valid session cookie passes; the token keeps working
+/// as the programmatic bypass. Until the account is set up AND no token
+/// is configured, data endpoints answer 401 — the anonymous window used
+/// to keep them reachable pre-setup, which left the most destructive
+/// endpoint (whole-database restore) open to anyone who could reach the
+/// port until somebody happened to complete setup. Setup itself and the
+/// auth endpoints need no gate; everything else waits for credentials.
 fn check_auth(state: &WebState, headers: &HeaderMap) -> Option<StatusCode> {
     let token = headers.get("X-Docsql-Token").and_then(|v| v.to_str().ok());
     let token_ok = match &state.token {
@@ -179,9 +190,6 @@ fn check_auth(state: &WebState, headers: &HeaderMap) -> Option<StatusCode> {
         return None;
     }
     if token_ok && state.token.is_some() {
-        return None;
-    }
-    if matches!(auth.mode(), auth::AuthMode::Setup) && state.token.is_none() {
         return None;
     }
     Some(StatusCode::UNAUTHORIZED)
@@ -207,6 +215,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Lockout bucket key for login-failure limiting: the direct socket peer
+/// by default; the forwarded client IP when running behind a trusted
+/// reverse proxy (`DOCSQL_WEB_TRUST_PROXY=1`) — otherwise every user
+/// shares the proxy's single bucket and anyone can lock out everybody.
+/// Only set the flag where the proxy strips/overwrites X-Forwarded-For;
+/// a client-supplied header must never choose the bucket.
+fn lockout_key(state: &WebState, headers: &HeaderMap, peer: SocketAddr) -> std::net::IpAddr {
+    if state.trust_proxy {
+        if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+    }
+    peer.ip()
+}
+
 async fn index() -> Html<&'static str> {
     Html(include_str!("console.html"))
 }
@@ -220,11 +247,17 @@ struct CredentialsBody {
 }
 
 fn session_cookie(token: &str) -> String {
+    // Secure keeps the session off plaintext hops; opt-in because the
+    // common deployment terminates TLS at a proxy and speaks http inside.
+    let secure = std::env::var("DOCSQL_WEB_COOKIE_SECURE")
+        .ok()
+        .is_some_and(|v| v.trim() == "1");
     format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}",
+        "{}={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
         auth::SESSION_COOKIE,
         token,
-        auth::SESSION_TTL.as_secs()
+        auth::SESSION_TTL.as_secs(),
+        if secure { "; Secure" } else { "" }
     )
 }
 
@@ -258,6 +291,7 @@ async fn auth_status(State(state): State<Arc<WebState>>) -> Response {
 async fn auth_setup(
     State(state): State<Arc<WebState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<CredentialsBody>,
 ) -> Response {
     let Some(a) = &state.auth else {
@@ -266,7 +300,8 @@ async fn auth_setup(
             json!({"error": "console account is not enabled"}),
         );
     };
-    if a.lockout.lock().unwrap().check(peer.ip()) {
+    let source = lockout_key(&state, &headers, peer);
+    if a.lockout.lock().unwrap().check(source) {
         return json_response(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error": "尝试次数过多,请一分钟后再试"}),
@@ -279,7 +314,7 @@ async fn auth_setup(
         .setup(&body.username, &body.password);
     match result {
         Ok(creds) => {
-            a.lockout.lock().unwrap().reset(peer.ip());
+            a.lockout.lock().unwrap().reset(source);
             let token = a.sessions.create();
             with_session_cookie(
                 json_response(
@@ -290,7 +325,7 @@ async fn auth_setup(
             )
         }
         Err(auth::SetupError::Exists) => {
-            a.lockout.lock().unwrap().record_failure(peer.ip());
+            a.lockout.lock().unwrap().record_failure(source);
             json_response(
                 StatusCode::CONFLICT,
                 json!({"error": "账号已存在,请直接登录"}),
@@ -309,6 +344,7 @@ async fn auth_setup(
 async fn auth_login(
     State(state): State<Arc<WebState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<CredentialsBody>,
 ) -> Response {
     let Some(a) = &state.auth else {
@@ -317,7 +353,8 @@ async fn auth_login(
             json!({"error": "console account is not enabled"}),
         );
     };
-    if a.lockout.lock().unwrap().check(peer.ip()) {
+    let source = lockout_key(&state, &headers, peer);
+    if a.lockout.lock().unwrap().check(source) {
         return json_response(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error": "尝试次数过多,请一分钟后再试"}),
@@ -332,13 +369,13 @@ async fn auth_login(
         // Same generic error for wrong username and wrong password —
         // verify() burns a derivation either way, and the text must not
         // narrow the guess.
-        a.lockout.lock().unwrap().record_failure(peer.ip());
+        a.lockout.lock().unwrap().record_failure(source);
         return json_response(
             StatusCode::UNAUTHORIZED,
             json!({"error": "用户名或密码不正确"}),
         );
     }
-    a.lockout.lock().unwrap().reset(peer.ip());
+    a.lockout.lock().unwrap().reset(source);
     let username = a.username().unwrap_or_default();
     let token = a.sessions.create();
     with_session_cookie(
@@ -1087,32 +1124,30 @@ async fn api_backup_trigger(
 /// node replays the script through its write path, so every statement fans
 /// out to the peers — the whole cluster converges to the backup's state.
 /// Acknowledged when the node accepts the request; progress and outcome
-/// show up in the next `list` poll's `restore` object.
+/// show up in the next `list` poll's `restore` object. Err = transport
+/// failure (mapped to 502 by the caller); Ok carries the node's answer,
+/// including its refusals (missing file, restore already running) as
+/// in-band `{"error": …}`.
 pub async fn remote_backup_restore(
     addr: &str,
     token: Option<&str>,
     file: &str,
-) -> serde_json::Value {
-    let run: Result<serde_json::Value, String> = async {
-        let mut stream = node_connect(addr, token).await?;
-        let payload = serde_json::to_vec(&serde_json::json!({"action": "restore", "file": file}))
-            .unwrap_or_default();
-        node_write_frame(&mut stream, &Frame::new(proto::REQ_BACKUP, payload))
-            .await
-            .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
-        let f = node_read_frame(&mut stream)
-            .await
-            .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
-        match f.frame_type {
-            proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
-            proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
-            other => Err(format!("节点 {addr} 返回了意外帧: {other:#06x}")),
-        }
-    }
-    .await;
-    match run {
-        Ok(v) => v,
-        Err(m) => serde_json::json!({"error": m}),
+) -> Result<serde_json::Value, String> {
+    let mut stream = node_connect(addr, token).await?;
+    let payload = serde_json::to_vec(&serde_json::json!({"action": "restore", "file": file}))
+        .unwrap_or_default();
+    node_write_frame(&mut stream, &Frame::new(proto::REQ_BACKUP, payload))
+        .await
+        .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
+    let f = node_read_frame(&mut stream)
+        .await
+        .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
+    match f.frame_type {
+        proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
+        proto::RESP_ERROR => Ok(serde_json::json!({
+            "error": String::from_utf8_lossy(&f.payload).into_owned()
+        })),
+        other => Err(format!("节点 {addr} 返回了意外帧: {other:#06x}")),
     }
 }
 
@@ -1121,26 +1156,45 @@ struct BackupRestoreBody {
     /// The backup file name (bare `backup-*.sql` in the node's backup
     /// directory).
     file: String,
+    /// Must repeat `file` exactly. The console's type-to-confirm is UX;
+    /// this makes the destructive intent explicit in the request itself —
+    /// a stolen session or a scripted mistake cannot one-shot a restore
+    /// without deliberately naming the file twice.
+    confirm: Option<String>,
     /// Managed-node override (the console's api.post merges the selected
     /// node into the JSON body).
     node: Option<String>,
 }
 
 /// Restore a backup on the managed node (`?node=` or JSON body `node`).
+/// Transport failures answer 502 so scripts can tell them apart from a
+/// node's in-band refusals; the JSON body shape is the same either way.
 async fn api_backup_restore(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
     Query(params): Query<NodeParams>,
     body: Json<BackupRestoreBody>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if let Some(code) = check_auth(&state, &headers) {
-        return Err(code);
+        return Err((code, Json(serde_json::json!({"error": "unauthorized"}))));
+    }
+    if body.confirm.as_deref() != Some(body.file.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "restore: confirm 必须与 file 完全一致(整库替换属高危操作)"
+            })),
+        ));
     }
     let node = body.node.clone().or(params.node);
     match target_for(&state, &node) {
-        Ok(addr) => Ok(Json(
-            remote_backup_restore(&addr, state.token.as_deref(), &body.file).await,
-        )),
+        Ok(addr) => match remote_backup_restore(&addr, state.token.as_deref(), &body.file).await {
+            Ok(v) => Ok(Json(v)),
+            Err(m) => Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": m})),
+            )),
+        },
         Err(e) => Ok(Json(e)),
     }
 }
@@ -1191,6 +1245,7 @@ mod tests {
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
             auth: None,
+            trust_proxy: false,
         };
         assert_eq!(resolve_node(&state, &None).unwrap(), None);
         assert_eq!(resolve_node(&state, &Some(String::new())).unwrap(), None);
@@ -1219,6 +1274,7 @@ mod tests {
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
             auth: None,
+            trust_proxy: false,
         };
         assert_eq!(target_for(&state, &None).unwrap(), "node-a:7600");
         assert_eq!(
@@ -1246,6 +1302,7 @@ mod tests {
             query_log: querylog::QueryLog::new(),
             sync_log: querylog::SyncLog::new(1),
             auth: None,
+            trust_proxy: false,
         });
         let res = build_router(state)
             .oneshot(

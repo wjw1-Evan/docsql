@@ -924,15 +924,17 @@ async fn console_account_setup_login_and_gate() {
     )
     .await;
 
-    // Setup mode; anonymous data calls still work until the account exists
-    // (no token configured to demand otherwise).
+    // Setup mode. Data endpoints stay locked until the account exists and
+    // the operator is logged in — the anonymous pre-setup window used to
+    // expose the whole-database restore to anyone who could reach the port.
     let st = http(&addr, "GET", "/api/auth/status", None, None)
         .await
         .json();
     assert_eq!(st["mode"], "setup");
     assert_eq!(
         http(&addr, "GET", "/api/meta", None, None).await.status,
-        200
+        401,
+        "pre-setup data endpoints must not be anonymous"
     );
 
     // Weak password rejected; the account does not exist yet.
@@ -1324,7 +1326,20 @@ async fn backup_restore_endpoint_round_trip() {
     // Drop the table, then restore the backup — explicitly targeting the
     // peer via ?node= (the restore endpoint honors the query param too).
     sql(&web, Some("sekrit"), "DROP TABLE s").await;
+    // The confirm field must repeat the file name exactly: a restore is a
+    // whole-database replacement, the request itself carries the intent.
     let body = serde_json::to_string(&json!({ "file": name })).unwrap();
+    let res = http(
+        &web,
+        "POST",
+        &format!("/api/backup/restore?node={node_addr}"),
+        Some("sekrit"),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(res.status, 400, "missing confirm must be refused");
+
+    let body = serde_json::to_string(&json!({ "file": name, "confirm": name })).unwrap();
     let res = http(
         &web,
         "POST",
@@ -1352,13 +1367,16 @@ async fn backup_restore_endpoint_round_trip() {
     let out = sql(&web, Some("sekrit"), "SELECT v FROM s WHERE id = 2").await;
     assert!(out.to_string().contains("rt-2"), "rows not restored: {out}");
 
-    // Invalid names surface the node's refusal in-band.
+    // Invalid names surface the node's refusal in-band (the confirm field
+    // repeats the name; the node's own validation refuses the path).
+    let body = serde_json::to_string(&json!({ "file": "../docsql.db", "confirm": "../docsql.db" }))
+        .unwrap();
     let res = http(
         &web,
         "POST",
         "/api/backup/restore",
         Some("sekrit"),
-        Some(r#"{"file":"../docsql.db"}"#),
+        Some(&body),
     )
     .await;
     assert_eq!(res.status, 200);

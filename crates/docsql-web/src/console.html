@@ -1421,15 +1421,20 @@ function openBackupTab() {
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
     $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     // 恢复:整库覆盖级操作,输入完整备份文件名确认后才发请求。
+    // 目标节点在打开对话框时锁定并随请求显式下发:api.node 存在
+    // localStorage 且跨标签页共享,若等发送时才读,另一个标签页切换
+    // 节点会让「确认的对象」和「执行的对象」变成两台机器。
     const doRestore = (name) => {
-      dialog(`恢复备份 ${name}`, [
-        {name: 'confirm', label: `输入 ${name} 确认恢复。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。`, ph: name, value: ''},
+      const targetNode = api.node;
+      const targetLabel = targetNode || '默认节点';
+      dialog(`恢复备份 ${name} → ${targetLabel}`, [
+        {name: 'confirm', label: `输入 ${name} 确认恢复到节点 ${targetLabel}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。`, ph: name, value: ''},
       ], '确认恢复', async (vals, err) => {
         if (vals.confirm !== name) { err('输入与备份文件名不一致'); throw new Error('mismatch'); }
         try {
-          const r = await api.post('/api/backup/restore', {file: name});
+          const r = await api.post('/api/backup/restore', {file: name, confirm: name, node: targetNode});
           if (r.error) { err(r.error); throw new Error(r.error); }
-          ui.toast('恢复已开始');
+          ui.toast(`恢复已开始(${targetLabel})`);
           t.load();
         } catch (e) { if (e.message !== 'mismatch') ui.toast('恢复触发失败:' + e.message, true); throw e; }
       });
@@ -1464,7 +1469,10 @@ function openBackupTab() {
         const rs = rst.running
           ? `<span style="color:var(--warn)">● 恢复进行中</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span>${rst.total ? ` · <span data-rprog>${rst.applied}/${rst.total}</span> 条语句` : ''}`
           : (rst.ok
-            ? `<span style="color:var(--ok)">● 恢复完成</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span> · ${esc(rst.applied)} 条语句${rst.ts_ms ? ' · ' + esc(new Date(rst.ts_ms).toLocaleString()) : ''}`
+            ? `<span style="color:var(--ok)">● 恢复完成</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span> · ${esc(rst.applied)} 条语句${rst.ts_ms ? ' · ' + esc(new Date(rst.ts_ms).toLocaleString()) : ''}` +
+              (rst.converged === true ? ' · <span style="color:var(--ok)">集群已验证收敛</span>' : '') +
+              (rst.converged === false ? ' · <span style="color:var(--warn)">集群收敛未验证</span>' : '') +
+              (rst.note ? `<div class="k" style="color:var(--txt3);margin-top:4px">${esc(rst.note)}</div>` : '')
             : `<span style="color:var(--err)">● 恢复失败</span> <span style="font-family:var(--mono)">${esc(rst.file || '')}</span> ${esc(rst.error || '')}`);
         html += `<div class="card" style="margin-bottom:14px;padding:10px 14px"><div class="v" style="font-size:13px;font-weight:400">${rs}</div></div>`;
       }

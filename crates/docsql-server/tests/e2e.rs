@@ -1653,6 +1653,16 @@ async fn pubsub_trim_view_and_system_guard() {
         .await;
     assert_eq!(r.frame_type, proto::RESP_ERROR);
     assert!(payload_str(&r).contains("internal"), "{}", payload_str(&r));
+    // But a user-table write whose LITERAL merely mentions a system table
+    // is the user's own data: the gate classifies on the statement's write
+    // targets, not on a substring scan over the whole text.
+    c.sql("CREATE TABLE audit_t (note TEXT)").await;
+    let r = c
+        .sql("INSERT INTO audit_t VALUES ('switched to _cluster_pos today')")
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    let r = c.sql("SELECT COUNT(*) FROM audit_t").await;
+    assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
     // ...and the docsql_pubsub view reads it with full SQL.
     let r = c.sql("SELECT COUNT(*) FROM docsql_pubsub").await;
     assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
@@ -1683,12 +1693,13 @@ async fn pubsub_trim_view_and_system_guard() {
         .await;
     assert_eq!(r.frame_type, proto::RESP_ERROR);
 
-    // The system table stays out of user-facing status totals.
+    // The system tables stay out of user-facing status totals (audit_t
+    // from the gate check above and t are the only user tables).
     c.sql("CREATE TABLE t (id INT)").await;
     c.send(&Frame::new(proto::REQ_STATUS, vec![])).await;
     let r = c.recv().await;
     let v: serde_json::Value = serde_json::from_slice(&r.payload).unwrap();
-    assert_eq!(v["totals"]["tables"], 1);
+    assert_eq!(v["totals"]["tables"], 2);
 }
 
 /// Pub/sub frames are gated behind AUTH like SQL.
@@ -2990,6 +3001,15 @@ async fn backup_restore_round_trip() {
     c.sql("CREATE TABLE s (id INT PRIMARY KEY, v TEXT)").await;
     c.sql("INSERT INTO s VALUES (1, 'snap-1'), (2, 'snap-2')")
         .await;
+    // FK pair with a default: the restore replays over LIVE data, and the
+    // recreated child used to block the old parent's DROP (FK guard) —
+    // aborting every FK-bearing restore halfway.
+    c.sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT DEFAULT 'anon')")
+        .await;
+    c.sql("CREATE TABLE orders (oid INT PRIMARY KEY, uid INT, FOREIGN KEY (uid) REFERENCES users (id))")
+        .await;
+    c.sql("INSERT INTO users VALUES (1, 'u1')").await;
+    c.sql("INSERT INTO orders VALUES (100, 1)").await;
 
     // Take a backup carrying the rows.
     c.send(&Frame::new(
@@ -3020,6 +3040,8 @@ async fn backup_restore_round_trip() {
     assert!(!name.is_empty(), "backup with data never appeared");
 
     // Damage the state: drop the backed-up table, add a post-backup one.
+    // The FK pair stays LIVE on purpose: the restore must replace both
+    // tables through their live FK references without tripping the guard.
     c.sql("DROP TABLE s").await;
     c.sql("CREATE TABLE after_bk (id INT PRIMARY KEY)").await;
     c.sql("INSERT INTO after_bk VALUES (7)").await;
@@ -3047,12 +3069,14 @@ async fn backup_restore_round_trip() {
 
     let mut applied = 0u64;
     let mut total = 0u64;
+    let mut converged = String::from("missing");
     for _ in 0..250 {
         let v = backup_list(&addr, Some("s3cret")).await;
         if let Some(rs) = v["restore"].as_object() {
             if rs["running"] == false && rs["ok"] == true && rs["file"] == name {
                 applied = rs["applied"].as_u64().unwrap_or(0);
                 total = rs["total"].as_u64().unwrap_or(0);
+                converged = rs["converged"].to_string();
                 break;
             }
         }
@@ -3061,6 +3085,10 @@ async fn backup_restore_round_trip() {
     assert!(applied > 0, "restore never completed");
     assert_eq!(applied, total, "progress != script size");
     assert!(total >= 3, "suspiciously small script: {total} statements");
+    assert_eq!(
+        converged, "true",
+        "single-node restore must verify converged"
+    );
 
     // The dropped table is back with its backup rows...
     let r = c.sql("SELECT v FROM s WHERE id = 2").await;
@@ -3068,6 +3096,11 @@ async fn backup_restore_round_trip() {
     assert!(payload_str(&r).contains("snap-2"));
     let r = c.sql("SELECT COUNT(id) FROM s").await;
     assert!(payload_str(&r).contains("[[2]]"), "{}", payload_str(&r));
+    // The FK pair was replaced through live references, rows intact.
+    let r = c.sql("SELECT oid FROM orders").await;
+    assert!(payload_str(&r).contains("100"), "{}", payload_str(&r));
+    let r = c.sql("SELECT name FROM users WHERE id = 1").await;
+    assert!(payload_str(&r).contains("u1"), "{}", payload_str(&r));
     // ...while the post-backup table survived (documented semantics).
     let r = c.sql("SELECT COUNT(id) FROM after_bk").await;
     assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
@@ -3129,7 +3162,10 @@ async fn backup_restore_converges_the_cluster() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(triggered, "backup trigger never accepted (startup sync never closed)");
+    assert!(
+        triggered,
+        "backup trigger never accepted (startup sync never closed)"
+    );
     let backups = dir.path().join("backups");
     let mut name = String::new();
     for _ in 0..250 {

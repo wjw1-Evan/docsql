@@ -32,8 +32,15 @@
 //! backup file itself (its own backup directory); restore runs in the
 //! background with progress in the shared status. Semantics: tables in
 //! the backup are dropped and recreated with the backup's data; tables
-//! created after the backup are not touched; writes arriving during the
-//! restore land normally on top.
+//! created after the backup are not touched. The replay holds the write
+//! path for its whole duration — client writes on this node queue (and
+//! error after the 30s deadline), so nothing interleaves into the
+//! replayed stream; fan-ins from peers are refused meanwhile and pulled
+//! back from their journals by the post-replay convergence pass, which
+//! then verifies every reachable peer's digest and reports `converged`
+//! (a still-diverged node heals on its own restart repair). Restores are
+//! mutually exclusive cluster-wide: the initiating node probes every
+//! peer's status and refuses while one is already running there.
 
 use crate::querylog;
 use crate::{ConnRole, ServerState};
@@ -162,8 +169,10 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
         db.dump_script().map_err(|e| format!("backup dump: {e}"))?
     };
     drop(_order);
-    // All locks released: filesystem work never blocks writers.
-    let name = format!("backup-{}.sql", utc_stamp(now_ms()));
+    // All locks released: filesystem work never blocks writers. The stamp
+    // is monotonic against the directory's contents, so name order stays
+    // creation order even when the wall clock steps backwards.
+    let name = format!("backup-{}.sql", next_stamp(&state.backup_dir, now_ms()));
     std::fs::create_dir_all(&state.backup_dir).map_err(|e| format!("backup dir: {e}"))?;
     let tmp = state.backup_dir.join(format!("{name}.tmp"));
     std::fs::write(&tmp, script.as_bytes()).map_err(|e| format!("backup write: {e}"))?;
@@ -173,16 +182,34 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     Ok(name)
 }
 
-/// Periodic backup task: first tick is immediate (a restart yields a fresh
-/// backup), then every `interval_secs`. Ticks during startup sync (join /
-/// rejoin repair) are skipped — the gate closes when the node's startup
-/// state settles, and the next tick snapshots the settled data. A tick
-/// while a manual backup runs is skipped silently.
+/// Periodic backup task: the first tick is immediate when no usable
+/// backup exists or the newest one is older than one interval — a restart
+/// still yields a fresh backup, but a restart STORM (rolling releases,
+/// crash loops) no longer writes a near-identical snapshot per restart,
+/// which used to squeeze the real history out of the keep-N window. Ticks
+/// during startup sync (join / rejoin repair) are skipped — the gate
+/// closes when the node's startup state settles, and the next tick
+/// snapshots the settled data. A tick while a manual backup runs is
+/// skipped silently.
 pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut first = true;
     loop {
         tick.tick().await;
+        if first {
+            first = false;
+            if let Some(newest) = read_backup_files(&state.backup_dir).pop() {
+                let age_secs = std::fs::metadata(state.backup_dir.join(&newest))
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs());
+                if age_secs.is_some_and(|age| age < interval_secs) {
+                    continue;
+                }
+            }
+        }
         if !state.sync_queue.lock().await.closed {
             continue; // startup sync still in flight; snapshot the settled state
         }
@@ -485,8 +512,7 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
     let stmts = if script.trim().is_empty() {
         Vec::new()
     } else {
-        docsql_core::stmt::split_statements(&script)
-            .map_err(|e| format!("restore parse: {e}"))?
+        docsql_core::stmt::split_statements(&script).map_err(|e| format!("restore parse: {e}"))?
     };
     let total = stmts.len();
     {
@@ -596,7 +622,10 @@ fn list_backups(dir: &Path) -> Vec<serde_json::Value> {
 }
 
 /// Keep the newest `keep` backup files, delete the rest (only files in the
-/// backup naming pattern are ever touched).
+/// backup naming pattern are ever touched). Name order equals write order
+/// by construction: `next_stamp` never emits a stamp at or below an
+/// existing file's, so retention stays correct even through a clock roll
+/// back (a plain mtime comparison would not — mtimes roll back too).
 fn prune_backups(dir: &Path, keep: usize) {
     let keep = keep.max(1);
     // read_backup_files is sorted ascending: the head is the oldest.
@@ -608,6 +637,46 @@ fn prune_backups(dir: &Path, keep: usize) {
             break;
         }
     }
+}
+
+/// A backup stamp strictly newer than every file already in the
+/// directory: `now`, unless the clock is behind what we wrote before
+/// (NTP correction, VM restore), in which case step one millisecond past
+/// the newest existing stamp. Keeps lexicographic name order equal to
+/// creation order, which retention and listing both rely on.
+fn next_stamp(dir: &Path, now: u64) -> String {
+    let mut ms = now;
+    for name in read_backup_files(dir) {
+        let stem = name
+            .strip_prefix("backup-")
+            .and_then(|s| s.strip_suffix(".sql"))
+            .unwrap_or("");
+        if let Some(existing) = parse_stamp(stem) {
+            ms = ms.max(existing + 1);
+        }
+    }
+    utc_stamp(ms)
+}
+
+/// Parse `YYYYMMDDTHHMMSSmmmZ` back to epoch milliseconds (inverse of
+/// `utc_stamp`, same civil algorithm).
+fn parse_stamp(s: &str) -> Option<u64> {
+    if s.len() != 19 || !s.ends_with('Z') {
+        return None;
+    }
+    let num = |a: usize, b: usize| s[a..b].parse::<u64>().ok();
+    let (y, mo, d) = (num(0, 4)? as i64, num(4, 6)? as i64, num(6, 8)? as i64);
+    let (h, mi, se, milli) = (num(9, 11)?, num(11, 13)?, num(13, 15)?, num(15, 18)?);
+    // Inverse of civil_from_days (Howard Hinnant's days_from_civil).
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = (days as u64) * 86_400 + h * 3_600 + mi * 60 + se;
+    Some(secs * 1_000 + milli)
 }
 
 fn read_backup_files(dir: &Path) -> Vec<String> {
@@ -718,5 +787,42 @@ mod tests {
         assert_eq!(utc_stamp(0), "19700101T000000000Z");
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1)); // 2024-01-01
+    }
+
+    #[test]
+    fn stamps_round_trip_and_next_stamp_stays_monotonic() {
+        // parse_stamp inverts utc_stamp across a spread of timestamps.
+        for ms in [
+            0u64,
+            1,
+            1_789_028_130_123,
+            951_827_696_000, // 2000-02-29 (leap day)
+            4_102_444_800_000,
+        ] {
+            assert_eq!(
+                parse_stamp(&utc_stamp(ms)),
+                Some(ms),
+                "round trip failed for {ms}"
+            );
+        }
+        assert_eq!(parse_stamp("not-a-stamp"), None);
+        assert_eq!(parse_stamp("20260910T08153012Z"), None);
+
+        // Clock rolled back (now older than existing files): next_stamp
+        // steps one millisecond past the newest existing stamp, keeping
+        // name order == creation order, which retention relies on.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("backup-20260910T081530999Z.sql"), b"x").unwrap();
+        let rolled_back_now = 1_700_000_000_000u64; // well before the file
+        let next = next_stamp(dir.path(), rolled_back_now);
+        assert_eq!(next, "20260910T081531000Z");
+        assert!(next.as_str() > "20260910T081530999Z");
+        // Normal case: now is ahead of an empty directory, the stamp just
+        // tracks the clock.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            next_stamp(empty.path(), 1_789_028_130_123),
+            "20260910T081530123Z"
+        );
     }
 }

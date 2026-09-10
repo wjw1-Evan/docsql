@@ -244,7 +244,8 @@ for _ in $(seq 1 30); do
 done
 if [ -n "$wname" ]; then
   sql "$A" "DROP TABLE wbk;" >/dev/null 2>&1
-  r=$(curl -s -X POST "$W/api/backup/restore" -H 'Content-Type: application/json' -d "{\"file\":\"$wname\"}")
+  r=$(curl -s -X POST "$W/api/backup/restore" -H 'Content-Type: application/json' \
+    -d "{\"file\":\"$wname\",\"confirm\":\"$wname\"}")
   echo "$r" | grep -q '"ok":true' && ok "web restore accepted" || bad "web restore trigger: $r"
   wr=""
   for _ in $(seq 1 20); do

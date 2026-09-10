@@ -3567,7 +3567,10 @@ pub(crate) struct PeerInfo {
 }
 
 /// One peer's status + journal window over REQ_STATUS.
-pub(crate) async fn probe_peer_info(state: &Arc<ServerState>, peer: &str) -> std::io::Result<PeerInfo> {
+pub(crate) async fn probe_peer_info(
+    state: &Arc<ServerState>,
+    peer: &str,
+) -> std::io::Result<PeerInfo> {
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
     if let Some(token) = fanout_auth(state) {
         auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
