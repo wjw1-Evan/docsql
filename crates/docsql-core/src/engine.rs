@@ -362,6 +362,12 @@ pub struct Database {
     async_commit: bool,
     /// True when deferred commits are waiting for a WAL fsync.
     pending_sync: bool,
+    /// Open fused write units (see [`Database::write_unit`]); depth-counted
+    /// because the guard borrows the database. While non-zero, statement
+    /// commits defer their WAL fsync to the unit's `end`, so a statement and
+    /// its replication bookkeeping (journal append / position update) share
+    /// one fsync and are atomic on crash.
+    write_unit: u8,
     /// SAVEPOINT stack inside the open transaction: (name, snapshot). Each
     /// ROLLBACK TO restores its snapshot and drops everything above it.
     savepoints: Vec<(String, TableSnapshot)>,
@@ -392,16 +398,36 @@ pub struct Database {
 }
 
 impl Database {
-    /// Commit a statement's pager tx: while an explicit SQL transaction is
-    /// open the WAL fsync is deferred — the whole batch pays one flush at
-    /// COMMIT (`sync_wal`), turning N fsyncs per transaction into one.
+    /// Commit a statement's pager tx: while an explicit SQL transaction or a
+    /// fused write unit is open the WAL fsync is deferred — the whole batch
+    /// pays one flush at COMMIT / [`WriteUnit::end`], turning N fsyncs per
+    /// transaction into one.
     fn commit_pager_tx(&mut self, tx: crate::pager::Tx) -> Result<u64> {
-        if self.async_commit || self.tx_snapshot.is_some() {
+        if self.async_commit || self.tx_snapshot.is_some() || self.write_unit > 0 {
             self.pending_sync = true;
             self.pager.commit_tx_deferred(tx).map_err(SqlError::from)
         } else {
             self.pager.commit_tx(tx).map_err(SqlError::from)
         }
+    }
+
+    /// Open fused write unit: every statement committed until
+    /// [`WriteUnit::end`] defers its WAL fsync, and the unit's single `end`
+    /// fsync makes them durable together — a crash mid-unit loses them all,
+    /// never a prefix. Servers use this to land a write and its replication
+    /// bookkeeping (catch-up journal entry on the origin, position update on
+    /// the receiver) in one fsync instead of two, closing the
+    /// "bookkeeping lags the data" crash window entirely.
+    ///
+    /// Unlike BEGIN it takes no rollback snapshot; a failed trailing
+    /// statement leaves the earlier ones applied-but-unsynced, so callers
+    /// that want the prefix to survive must call `end` on error paths too.
+    /// Dropping the guard without `end` only forgets the fusion (the flag
+    /// clears on drop; the next durable statement fsyncs anything deferred
+    /// before it), so a leaked unit can never wedge durability.
+    pub fn write_unit(&mut self) -> WriteUnit<'_> {
+        self.write_unit += 1;
+        WriteUnit { db: self }
     }
 
     /// Enable async-commit mode: statement commits skip the WAL fsync and a
@@ -595,6 +621,7 @@ impl Database {
             tables,
             async_commit: false,
             pending_sync: false,
+            write_unit: 0,
             savepoints: Vec::new(),
             tx_snapshot: None,
             ctes: std::collections::BTreeMap::new(),
@@ -888,6 +915,55 @@ impl Database {
                 | Statement::Savepoint { .. }
                 | Statement::ReleaseSavepoint { .. }
         )
+    }
+
+    /// Table names a mutating statement writes to (its targets, not the
+    /// tables it merely reads in a subquery). The server's system-table
+    /// gate classifies on this instead of a substring scan, so a user
+    /// write that merely MENTIONS a system table in a literal is not
+    /// rejected while any write aimed at one still is.
+    pub fn stmt_write_targets(stmt: &Statement) -> Vec<String> {
+        fn factor_name(factor: &sqlparser::ast::TableFactor) -> Option<String> {
+            match factor {
+                sqlparser::ast::TableFactor::Table { name, .. } => Some(obj_name(name)),
+                _ => None,
+            }
+        }
+        match stmt {
+            Statement::Insert(insert) => match &insert.table {
+                TableObject::TableName(n) => vec![obj_name(n)],
+                _ => vec![],
+            },
+            Statement::Update(u) => factor_name(&u.table.relation).into_iter().collect(),
+            Statement::Delete(d) => match &d.from {
+                sqlparser::ast::FromTable::WithFromKeyword(tables) => tables
+                    .iter()
+                    .filter_map(|t| factor_name(&t.relation))
+                    .collect(),
+                sqlparser::ast::FromTable::WithoutKeyword(tables) => tables
+                    .iter()
+                    .filter_map(|t| factor_name(&t.relation))
+                    .collect(),
+            },
+            Statement::CreateTable(create) => vec![obj_name(&create.name)],
+            Statement::CreateView(view) => vec![obj_name(&view.name)],
+            Statement::CreateIndex(idx) => vec![obj_name(&idx.table_name)],
+            Statement::Drop { names, .. } => names.iter().map(obj_name).collect(),
+            Statement::AlterTable(alter) => {
+                let mut out = vec![obj_name(&alter.name)];
+                for op in &alter.operations {
+                    if let sqlparser::ast::AlterTableOperation::RenameTable { table_name } = op {
+                        match table_name {
+                            sqlparser::ast::RenameTableNameKind::As(n)
+                            | sqlparser::ast::RenameTableNameKind::To(n) => out.push(obj_name(n)),
+                        }
+                    }
+                }
+                out
+            }
+            Statement::Truncate(tr) => tr.table_names.iter().map(|t| obj_name(&t.name)).collect(),
+            _ => vec![],
+        }
     }
 
     /// Transaction-control classification of an already-parsed statement.
@@ -1331,6 +1407,20 @@ impl Database {
         .map(|_| ())
     }
 
+    /// Void every journal entry's text, keeping the seqs allocated. Used
+    /// when a snapshot adoption overrules this node's own recent writes:
+    /// the adjudicated entries must never replay again (a later repair on
+    /// some peer would pull them back and resurrect discarded writes), but
+    /// the seq space and every recorded position must keep their meaning.
+    /// Replays of a voided entry are a parsed no-op.
+    pub fn journal_void_all(&mut self) -> Result<()> {
+        self.ensure_cluster_tables()?;
+        self.execute(&format!(
+            "UPDATE {CLUSTER_LOG_TABLE} SET sql = 'PRAGMA discarded_by_snapshot_adoption;'"
+        ))
+        .map(|_| ())
+    }
+
     /// Last applied journal seq for the origin `node_id`.
     pub fn position_get(&mut self, node_id: &str) -> Result<Option<u64>> {
         self.ensure_cluster_tables()?;
@@ -1385,6 +1475,14 @@ impl Database {
     /// declarations are safe in the DDL phase (referential checks run at
     /// insert time). Applying the script replaces tables wholesale
     /// (DROP + CREATE prefix), so re-applying is idempotent.
+    ///
+    /// All user tables are dropped by ONE statement: the DROP guard
+    /// exempts tables dropped by the same statement, so the drop cannot
+    /// be blocked by FK references — per-table drops interleaved with
+    /// CREATEs would deadlock against the restored schema (the new child
+    /// referencing a parent whose old copy is still to be dropped), and
+    /// backup restore replays this script over LIVE data, not a fresh
+    /// node.
     pub fn dump_script(&mut self) -> Result<String> {
         let names: Vec<String> = self
             .tables
@@ -1393,9 +1491,16 @@ impl Database {
             .cloned()
             .collect();
         let mut ddl = String::new();
+        if !names.is_empty() {
+            let drops = names
+                .iter()
+                .map(|n| quote_ident(n))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ddl.push_str(&format!("DROP TABLE IF EXISTS {drops};\n"));
+        }
         for name in &names {
             let meta = self.tables.get(name).cloned().unwrap();
-            ddl.push_str(&format!("DROP TABLE IF EXISTS {};\n", quote_ident(name)));
             ddl.push_str(&format!("CREATE TABLE {} (\n", quote_ident(name)));
             let mut parts: Vec<String> = Vec::new();
             for col in &meta.columns {
@@ -1470,7 +1575,11 @@ impl Database {
                 ));
             }
         }
-        Ok(ddl + &dml)
+        // Append in place instead of `ddl + &dml`: the dump is taken under
+        // the engine lock, so a third full-size copy would double the peak
+        // memory for nothing.
+        ddl.push_str(&dml);
+        Ok(ddl)
     }
 
     /// Page size of the underlying storage file.
@@ -2420,7 +2529,9 @@ impl Database {
                     for opt in &column_def.options {
                         use sqlparser::ast::ColumnOption as CO;
                         match &opt.option {
-                            CO::Default(e) => meta.defaults.push((col.clone(), format!("{e}"))),
+                            CO::Default(e) => {
+                                meta.defaults.push((col.clone(), default_expr_text(e)))
+                            }
                             CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
                             CO::NotNull => add_not_null = true,
                             // Same parity as CREATE TABLE: these options on
@@ -2932,7 +3043,8 @@ impl Database {
                     CO::NotNull => meta.not_null.push(col.name.value.clone()),
                     CO::Null => {}
                     CO::Default(e) => {
-                        meta.defaults.push((col.name.value.clone(), format!("{e}")));
+                        meta.defaults
+                            .push((col.name.value.clone(), default_expr_text(e)));
                     }
                     CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
                     CO::ForeignKey(fk) => {
@@ -4157,6 +4269,54 @@ impl Database {
     }
 }
 
+/// Borrow-guarded fused write unit ([`Database::write_unit`]). Statements
+/// run through the guard (it derefs to [`Database`]); [`WriteUnit::end`]
+/// makes the whole unit durable with one WAL fsync.
+pub struct WriteUnit<'a> {
+    db: &'a mut Database,
+}
+
+impl std::ops::Deref for WriteUnit<'_> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        self.db
+    }
+}
+
+impl std::ops::DerefMut for WriteUnit<'_> {
+    fn deref_mut(&mut self) -> &mut Database {
+        self.db
+    }
+}
+
+impl WriteUnit<'_> {
+    /// Close the unit and make its statements durable with one WAL fsync.
+    /// No-op when nothing deferred a commit.
+    pub fn end(self) -> Result<()> {
+        let result = {
+            self.db.write_unit = self.db.write_unit.saturating_sub(1);
+            if !self.db.pending_sync {
+                Ok(())
+            } else {
+                self.db
+                    .pager
+                    .sync_wal()
+                    .map_err(SqlError::from)
+                    .map(|_| self.db.pending_sync = false)
+            }
+        };
+        // The depth was already decremented above; skip Drop's.
+        std::mem::forget(self);
+        result
+    }
+}
+
+impl Drop for WriteUnit<'_> {
+    fn drop(&mut self) {
+        self.db.write_unit = self.db.write_unit.saturating_sub(1);
+    }
+}
+
 enum AggOp {
     Count,
     Sum,
@@ -4535,6 +4695,20 @@ fn value_literal(v: &Value) -> Result<String> {
              (replication and dump need scalar column values)",
             other.type_name()
         )),
+    }
+}
+
+/// Canonical text for a stored DEFAULT expression. sqlparser keeps
+/// redundant parentheses as `Expr::Nested`, so `DEFAULT ('anon')` from a
+/// replayed dump would otherwise be stored as `('anon')` and grow one
+/// layer per dump/restore cycle — silently poisoning `schema_hash` and
+/// permanently degrading digest equality (every rejoin falls back to a
+/// snapshot). Strip the nesting so the stored form is a fixed point of
+/// dump → parse → store.
+fn default_expr_text(e: &SqlExpr) -> String {
+    match e {
+        SqlExpr::Nested(inner) => default_expr_text(inner),
+        _ => format!("{e}"),
     }
 }
 
@@ -10645,5 +10819,120 @@ mod complex_query_tests {
             "journal seq continues after reopen"
         );
         assert_eq!(db.position_get("origin-x").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn write_unit_fuses_write_and_bookkeeping() {
+        // The origin-side shape: user write + journal append in one unit,
+        // durable together after `end` — and nothing in the data file
+        // before it (deferred commits never touch it ahead of the fsync).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unit.db");
+        let seq = {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            let file_len_before = std::fs::metadata(&path).unwrap().len();
+            let mut unit = db.write_unit();
+            unit.execute("INSERT INTO t VALUES (7)").unwrap();
+            let s = unit.journal_append("INSERT INTO t VALUES (7)").unwrap();
+            assert!(
+                unit.has_pending_sync(),
+                "statements inside the unit deferred their fsync"
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                file_len_before,
+                "no page image on disk before the unit's fsync"
+            );
+            // Reads see the unit's own writes through the buffer pool.
+            assert!(matches!(
+                unit.execute("SELECT id FROM t"),
+                Ok(ExecOutcome::Rows(r)) if !r.rows.is_empty()
+            ));
+            unit.end().unwrap();
+            assert!(
+                std::fs::metadata(&path).unwrap().len() > file_len_before,
+                "end flushed the deferred pages to the data file"
+            );
+            s
+        };
+        let mut db = Database::open(&path).unwrap();
+        let rows = db.execute("SELECT id FROM t").unwrap();
+        assert!(matches!(&rows, ExecOutcome::Rows(r) if !r.rows.is_empty()));
+        assert_eq!(db.journal_head().unwrap(), seq);
+    }
+
+    #[test]
+    fn write_unit_receiver_side_position_fused() {
+        // The receiver-side shape: replicated write + position update land
+        // in one unit; after reopen both are present (atomic on crash, the
+        // position can no longer lag the applied write).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recv.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            let mut unit = db.write_unit();
+            unit.execute("INSERT INTO t VALUES (1)").unwrap();
+            unit.position_set("origin-a", 5).unwrap();
+            unit.end().unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.position_get("origin-a").unwrap(), Some(5));
+        assert!(matches!(
+            db.execute("SELECT id FROM t"),
+            Ok(ExecOutcome::Rows(r)) if !r.rows.is_empty()
+        ));
+    }
+
+    #[test]
+    fn write_unit_batch_journals_in_one_sync() {
+        // The COMMIT-drain shape: N journal appends inside one unit share a
+        // single fsync; all N survive `end` in order.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drain.db");
+        let n = 50;
+        let first = {
+            let mut db = Database::open(&path).unwrap();
+            let mut unit = db.write_unit();
+            let mut s = None;
+            for i in 0..n {
+                let seq = unit
+                    .journal_append(&format!("INSERT INTO t VALUES ({i})"))
+                    .unwrap();
+                s.get_or_insert(seq);
+            }
+            unit.end().unwrap();
+            s.unwrap()
+        };
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.journal_head().unwrap(), first + n as u64 - 1);
+        let range = db.journal_range(first - 1, 1000).unwrap();
+        assert_eq!(range.len(), n);
+    }
+
+    #[test]
+    fn dropped_write_unit_never_wedges_durability() {
+        // A caller that forgets `end` only loses the fusion: the depth
+        // clears on drop, so the next statement commits durably on its own
+        // and flushes whatever the unit deferred before it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leak.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            {
+                let mut unit = db.write_unit();
+                unit.execute("INSERT INTO t VALUES (1)").unwrap();
+                assert!(unit.has_pending_sync());
+            } // dropped without end
+            db.execute("INSERT INTO t VALUES (2)").unwrap(); // durable commit
+        }
+        let mut db = Database::open(&path).unwrap();
+        let out = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert!(
+            matches!(&out, ExecOutcome::Rows(r) if r.rows[0][0].as_i64() == Some(2)),
+            "both rows survive: the leaked unit's deferred pages were flushed by the next durable commit"
+        );
     }
 }

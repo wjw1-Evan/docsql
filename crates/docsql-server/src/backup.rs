@@ -64,6 +64,14 @@ pub struct RestoreStatus {
     /// Statements applied so far / in the backup script (progress).
     pub applied: usize,
     pub total: usize,
+    /// Post-replay cluster verification: Some(true) when every reachable
+    /// peer's digest equals this node's, Some(false) when a reachable
+    /// peer still differs (its restart repair heals it), None while
+    /// running / failed / no peers. Reports truth instead of assuming the
+    /// fan-out reached everyone.
+    pub converged: Option<bool>,
+    /// Human-readable follow-up (unreachable peers, unusable journals).
+    pub note: Option<String>,
 }
 
 impl RestoreStatus {
@@ -76,6 +84,8 @@ impl RestoreStatus {
             error: None,
             applied: 0,
             total,
+            converged: None,
+            note: None,
         }
     }
 }
@@ -216,6 +226,15 @@ pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Fra
                     crate::err_payload("read-only token; writes are not permitted"),
                 );
             }
+            // Same window rule as the timer and restore: a snapshot taken
+            // mid-bootstrap captures a state the bootstrap is about to
+            // replace — misleading to hand to an operator.
+            if !state.sync_queue.lock().await.closed {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("backup: node is still in startup sync; retry later"),
+                );
+            }
             if !try_begin_backup(state) {
                 return Frame::new(
                     proto::RESP_ERROR,
@@ -269,6 +288,28 @@ pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Fra
                     crate::err_payload("restore: node is still in startup sync; retry later"),
                 );
             }
+            // Cluster-wide mutual exclusion: a restore converges EVERY peer
+            // via fan-out, so a second restore running on another node
+            // would interleave two conflicting DROP/CREATE/INSERT streams
+            // across the whole mesh. The local flag cannot see it — probe
+            // the peers' status first. (Simultaneous submissions remain a
+            // tiny race; the replay itself stays serialized by write_order
+            // per node, so the outcome is messy but never corrupt.)
+            {
+                let peers = state.peers.lock().await.clone();
+                for peer in &peers {
+                    if let Ok(info) = crate::probe_peer_info(state, peer).await {
+                        if info.restore_running {
+                            return Frame::new(
+                                proto::RESP_ERROR,
+                                crate::err_payload(&format!(
+                                    "restore: already running on peer {peer}"
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
             {
                 let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
                 let busy = b.running || b.restore.as_ref().is_some_and(|r| r.running);
@@ -307,9 +348,92 @@ fn valid_backup_name(name: &str) -> bool {
 }
 
 /// Replay one backup file through the normal write path. Caller must have
-/// claimed `BackupShared.restore`; this finishes the status either way.
+/// claimed `BackupShared.restore`; this finishes the status either way,
+/// including the post-replay cluster convergence pass.
 async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
     let res = restore_inner(state, file).await;
+    // Convergence pass on success: the replay fanned out every statement,
+    // but peers offline (or mid-fan-out-failure) during the restore missed
+    // statements. Used to be "wait for their next restart repair" — now
+    // the restoring node pulls the missed increments itself and then
+    // reports the verified truth instead of a hopeful ok=true.
+    let mut converged = None;
+    let mut note = None;
+    if res.is_ok() {
+        let peers = state.peers.lock().await.clone();
+        let mut infos = Vec::new();
+        let mut unreachable = Vec::new();
+        for peer in &peers {
+            match crate::probe_peer_info(state, peer).await {
+                Ok(info) => infos.push((peer.clone(), info)),
+                Err(_) => unreachable.push(peer.clone()),
+            }
+        }
+        // Pull what THIS node missed: fan-ins were refused while the write
+        // path was frozen by the replay; the origins hold them in their
+        // journals. Unknown positions or trimmed windows leave the plan
+        // unusable — the note says so.
+        match crate::catchup_plan(state, &infos).await {
+            Some(plan) if !plan.is_empty() => {
+                if let Err(e) = crate::run_catchup(state, &plan).await {
+                    eprintln!("restore: post-replay catch-up failed: {e}");
+                }
+            }
+            Some(_) => {}
+            None if !infos.is_empty() => {
+                note = Some(
+                    "some peer journals cannot be pulled incrementally \
+                     (positions unknown or trimmed); a diverged node repairs on its restart"
+                        .into(),
+                );
+            }
+            None => {}
+        }
+        // Verify against every reachable peer's digest.
+        let local = {
+            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            db.digests()
+        };
+        if let Ok(local) = local {
+            if peers.is_empty() {
+                converged = Some(true);
+            } else {
+                let mut all = true;
+                let mut diverged = Vec::new();
+                for (peer, _) in &infos {
+                    match crate::probe_peer_digests(state, peer).await {
+                        Ok(d) if d == local => {}
+                        Ok(_) => {
+                            all = false;
+                            diverged.push(peer.clone());
+                        }
+                        Err(_) => {
+                            all = false;
+                            diverged.push(format!("{peer} (unreachable)"));
+                        }
+                    }
+                }
+                converged = Some(all);
+                if !all {
+                    note = Some(format!(
+                        "cluster not verified converged: {}; a diverged node \
+                         repairs on its restart",
+                        diverged.join(", ")
+                    ));
+                }
+            }
+        }
+        if !unreachable.is_empty() {
+            let suffix = format!(
+                "unreachable during verification: {}",
+                unreachable.join(", ")
+            );
+            note = Some(match note {
+                Some(n) => format!("{n}; {suffix}"),
+                None => suffix,
+            });
+        }
+    }
     let applied = {
         let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
         let mut applied = 0;
@@ -325,6 +449,8 @@ async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, Stri
                 r.ok = res.is_ok();
                 r.error = res.as_ref().err().cloned();
                 r.applied = applied;
+                r.converged = converged;
+                r.note = note.clone();
             }
         }
         applied
@@ -337,7 +463,14 @@ async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, Stri
         res.is_ok(),
         match res.as_ref().err() {
             Some(e) => Some(e.clone()),
-            None => Some(format!("{applied} statements replayed")),
+            None => Some(format!(
+                "{applied} statements replayed{}",
+                match (&converged, &note) {
+                    (Some(true), _) => ", cluster verified converged".to_string(),
+                    (Some(false), Some(n)) => format!(", {n}"),
+                    _ => String::new(),
+                }
+            )),
         },
     );
     res
@@ -347,8 +480,14 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
     // Filesystem work before any engine lock: the script is O(data).
     let script = std::fs::read_to_string(state.backup_dir.join(file))
         .map_err(|e| format!("restore read: {e}"))?;
-    let stmts =
-        docsql_core::stmt::split_statements(&script).map_err(|e| format!("restore parse: {e}"))?;
+    // A backup of an empty database is an empty script: restoring it is a
+    // clean no-op (post-backup tables survive), not a parse error.
+    let stmts = if script.trim().is_empty() {
+        Vec::new()
+    } else {
+        docsql_core::stmt::split_statements(&script)
+            .map_err(|e| format!("restore parse: {e}"))?
+    };
     let total = stmts.len();
     {
         let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
@@ -358,20 +497,36 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
             }
         }
     }
+    // One write-order acquisition for the WHOLE replay: statements used to
+    // contend per statement, letting client writes interleave between them
+    // — a client INSERT into a just-recreated empty table would collide
+    // with the replayed rows (PK conflict) and abort the restore halfway,
+    // already fanned out. Holding the path makes the replay deterministic;
+    // lock_engine_for_write waited out any open transaction first, and no
+    // new one can start while it is held (BEGIN needs the write path).
+    // Fan-ins from other nodes' client writes are refused meanwhile (their
+    // origins log the failure); the convergence pass below pulls them back
+    // from the origins' journals.
+    let order = crate::lock_engine_for_write(state)
+        .await
+        .ok_or_else(|| "restore timed out waiting for the open transaction".to_string())?;
     // Per-statement replay through the normal write path: each statement
     // commits locally, is journaled, and fans out to every peer — the
-    // cluster converges to the backup's state (the dump is DROP-first, so
-    // replaying over live data is idempotent; AUTOINCREMENT counters
-    // continue from the restored max).
+    // cluster converges to the backup's state (the dump drops everything
+    // in one statement first, so replaying over live data is idempotent;
+    // AUTOINCREMENT counters continue from the restored max).
+    let mut replayed = 0usize;
     for (i, stmt) in stmts.iter().enumerate() {
-        let resp = crate::execute_sql(state, stmt, false, false, None, false).await;
+        let resp = crate::execute_sql(state, stmt, false, false, None, true, None).await;
         if resp.frame_type == proto::RESP_ERROR {
+            drop(order);
             return Err(format!(
                 "statement {} of {total} failed: {}",
                 i + 1,
                 String::from_utf8_lossy(&resp.payload)
             ));
         }
+        replayed = i + 1;
         let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(r) = b.restore.as_mut() {
             if r.file == file {
@@ -379,7 +534,8 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
             }
         }
     }
-    Ok(total)
+    drop(order);
+    Ok(replayed)
 }
 
 /// REQ_BACKUP (list) / `status_payload().backup` body. Reads only the
@@ -408,6 +564,8 @@ pub fn backup_payload(state: &ServerState) -> Vec<u8> {
             "error": r.error,
             "applied": r.applied,
             "total": r.total,
+            "converged": r.converged,
+            "note": r.note,
         })),
     });
     serde_json::to_vec(&body).unwrap_or_default()

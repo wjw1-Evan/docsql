@@ -94,8 +94,13 @@ pub struct ServerState {
     /// cluster-join holds can keep an `OwnedMutexGuard` past the handler.
     pub write_order: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Write-path holds taken by a peer serving REQ_SYNC (cluster-join
-    /// quiesce): hold id -> guard. Dropping the guard releases the freeze.
-    pub holds: tokio::sync::Mutex<std::collections::HashMap<u64, tokio::sync::OwnedMutexGuard<()>>>,
+    /// quiesce): hold id -> (guard, joiner identity). The identity lets a
+    /// joiner clear hold remnants of its own prior attempts (a REQ_HOLD
+    /// answered after its response was lost freezes the peer for 60s
+    /// otherwise). Dropping the guard releases the freeze.
+    pub holds: tokio::sync::Mutex<
+        std::collections::HashMap<u64, (tokio::sync::OwnedMutexGuard<()>, String)>,
+    >,
     /// Monotonic id source for REQ_HOLD grants.
     pub next_hold_id: std::sync::atomic::AtomicU64,
     /// Cluster-join intake: while this node bootstraps, replication writes
@@ -140,6 +145,11 @@ pub struct ServerState {
     /// Backup shared state: in-flight flag + last attempt outcome.
     /// Never held while acquiring `write_order`/the engine (see backup.rs).
     pub backup: Mutex<backup::BackupShared>,
+    /// Join-intake replays that failed to apply at drain time. Each one is
+    /// a write some origin already had acknowledged; surfacing the count in
+    /// REQ_STATUS keeps the divergence observable instead of burying it in
+    /// stderr (digest repair on the next restart is the remedy).
+    pub replay_failures: std::sync::atomic::AtomicU64,
     /// Data file location (status reports its size on disk).
     pub db_path: PathBuf,
     /// Server start time (status reports uptime).
@@ -378,6 +388,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         backup_keep: cfg.backup_keep,
         backup_dir,
         backup: Mutex::new(backup::BackupShared::default()),
+        replay_failures: std::sync::atomic::AtomicU64::new(0),
         db_path: cfg.db_path,
         started: std::time::Instant::now(),
     });
@@ -390,7 +401,37 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             eprintln!("node with peers configured: comparing cluster digests (rejoin repair)");
         }
         let st = state.clone();
-        tokio::spawn(bootstrap_sync(st, fresh));
+        // Watchdog: every normal bootstrap exit drains and closes the gate
+        // itself, but a task death (panic, future early-return) must never
+        // leave the gate open — it would keep acknowledging writes into a
+        // queue nothing will replay. On an abnormal exit, drain with a
+        // bounded budget, then hard-close (loudly) rather than ack forever.
+        tokio::spawn(async move {
+            if tokio::spawn(bootstrap_sync(st.clone(), fresh))
+                .await
+                .is_err()
+            {
+                eprintln!("sync: bootstrap task died (panic?) — force-closing the sync gate");
+            }
+            if st.sync_queue.lock().await.closed {
+                return;
+            }
+            eprintln!("sync: gate still open after bootstrap exit; draining the queue");
+            let deadline = tokio::time::Instant::now() + SYNC_WATCHDOG_GRACE;
+            if tokio::time::timeout_at(deadline, drain_sync_queue(&st, false))
+                .await
+                .is_err()
+            {
+                let mut gate = st.sync_queue.lock().await;
+                let n = gate.pending.len();
+                gate.pending = Vec::new();
+                gate.closed = true;
+                eprintln!(
+                    "sync: could not acquire the write path within {SYNC_WATCHDOG_GRACE:?}; \
+                     gate hard-closed with {n} unapplied queued write(s) — restart this node"
+                );
+            }
+        });
     }
     if cfg.async_commit {
         // Group commit: statements committed deferred since the last tick
@@ -882,6 +923,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         is_replication,
                                         if is_replication { None } else { Some(conn_id) },
                                         false,
+                                        None,
                                     )
                                     .await
                                 }
@@ -904,10 +946,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // Sequenced replication write: apply it like any
                     // replicated write, then record (origin node_id, seq)
                     // so a rejoin can pull exactly the ops it missed. The
-                    // position update is a separate commit — a crash in
-                    // between leaves the position behind the data, which
-                    // only ever causes a redundant replay (an error that
-                    // falls back to snapshot repair), never a missed one.
+                    // position update is fused into the write's commit unit
+                    // — one fsync, and a crash can no longer leave the
+                    // position behind the data (the old separate-commit
+                    // window only ever caused a redundant replay that fell
+                    // back to snapshot repair, but now it cannot happen).
                     match parse_seq_frame(&frame.payload) {
                         Some((seq, node_id, sql)) => {
                             // Join intake: while the sync gate is open,
@@ -942,13 +985,16 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                 Some(f) => Some(f),
                                 None => {
                                     let started = std::time::Instant::now();
-                                    let resp =
-                                        execute_sql(&state, &sql, false, true, None, false).await;
-                                    if resp.frame_type != proto::RESP_ERROR {
-                                        let mut db =
-                                            state.db.lock().unwrap_or_else(|p| p.into_inner());
-                                        advance_position(&mut db, &node_id, seq);
-                                    }
+                                    let resp = execute_sql(
+                                        &state,
+                                        &sql,
+                                        false,
+                                        true,
+                                        None,
+                                        false,
+                                        Some((&node_id, seq)),
+                                    )
+                                    .await;
                                     // Same audit trail as plain REQ_SQL applies.
                                     querylog::record(
                                         &state,
@@ -1136,6 +1182,9 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "cluster_id": state.cluster_id,
         "journal_head": db.journal_head().unwrap_or(0),
         "journal_oldest": db.journal_oldest().unwrap_or(0),
+        "replay_failures": state
+            .replay_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
         "backup": backup,
     })
 }
@@ -1174,6 +1223,12 @@ pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: toki
 /// identifies the client connection (None for replication applies);
 /// `order_held` marks the cluster-join drain path, which already holds
 /// `write_order`.
+///
+/// `seq_pos` carries the (origin, seq) of a sequenced replication write
+/// (REQ_SQL_SEQ): after the statement applies, the origin's position is
+/// advanced **in the same fused write unit** — one WAL fsync lands the
+/// write and its bookkeeping together, so a crash can no longer leave the
+/// position lagging the applied data (the old two-commit window).
 async fn execute_sql(
     state: &Arc<ServerState>,
     sql: &str,
@@ -1181,6 +1236,7 @@ async fn execute_sql(
     is_replication: bool,
     conn: Option<u64>,
     order_held: bool,
+    seq_pos: Option<(&str, u64)>,
 ) -> Frame {
     // One parse for the whole round-trip: the AST executes at the bottom,
     // the classification routes the request here (parse errors surface with
@@ -1192,32 +1248,26 @@ async fn execute_sql(
     let p = parsed.as_ref().expect("parsed just above");
     let is_write = p.is_write;
     let tx_kind = p.tx.clone();
-    // System tables are shielded from anything that could mutate them; the
-    // check runs on the classified AST (exactly one statement per frame),
-    // so a SELECT prefix can't smuggle a write past it, and read-only
-    // queries go through to the console's read-only 系统表 branch.
+    // System tables are shielded from anything that could mutate them.
+    // The check runs on the classified AST twice over: write-vs-read comes
+    // from the classifier, and the table comparison uses the statement's
+    // write TARGETS (`stmt_write_targets`) — not a substring scan, which
+    // used to reject user writes that merely mentioned a system table in a
+    // literal or comment. Read-only queries go through to the console's
+    // read-only 系统表 branch.
     if !allow_system_table && is_write {
-        let lower = sql.to_ascii_lowercase();
-        if lower.contains(pubsub::PUBSUB_TABLE) {
+        let targets = Database::stmt_write_targets(&p.stmt);
+        let hit = targets
+            .iter()
+            .find(|t| docsql_core::engine::is_system_table(t));
+        if let Some(target) = hit {
             return Frame::new(
                 proto::RESP_ERROR,
-                err_payload(
-                    "system table _pubsub_messages is internal: \
-                     query the docsql_pubsub view, trim with PUBSUB TRIM",
-                ),
+                err_payload(&format!(
+                    "system table {target} is internal to the engine and cannot be modified; \
+                     SELECT is allowed (docsql_pubsub view / PUBSUB TRIM for _pubsub_messages)"
+                )),
             );
-        }
-        for internal in [
-            docsql_core::engine::CLUSTER_LOG_TABLE,
-            docsql_core::engine::CLUSTER_POS_TABLE,
-            docsql_core::engine::CLUSTER_ID_TABLE,
-        ] {
-            if lower.contains(internal) {
-                return Frame::new(
-                    proto::RESP_ERROR,
-                    err_payload("system table is internal to catch-up replication"),
-                );
-            }
         }
     }
     // Replica read-only gate (replication-internal frames pass through).
@@ -1252,12 +1302,25 @@ async fn execute_sql(
     // client. The deadline bounds both queues.
     let queues = !is_replication && matches!(tx_kind, TxControl::Begin);
     let deadline = tokio::time::Instant::now() + BEGIN_QUEUE_WAIT;
-    let (outcome, in_tx, _order_guard, resolved) = loop {
+    // Journaling needs a fan-out target: a node without peers or upstream
+    // has nobody to ever pull its catch-up journal, and appending would be
+    // a second engine commit per write for nothing. Peers only change at
+    // restart, so one check up front is exact.
+    let journal_wanted = !is_replication
+        && is_write
+        && matches!(tx_kind, TxControl::None)
+        && (!state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some());
+    let (outcome, in_tx, _order_guard, resolved, journal_seq) = loop {
         let foreign_tx = is_write && *state.tx_owner.lock().unwrap() != conn;
         if queues || foreign_tx {
             wait_engine_tx_free(state, deadline).await;
         }
-        let guard = if !is_replication && (is_write || !matches!(tx_kind, TxControl::None)) {
+        let guard = if order_held {
+            // Caller already holds write_order (cluster-join drain, backup
+            // restore replay) and waited out any open transaction on the
+            // way to taking it — re-locking would self-deadlock.
+            None
+        } else if !is_replication && (is_write || !matches!(tx_kind, TxControl::None)) {
             let order = state.write_order.lock().await;
             let busy = {
                 let in_tx = state
@@ -1307,23 +1370,60 @@ async fn execute_sql(
         } else {
             None
         };
-        let (out, in_tx, resolved) = {
+        let (out, in_tx, resolved, seq, sync_failed) = {
             let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-            let out = match parsed.take() {
-                Some(p) => db.execute_parsed(p),
-                // Consumed by a lost BEGIN-queue race above: re-parse (the
-                // failed attempt left no state behind) and retry.
-                None => db.execute(sql),
+            // Fuse the statement's commit with its replication bookkeeping
+            // into ONE WAL fsync: journal append on the writing side,
+            // position update on the receiving side. Unfused, each is an
+            // engine commit of its own — two fsyncs per clustered write —
+            // and a crash between them leaves bookkeeping lagging the data.
+            // The unit lands both atomically (all-or-nothing prefix).
+            let fuse = !db.in_transaction() && (journal_wanted || (seq_pos.is_some() && is_write));
+            let (out, resolved, seq, sync_failed) = if fuse {
+                let mut unit = db.write_unit();
+                let out = match parsed.take() {
+                    Some(p) => unit.execute_parsed(p),
+                    None => unit.execute(sql),
+                };
+                let resolved = unit.take_resolved_insert();
+                let mut seq = None;
+                if out.is_ok() {
+                    // Auto-generated GUID values are random: peers cannot
+                    // re-derive them, so journal the explicit-value rewrite.
+                    let forward = resolved.as_deref().unwrap_or(sql);
+                    if journal_wanted {
+                        seq = journal_append_trimmed(&mut unit, state, forward);
+                    }
+                    if let Some((origin, s)) = seq_pos {
+                        advance_position(&mut unit, origin, s);
+                    }
+                }
+                let end = unit.end();
+                (out, resolved, seq, end.is_err())
+            } else {
+                let out = match parsed.take() {
+                    Some(p) => db.execute_parsed(p),
+                    // Consumed by a lost BEGIN-queue race above: re-parse (the
+                    // failed attempt left no state behind) and retry.
+                    None => db.execute(sql),
+                };
+                let resolved = db.take_resolved_insert();
+                (out, resolved, None, false)
             };
-            // Auto-GUID inserts rewrite themselves into explicit-value SQL;
-            // grab it under the same lock so replication replays the exact
-            // generated ids.
-            let resolved = db.take_resolved_insert();
-            // Capture inside the same lock: another connection must not be able
-            // to open/close a transaction between execute and classification.
+            // Capture inside the same lock: another connection must not be
+            // able to open/close a transaction between execute and
+            // classification.
             let in_tx = db.in_transaction();
-            (out, in_tx, resolved)
+            (out, in_tx, resolved, seq, sync_failed)
         };
+        if sync_failed {
+            // The fused unit's single fsync failed: durable state is
+            // unknown, the statement must not be acknowledged.
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload("failed to make the write durable"),
+            );
+        }
         // Lost the race for the engine transaction between the wait and the
         // locks: requeue until the deadline, then let the error through.
         if queues
@@ -1336,7 +1436,7 @@ async fn execute_sql(
             tokio::time::sleep(BEGIN_QUEUE_POLL).await;
             continue;
         }
-        break (out, in_tx, guard, resolved);
+        break (out, in_tx, guard, resolved, seq);
     };
     // Replication timing follows engine transaction state: writes inside an
     // open transaction buffer until COMMIT (ROLLBACK discards them), so peers
@@ -1364,7 +1464,8 @@ async fn execute_sql(
                 // Auto-generated GUID values are random: peers cannot
                 // re-derive them the way AUTOINCREMENT recomputes max+1,
                 // so forward the engine's explicit-value rewrite when the
-                // statement filled any.
+                // statement filled any. The journal seq was fused into the
+                // statement's write unit above (same fsync).
                 let forward = resolved.as_deref().unwrap_or(sql);
                 if in_tx {
                     state
@@ -1374,11 +1475,7 @@ async fn execute_sql(
                         .writes
                         .push(forward.to_string());
                 } else {
-                    // Journal the committed write so rejoined peers can
-                    // pull exactly it later, then fan out carrying the
-                    // journal seq (their positions advance with it).
-                    let seq = journal_local_write(state, forward).await;
-                    forward_sql_all(state, forward, seq).await;
+                    forward_sql_all(state, forward, journal_seq).await;
                 }
             }
             _ => {}
@@ -1547,7 +1644,7 @@ async fn forward_write(
 /// writes over sockets that outlived it, or outage writes would silently
 /// reach a node that will never acknowledge them in the sync log (and an
 /// e2e/deploy test exactly pins the no-catchup behavior this preserves).
-async fn forward_frame(
+pub(crate) async fn forward_frame(
     target: &str,
     frame_type: u16,
     payload: &[u8],
@@ -1561,34 +1658,26 @@ async fn forward_frame(
 
 /// Credential fan-out presents to peers: the cluster token when
 /// configured (nodes authenticate as nodes), else the client token.
-fn fanout_auth(state: &ServerState) -> Option<&str> {
+pub(crate) fn fanout_auth(state: &ServerState) -> Option<&str> {
     state
         .cluster_token
         .as_deref()
         .or(state.auth_token.as_deref())
 }
 
-/// Fan one SQL write out to the replication upstream and every peer, in
-/// parallel. Each attempt lands in the sync log so the console's logs page
-/// shows the replication trail (target, statement, ok/error). Per-target
-/// ordering is untouched: fan-out runs under `write_order`, so the next
-/// write's fan-out only starts after this one finished everywhere.
-/// Journal one locally-committed write (autocommit path: the write has
-/// already committed when this runs; the drained-transaction path calls
-/// it per buffered write after COMMIT). Returns the journal seq, or None
+/// Append one locally-committed write to the catch-up journal, trimming the
+/// bounded window on the amortized cadence. Callers gate this on the node
+/// having a fan-out target (peers or upstream): a lone node's journal can
+/// never be pulled, and appending is an engine write of its own. Runs
+/// inside the caller's fused write unit when there is one, so the journal
+/// entry shares the statement's fsync. Returns the journal seq, or None
 /// when journaling failed — peers then cannot place the op in the origin's
 /// journal and fall back to snapshot repair on divergence.
-async fn journal_local_write(state: &Arc<ServerState>, sql: &str) -> Option<u64> {
-    // No fan-out target (single node: no peers, no upstream): nobody can
-    // ever pull this journal, and appending is an engine write of its own
-    // — it would double every write's fsync cost for nothing. Peers
-    // arriving via a later config change re-enable journaling at that
-    // restart; convergence then runs through digest repair, whose
-    // snapshot fallback never needed the journal.
-    if state.replicate_to.lock().await.is_none() && state.peers.lock().await.is_empty() {
-        return None;
-    }
-    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+fn journal_append_trimmed(
+    db: &mut docsql_core::engine::Database,
+    state: &ServerState,
+    sql: &str,
+) -> Option<u64> {
     match db.journal_append(sql) {
         Ok(seq) => {
             // Amortized window trim: keep the journal bounded so positions
@@ -1624,6 +1713,11 @@ fn advance_position(db: &mut docsql_core::engine::Database, node_id: &str, seq: 
     }
 }
 
+/// Fan one SQL write out to the replication upstream and every peer, in
+/// parallel. Each attempt lands in the sync log so the console's logs page
+/// shows the replication trail (target, statement, ok/error). Per-target
+/// ordering is untouched: fan-out runs under `write_order`, so the next
+/// write's fan-out only starts after this one finished everywhere.
 pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u64>) {
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
@@ -1666,14 +1760,35 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u6
 
 /// Forward everything buffered in the open transaction (SQL writes, in
 /// execution order) and clear the buffer. Called after a successful COMMIT.
+/// The whole batch's journal appends land in ONE fused write unit — one WAL
+/// fsync for N entries instead of N — before any fan-out starts (durable
+/// before peers see it, same as single writes).
 pub async fn drain_tx_pending(state: &Arc<ServerState>) {
     let mut pending = state.tx_pending.lock().await;
     let writes = std::mem::take(&mut pending.writes);
     pending.marks.clear();
     drop(pending);
-    for sql in &writes {
-        let seq = journal_local_write(state, sql).await;
-        forward_sql_all(state, sql, seq).await;
+    let has_target =
+        !state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some();
+    let seqs = if has_target && !writes.is_empty() {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut unit = db.write_unit();
+        let seqs: Vec<Option<u64>> = writes
+            .iter()
+            .map(|sql| journal_append_trimmed(&mut unit, state, sql))
+            .collect();
+        if let Err(e) = unit.end() {
+            eprintln!("transaction drain journal sync failed: {e}");
+        }
+        seqs
+    } else {
+        Vec::new()
+    };
+    for (sql, seq) in writes
+        .iter()
+        .zip(seqs.iter().chain(std::iter::repeat(&None)))
+    {
+        forward_sql_all(state, sql, *seq).await;
     }
 }
 
@@ -2129,6 +2244,9 @@ pub(crate) const SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// milliseconds instead of seconds.
 const SYNC_ROUNDS: usize = 10;
 const SYNC_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Budget the gate watchdog gives a force drain to acquire the write path
+/// before hard-closing the gate (see the bootstrap spawn site).
+const SYNC_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// True when the database holds anything beyond the pubsub system table.
 fn has_user_tables(db: &Database) -> bool {
@@ -2251,6 +2369,24 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
         };
     let mut targets = state.peers.lock().await.clone();
     targets.sort();
+    // Clear hold remnants of OUR prior attempts first: a REQ_HOLD whose
+    // response was lost in an earlier try leaves the peer frozen (id
+    // unknown to us) until the 60s watchdog — every hold we now request
+    // would answer "busy" and the join would stall for that long. The
+    // sweep (id 0 + our identity) is a no-op when nothing is stale.
+    for target in &targets {
+        let mut clear = Vec::with_capacity(8 + advertise.len());
+        clear.extend_from_slice(&0u64.to_le_bytes());
+        clear.extend_from_slice(advertise.as_bytes());
+        let _ = forward_frame(
+            target,
+            proto::REQ_RELEASE,
+            &clear,
+            state.transport_key.as_ref(),
+            fanout_auth(state),
+        )
+        .await;
+    }
     let mut held: Vec<(String, u64)> = Vec::new();
     for target in targets {
         let hold = hold_peer(state, &target, &advertise).await;
@@ -2314,7 +2450,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.catalog()
             .iter()
-            .filter(|t| t.name != pubsub::PUBSUB_TABLE)
+            .filter(|t| !docsql_core::engine::is_system_table(&t.name))
             .count() as u64
     };
     // Register the joiner still under the write path: every write before
@@ -2328,18 +2464,30 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
             querylog::sync_event(&state.sync_log, "join", &advertise, None, true, None);
         }
     }
+    // Releases are idempotent and watchdog-backed: send them concurrently
+    // so a slow/dead peer cannot stretch this node's write freeze by
+    // (peers × timeout) — the freeze is held until the sends conclude.
+    let mut releases = Vec::new();
     for (target, id) in &held {
-        if let Err(e) = forward_frame(
-            target,
-            proto::REQ_RELEASE,
-            &id.to_le_bytes(),
-            state.transport_key.as_ref(),
-            fanout_auth(state),
-        )
-        .await
-        {
-            eprintln!("sync: release on {target} failed ({e}); watchdog will drop the hold");
-        }
+        let st = state.clone();
+        let target = target.clone();
+        let id = *id;
+        releases.push(tokio::spawn(async move {
+            if let Err(e) = forward_frame(
+                &target,
+                proto::REQ_RELEASE,
+                &id.to_le_bytes(),
+                st.transport_key.as_ref(),
+                fanout_auth(&st),
+            )
+            .await
+            {
+                eprintln!("sync: release on {target} failed ({e}); watchdog will drop the hold");
+            }
+        }));
+    }
+    for handle in releases {
+        let _ = handle.await;
     }
     drop(order);
     let script = match dump {
@@ -2416,7 +2564,11 @@ async fn handle_hold(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     let id = state
         .next_hold_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.holds.lock().await.insert(id, guard);
+    state
+        .holds
+        .lock()
+        .await
+        .insert(id, (guard, advertise.clone()));
     // Register the joiner while still frozen: writes that start after the
     // hold fans out to the joiner; ones before it are in the dump.
     if !advertise.is_empty() {
@@ -2437,17 +2589,41 @@ async fn handle_hold(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     Frame::new(proto::RESP_AFFECTED, id.to_le_bytes().to_vec())
 }
 
-/// REQ_RELEASE: drop one hold; the joiner stays registered as a peer.
+/// REQ_RELEASE: drop one hold (8-byte id payload); the joiner stays
+/// registered as a peer. A payload of id 0 plus the joiner identity
+/// (`id_le || advertise`) sweeps every hold that identity still owns —
+/// how a joiner clears remnants of a prior attempt whose REQ_RELEASE was
+/// lost (the peer would otherwise stay frozen until the 60s watchdog).
+/// Receivers older than the extension read only the id and behave as
+/// before.
 async fn handle_release(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     let id = frame
         .payload
         .get(..8)
         .and_then(|b| b.try_into().ok())
         .map(u64::from_le_bytes);
-    let dropped = match id {
-        Some(id) => state.holds.lock().await.remove(&id).is_some(),
+    let owner = if frame.payload.len() > 8 {
+        Some(String::from_utf8_lossy(&frame.payload[8..]).into_owned())
+    } else {
+        None
+    };
+    let mut holds = state.holds.lock().await;
+    let mut dropped = match id {
+        Some(id) => holds.remove(&id).is_some(),
         None => false,
     };
+    if let Some(owner) = owner {
+        let stale: Vec<u64> = holds
+            .iter()
+            .filter(|(_, (_, o))| *o == owner)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if holds.remove(&id).is_some() {
+                dropped = true;
+            }
+        }
+    }
     Frame::new(
         proto::RESP_AFFECTED,
         (dropped as u64).to_le_bytes().to_vec(),
@@ -2565,7 +2741,7 @@ async fn apply_sync(
     // guaranteed to be inside the snapshot and the drain can skip it
     // instead of replaying it onto its own copy (duplicate-key noise).
     seed_positions(state, heads);
-    drain_sync_queue(state).await;
+    drain_sync_queue(state, true).await;
     // Free the write path before re-probing: the probes are network
     // round-trips and must not stall client writes.
     drop(order);
@@ -2592,7 +2768,36 @@ async fn apply_sync(
 /// [ServerState::sync_queue]). Callers run it at every terminal state of
 /// the bootstrap — the queue holds acknowledged writes that must land no
 /// matter how the join concluded.
-async fn drain_sync_queue(state: &Arc<ServerState>) {
+///
+/// `order_held` must be true only when the caller already holds
+/// `write_order` (the apply_* snapshot paths). Terminal-state drains run
+/// unlocked and pass false: the drain then takes the write path itself so
+/// replays cannot merge into a client's open transaction — its ROLLBACK
+/// would drop writes the origins already had acknowledged. A stuck client
+/// transaction delays the gate closing but never merges queued writes
+/// into it; the drain waits with a loud heartbeat rather than give up on
+/// acknowledged data.
+async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
+    let _order = if order_held {
+        None
+    } else {
+        let mut waits = 0u64;
+        loop {
+            match lock_engine_for_write(state).await {
+                Some(order) => break Some(order),
+                None => {
+                    waits += 1;
+                    if waits == 1 || waits.is_multiple_of(30) {
+                        eprintln!(
+                            "sync: drain waiting for an open client transaction \
+                             ({waits} cycle(s)); acked queued writes must land"
+                        );
+                    }
+                    tokio::time::sleep(BEGIN_QUEUE_POLL).await;
+                }
+            }
+        }
+    };
     loop {
         let batch = {
             let mut gate = state.sync_queue.lock().await;
@@ -2625,10 +2830,17 @@ async fn drain_sync_queue(state: &Arc<ServerState>) {
                     continue;
                 }
             }
-            let resp = execute_sql(state, &q.sql, false, true, None, true).await;
+            let seq_pos = q
+                .origin
+                .as_ref()
+                .map(|(origin, seq)| (origin.as_str(), *seq));
+            let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos).await;
             if resp.frame_type == proto::RESP_ERROR {
                 let msg = String::from_utf8_lossy(&resp.payload).into_owned();
                 eprintln!("sync: queued replay failed: {msg}");
+                state
+                    .replay_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 querylog::sync_event(
                     &state.sync_log,
                     "bootstrap",
@@ -2638,10 +2850,8 @@ async fn drain_sync_queue(state: &Arc<ServerState>) {
                     Some(msg),
                 );
             } else {
-                if let Some((origin, seq)) = &q.origin {
-                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-                    advance_position(&mut db, origin, *seq);
-                }
+                // Position was fused into the replay's commit unit
+                // (see execute_sql's `seq_pos`).
                 querylog::record(state, "sync", &q.sql, 0.0, &resp, true);
             }
         }
@@ -2677,9 +2887,12 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                     if info.tables > 0 {
                         saw_data = true;
                         match join_from(&state, peer, &heads).await {
-                            JoinApply::Applied => return,
+                            JoinApply::Applied => {
+                                verify_join_convergence(&state, peers.clone()).await;
+                                return;
+                            }
                             JoinApply::LocalData => {
-                                drain_sync_queue(&state).await;
+                                drain_sync_queue(&state, false).await;
                                 return;
                             }
                             JoinApply::Failed(e) => {
@@ -2702,7 +2915,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                 "bootstrap sync: peers hold no data (born-empty cluster); \
                  serving fresh — later writes fan out from the data holders"
             );
-            drain_sync_queue(&state).await;
+            drain_sync_queue(&state, false).await;
             querylog::sync_event(
                 &state.sync_log,
                 "bootstrap",
@@ -2716,7 +2929,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
         tokio::time::sleep(SYNC_RETRY_DELAY).await;
     }
     eprintln!("bootstrap sync gave up after {SYNC_ROUNDS} rounds ({last_err}); serving fresh");
-    drain_sync_queue(&state).await;
+    drain_sync_queue(&state, false).await;
     querylog::sync_event(
         &state.sync_log,
         "bootstrap",
@@ -2822,7 +3035,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
             }
         };
         if reports.iter().any(|(_, d)| d == &local) {
-            drain_sync_queue(&state).await;
+            drain_sync_queue(&state, false).await;
             return;
         }
 
@@ -2854,7 +3067,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                         // the next pull; replays are order-idempotent,
                         // and any residual divergence still lands in the
                         // snapshot fallback).
-                        drain_sync_queue(&state).await;
+                        drain_sync_queue(&state, false).await;
                         // Fresh digest check: the mesh kept writing while
                         // the backlog replayed.
                         let mut fresh_probes = Vec::new();
@@ -2890,7 +3103,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                                     true,
                                     Some(format!("{total} ops from {} origins", plan.len())),
                                 );
-                                drain_sync_queue(&state).await;
+                                drain_sync_queue(&state, false).await;
                                 return;
                             }
                         }
@@ -2922,7 +3135,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
             .collect();
         match decide_repair(&local, &reports) {
             RepairDecision::Converged => {
-                drain_sync_queue(&state).await;
+                drain_sync_queue(&state, false).await;
                 return;
             }
             RepairDecision::Serve => {
@@ -2931,7 +3144,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                      picked this node's state as the reference",
                     round + 1
                 );
-                drain_sync_queue(&state).await;
+                drain_sync_queue(&state, false).await;
                 return;
             }
             RepairDecision::Pull(source) => {
@@ -2970,7 +3183,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
         "rejoin repair gave up; serving local state (divergent peers \
          repair on their own restart)"
     );
-    drain_sync_queue(&state).await;
+    drain_sync_queue(&state, false).await;
     querylog::sync_event(
         &state.sync_log,
         "repair",
@@ -2983,7 +3196,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
 
 /// One origin's missed-op range: pull journal entries (from, to] from
 /// `addr` and apply them in order.
-struct CatchupTask {
+pub(crate) struct CatchupTask {
     addr: String,
     node_id: String,
     from: u64,
@@ -2997,7 +3210,7 @@ struct CatchupTask {
 /// force the snapshot path. Positions can only lag the data, so a
 /// partial catch-up is always safe — the digest re-check after it
 /// decides whether a snapshot is still needed.
-async fn catchup_plan(
+pub(crate) async fn catchup_plan(
     state: &Arc<ServerState>,
     infos: &[(String, PeerInfo)],
 ) -> Option<Vec<CatchupTask>> {
@@ -3027,7 +3240,12 @@ async fn catchup_plan(
 
 /// Execute a catch-up plan: pull each origin's missed range in order and
 /// record the origin's head as the new position.
-async fn run_catchup(state: &Arc<ServerState>, plan: &[CatchupTask]) -> Result<(), String> {
+/// Execute a catch-up plan: pull each origin's missed range in order and
+/// record the origin's head as the new position.
+pub(crate) async fn run_catchup(
+    state: &Arc<ServerState>,
+    plan: &[CatchupTask],
+) -> Result<(), String> {
     for task in plan {
         let head = catch_up_from(state, &task.addr, task.from)
             .await
@@ -3198,22 +3416,37 @@ async fn apply_repair_sync(
             let _ = db.execute("ROLLBACK");
             return JoinApply::Failed(format!("statement {}: {}", err.statement, err.message));
         }
+        // The adopted snapshot replaces the state the old positions
+        // described — drop them (a stale-high survivor would over-claim
+        // coverage of a snapshot that no longer contains those ops) inside
+        // the SAME transaction as the snapshot: a crash between an
+        // autocommit clear and the next restart would otherwise survive the
+        // Converged digest exit, which never re-clears positions.
+        if let Err(e) = db.positions_clear() {
+            let _ = db.execute("ROLLBACK");
+            return JoinApply::Failed(format!("position reset: {e}"));
+        }
+        // The adjudication is final: this node's own journal entries the
+        // majority snapshot did not adopt must never replay again — a
+        // later repair on some peer would otherwise pull them back and
+        // resurrect discarded writes. Void their texts (seqs stay
+        // allocated so the counter and every recorded position keep their
+        // meaning; a replayed entry is a parsed no-op). Third parties that
+        // pull the voided range land on the digest re-check → snapshot,
+        // which is where a resurrected range would have sent them anyway.
+        if let Err(e) = db.journal_void_all() {
+            let _ = db.execute("ROLLBACK");
+            return JoinApply::Failed(format!("journal void: {e}"));
+        }
         if let Err(e) = db.execute("COMMIT") {
             let _ = db.execute("ROLLBACK");
             return JoinApply::Failed(format!("COMMIT: {e}"));
-        }
-        // The adopted snapshot replaces the state the old positions
-        // described — drop them (a stale-high survivor would over-claim
-        // coverage of a snapshot that no longer contains those ops)
-        // before the floor and fresh-head re-seeding below.
-        if let Err(e) = db.positions_clear() {
-            eprintln!("repair position reset failed: {e}");
         }
     }
     // Probe-round floor before the drain, fresh heads after — same order
     // and same reasoning as the join path (see apply_sync).
     seed_positions(state, heads);
-    drain_sync_queue(state).await;
+    drain_sync_queue(state, true).await;
     // Free the write path before re-probing: the probes are network
     // round-trips and must not stall client writes.
     drop(order);
@@ -3230,12 +3463,66 @@ async fn apply_repair_sync(
     JoinApply::Applied
 }
 
+/// Post-join sanity check: the snapshot + queue replay is only as
+/// complete as the fan-outs that reached this node while the gate was
+/// open. A fan-out lost to a transient refusal on either side would
+/// otherwise sit as a silent divergence until the NEXT restart's digest
+/// repair — the join path had no re-verification at all. Probe the peers
+/// once; if none agrees with the bootstrapped state, hand the node to the
+/// rejoin-repair machinery immediately (incremental pull when possible,
+/// snapshot otherwise).
+async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
+    let local = {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.digests()
+    };
+    let Ok(local) = local else {
+        return;
+    };
+    let mut probes = Vec::new();
+    for peer in &peers {
+        let st = state.clone();
+        let target = peer.clone();
+        probes.push(tokio::spawn(async move {
+            let digests = probe_peer_digests(&st, &target).await;
+            (target, digests)
+        }));
+    }
+    let mut reachable = 0usize;
+    let mut agreeing = 0usize;
+    for probe in probes {
+        if let Ok((peer, Ok(d))) = probe.await {
+            reachable += 1;
+            if d == local {
+                agreeing += 1;
+            } else {
+                eprintln!("join verify: state differs from {peer}");
+            }
+        }
+    }
+    if reachable > 0 && agreeing == 0 {
+        eprintln!(
+            "join verify: no reachable peer agrees with the bootstrapped state; \
+             running rejoin repair now instead of waiting for the next restart"
+        );
+        querylog::sync_event(
+            &state.sync_log,
+            "bootstrap",
+            "",
+            None,
+            false,
+            Some("post-join digest verification failed; repair engaged".into()),
+        );
+        repair_sync(state.clone(), peers).await;
+    }
+}
+
 /// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
 /// mean "unknown" (unreachable / auth mismatch), never "divergent". The
 /// frame rides FLAG_REPLICATION like every node-internal frame — under
 /// cluster-token auth a peer-role connection only accepts replication
 /// traffic.
-async fn probe_peer_digests(
+pub(crate) async fn probe_peer_digests(
     state: &Arc<ServerState>,
     peer: &str,
 ) -> std::io::Result<Vec<TableDigest>> {
@@ -3268,17 +3555,19 @@ async fn probe_peer_digests(
 /// count (fresh-join probe), its persistent identity, and its journal
 /// window. `node_id`/journal fields are None from peers predating
 /// catch-up replication — incremental repair is impossible against them
-/// and the snapshot path takes over.
+/// and the snapshot path takes over. `restore_running` drives the
+/// cluster-wide restore mutual-exclusion probe (see backup.rs).
 #[derive(Debug, Clone)]
-struct PeerInfo {
-    tables: u64,
-    node_id: Option<String>,
-    journal_head: Option<u64>,
-    journal_oldest: Option<u64>,
+pub(crate) struct PeerInfo {
+    pub(crate) tables: u64,
+    pub(crate) node_id: Option<String>,
+    pub(crate) journal_head: Option<u64>,
+    pub(crate) journal_oldest: Option<u64>,
+    pub(crate) restore_running: bool,
 }
 
 /// One peer's status + journal window over REQ_STATUS.
-async fn probe_peer_info(state: &Arc<ServerState>, peer: &str) -> std::io::Result<PeerInfo> {
+pub(crate) async fn probe_peer_info(state: &Arc<ServerState>, peer: &str) -> std::io::Result<PeerInfo> {
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
     if let Some(token) = fanout_auth(state) {
         auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
@@ -3307,6 +3596,7 @@ async fn probe_peer_info(state: &Arc<ServerState>, peer: &str) -> std::io::Resul
         node_id: v["cluster_id"].as_str().map(String::from),
         journal_head: v["journal_head"].as_u64(),
         journal_oldest: v["journal_oldest"].as_u64(),
+        restore_running: v["backup"]["restore"]["running"].as_bool() == Some(true),
     })
 }
 
@@ -3391,6 +3681,16 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
         db.journal_head().unwrap_or(0)
     };
     let mut after = after;
+    // Continuity audit: the requester will adopt `head` as its position,
+    // so every seq in (after, head] must actually be served. A trim (or a
+    // crash-lost entry) that removes part of the range mid-pull would
+    // otherwise be invisible — journal_range just skips the missing seqs,
+    // the stream ends cleanly, and the requester's position leaps over
+    // data it never received (positions may lag, never lead). Detecting a
+    // hole here turns the silent divergence into an explicit error the
+    // requester answers with snapshot adoption.
+    let mut expected = after + 1;
+    let mut last_served = after;
     loop {
         let batch = {
             let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
@@ -3414,6 +3714,22 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
         if served == 0 {
             break;
         }
+        let hole = batch[..served]
+            .iter()
+            .enumerate()
+            .find_map(|(i, (seq, _))| (*seq != expected.saturating_add(i as u64)).then_some(*seq));
+        if let Some(seq) = hole {
+            let _ = tx
+                .send(Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload(&format!(
+                        "catchup: journal hole before seq {seq} \
+                         (entry trimmed or lost); snapshot repair required"
+                    )),
+                ))
+                .await;
+            return;
+        }
         let mut idx = 0;
         while idx < served {
             let (payload, packed) = pack_catchup_entries(&batch[idx..served], BUDGET);
@@ -3426,10 +3742,26 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
             }
             idx += packed;
         }
+        expected = batch[served - 1].0 + 1;
+        last_served = batch[served - 1].0;
         if served < batch.len() {
             break;
         }
         after = batch.last().expect("non-empty batch").0;
+    }
+    if last_served != head {
+        // The stream ended short of the sampled head: the tail of the
+        // requested range is gone from the journal (trimmed mid-pull).
+        let _ = tx
+            .send(Frame::new(
+                proto::RESP_ERROR,
+                err_payload(&format!(
+                    "catchup: journal ends at {last_served} but head is {head} \
+                     (trimmed mid-pull); snapshot repair required"
+                )),
+            ))
+            .await;
+        return;
     }
     let _ = tx
         .send(Frame::new(
@@ -3463,7 +3795,7 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
             match f.frame_type {
                 proto::RESP_CATCHUP => {
                     for (_, sql) in decode_catchup_entries(&f.payload)? {
-                        let resp = execute_sql(state, &sql, false, true, None, false).await;
+                        let resp = execute_sql(state, &sql, false, true, None, false, None).await;
                         if resp.frame_type == proto::RESP_ERROR {
                             return Err(std::io::Error::other(format!(
                                 "catch-up replay failed: {}",

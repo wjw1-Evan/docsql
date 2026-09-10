@@ -80,6 +80,45 @@ fn main() {
     );
     db.set_async_commit(false);
 
+    // 4b) 集群写路径的复制记账:未融合时每条写 = 用户写 fsync + journal
+    // fsync;融合写单元把两笔并成一次 fsync。用独立的新库测,避免上方
+    // 30k 行大库的 WAL checkpoint(sync_all 整库)摊销淹没逐条 fsync 差异。
+    {
+        const C: i64 = 3_000;
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(&dir2.path().join("cluster.db")).unwrap();
+        db2.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, v INT)")
+            .unwrap();
+        db2.ensure_cluster_tables().unwrap();
+        // 预热:journal 表建好、journal_next 缓存住
+        db2.journal_append("INSERT INTO t VALUES (-1, 'warm', 1)")
+            .unwrap();
+        // 未融合:两条独立 autocommit
+        let t = Instant::now();
+        for i in 0..C {
+            let sql = format!("INSERT INTO t VALUES ({i}, 'c{i}', 1)");
+            db2.execute(&sql).unwrap();
+            db2.journal_append(&sql).unwrap();
+        }
+        let unfused = now_us(t);
+        // 融合:一个写单元内 用户写 + journal,结束一次 fsync
+        let t = Instant::now();
+        for i in C..2 * C {
+            let sql = format!("INSERT INTO t VALUES ({i}, 'c{i}', 1)");
+            let mut unit = db2.write_unit();
+            unit.execute(&sql).unwrap();
+            unit.journal_append(&sql).unwrap();
+            unit.end().unwrap();
+        }
+        let fused = now_us(t);
+        println!(
+            "集群写记账({C} 条): 未融合 {unfused:9.1} µs ({:7.1} µs/条) vs 融合 {fused:9.1} µs ({:7.1} µs/条, {:.2}×)",
+            unfused / C as f64,
+            fused / C as f64,
+            unfused / fused,
+        );
+    }
+
     // 5) 点查随表规模伸缩(30k → 300k 行;旧 catalog 单页格式在 ~10 万行即封顶)
     for (label, total) in [("30k 行", 30_000i64), ("300k 行", 300_000)] {
         if total > A0 + N {
