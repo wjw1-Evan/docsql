@@ -109,9 +109,13 @@ pub const REQ_SQL_SEQ: u16 = 0x0015;
 /// terminates with RESP_AFFECTED carrying its journal head.
 pub const REQ_CATCHUP: u16 = 0x0016;
 /// Backup management (authenticated): payload = JSON
-/// `{"action": "list"|"trigger"}`. `list` reports the node's backup
-/// directory contents and last-attempt status; `trigger` runs one backup
-/// now (rejected for read-only connections). Both respond RESP_BACKUP.
+/// `{"action": "list"|"trigger"|"restore", "file"?}`. `list` reports the
+/// node's backup directory contents, last-attempt status and restore
+/// status; `trigger` runs one backup now; `restore` replays the named
+/// backup file through the write path (whole-cluster restore — every
+/// replayed statement fans out to the peers). trigger/restore are
+/// rejected for read-only connections. All respond RESP_BACKUP (list) or
+/// RESP_AFFECTED (accepted trigger/restore); errors ride RESP_ERROR.
 pub const REQ_BACKUP: u16 = 0x0017;
 
 // Response frame types.
@@ -149,7 +153,8 @@ pub const RESP_DIGEST: u16 = 0x010B;
 pub const RESP_CATCHUP: u16 = 0x010C;
 /// Backup report (see REQ_BACKUP): payload = JSON object
 /// `{dir, interval_secs, keep, count, files: [{name, bytes, ts_ms}],
-/// last: {ts_ms, file, ok, error}?}`.
+/// last: {ts_ms, file, ok, error}?,
+/// restore: {ts_ms, file, running, ok, error, applied, total}?}`.
 pub const RESP_BACKUP: u16 = 0x010D;
 
 #[derive(Debug, Clone, PartialEq)]

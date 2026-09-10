@@ -23,6 +23,17 @@
 //! millisecond resolution, so lexicographic order is chronological.
 //! Retention keeps the newest `backup_keep` files and prunes only files
 //! matching the backup naming pattern.
+//!
+//! Restore (`REQ_BACKUP` action `"restore"`) replays a backup file's
+//! statements one by one through the normal write path (`execute_sql`),
+//! so every statement commits locally AND fans out to the peers — the
+//! whole cluster converges to the backup's state, exactly like the manual
+//! runbook of piping the file into `docsql-cli`. The node must hold the
+//! backup file itself (its own backup directory); restore runs in the
+//! background with progress in the shared status. Semantics: tables in
+//! the backup are dropped and recreated with the backup's data; tables
+//! created after the backup are not touched; writes arriving during the
+//! restore land normally on top.
 
 use crate::querylog;
 use crate::{ConnRole, ServerState};
@@ -40,18 +51,51 @@ pub struct BackupStatus {
     pub error: Option<String>,
 }
 
-/// Shared backup state: one backup runs at a time (timer tick and manual
-/// trigger dedupe on `running`), `last` reports the newest attempt.
+/// State of the last/current restore attempt: replays a backup file's
+/// statements through the normal write path, so the whole cluster
+/// converges to the backup's state (see the module docs).
+#[derive(Clone, Debug)]
+pub struct RestoreStatus {
+    pub ts_ms: u64,
+    pub file: String,
+    pub running: bool,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Statements applied so far / in the backup script (progress).
+    pub applied: usize,
+    pub total: usize,
+}
+
+impl RestoreStatus {
+    fn started(file: &str, total: usize) -> Self {
+        RestoreStatus {
+            ts_ms: now_ms(),
+            file: file.to_string(),
+            running: true,
+            ok: false,
+            error: None,
+            applied: 0,
+            total,
+        }
+    }
+}
+
+/// Shared backup state: one backup/restore runs at a time (timer tick and
+/// manual triggers dedupe on the flags; a restore excludes a backup and
+/// vice versa — both contend for the same write path). `last` reports the
+/// newest backup attempt, `restore` the newest restore attempt.
 #[derive(Default)]
 pub struct BackupShared {
     pub running: bool,
     pub last: Option<BackupStatus>,
+    pub restore: Option<RestoreStatus>,
 }
 
-/// true = this caller owns the backup; false = one is already in flight.
+/// true = this caller owns the backup; false = one is already in flight
+/// (or a restore is running — they share the write path).
 fn try_begin_backup(state: &ServerState) -> bool {
     let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-    if b.running {
+    if b.running || b.restore.as_ref().is_some_and(|r| r.running) {
         return false;
     }
     b.running = true;
@@ -142,8 +186,10 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
 
 /// REQ_BACKUP: `{"action": "list"}` reports the backup directory and last
 /// attempt; `{"action": "trigger"}` starts one backup now (rejected for
-/// read-only connections like every other durable-writing operation) and
-/// answers immediately — the outcome shows up in REQ_STATUS/REQ_BACKUP.
+/// read-only connections like every other durable-writing operation);
+/// `{"action": "restore", "file": "backup-….sql"}` replays that backup
+/// through the write path (whole-cluster restore). trigger/restore answer
+/// immediately — the outcome shows up in REQ_STATUS/REQ_BACKUP.
 pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Frame) -> Frame {
     let action = if frame.payload.is_empty() {
         "list".to_string()
@@ -184,11 +230,156 @@ pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Fra
             });
             Frame::new(proto::RESP_AFFECTED, b"backup started".to_vec())
         }
+        "restore" => {
+            if role == ConnRole::ReadOnly {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("read-only token; writes are not permitted"),
+                );
+            }
+            // A replica accepts no writes at all; every replayed statement
+            // would be refused, so fail the request up front.
+            if state.read_only.load(std::sync::atomic::Ordering::SeqCst) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("read-only replica; PROMOTE to accept writes"),
+                );
+            }
+            let file = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                .ok()
+                .and_then(|v| v["file"].as_str().map(String::from))
+                .unwrap_or_default();
+            if !valid_backup_name(&file) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload(
+                        "restore: expected {\"file\": \"backup-<stamp>.sql\"} - the bare name of a file in this node's backup directory",
+                    ),
+                );
+            }
+            if !state.backup_dir.join(&file).is_file() {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload(&format!("restore: no such backup file {file}")),
+                );
+            }
+            if !state.sync_queue.lock().await.closed {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("restore: node is still in startup sync; retry later"),
+                );
+            }
+            {
+                let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
+                let busy = b.running || b.restore.as_ref().is_some_and(|r| r.running);
+                if busy {
+                    return Frame::new(
+                        proto::RESP_ERROR,
+                        crate::err_payload("backup/restore already in progress"),
+                    );
+                }
+                b.restore = Some(RestoreStatus::started(&file, 0));
+            }
+            let st = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_restore(&st, &file).await {
+                    eprintln!("restore of {file} failed: {e}");
+                }
+            });
+            Frame::new(proto::RESP_AFFECTED, b"restore started".to_vec())
+        }
         other => Frame::new(
             proto::RESP_ERROR,
             crate::err_payload(&format!("backup: unknown action \"{other}\"")),
         ),
     }
+}
+
+/// A restorable file is a bare backup name from this node's backup
+/// directory: no separators, no traversal, no look-alike paths.
+fn valid_backup_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.starts_with("backup-")
+        && name.ends_with(".sql")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+}
+
+/// Replay one backup file through the normal write path. Caller must have
+/// claimed `BackupShared.restore`; this finishes the status either way.
+async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
+    let res = restore_inner(state, file).await;
+    let applied = {
+        let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
+        let mut applied = 0;
+        if let Some(r) = b.restore.as_mut() {
+            if r.file == file {
+                applied = match &res {
+                    Ok(n) => *n,
+                    // Keep the progress: how far the replay got matters
+                    // more than a zero on failure.
+                    Err(_) => r.applied,
+                };
+                r.running = false;
+                r.ok = res.is_ok();
+                r.error = res.as_ref().err().cloned();
+                r.applied = applied;
+            }
+        }
+        applied
+    };
+    querylog::sync_event(
+        &state.sync_log,
+        "restore",
+        file,
+        None,
+        res.is_ok(),
+        match res.as_ref().err() {
+            Some(e) => Some(e.clone()),
+            None => Some(format!("{applied} statements replayed")),
+        },
+    );
+    res
+}
+
+async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
+    // Filesystem work before any engine lock: the script is O(data).
+    let script = std::fs::read_to_string(state.backup_dir.join(file))
+        .map_err(|e| format!("restore read: {e}"))?;
+    let stmts =
+        docsql_core::stmt::split_statements(&script).map_err(|e| format!("restore parse: {e}"))?;
+    let total = stmts.len();
+    {
+        let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = b.restore.as_mut() {
+            if r.file == file {
+                r.total = total;
+            }
+        }
+    }
+    // Per-statement replay through the normal write path: each statement
+    // commits locally, is journaled, and fans out to every peer — the
+    // cluster converges to the backup's state (the dump is DROP-first, so
+    // replaying over live data is idempotent; AUTOINCREMENT counters
+    // continue from the restored max).
+    for (i, stmt) in stmts.iter().enumerate() {
+        let resp = crate::execute_sql(state, stmt, false, false, None, false).await;
+        if resp.frame_type == proto::RESP_ERROR {
+            return Err(format!(
+                "statement {} of {total} failed: {}",
+                i + 1,
+                String::from_utf8_lossy(&resp.payload)
+            ));
+        }
+        let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = b.restore.as_mut() {
+            if r.file == file {
+                r.applied = i + 1;
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// REQ_BACKUP (list) / `status_payload().backup` body. Reads only the
@@ -208,6 +399,15 @@ pub fn backup_payload(state: &ServerState) -> Vec<u8> {
             "file": l.file,
             "ok": l.ok,
             "error": l.error,
+        })),
+        "restore": b.restore.as_ref().map(|r| serde_json::json!({
+            "ts_ms": r.ts_ms,
+            "file": r.file,
+            "running": r.running,
+            "ok": r.ok,
+            "error": r.error,
+            "applied": r.applied,
+            "total": r.total,
         })),
     });
     serde_json::to_vec(&body).unwrap_or_default()
@@ -302,6 +502,21 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_names_are_validated_for_restore() {
+        assert!(valid_backup_name("backup-20260910T081530123Z.sql"));
+        assert!(valid_backup_name("backup-1.sql"));
+        // Path traversal and separator games never pass.
+        assert!(!valid_backup_name("../docsql.db"));
+        assert!(!valid_backup_name("backup-../../etc/passwd.sql"));
+        assert!(!valid_backup_name("backups/backup-1.sql"));
+        assert!(!valid_backup_name(r"backup-1\..\x.sql"));
+        assert!(!valid_backup_name("backup-.sql.tmp"));
+        assert!(!valid_backup_name("other-1.sql"));
+        assert!(!valid_backup_name(""));
+        assert!(!valid_backup_name(&"backup-1.sql".repeat(30)));
+    }
 
     #[test]
     fn utc_stamp_is_fixed_width_and_ordered() {

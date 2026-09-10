@@ -2730,6 +2730,18 @@ async fn backup_trigger_over_wire() {
         "unexpected error: {}",
         payload_str(&r)
     );
+    ro.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"restore","file":"backup-1.sql"}"#.to_vec(),
+    ))
+    .await;
+    let r = ro.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR);
+    assert!(
+        payload_str(&r).contains("read-only"),
+        "unexpected error: {}",
+        payload_str(&r)
+    );
 
     // Trigger: acknowledged at once, the file lands asynchronously.
     c.send(&Frame::new(
@@ -2770,11 +2782,106 @@ async fn backup_trigger_over_wire() {
     c2.auth("s3cret").await;
     c2.send(&Frame::new(
         proto::REQ_BACKUP,
-        br#"{"action":"restore"}"#.to_vec(),
+        br#"{"action":"snapshot"}"#.to_vec(),
     ))
     .await;
     assert_eq!(c2.recv().await.frame_type, proto::RESP_ERROR);
     c2.send(&Frame::new(proto::REQ_BACKUP, b"not json".to_vec()))
         .await;
     assert_eq!(c2.recv().await.frame_type, proto::RESP_ERROR);
+}
+
+/// REQ_BACKUP restore: replays a backup file through the write path — a
+/// table dropped after the backup comes back with its rows; traversal and
+/// missing-file names are refused.
+#[tokio::test]
+async fn backup_restore_round_trip() {
+    let (_dir, addr) = start_server(Some("s3cret")).await;
+    let mut c = Client::connect(&addr).await;
+    c.auth("s3cret").await;
+    c.sql("CREATE TABLE s (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO s VALUES (1, 'snap-1'), (2, 'snap-2')")
+        .await;
+
+    // Take a backup carrying the rows.
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    let dir = backup_list(&addr, Some("s3cret")).await["dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = std::path::PathBuf::from(dir);
+    let mut name = String::new();
+    for _ in 0..250 {
+        let names = backup_names(&dir);
+        if let Some(n) = names.first() {
+            if std::fs::read_to_string(dir.join(n))
+                .unwrap_or_default()
+                .contains("snap-2")
+            {
+                name = n.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "backup with data never appeared");
+
+    // Damage the state: drop the backed-up table, add a post-backup one.
+    c.sql("DROP TABLE s").await;
+    c.sql("CREATE TABLE after_bk (id INT PRIMARY KEY)").await;
+    c.sql("INSERT INTO after_bk VALUES (7)").await;
+
+    // Refusals: traversal name, wrong shape, missing file.
+    for bad in [
+        r#"{"action":"restore","file":"../docsql.db"}"#,
+        r#"{"action":"restore"}"#,
+        r#"{"action":"restore","file":"backup-nope.sql"}"#,
+    ] {
+        c.send(&Frame::new(proto::REQ_BACKUP, bad.as_bytes().to_vec()))
+            .await;
+        let r = c.recv().await;
+        assert_eq!(r.frame_type, proto::RESP_ERROR, "expected refusal: {bad}");
+    }
+
+    // Restore: acknowledged at once, outcome polled via list.
+    let payload = format!(r#"{{"action":"restore","file":"{name}"}}"#);
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.into_bytes()))
+        .await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+
+    let mut done = false;
+    for _ in 0..250 {
+        let v = backup_list(&addr, Some("s3cret")).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false && rs["ok"] == true && rs["file"] == name {
+                done = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(done, "restore never completed");
+
+    // The dropped table is back with its backup rows...
+    let r = c.sql("SELECT v FROM s WHERE id = 2").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    assert!(payload_str(&r).contains("snap-2"));
+    let r = c.sql("SELECT COUNT(id) FROM s").await;
+    assert!(payload_str(&r).contains("[[2]]"), "{}", payload_str(&r));
+    // ...while the post-backup table survived (documented semantics).
+    let r = c.sql("SELECT COUNT(id) FROM after_bk").await;
+    assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
+
+    // The restore attempt is audited in the sync log.
+    let mut cl = Client::connect(&addr).await;
+    cl.auth("s3cret").await;
+    cl.send(&Frame::new(proto::REQ_LOGS, vec![])).await;
+    let logs = String::from_utf8_lossy(&cl.recv().await.payload).to_string();
+    assert!(logs.contains("\"restore\""), "no restore event: {logs}");
 }

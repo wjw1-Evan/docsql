@@ -1248,3 +1248,118 @@ async fn backup_endpoint_lists_and_triggers() {
     assert_eq!(res.status, 200);
     assert!(res.json()["error"].as_str().unwrap().contains("未知节点"));
 }
+
+/// /api/backup/restore: the named backup replays through the node's write
+/// path — a table dropped after the backup comes back with its rows, and
+/// invalid file names surface the node's refusal.
+#[tokio::test]
+async fn backup_restore_endpoint_round_trip() {
+    // Real node as default managed target AND whitelisted peer.
+    let node_dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let node_addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: node_dir.path().join("node.db"),
+        listen: node_addr.clone(),
+        auth_token: Some("sekrit".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let web = start_web(
+        Some("sekrit"),
+        vec![node_addr.clone()],
+        Some(node_addr.clone()),
+    )
+    .await;
+    sql(
+        &web,
+        Some("sekrit"),
+        "CREATE TABLE s (id INT PRIMARY KEY, v TEXT)",
+    )
+    .await;
+    sql(
+        &web,
+        Some("sekrit"),
+        "INSERT INTO s VALUES (1, 'rt-1'), (2, 'rt-2')",
+    )
+    .await;
+
+    // Backup, wait for it to land.
+    let res = http(&web, "POST", "/api/backup", Some("sekrit"), Some("{}")).await;
+    assert_eq!(res.json()["ok"], true);
+    let mut name = String::new();
+    for _ in 0..250 {
+        let v = http(&web, "GET", "/api/backup", Some("sekrit"), None)
+            .await
+            .json();
+        if v["last"]["ok"] == true {
+            name = v["files"][0]["name"].as_str().unwrap().to_string();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "backup never appeared");
+
+    // Drop the table, then restore the backup.
+    sql(&web, Some("sekrit"), "DROP TABLE s").await;
+    let body = serde_json::to_string(&json!({ "file": name })).unwrap();
+    let res = http(
+        &web,
+        "POST",
+        "/api/backup/restore",
+        Some("sekrit"),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["ok"], true);
+
+    let mut done = false;
+    for _ in 0..250 {
+        let v = http(&web, "GET", "/api/backup", Some("sekrit"), None)
+            .await
+            .json();
+        if v["restore"]["running"] == false && v["restore"]["ok"] == true {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(done, "restore never completed");
+
+    let out = sql(&web, Some("sekrit"), "SELECT v FROM s WHERE id = 2").await;
+    assert!(out.to_string().contains("rt-2"), "rows not restored: {out}");
+
+    // Invalid names surface the node's refusal in-band.
+    let res = http(
+        &web,
+        "POST",
+        "/api/backup/restore",
+        Some("sekrit"),
+        Some(r#"{"file":"../docsql.db"}"#),
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    assert!(res.json()["error"].as_str().unwrap().contains("restore"));
+}

@@ -230,6 +230,33 @@ if [ -n "$sgbk" ]; then
 else
   bad "restore drill: no snapshot carrying sg rows"
 fi
+# web 控制台恢复(POST /api/backup/restore):建表 → 等快照带上它 → DROP →
+# 恢复 → 数据回来。节点经正常写路径重放,整库收敛到快照时点。
+sql "$A" "CREATE TABLE wbk (id INT PRIMARY KEY, v TEXT);" >/dev/null 2>&1
+sql "$A" "INSERT INTO wbk VALUES (9, 'webrestore');" >/dev/null 2>&1
+wname=""
+for _ in $(seq 1 30); do
+  w=$(newest)
+  [ -n "$w" ] || { sleep 1; continue; }
+  out=$(docker exec "$CTR" cat "$BK/$w" 2>/dev/null)
+  echo "$out" | grep -q "webrestore" && { wname="$w"; break; }
+  sleep 1
+done
+if [ -n "$wname" ]; then
+  sql "$A" "DROP TABLE wbk;" >/dev/null 2>&1
+  r=$(curl -s -X POST "$W/api/backup/restore" -H 'Content-Type: application/json' -d "{\"file\":\"$wname\"}")
+  echo "$r" | grep -q '"ok":true' && ok "web restore accepted" || bad "web restore trigger: $r"
+  wr=""
+  for _ in $(seq 1 20); do
+    out=$(sql "$A" "SELECT v FROM wbk WHERE id = 9;" 2>/dev/null)
+    echo "$out" | grep -q "webrestore" && { wr=1; break; }
+    sleep 0.5
+  done
+  [ -n "$wr" ] && ok "web restore: dropped table back with data" \
+    || bad "web restore: $(sql "$A" "SELECT COUNT(id) FROM wbk;" 2>&1)"
+else
+  bad "web restore: no snapshot carrying wbk rows"
+fi
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

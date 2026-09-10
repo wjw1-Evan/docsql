@@ -1388,10 +1388,11 @@ function openClusterTab() {
 
 /* ================= 备份管理 ================= */
 // 当前管理目标(节点切换器选定)的自动备份状态与备份文件列表(GET
-// /api/backup),「立即备份」触发一次手动备份(POST /api/backup,节点异步
-// 执行,状态经轮询回显)。恢复是整库覆盖操作,控制台不提供按钮:备份文件
-// 是完整 SQL 快照,在节点上重放即还原(集群内会经扇出传播收敛),手册见
-// README「数据持久化」。
+// /api/backup),「立即备份」触发一次手动备份(POST /api/backup),每行
+// 「恢复」把该快照重放进节点(POST /api/backup/restore,需输入完整文件名
+// 确认):节点经正常写路径逐条重放,每条语句扇出到集群,全网收敛到备份
+// 时点;同名表被覆盖,备份之后新建的表不受影响。恢复/备份均异步执行,
+// 状态与进度经 5 秒轮询回显。
 function openBackupTab() {
   tabs.open('backup', 'backup', '备份管理', (t) => {
     t.auto = true;
@@ -1419,6 +1420,20 @@ function openBackupTab() {
     };
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
     $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
+    // 恢复:整库覆盖级操作,输入完整备份文件名确认后才发请求。
+    const doRestore = (name) => {
+      dialog(`恢复备份 ${name}`, [
+        {name: 'confirm', label: `输入 ${name} 确认恢复。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。`, ph: name, value: ''},
+      ], '确认恢复', async (vals, err) => {
+        if (vals.confirm !== name) { err('输入与备份文件名不一致'); throw new Error('mismatch'); }
+        try {
+          const r = await api.post('/api/backup/restore', {file: name});
+          if (r.error) { err(r.error); throw new Error(r.error); }
+          ui.toast('恢复已开始');
+          t.load();
+        } catch (e) { if (e.message !== 'mismatch') ui.toast('恢复触发失败:' + e.message, true); throw e; }
+      });
+    };
     t.render = (v) => {
       const body = $('[data-body]', t.el);
       if (v.error) {
@@ -1442,21 +1457,34 @@ function openBackupTab() {
       ];
       let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
         `<div class="card"><div class="v"${c[2] || ''}>${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
+      // 恢复状态条(进行中含进度;完成后保留最近一次结果)。
+      const rst = v.restore;
+      $('[data-do="trigger"]', t.el).disabled = !!(rst && rst.running);
+      if (rst) {
+        const rs = rst.running
+          ? `<span style="color:var(--warn)">● 恢复进行中</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span>${rst.total ? ` · <span data-rprog>${rst.applied}/${rst.total}</span> 条语句` : ''}`
+          : (rst.ok
+            ? `<span style="color:var(--ok)">● 恢复完成</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span> · ${esc(rst.applied)} 条语句${rst.ts_ms ? ' · ' + esc(new Date(rst.ts_ms).toLocaleString()) : ''}`
+            : `<span style="color:var(--err)">● 恢复失败</span> <span style="font-family:var(--mono)">${esc(rst.file || '')}</span> ${esc(rst.error || '')}`);
+        html += `<div class="card" style="margin-bottom:14px;padding:10px 14px"><div class="v" style="font-size:13px;font-weight:400">${rs}</div></div>`;
+      }
       const files = v.files || [];
       if (!files.length) {
         html += `<div class="card" style="max-width:680px">
           <div class="v" style="font-size:15px">暂无备份</div>
           <div class="k" style="line-height:1.7">节点尚未产生备份文件(目录:${esc(v.dir || dash)})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。
-          备份是完整的 SQL 快照(DROP + CREATE + INSERT),在节点上重放即整库还原;集群内任一节点重放会经复制扇出传播到全网,操作手册见 README「数据持久化」。</div></div>`;
+          备份是完整的 SQL 快照(DROP + CREATE + INSERT);恢复时整库重放该快照,同名表还原为备份时点并扇出到集群全网。</div></div>`;
       } else {
-        html += `<table class="grid"><thead><tr><th>备份文件</th><th>大小</th><th>时间</th></tr></thead><tbody>` +
+        html += `<table class="grid"><thead><tr><th>备份文件</th><th>大小</th><th>时间</th><th>操作</th></tr></thead><tbody>` +
           files.map(f => `<tr>
             <td style="font-family:var(--mono)">${esc(f.name)}</td>
             <td>${fmtBytes(f.bytes)}</td>
             <td>${f.ts_ms ? esc(new Date(f.ts_ms).toLocaleString()) : dash}</td>
+            <td><button data-restore="${esc(f.name)}"${rst && rst.running ? ' disabled' : ''}>恢复</button></td>
           </tr>`).join('') + `</tbody></table>`;
       }
       body.innerHTML = html;
+      $$('[data-restore]', body).forEach(b => b.onclick = () => doRestore(b.dataset.restore));
     };
     t.load = async () => {
       try {
