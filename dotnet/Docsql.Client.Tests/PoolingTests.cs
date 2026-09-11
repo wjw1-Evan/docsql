@@ -9,6 +9,15 @@ using Docsql.Client;
 using System.Data.Common;
 using Xunit;
 
+// 池命中/丢弃计数是客户端进程级静态(xUnit 默认按测试类并行),其它测试类的
+// 池化连接会在断言窗口内推高计数 —— 断言计数器的类必须整体串行,xUnit 保证
+// 该 collection 等所有并行 collection 结束后独占运行。
+[CollectionDefinition("pooling-counters", DisableParallelization = true)]
+public sealed class PoolingCountersCollection
+{
+}
+
+[Collection("pooling-counters")]
 public sealed class PoolingTests : IClassFixture<ServerFixture>
 {
     private readonly ServerFixture _fx;
