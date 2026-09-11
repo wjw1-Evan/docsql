@@ -163,7 +163,7 @@ docker exec docsql-prod-single cat "/data/backups/$bk" | docker exec -i docsql-p
 
 恢复语义与注意事项:恢复**覆盖备份中包含的所有表**(整表替换);备份之后新建的表不受影响,如需完全对齐请先手动删除;**恢复重放期间发起节点持写路径**——本地新写在恢复期间排队(超过 30 秒报错),恢复完成后照常落库、不会回滚;重放期间其它节点错过扇入的写由发起节点在恢复完成后自动增量补拉,并逐一比对全网摘要,`converged=false` 时按提示让仍分歧的节点重启一次即自动修复;AUTOINCREMENT 计数器按恢复后现存最大值 +1 续推;恢复在所选节点发起即可,重放经扇出传播全网(全网同时只允许一个恢复:发起节点会探测各 peer,他节点恢复进行中即拒绝);只读连接/只读副本拒绝恢复。要把备份带到主机侧归档,`docker cp docsql-prod-single:/data/backups .` 即可。
 
-**本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。
+**本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。客户端 token 用 `DOCSQL_DEV_TOKEN` 配置(同时下发给所有节点与 Web 控制台,控制台以它认证节点;**从控制台创建数据库用户之前必须配置**——节点一旦存在用户,匿名的控制台连接会被拒绝,部署测试脚本会自动将其置空)。
 
 **生产**(`deploy/docker-compose.prod.yml`,项目名 `docsql-prod`):拉取 CI 发布的 GHCR 镜像(不本地构建),端口 +1000(18600-18604/18700/18710,与开发栈互不冲突),数据卷沿用历史命名 `docsql-data-*`(真实数据在此),断线自动重启,日志轮转,Web 控制台可配 token:
 
@@ -174,7 +174,7 @@ docker compose -f docker-compose.prod.yml --profile single up -d    # 生产单�
 docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三节点集群
 ```
 
-> 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)互不相同,两套拓扑可同时运行、互不共享数据。
+> 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)与客户端 token 变量(`DOCSQL_DEV_TOKEN` / `DOCSQL_TOKEN`)互不相同,两套拓扑可同时运行、互不共享数据。
 
 部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 81 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub、自动备份与恢复演练)。
 
@@ -209,7 +209,7 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 - ADO.NET 连接串:`host=...;port=...;user=analyst;password=...`(与 `token=` 二选一,同时给出时用户登录优先);EF Core `UseDocsql("...")` 同一连接串。
 - CLI:`docsql-cli connect 127.0.0.1:7600 --user analyst`(密码从 `DOCSQL_PASSWORD` 或交互提示读取,不走命令行参数)。
 
-**Web 控制台管理**:「视图 → 用户与角色」页面可视化完成上述全部操作 —— 用户列表(角色徽标/表级权限/改密码/删除)、角色管理(内置角色说明/自定义角色/成员授予与移除)、以及按表勾选 SELECT/INSERT/UPDATE/DELETE 的表级权限编辑器(用户的直接授予与其角色携带的权限分开展示)。页面数据来自控制台的管理员连接;**节点启用用户后,务必为 Web 服务与节点配置一致的 `DOCSQL_TOKEN`**,否则控制台的匿名连接会被节点拒绝(页面会给出相应提示)。
+**Web 控制台管理**:「视图 → 用户与角色」页面可视化完成上述全部操作 —— 用户列表(角色徽标/表级权限/改密码/删除)、角色管理(内置角色说明/自定义角色/成员授予与移除)、以及按表勾选 SELECT/INSERT/UPDATE/DELETE 的表级权限编辑器(用户的直接授予与其角色携带的权限分开展示)。页面数据来自控制台的管理员连接;**节点启用用户后,务必为 Web 服务与节点配置一致的 `DOCSQL_TOKEN`(生产栈,经 `.env`;开发栈为 `DOCSQL_DEV_TOKEN`)**,否则控制台的匿名连接会被节点拒绝(页面会给出相应提示)。
 
 **兼容与过渡**:`DOCSQL_TOKEN` 恒为管理员身份(存量部署零变化);未配置 token 且从未创建用户的节点维持开放访问(开发模式);**一旦存在任一用户,新建的匿名连接即被拒绝**(判定取连接建立时刻——正在建号授权的会话不会被自己锁死)。用户/角色数据存于保留名内部表(`docsql_users` 等,复制但不可直接读写),明文密码只在执行节点出现,日志、复制流、备份里均为 PBKDF2 哈希形式。
 

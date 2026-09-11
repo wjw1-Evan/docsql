@@ -14,6 +14,13 @@
 # building — deliberately NOT DOCSQL_IMAGE_TAG, which belongs to the prod
 # compose and its .env and must never silently retag the dev stack.
 #
+# DOCSQL_DEV_TOKEN (deliberately NOT DOCSQL_TOKEN, same separation rule as
+# the image tag): the client token handed to every node AND both web
+# consoles. Optional — but once the node has database users, anonymous
+# console connections are rejected ("authentication required"), so set it
+# BEFORE managing users from the web console; the console authenticates to
+# nodes with this value (run-tests.sh scrubs it for deterministic tests).
+#
 # Fully separated from docker-compose.prod.yml (project docsql-prod): own
 # host ports (17600-17604/17700/17710) and own data volumes, so dev and prod
 # can run SIDE BY SIDE. Prod listens on 18600-18604/18700/18710 and keeps the
@@ -34,6 +41,11 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-b:7600,node-c:7600"
+      # Client token (same value into the web consoles below). Empty =
+      # legacy open access — until the first database user is created,
+      # after which anonymous connections are refused, so configure this
+      # before creating users from the console.
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       # Inter-node credential: fan-out authenticates with it and only
       # cluster-authed connections may send replication frames. Dev value
       # is public on purpose (nothing secret on a loopback dev cluster);
@@ -50,7 +62,7 @@ services:
       - peer-a-data:/data
     networks: [docsql]
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-a:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-a:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -62,6 +74,7 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
@@ -74,7 +87,7 @@ services:
       node-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-b:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-b:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -86,6 +99,7 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
@@ -98,7 +112,7 @@ services:
       node-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-c:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-c:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -120,6 +134,7 @@ services:
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
       DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
@@ -132,7 +147,7 @@ services:
       node-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-d:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-d:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -151,6 +166,9 @@ services:
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      # Same client token as the nodes: the console authenticates to them
+      # with it (required once database users exist — see header comment).
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       # Console account (first-use username/password). Empty env disables
       # the gate (run-tests.sh sets it so its raw curls stay unauthenticated).
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
@@ -177,6 +195,7 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       # Automatic backups: same semantics as the cluster nodes above.
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -185,7 +204,7 @@ services:
       - single-data:/data
     networks: [docsql]
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-single:7600 <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "docsql-cli connect node-single:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -201,6 +220,7 @@ services:
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_PEERS: "node-single:7600"
+      DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
     volumes:
       - web-auth-single:/auth

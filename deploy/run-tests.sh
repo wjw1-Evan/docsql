@@ -10,6 +10,10 @@ cd "$(dirname "$0")"
 # empty DOCSQL_WEB_AUTH_FILE disables the console account gate for the test
 # stack (compose's unset-only default would otherwise turn it on).
 export DOCSQL_WEB_AUTH_FILE=""
+# Same determinism for the client token: a developer's .env may set
+# DOCSQL_DEV_TOKEN for daily use (console↔node auth); the test stack must
+# run token-less so its raw curls keep working.
+export DOCSQL_DEV_TOKEN=""
 # Backup assertions need backups on a test-friendly cadence (single-test.sh
 # chapter 8 polls for files and drives a retention/restore round-trip).
 # Empty in compose = server default (daily) — too slow for tests.
