@@ -315,9 +315,22 @@ struct TableMeta {
     /// INDEX adds non-unique trees. Lookups over these columns skip the
     /// heap scan.
     index_roots: std::collections::BTreeMap<String, u32>,
+    /// Recycled overflow-chain page ids (documents larger than one page;
+    /// see heap.rs / docs/design/002): reused by the next oversized insert.
+    /// Persisted in the catalog; empty for tables without overflow history.
+    overflow_free: Vec<u32>,
 }
 
 impl TableMeta {
+    /// Heap view over this table's storage: live pages plus the recycled
+    /// overflow-chain free list.
+    fn heap_of(&self) -> Heap {
+        Heap {
+            pages: self.pages.clone(),
+            overflow_free: self.overflow_free.clone(),
+        }
+    }
+
     /// Columns making up the index behind `root_key`: the definition's
     /// ordered column list for a named (possibly composite) index, or the
     /// key itself for legacy single-column entries (constraint trees and
@@ -709,6 +722,15 @@ impl Database {
                                     .collect(),
                                 _ => std::collections::BTreeMap::new(),
                             };
+                            // Recycled overflow-chain pages (optional key:
+                            // catalogs predating overflow documents lack it).
+                            let overflow_free = match m.get("overflow_free") {
+                                Some(Value::Array(a)) => a
+                                    .iter()
+                                    .filter_map(|v| v.as_i64().map(|i| i as u32))
+                                    .collect(),
+                                _ => vec![],
+                            };
                             let foreign_keys = match m.get("foreign_keys") {
                                 Some(Value::Array(a)) => a
                                     .iter()
@@ -747,6 +769,7 @@ impl Database {
                                     checks,
                                     foreign_keys,
                                     index_roots,
+                                    overflow_free,
                                 },
                             );
                         }
@@ -790,6 +813,7 @@ impl Database {
         tname: &str,
         pages: Vec<u32>,
         roots: std::collections::BTreeMap<String, u32>,
+        overflow_free: Vec<u32>,
     ) -> Result<()> {
         let prev = self
             .tables
@@ -798,6 +822,7 @@ impl Database {
         if let Some(m) = self.tables.get_mut(tname) {
             m.pages = pages;
             m.index_roots = roots;
+            m.overflow_free = overflow_free;
         }
         if let Err(e) = self.save_catalog_into(tx) {
             if let Some((pages, index_roots)) = prev {
@@ -928,6 +953,17 @@ impl Database {
                         meta.index_roots
                             .iter()
                             .map(|(c, r)| (c.clone(), Value::Int(*r as i64)))
+                            .collect(),
+                    ),
+                );
+            }
+            if !meta.overflow_free.is_empty() {
+                m.insert(
+                    "overflow_free".into(),
+                    Value::Array(
+                        meta.overflow_free
+                            .iter()
+                            .map(|p| Value::Int(*p as i64))
                             .collect(),
                     ),
                 );
@@ -2056,7 +2092,10 @@ impl Database {
         meta: &mut TableMeta,
         docs: Vec<Object>,
     ) -> Result<()> {
-        let mut heap = Heap { pages: Vec::new() };
+        let mut heap = Heap {
+            pages: Vec::new(),
+            overflow_free: meta.overflow_free.clone(),
+        };
         let cols: Vec<String> = meta.index_roots.keys().cloned().collect();
         let mut tx = self.pager.begin_tx();
         let mut pairs: Vec<(u64, Object)> = Vec::with_capacity(docs.len());
@@ -2107,9 +2146,7 @@ impl Database {
         let Some(meta) = self.tables.get(table) else {
             return err(format!("table {table} does not exist"));
         };
-        let heap = Heap {
-            pages: meta.pages.clone(),
-        };
+        let heap = meta.heap_of();
         let mut out = Vec::new();
         let rtx = self.pager.begin_tx();
         for &pid in &heap.pages {
@@ -2162,6 +2199,7 @@ impl Database {
             // a reset counter and hand out ids that collide after restart.
             let docs = Heap {
                 pages: meta.pages.clone(),
+                overflow_free: meta.overflow_free.clone(),
             }
             .scan(&mut self.pager)?;
             for d in &docs {
@@ -2194,9 +2232,7 @@ impl Database {
             return Ok(None);
         };
         let root = meta.index_roots[&col];
-        let heap = Heap {
-            pages: meta.pages.clone(),
-        };
+        let heap = meta.heap_of();
         let tx = self.pager.begin_tx(); // read-only use; aborted immediately
         let tree = BTree::open(root);
         let pairs = match plan {
@@ -2278,9 +2314,7 @@ impl Database {
         let Some(meta) = self.tables.get(table) else {
             return err(format!("table {table} does not exist"));
         };
-        let heap = Heap {
-            pages: meta.pages.clone(),
-        };
+        let heap = meta.heap_of();
         heap.scan(&mut self.pager).map_err(Into::into)
     }
 
@@ -2497,6 +2531,7 @@ impl Database {
         };
         let mut heap = Heap {
             pages: meta.pages.clone(),
+            overflow_free: meta.overflow_free.clone(),
         };
         let mut roots = meta.index_roots.clone();
         let idx_cols: Vec<String> = roots.keys().cloned().collect();
@@ -2587,8 +2622,17 @@ impl Database {
                 return Err(e);
             }
         }
-        if heap.pages != meta.pages || roots != meta.index_roots {
-            self.sync_table_layout(&mut tx, &tname, heap.pages.clone(), roots)?;
+        if heap.pages != meta.pages
+            || roots != meta.index_roots
+            || heap.overflow_free != meta.overflow_free
+        {
+            self.sync_table_layout(
+                &mut tx,
+                &tname,
+                heap.pages.clone(),
+                roots,
+                heap.overflow_free.clone(),
+            )?;
         }
         self.commit_pager_tx(tx)?;
         // Explicit ids may bump the AUTOINCREMENT watermark.
@@ -2713,6 +2757,7 @@ impl Database {
         self.check_fk_parent_delete(&tname, &removed_docs, &[])?;
         let mut heap = Heap {
             pages: meta.pages.clone(),
+            overflow_free: meta.overflow_free.clone(),
         };
         let mut roots = meta.index_roots.clone();
         let idx_cols: Vec<String> = roots.keys().cloned().collect();
@@ -2750,8 +2795,17 @@ impl Database {
                 *new_l,
             )?;
         }
-        if heap.pages != meta.pages || roots != meta.index_roots {
-            self.sync_table_layout(&mut tx, &tname, heap.pages.clone(), roots)?;
+        if heap.pages != meta.pages
+            || roots != meta.index_roots
+            || heap.overflow_free != meta.overflow_free
+        {
+            self.sync_table_layout(
+                &mut tx,
+                &tname,
+                heap.pages.clone(),
+                roots,
+                heap.overflow_free.clone(),
+            )?;
         }
         self.commit_pager_tx(tx)?;
         // Deleted rows may have held the AUTOINCREMENT watermark.
@@ -3714,6 +3768,7 @@ impl Database {
         // statement is either fully applied or not at all, and commits once.
         let mut heap = Heap {
             pages: meta.pages.clone(),
+            overflow_free: meta.overflow_free.clone(),
         };
         let mut roots = meta.index_roots.clone();
         let mut tx = self.pager.begin_tx();
@@ -3864,6 +3919,7 @@ impl Database {
             // A failed scan must abort, not silently skip the unique check.
             let mut combined = match (Heap {
                 pages: meta.pages.clone(),
+                overflow_free: meta.overflow_free.clone(),
             }
             .scan(&mut self.pager))
             {
@@ -3880,8 +3936,17 @@ impl Database {
             }
         }
         let count = placed.len() as u64;
-        if heap.pages != meta.pages || roots != meta.index_roots {
-            self.sync_table_layout(&mut tx, &table, heap.pages.clone(), roots)?;
+        if heap.pages != meta.pages
+            || roots != meta.index_roots
+            || heap.overflow_free != meta.overflow_free
+        {
+            self.sync_table_layout(
+                &mut tx,
+                &table,
+                heap.pages.clone(),
+                roots,
+                heap.overflow_free.clone(),
+            )?;
         }
         self.commit_pager_tx(tx)?;
         // AUTOINCREMENT counter: never regress, follow explicit max.
@@ -12669,6 +12734,73 @@ mod complex_query_tests {
             fresh
                 .execute("SELECT v FROM t WHERE a = 2 AND b2 = 'x'")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn oversized_document_sql_roundtrip_and_update() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE big (id INT PRIMARY KEY, blob TEXT)")
+            .unwrap();
+        // 9 KB document — over the legacy 4 KB page cap, stored via an
+        // overflow chain.
+        let payload = "z".repeat(9_000);
+        db.execute(&format!("INSERT INTO big VALUES (1, '{payload}')"))
+            .unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT LENGTH(blob) FROM big WHERE id = 1").rows,
+            vec![vec![Value::Int(9_000)]]
+        );
+        // End-to-end content check: characters survive the chain.
+        assert_eq!(
+            rows(&mut db, "SELECT SUBSTR(blob, 1, 3) FROM big WHERE id = 1").rows,
+            vec![vec![Value::Str("zzz".into())]]
+        );
+        // Shrinking an oversized document recycles its chain pages without
+        // breaking later reads.
+        db.execute("UPDATE big SET blob = 'small' WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT blob FROM big WHERE id = 1").rows,
+            vec![vec![Value::Str("small".into())]]
+        );
+        // Growing again assembles a fresh overflow chain.
+        let payload2 = "w".repeat(12_000);
+        db.execute(&format!("UPDATE big SET blob = '{payload2}' WHERE id = 1"))
+            .unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT LENGTH(blob) FROM big WHERE id = 1").rows,
+            vec![vec![Value::Int(12_000)]]
+        );
+        // The oversized document participates in dumps like any other row
+        // (the dump carries its full text).
+        let dump = db.dump_script().unwrap();
+        assert!(dump.contains(&payload2), "dump lost the oversized document");
+    }
+
+    #[test]
+    fn oversized_document_survives_index_maintenance() {
+        // An oversized document on a table with indexes: locator semantics
+        // (index entries point at the main-page slot) must hold through
+        // updates that rewrite the overflow chain.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, tag TEXT, blob TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX ix_tag ON t (tag)").unwrap();
+        let payload = "z".repeat(9_000);
+        db.execute(&format!("INSERT INTO t VALUES (1, 'k', '{payload}')"))
+            .unwrap();
+        // Probe via the single-column index, read the oversized column.
+        assert_eq!(
+            rows(&mut db, "SELECT LENGTH(blob) FROM t WHERE tag = 'k'").rows,
+            vec![vec![Value::Int(9_000)]]
+        );
+        // Update shrinks it; the index entry for tag='k' stays valid.
+        db.execute("UPDATE t SET blob = 'small' WHERE tag = 'k'")
+            .unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT tag, blob FROM t WHERE tag = 'k'").rows,
+            vec![vec![Value::Str("k".into()), Value::Str("small".into())]]
         );
     }
 }

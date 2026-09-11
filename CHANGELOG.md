@@ -33,6 +33,11 @@
   记录全列清单(向后兼容旧卷三元格式,无需 MAGIC 升版);`schema_hash`/摘要纳入全列,
   跨节点收敛一致;dump/sqlite_master/`/api/meta` 带全列;设计说明见
   `docs/design/001-composite-indexes.md`;
+- **文档 >4KB 溢出页链**:旧单页 4KB 文档上限解除——超页文档主页槽存溢出头+内联
+  前缀(`0xFF` 标记),其余沿 `0xFE` 溢出链页存储(encode/B+ 树/复制位点零改动);
+  硬上限 16MiB(对齐主流文档库默认;超限显式报错);删除/替换回收链页进表内
+  free 清单(catalog 持久化)并优先复用;旧卷字节级兼容(旧槽首字节必非 `0xFF`);
+  设计说明见 `docs/design/002-overflow-page-chains.md`;
 - **CLI**:`-f/--file <script.sql>` 脚本批执行(快速失败,容忍缺失末尾分号)、
   `--csv`(RFC 4180)/`--json` 行导出、`help;` 内联命令(嵌入式与远程模式通用);
 - **优雅停机**:server/web 处理 SIGTERM/SIGINT——停止接受新连接,存量连接限时(10s)排空,

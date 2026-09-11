@@ -7,13 +7,37 @@
 //! Documents are appended to the last non-full page; new pages come from the
 //! pager. Deletion compacts in place within a page (M4); updates rewrite the
 //! doc if it still fits.
+//!
+//! Overflow (documents larger than one page): the main-page slot stores
+//! `[0xFF][total:u32][chain_head:u32]` plus as much of the encoded document
+//! as the page can hold; the rest lives on a chain of `0xFE` pages
+//! (`0xFE | next:u32 | len:u16 | payload`). `0xFE`/`0xFF` are bytes the
+//! value encoder never emits (tags 0..=7), so readers disambiguate on the
+//! first byte with zero ambiguity and legacy documents keep their exact
+//! bytes. Recycled chain pages are parked in the table's `overflow_free`
+//! list (persisted in the catalog) and reused by the next oversized insert.
+//! Design: docs/design/002-overflow-page-chains.md.
 
 use crate::encode;
 use crate::pager::{Pager, PagerError, Tx, PAGE_SIZE};
 use crate::value::{Object, Value};
+use std::collections::HashSet;
 
 const SLOT_SIZE: usize = 4;
 const HEADER_FIXED: usize = 2;
+
+/// Overflow slot marker: encode tags are 0..=7, so a payload can never
+/// start with this byte.
+const OVERFLOW_MARK: u8 = 0xFF;
+/// Overflow chain-page marker.
+const CHAIN_MARK: u8 = 0xFE;
+/// Overflow slot header: mark + total:u32 + chain_head:u32.
+const OVERFLOW_SLOT_HEADER: usize = 9;
+/// Chain page header: mark + next:u32 + len:u16.
+const CHAIN_HEADER: usize = 7;
+/// Hard document size cap (per-heap defense against hostile oversized
+/// documents; aligned with mainstream document-store defaults).
+pub const MAX_DOC_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeapError {
@@ -132,18 +156,89 @@ fn repack(page: &mut [u8]) -> Vec<(usize, usize)> {
     moves
 }
 
-/// Read the page image to mutate (staged version if this tx already wrote
-/// it). Always borrowed — mutating callers copy via `into_owned()` when they
-/// re-pack the page, so no copy is made on the read itself.
-fn staged_or_file_page<'a>(
-    pager: &'a mut Pager,
-    tx: &'a Tx,
-    id: u32,
-) -> Result<std::borrow::Cow<'a, [u8]>> {
-    Ok(match tx.staged_page(id) {
-        Some(p) => std::borrow::Cow::Borrowed(p),
-        None => std::borrow::Cow::Borrowed(pager.read_page(id)?),
-    })
+/// Read a page image (staged version if this tx wrote it), owned copy —
+/// overflow slots need `&mut Pager` while assembling the chain, so borrowed
+/// page reads would alias. `tx = None` reads the committed image.
+fn load_page_owned(pager: &mut Pager, tx: Option<&Tx>, id: u32) -> Result<Vec<u8>> {
+    if let Some(tx) = tx {
+        if let Some(p) = tx.staged_page(id) {
+            return Ok(p.to_vec());
+        }
+    }
+    Ok(pager.read_page(id)?.to_vec())
+}
+
+/// Assemble one slot's document bytes: a plain slot's content is the
+/// encoded document itself; an overflow slot (`0xFF` first byte) carries
+/// `[mark][total:u32][chain_head:u32][inline prefix]` and the rest is
+/// assembled along the chain page list.
+fn slot_document_bytes(
+    pager: &mut Pager,
+    tx: Option<&Tx>,
+    page_id: u32,
+    page: &[u8],
+    off: usize,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let content = &page[off..off + len];
+    if content.first() != Some(&OVERFLOW_MARK) {
+        return Ok(content.to_vec());
+    }
+    if content.len() < OVERFLOW_SLOT_HEADER {
+        return Err(HeapError::Page(page_id, "overflow slot truncated"));
+    }
+    let total = u32::from_le_bytes(content[1..5].try_into().expect("4 bytes")) as usize;
+    let mut next = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
+    let mut out = content[OVERFLOW_SLOT_HEADER..].to_vec();
+    let min_chunk = PAGE_SIZE - CHAIN_HEADER;
+    let mut hops = 0usize;
+    let mut seen = HashSet::new();
+    while next != 0 {
+        // Cycle defense: a corrupt next pointer must fail loudly, not loop.
+        if !seen.insert(next) || hops > total / min_chunk + 2 {
+            return Err(HeapError::Page(page_id, "overflow chain corrupt"));
+        }
+        hops += 1;
+        let chain_page = load_page_owned(pager, tx, next)?;
+        if chain_page.first() != Some(&CHAIN_MARK) {
+            return Err(HeapError::Page(next, "overflow chain corrupt (bad marker)"));
+        }
+        let nxt = u32::from_le_bytes(chain_page[1..5].try_into().expect("4 bytes"));
+        let l = u16::from_le_bytes(chain_page[5..7].try_into().expect("2 bytes")) as usize;
+        if CHAIN_HEADER + l > chain_page.len() || out.len() + l > total {
+            return Err(HeapError::Page(next, "overflow chain corrupt (bad length)"));
+        }
+        out.extend_from_slice(&chain_page[CHAIN_HEADER..CHAIN_HEADER + l]);
+        next = nxt;
+    }
+    if out.len() != total {
+        return Err(HeapError::Page(
+            page_id,
+            "overflow chain corrupt (short read)",
+        ));
+    }
+    Ok(out)
+}
+
+/// Walk an overflow chain, zero every page and park the page ids in the
+/// table's free list (used by remove/replace of overflow documents).
+fn recycle_chain(pager: &mut Pager, tx: &mut Tx, head: u32, free: &mut Vec<u32>) -> Result<()> {
+    let mut next = head;
+    let mut seen = HashSet::new();
+    while next != 0 {
+        if !seen.insert(next) {
+            return Err(HeapError::Page(next, "overflow chain corrupt (cycle)"));
+        }
+        let page = load_page_owned(pager, Some(tx), next)?;
+        if page.first() != Some(&CHAIN_MARK) {
+            return Err(HeapError::Page(next, "overflow chain corrupt (bad marker)"));
+        }
+        let nxt = u32::from_le_bytes(page[1..5].try_into().expect("4 bytes"));
+        pager.write_page(tx, next, 0, &vec![0u8; PAGE_SIZE])?;
+        free.push(next);
+        next = nxt;
+    }
+    Ok(())
 }
 
 /// A document slot location: (page_id, slot_index).
@@ -157,6 +252,10 @@ pub struct DocId {
 pub struct Heap {
     /// Pages belonging to this table, in insertion order.
     pub pages: Vec<u32>,
+    /// Recycled overflow-chain pages (zeroed on release), reused by the next
+    /// oversized insert before fresh pager pages are allocated. Persisted in
+    /// the table's catalog entry (`overflow_free`).
+    pub overflow_free: Vec<u32>,
 }
 
 /// Where a replaced document ended up, plus slot moves its page-mates
@@ -179,14 +278,15 @@ impl Heap {
     pub fn scan(&self, pager: &mut Pager) -> Result<Vec<Object>> {
         let mut out = Vec::new();
         for &pid in &self.pages {
-            let page = pager.read_page(pid)?;
-            validate_page(page, pid)?;
-            for i in 0..count_of(page) {
-                let (off, len) = slot(page, i);
+            let page = pager.read_page(pid)?.to_vec();
+            validate_page(&page, pid)?;
+            for i in 0..count_of(&page) {
+                let (off, len) = slot(&page, i);
                 if len == 0 {
                     continue; // tombstone
                 }
-                let (v, _) = encode::decode_prefix(&page[off..off + len])?;
+                let bytes = slot_document_bytes(pager, None, pid, &page, off, len)?;
+                let (v, _) = encode::decode_prefix(&bytes)?;
                 if let Value::Object(o) = v {
                     out.push(o);
                 }
@@ -199,7 +299,7 @@ impl Heap {
     /// pages of an open transaction are preferred, so consecutive
     /// mutations within one statement see each other.
     pub fn page_docs(&self, pager: &mut Pager, tx: &Tx, page: u32) -> Result<Vec<(u64, Object)>> {
-        let buf = staged_or_file_page(pager, tx, page)?;
+        let buf = load_page_owned(pager, Some(tx), page)?;
         validate_page(&buf, page)?;
         let mut out = Vec::new();
         for i in 0..count_of(&buf) {
@@ -207,7 +307,8 @@ impl Heap {
             if len == 0 {
                 continue;
             }
-            let (v, _) = encode::decode_prefix(&buf[off..off + len])?;
+            let bytes = slot_document_bytes(pager, Some(tx), page, &buf, off, len)?;
+            let (v, _) = encode::decode_prefix(&bytes)?;
             if let Value::Object(o) = v {
                 out.push((pack_loc(page, i), o));
             }
@@ -218,16 +319,17 @@ impl Heap {
     /// One document by locator; None for a tombstone/empty slot.
     pub fn doc_at(&self, pager: &mut Pager, loc: u64) -> Result<Option<Object>> {
         let (page, slot_i) = unpack_loc(loc);
-        let buf = pager.read_page(page)?;
-        validate_page(buf, page)?;
-        if slot_i >= count_of(buf) {
+        let buf = pager.read_page(page)?.to_vec();
+        validate_page(&buf, page)?;
+        if slot_i >= count_of(&buf) {
             return Err(HeapError::Page(page, "slot out of range"));
         }
-        let (off, len) = slot(buf, slot_i);
+        let (off, len) = slot(&buf, slot_i);
         if len == 0 {
             return Ok(None);
         }
-        let (v, _) = encode::decode_prefix(&buf[off..off + len])?;
+        let bytes = slot_document_bytes(pager, None, page, &buf, off, len)?;
+        let (v, _) = encode::decode_prefix(&bytes)?;
         Ok(Some(match v {
             Value::Object(o) => o,
             other => Object::from([("_doc".into(), other)]),
@@ -235,20 +337,21 @@ impl Heap {
     }
 
     /// Append a document; extends the heap with a new page when needed.
-    /// Returns the new document's locator.
+    /// Documents larger than one page are laid out overflow-style (see the
+    /// module docs). Returns the new document's locator.
     pub fn insert(&mut self, pager: &mut Pager, tx: &mut Tx, doc: &Object) -> Result<u64> {
         let bytes = encode::encode_to_vec(&Value::Object(doc.clone()))?;
+        if bytes.len() > MAX_DOC_SIZE {
+            return Err(HeapError::DocTooLarge(bytes.len(), MAX_DOC_SIZE));
+        }
         if bytes.len() + SLOT_SIZE > PAGE_SIZE - HEADER_FIXED {
-            return Err(HeapError::DocTooLarge(
-                bytes.len(),
-                PAGE_SIZE - HEADER_FIXED - SLOT_SIZE,
-            ));
+            return self.insert_overflow(pager, tx, &bytes);
         }
         // Try the last page first (prefer this tx's staged image — the
         // page may not be on disk yet).
         let mut placed = None;
         if let Some(&last) = self.pages.last() {
-            let mut page = staged_or_file_page(pager, tx, last)?.into_owned();
+            let mut page = load_page_owned(pager, Some(tx), last)?;
             validate_page(&page, last)?;
             if free_space(&page) >= bytes.len() + SLOT_SIZE {
                 let off = content_start(&page) - bytes.len();
@@ -271,6 +374,76 @@ impl Heap {
         Ok(placed.unwrap())
     }
 
+    /// Overflow layout insert (document encoding exceeds one page). The
+    /// main-page slot carries the header + inline prefix; the rest goes to a
+    /// chain of `0xFE` pages taken from the free list first, fresh pager
+    /// pages only for the remainder.
+    fn insert_overflow(&mut self, pager: &mut Pager, tx: &mut Tx, bytes: &[u8]) -> Result<u64> {
+        // Main page: the last page when it can host the slot, else a fresh
+        // page (fresh pages give maximum inline capacity).
+        let use_last = match self.pages.last() {
+            Some(&last) => {
+                let page = load_page_owned(pager, Some(tx), last)?;
+                validate_page(&page, last)?;
+                free_space(&page) >= SLOT_SIZE + OVERFLOW_SLOT_HEADER
+            }
+            None => false,
+        };
+        let max_inline = if use_last {
+            let page = load_page_owned(pager, Some(tx), *self.pages.last().unwrap())?;
+            free_space(&page).saturating_sub(SLOT_SIZE + OVERFLOW_SLOT_HEADER)
+        } else {
+            PAGE_SIZE - HEADER_FIXED - SLOT_SIZE - OVERFLOW_SLOT_HEADER
+        };
+        let inline_len = max_inline.min(bytes.len());
+
+        // Chain pages: free list first, fresh allocation for the remainder.
+        let rest = &bytes[inline_len..];
+        let chunk_count = rest.chunks(PAGE_SIZE - CHAIN_HEADER).count();
+        let mut chain = Vec::with_capacity(chunk_count);
+        while chain.len() < chunk_count {
+            match self.overflow_free.pop() {
+                Some(pid) => chain.push(pid),
+                None => chain.push(pager.allocate_page(tx)?),
+            }
+        }
+        for (i, chunk) in rest.chunks(PAGE_SIZE - CHAIN_HEADER).enumerate() {
+            let pid = chain[i];
+            let next = chain.get(i + 1).copied().unwrap_or(0);
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[0] = CHAIN_MARK;
+            page[1..5].copy_from_slice(&next.to_le_bytes());
+            page[5..7].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+            page[7..7 + chunk.len()].copy_from_slice(chunk);
+            pager.write_page(tx, pid, 0, &page)?;
+        }
+
+        // Main-page slot: header + inline prefix.
+        let mut content = Vec::with_capacity(OVERFLOW_SLOT_HEADER + inline_len);
+        content.push(OVERFLOW_MARK);
+        content.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        content.extend_from_slice(&chain.first().copied().unwrap_or(0).to_le_bytes());
+        content.extend_from_slice(&bytes[..inline_len]);
+
+        if !use_last {
+            let pid = pager.allocate_page(tx)?;
+            let mut page = vec![0u8; PAGE_SIZE];
+            let off = PAGE_SIZE - content.len();
+            page[off..off + content.len()].copy_from_slice(&content);
+            push_slot(&mut page, off, content.len());
+            pager.write_page(tx, pid, 0, &page)?;
+            self.pages.push(pid);
+            return Ok(pack_loc(pid, 0));
+        }
+        let last = *self.pages.last().unwrap();
+        let mut page = load_page_owned(pager, Some(tx), last)?;
+        let off = content_start(&page) - content.len();
+        page[off..off + content.len()].copy_from_slice(&content);
+        push_slot(&mut page, off, content.len());
+        pager.write_page(tx, last, 0, &page)?;
+        Ok(pack_loc(last, count_of(&page) - 1))
+    }
+
     /// Replace one document in place: the old slot is dropped, the page is
     /// re-packed, and the new bytes go back into the same page when they fit
     /// (the common KV-overwrite case recycles the page). Otherwise the old
@@ -283,22 +456,28 @@ impl Heap {
         doc: &Object,
     ) -> Result<ReplaceOutcome> {
         let bytes = encode::encode_to_vec(&Value::Object(doc.clone()))?;
-        if bytes.len() + SLOT_SIZE > PAGE_SIZE - HEADER_FIXED {
-            return Err(HeapError::DocTooLarge(
-                bytes.len(),
-                PAGE_SIZE - HEADER_FIXED - SLOT_SIZE,
-            ));
+        if bytes.len() > MAX_DOC_SIZE {
+            return Err(HeapError::DocTooLarge(bytes.len(), MAX_DOC_SIZE));
         }
         let (page_id, slot_i) = unpack_loc(loc);
-        let mut page = staged_or_file_page(pager, tx, page_id)?.into_owned();
+        let mut page = load_page_owned(pager, Some(tx), page_id)?;
         validate_page(&page, page_id)?;
         let n = count_of(&page);
         if slot_i >= n {
             return Err(HeapError::Page(page_id, "slot out of range"));
         }
-        let (_, len) = slot(&page, slot_i);
+        let (off, len) = slot(&page, slot_i);
         if len == 0 {
             return Err(HeapError::Page(page_id, "replace of a dead slot"));
+        }
+        // If the old document was overflow-layout, recycle its chain pages
+        // into the free list BEFORE any new layout lands (the new image may
+        // be plain, overflow, or fail to fit and be re-appended — in every
+        // case the old chain is gone).
+        if page[off] == OVERFLOW_MARK {
+            let content = &page[off..off + len];
+            let head = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
+            recycle_chain(pager, tx, head, &mut self.overflow_free)?;
         }
         // Rebuild the page with the new document at the replaced document's
         // position — slot order (== row order) is preserved.
@@ -375,16 +554,23 @@ impl Heap {
         for (page_id, mut slots) in by_page {
             slots.sort_unstable();
             slots.dedup();
-            let mut page = staged_or_file_page(pager, tx, page_id)?.into_owned();
+            let mut page = load_page_owned(pager, Some(tx), page_id)?;
             validate_page(&page, page_id)?;
             let n = count_of(&page);
             for &s in &slots {
                 if s >= n {
                     return Err(HeapError::Page(page_id, "slot out of range"));
                 }
-                let (_, len) = slot(&page, s);
+                let (off, len) = slot(&page, s);
                 if len == 0 {
                     continue; // already dead
+                }
+                // Overflow document: recycle its chain pages before the slot
+                // dies (they are unreachable afterwards).
+                if page[off] == OVERFLOW_MARK {
+                    let content = &page[off..off + len];
+                    let head = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
+                    recycle_chain(pager, tx, head, &mut self.overflow_free)?;
                 }
                 tombstone(&mut page, s);
             }
@@ -465,9 +651,92 @@ mod tests {
     fn oversize_doc_rejected() {
         let (_d, mut pager) = db("heap3.db");
         let mut heap = Heap::default();
-        let big = Object::from([("blob".into(), Value::Str("x".repeat(9000)))]);
+        // 16 MiB cap: a document above MAX_DOC_SIZE is rejected up front…
+        let big = Object::from([("blob".into(), Value::Str("x".repeat(17 * 1024 * 1024)))]);
         let mut tx = pager.begin_tx();
-        assert!(heap.insert(&mut pager, &mut tx, &big).is_err());
+        let e = heap.insert(&mut pager, &mut tx, &big).unwrap_err();
+        assert!(matches!(e, HeapError::DocTooLarge(..)), "{e:?}");
+        pager.commit_tx(tx).unwrap();
+        // …while anything below it now fits via overflow chains.
+        let ok = Object::from([("blob".into(), Value::Str("x".repeat(9000)))]);
+        let mut tx = pager.begin_tx();
+        let loc = heap.insert(&mut pager, &mut tx, &ok).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let back = heap.doc_at(&mut pager, loc).unwrap().unwrap();
+        assert_eq!(back.get("blob").unwrap(), &Value::Str("x".repeat(9000)));
+    }
+
+    #[test]
+    fn overflow_documents_roundtrip_across_chains() {
+        let (_d, mut pager) = db("heap_of.db");
+        let mut heap = Heap::default();
+        // ~9 KB: two chain pages; ~20 KB: three.
+        let specs = [(1i64, 9_000usize), (2, 20_000), (3, 300)];
+        for (id, size) in specs {
+            let doc = Object::from([
+                ("_id".into(), Value::Int(id)),
+                ("blob".into(), Value::Str("y".repeat(size))),
+            ]);
+            let mut tx = pager.begin_tx();
+            heap.insert(&mut pager, &mut tx, &doc).unwrap();
+            pager.commit_tx(tx).unwrap();
+        }
+        let docs = heap.scan(&mut pager).unwrap();
+        assert_eq!(docs.len(), specs.len());
+        for ((id, size), d) in specs.iter().zip(&docs) {
+            assert_eq!(d.get("_id"), Some(&Value::Int(*id)));
+            assert_eq!(
+                d.get("blob").unwrap(),
+                &Value::Str("y".repeat(*size)),
+                "doc {id} content corrupted"
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_chain_pages_are_recycled_and_reused() {
+        let (_d, mut pager) = db("heap_rec.db");
+        let mut heap = Heap::default();
+        let big = Object::from([("blob".into(), Value::Str("y".repeat(20_000)))]);
+        let mut tx = pager.begin_tx();
+        let loc = heap.insert(&mut pager, &mut tx, &big).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let pages_after_big = pager.num_pages();
+
+        // Replace with a small document: the chain pages are recycled into
+        // the table's free list instead of leaking.
+        let mut tx = pager.begin_tx();
+        let small = Object::from([("blob".into(), Value::Str("tiny".to_string()))]);
+        heap.replace(&mut pager, &mut tx, loc, &small).unwrap();
+        pager.commit_tx(tx).unwrap();
+        assert!(
+            !heap.overflow_free.is_empty(),
+            "chain pages must be recycled"
+        );
+        assert_eq!(
+            pager.num_pages(),
+            pages_after_big,
+            "recycling must not allocate"
+        );
+
+        // The next oversized insert reuses the recycled pages: still no
+        // fresh allocation, and the content round-trips.
+        let mut tx = pager.begin_tx();
+        let big2 = Object::from([("blob".into(), Value::Str("y".repeat(20_000)))]);
+        heap.insert(&mut pager, &mut tx, &big2).unwrap();
+        pager.commit_tx(tx).unwrap();
+        assert_eq!(
+            pager.num_pages(),
+            pages_after_big,
+            "reuse must not allocate"
+        );
+        assert!(heap.overflow_free.is_empty(), "free list drained");
+        let docs = heap.scan(&mut pager).unwrap();
+        // The small replacement row and the new oversized row both live.
+        assert_eq!(docs.len(), 2);
+        assert!(docs
+            .iter()
+            .any(|d| d.get("blob") == Some(&Value::Str("y".repeat(20_000)))));
     }
 
     #[test]
@@ -561,9 +830,10 @@ mod tests {
     fn doc_too_large_and_bad_slot_paths() {
         let (_d, mut pager) = db("heap_big.db");
         let mut heap = Heap::default();
-        let big = "z".repeat(PAGE_SIZE * 2);
+        // MAX_DOC_SIZE (16 MiB) is the loud rejection floor; 2-page documents
+        // now fit via overflow chains instead.
+        let big = "z".repeat(17 * 1024 * 1024);
         let mut tx = pager.begin_tx();
-        // 超过单页容量的文档拒绝写入
         let e = heap.insert(&mut pager, &mut tx, &doc(1, &big)).unwrap_err();
         assert!(matches!(e, HeapError::DocTooLarge(..)), "{e:?}");
         pager.commit_tx(tx).unwrap();

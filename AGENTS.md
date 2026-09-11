@@ -74,6 +74,8 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 19. **PK ≠ NOT NULL** — 主键当前不隐含 NOT NULL(与主流不同);动约束逻辑需全量回归约束测试。
 20. **deploy 钉子与本机环境** — `deploy/multinode-test.sh` 断言固定 REST/协议字段,改协议/REST 先同步该脚本与 dotnet 客户端;分区重连必须 `docker network connect --alias node-c <net> docsql-c`(裸 connect 丢别名,DNS/healthcheck/扇出静默失效,restart 不恢复),节点侧查询走 127.0.0.1;`DOCSQL_DEV_IMAGE_TAG`(dev)与 `DOCSQL_IMAGE_TAG`(prod)刻意分开,`.env` 的 prod tag 不会泄漏到 dev;本机到 github.com:443 间歇阻断,推送失败用 `git -c http.version=HTTP/1.1 push` 重试;Docker 构建基于 mcr.microsoft.com/azurelinux(docker.io 不可达);dotnet 的 bin/obj 不入库,新项目沿用;镜像运行层必须预建全部 compose 挂载点并 `chown 1000:1000`(/data、/auth——全新命名卷的属主继承自镜像内同名目录,镜像缺该目录则挂载点归 root,uid 1000 进程写入即 os error 13,console 凭据写入曾栽在此)。
 
+21. **堆溢出链(>4KB 文档)** — 超页文档主页槽存 `[0xFF][total:u32][chain_head:u32][内联前缀]`,其余沿 `0xFE` 链页(`next:u32`+`len:u16`+载荷);`0xFE/0xFF` 是 encode 永不产生的字节,读取端按槽首字节判别,**旧卷字节级兼容**;链页回收进 `TableMeta.overflow_free`(catalog 持久化)优先复用;硬上限 `MAX_DOC_SIZE`=16MiB。改 heap 相关代码:一切读槽走 `slot_document_bytes`(防环/截断校验),新存储布局禁止使用 encode tag 0..=7 的首字节。设计见 `docs/design/002-overflow-page-chains.md`。
+
 ## 工作流约定
 
 - **修改完成后自动提交并推送源码,无需用户再下指令**:过完提交门禁与相关专项测试即 `git add` 本次改动 → `commit` → `push`(push 即触发 CI);只暂存本次改动涉及的文件,不要把工作区里其它在途修改一并提交。

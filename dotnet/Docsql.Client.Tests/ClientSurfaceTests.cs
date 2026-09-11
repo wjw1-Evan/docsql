@@ -219,12 +219,15 @@ public sealed class ClientSurfaceTests : IClassFixture<ServerFixture>
         cmd.CommandText = "SELECT doc FROM csurf_big WHERE id = 1";
         Assert.Equal(payload, cmd.ExecuteScalar());
 
-        // 超过单文档 ~4KB 上限:显式报错而不是静默截断
-        var tooBig = new string('y', 5000);
+        // 超过旧 4KB 单页上限的文档走溢出页链存储:无损往返而非报错
+        // (上限为 16MB,超过才显式报错而不是静默截断)
+        var bigOverflow = new string('y', 5000);
         cmd.CommandText = "INSERT INTO csurf_big (id, doc) VALUES (2, @doc)";
-        ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("doc", tooBig);
-        var ex = Assert.Throws<DocsqlException>(() => cmd.ExecuteNonQuery());
-        Assert.Contains("too large", ex.Message);
+        ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("doc", bigOverflow);
+        Assert.Equal(1, cmd.ExecuteNonQuery());
+        cmd.Parameters.Clear();
+        cmd.CommandText = "SELECT doc FROM csurf_big WHERE id = 2";
+        Assert.Equal(bigOverflow, cmd.ExecuteScalar());
     }
 
     [Fact]
