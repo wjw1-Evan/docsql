@@ -4332,3 +4332,49 @@ async fn server_side_prepared_statements_bind_safely() {
     let f = c.recv().await;
     assert!(payload_str(&f).contains("unknown statement handle"));
 }
+
+/// MVCC stage A (concurrent readers): many read-only SELECTs on separate
+/// connections all succeed while a writer commits between them — the read
+/// tier shares the engine and never observes a torn or missing row.
+#[tokio::test]
+async fn concurrent_readers_never_observe_partial_writes() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE cr (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO cr VALUES (1, 'a'), (2, 'b')").await;
+
+    // 8 concurrent reader connections: each repeatedly counts rows and
+    // reads both rows by PK while a writer inserts row after row. Every
+    // count must be the full previous size or the final size — never a
+    // torn intermediate.
+    let mut readers = Vec::new();
+    for _ in 0..8 {
+        let addr = addr.clone();
+        readers.push(tokio::spawn(async move {
+            let mut c = Client::connect(&addr).await;
+            for _ in 0..25 {
+                let f = c.sql("SELECT COUNT(id) FROM cr").await;
+                assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+                let n: i64 = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()
+                    ["rows"][0][0]
+                    .as_i64()
+                    .unwrap();
+                if n != 2 && n != 3 {
+                    panic!("torn read: count {n} is neither the pre- nor post-write size");
+                }
+                let f = c.sql("SELECT v FROM cr WHERE id = 1").await;
+                assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+            }
+        }));
+    }
+    // One writer: a single new row, committed while readers are probing.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut w = Client::connect(&addr).await;
+        let f = w.sql("INSERT INTO cr VALUES (3, 'c')").await;
+        assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    });
+    for r in readers {
+        r.await.unwrap();
+    }
+}

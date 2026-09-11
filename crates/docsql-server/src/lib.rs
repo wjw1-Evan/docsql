@@ -50,7 +50,13 @@ pub fn err_payload(msg: &str) -> Vec<u8> {
 }
 
 pub struct ServerState {
-    pub db: Mutex<Database>,
+    /// MVCC stage A: RwLock tiers the single-writer engine — write
+    /// statements take the write lock (exclusive, unchanged semantics);
+    /// plain SELECTs take the read lock and run concurrently. All other
+    /// engine invariants (single writer, tx_owner, write_order) are
+    /// unchanged: the read tier only ever executes classified read-only
+    /// SELECTs.
+    pub db: std::sync::RwLock<Database>,
     /// Process-lifetime runtime counters, embedded into REQ_STATUS and
     /// formatted into Prometheus text by the web console's /metrics.
     pub metrics: std::sync::Arc<metrics::Metrics>,
@@ -386,7 +392,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     // with pre-upgrade peers).
     let has_users0 = db.any_user_exists().unwrap_or(false);
     let state = Arc::new(ServerState {
-        db: Mutex::new(db),
+        db: std::sync::RwLock::new(db),
         metrics: metrics::Metrics::new(),
         auth_token: cfg.auth_token,
         read_token: cfg.read_token,
@@ -490,7 +496,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                 tick.tick().await;
                 let flushed = st
                     .db
-                    .lock()
+                    .write()
                     .unwrap_or_else(|p| p.into_inner())
                     .sync_pending();
                 if let Err(e) = flushed {
@@ -715,7 +721,7 @@ async fn user_login_frame(
         return (bad(), None);
     }
     let stored = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.user_stored_pw(&name)
     };
     let ok = tokio::task::spawn_blocking(move || match stored {
@@ -768,7 +774,7 @@ async fn user_login_frame(
         return (bad(), None);
     }
     let grants = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         docsql_core::useradmin::resolve_grants(&mut db, &name)
             .ok()
             .flatten()
@@ -1014,7 +1020,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
             {
                 let name = user.as_ref().expect("checked just above").name.clone();
                 let refreshed = {
-                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                     docsql_core::useradmin::resolve_grants(&mut db, &name)
                         .ok()
                         .flatten()
@@ -1198,7 +1204,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // on its embedded engine, so remote nodes report
                     // shape-identical /api/meta payloads. Not an SQL
                     // statement, so it bypasses the query log.
-                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                     let meta = docsql_core::meta::build_meta(
                         &mut db,
                         &state.db_path,
@@ -1268,18 +1274,67 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                             .statement_timeout
                                             .map(|t| std::time::Instant::now() + t)
                                     };
-                                    execute_sql(
-                                        &state,
-                                        &effective,
-                                        allow_system,
-                                        is_replication,
-                                        if is_replication { None } else { Some(conn_id) },
-                                        false,
-                                        None,
-                                        if is_replication { None } else { user.as_ref() },
-                                        stmt_deadline,
-                                    )
-                                    .await
+                                    // MVCC stage A: classified read-only
+                                    // SELECTs run on the read tier (multiple
+                                    // readers share the engine); everything
+                                    // else keeps the exclusive write tier.
+                                    // No open transaction may exist (a tx
+                                    // owner's reads must see its own staged
+                                    // writes, which the read tier cannot),
+                                    // and the statement must pass the SAME
+                                    // authorization the write tier applies
+                                    // (user grants / fail-closed read
+                                    // targets) — anything unauthorized or
+                                    // unclassifiable falls through to the
+                                    // original path and its error.
+                                    let tx_owner_active = state
+                                        .tx_owner
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .is_some();
+                                    let parsed_stmt =
+                                        Database::parse_classified(&effective).ok();
+                                    let authorized = match (&parsed_stmt, &user) {
+                                        (Some(p), Some(u)) => authorize_statement(
+                                            &p.stmt,
+                                            &p.tx,
+                                            p.is_write,
+                                            &u.grants,
+                                        )
+                                        .is_ok(),
+                                        (Some(_), None) => true, // token/开放连接
+                                        _ => false,
+                                    };
+                                    let read_eligible = !is_replication
+                                        && !tx_owner_active
+                                        && authorized
+                                        && parsed_stmt.as_ref().is_some_and(|p| {
+                                            !p.is_write
+                                                && p.tx == TxControl::None
+                                                && matches!(
+                                                    &p.stmt,
+                                                    AnyStmt::Sql(s) if matches!(
+                                                        &**s,
+                                                        sqlparser::ast::Statement::Query(q) if q.with.is_none()
+                                                    )
+                                                )
+                                        });
+                                    if read_eligible {
+                                        execute_read_sql(&state, &effective, stmt_deadline).await
+                                    } else {
+                                        execute_sql(
+                                            &state,
+                                            &effective,
+                                            allow_system,
+                                            is_replication,
+                                            if is_replication { None } else { Some(conn_id) },
+                                            false,
+                                            None,
+                                            if is_replication { None } else { user.as_ref() },
+                                            stmt_deadline,
+                                        )
+                                        .await
+                                    }
                                 }
                             }
                         }
@@ -1539,7 +1594,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
         if *state.tx_owner.lock().unwrap() == Some(conn_id) {
             *state.tx_owner.lock().unwrap() = None;
             {
-                let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                 if db.in_transaction() {
                     let _ = db.execute("ROLLBACK");
                 }
@@ -1687,6 +1742,41 @@ fn render_param(p: &Value) -> String {
     }
 }
 
+/// MVCC stage A read path: classified read-only SELECTs execute under the
+/// RwLock read tier — concurrent readers share the engine while writers keep
+/// the exclusive tier. Statement deadline and audit apply identically to the
+/// write path.
+async fn execute_read_sql(
+    state: &Arc<ServerState>,
+    sql: &str,
+    deadline: Option<std::time::Instant>,
+) -> Frame {
+    let db = state.db.read().unwrap_or_else(|p| p.into_inner());
+    db.set_statement_deadline(deadline);
+    let resp = match db.execute_read(sql) {
+        Ok(ExecOutcome::Rows(r)) => {
+            let mut obj = docsql_core::value::Object::new();
+            obj.insert(
+                "columns".into(),
+                Value::Array(r.columns.into_iter().map(Value::Str).collect()),
+            );
+            obj.insert(
+                "rows".into(),
+                Value::Array(r.rows.into_iter().map(Value::Array).collect()),
+            );
+            Frame::new(
+                proto::RESP_ROWS,
+                docsql_core::json::to_string(&Value::Object(obj)).into_bytes(),
+            )
+        }
+        Ok(ExecOutcome::Affected(n)) => Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec()),
+        Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
+    };
+    db.set_statement_deadline(None);
+    drop(db);
+    resp
+}
+
 /// Assemble the REQ_STATUS payload: everything a monitoring console needs to
 /// judge node health and cluster convergence in one round trip.
 pub async fn status_payload(state: &ServerState) -> serde_json::Value {
@@ -1696,7 +1786,19 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
     // (backup.rs never nests the two, keep it that way).
     let backup = serde_json::from_slice::<serde_json::Value>(&backup::backup_payload(state))
         .unwrap_or(serde_json::json!({}));
-    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    // journal_head/oldest may lazily create the cluster tables (&mut path):
+    // take them on the WRITE tier FIRST — holding the read guard while
+    // asking for the write lock would deadlock the same thread.
+    let (journal_head, journal_oldest) = {
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+        (
+            db.journal_head().unwrap_or(0),
+            db.journal_oldest().unwrap_or(0),
+        )
+    };
+    // Read tier: the census is a set of plain SELECTs — concurrent readers
+    // share the engine (MVCC stage A) instead of blocking each other.
+    let db = state.db.read().unwrap_or_else(|p| p.into_inner());
     let mut total_rows = 0u64;
     let mut user_tables = 0usize;
     for t in &db.catalog() {
@@ -1707,7 +1809,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         }
         user_tables += 1;
         // Same COUNT(*) census the web console's /api/meta performs.
-        total_rows += match db.execute(&format!(
+        total_rows += match db.execute_read(&format!(
             "SELECT COUNT(*) FROM \"{}\"",
             t.name.replace('"', "\"\"")
         )) {
@@ -1735,8 +1837,8 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "totals": {"tables": user_tables, "rows": total_rows},
         "metrics": state.metrics.snapshot_json(),
         "cluster_id": state.cluster_id,
-        "journal_head": db.journal_head().unwrap_or(0),
-        "journal_oldest": db.journal_oldest().unwrap_or(0),
+        "journal_head": journal_head,
+        "journal_oldest": journal_oldest,
         "replay_failures": state
             .replay_failures
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -1758,7 +1860,7 @@ pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: toki
     while tokio::time::Instant::now() < deadline {
         let busy = state
             .db
-            .lock()
+            .read()
             .unwrap_or_else(|p| p.into_inner())
             .in_transaction();
         if !busy {
@@ -2028,7 +2130,7 @@ async fn execute_sql_inner(
             let busy = {
                 let in_tx = state
                     .db
-                    .lock()
+                    .read()
                     .unwrap_or_else(|p| p.into_inner())
                     .in_transaction();
                 in_tx && *state.tx_owner.lock().unwrap() != conn
@@ -2055,7 +2157,7 @@ async fn execute_sql_inner(
             let order = state.write_order.lock().await;
             let busy = state
                 .db
-                .lock()
+                .read()
                 .unwrap_or_else(|p| p.into_inner())
                 .in_transaction();
             if busy {
@@ -2074,7 +2176,7 @@ async fn execute_sql_inner(
             None
         };
         let (out, in_tx, resolved, seq, sync_failed) = {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             // Arm the client-statement deadline inside the engine lock —
             // it is engine-global, so it must cover exactly this statement
             // and be cleared on every path below (the guard block does).
@@ -2159,9 +2261,11 @@ async fn execute_sql_inner(
             .grants_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if user_count_changed {
+            // any_user_exists needs &mut Database: keep this refresh on the
+            // write tier.
             let has = state
                 .db
-                .lock()
+                .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .any_user_exists()
                 .unwrap_or(false);
@@ -2542,7 +2646,7 @@ pub async fn drain_tx_pending(state: &Arc<ServerState>) {
     let has_target =
         !state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some();
     let seqs = if has_target && !writes.is_empty() {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         let mut unit = db.write_unit();
         let seqs: Vec<Option<u64>> = writes
             .iter()
@@ -2591,7 +2695,7 @@ async fn lock_engine_for_write(
         let order = state.write_order.lock().await;
         let in_tx = state
             .db
-            .lock()
+            .read()
             .unwrap_or_else(|p| p.into_inner())
             .in_transaction();
         if !in_tx {
@@ -2660,7 +2764,7 @@ async fn handle_publish(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     // Block scope so the engine guard drops before the awaits below (the
     // connection future must stay Send).
     let id = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         let id = match pubsub::store_insert(&mut db, channel, ts, payload) {
             Ok(id) => id,
             Err(e) => return Frame::new(proto::RESP_ERROR, err_payload(&e)),
@@ -2742,7 +2846,7 @@ async fn handle_subscribe(
     // committing after this point notify this subscription live with
     // id > watermark; earlier ones are covered by the replay below.
     let (watermark, history) = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         let wm = pubsub::query_max_id(&mut db);
         let hist = pubsub::query_history(&mut db, after_id.unwrap_or(wm), wm).unwrap_or_default();
         (wm, hist)
@@ -2895,7 +2999,7 @@ async fn handle_pubsub_cmd(
                 );
             };
             let deleted = {
-                let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                 match pubsub::store_trim(&mut db, channel, keep) {
                     Ok(n) => n,
                     Err(e) => return Frame::new(proto::RESP_ERROR, err_payload(&e)),
@@ -3223,11 +3327,11 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
     // here: write_order stops new local writes, the holds stopped the
     // peers, and replication applies were drained by the hold handshakes.
     let dump = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.dump_script()
     };
     let table_count = {
-        let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.catalog()
             .iter()
             .filter(|t| !docsql_core::engine::is_internal_table(&t.name))
@@ -3415,7 +3519,7 @@ async fn handle_release(state: &Arc<ServerState>, frame: &Frame) -> Frame {
 /// answering holds its writes for the O(data) hashing — a startup-time
 /// cost, same class as serving a join dump.
 async fn handle_digest(state: &Arc<ServerState>) -> Frame {
-    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
     match db.digests() {
         Ok(list) => match serde_json::to_vec(&list) {
             Ok(payload) => Frame::new(proto::RESP_DIGEST, payload),
@@ -3490,7 +3594,7 @@ async fn apply_sync(
         return JoinApply::Failed("timed out waiting for the open transaction".into());
     };
     {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         if has_user_tables(&db) {
             eprintln!("bootstrap sync aborted: local data appeared before the dump landed");
             return JoinApply::LocalData;
@@ -3591,7 +3695,7 @@ async fn finish_snapshot_adopt<'a>(
         .grants_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let has = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.any_user_exists().unwrap_or(false)
     };
     state
@@ -3667,7 +3771,7 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
         // invariant the live REQ_SQL_SEQ path keeps).
         if let Some((origin, seq)) = &q.origin {
             let covered = {
-                let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                 db.position_get(origin)
                     .ok()
                     .flatten()
@@ -3872,7 +3976,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
             continue;
         }
         let local = {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             db.digests()
         };
         let local = match local {
@@ -3934,7 +4038,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                             }
                         }
                         let fresh_local = {
-                            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                             db.digests()
                         };
                         if let Ok(fresh_local) = fresh_local {
@@ -4069,7 +4173,7 @@ pub(crate) async fn catchup_plan(
         let head = info.journal_head?;
         let oldest = info.journal_oldest?;
         let pos = {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             db.position_get(&node_id).ok().flatten()
         }?;
         if pos > head || pos + 1 < oldest {
@@ -4098,7 +4202,7 @@ pub(crate) async fn run_catchup(
             .await
             .map_err(|e| format!("pull from {}: {e}", task.addr))?;
         {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             advance_position(&mut db, &task.node_id, head);
         }
     }
@@ -4114,7 +4218,7 @@ pub(crate) async fn run_catchup(
 /// landed. Origins that could not be probed stay position-less (no
 /// incremental trust) and are covered by snapshot repair.
 fn seed_positions(state: &Arc<ServerState>, heads: &[(String, u64)]) {
-    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
     for (node_id, head) in heads {
         // Never LOWER an existing position: a blind position_set was safe
         // only by context (fresh node, or positions cleared in the same
@@ -4146,7 +4250,7 @@ async fn seed_fresh_positions(state: &Arc<ServerState>) {
         let (Some(node_id), Some(head)) = (&info.node_id, info.journal_head) else {
             continue;
         };
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         advance_position(&mut db, node_id, head);
     }
 }
@@ -4257,7 +4361,7 @@ async fn apply_repair_sync(
         return JoinApply::Failed("timed out waiting for the open transaction".into());
     };
     {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = db.execute("BEGIN") {
             return JoinApply::Failed(format!("BEGIN: {e}"));
         }
@@ -4322,7 +4426,7 @@ async fn apply_repair_sync(
 /// snapshot otherwise).
 async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
     let local = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.digests()
     };
     let Ok(local) = local else {
@@ -4510,7 +4614,7 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
     // may lag, never lead). Anything committed past the head simply waits
     // for the next pull.
     let head = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.journal_head().unwrap_or(0)
     };
     let mut after = after;
@@ -4526,7 +4630,7 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
     let mut last_served = after;
     loop {
         let batch = {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             db.journal_range(after, 512)
         };
         let batch = match batch {

@@ -781,7 +781,7 @@ mod tests {
             pager.commit_tx(tx).unwrap();
         }
         drop(pager);
-        let mut pager = Pager::open(&d.path().join("bt5.db")).unwrap();
+        let pager = Pager::open(&d.path().join("bt5.db")).unwrap();
         let tree = BTree::open(root);
         let tx = pager.begin_tx();
         assert_eq!(tree.get(&pager, &tx, &Value::Int(299)).unwrap(), Some(299));

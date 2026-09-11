@@ -43,7 +43,9 @@ pub struct Pager {
     path: PathBuf,
     wal: Wal,
     num_pages: u32,
-    next_txid: u64,
+    /// Transaction id source: atomic so `begin_tx` is callable on `&Pager`
+    /// (MVCC stage A shared readers need a read-only Tx handle).
+    next_txid: std::sync::atomic::AtomicU64,
     /// Buffer pool, behind a lock so that **read-only** callers (`&Pager`,
     /// MVCC stage A: concurrent SELECTs under the server's read lock) can
     /// fetch pages while the write path holds nothing but this short-lived
@@ -107,7 +109,7 @@ impl Pager {
             path: path.to_path_buf(),
             wal,
             num_pages,
-            next_txid: 1,
+            next_txid: std::sync::atomic::AtomicU64::new(1),
             pool: std::sync::Mutex::new(PoolState::default()),
             max_pool: DEFAULT_POOL_PAGES,
             pending_writes: std::collections::BTreeMap::new(),
@@ -286,9 +288,12 @@ impl Pager {
     }
 
     /// Begin a write transaction. Staged page writes are private until commit.
-    pub fn begin_tx(&mut self) -> Tx {
-        let txid = self.next_txid;
-        self.next_txid += 1;
+    /// Begin a write transaction. Staged page writes are private until commit.
+    pub fn begin_tx(&self) -> Tx {
+        let txid = self
+            .next_txid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         Tx {
             id: txid,
             staged: HashMap::new(),

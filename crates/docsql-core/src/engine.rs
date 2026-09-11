@@ -96,6 +96,11 @@ pub enum SqlError {
 
 pub type Result<T> = std::result::Result<T, SqlError>;
 
+/// Statement-local CTE table (`WITH name AS (SELECT …)` materialized rows),
+/// threaded through the SELECT execution chain so it can run on `&Database`
+/// (MVCC stage A concurrent readers).
+type Ctes = std::collections::BTreeMap<String, Vec<Object>>;
+
 fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(SqlError::Message(msg.into()))
 }
@@ -107,32 +112,30 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 /// DELETE matching) check in here instead. The wall clock is sampled once
 /// per [`StmtDeadline::TICK_BATCH`] iterations; a fired deadline surfaces
 /// as a normal SQL error, rolling the statement back like any failure.
+/// Mutex-based (not Cell): `Database: Sync` is required once the server
+/// shares `&Database` across threads under the read tier.
 #[derive(Default)]
 pub struct StmtDeadline {
-    at: std::cell::Cell<Option<std::time::Instant>>,
-    ticks: std::cell::Cell<u64>,
+    inner: std::sync::Mutex<(Option<std::time::Instant>, u64)>,
 }
 
 impl StmtDeadline {
-    /// Sampling granularity: Instant::now() is cheap but not free at
-    /// millions of rows — amortize it.
-    const TICK_BATCH: u64 = 1024;
-
     pub fn set(&self, deadline: Option<std::time::Instant>) {
-        self.at.set(deadline);
-        self.ticks.set(0);
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        *g = (deadline, 0);
     }
 
     /// Call once per row iteration from long loops. Engine-global, not per
     /// connection — the caller arms and clears it around exactly one
     /// statement (see [`Database::set_statement_deadline`]).
     pub fn check(&self) -> Result<()> {
-        let t = (self.ticks.get() + 1) % Self::TICK_BATCH;
-        self.ticks.set(t);
-        if t != 0 {
+        const TICK_BATCH: u64 = 1024;
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.1 = (g.1 + 1) % TICK_BATCH;
+        if g.1 != 0 {
             return Ok(());
         }
-        if let Some(d) = self.at.get() {
+        if let Some(d) = g.0 {
             if std::time::Instant::now() >= d {
                 return err("statement timeout exceeded (DOCSQL_STATEMENT_TIMEOUT_MS)");
             }
@@ -1287,17 +1290,43 @@ impl Database {
         self.tables.contains_key(name)
     }
 
-    /// True when a session transaction is open.
-    pub fn in_transaction(&self) -> bool {
-        self.tx_snapshot.is_some()
-    }
-
     /// Arm the cooperative deadline for the statement about to execute
     /// (server-side statement timeout). Engine-global, not per connection:
     /// the caller MUST clear it (`set_statement_deadline(None)`) once the
     /// statement finished, on every path.
     pub fn set_statement_deadline(&self, deadline: Option<std::time::Instant>) {
         self.stmt_deadline.set(deadline);
+    }
+
+    /// True when a session transaction is open.
+    pub fn in_transaction(&self) -> bool {
+        self.tx_snapshot.is_some()
+    }
+
+    /// Read-only execution path (MVCC stage A): plain SELECT only, callable
+    /// on `&Database` under the server's read lock so read-only statements
+    /// run concurrently. Writes, transaction control and WITH queries are
+    /// refused — the server tiers them to the write lock (WITH
+    /// materialization is statement-local mutable state).
+    pub fn execute_read(&self, sql: &str) -> Result<ExecOutcome> {
+        let parsed = Self::parse_classified(sql)?;
+        if parsed.is_write {
+            return err("read path refused a write statement");
+        }
+        if parsed.tx != TxControl::None {
+            return err("read path refused a transaction statement");
+        }
+        match parsed.stmt {
+            AnyStmt::Sql(stmt) => match &*stmt {
+                Statement::Query(q) if q.with.is_none() => {
+                    let q = q.clone();
+                    self.exec_query(*q)
+                }
+                Statement::Query(_) => err("read path: WITH queries must use the write path"),
+                _ => err("read path: statement is not a query"),
+            },
+            _ => err("read path: statement is not a query"),
+        }
     }
 
     /// Execute exactly one SQL statement.
@@ -1481,7 +1510,7 @@ impl Database {
     /// auto-sync with data; this is the data-side counterpart. It scans
     /// the table, so only deliberate introspection surfaces (object
     /// explorer) should call it. Unknown tables yield an empty list.
-    pub fn observed_columns(&mut self, table: &str) -> Vec<String> {
+    pub fn observed_columns(&self, table: &str) -> Vec<String> {
         if !self.tables.contains_key(table) {
             return Vec::new();
         }
@@ -2142,7 +2171,7 @@ impl Database {
         Ok(())
     }
 
-    fn table_pairs(&mut self, table: &str) -> Result<Vec<(u64, Object)>> {
+    fn table_pairs(&self, table: &str) -> Result<Vec<(u64, Object)>> {
         let Some(meta) = self.tables.get(table) else {
             return err(format!("table {table} does not exist"));
         };
@@ -2152,7 +2181,7 @@ impl Database {
         for &pid in &heap.pages {
             out.extend(heap.page_docs(&self.pager, &rtx, pid)?);
         }
-        self.pager.abort_tx(rtx)?;
+        // The read-only tx has no staged pages: dropping it is the cleanup.
         Ok(out)
     }
 
@@ -2214,10 +2243,11 @@ impl Database {
     }
 
     fn index_probe(
-        &mut self,
+        &self,
         table: &str,
         alias: Option<&str>,
         selection: &Option<SqlExpr>,
+        ctes: &Ctes,
     ) -> Result<Option<Vec<(u64, Object)>>> {
         let Some(cond) = selection else {
             return Ok(None);
@@ -2225,7 +2255,7 @@ impl Database {
         let Some(meta) = self.tables.get(table).cloned() else {
             return Ok(None);
         };
-        if meta.index_roots.is_empty() || !self.ctes.is_empty() {
+        if meta.index_roots.is_empty() || !ctes.is_empty() {
             return Ok(None);
         }
         let Some((col, plan)) = probe_plan(cond, &meta, table, alias) else {
@@ -2298,7 +2328,8 @@ impl Database {
                 pairs
             }
         };
-        self.pager.abort_tx(tx)?;
+        // Read-only tx: no staged pages, dropping it is the cleanup.
+        drop(tx);
         let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
         for (_, loc) in pairs {
             if let Some(doc) = heap.doc_at(&self.pager, loc)? {
@@ -2310,7 +2341,7 @@ impl Database {
         Ok(Some(out))
     }
 
-    pub(crate) fn table_docs(&mut self, table: &str) -> Result<Vec<Object>> {
+    pub(crate) fn table_docs(&self, table: &str) -> Result<Vec<Object>> {
         let Some(meta) = self.tables.get(table) else {
             return err(format!("table {table} does not exist"));
         };
@@ -2354,7 +2385,9 @@ impl Database {
         // Fast path: probe-able WHERE on an indexed column — update the
         // affected rows in place instead of rewriting the whole table.
         if from.is_none() {
-            if let Some(matches) = self.index_probe(&tname, Some(tkey.as_str()), &selection)? {
+            if let Some(matches) =
+                self.index_probe(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
+            {
                 return self.exec_update_fast(
                     tname,
                     meta,
@@ -2415,7 +2448,7 @@ impl Database {
                     joins: vec![],
                 }];
                 from_list.extend(extra);
-                let merged = self.load_from(&from_list, &None)?;
+                let merged = self.load_from(&from_list, &None, &self.ctes)?;
                 let prefix = format!("{tkey}.");
                 // First qualifying match per target content: every output
                 // row with that content receives that image — including
@@ -2681,7 +2714,9 @@ impl Database {
         // matching rows in place (page re-pack) instead of rewriting the
         // whole table.
         if using.is_none() {
-            if let Some(matches) = self.index_probe(&tname, Some(tkey.as_str()), &selection)? {
+            if let Some(matches) =
+                self.index_probe(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
+            {
                 return self.exec_delete_fast(tname, meta, matches, &selection, &returning);
             }
         }
@@ -2691,7 +2726,7 @@ impl Database {
             // target docs whose combination satisfies WHERE.
             let mut from_list = vec![tables[0].clone()];
             from_list.extend(using);
-            let merged = self.load_from(&from_list, &None)?;
+            let merged = self.load_from(&from_list, &None, &self.ctes)?;
             let prefix = format!("{tkey}.");
             let mut rm: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
             for m in &merged {
@@ -3250,7 +3285,7 @@ impl Database {
 
     /// Run a subquery and return its rows (first column only matters for
     /// IN/ANY lists, but scalar casts use the full first cell).
-    fn subquery_result(&mut self, q: &Query) -> Result<QueryResult> {
+    fn subquery_result(&self, q: &Query) -> Result<QueryResult> {
         // Correlated references (`outer_table.column`) must error instead of
         // falling into the inner query's schemaless column lookup, where a
         // missing column reads as NULL and silently mis-filters (NOT IN ()
@@ -3288,7 +3323,7 @@ impl Database {
 
     /// Rewrite uncorrelated subqueries inside `e` into row-local
     /// expressions (IN-lists / literals) before row iteration.
-    fn subst_expr(&mut self, e: &mut SqlExpr) -> Result<()> {
+    fn subst_expr(&self, e: &mut SqlExpr) -> Result<()> {
         match e {
             SqlExpr::Subquery(q) => {
                 let r = self.subquery_result(q)?;
@@ -3403,7 +3438,7 @@ impl Database {
     }
 
     /// Substitute subqueries inside a projection item.
-    fn subst_item(&mut self, item: &mut SelectItem) -> Result<()> {
+    fn subst_item(&self, item: &mut SelectItem) -> Result<()> {
         match item {
             SelectItem::UnnamedExpr(e) => self.subst_expr(e),
             SelectItem::ExprWithAlias { expr, .. } => self.subst_expr(expr),
@@ -3969,16 +4004,21 @@ impl Database {
         Ok(ExecOutcome::Affected(count))
     }
 
-    fn exec_query(&mut self, query: Query) -> Result<ExecOutcome> {
+    fn exec_query(&self, query: Query) -> Result<ExecOutcome> {
         // WITH <cte> AS (...), ...: materialize each CTE (they can reference
-        // earlier ones) into the statement-local CTE table.
+        // earlier ones) into a statement-local map — owned by this call, so
+        // the whole SELECT execution chain can run on `&Database` (MVCC
+        // stage A concurrent readers).
+        let mut ctes: Ctes = Ctes::new();
         if let Some(with) = &query.with {
             if with.recursive {
                 return err("WITH RECURSIVE is not supported");
             }
             for cte in &with.cte_tables {
                 let name = cte.alias.name.value.clone();
-                let ExecOutcome::Rows(r) = self.exec_query(cte.query.as_ref().clone())? else {
+                let ExecOutcome::Rows(r) =
+                    self.exec_query_body(cte.query.as_ref().clone(), &ctes)?
+                else {
                     return err("CTE body must be a SELECT");
                 };
                 let docs: Vec<Object> = r
@@ -3986,12 +4026,18 @@ impl Database {
                     .into_iter()
                     .map(|row| r.columns.iter().cloned().zip(row).collect())
                     .collect();
-                self.ctes.insert(name, docs);
+                ctes.insert(name, docs);
             }
         }
+        self.exec_query_body(query, &ctes)
+    }
+
+    /// Execute the query body (no WITH: it was materialized by the caller
+    /// into `ctes`).
+    fn exec_query_body(&self, query: Query, ctes: &Ctes) -> Result<ExecOutcome> {
         let body = query.body.clone();
         match *body {
-            SetExpr::Select(select) => self.exec_select(query.clone(), *select),
+            SetExpr::Select(select) => self.exec_select(query.clone(), *select, ctes),
             SetExpr::SetOperation {
                 left,
                 op,
@@ -4084,9 +4130,10 @@ impl Database {
     }
 
     fn exec_select(
-        &mut self,
+        &self,
         query: Query,
         mut select: sqlparser::ast::Select,
+        ctes: &Ctes,
     ) -> Result<ExecOutcome> {
         // Resolve uncorrelated subqueries up front so the row-local
         // expression evaluator never sees them.
@@ -4141,7 +4188,7 @@ impl Database {
             }
             return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
         }
-        let mut rows = self.load_from(&select.from, &select.selection)?;
+        let mut rows = self.load_from(&select.from, &select.selection, ctes)?;
 
         // WHERE — consuming pass: matching docs move into the kept vec
         // instead of being whole-document cloned (the filtered set is
@@ -4177,9 +4224,10 @@ impl Database {
     /// unqualified field names; anything joined gets "alias.col" keys.
     /// A solo real table with a probe-able WHERE skips the heap scan.
     fn load_from(
-        &mut self,
+        &self,
         from: &[sqlparser::ast::TableWithJoins],
         selection: &Option<SqlExpr>,
+        ctes: &Ctes,
     ) -> Result<Vec<Object>> {
         use sqlparser::ast::{JoinConstraint, JoinOperator};
         let base = &from[0];
@@ -4189,15 +4237,17 @@ impl Database {
         if base.joins.is_empty() && from.len() == 1 {
             if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &base.relation {
                 let tname = obj_name(name);
-                if self.tables.contains_key(&tname) && !self.ctes.contains_key(&tname) {
+                if self.tables.contains_key(&tname) && !ctes.contains_key(&tname) {
                     let akey = alias.as_ref().map(|a| a.name.value.clone());
-                    if let Some(pairs) = self.index_probe(&tname, akey.as_deref(), selection)? {
+                    if let Some(pairs) =
+                        self.index_probe(&tname, akey.as_deref(), selection, ctes)?
+                    {
                         return Ok(pairs.into_iter().map(|(_, d)| d).collect());
                     }
                 }
             }
         }
-        let (bname, balias, mut bdocs) = self.load_table_factor(&base.relation)?;
+        let (bname, balias, mut bdocs) = self.load_table_factor(&base.relation, ctes)?;
         let bkey = balias.unwrap_or_else(|| bname.clone());
         let solo = base.joins.is_empty() && from.len() == 1;
         let mut rows: Vec<Object> = if solo {
@@ -4209,14 +4259,14 @@ impl Database {
         if !solo {
             for twj in &from[1..] {
                 // comma-separated FROM entries: cross join their base tables
-                let (n, a, d) = self.load_table_factor(&twj.relation)?;
+                let (n, a, d) = self.load_table_factor(&twj.relation, ctes)?;
                 let k = a.unwrap_or(n);
                 rows = join_rows(rows, &d, &k, None, false, false, &self.stmt_deadline)?;
                 all_joins.extend(twj.joins.iter());
             }
         }
         for j in all_joins {
-            let (jname, jalias, jdocs) = self.load_table_factor(&j.relation)?;
+            let (jname, jalias, jdocs) = self.load_table_factor(&j.relation, ctes)?;
             let jkey = jalias.unwrap_or(jname);
             let (left_join, right_join, on) = match &j.join_operator {
                 JoinOperator::Join(c)
@@ -4286,7 +4336,7 @@ impl Database {
 
     /// No aggregation: project expressions over rows.
     fn exec_plain_select(
-        &mut self,
+        &self,
         query: Query,
         select: sqlparser::ast::Select,
         rows: Vec<Object>,
@@ -4372,7 +4422,7 @@ impl Database {
 
     /// GROUP BY + aggregates (+ HAVING).
     fn exec_grouped_select(
-        &mut self,
+        &self,
         query: Query,
         select: sqlparser::ast::Select,
         rows: Vec<Object>,
@@ -4483,8 +4533,9 @@ impl Database {
     }
 
     fn load_table_factor(
-        &mut self,
+        &self,
         tf: &sqlparser::ast::TableFactor,
+        ctes: &Ctes,
     ) -> Result<(String, Option<String>, Vec<Object>)> {
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = tf else {
             // Derived table: FROM (SELECT ...) AS alias
@@ -4511,7 +4562,7 @@ impl Database {
         let tname = obj_name(name);
         let alias = alias.as_ref().map(|a| a.name.value.clone());
         // WITH (...) names shadow real tables for this statement.
-        if let Some(docs) = self.ctes.get(&tname) {
+        if let Some(docs) = ctes.get(&tname) {
             return Ok((tname, alias, docs.clone()));
         }
         let qualified: String = name
@@ -4617,7 +4668,7 @@ impl Database {
     /// the caller supplies the source docs — an arbitrary expression
     /// evaluated per row.
     fn apply_order_limit(
-        &mut self,
+        &self,
         query: Query,
         mut rows: Vec<Vec<Value>>,
         columns: &[String],
