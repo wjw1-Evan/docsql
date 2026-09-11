@@ -675,6 +675,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_creds_rejects_tampered_fields() {
+        let salt_hex = hex(&[0xab_u8; 16]);
+        let hash_hex = hex(&[0xcd_u8; 32]);
+        let creds = |user: &str, salt: &str, hash: &str, iters: serde_json::Value| -> Vec<u8> {
+            json!({"username": user, "salt_hex": salt, "hash_hex": hash, "iterations": iters})
+                .to_string()
+                .into_bytes()
+        };
+        // Well-formed file parses; a missing iterations key falls back to
+        // the default (older credential files predate the field).
+        let c = parse_creds(&creds("admin", &salt_hex, &hash_hex, json!(1000))).unwrap();
+        assert_eq!(c.iterations, 1000);
+        let no_iters = json!({"username": "admin", "salt_hex": salt_hex, "hash_hex": hash_hex})
+            .to_string()
+            .into_bytes();
+        assert_eq!(
+            parse_creds(&no_iters).unwrap().iterations,
+            PBKDF2_ITERATIONS
+        );
+        // A hand-edited 0 would panic the login handler downstream — refused.
+        assert!(parse_creds(&creds("admin", &salt_hex, &hash_hex, json!(0))).is_err());
+        // Missing or non-string fields, broken hex, wrong lengths.
+        // (An empty username string still parses here — name policy is
+        // setup's job; parse only guards the file's structural integrity.)
+        assert!(parse_creds(b"{}").is_err());
+        assert!(parse_creds(&creds("admin", "zz", &hash_hex, json!(1000))).is_err());
+        assert!(parse_creds(&creds("admin", &hex(&[1_u8; 8]), &hash_hex, json!(1000))).is_err());
+        assert!(parse_creds(&creds("admin", &salt_hex, "nothex", json!(1000))).is_err());
+        assert!(parse_creds(&creds("admin", &salt_hex, "cd", json!(1000))).is_err());
+    }
+
+    #[test]
+    fn validate_username_length_boundaries() {
+        assert!(validate_username("").is_err());
+        assert!(validate_username(&"a".repeat(64)).is_ok());
+        assert!(validate_username(&"a".repeat(65)).is_err());
+        // The limit counts characters, not bytes.
+        assert!(validate_username(&"好".repeat(65)).is_err());
+    }
+
+    #[test]
     fn lockout_locks_after_threshold_and_resets() {
         let mut lock = Lockout::new();
         let ip: IpAddr = "10.0.0.9".parse().unwrap();

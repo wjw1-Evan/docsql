@@ -186,7 +186,7 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 
 ```sql
 -- 管理员(持有 DOCSQL_TOKEN 的连接,或尚未创建任何用户时的开放连接)建号授权:
-CREATE USER analyst PASSWORD '至少8位密码';
+CREATE USER analyst PASSWORD '至少8位密码';   -- 用户名已存在时报错(改密码走 ALTER USER)
 ALTER USER analyst PASSWORD '新密码';
 GRANT readonly   TO analyst;            -- 内置角色:只读(可 SELECT 全部业务表)
 GRANT readwrite  TO app_service;        -- 内置角色:读写(DML + PUBLISH/TRIM,无 DDL)
@@ -197,11 +197,11 @@ CREATE ROLE reporting;
 GRANT SELECT, UPDATE ON orders TO reporting;   -- SELECT/INSERT/UPDATE/DELETE/ALL
 GRANT reporting TO analyst;
 REVOKE UPDATE ON orders FROM reporting;
-REVOKE reporting FROM analyst;                 -- 撤销立即生效(同连接下一条语句起)
+REVOKE reporting FROM analyst;                 -- 撤销立即生效
 DROP USER analyst;                             -- 级联清理其授权与角色成员关系
 ```
 
-**权限矩阵**:admin=全部;readwrite=全部表 DML + `PUBLISH`/`PUBSUB TRIM`;readonly=全部表 `SELECT`;自定义角色=被授予的表级 DML 位。DDL(`CREATE/DROP/ALTER TABLE`、`CREATE INDEX`)与用户管理、备份触发/恢复、`PROMOTE` 仅 admin。子查询同样受读权限约束,无法分类的语句形状按拒绝处理(_fail-closed_)。
+**权限矩阵**:admin=全部;readwrite=全部表 DML + `PUBLISH`/`PUBSUB TRIM`;readonly=全部表 `SELECT`;自定义角色=被授予的表级 DML 位。DDL(`CREATE/DROP/ALTER TABLE`、`CREATE INDEX`)与用户管理、备份触发/恢复、`PROMOTE` 仅 admin。子查询同样受读权限约束,无法分类的语句形状按拒绝处理(_fail-closed_)。GRANT/REVOKE/DROP USER 对**既有连接**即时生效:授权在每帧处理前按纪元刷新,被撤销或被删除用户的连接从下一帧起被拒(涵盖 SQL、PUBLISH/TRIM、备份、PROMOTE 全部权限面)。
 
 **登录方式**:
 

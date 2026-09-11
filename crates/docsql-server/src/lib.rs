@@ -896,6 +896,27 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     continue;
                 }
             }
+            // Refresh a user connection's grants when user/role state has
+            // changed since its last frame. Runs BEFORE the frame gates, so
+            // a revocation applies to PUBLISH/TRIM/backup/PROMOTE too — and
+            // a dropped account (refresh → None) falls into the anonymous
+            // gate below instead of executing as an identity-less legacy
+            // session (a one-statement full-privilege window, or worse:
+            // stale grants kept PUBLISH/backup alive on non-SQL frames).
+            if user.is_some()
+                && state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst) != user_epoch
+            {
+                let name = user.as_ref().expect("checked just above").name.clone();
+                let refreshed = {
+                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                    docsql_core::useradmin::resolve_grants(&mut db, &name)
+                        .ok()
+                        .flatten()
+                        .map(|g| UserAuth { name, grants: g })
+                };
+                user = refreshed;
+                user_epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            }
             // Once at least one database user exists, legacy anonymous
             // (token-less) access closes: data operations then require the
             // client token (admin) or a REQ_AUTH_USER login.
@@ -1080,25 +1101,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     ))
                 }
                 proto::REQ_SQL if authed => {
-                    // Refresh a user connection's grants when user/role
-                    // state changed since its last statement (revocations
-                    // take effect immediately; a dropped user loses access
-                    // on the next statement).
-                    if user.is_some()
-                        && state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst)
-                            != user_epoch
-                    {
-                        let name = user.as_ref().expect("checked just above").name.clone();
-                        let refreshed = {
-                            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-                            docsql_core::useradmin::resolve_grants(&mut db, &name)
-                                .ok()
-                                .flatten()
-                                .map(|g| UserAuth { name, grants: g })
-                        };
-                        user = refreshed;
-                        user_epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
-                    }
+                    // Grants were refreshed above, before the frame gates.
                     let started = std::time::Instant::now();
                     // Full statement text: the query log truncates its own
                     // copy (querylog::record), and cutting here would

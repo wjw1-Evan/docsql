@@ -306,6 +306,57 @@ mod tests {
     }
 
     #[test]
+    fn hmac_sha256_rfc4231_large_key_cases() {
+        // RFC 4231 vectors 6/7: keys over the 64-byte block size must be
+        // hashed before use (exercises the key.len() > 64 branch).
+        let key = [0xaa_u8; 131];
+        let out = hmac_sha256(
+            &key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex_of(out),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        let out = hmac_sha256(
+            &key,
+            b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.",
+        );
+        assert_eq!(
+            hex_of(out),
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_and_unhex_edges() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"samf", b"same"));
+        assert!(!constant_time_eq(b"short", b"different length"));
+        assert_eq!(unhex("a"), None);
+        assert_eq!(unhex("zz"), None);
+        assert_eq!(unhex("0a0B"), Some(vec![0x0a, 0x0b]));
+        assert_eq!(unhex(""), Some(Vec::new()));
+    }
+
+    #[test]
+    fn stored_pw_parse_rejects_malformed_inputs() {
+        let ok_hash = "ab".repeat(32);
+        let good = format!("{HASH_PREFIX}$60000$aa${ok_hash}");
+        assert!(StoredPw::parse(&good).is_some());
+        // wrong prefix, non-numeric or zero iterations
+        assert!(StoredPw::parse(&format!("$sha256$60000$aa${ok_hash}")).is_none());
+        assert!(StoredPw::parse(&format!("{HASH_PREFIX}$abc$aa${ok_hash}")).is_none());
+        assert!(StoredPw::parse(&format!("{HASH_PREFIX}$0$aa${ok_hash}")).is_none());
+        // salt/hash hex problems, missing or extra segments
+        assert!(StoredPw::parse(&format!("{HASH_PREFIX}$60000$zz${ok_hash}")).is_none());
+        assert!(StoredPw::parse(&format!("{HASH_PREFIX}$60000$aa$cd")).is_none());
+        assert!(StoredPw::parse(&format!("{HASH_PREFIX}$60000$aa${ok_hash}$trailing")).is_none());
+        assert!(StoredPw::parse(&format!("{HASH_PREFIX}$60000$aa")).is_none());
+    }
+
+    #[test]
     fn pbkdf2_hmac_sha256_known_answers() {
         // RFC 7914 / draft-josefsson-pbkdf2 test vectors (SHA-256).
         let mut out = [0u8; 16];

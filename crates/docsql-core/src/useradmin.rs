@@ -503,13 +503,14 @@ pub fn redact_sql(sql: &str) -> String {
                     }
                     k += 1;
                 }
-                if k < bytes.len() {
-                    let value = &sql[j + 1..k];
-                    if !value.starts_with(kdf::HASH_PREFIX) {
-                        out.push_str("PASSWORD '***'");
-                        i = k + 1;
-                        continue;
-                    }
+                // An unterminated literal (k == len) still hides the tail:
+                // the query log must never carry a password's characters.
+                let closed = k < bytes.len();
+                let value = &sql[j + 1..if closed { k } else { bytes.len() }];
+                if !value.starts_with(kdf::HASH_PREFIX) {
+                    out.push_str("PASSWORD '***'");
+                    i = if closed { k + 1 } else { bytes.len() };
+                    continue;
                 }
             }
         }
@@ -719,10 +720,18 @@ impl Database {
                 if self.role_names()?.contains(name) {
                     return Err(err_str(format!("a role named {name} already exists")));
                 }
+                // No silent password reset: re-running a bootstrap script on
+                // an existing user must fail (ALTER USER is the only way to
+                // change a credential). Snapshots/backups replay CREATE USER
+                // only after dropping the user tables, so replication and
+                // restore never see this error.
+                if self.stored_pw(name)?.is_some() {
+                    return Err(err_str(format!("user {name} already exists")));
+                }
                 let stored = stored_password_form(password).map_err(err_str)?;
                 self.ensure_user_tables()?;
                 self.execute(&format!(
-                    "INSERT OR REPLACE INTO {} (name, pw) VALUES ({}, {})",
+                    "INSERT INTO {} (name, pw) VALUES ({}, {})",
                     q(USERS_TABLE),
                     lit(name),
                     lit(&stored)
@@ -878,10 +887,11 @@ impl Database {
                 for g in from {
                     for t in tables {
                         for p in privileges {
+                            // Stored rows carry the canonical uppercase
+                            // name() form (written by the grant path).
                             let present = rows.iter().any(|d| {
                                 d.get("grantee").and_then(|v| v.as_str()) == Some(g.as_str())
-                                    && d.get("priv").and_then(|v| v.as_str())
-                                        == Some(p.name().to_lowercase().as_str())
+                                    && d.get("priv").and_then(|v| v.as_str()) == Some(p.name())
                                     && d.get("tbl").and_then(|v| v.as_str()) == Some(t.as_str())
                             });
                             if present {
@@ -1192,6 +1202,23 @@ mod tests {
         assert!(parse("CREATE TABLE t (a INT)").is_none());
         assert!(parse("SELECT 1").is_none());
         assert!(parse("").is_none());
+        // tokenizer error paths
+        assert!(parse("CREATE USER a PASSWORD 'unterminated")
+            .unwrap()
+            .is_err());
+        assert!(parse(r#"CREATE USER "" PASSWORD 'whatever12'"#)
+            .unwrap()
+            .is_err());
+        assert!(parse("CREATE USER al@ice PASSWORD 'whatever12'")
+            .unwrap()
+            .is_err());
+        // line-oriented callers pipe a trailing `;` — tolerated
+        assert_eq!(
+            parse("DROP USER alice;").unwrap().unwrap(),
+            UserAdminStmt::DropUser {
+                name: "alice".into(),
+            }
+        );
         // Passwords containing quotes/semicolons round-trip the tokenizer
         // (embedded quotes are doubled per SQL string syntax).
         let tricky = ["p'", "q;", "r"].concat();
@@ -1217,6 +1244,155 @@ mod tests {
         );
         let hashed = format!("CREATE USER a PASSWORD '{}$60000$aa$bb'", kdf::HASH_PREFIX);
         assert_eq!(redact_sql(&hashed), hashed);
+    }
+
+    #[test]
+    fn redact_masks_unterminated_literals_but_not_embedded_words() {
+        let pw = test_pw();
+        // a malformed statement (no closing quote) must not leak the tail
+        let out = redact_sql(&format!("CREATE USER alice PASSWORD '{pw}"));
+        assert!(!out.contains(&pw), "{out}");
+        assert_eq!(out, "CREATE USER alice PASSWORD '***'");
+        // '' escapes stay inside one literal
+        assert_eq!(
+            redact_sql("CREATE USER a PASSWORD 'p''q'"),
+            "CREATE USER a PASSWORD '***'"
+        );
+        // "MYPASSWORD" is not the keyword (no whitespace before it)
+        let keep = format!("UPDATE t SET note = 'mypassword {pw}' WHERE id = 1");
+        assert_eq!(redact_sql(&keep), keep);
+    }
+
+    #[test]
+    fn create_user_rejects_duplicates_instead_of_resetting() {
+        let mut db = Database::in_memory().unwrap();
+        let pw = test_pw();
+        db.execute(&format!("CREATE USER alice PASSWORD '{pw}'"))
+            .unwrap();
+        // re-running a bootstrap script must fail, not silently swap the
+        // credential out from under the user
+        assert!(db
+            .execute("CREATE USER alice PASSWORD 'second-pw-99'")
+            .is_err());
+        assert!(db.verify_user_password("alice", &pw).unwrap());
+        assert!(!db.verify_user_password("alice", "second-pw-99").unwrap());
+        // ALTER USER is the only door, and it rejects ghosts
+        assert!(db
+            .execute("ALTER USER ghost PASSWORD 'second-pw-99'")
+            .is_err());
+        db.execute("ALTER USER alice PASSWORD 'third-pw-777'")
+            .unwrap();
+        assert!(!db.verify_user_password("alice", &pw).unwrap());
+        assert!(db.verify_user_password("alice", "third-pw-777").unwrap());
+    }
+
+    #[test]
+    fn validate_name_enforces_charset_length_and_builtin_reserve() {
+        for ok in ["a", "_x", "u$1", &"a".repeat(64)] {
+            validate_name(ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+        let long = "a".repeat(65);
+        for bad in [
+            "",
+            "9lives",
+            "$money",
+            "a-b",
+            "a b",
+            "hésité",
+            long.as_str(),
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad:?}");
+        }
+        for role in BUILTIN_ROLES {
+            assert!(validate_name(role).is_err(), "{role}");
+        }
+    }
+
+    #[test]
+    fn password_policy_rejects_short_and_malformed_prehashed() {
+        let mut db = Database::in_memory().unwrap();
+        // too short
+        assert!(db.execute("CREATE USER u PASSWORD 'short'").is_err());
+        // pre-hashed but malformed (bad hash length / junk tail)
+        assert!(db
+            .execute(&format!(
+                "CREATE USER u PASSWORD '{}$60000$aa$zz'",
+                kdf::HASH_PREFIX
+            ))
+            .is_err());
+        assert!(db
+            .execute(&format!(
+                "CREATE USER u PASSWORD '{}$60000$aa'",
+                kdf::HASH_PREFIX
+            ))
+            .is_err());
+        assert_eq!(db.user_names().unwrap().len(), 0);
+        // a valid pre-hashed form is accepted verbatim (replication replay)
+        let stored = kdf::hash_password(&test_pw(), &[9u8; 16]);
+        db.execute(&format!("CREATE USER u PASSWORD '{stored}'"))
+            .unwrap();
+        assert_eq!(db.user_stored_pw("u").as_deref(), Some(stored.as_str()));
+        assert!(db.verify_user_password("u", &test_pw()).unwrap());
+    }
+
+    #[test]
+    fn grant_revoke_error_branches_and_row_idempotency() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute(&format!("CREATE USER alice PASSWORD '{}'", test_pw()))
+            .unwrap();
+        db.execute("CREATE ROLE analyst").unwrap();
+        // unknown role / non-user member
+        assert!(db.execute("GRANT ghost TO alice").is_err());
+        assert!(db.execute("GRANT analyst TO ghost").is_err());
+        // table grants: missing table, internal user tables, unknown grantee
+        assert!(db.execute("GRANT SELECT ON missing TO alice").is_err());
+        assert!(db
+            .execute(&format!("GRANT SELECT ON {USERS_TABLE} TO alice"))
+            .is_err());
+        assert!(db.execute("GRANT SELECT ON t TO ghost").is_err());
+        // REVOKE of an absent grant/membership is a silent no-op
+        db.execute("REVOKE INSERT ON t FROM alice").unwrap();
+        db.execute("REVOKE analyst FROM alice").unwrap();
+        // duplicate GRANTs produce exactly one row each
+        db.execute("GRANT SELECT ON t TO analyst").unwrap();
+        db.execute("GRANT SELECT ON t TO analyst").unwrap();
+        assert_eq!(db.table_docs(GRANTS_TABLE).unwrap().len(), 1);
+        db.execute("GRANT analyst TO alice").unwrap();
+        db.execute("GRANT analyst TO alice").unwrap();
+        assert_eq!(db.table_docs(MEMBERS_TABLE).unwrap().len(), 1);
+        let g = resolve_grants(&mut db, "alice").unwrap().unwrap();
+        assert!(g.may_select("t"));
+        assert!(!g.may_dml("t", PRIV_INSERT));
+        // a real table-level REVOKE removes the privilege (rows store the
+        // canonical uppercase form; the match used to lowercase one side
+        // and silently never fired)
+        db.execute("REVOKE SELECT ON t FROM analyst").unwrap();
+        assert!(db.table_docs(GRANTS_TABLE).unwrap().is_empty());
+        let g = resolve_grants(&mut db, "alice").unwrap().unwrap();
+        assert!(!g.may_select("t"));
+    }
+
+    #[test]
+    fn drop_role_protects_builtins_and_cascades() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute(&format!("CREATE USER bob PASSWORD '{}'", test_pw()))
+            .unwrap();
+        db.execute("CREATE ROLE analyst").unwrap();
+        db.execute("GRANT SELECT, UPDATE ON t TO analyst").unwrap();
+        db.execute("GRANT analyst TO bob").unwrap();
+        // built-in roles are irremovable; ghost roles are rejected
+        for role in BUILTIN_ROLES {
+            assert!(db.execute(&format!("DROP ROLE {role}")).is_err(), "{role}");
+        }
+        assert!(db.execute("DROP ROLE ghost").is_err());
+        // dropping the role removes its membership and table grants
+        db.execute("DROP ROLE analyst").unwrap();
+        let g = resolve_grants(&mut db, "bob").unwrap().unwrap();
+        assert!(!g.may_select("t"));
+        assert!(!g.may_dml("t", PRIV_UPDATE));
+        assert!(db.table_docs(MEMBERS_TABLE).unwrap().is_empty());
     }
 
     #[test]

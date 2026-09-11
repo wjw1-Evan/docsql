@@ -3802,6 +3802,28 @@ async fn users_roles_and_the_privilege_matrix() {
     assert_eq!(f.frame_type, proto::RESP_ERROR, "readwrite DDL must fail");
     let f = rw.sql("GRANT admin TO wally").await;
     assert_eq!(f.frame_type, proto::RESP_ERROR);
+    // Even a readwrite user cannot touch the internal user tables with
+    // plain DML — the statement family is the only door.
+    let f = rw.sql("INSERT INTO docsql_users VALUES ('x', 'y')").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "user-table DML");
+    let f = rw.sql("DELETE FROM docsql_users").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "user-table DML");
+
+    // PUBLISH is a durable write: readonly refused, readwrite allowed.
+    let f = ro.publish("ch", "nope").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly PUBLISH");
+    assert!(payload_str(&f).contains("readwrite"), "{}", payload_str(&f));
+    let f = rw.publish("ch", "from-wally").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    // TRIM deletes persisted messages: readonly refused, readwrite allowed.
+    let f = ro
+        .pubsub_cmd(r#"{"sub":"trim","channel":"ch","keep":1}"#)
+        .await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly TRIM");
+    let f = rw
+        .pubsub_cmd(r#"{"sub":"trim","channel":"ch","keep":1}"#)
+        .await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
 
     // wrong password / unknown user are indistinguishable
     let mut bad = Client::connect(&addr).await;
@@ -3837,14 +3859,25 @@ async fn users_roles_and_the_privilege_matrix() {
     let f = cu.sql("SELECT (SELECT MAX(x) FROM secret) AS leak").await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "subquery leak");
 
-    // Revoke takes effect on the SAME connection (epoch refresh).
+    // Grants land on an already-open connection at its NEXT statement
+    // (epoch refresh is synchronous — no delay to wait out).
+    admin.sql("GRANT INSERT ON t TO clerk").await;
+    let f = cu.sql("INSERT INTO t VALUES (51, 'yes')").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    admin.sql("REVOKE INSERT ON t FROM clerk").await;
+    let f = cu.sql("INSERT INTO t VALUES (52, 'no')").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "table-level revocation");
+
+    // Revoke of the membership itself, same connection again.
     admin.sql("REVOKE clerk FROM cara").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let f = cu.sql("SELECT id FROM t WHERE id = 1").await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "revocation must apply");
 
-    // DROP USER cascades: cara can no longer log in.
+    // DROP USER cascades: cara can no longer log in — and her still-open
+    // connection loses access at its next statement.
     admin.sql("DROP USER cara").await;
+    let f = cu.sql("SELECT 1").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "dropped user's session");
     let mut gone = Client::connect(&addr).await;
     let f = user_login(&mut gone, "cara", "carapw99").await;
     assert_eq!(f.frame_type, proto::RESP_ERROR);
@@ -3922,4 +3955,74 @@ async fn user_login_lockout_mirrors_token_auth() {
         "correct password must be locked out"
     );
     assert!(payload_str(&f).contains("locked"), "{}", payload_str(&f));
+}
+
+/// Protocol-level identity and admin guards: a peer connection never
+/// authenticates as a database user, one connection holds one identity,
+/// and non-admin users are refused backup trigger/restore and PROMOTE.
+#[tokio::test]
+async fn user_identity_and_admin_protocol_guards() {
+    let (_dir, addr) = start_server_tokens(Some("client-tok"), Some("cluster-tok")).await;
+    let mut admin = Client::connect(&addr).await;
+    assert_eq!(
+        admin.auth("client-tok").await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    let pw = ["gu", "ar", "d1", "23"].concat();
+    admin
+        .sql(&format!("CREATE USER gina PASSWORD '{pw}'"))
+        .await;
+    admin.sql("GRANT readonly TO gina").await;
+    admin.sql("CREATE TABLE t (id INT PRIMARY KEY)").await;
+
+    // A cluster-token (peer) connection cannot log in as a user.
+    let mut peer = Client::connect(&addr).await;
+    assert_eq!(payload_str(&peer.auth("cluster-tok").await), "ok");
+    let f = user_login(&mut peer, "gina", &pw).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "peer user login");
+
+    // One identity per connection: token first, then user login → refused.
+    let mut mixed = Client::connect(&addr).await;
+    assert_eq!(
+        mixed.auth("client-tok").await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    let f = user_login(&mut mixed, "gina", &pw).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "double authentication");
+    assert!(
+        payload_str(&f).contains("already authenticated"),
+        "{}",
+        payload_str(&f)
+    );
+
+    // A readonly user session: PUBLISH/TRIM were covered by the matrix
+    // test; here the admin-only protocol surface — backup trigger,
+    // restore and PROMOTE.
+    let mut gina = Client::connect(&addr).await;
+    assert_eq!(
+        user_login(&mut gina, "gina", &pw).await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    gina.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    let f = gina.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly backup trigger");
+    assert!(payload_str(&f).contains("admin"), "{}", payload_str(&f));
+    gina.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"restore","file":"backup-1.sql"}"#.to_vec(),
+    ))
+    .await;
+    let f = gina.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly backup restore");
+    assert!(payload_str(&f).contains("admin"), "{}", payload_str(&f));
+    let f = gina.promote().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly PROMOTE");
+    assert!(payload_str(&f).contains("admin"), "{}", payload_str(&f));
+    // Her SELECT surface still works (identity intact, not locked out).
+    let f = gina.sql("SELECT COUNT(*) FROM t").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
 }
