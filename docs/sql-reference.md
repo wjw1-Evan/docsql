@@ -73,8 +73,29 @@ SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡
   JSON_TYPE(doc, '$.tags[0]')          -- object/array/text/integer/real/boolean/null
   JSON_VALID(text)                     -- 合法 JSON 文本判定
   ```
+- **Oracle 风格**:
+  ```sql
+  NVL(a, b) / NVL2(a, b, c)            -- 空值替换
+  DECODE(expr, s1, r1, s2, r2 [, d])   -- NULL=NULL 匹配;无命中且无 default 返回 NULL
+  INSTR(str, sub)                      -- 1 起始位置,无则 0
+  LPAD / RPAD(str, len [, pad])        -- 填充/截断到 len 字符
+  GREATEST / LEAST(a, b, …)            -- 任一 NULL → NULL
+  TO_NUMBER(text)                      -- 解析失败显式报错
+  TO_CHAR(v)                           -- 值 → 文本(格式掩码不支持)
+  SYSDATE()                            -- 当前 UTC 时间戳文本(固定形状)
+  ```
 
 不支持:窗口函数(OVER)、DISTINCT ON、ON CONFLICT DO UPDATE、相关子查询、自定义 TRIM 字符集、递归 CTE。
+
+## Oracle 兼容面
+
+- `FROM DUAL`:哑表(单行零列,大小写不敏感);
+- `ROWNUM` 伪列:行取出后、WHERE 与 ORDER BY **之前**编号;被 WHERE 过滤的行
+  消耗编号(Oracle 语义);`SELECT *` 不含该列;
+- `FETCH FIRST n ROWS ONLY`(Oracle 12c/SQL 标准分页;`WITH TIES`/`PERCENT` 不支持,显式报错);
+- 数据字典兼容视图:`ALL_TABLES`/`USER_TABLES`/`ALL_TAB_COLUMNS`/`USER_TAB_COLUMNS`/
+  `ALL_INDEXES`/`USER_INDEXES`(OWNER 恒为 `DOCSQL`;单全局命名空间,USER_* 与 ALL_* 同数据;
+  系统内部表不出现)。
 
 ## 事务
 

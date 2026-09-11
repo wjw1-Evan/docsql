@@ -4190,6 +4190,23 @@ impl Database {
         }
         let mut rows = self.load_from(&select.from, &select.selection, ctes)?;
 
+        // Oracle ROWNUM pseudo-column: number each row right after it is
+        // retrieved (before WHERE and before ORDER BY — Oracle semantics).
+        // Injected only when the statement references it, and only for the
+        // non-aggregated path (aggregates + ROWNUM error on the missing
+        // column, which is the honest refusal).
+        let group_exprs: Vec<SqlExpr> = match &select.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
+            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
+        };
+        let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
+        let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
+        if rownum_wanted {
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.insert("ROWNUM".into(), Value::Int(i as i64 + 1));
+            }
+        }
+
         // WHERE — consuming pass: matching docs move into the kept vec
         // instead of being whole-document cloned (the filtered set is
         // often the whole table).
@@ -4205,11 +4222,7 @@ impl Database {
         }
 
         // Aggregation path: aggregate functions in projection or GROUP BY.
-        let group_exprs: Vec<SqlExpr> = match &select.group_by {
-            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
-            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
-        };
-        if !group_exprs.is_empty() || select.projection.iter().any(is_agg_item) {
+        if is_aggregate {
             return self.exec_grouped_select(query, select, rows, group_exprs);
         }
         if select.having.is_some() {
@@ -4356,8 +4369,13 @@ impl Database {
         let columns_out: Vec<String> = if want_star {
             // SELECT *, expr: star fields first, then the explicit
             // projections (SQLite semantics) — dropping the exprs silently
-            // returned fewer columns than the statement asked for.
-            let mut cols = union_of_fields(&rows);
+            // returned fewer columns than the statement asked for. The
+            // ROWNUM pseudo-column (if injected) is not part of * — Oracle
+            // semantics.
+            let mut cols: Vec<String> = union_of_fields(&rows)
+                .into_iter()
+                .filter(|c| c != "ROWNUM")
+                .collect();
             cols.extend(project.iter().map(|(n, _)| n.clone()));
             cols
         } else {
@@ -4561,6 +4579,11 @@ impl Database {
         };
         let tname = obj_name(name);
         let alias = alias.as_ref().map(|a| a.name.value.clone());
+        // Oracle DUAL: the one-row dummy table. Case-insensitive, works even
+        // when no user table named DUAL exists (it always shadows).
+        if tname.eq_ignore_ascii_case("DUAL") {
+            return Ok(("DUAL".into(), alias, vec![Object::new()]));
+        }
         // WITH (...) names shadow real tables for this statement.
         if let Some(docs) = ctes.get(&tname) {
             return Ok((tname, alias, docs.clone()));
@@ -4613,6 +4636,85 @@ impl Database {
         if qualified == "information_schema.tables" || qualified == "information_schema.columns" {
             let docs = self.information_schema(&qualified);
             return Ok(("information_schema".into(), alias, docs));
+        }
+        // Oracle data-dictionary compatibility views (case-insensitive):
+        // USER_* and ALL_* carry the same data — DocSQL has one global
+        // namespace, so every owner sees every user table.
+        let dq = qualified.to_ascii_uppercase();
+        if matches!(
+            dq.as_str(),
+            "ALL_TABLES"
+                | "USER_TABLES"
+                | "ALL_TAB_COLUMNS"
+                | "USER_TAB_COLUMNS"
+                | "ALL_INDEXES"
+                | "USER_INDEXES"
+        ) {
+            let owner = "DOCSQL";
+            let mut docs: Vec<Object> = Vec::new();
+            let user_tables: Vec<(&String, &TableMeta)> = self
+                .tables
+                .iter()
+                .filter(|(n, _)| !is_internal_table(n))
+                .collect();
+            match dq.as_str() {
+                "ALL_TABLES" | "USER_TABLES" => {
+                    for (n, meta) in &user_tables {
+                        docs.push(Object::from([
+                            ("owner".into(), Value::Str(owner.into())),
+                            ("table_name".into(), Value::Str((*n).clone())),
+                            ("num_rows".into(), Value::Null),
+                            ("blocks".into(), Value::Int(meta.pages.len() as i64)),
+                        ]));
+                    }
+                }
+                "ALL_TAB_COLUMNS" | "USER_TAB_COLUMNS" => {
+                    for (n, meta) in &user_tables {
+                        for (i, col) in meta.columns.iter().enumerate() {
+                            docs.push(Object::from([
+                                ("owner".into(), Value::Str(owner.into())),
+                                ("table_name".into(), Value::Str((*n).clone())),
+                                ("column_name".into(), Value::Str(col.clone())),
+                                ("data_type".into(), Value::Str("TEXT".into())),
+                                (
+                                    "nullable".into(),
+                                    Value::Str(
+                                        if meta.not_null.contains(col) {
+                                            "N"
+                                        } else {
+                                            "Y"
+                                        }
+                                        .into(),
+                                    ),
+                                ),
+                                ("column_id".into(), Value::Int(i as i64 + 1)),
+                            ]));
+                        }
+                    }
+                }
+                _ => {
+                    for (tbl, meta) in &user_tables {
+                        for d in &meta.index_defs {
+                            docs.push(Object::from([
+                                ("owner".into(), Value::Str(owner.into())),
+                                ("index_name".into(), Value::Str(d.name.clone())),
+                                ("table_name".into(), Value::Str((*tbl).clone())),
+                                (
+                                    "uniqueness".into(),
+                                    Value::Str(
+                                        if d.unique { "UNIQUE" } else { "NONUNIQUE" }.into(),
+                                    ),
+                                ),
+                            ]));
+                        }
+                    }
+                }
+            }
+            let view = match dq.as_str() {
+                v if v.starts_with("ALL_") => v.to_string(),
+                v => format!("USER_{}", &v[5..]),
+            };
+            return Ok((view, alias, docs));
         }
         let docs = self.table_docs(&tname)?;
         Ok((tname, alias, docs))
@@ -4729,6 +4831,26 @@ impl Database {
         }
         if let Some(lc) = &query.limit_clause {
             rows = apply_limit_clause(lc, rows)?;
+        }
+        // Oracle 12c+/SQL-standard FETCH: `FETCH FIRST n ROWS ONLY` (and the
+        // NEXT form). WITH TIES requires the ORDER BY key's tie set — not
+        // supported, and per house rules it errors instead of silently
+        // returning a different row count.
+        if let Some(fetch) = &query.fetch {
+            if fetch.percent {
+                return err("FETCH … PERCENT is not supported");
+            }
+            if fetch.with_ties {
+                return err("FETCH … WITH TIES is not supported");
+            }
+            let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
+                Some(Value::Int(n)) if n >= 0 => n as usize,
+                Some(Value::Int(n)) => {
+                    return err(format!("FETCH quantity must be non-negative ({n})"))
+                }
+                Some(_) | None => return err("FETCH quantity must be an integer"),
+            };
+            rows.truncate(n);
         }
         Ok(rows)
     }
@@ -6046,6 +6168,81 @@ fn apply_limit_clause(
 }
 
 /// Canonical text form of a value (CAST AS TEXT, GROUP_CONCAT, ||).
+/// Current wall clock as the canonical text form (UTC, RFC 3339-style
+/// seconds precision) — the SYSDATE() compatibility function's value.
+fn now_ms_string() -> String {
+    let ms = crate::now_ms();
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let (y, mo, d, h, mi, se) = civil_from_secs(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}.{millis:03}Z")
+}
+
+/// Seconds-since-epoch → (y, m, d, h, mi, s), same civil algorithm as
+/// backup.rs's UTC stamping (Howard Hinnant's civil_from_days).
+fn civil_from_secs(secs: u64) -> (i64, i64, i64, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let se = (rem % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 399 } / 400;
+    let doe = z - era * 400;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (y, m, d, h, mi, se)
+}
+
+/// True when the statement's projection or WHERE references the Oracle
+/// ROWNUM pseudo-column.
+fn select_refs_rownum(select: &sqlparser::ast::Select) -> bool {
+    let mut refs = false;
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => refs |= refs_rownum(e),
+            SelectItem::ExprWithAlias { expr, .. } => refs |= refs_rownum(expr),
+            _ => {}
+        }
+    }
+    if let Some(cond) = &select.selection {
+        refs |= refs_rownum(cond);
+    }
+    refs
+}
+
+/// Walk an expression tree looking for the Oracle ROWNUM pseudo-column
+/// reference (case-insensitive identifier).
+fn refs_rownum(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Identifier(i) => i.value.eq_ignore_ascii_case("ROWNUM"),
+        SqlExpr::BinaryOp { left, right, .. } => refs_rownum(left) || refs_rownum(right),
+        SqlExpr::UnaryOp { expr, .. } => refs_rownum(expr),
+        SqlExpr::Nested(e)
+        | SqlExpr::IsFalse(e)
+        | SqlExpr::IsTrue(e)
+        | SqlExpr::IsNotNull(e)
+        | SqlExpr::IsNull(e) => refs_rownum(e),
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                list.args.iter().any(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) => refs_rownum(inner),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn value_to_text(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
@@ -6253,6 +6450,172 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Str(s) => Value::Bool(crate::json::from_str(s).is_ok()),
                 _ => Value::Bool(false),
             }
+        }
+        // ---- Oracle-style function family (compatibility surface) ----
+        "NVL" => {
+            exact_arity(name, args, 2)?;
+            match arg(args, 0, name)? {
+                Value::Null => arg(args, 1, name)?.clone(),
+                v => v.clone(),
+            }
+        }
+        "NVL2" => {
+            exact_arity(name, args, 3)?;
+            match arg(args, 0, name)? {
+                Value::Null => arg(args, 2, name)?.clone(),
+                _ => arg(args, 1, name)?.clone(),
+            }
+        }
+        "DECODE" => {
+            // Oracle DECODE: (expr, search1, result1, … [, default]). Oracle
+            // treats NULL as equal to NULL in the comparisons; no match and
+            // no default yields NULL.
+            if args.len() < 3 {
+                return err(format!(
+                    "function {name} takes at least 3 arguments, got {}",
+                    args.len()
+                ));
+            }
+            let expr = &args[0];
+            let mut i = 1;
+            while i + 1 < args.len() {
+                let s = &args[i];
+                let matched = match (expr, s) {
+                    (Value::Null, Value::Null) => true,
+                    (Value::Null, _) | (_, Value::Null) => false,
+                    (a, b) => Value::cmp_values(a, b) == Ordering::Equal,
+                };
+                if matched {
+                    return Ok(args[i + 1].clone());
+                }
+                i += 2;
+            }
+            if args.len().is_multiple_of(2) {
+                return Ok(args[args.len() - 1].clone());
+            }
+            Value::Null
+        }
+        "INSTR" => {
+            // 1-based position of the first occurrence; 0 when absent.
+            exact_arity(name, args, 2)?;
+            let (Value::Str(hay), Value::Str(needle)) = (arg(args, 0, name)?, arg(args, 1, name)?)
+            else {
+                return err(format!("function {name} requires text arguments"));
+            };
+            let pos = hay
+                .find(needle.as_str())
+                .map(|byte_idx| hay[..byte_idx].chars().count() + 1)
+                .unwrap_or(0);
+            Value::Int(pos as i64)
+        }
+        "LPAD" | "RPAD" => {
+            // Pad/truncate `str` to `len` display characters with `pad`
+            // (default a single space).
+            if args.len() < 2 || args.len() > 3 {
+                return err(format!(
+                    "function {name} takes 2 or 3 arguments, got {}",
+                    args.len()
+                ));
+            }
+            let Value::Str(s) = arg(args, 0, name)? else {
+                return err(format!("function {name} requires a text argument"));
+            };
+            let len = match arg(args, 1, name)? {
+                Value::Int(n) if *n >= 0 => *n as usize,
+                Value::Int(n) => {
+                    return err(format!(
+                        "function {name}: length must be non-negative ({n})"
+                    ))
+                }
+                _ => return err(format!("function {name}: length must be an integer")),
+            };
+            let pad = match args.get(2) {
+                Some(Value::Str(p)) if !p.is_empty() => p.clone(),
+                Some(Value::Str(_)) => " ".to_string(),
+                _ => " ".to_string(),
+            };
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() >= len {
+                return Ok(Value::Str(chars[..len].iter().collect()));
+            }
+            let fill: Vec<char> = pad.chars().collect();
+            let mut out = String::with_capacity(len * 2);
+            let need = len - chars.len();
+            if name == "LPAD" {
+                for k in 0..need {
+                    out.push(fill[k % fill.len()]);
+                }
+                out.extend(chars);
+            } else {
+                out.extend(chars);
+                for k in 0..need {
+                    out.push(fill[k % fill.len()]);
+                }
+            }
+            Value::Str(out)
+        }
+        "GREATEST" | "LEAST" => {
+            // Oracle: any NULL argument → NULL; ties return the first.
+            if args.is_empty() {
+                return err(format!("function {name} requires at least 1 argument"));
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let mut best = args[0].clone();
+            for v in &args[1..] {
+                let o = Value::cmp_values(v, &best);
+                let better = if name == "GREATEST" {
+                    o == Ordering::Greater
+                } else {
+                    o == Ordering::Less
+                };
+                if better {
+                    best = v.clone();
+                }
+            }
+            best
+        }
+        "TO_NUMBER" => {
+            exact_arity(name, args, 1)?;
+            match arg(args, 0, name)?.clone() {
+                Value::Int(_) | Value::Float(_) => args[0].clone(),
+                Value::Str(s) => {
+                    let t = s.trim();
+                    if let Ok(i) = t.parse::<i64>() {
+                        Value::Int(i)
+                    } else {
+                        match t.parse::<f64>() {
+                            Ok(f) => Value::Float(f),
+                            Err(_) => {
+                                return err(format!("TO_NUMBER: invalid number {s:?}"));
+                            }
+                        }
+                    }
+                }
+                _ => return err("TO_NUMBER requires a text argument"),
+            }
+        }
+        "TO_CHAR" => {
+            // Single-argument form: value → text. The Oracle format-mask
+            // form requires a typed date/number system and is rejected.
+            if args.is_empty() || args.len() > 2 {
+                return err(format!(
+                    "function {name} takes 1 or 2 arguments, got {}",
+                    args.len()
+                ));
+            }
+            if args.len() == 2 {
+                return err("TO_CHAR format masks are not supported");
+            }
+            match arg(args, 0, name)? {
+                Value::Str(s) => Value::Str(s.clone()),
+                other => Value::Str(crate::json::to_string(other).trim_matches('"').to_string()),
+            }
+        }
+        "SYSDATE" => {
+            exact_arity(name, args, 0)?;
+            Value::Str(now_ms_string())
         }
         "JSON_EXTRACT" | "JSON_TYPE" => {
             // Documents live as JSON text, so point reads into them are the
@@ -12853,5 +13216,186 @@ mod complex_query_tests {
             rows(&mut db, "SELECT tag, blob FROM t WHERE tag = 'k'").rows,
             vec![vec![Value::Str("k".into()), Value::Str("small".into())]]
         );
+    }
+
+    #[test]
+    fn oracle_compat_dual_rownum_fetch_and_dictionary_views() {
+        let mut db = Database::in_memory().unwrap();
+        // DUAL: the one-row dummy table, case-insensitive.
+        for name in ["DUAL", "dual", "Dual"] {
+            assert_eq!(
+                rows(&mut db, &format!("SELECT 1 AS one FROM {name}")).rows,
+                vec![vec![Value::Int(1)]]
+            );
+        }
+        // SELECT * FROM DUAL is a single empty row.
+        assert_eq!(rows(&mut db, "SELECT * FROM DUAL").rows.len(), 1);
+
+        // ROWNUM: numbering before WHERE (Oracle semantics) — take the
+        // first 2 of the scanned rows via ROWNUM, not LIMIT.
+        db.execute("CREATE TABLE r (n INT)").unwrap();
+        db.execute("INSERT INTO r VALUES (10), (20), (30), (40), (50)")
+            .unwrap();
+        let r = rows(&mut db, "SELECT n FROM r WHERE ROWNUM <= 2 ORDER BY n");
+        assert_eq!(r.rows, vec![vec![Value::Int(10)], vec![Value::Int(20)]]);
+        // ROWNUM in the projection keeps the pre-WHERE numbering (Oracle:
+        // filtered-out rows consume their numbers — rows 10 and 20 hold
+        // ROWNUM 1 and 2 but are filtered away).
+        let r = rows(&mut db, "SELECT ROWNUM, n FROM r WHERE n >= 30");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(3), Value::Int(30)],
+                vec![Value::Int(4), Value::Int(40)],
+                vec![Value::Int(5), Value::Int(50)],
+            ]
+        );
+        // SELECT * must NOT surface the injected pseudo-column.
+        let r = rows(&mut db, "SELECT * FROM r WHERE ROWNUM = 1");
+        assert_eq!(r.columns, vec!["n"], "ROWNUM leaked into *");
+
+        // FETCH FIRST (Oracle 12c / SQL standard).
+        let r = rows(
+            &mut db,
+            "SELECT n FROM r ORDER BY n FETCH FIRST 2 ROWS ONLY",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(10)], vec![Value::Int(20)]]);
+        let e = db
+            .execute("SELECT n FROM r ORDER BY n FETCH FIRST 1 ROWS WITH TIES")
+            .unwrap_err();
+        assert!(e.to_string().contains("WITH TIES"), "{e}");
+    }
+
+    #[test]
+    fn oracle_dictionary_views_expose_catalog() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE emp (id INT, name TEXT)").unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_emp ON emp (id)")
+            .unwrap();
+        db.execute("CREATE INDEX ix_name ON emp (name)").unwrap();
+
+        let tables = rows(
+            &mut db,
+            "SELECT table_name FROM all_tables ORDER BY table_name",
+        );
+        assert_eq!(
+            tables.rows,
+            vec![vec![Value::Str("emp".into())]],
+            "internal tables must not leak into ALL_TABLES"
+        );
+        // USER_* carries the same rows (single global namespace).
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT table_name FROM user_tables ORDER BY table_name"
+            )
+            .rows,
+            tables.rows
+        );
+        // Columns with ids, and indexes with uniqueness.
+        let cols = rows(
+            &mut db,
+            "SELECT column_name, column_id FROM all_tab_columns WHERE table_name = 'emp' ORDER BY column_id",
+        );
+        assert_eq!(
+            cols.rows,
+            vec![
+                vec![Value::Str("id".into()), Value::Int(1)],
+                vec![Value::Str("name".into()), Value::Int(2)],
+            ]
+        );
+        let idx = rows(
+            &mut db,
+            "SELECT index_name, uniqueness FROM all_indexes WHERE table_name = 'emp' ORDER BY index_name",
+        );
+        assert_eq!(
+            idx.rows,
+            vec![
+                vec![Value::Str("ix_name".into()), Value::Str("NONUNIQUE".into())],
+                vec![Value::Str("ux_emp".into()), Value::Str("UNIQUE".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn oracle_style_scalar_functions() {
+        let mut db = Database::in_memory().unwrap();
+        let q = |db: &mut Database, sql: &str| -> Value {
+            match db.execute(sql).unwrap() {
+                ExecOutcome::Rows(r) => r.rows[0][0].clone(),
+                ExecOutcome::Affected(_) => panic!("expected rows"),
+            }
+        };
+        // NULL-propagating and Oracle-null-comparison forms.
+        assert_eq!(
+            q(&mut db, "SELECT NVL(NULL, 'dflt')"),
+            Value::Str("dflt".into())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT NVL('x', 'dflt')"),
+            Value::Str("x".into())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT NVL2(NULL, 'a', 'b')"),
+            Value::Str("b".into())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT NVL2('v', 'a', 'b')"),
+            Value::Str("a".into())
+        );
+        // DECODE: NULL matches NULL (Oracle semantics), default optional.
+        assert_eq!(
+            q(&mut db, "SELECT DECODE(NULL, NULL, 'null-match', 'no')"),
+            Value::Str("null-match".into())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT DECODE(2, 1, 'one', 2, 'two', 'other')"),
+            Value::Str("two".into())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT DECODE(9, 1, 'one', 2, 'two')"),
+            Value::Null
+        );
+        // String helpers.
+        assert_eq!(
+            q(&mut db, "SELECT INSTR('hello world', 'world')"),
+            Value::Int(7)
+        );
+        assert_eq!(q(&mut db, "SELECT INSTR('hello', 'z')"), Value::Int(0));
+        assert_eq!(
+            q(&mut db, "SELECT LPAD('7', 3, '0')"),
+            Value::Str("007".into())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT RPAD('ab', 4)"),
+            Value::Str("ab  ".into())
+        );
+        // Truncating pads.
+        assert_eq!(
+            q(&mut db, "SELECT LPAD('abcdef', 3)"),
+            Value::Str("abc".into())
+        );
+        // GREATEST/LEAST: NULL poisons, numeric/lexicographic order.
+        assert_eq!(q(&mut db, "SELECT GREATEST(1, 5, 3)"), Value::Int(5));
+        assert_eq!(
+            q(&mut db, "SELECT LEAST('b', 'a', 'c')"),
+            Value::Str("a".into())
+        );
+        assert_eq!(q(&mut db, "SELECT GREATEST(1, NULL)"), Value::Null);
+        // Conversions.
+        assert_eq!(q(&mut db, "SELECT TO_NUMBER('42') + 1"), Value::Int(43));
+        assert!(matches!(
+            db.execute("SELECT TO_NUMBER('not-a-number')"),
+            Err(SqlError::Message(m)) if m.contains("invalid number")
+        ));
+        assert_eq!(
+            q(&mut db, "SELECT TO_CHAR(123) || '!'"),
+            Value::Str("123!".into())
+        );
+        // SYSDATE: fixed-shape UTC timestamp text.
+        assert!(matches!(
+            q(&mut db, "SELECT SYSDATE()"),
+            Value::Str(s) if s.len() >= 19 && s.contains('T')
+        ));
     }
 }

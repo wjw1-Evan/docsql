@@ -38,6 +38,13 @@
   硬上限 16MiB(对齐主流文档库默认;超限显式报错);删除/替换回收链页进表内
   free 清单(catalog 持久化)并优先复用;旧卷字节级兼容(旧槽首字节必非 `0xFF`);
   设计说明见 `docs/design/002-overflow-page-chains.md`;
+- **Oracle 兼容增强**:`DUAL` 哑表(大小写不敏感)、`ROWNUM` 伪列(取行后、WHERE 与
+  ORDER BY 之前编号,被过滤行消耗编号,`SELECT *` 不含该列)、`FETCH FIRST n ROWS ONLY`
+  (SQL 标准/Oracle 12c 分页;`WITH TIES`/`PERCENT` 显式不支持)、Oracle 风格函数族
+  (`NVL`/`NVL2`/`DECODE`(NULL=NULL 匹配)/`INSTR`/`LPAD`/`RPAD`/`GREATEST`/`LEAST`/
+  `TO_NUMBER`/`TO_CHAR`(单参)/`SYSDATE()`)、Oracle 数据字典兼容视图
+  (`ALL_TABLES`/`USER_TABLES`/`ALL_TAB_COLUMNS`/`USER_TAB_COLUMNS`/`ALL_INDEXES`/
+  `USER_INDEXES`,单全局命名空间下 USER 与 ALL 同数据,系统表不出现);
 - **CLI**:`-f/--file <script.sql>` 脚本批执行(快速失败,容忍缺失末尾分号)、
   `--csv`(RFC 4180)/`--json` 行导出、`help;` 内联命令(嵌入式与远程模式通用);
 - **优雅停机**:server/web 处理 SIGTERM/SIGINT——停止接受新连接,存量连接限时(10s)排空,
