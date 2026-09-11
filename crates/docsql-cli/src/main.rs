@@ -328,15 +328,11 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
     };
     match remote.round_trip(&Frame::new(frame_type, payload)) {
         Ok(f) if f.frame_type == proto::RESP_ERROR => {
-            println!("error: {}", String::from_utf8_lossy(&f.payload));
+            eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
         }
         Ok(f) => {
             if f.frame_type == proto::RESP_AFFECTED {
-                let n = f
-                    .payload
-                    .get(..8)
-                    .and_then(|s| s.try_into().ok())
-                    .map_or(0, u64::from_le_bytes);
+                let n = proto::decode_affected(&f.payload);
                 match confirm {
                     "subscribed" => println!("(subscribed; {n} active subscription(s))"),
                     "unsubscribed" => println!("(unsubscribed; {n} remain)"),
@@ -348,7 +344,7 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
             }
         }
         Err(e) => {
-            println!("{e}");
+            eprintln!("{e}");
             return false;
         }
     }
@@ -401,7 +397,9 @@ fn remote_shell(addr: &str, token: Option<&str>) {
         // Inline pub/sub commands (single line, `;`-terminated like SQL).
         if let Some(cmd) = parse_pubsub_command(trimmed) {
             if !run_pubsub_command(&mut remote, cmd) {
-                break;
+                // A failed control round trip leaves the session unusable —
+                // exit nonzero so scripts see the transport loss.
+                std::process::exit(1);
             }
             continue;
         }
@@ -415,7 +413,7 @@ fn remote_shell(addr: &str, token: Option<&str>) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("{e}");
-                break;
+                std::process::exit(1);
             }
         };
         print_frame(&f);
@@ -453,11 +451,7 @@ fn print_frame(f: &Frame) {
             }
         }
         proto::RESP_AFFECTED => {
-            let n = f
-                .payload
-                .get(..8)
-                .and_then(|s| s.try_into().ok())
-                .map_or(0, u64::from_le_bytes);
+            let n = proto::decode_affected(&f.payload);
             println!("({n} rows affected)");
         }
         _ => println!("error: {}", String::from_utf8_lossy(&f.payload)),
@@ -473,7 +467,9 @@ pub fn render_rows(r: &QueryResult) -> String {
     if r.rows.is_empty() {
         return "(no rows)\n".to_string();
     }
-    let mut widths: Vec<usize> = r.columns.iter().map(|c| c.len()).collect();
+    // Widths count CHARS while the pad below pads chars: measuring bytes
+    // left CJK cells ragged (a 3-char/9-byte string padded as 9).
+    let mut widths: Vec<usize> = r.columns.iter().map(|c| c.chars().count()).collect();
     let cells: Vec<Vec<String>> = r
         .rows
         .iter()
@@ -490,7 +486,7 @@ pub fn render_rows(r: &QueryResult) -> String {
         for (i, c) in row.iter().enumerate() {
             // Rows wider than the column list must not panic the client.
             if let Some(w) = widths.get_mut(i) {
-                *w = (*w).max(c.len());
+                *w = (*w).max(c.chars().count());
             }
         }
     }

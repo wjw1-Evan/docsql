@@ -22,12 +22,6 @@ fn file_bytes(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-fn wal_path(db: &Path) -> std::path::PathBuf {
-    let mut s = db.as_os_str().to_os_string();
-    s.push(".wal");
-    std::path::PathBuf::from(s)
-}
-
 /// The `/api/meta` payload: server identity, storage counters, totals, one
 /// entry per user table, and the engine-managed system tables (pub/sub
 /// backing store, catch-up journal/positions/identity) under
@@ -143,7 +137,10 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
                 ("page_size".into(), int(db.page_size() as u64)),
                 ("num_pages".into(), int(db.num_pages() as u64)),
                 ("db_bytes".into(), int(file_bytes(db_path))),
-                ("wal_bytes".into(), int(file_bytes(&wal_path(db_path)))),
+                (
+                    "wal_bytes".into(),
+                    int(file_bytes(&crate::pager::wal_path_for(db_path))),
+                ),
             ])),
         ),
         (

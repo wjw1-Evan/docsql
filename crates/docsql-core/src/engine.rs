@@ -255,18 +255,16 @@ impl TableMeta {
     /// Enforce PRIMARY KEY / UNIQUE across the whole (rewritten) doc set.
     fn check_unique(&self, docs: &[Object]) -> Result<()> {
         for col in self.primary_key.iter().chain(self.unique.iter()) {
-            let mut seen: Vec<Vec<u8>> = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
             for doc in docs {
                 if let Some(v) = doc.get(col) {
                     if matches!(v, Value::Null) {
                         continue;
                     }
                     let key = encode::encode_to_vec(v).map_err(SqlError::Encode)?;
-                    if seen.binary_search(&key).is_ok() {
+                    if !seen.insert(key) {
                         return err(format!("UNIQUE constraint failed: {col}"));
                     }
-                    seen.push(key);
-                    seen.sort();
                 }
             }
         }
@@ -876,6 +874,10 @@ impl Database {
         };
         self.savepoints.clear();
         self.tables.clear();
+        // Tables created inside the transaction have no snapshot entry, so
+        // their autoinc watermarks survive a table-clear; re-CREATE would
+        // resume from the stale value instead of max+1 = 1.
+        self.autoinc_cache.clear();
         for (name, (mut meta, docs)) in snap {
             self.rewrite_table(&name, &mut meta, docs)?;
         }
@@ -894,9 +896,10 @@ impl Database {
         Ok(ExecOutcome::Affected(0))
     }
 
-    /// RELEASE SAVEPOINT name: forget the savepoint (changes stay).
+    /// RELEASE SAVEPOINT name: forget the savepoint (changes stay). With
+    /// duplicate names the most recent one is released (SQLite semantics).
     fn release_savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
-        let Some(pos) = self.savepoints.iter().position(|(n, _)| n == name) else {
+        let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n == name) else {
             return err(format!("savepoint {name} does not exist"));
         };
         self.savepoints.truncate(pos);
@@ -906,12 +909,15 @@ impl Database {
     /// ROLLBACK TO SAVEPOINT name: restore that savepoint's state; the
     /// outer transaction continues and later savepoints are discarded.
     fn rollback_to_savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
-        let Some(pos) = self.savepoints.iter().position(|(n, _)| n == name) else {
+        let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n == name) else {
             return err(format!("savepoint {name} does not exist"));
         };
         let snap = self.savepoints[pos].1.clone();
         self.savepoints.truncate(pos);
         self.tables.clear();
+        // Same stale-autoinc-cache hazard as a full ROLLBACK: tables whose
+        // pre-savepoint image is absent were created after the savepoint.
+        self.autoinc_cache.clear();
         for (name, (mut meta, docs)) in snap {
             self.rewrite_table(&name, &mut meta, docs)?;
         }
@@ -1031,19 +1037,6 @@ impl Database {
     /// True when a session transaction is open.
     pub fn in_transaction(&self) -> bool {
         self.tx_snapshot.is_some()
-    }
-
-    /// Classify transaction-control statements, used by servers to time
-    /// replication: writes inside an open transaction must not reach peers
-    /// until the transaction commits; a rollback discards them.
-    pub fn tx_control(sql: &str) -> TxControl {
-        let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else {
-            return TxControl::None;
-        };
-        match stmts.first() {
-            Some(stmt) => Self::classify_tx(stmt),
-            None => TxControl::None,
-        }
     }
 
     /// Execute exactly one SQL statement.
@@ -1333,6 +1326,22 @@ impl Database {
         Ok(id)
     }
 
+    /// MAX/MIN(seq) over the journal (0 when empty or negative somehow).
+    fn journal_seq_boundary(&mut self, agg: &str) -> Result<u64> {
+        self.ensure_cluster_tables()?;
+        let r = self.execute(&format!("SELECT {agg}(seq) FROM {CLUSTER_LOG_TABLE}"))?;
+        Ok(match r {
+            ExecOutcome::Rows(rows) => rows
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0) as u64,
+            _ => 0,
+        })
+    }
+
     /// Append one locally-committed write to the journal and return its
     /// seq. Call immediately after the write commits, before fanning out:
     /// the entry then exists for every peer that ever pulls catch-up,
@@ -1344,19 +1353,7 @@ impl Database {
         self.ensure_cluster_tables()?;
         let next = match self.journal_next {
             Some(n) => n,
-            None => {
-                let r = self.execute(&format!("SELECT MAX(seq) FROM {CLUSTER_LOG_TABLE}"))?;
-                let max = match r {
-                    ExecOutcome::Rows(rows) => rows
-                        .rows
-                        .first()
-                        .and_then(|row| row.first())
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0),
-                    _ => 0,
-                };
-                (max as u64) + 1
-            }
+            None => self.journal_seq_boundary("MAX")? + 1,
         };
         self.execute(&format!(
             "INSERT INTO {CLUSTER_LOG_TABLE} (seq, sql) VALUES ({next}, {})",
@@ -1368,34 +1365,14 @@ impl Database {
 
     /// Highest journal seq (0 when empty).
     pub fn journal_head(&mut self) -> Result<u64> {
-        self.ensure_cluster_tables()?;
-        let r = self.execute(&format!("SELECT MAX(seq) FROM {CLUSTER_LOG_TABLE}"))?;
-        Ok(match r {
-            ExecOutcome::Rows(rows) => rows
-                .rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(Value::as_i64)
-                .unwrap_or(0) as u64,
-            _ => 0,
-        })
+        self.journal_seq_boundary("MAX")
     }
 
     /// Lowest journal seq still retained (0 when empty). A position below
     /// this minus one means the needed range was trimmed away and the
     /// peer must fall back to a full snapshot.
     pub fn journal_oldest(&mut self) -> Result<u64> {
-        self.ensure_cluster_tables()?;
-        let r = self.execute(&format!("SELECT MIN(seq) FROM {CLUSTER_LOG_TABLE}"))?;
-        Ok(match r {
-            ExecOutcome::Rows(rows) => rows
-                .rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(Value::as_i64)
-                .unwrap_or(0) as u64,
-            _ => 0,
-        })
+        self.journal_seq_boundary("MIN")
     }
 
     /// Journal entries with seq > `after`, in order, capped at `limit`
@@ -1754,6 +1731,7 @@ impl Database {
                 // (async-commit mode leaves it to the background flusher).
                 if !self.async_commit {
                     self.pager.sync_wal().map_err(SqlError::from)?;
+                    self.pending_sync = false;
                 }
                 Ok(ExecOutcome::Affected(0))
             }
@@ -2040,14 +2018,9 @@ impl Database {
                 for doc in docs {
                     if self.matches(&selection, &doc)? {
                         old_changed.push(doc.clone());
+                        let new_vals = eval_assignments(&assignments, &doc)?;
                         let mut doc = doc;
-                        for a in &assignments {
-                            let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target
-                            else {
-                                return err("unsupported assignment target");
-                            };
-                            let col_name = obj_name(col);
-                            let v = eval_expr(&a.value, &doc)?;
+                        for (col_name, v) in new_vals {
                             doc.insert(col_name, v);
                         }
                         count += 1;
@@ -2085,20 +2058,17 @@ impl Database {
                 from_list.extend(extra);
                 let merged = self.load_from(&from_list, &None)?;
                 let prefix = format!("{tkey}.");
-                let mut updates: std::collections::BTreeMap<Vec<u8>, Object> =
-                    std::collections::BTreeMap::new();
+                // First qualifying match per target content: every output
+                // row with that content receives that image — including
+                // byte-identical duplicate rows, which are distinct rows
+                // despite sharing a key.
+                let mut updates: std::collections::HashMap<Vec<u8>, Object> =
+                    std::collections::HashMap::new();
                 let mut changed_docs: Vec<Object> = Vec::new();
                 let mut old_changed: Vec<Object> = Vec::new();
                 for m in &merged {
-                    // Rebuild the target doc from its qualified slice.
-                    let mut tdoc = Object::new();
-                    for (k, v) in m {
-                        if let Some(col) = k.strip_prefix(&prefix) {
-                            tdoc.insert(col.to_string(), v.clone());
-                        }
-                    }
-                    let key =
-                        encode::encode_to_vec(&Value::Object(tdoc.clone())).unwrap_or_default();
+                    let tdoc = target_doc_from_merged(m, &prefix);
+                    let key = object_key(&tdoc);
                     if updates.contains_key(&key) {
                         continue; // first qualifying match wins
                     }
@@ -2106,26 +2076,25 @@ impl Database {
                         continue;
                     }
                     old_changed.push(tdoc.clone());
-                    for a in &assignments {
-                        let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target else {
-                            return err("unsupported assignment target");
-                        };
-                        let col_name = obj_name(col);
-                        let v = eval_expr(&a.value, m)?;
+                    let new_vals = eval_assignments(&assignments, m)?;
+                    let mut tdoc = tdoc;
+                    for (col_name, v) in new_vals {
                         tdoc.insert(col_name, v);
                     }
                     changed_docs.push(tdoc.clone());
                     updates.insert(key, tdoc);
                 }
+                let mut count = 0u64;
                 let out: Vec<Object> = docs
                     .into_iter()
-                    .map(|doc| {
-                        let key =
-                            encode::encode_to_vec(&Value::Object(doc.clone())).unwrap_or_default();
-                        updates.remove(&key).unwrap_or(doc)
+                    .map(|doc| match updates.get(&object_key(&doc)) {
+                        Some(img) => {
+                            count += 1;
+                            img.clone()
+                        }
+                        None => doc,
                     })
                     .collect();
-                let count = changed_docs.len() as u64;
                 (out, changed_docs, old_changed, count)
             }
         };
@@ -2162,15 +2131,11 @@ impl Database {
             }
             let mut doc = doc;
             // The pre-update image must be captured before assignments run —
-            // it drives reindex_replace's old-key removal; pushing the mutated
-            // doc as both old and new leaves stale index entries behind.
+            // it drives the old-key removal in the apply loop below; pushing
+            // the mutated doc as both old and new leaves stale entries.
             let old_doc = doc.clone();
-            for a in assignments {
-                let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target else {
-                    return err("unsupported assignment target");
-                };
-                let col_name = obj_name(col);
-                let v = eval_expr(&a.value, &doc)?;
+            let new_vals = eval_assignments(assignments, &doc)?;
+            for (col_name, v) in new_vals {
                 doc.insert(col_name, v);
             }
             meta.check(&doc)?;
@@ -2191,9 +2156,9 @@ impl Database {
         self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
         // Pre-statement docs for the legacy whole-set unique check below —
         // loaded only when that check can actually run (a constraint column
-        // without a tree). Tables with full trees enforce uniqueness via
-        // reindex_replace; loading every doc here made single-row UPDATE
-        // loops quadratic.
+        // without a tree). Tables with full trees enforce uniqueness in the
+        // apply loop; loading every doc here made single-row UPDATE loops
+        // quadratic.
         let legacy_check = (meta.primary_key.is_some() || !meta.unique.is_empty())
             && meta
                 .primary_key
@@ -2209,9 +2174,28 @@ impl Database {
             pages: meta.pages.clone(),
         };
         let mut roots = meta.index_roots.clone();
+        let idx_cols: Vec<String> = roots.keys().cloned().collect();
         let mut tx = self.pager.begin_tx();
+        // Pass 1: drop every updated row's old index entries before any
+        // replacement lands — a multi-row unique-key shift (SET id = id + 1,
+        // key swaps between rows) must not collide with a not-yet-replaced
+        // row's still-present old key.
+        for (loc, old_doc, _) in &updates {
+            if let Err(e) = reindex_remove(
+                &mut self.pager,
+                &mut tx,
+                &idx_cols,
+                &mut roots,
+                old_doc,
+                *loc,
+            ) {
+                self.pager.abort_tx(tx)?;
+                return Err(e);
+            }
+        }
+        // Pass 2: apply the new images.
         for i in 0..updates.len() {
-            let (loc, old_doc, new_doc) = updates[i].clone();
+            let (loc, _, new_doc) = updates[i].clone();
             let page = crate::heap::unpack_loc(loc).0;
             let before = heap.page_docs(&mut self.pager, &tx, page)?;
             let out = heap.replace(&mut self.pager, &mut tx, loc, &new_doc)?;
@@ -2226,22 +2210,32 @@ impl Database {
                 }
             }
             for (old_l, new_l) in &out.moved {
-                reindex_repoint(
+                // Updated rows had their entries removed in pass 1 and
+                // receive their new-image entries in their own iteration;
+                // repointing them here would resurrect the removed old-key
+                // entry at the new locator.
+                if *old_l == loc || updates.iter().any(|(l, _, _)| l == old_l) {
+                    continue;
+                }
+                if let Err(e) = reindex_repoint(
                     &mut self.pager,
                     &mut tx,
+                    &idx_cols,
                     &mut roots,
                     &before,
                     *old_l,
                     *new_l,
-                )?;
+                ) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
             }
-            if let Err(e) = reindex_replace(
+            if let Err(e) = reindex_insert(
                 &mut self.pager,
                 &mut tx,
                 &meta,
+                &idx_cols,
                 &mut roots,
-                &old_doc,
-                loc,
                 &new_doc,
                 out.placed,
             ) {
@@ -2251,7 +2245,7 @@ impl Database {
         }
         // Legacy files whose constraint columns predate trees keep the
         // whole-set duplicate check (mirrors the INSERT path); tables with
-        // trees enforce uniqueness through reindex_replace above.
+        // trees enforce uniqueness through the apply loop above.
         if legacy_check {
             let combined: Vec<Object> = all_docs
                 .expect("pre-statement docs loaded for the legacy check")
@@ -2333,19 +2327,13 @@ impl Database {
                 if !self.matches(&selection, m)? {
                     continue;
                 }
-                let mut tdoc = Object::new();
-                for (k, v) in m {
-                    if let Some(col) = k.strip_prefix(&prefix) {
-                        tdoc.insert(col.to_string(), v.clone());
-                    }
-                }
-                rm.insert(encode::encode_to_vec(&Value::Object(tdoc)).unwrap_or_default());
+                let tdoc = target_doc_from_merged(m, &prefix);
+                rm.insert(object_key(&tdoc));
             }
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for doc in docs {
-                let key = encode::encode_to_vec(&Value::Object(doc.clone())).unwrap_or_default();
-                if rm.contains(&key) {
+                if rm.contains(&object_key(&doc)) {
                     removed.push(doc);
                 } else {
                     kept.push(doc);
@@ -2400,6 +2388,7 @@ impl Database {
             pages: meta.pages.clone(),
         };
         let mut roots = meta.index_roots.clone();
+        let idx_cols: Vec<String> = roots.keys().cloned().collect();
         let mut tx = self.pager.begin_tx();
         let affected: std::collections::BTreeSet<u32> = targets
             .iter()
@@ -2412,12 +2401,13 @@ impl Database {
         let locs: Vec<u64> = targets.iter().map(|(l, _)| *l).collect();
         let moves = heap.remove_many(&mut self.pager, &mut tx, &locs)?;
         for (loc, doc) in &targets {
-            reindex_remove(&mut self.pager, &mut tx, &mut roots, doc, *loc)?;
+            reindex_remove(&mut self.pager, &mut tx, &idx_cols, &mut roots, doc, *loc)?;
         }
         for (old_l, new_l) in &moves {
             reindex_repoint(
                 &mut self.pager,
                 &mut tx,
+                &idx_cols,
                 &mut roots,
                 &before,
                 *old_l,
@@ -2503,6 +2493,9 @@ impl Database {
         let Some(mut meta) = self.tables.get(&tname).cloned() else {
             return err(format!("table {tname} does not exist"));
         };
+        // rewrite_table persists the catalog in its own transaction; only
+        // metadata-only ALTERs (plain ADD COLUMN) need the tail save.
+        let mut rewrote = false;
         for op in &alter.operations {
             match op {
                 Op::AddColumn { column_def, .. } => {
@@ -2564,6 +2557,7 @@ impl Database {
                             })
                             .collect();
                         self.rewrite_table(&tname, &mut meta, filled)?;
+                        rewrote = true;
                     }
                 }
                 Op::DropColumn { column_names, .. } => {
@@ -2609,6 +2603,7 @@ impl Database {
                         })
                         .collect();
                     self.rewrite_table(&tname, &mut meta, stripped)?;
+                    rewrote = true;
                 }
                 Op::RenameColumn {
                     old_column_name,
@@ -2706,6 +2701,7 @@ impl Database {
                         })
                         .collect();
                     self.rewrite_table(&tname, &mut meta, renamed)?;
+                    rewrote = true;
                 }
                 Op::RenameTable { table_name } => {
                     let new_name = match table_name {
@@ -2725,8 +2721,10 @@ impl Database {
                 other => return err(format!("unsupported ALTER TABLE operation: {other}")),
             }
         }
-        self.tables.insert(tname.clone(), meta);
-        self.save_catalog()?;
+        if !rewrote {
+            self.tables.insert(tname.clone(), meta);
+            self.save_catalog()?;
+        }
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -3343,6 +3341,10 @@ impl Database {
             .filter(|c| roots.contains_key(*c))
             .cloned()
             .collect();
+        // Every indexed column (constraint trees + plain CREATE INDEX trees),
+        // hoisted once so the per-row maintenance loops below do not clone
+        // the roots map per row.
+        let idx_cols: Vec<String> = roots.keys().cloned().collect();
 
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
@@ -3376,12 +3378,13 @@ impl Database {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
                     continue;
                 };
-                reindex_remove(&mut self.pager, &mut tx, &mut roots, doc, *loc)?;
+                reindex_remove(&mut self.pager, &mut tx, &idx_cols, &mut roots, doc, *loc)?;
             }
             for (old_l, new_l) in &moves {
                 reindex_repoint(
                     &mut self.pager,
                     &mut tx,
+                    &idx_cols,
                     &mut roots,
                     &before,
                     *old_l,
@@ -3434,19 +3437,20 @@ impl Database {
                 }
             }
             // Non-constraint CREATE INDEX trees (non-unique).
-            for (col, root) in roots.clone() {
-                if indexed.contains(&col) {
+            for col in &idx_cols {
+                if indexed.contains(col) {
                     continue;
                 }
-                let Some(v) = doc.get(&col) else { continue };
+                let Some(v) = doc.get(col) else { continue };
                 if matches!(v, Value::Null) {
                     continue;
                 }
+                let root = roots[col.as_str()];
                 let mut tree = BTree::open(root);
                 tree.insert(&mut self.pager, &mut tx, v.clone(), loc, false)
-                    .map_err(|e| index_err(&col, e))?;
+                    .map_err(|e| index_err(col, e))?;
                 if tree.root != root {
-                    roots.insert(col, tree.root);
+                    roots.insert(col.clone(), tree.root);
                 }
             }
             placed.push((loc, doc));
@@ -3669,32 +3673,8 @@ impl Database {
             // must return zero rows, not one). ORDER BY over a single row
             // cannot reorder anything.
             let mut rows = vec![row];
-            match &query.limit_clause {
-                Some(LimitClause::LimitOffset { limit, offset, .. }) => {
-                    let n = match limit {
-                        Some(e) => match eval_const(e)?.as_i64() {
-                            Some(n) if n >= 0 => n as usize,
-                            // Negative LIMIT means "no limit" (SQLite).
-                            _ => usize::MAX,
-                        },
-                        None => usize::MAX,
-                    };
-                    let skip = match offset {
-                        Some(o) => eval_const(&o.value)?.as_i64().unwrap_or(0).max(0) as usize,
-                        None => 0,
-                    };
-                    rows = rows.into_iter().skip(skip).take(n).collect();
-                }
-                // MySQL form `LIMIT <offset>, <count>` (order reversed).
-                Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                    let skip = eval_const(offset)?.as_i64().unwrap_or(0).max(0) as usize;
-                    let n = match eval_const(limit)?.as_i64() {
-                        Some(n) if n >= 0 => n as usize,
-                        _ => usize::MAX,
-                    };
-                    rows = rows.into_iter().skip(skip).take(n).collect();
-                }
-                None => {}
+            if let Some(lc) = &query.limit_clause {
+                rows = apply_limit_clause(lc, rows)?;
             }
             return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
         }
@@ -3926,16 +3906,25 @@ impl Database {
         rows: Vec<Object>,
         group_exprs: Vec<SqlExpr>,
     ) -> Result<ExecOutcome> {
-        // Evaluate group keys per row.
+        // GROUP BY + aggregates (+ HAVING).
+        // Evaluate group keys per row. Groups hash by the encoded key —
+        // the same byte identity DISTINCT uses — instead of a linear scan
+        // per row (O(rows × groups) on large grouped queries).
         let mut groups: Vec<(Vec<Value>, Vec<&Object>)> = Vec::new();
+        let mut group_index: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
         for doc in &rows {
             let key: Vec<Value> = group_exprs
                 .iter()
                 .map(|e| eval_expr(e, doc))
                 .collect::<Result<_>>()?;
-            match groups.iter_mut().find(|(k, _)| k == &key) {
-                Some((_, g)) => g.push(doc),
-                None => groups.push((key, vec![doc])),
+            let kb = row_key(&key);
+            match group_index.get(&kb) {
+                Some(&gi) => groups[gi].1.push(doc),
+                None => {
+                    group_index.insert(kb, groups.len());
+                    groups.push((key, vec![doc]));
+                }
             }
         }
         // With no GROUP BY, aggregates run over one group even when empty.
@@ -3962,7 +3951,7 @@ impl Database {
         for (key, docs) in &groups {
             let mut row = Vec::with_capacity(agg_specs.len());
             for spec in &agg_specs {
-                row.push(eval_agg(spec, docs, key)?);
+                row.push(eval_agg(spec, docs, key, &group_exprs)?);
             }
             // HAVING: aggregates evaluate over the group's rows directly;
             // everything else evaluates against the output columns, with
@@ -3971,7 +3960,7 @@ impl Database {
             if let Some(having) = &select.having {
                 let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
                 if !matches!(
-                    eval_having(having, &doc, docs, &group_exprs)?,
+                    eval_group_expr(having, &doc, docs, &group_exprs)?,
                     Value::Bool(true)
                 ) {
                     continue;
@@ -4002,16 +3991,23 @@ impl Database {
                 i.value
             ));
         }
-        let SqlExpr::Function(f) = e else {
-            return err(format!("unsupported aggregate projection: {e}"));
-        };
-        let (op, inner, distinct, sep) = agg_parts(f)?;
-        Ok(AggSpec::Agg {
-            op,
-            arg: inner,
-            distinct,
-            sep,
-        })
+        if let SqlExpr::Function(f) = e {
+            if is_agg_fn(f) {
+                let (op, inner, distinct, sep) = agg_parts(f)?;
+                return Ok(AggSpec::Agg {
+                    op,
+                    arg: inner,
+                    distinct,
+                    sep,
+                });
+            }
+        }
+        // Composite expressions containing aggregate calls.
+        if contains_agg(e) {
+            check_group_refs(e, group_exprs)?;
+            return Ok(AggSpec::Composite { expr: e.clone() });
+        }
+        err(format!("unsupported aggregate projection: {e}"))
     }
 
     fn load_table_factor(
@@ -4206,32 +4202,8 @@ impl Database {
                 }
             }
         }
-        match &query.limit_clause {
-            Some(LimitClause::LimitOffset { limit, offset, .. }) => {
-                let n = match limit {
-                    Some(e) => match eval_const(e)?.as_i64() {
-                        Some(n) if n >= 0 => n as usize,
-                        // Negative LIMIT means "no limit" (SQLite).
-                        _ => usize::MAX,
-                    },
-                    None => usize::MAX,
-                };
-                let skip = match offset {
-                    Some(o) => eval_const(&o.value)?.as_i64().unwrap_or(0).max(0) as usize,
-                    None => 0,
-                };
-                rows = rows.into_iter().skip(skip).take(n).collect();
-            }
-            // MySQL form `LIMIT <offset>, <count>` (order reversed).
-            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                let skip = eval_const(offset)?.as_i64().unwrap_or(0).max(0) as usize;
-                let n = match eval_const(limit)?.as_i64() {
-                    Some(n) if n >= 0 => n as usize,
-                    _ => usize::MAX,
-                };
-                rows = rows.into_iter().skip(skip).take(n).collect();
-            }
-            None => {}
+        if let Some(lc) = &query.limit_clause {
+            rows = apply_limit_clause(lc, rows)?;
         }
         Ok(rows)
     }
@@ -4308,6 +4280,12 @@ enum AggSpec {
         arg: SqlExpr,
         distinct: bool,
         sep: Option<String>,
+    },
+    /// Aggregate arithmetic in the projection (`SUM(x) + 1`, `-COUNT(*)`,
+    /// `COALESCE(SUM(x), 0)`): the whole expression evaluates over the
+    /// group with aggregate subcalls resolved.
+    Composite {
+        expr: SqlExpr,
     },
 }
 
@@ -4420,9 +4398,18 @@ fn consume_one(counts: &mut std::collections::BTreeMap<Vec<u8>, usize>, row: &[V
     }
 }
 
-fn eval_agg(spec: &AggSpec, docs: &[&Object], key: &[Value]) -> Result<Value> {
+fn eval_agg(
+    spec: &AggSpec,
+    docs: &[&Object],
+    key: &[Value],
+    group_exprs: &[SqlExpr],
+) -> Result<Value> {
     match spec {
         AggSpec::GroupKey { idx } => Ok(key.get(*idx).cloned().unwrap_or(Value::Null)),
+        AggSpec::Composite { expr } => {
+            let empty = Object::new();
+            eval_group_expr(expr, &empty, docs, group_exprs)
+        }
         AggSpec::Agg {
             op,
             arg,
@@ -4584,16 +4571,51 @@ fn is_agg_item(item: &SelectItem) -> bool {
     contains_agg(e)
 }
 
+/// True for the aggregate functions the executor knows (`COUNT`/`SUM`/...).
+/// Window forms (`OVER`) are never aggregates here.
+fn is_agg_fn(f: &sqlparser::ast::Function) -> bool {
+    !f.over.is_some()
+        && matches!(
+            f.name.to_string().to_uppercase().as_str(),
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
+        )
+}
+
 fn contains_agg(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
-            !f.over.is_some()
-                && matches!(
-                    f.name.to_string().to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
-                )
+            if is_agg_fn(f) {
+                return true;
+            }
+            // Aggregate calls wrapped in scalar functions or arithmetic
+            // (`COALESCE(SUM(x), 0)`, `SUM(x) + 1`) count too.
+            match &f.args {
+                sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|a| {
+                    matches!(
+                        a,
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) if contains_agg(inner)
+                    )
+                }),
+                _ => false,
+            }
         }
         SqlExpr::Nested(inner) => contains_agg(inner),
+        SqlExpr::BinaryOp { left, right, .. } => contains_agg(left) || contains_agg(right),
+        SqlExpr::UnaryOp { expr, .. } => contains_agg(expr),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(contains_agg)
+                || conditions
+                    .iter()
+                    .any(|w| contains_agg(&w.condition) || contains_agg(&w.result))
+                || else_result.as_deref().is_some_and(contains_agg)
+        }
         _ => false,
     }
 }
@@ -4710,28 +4732,72 @@ fn expr_name(e: &SqlExpr) -> String {
     }
 }
 
-/// Replace identifier `old` with `new` in SQL text, matching whole
-/// identifiers only (adjacent word characters disqualify the match).
-fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
-    fn is_word(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+/// Encoded identity of a document (UPDATE ... FROM / DELETE ... USING match
+/// target rows by content).
+fn object_key(doc: &Object) -> Vec<u8> {
+    encode::encode_to_vec(&Value::Object(doc.clone())).unwrap_or_default()
+}
+
+/// Rebuild a target table's document from its qualified slice of a merged
+/// FROM row (UPDATE ... FROM / DELETE ... USING).
+fn target_doc_from_merged(m: &Object, prefix: &str) -> Object {
+    let mut tdoc = Object::new();
+    for (k, v) in m {
+        if let Some(col) = k.strip_prefix(prefix) {
+            tdoc.insert(col.to_string(), v.clone());
+        }
     }
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    tdoc
+}
+
+/// Evaluate SET assignments against the pre-update image and return them as
+/// (column, value) pairs. SQL binds every right-hand side before any column
+/// is written: in `SET a = a + 1, b = a`, `b` must observe the old `a`.
+fn eval_assignments(
+    assignments: &[sqlparser::ast::Assignment],
+    doc: &Object,
+) -> Result<Vec<(String, Value)>> {
+    assignments
+        .iter()
+        .map(|a| {
+            let sqlparser::ast::AssignmentTarget::ColumnName(col) = &a.target else {
+                return err("unsupported assignment target");
+            };
+            Ok((obj_name(col), eval_expr(&a.value, doc)?))
+        })
+        .collect()
+}
+
+/// Replace identifier `old` with `new` in SQL text, matching whole
+/// identifiers only (adjacent identifier characters disqualify the match).
+/// Walks char boundaries — a byte walk would panic slicing into a multibyte
+/// identifier, and non-ASCII chars count as identifier characters so the
+/// `a` inside `éa` can never match.
+fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
+    fn is_word(c: char) -> bool {
+        !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let old_chars = old.chars().count();
+    let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if text[i..].starts_with(old)
-            && (i == 0 || !is_word(bytes[i - 1]))
-            && !bytes.get(i + old.len()).copied().is_some_and(is_word)
-        {
-            out.extend_from_slice(new.as_bytes());
-            i += old.len();
+    while i < chars.len() {
+        let (byte_i, c) = chars[i];
+        let prev_word = i > 0 && is_word(chars[i - 1].1);
+        let next_word = chars
+            .get(i + old_chars)
+            .copied()
+            .map(|(_, c2)| is_word(c2))
+            .unwrap_or(false);
+        if !prev_word && !next_word && text[byte_i..].starts_with(old) {
+            out.push_str(new);
+            i += old_chars;
         } else {
-            out.push(bytes[i]);
+            out.push(c);
             i += 1;
         }
     }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+    out
 }
 
 /// Collect the table names and aliases a query reads in its own FROM, so
@@ -4886,10 +4952,15 @@ fn sql_value(v: &sqlparser::ast::Value) -> Result<Value> {
             if let Ok(i) = n.parse::<i64>() {
                 Value::Int(i)
             } else {
-                Value::Float(
-                    n.parse::<f64>()
-                        .map_err(|_| SqlError::Message(format!("bad number {n}")))?,
-                )
+                let f = n
+                    .parse::<f64>()
+                    .map_err(|_| SqlError::Message(format!("bad number {n}")))?;
+                // Overflowing literals ("1e999") parse to inf; admitting
+                // them would store rows no dump or journal replay can render.
+                if !f.is_finite() {
+                    return err(format!("non-finite numeric literal: {n}"));
+                }
+                Value::Float(f)
             }
         }
         V::SingleQuotedString(s) | V::DoubleQuotedString(s) => Value::Str(s.clone()),
@@ -5194,6 +5265,48 @@ fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
     pi == p.len()
 }
 
+/// LIMIT/OFFSET windowing shared by the FROM-less and general SELECT paths.
+/// A negative limit or offset means "no limit"/"skip nothing" (SQLite);
+/// non-integer values are an error, not a silently unlimited query.
+fn apply_limit_clause(
+    limit_clause: &LimitClause,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>> {
+    fn limit_count(e: &SqlExpr) -> Result<usize> {
+        match eval_const(e)?.as_i64() {
+            Some(n) if n >= 0 => Ok(n as usize),
+            Some(_) => Ok(usize::MAX), // negative LIMIT means "no limit" (SQLite)
+            None => err("LIMIT must be a non-negative integer"),
+        }
+    }
+    fn offset_count(e: &SqlExpr) -> Result<usize> {
+        match eval_const(e)?.as_i64() {
+            Some(n) if n >= 0 => Ok(n as usize),
+            Some(_) => Ok(0),
+            None => err("OFFSET must be a non-negative integer"),
+        }
+    }
+    match limit_clause {
+        LimitClause::LimitOffset { limit, offset, .. } => {
+            let n = match limit {
+                Some(e) => limit_count(e)?,
+                None => usize::MAX,
+            };
+            let skip = match offset {
+                Some(o) => offset_count(&o.value)?,
+                None => 0,
+            };
+            Ok(rows.into_iter().skip(skip).take(n).collect())
+        }
+        // MySQL form `LIMIT <offset>, <count>` (order reversed).
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            let skip = offset_count(offset)?;
+            let n = limit_count(limit)?;
+            Ok(rows.into_iter().skip(skip).take(n).collect())
+        }
+    }
+}
+
 /// Canonical text form of a value (CAST AS TEXT, GROUP_CONCAT, ||).
 fn value_to_text(v: &Value) -> String {
     match v {
@@ -5309,7 +5422,9 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             } else {
                 let x = as_f64(arg(args, 0, name)?)?;
                 let digits = match args.get(1) {
-                    Some(Value::Int(d)) => *d,
+                    // Clamp into f64-precision territory: the raw i64 would
+                    // wrap through powi's i32 and round to a random scale.
+                    Some(Value::Int(d)) => (*d).clamp(-15, 15),
                     _ => 0,
                 };
                 let m = 10f64.powi(digits as i32);
@@ -5525,12 +5640,7 @@ fn probe_plan(
             _ => continue,
         };
         let name = match col_ref {
-            SqlExpr::Identifier(i) => i.value.clone(),
-            SqlExpr::CompoundIdentifier(parts) => parts
-                .iter()
-                .map(|p| p.value.clone())
-                .collect::<Vec<_>>()
-                .join("."),
+            SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(col_ref),
             _ => continue,
         };
         // The literal side must be a constant (subqueries were substituted
@@ -5567,11 +5677,41 @@ fn probe_plan(
     let mut hi: Option<(Value, bool)> = None;
     for (op, v) in bounds {
         use BinaryOperator::*;
+        use Ordering::Equal as Eq;
+        // Keep the TIGHTEST bound per side, not the last one written —
+        // `a > 10 AND a > 5` must probe from 10 (the residual filter
+        // guarantees correctness either way; this only narrows the scan).
         match op {
-            Gt => lo = Some((v, false)),
-            GtEq => lo = Some((v, true)),
-            Lt => hi = Some((v, false)),
-            LtEq => hi = Some((v, true)),
+            Gt => {
+                if lo.as_ref().is_none_or(|(cv, incl)| {
+                    Value::cmp_values(&v, cv) == Ordering::Greater
+                        || (Value::cmp_values(&v, cv) == Eq && *incl)
+                }) {
+                    lo = Some((v, false));
+                }
+            }
+            GtEq => {
+                if lo
+                    .as_ref()
+                    .is_none_or(|(cv, _)| Value::cmp_values(&v, cv) == Ordering::Greater)
+                {
+                    lo = Some((v, true));
+                }
+            }
+            Lt => {
+                if hi.as_ref().is_none_or(|(cv, incl)| {
+                    Value::cmp_values(&v, cv) == Ordering::Less
+                        || (Value::cmp_values(&v, cv) == Eq && *incl)
+                }) {
+                    hi = Some((v, false));
+                }
+            }
+            LtEq if hi
+                .as_ref()
+                .is_none_or(|(cv, _)| Value::cmp_values(&v, cv) == Ordering::Less) =>
+            {
+                hi = Some((v, true));
+            }
             _ => {}
         }
     }
@@ -5606,6 +5746,7 @@ fn is_constraint_col(meta: &TableMeta, col: &str) -> bool {
 fn reindex_repoint(
     pager: &mut Pager,
     tx: &mut crate::pager::Tx,
+    cols: &[String],
     roots: &mut std::collections::BTreeMap<String, u32>,
     before: &[(u64, Object)],
     old_l: u64,
@@ -5614,16 +5755,17 @@ fn reindex_repoint(
     let Some((_, doc)) = before.iter().find(|(l, _)| *l == old_l) else {
         return err("index fixup: moved document not found");
     };
-    for (col, root) in roots.clone() {
-        if let Some(v) = doc.get(&col) {
+    for col in cols {
+        if let Some(v) = doc.get(col) {
             if !matches!(v, Value::Null) {
+                let root = roots[col];
                 let mut tree = BTree::open(root);
                 tree.delete_entry(pager, tx, v, old_l)
-                    .map_err(|e| index_err(&col, e))?;
+                    .map_err(|e| index_err(col, e))?;
                 tree.insert(pager, tx, v.clone(), new_l, false)
-                    .map_err(|e| index_err(&col, e))?;
+                    .map_err(|e| index_err(col, e))?;
                 if tree.root != root {
-                    roots.insert(col, tree.root);
+                    roots.insert(col.clone(), tree.root);
                 }
             }
         }
@@ -5635,18 +5777,20 @@ fn reindex_repoint(
 fn reindex_remove(
     pager: &mut Pager,
     tx: &mut crate::pager::Tx,
+    cols: &[String],
     roots: &mut std::collections::BTreeMap<String, u32>,
     doc: &Object,
     loc: u64,
 ) -> Result<()> {
-    for (col, root) in roots.clone() {
-        if let Some(v) = doc.get(&col) {
+    for col in cols {
+        if let Some(v) = doc.get(col) {
             if !matches!(v, Value::Null) {
+                let root = roots[col];
                 let mut tree = BTree::open(root);
                 tree.delete_entry(pager, tx, v, loc)
-                    .map_err(|e| index_err(&col, e))?;
+                    .map_err(|e| index_err(col, e))?;
                 if tree.root != root {
-                    roots.insert(col, tree.root);
+                    roots.insert(col.clone(), tree.root);
                 }
             }
         }
@@ -5654,53 +5798,125 @@ fn reindex_remove(
     Ok(())
 }
 
-/// Swap one document's index entries for its updated keys (fast-path
-/// UPDATE). Constraint columns enforce uniqueness on insert.
-#[allow(clippy::too_many_arguments)]
-fn reindex_replace(
+/// Insert one document's index entries (fast-path UPDATE pass 2). Constraint
+/// columns enforce uniqueness on insert.
+fn reindex_insert(
     pager: &mut Pager,
     tx: &mut crate::pager::Tx,
     meta: &TableMeta,
+    cols: &[String],
     roots: &mut std::collections::BTreeMap<String, u32>,
-    old_doc: &Object,
-    old_l: u64,
-    new_doc: &Object,
-    new_l: u64,
+    doc: &Object,
+    loc: u64,
 ) -> Result<()> {
-    for (col, root) in roots.clone() {
-        let old_v = old_doc.get(&col).filter(|v| !matches!(v, Value::Null));
-        let new_v = new_doc.get(&col).filter(|v| !matches!(v, Value::Null));
-        if old_v.is_none() && new_v.is_none() {
-            continue;
-        }
-        let mut tree = BTree::open(root);
-        if let Some(v) = old_v {
-            tree.delete_entry(pager, tx, v, old_l)
-                .map_err(|e| index_err(&col, e))?;
-        }
-        if let Some(v) = new_v {
-            tree.insert(pager, tx, v.clone(), new_l, is_constraint_col(meta, &col))
-                .map_err(|e| index_err(&col, e))?;
-        }
-        if tree.root != root {
-            roots.insert(col, tree.root);
+    for col in cols {
+        if let Some(v) = doc.get(col) {
+            if !matches!(v, Value::Null) {
+                let root = roots[col];
+                let mut tree = BTree::open(root);
+                tree.insert(pager, tx, v.clone(), loc, is_constraint_col(meta, col))
+                    .map_err(|e| index_err(col, e))?;
+                if tree.root != root {
+                    roots.insert(col.clone(), tree.root);
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// HAVING evaluation: aggregate subexpressions are computed over the group's
-/// rows; bare columns matching a GROUP BY expression resolve to the group key
-/// (via the group's rows — every row shares the key value); everything else
-/// evaluates against the already-projected columns.
-fn eval_having(
+/// Composite aggregate projections may reference columns outside the
+/// aggregate arguments only when they are GROUP BY expressions — the
+/// bare-column rule of `agg_spec`, applied inside nested expressions.
+/// Constructs without explicit support reject loudly rather than silently
+/// evaluating columns to NULL.
+fn check_group_refs(e: &SqlExpr, group_exprs: &[SqlExpr]) -> Result<()> {
+    match e {
+        SqlExpr::Function(f) if is_agg_fn(f) => Ok(()), // per-row inside eval_agg
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        check_group_refs(inner, group_exprs)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Nested(inner) => check_group_refs(inner, group_exprs),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            check_group_refs(left, group_exprs)?;
+            check_group_refs(right, group_exprs)
+        }
+        SqlExpr::UnaryOp { expr, .. } => check_group_refs(expr, group_exprs),
+        SqlExpr::Cast { expr, .. } => check_group_refs(expr, group_exprs),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                check_group_refs(o, group_exprs)?;
+            }
+            for w in conditions {
+                check_group_refs(&w.condition, group_exprs)?;
+                check_group_refs(&w.result, group_exprs)?;
+            }
+            if let Some(r) = else_result {
+                check_group_refs(r, group_exprs)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Identifier(i) => {
+            if group_exprs
+                .iter()
+                .any(|g| matches!(g, SqlExpr::Identifier(gi) if gi.value == i.value))
+            {
+                Ok(())
+            } else {
+                err(format!(
+                    "column {} must appear in GROUP BY or an aggregate",
+                    i.value
+                ))
+            }
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            let name = parts
+                .iter()
+                .map(|p| p.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            if group_exprs.iter().any(|g| expr_name(g) == name) {
+                Ok(())
+            } else {
+                err(format!(
+                    "column {name} must appear in GROUP BY or an aggregate"
+                ))
+            }
+        }
+        SqlExpr::Value(_) => Ok(()),
+        other => err(format!("unsupported aggregate expression: {other}")),
+    }
+}
+
+/// Group-aware expression evaluation (HAVING and composite aggregate
+/// projections): aggregate subcalls run over the group's rows, GROUP BY
+/// expressions resolve to the group key (via the group's rows — every row
+/// shares the key value), and everything else evaluates against `out` —
+/// the projected output row for HAVING, empty for projection items (where
+/// `check_group_refs` has already rejected bare non-group columns).
+fn eval_group_expr(
     e: &SqlExpr,
     out: &Object,
     docs: &[&Object],
     group_exprs: &[SqlExpr],
 ) -> Result<Value> {
     match e {
-        SqlExpr::Function(f) if contains_agg(&SqlExpr::Function(f.clone())) => {
+        SqlExpr::Function(f) if is_agg_fn(f) => {
             let (op, arg, distinct, sep) = agg_parts(f)?;
             eval_agg(
                 &AggSpec::Agg {
@@ -5711,7 +5927,28 @@ fn eval_having(
                 },
                 docs,
                 &[],
+                group_exprs,
             )
+        }
+        SqlExpr::Function(f) => {
+            // Scalar function whose arguments may contain aggregates
+            // (`COALESCE(SUM(x), 0)`).
+            let name = f.name.to_string().to_uppercase();
+            if f.over.is_some() {
+                return err(format!("window functions (OVER) are not supported: {name}"));
+            }
+            let mut args = Vec::new();
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    match a {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) => args.push(eval_group_expr(inner, out, docs, group_exprs)?),
+                        _ => return err(format!("unsupported argument to {name}")),
+                    }
+                }
+            }
+            scalar_function(&name, &args)
         }
         SqlExpr::Identifier(i) => {
             if let Some(g) = group_exprs
@@ -5740,11 +5977,64 @@ fn eval_having(
             eval_expr(e, out)
         }
         SqlExpr::BinaryOp { left, op, right } => {
-            let l = eval_having(left, out, docs, group_exprs)?;
-            let r = eval_having(right, out, docs, group_exprs)?;
+            let l = eval_group_expr(left, out, docs, group_exprs)?;
+            let r = eval_group_expr(right, out, docs, group_exprs)?;
             binop(l, op, r)
         }
-        SqlExpr::Nested(inner) => eval_having(inner, out, docs, group_exprs),
+        SqlExpr::UnaryOp { op, expr } => {
+            let v = eval_group_expr(expr, out, docs, group_exprs)?;
+            match (op, v) {
+                (sqlparser::ast::UnaryOperator::Minus, Value::Int(i)) => match i.checked_neg() {
+                    Some(n) => Ok(Value::Int(n)),
+                    // -i64::MIN overflows; mirror literal handling and keep
+                    // the value instead of panicking in debug builds.
+                    None => Ok(Value::Float(-(i as f64))),
+                },
+                (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+                (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
+                _ => err("unsupported unary operand"),
+            }
+        }
+        SqlExpr::Nested(inner) => eval_group_expr(inner, out, docs, group_exprs),
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => {
+            let v = eval_group_expr(expr, out, docs, group_exprs)?;
+            cast_value(v, &data_type.to_string())
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let base = operand
+                .as_ref()
+                .map(|o| eval_group_expr(o, out, docs, group_exprs))
+                .transpose()?;
+            for w in conditions {
+                let hit = match &base {
+                    Some(b) => {
+                        let cv = eval_group_expr(&w.condition, out, docs, group_exprs)?;
+                        !matches!(b, Value::Null)
+                            && !matches!(cv, Value::Null)
+                            && Value::cmp_values(b, &cv) == Ordering::Equal
+                    }
+                    None => matches!(
+                        eval_group_expr(&w.condition, out, docs, group_exprs)?,
+                        Value::Bool(true)
+                    ),
+                };
+                if hit {
+                    return eval_group_expr(&w.result, out, docs, group_exprs);
+                }
+            }
+            match else_result {
+                Some(r) => eval_group_expr(r, out, docs, group_exprs),
+                None => Ok(Value::Null),
+            }
+        }
         other => eval_expr(other, out),
     }
 }
@@ -5985,6 +6275,202 @@ mod tests {
         // and the failed UPDATE changed nothing
         let r = rows(&mut db, "SELECT name FROM t WHERE id = 4");
         assert_eq!(r.rows, vec![vec![Value::Str("u4".into())]]);
+    }
+
+    #[test]
+    fn fast_update_shifts_unique_keys_across_rows() {
+        let mut db = idx_db();
+        insert_n(&mut db, 5);
+        // A multi-row shift used to collide each row's new key with the
+        // next row's still-present old entry.
+        db.execute("UPDATE t SET id = id + 1 WHERE id >= 0")
+            .unwrap();
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        let ids: Vec<i64> = r.rows.iter().filter_map(|v| v[0].as_i64()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        // the trees stay consistent for probes after the shift
+        for i in 1..=5i64 {
+            assert_eq!(
+                rows(&mut db, &format!("SELECT name FROM t WHERE id = {i}")).rows,
+                vec![vec![Value::Str(format!("u{}", i - 1))]]
+            );
+        }
+        assert_eq!(rows(&mut db, "SELECT id FROM t WHERE id = 0").rows.len(), 0);
+        // keys swapped between two rows in one statement
+        db.execute("UPDATE t SET id = CASE id WHEN 1 THEN 2 ELSE 1 END WHERE id <= 2")
+            .unwrap();
+        let r = rows(&mut db, "SELECT id, name FROM t WHERE id <= 2 ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Str("u1".into())],
+                vec![Value::Int(2), Value::Str("u0".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn rollback_discards_autoinc_watermark_of_created_table() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("CREATE TABLE t (id INT AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('a'), ('b')").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        db.execute("CREATE TABLE t (id INT AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (v) VALUES ('c')").unwrap();
+        // Without the cache wipe the recreated table resumed at 3, and any
+        // peer replaying the same INSERTs diverged from max+1 = 1.
+        let r = rows(&mut db, "SELECT id FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // same hazard through ROLLBACK TO SAVEPOINT for a table created
+        // after the savepoint
+        db.execute("BEGIN").unwrap();
+        db.execute("SAVEPOINT sp").unwrap();
+        db.execute("CREATE TABLE u (id INT AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO u (v) VALUES ('x'), ('y')").unwrap();
+        db.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+        db.execute("CREATE TABLE u (id INT AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO u (v) VALUES ('z')").unwrap();
+        let r = rows(&mut db, "SELECT id FROM u");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        db.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn aggregate_arithmetic_in_projection() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (g TEXT, x INT)").unwrap();
+        db.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10)")
+            .unwrap();
+        let r = rows(&mut db, "SELECT SUM(x) + 1 FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(14)]]);
+        let r = rows(&mut db, "SELECT -COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(-3)]]);
+        let r = rows(&mut db, "SELECT COALESCE(SUM(x), 0) FROM t WHERE x > 99");
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+        let r = rows(
+            &mut db,
+            "SELECT g, COUNT(*) * 2 FROM t GROUP BY g ORDER BY g",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("a".into()), Value::Int(4)],
+                vec![Value::Str("b".into()), Value::Int(2)],
+            ]
+        );
+        // HAVING over aggregate arithmetic
+        let r = rows(&mut db, "SELECT g FROM t GROUP BY g HAVING SUM(x) + 1 > 4");
+        assert_eq!(r.rows, vec![vec![Value::Str("b".into())]]);
+        // a bare non-group column inside composite arithmetic still errors
+        let e = db
+            .execute("SELECT x + COUNT(*) FROM t GROUP BY g")
+            .unwrap_err();
+        assert!(e.to_string().contains("must appear in GROUP BY"), "{e}");
+    }
+
+    #[test]
+    fn duplicate_savepoint_names_resolve_to_newest() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("SAVEPOINT sp").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.execute("SAVEPOINT sp").unwrap();
+        db.execute("INSERT INTO t VALUES (3)").unwrap();
+        // rolls back to the SECOND sp (row 3 gone), not the first
+        db.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(2));
+        // ROLLBACK TO dropped the second sp; the remaining one predates row 2
+        db.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(1));
+        db.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn assignments_bind_the_pre_update_image() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+        db.execute("UPDATE t SET a = a + 1, b = a").unwrap();
+        let r = rows(&mut db, "SELECT a, b FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(2), Value::Int(1)]]);
+        // the fast (index-probed) path binds identically
+        db.execute("CREATE TABLE u (id INT PRIMARY KEY, a INT, b INT)")
+            .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 5, 0)").unwrap();
+        db.execute("UPDATE u SET a = a + 1, b = a WHERE id = 1")
+            .unwrap();
+        let r = rows(&mut db, "SELECT a, b FROM u");
+        assert_eq!(r.rows, vec![vec![Value::Int(6), Value::Int(5)]]);
+    }
+
+    #[test]
+    fn non_integer_limit_is_an_error() {
+        let mut db = idx_db();
+        insert_n(&mut db, 3);
+        let e = db.execute("SELECT id FROM t LIMIT 2.5").unwrap_err();
+        assert!(e.to_string().contains("LIMIT"), "{e}");
+        // integers still fine; negative means "no limit" (SQLite)
+        assert_eq!(rows(&mut db, "SELECT id FROM t LIMIT 2").rows.len(), 2);
+        assert_eq!(rows(&mut db, "SELECT id FROM t LIMIT -1").rows.len(), 3);
+    }
+
+    #[test]
+    fn non_finite_float_literals_are_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (x FLOAT)").unwrap();
+        let e = db.execute("INSERT INTO t VALUES (1e999)").unwrap_err();
+        assert!(e.to_string().contains("non-finite"), "{e}");
+        db.execute("INSERT INTO t VALUES (1.5)").unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT x FROM t").rows[0][0],
+            Value::Float(1.5)
+        );
+    }
+
+    #[test]
+    fn rename_column_keeps_multibyte_check_references() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (a INT CHECK (a > 0), \"éa\" INT CHECK (\"éa\" > 0))")
+            .unwrap();
+        run(&mut db, "ALTER TABLE t RENAME COLUMN a TO b");
+        // the renamed column's check followed the rename
+        let e = db.execute("INSERT INTO t (b) VALUES (-1)").unwrap_err();
+        assert!(e.to_string().contains("CHECK"), "{e}");
+        // the multibyte column's check was NOT rewritten (the ASCII-word
+        // boundary bug renamed the `a` inside `éa`, and a missing column in
+        // a CHECK reads as NULL → constraint silently disabled)
+        let e = db
+            .execute("INSERT INTO t (\"éa\") VALUES (-1)")
+            .unwrap_err();
+        assert!(e.to_string().contains("CHECK"), "{e}");
+        db.execute("INSERT INTO t (b, \"éa\") VALUES (2, 2)")
+            .unwrap();
+    }
+
+    #[test]
+    fn update_from_updates_identical_duplicate_rows() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT, v TEXT)").unwrap();
+        // two byte-identical rows and no PK
+        db.execute("INSERT INTO t VALUES (1, 'x'), (1, 'x')")
+            .unwrap();
+        db.execute("CREATE TABLE s (id INT, nv TEXT)").unwrap();
+        db.execute("INSERT INTO s VALUES (1, 'y')").unwrap();
+        db.execute("UPDATE t SET v = s.nv FROM s WHERE t.id = s.id")
+            .unwrap();
+        // both duplicates receive the update (content-keyed matching used
+        // to update only the first)
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t WHERE v = 'y'");
+        assert_eq!(r.rows[0][0], Value::Int(2));
     }
 
     #[test]
@@ -10644,11 +11130,9 @@ mod complex_query_tests {
                 "{sql}\n{e}"
             );
         }
-        // Arithmetic mixing aggregates is not supported either.
-        let e = db
-            .execute("SELECT MAX(amount) - MIN(amount) FROM orders")
-            .unwrap_err();
-        assert!(e.to_string().contains("not allowed in this context"), "{e}");
+        // Arithmetic over aggregates evaluates per group.
+        let r = rows(&mut db, "SELECT MAX(amount) - MIN(amount) FROM orders");
+        assert_eq!(r.rows, vec![vec![Value::Int(260)]]);
         // ORDER BY must use an alias, not a bare aggregate expression.
         let e = db
             .execute(

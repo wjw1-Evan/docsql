@@ -2724,6 +2724,47 @@ async fn sequenced_write_during_join_queues_instead_of_applying() {
     );
 }
 
+/// A BEGIN arriving on a replication frame used to open the global
+/// transaction with no owner connection: every later replicated write then
+/// spun in the 30s busy-wait — nothing could COMMIT or roll it back, and
+/// the owner-disconnect cleanup only fires for owner connections.
+/// Transaction control must be rejected on replication connections.
+#[tokio::test]
+async fn replication_frames_reject_transaction_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let addr = free();
+    spawn_node(&dir, "rtc", &addr, vec![], None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE t (id INT PRIMARY KEY)").await;
+    for sql in ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT s"] {
+        let mut f = Frame::new(proto::REQ_SQL, proto::encode_sql(sql).unwrap());
+        f.flags = docsql_server::FLAG_REPLICATION;
+        c.send(&f).await;
+        let r = c.recv().await;
+        assert_eq!(
+            r.frame_type,
+            proto::RESP_ERROR,
+            "{sql}: {}",
+            payload_str(&r)
+        );
+        assert!(
+            payload_str(&r).contains("replication"),
+            "{sql}: {}",
+            payload_str(&r)
+        );
+    }
+    // No transaction was opened: later writes proceed immediately.
+    c.sql("INSERT INTO t VALUES (1)").await;
+    let r = c.sql("SELECT COUNT(id) FROM t").await;
+    assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
+}
+
 /// After a join the joiner's catch-up positions must equal the origins'
 /// current journal heads. The probe-round heads are stale by the whole
 /// snapshot transfer; leaving them low made the next rejoin replay

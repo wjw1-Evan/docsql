@@ -61,6 +61,9 @@ pub struct ServerState {
     /// connections may carry FLAG_REPLICATION frames; fan-out presents it
     /// to peers in preference to `auth_token`.
     pub cluster_token: Option<String>,
+    /// Restore replay progress (applied/total), published locklessly so
+    /// the replay loop never takes the backup mutex under `write_order`.
+    pub restore_progress: std::sync::Arc<backup::RestoreProgress>,
     /// Auth-failure lockout (identity-authentication failure handling):
     /// source IP -> failure timestamps. At AUTH_LOCK_THRESHOLD failures
     /// inside AUTH_LOCK_WINDOW the source is locked out for
@@ -340,11 +343,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     // concludes, so replication writes arriving mid-flow queue and land
     // after the snapshot — snapshot < queued < direct is the total order.
     let peers_configured = !peers.is_empty();
-    let fresh = peers_configured
-        && !db
-            .catalog()
-            .iter()
-            .any(|t| !docsql_core::engine::is_system_table(&t.name));
+    let fresh = peers_configured && !has_user_tables(&db);
     let backup_dir = cfg.backup_dir.clone().unwrap_or_else(|| {
         let mut dir = cfg
             .db_path
@@ -389,6 +388,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         backup_keep: cfg.backup_keep,
         backup_dir,
         backup: Mutex::new(backup::BackupShared::default()),
+        restore_progress: std::sync::Arc::new(backup::RestoreProgress::default()),
         replay_failures: std::sync::atomic::AtomicU64::new(0),
         db_path: cfg.db_path,
         started: std::time::Instant::now(),
@@ -807,8 +807,15 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             if state.auth_lock_threshold > 0 {
                                 let mut failures = state.auth_failures.lock().await;
                                 let now = std::time::Instant::now();
+                                // Prune idle sources along the way: a scanner
+                                // leaving one entry per IP would otherwise
+                                // grow the map forever (entries are only
+                                // otherwise dropped on that IP's success).
+                                failures.retain(|_, list| {
+                                    list.retain(|t| now.duration_since(*t) < AUTH_LOCK_WINDOW);
+                                    !list.is_empty()
+                                });
                                 let list = failures.entry(source_ip.to_string()).or_default();
-                                list.retain(|t| now.duration_since(*t) < AUTH_LOCK_WINDOW);
                                 list.push(now);
                                 if list.len() as u32 == state.auth_lock_threshold {
                                     audit(false, "lockout: repeated auth failures", &state);
@@ -891,19 +898,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             let queued = if is_replication
                                 && docsql_core::engine::Database::is_write_statement(&sql)
                             {
-                                let mut gate = state.sync_queue.lock().await;
-                                if !gate.closed {
-                                    gate.pending.push(QueuedWrite {
-                                        origin: None,
-                                        sql: sql.clone(),
-                                    });
-                                    Some(Frame::new(
-                                        proto::RESP_AFFECTED,
-                                        1u64.to_le_bytes().to_vec(),
-                                    ))
-                                } else {
-                                    None
-                                }
+                                gate_enqueue(&state, None, &sql).await
                             } else {
                                 None
                             };
@@ -970,19 +965,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             // position exact.
                             let queued = if docsql_core::engine::Database::is_write_statement(&sql)
                             {
-                                let mut gate = state.sync_queue.lock().await;
-                                if !gate.closed {
-                                    gate.pending.push(QueuedWrite {
-                                        origin: Some((node_id.clone(), seq)),
-                                        sql: sql.clone(),
-                                    });
-                                    Some(Frame::new(
-                                        proto::RESP_AFFECTED,
-                                        1u64.to_le_bytes().to_vec(),
-                                    ))
-                                } else {
-                                    None
-                                }
+                                gate_enqueue(&state, Some((node_id.clone(), seq)), &sql).await
                             } else {
                                 None
                             };
@@ -1196,15 +1179,12 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
 }
 
 fn file_bytes(p: &std::path::Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    backup::file_bytes(p)
 }
 
 fn wal_path(db: &std::path::Path) -> PathBuf {
-    let mut s = db.as_os_str().to_os_string();
-    s.push(".wal");
-    PathBuf::from(s)
+    docsql_core::pager::wal_path_for(db)
 }
-
 /// Sleep-poll until the shared engine transaction closes or `deadline`
 /// passes. Nothing is held across awaits, so the owning connection's
 /// COMMIT/ROLLBACK always makes progress.
@@ -1300,6 +1280,18 @@ async fn execute_sql(
                 err_payload("transaction is held open by another connection"),
             );
         }
+    }
+    if is_replication && !matches!(tx_kind, TxControl::None) {
+        // Fan-out only ever replays autocommit writes. A BEGIN arriving on a
+        // replication frame would open the global transaction with no owner
+        // connection to clean it up — every later replicated write would
+        // then spin in the busy-wait below for the full 30s and fail.
+        return Frame::new(
+            proto::RESP_ERROR,
+            err_payload(
+                "transaction control statements are not allowed on replication connections",
+            ),
+        );
     }
     // A client BEGIN queues behind an open engine transaction instead of
     // erroring immediately (single-writer engine). So does every write the
@@ -1597,8 +1589,8 @@ async fn write_frame_on(stream: &mut TcpStream, frame: &Frame) -> std::io::Resul
     Ok(())
 }
 
-/// Write one replication-internal frame and read its response; the stream
-/// comes back so the caller can pool it. Encryption is per frame.
+/// Write one replication-internal frame and read its response. RESP_ERROR
+/// frames surface as `Err`. Encryption is per frame.
 async fn send_frame_on(
     mut stream: TcpStream,
     frame_type: u16,
@@ -1644,7 +1636,10 @@ async fn forward_write(
             payload.extend_from_slice(&(node_id.len() as u32).to_le_bytes());
             payload.extend_from_slice(node_id.as_bytes());
             payload.extend_from_slice(&proto::encode_sql(sql).map_err(std::io::Error::other)?);
-            let sequenced = forward_frame(target, proto::REQ_SQL_SEQ, &payload, key, auth).await;
+            // `forward_frame` (via `send_frame_on`) turns RESP_ERROR into
+            // Err, hiding the one case the fallback must see — probe raw.
+            let sequenced =
+                forward_frame_raw(target, proto::REQ_SQL_SEQ, &payload, key, auth).await;
             match sequenced {
                 Ok(resp) if resp.frame_type == proto::RESP_ERROR => {
                     let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
@@ -1677,6 +1672,22 @@ pub(crate) async fn forward_frame(
     let stream = open_peer_conn(target, key, auth).await?;
     let (resp, _stream) = send_frame_on(stream, frame_type, payload, key).await?;
     Ok(resp)
+}
+
+/// One-shot replication frame that does NOT translate RESP_ERROR into an
+/// error — the legacy-peer fallback in `forward_write` must inspect the
+/// frame type itself to decide whether to resend as plain REQ_SQL.
+async fn forward_frame_raw(
+    target: &str,
+    frame_type: u16,
+    payload: &[u8],
+    key: Option<&crypto::TransportKey>,
+    auth: Option<&str>,
+) -> std::io::Result<Frame> {
+    let mut stream = open_peer_conn(target, key, auth).await?;
+    let frame = replication_frame(frame_type, payload.to_vec(), key);
+    write_frame_on(&mut stream, &frame).await?;
+    read_response_frame(&mut stream).await
 }
 
 /// Credential fan-out presents to peers: the cluster token when
@@ -2089,11 +2100,7 @@ async fn handle_pubsub_cmd(state: &Arc<ServerState>, frame: &Frame) -> Frame {
             let list = state.pubsub.lock().await.channels(filter);
             let rows: Vec<serde_json::Value> =
                 list.iter().map(|c| serde_json::json!([c])).collect();
-            let body = serde_json::json!({"columns": ["channel"], "rows": rows});
-            Frame::new(
-                proto::RESP_ROWS,
-                serde_json::to_vec(&body).unwrap_or_default(),
-            )
+            rows_frame(serde_json::json!(["channel"]), rows)
         }
         Some("numsub") => {
             let names = v["channels"]
@@ -2109,18 +2116,13 @@ async fn handle_pubsub_cmd(state: &Arc<ServerState>, frame: &Frame) -> Frame {
                 .iter()
                 .map(|(c, n)| serde_json::json!([c, n]))
                 .collect();
-            let body = serde_json::json!({"columns": ["channel", "subscribers"], "rows": rows});
-            Frame::new(
-                proto::RESP_ROWS,
-                serde_json::to_vec(&body).unwrap_or_default(),
-            )
+            rows_frame(serde_json::json!(["channel", "subscribers"]), rows)
         }
         Some("numpat") => {
             let n = state.pubsub.lock().await.numpat();
-            let body = serde_json::json!({"columns": ["patterns"], "rows": [[n]]});
-            Frame::new(
-                proto::RESP_ROWS,
-                serde_json::to_vec(&body).unwrap_or_default(),
+            rows_frame(
+                serde_json::json!(["patterns"]),
+                vec![serde_json::json!([n])],
             )
         }
         Some("trim") => {
@@ -2400,19 +2402,29 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
     // response was lost in an earlier try leaves the peer frozen (id
     // unknown to us) until the 60s watchdog — every hold we now request
     // would answer "busy" and the join would stall for that long. The
-    // sweep (id 0 + our identity) is a no-op when nothing is stale.
+    // sweep (id 0 + our identity) is a no-op when nothing is stale, and
+    // runs concurrently so dead peers do not stretch this node's write
+    // freeze by (peers × timeout).
+    let mut sweep = Vec::new();
     for target in &targets {
         let mut clear = Vec::with_capacity(8 + advertise.len());
         clear.extend_from_slice(&0u64.to_le_bytes());
         clear.extend_from_slice(advertise.as_bytes());
-        let _ = forward_frame(
-            target,
-            proto::REQ_RELEASE,
-            &clear,
-            state.transport_key.as_ref(),
-            fanout_auth(state),
-        )
-        .await;
+        let st = state.clone();
+        let target = target.clone();
+        sweep.push(tokio::spawn(async move {
+            let _ = forward_frame(
+                &target,
+                proto::REQ_RELEASE,
+                &clear,
+                st.transport_key.as_ref(),
+                fanout_auth(&st),
+            )
+            .await;
+        }));
+    }
+    for j in sweep {
+        let _ = j.await;
     }
     let mut held: Vec<(String, u64)> = Vec::new();
     for target in targets {
@@ -2755,31 +2767,90 @@ async fn apply_sync(
             return JoinApply::Failed(format!("COMMIT: {e}"));
         }
     }
-    // Seed the probe-round heads before the drain: they predate the
-    // freeze, so every queued sequenced write at or under them is
-    // guaranteed to be inside the snapshot and the drain can skip it
-    // instead of replaying it onto its own copy (duplicate-key noise).
+    // Shared post-snapshot tail (join + rejoin repair): seed the
+    // probe-round floor, drain the queue (snapshot < queued < direct),
+    // free the write path, then raise every origin's position to its
+    // CURRENT head. The floor is stale by the whole transfer; leaving it
+    // low makes the next rejoin replay snapshot-covered ops, error, and
+    // degrade to the snapshot fallback. The re-probe happens only after
+    // the write path is released: network round-trips must not stall
+    // client writes.
+    finish_snapshot_adopt(
+        state,
+        order,
+        heads,
+        "bootstrap",
+        "bootstrap sync",
+        peer,
+        script.len(),
+    )
+    .await;
+    JoinApply::Applied
+}
+
+/// Sync-gate intake for a replicated write: while the gate is open the
+/// write queues and is acknowledged on the spot — making the origin wait
+/// for the apply would deadlock its write path against the snapshot it is
+/// waiting on. None (gate closed) tells the caller to execute directly.
+async fn gate_enqueue(
+    state: &ServerState,
+    origin: Option<(String, u64)>,
+    sql: &str,
+) -> Option<Frame> {
+    let mut gate = state.sync_queue.lock().await;
+    if gate.closed {
+        return None;
+    }
+    gate.pending.push(QueuedWrite {
+        origin,
+        sql: sql.to_string(),
+    });
+    Some(Frame::new(
+        proto::RESP_AFFECTED,
+        1u64.to_le_bytes().to_vec(),
+    ))
+}
+
+/// RESP_ROWS frame from a column list and pre-rendered row tuples.
+fn rows_frame(columns: serde_json::Value, rows: Vec<serde_json::Value>) -> Frame {
+    let body = serde_json::json!({ "columns": columns, "rows": rows });
+    Frame::new(
+        proto::RESP_ROWS,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+/// Shared tail of both snapshot-adopt paths (join and rejoin repair): seed
+/// the probe-round floor (it predates the freeze, so every queued sequenced
+/// write at or under it is inside the snapshot and the drain skips it),
+/// drain the queue, free the write path, then raise every origin's position
+/// to its CURRENT head — the floor is stale by the whole transfer, and
+/// leaving it low would make the next rejoin replay snapshot-covered ops,
+/// error, and degrade to the snapshot fallback. The re-probe happens only
+/// after the write path is released: network round-trips must not stall
+/// client writes.
+async fn finish_snapshot_adopt<'a>(
+    state: &Arc<ServerState>,
+    order: tokio::sync::MutexGuard<'a, ()>,
+    heads: &[(String, u64)],
+    event: &str,
+    label: &str,
+    peer: &str,
+    script_len: usize,
+) {
     seed_positions(state, heads);
     drain_sync_queue(state, true).await;
-    // Free the write path before re-probing: the probes are network
-    // round-trips and must not stall client writes.
     drop(order);
-    // Then raise the positions to the origins' current heads. The probe
-    // floor is stale by the whole transfer; leaving it low makes the
-    // next rejoin replay snapshot-covered ops, error, and degrade to the
-    // snapshot fallback — the incremental path would never engage after
-    // a join.
     seed_fresh_positions(state).await;
-    eprintln!("bootstrap sync from {peer} complete");
+    eprintln!("{label} from {peer} complete");
     querylog::sync_event(
         &state.sync_log,
-        "bootstrap",
+        event,
         peer,
         None,
         true,
-        Some(format!("{} bytes", script.len())),
+        Some(format!("{script_len} bytes")),
     );
-    JoinApply::Applied
 }
 
 /// Replay the join-intake queue in arrival order and close the gate
@@ -2818,62 +2889,65 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
         }
     };
     loop {
-        let batch = {
+        // Peek-then-pop: the item stays in the queue until its replay
+        // finishes. If this future is dropped mid-replay (the watchdog's
+        // bounded budget), the item — and everything after it — remains in
+        // `gate.pending`, so the hard-close accounting counts every
+        // acknowledged write it is about to strand.
+        let q = {
             let mut gate = state.sync_queue.lock().await;
-            if gate.pending.is_empty() {
-                gate.closed = true;
-                Vec::new()
-            } else {
-                std::mem::take(&mut gate.pending)
+            match gate.pending.first() {
+                None => {
+                    gate.closed = true;
+                    break;
+                }
+                Some(q) => q.clone(),
             }
         };
-        if batch.is_empty() {
-            return;
-        }
-        for q in batch {
-            // A sequenced write the adopted snapshot already covers (seq
-            // at or under the position seeded from the probe round) is
-            // skipped, not replayed — replaying it would only error on
-            // the snapshot's own rows. Applied sequenced writes advance
-            // their origin's position (apply-then-record, the same
-            // invariant the live REQ_SQL_SEQ path keeps).
-            if let Some((origin, seq)) = &q.origin {
-                let covered = {
-                    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
-                    db.position_get(origin)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|pos| pos >= *seq)
-                };
-                if covered {
-                    continue;
-                }
-            }
-            let seq_pos = q
-                .origin
-                .as_ref()
-                .map(|(origin, seq)| (origin.as_str(), *seq));
-            let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos).await;
-            if resp.frame_type == proto::RESP_ERROR {
-                let msg = String::from_utf8_lossy(&resp.payload).into_owned();
-                eprintln!("sync: queued replay failed: {msg}");
-                state
-                    .replay_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                querylog::sync_event(
-                    &state.sync_log,
-                    "bootstrap",
-                    "",
-                    Some(&q.sql),
-                    false,
-                    Some(msg),
-                );
-            } else {
-                // Position was fused into the replay's commit unit
-                // (see execute_sql's `seq_pos`).
-                querylog::record(state, "sync", &q.sql, 0.0, &resp, true);
+        // A sequenced write the adopted snapshot already covers (seq
+        // at or under the position seeded from the probe round) is
+        // skipped, not replayed — replaying it would only error on
+        // the snapshot's own rows. Applied sequenced writes advance
+        // their origin's position (apply-then-record, the same
+        // invariant the live REQ_SQL_SEQ path keeps).
+        if let Some((origin, seq)) = &q.origin {
+            let covered = {
+                let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                db.position_get(origin)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|pos| pos >= *seq)
+            };
+            if covered {
+                state.sync_queue.lock().await.pending.remove(0);
+                continue;
             }
         }
+        let seq_pos = q
+            .origin
+            .as_ref()
+            .map(|(origin, seq)| (origin.as_str(), *seq));
+        let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos).await;
+        if resp.frame_type == proto::RESP_ERROR {
+            let msg = String::from_utf8_lossy(&resp.payload).into_owned();
+            eprintln!("sync: queued replay failed: {msg}");
+            state
+                .replay_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            querylog::sync_event(
+                &state.sync_log,
+                "bootstrap",
+                "",
+                Some(&q.sql),
+                false,
+                Some(msg),
+            );
+        } else {
+            // Position was fused into the replay's commit unit
+            // (see execute_sql's `seq_pos`).
+            querylog::record(state, "sync", &q.sql, 0.0, &resp, true);
+        }
+        state.sync_queue.lock().await.pending.remove(0);
     }
 }
 
@@ -3223,12 +3297,13 @@ pub(crate) struct CatchupTask {
 }
 
 /// Build the incremental catch-up plan, or None when catch-up is
-/// impossible: any peer without journal info (old version, probe
-/// failure), any unknown position (never adopted from that origin), or
-/// any position outside the peer's retained window (trimmed past) all
-/// force the snapshot path. Positions can only lag the data, so a
-/// partial catch-up is always safe — the digest re-check after it
-/// decides whether a snapshot is still needed.
+/// impossible: any REACHED peer without journal info (old version), any
+/// unknown position (never adopted from that origin), or any position
+/// outside the peer's retained window (trimmed past) all force the
+/// snapshot path. (Peers that could not be probed at all are absent from
+/// `infos`; a partial catch-up runs and the digest re-check decides
+/// whether a snapshot is still needed — positions can only lag the data,
+/// so a partial catch-up is always safe.)
 pub(crate) async fn catchup_plan(
     state: &Arc<ServerState>,
     infos: &[(String, PeerInfo)],
@@ -3259,8 +3334,6 @@ pub(crate) async fn catchup_plan(
 
 /// Execute a catch-up plan: pull each origin's missed range in order and
 /// record the origin's head as the new position.
-/// Execute a catch-up plan: pull each origin's missed range in order and
-/// record the origin's head as the new position.
 pub(crate) async fn run_catchup(
     state: &Arc<ServerState>,
     plan: &[CatchupTask],
@@ -3288,8 +3361,15 @@ pub(crate) async fn run_catchup(
 fn seed_positions(state: &Arc<ServerState>, heads: &[(String, u64)]) {
     let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
     for (node_id, head) in heads {
-        if let Err(e) = db.position_set(node_id, *head) {
-            eprintln!("catchup position seed failed: {e}");
+        // Never LOWER an existing position: a blind position_set was safe
+        // only by context (fresh node, or positions cleared in the same
+        // transaction as the snapshot); max keeps the seeding safe even
+        // when those distant invariants change.
+        let existing = db.position_get(node_id).ok().flatten().unwrap_or(0);
+        if *head > existing {
+            if let Err(e) = db.position_set(node_id, *head) {
+                eprintln!("catchup position seed failed: {e}");
+            }
         }
     }
 }
@@ -3463,22 +3543,17 @@ async fn apply_repair_sync(
         }
     }
     // Probe-round floor before the drain, fresh heads after — same order
-    // and same reasoning as the join path (see apply_sync).
-    seed_positions(state, heads);
-    drain_sync_queue(state, true).await;
-    // Free the write path before re-probing: the probes are network
-    // round-trips and must not stall client writes.
-    drop(order);
-    seed_fresh_positions(state).await;
-    eprintln!("rejoin repair from {peer} complete");
-    querylog::sync_event(
-        &state.sync_log,
+    // and same reasoning as the join path (see finish_snapshot_adopt).
+    finish_snapshot_adopt(
+        state,
+        order,
+        heads,
         "repair",
+        "rejoin repair",
         peer,
-        None,
-        true,
-        Some(format!("{} bytes", script.len())),
-    );
+        script.len(),
+    )
+    .await;
     JoinApply::Applied
 }
 
@@ -3536,19 +3611,26 @@ async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
     }
 }
 
+/// Connect + auth + send one zero-payload replication probe frame; returns
+/// the response frame untouched — the caller validates the frame type and
+/// parses the payload. Shared by the digest/status probes.
+async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::io::Result<Frame> {
+    let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+    let frame = replication_frame(frame_type, vec![], state.transport_key.as_ref());
+    write_frame_on(&mut stream, &frame).await?;
+    read_response_frame(&mut stream).await
+}
+
 /// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
 /// mean "unknown" (unreachable / auth mismatch), never "divergent". The
 /// frame rides FLAG_REPLICATION like every node-internal frame — under
 /// cluster-token auth a peer-role connection only accepts replication
 /// traffic.
 pub(crate) async fn probe_peer_digests(
-    state: &Arc<ServerState>,
+    state: &ServerState,
     peer: &str,
 ) -> std::io::Result<Vec<TableDigest>> {
-    let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
-    let frame = replication_frame(proto::REQ_DIGEST, vec![], state.transport_key.as_ref());
-    write_frame_on(&mut stream, &frame).await?;
-    let resp = read_response_frame(&mut stream).await?;
+    let resp = probe_frame(state, peer, proto::REQ_DIGEST).await?;
     if resp.frame_type != proto::RESP_DIGEST {
         return Err(std::io::Error::other(format!(
             "{peer}: digest probe answered {} {}",
@@ -3576,14 +3658,8 @@ pub(crate) struct PeerInfo {
 }
 
 /// One peer's status + journal window over REQ_STATUS.
-pub(crate) async fn probe_peer_info(
-    state: &Arc<ServerState>,
-    peer: &str,
-) -> std::io::Result<PeerInfo> {
-    let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
-    let frame = replication_frame(proto::REQ_STATUS, vec![], state.transport_key.as_ref());
-    write_frame_on(&mut stream, &frame).await?;
-    let resp = read_response_frame(&mut stream).await?;
+pub(crate) async fn probe_peer_info(state: &ServerState, peer: &str) -> std::io::Result<PeerInfo> {
+    let resp = probe_frame(state, peer, proto::REQ_STATUS).await?;
     if resp.frame_type != proto::RESP_STATUS {
         return Err(std::io::Error::other(format!(
             "{peer}: status probe answered {} {}",
@@ -3671,7 +3747,7 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
             .await;
         return;
     };
-    const BUDGET: usize = 4 * 1024 * 1024;
+    const BUDGET: usize = SYNC_CHUNK_BYTES;
     // The terminating head is the position the requester will adopt, so
     // it is sampled up front and the stream never serves past it: a head
     // taken after the batches could cover entries appended while the pull

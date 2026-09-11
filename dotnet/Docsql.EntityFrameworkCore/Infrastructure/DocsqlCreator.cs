@@ -27,11 +27,7 @@ public sealed class DocsqlDatabaseCreator(
         {
             connection.DbConnection.Open();
         }
-        foreach (var entity in model.GetEntityTypes())
-        {
-            SchemaSync.SyncTable(connection.DbConnection, entity);
-            SchemaSync.SyncIndexes(connection.DbConnection, entity);
-        }
+        SchemaSync.SyncModel(connection.DbConnection, model);
     }
 
     public Task CreateTablesAsync(CancellationToken ct = default)

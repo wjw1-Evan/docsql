@@ -48,7 +48,9 @@ public sealed class DocsqlSubscriber : IDisposable
 {
     private readonly ProtocolConnection _proto;
     private readonly Thread _reader;
-    private readonly object _sendLock = new();
+    /// <summary>串行化整个控制面往返(发送→等确认→取回应答):并发的
+    /// Subscribe/Unsubscribe 各自等待同一个无关联邮箱,应答会被错配或吞掉。</summary>
+    private readonly object _ctrlLock = new();
     private readonly AutoResetEvent _respReady = new(false);
     private readonly Dictionary<(bool Pattern, string Name), Action<DocsqlMessage>>
         _handlers = new();
@@ -67,27 +69,7 @@ public sealed class DocsqlSubscriber : IDisposable
     public DocsqlSubscriber(string connectionString)
     {
         var b = new DocsqlConnectionStringBuilder { ConnectionString = connectionString };
-        _proto = new ProtocolConnection(b.Host, b.Port, DocsqlConnection.ParseKey(b.Key));
-        if (!string.IsNullOrEmpty(b.Token))
-        {
-            Frame resp;
-            try
-            {
-                resp = _proto.Send(new Frame(
-                    FrameType.ReqAuth, 0, 0, Encoding.UTF8.GetBytes(b.Token)));
-            }
-            catch
-            {
-                // 握手期间连接被重置也要释放套接字,重试循环下才不会耗尽句柄。
-                _proto.Dispose();
-                throw;
-            }
-            if (resp.Type == FrameType.RespError)
-            {
-                _proto.Dispose();
-                throw new DocsqlException("auth failed: " + Encoding.UTF8.GetString(resp.Payload));
-            }
-        }
+        _proto = DocsqlConnection.ConnectAndAuth(b, null);
         _reader = new Thread(ReadLoop) { IsBackground = true, Name = "docsql-subscriber" };
         _reader.Start();
     }
@@ -116,6 +98,7 @@ public sealed class DocsqlSubscriber : IDisposable
     private int Sub(
         FrameType type, bool pattern, string name, Action<DocsqlMessage> onMessage, string from)
     {
+        ArgumentNullException.ThrowIfNull(onMessage);
         object bodyObj = pattern ? new { pattern = name, from } : new { channel = name, from };
         var body = JsonSerializer.Serialize(bodyObj);
         // Handler first: the server replays history right after the
@@ -127,11 +110,13 @@ public sealed class DocsqlSubscriber : IDisposable
         var resp = RoundTrip(new Frame(type, 0, 0, Encoding.UTF8.GetBytes(body)));
         if (resp.Type == FrameType.RespError)
         {
+            // 服务端明确拒绝:handler 必须移除,否则回放会被静默吞掉。
+            // 传输层失败(超时/断线)不在此列 —— 订阅可能已在服务端生效。
             lock (_handlers)
             {
                 _handlers.Remove((pattern, name));
             }
-            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
+            resp.EnsureOk();
         }
         return (int)Math.Clamp(DocsqlConnection.DecodeLong(resp.Payload), 0, int.MaxValue);
     }
@@ -140,10 +125,7 @@ public sealed class DocsqlSubscriber : IDisposable
     {
         var body = name is null ? "[]" : JsonSerializer.Serialize(new[] { name });
         var resp = RoundTrip(new Frame(type, 0, 0, Encoding.UTF8.GetBytes(body)));
-        if (resp.Type == FrameType.RespError)
-        {
-            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
-        }
+        resp.EnsureOk();
         lock (_handlers)
         {
             if (name is null)
@@ -162,33 +144,45 @@ public sealed class DocsqlSubscriber : IDisposable
         return (int)Math.Clamp(DocsqlConnection.DecodeLong(resp.Payload), 0, int.MaxValue);
     }
 
-    /// <summary>发送订阅请求并等待后台读线程交回的确认帧。</summary>
+    /// <summary>发送订阅请求并等待后台读线程交回的确认帧。整个往返串行在
+    /// _ctrlLock 内:并发的控制请求不会交错抢占同一个响应邮箱。</summary>
     private Frame RoundTrip(Frame req)
     {
         if (_dead)
         {
             throw new DocsqlException("连接已断开: " + _deadReason);
         }
-        lock (_sendLock)
+        // 消息回调跑在读线程上;在回调里调用 Subscribe/Unsubscribe 会在
+        // 唯一能收到确认帧的线程上等它自己 —— 必死锁 30s 后失败,直接拒绝。
+        if (ReferenceEquals(Thread.CurrentThread, _reader))
         {
-            _proto.Write(req);
+            throw new DocsqlException(
+                "不能在消息回调内调用订阅控制方法(死锁);请把调用移出回调线程");
         }
-        if (!_respReady.WaitOne(TimeSpan.FromSeconds(30)))
+        lock (_ctrlLock)
         {
-            if (_dead)
+            // 清空上一次往返可能遗留的邮箱状态(如超时后才迟到的那条应答),
+            // 否则它会被下一个请求错认为自己的确认。
+            _pendingResp = null;
+            _respReady.Reset();
+            _proto.Write(req);
+            if (!_respReady.WaitOne(TimeSpan.FromSeconds(30)))
             {
+                if (_dead)
+                {
+                    throw new DocsqlException("连接已断开: " + _deadReason);
+                }
+                throw new DocsqlException("订阅请求超时(服务器无响应或连接已断开)");
+            }
+            if (_dead && _pendingResp is null)
+            {
+                // 断线唤醒:这不是任何请求的应答。
                 throw new DocsqlException("连接已断开: " + _deadReason);
             }
-            throw new DocsqlException("订阅请求超时(服务器无响应或连接已断开)");
+            var resp = _pendingResp ?? default;
+            _pendingResp = null;
+            return resp;
         }
-        if (_dead && _pendingResp is null)
-        {
-            // 断线唤醒:这不是任何请求的应答。
-            throw new DocsqlException("连接已断开: " + _deadReason);
-        }
-        var resp = _pendingResp ?? default;
-        _pendingResp = null;
-        return resp;
     }
 
     private void ReadLoop()
@@ -216,7 +210,12 @@ public sealed class DocsqlSubscriber : IDisposable
         }
         if (!_running)
         {
-            return; // Dispose 主动关闭,不是故障
+            // Dispose 主动关闭不是故障,但在途 RoundTrip 仍需被唤醒
+            // (否则要挂满 30s 超时);标记 _dead 让后续控制调用立即失败。
+            _deadReason = "disposed";
+            _dead = true;
+            _respReady.Set();
+            return;
         }
         // 连接丢失必须可见:静默死线程会让应用以为订阅还活着。同时唤醒
         // 在途 RoundTrip 让它立即失败。

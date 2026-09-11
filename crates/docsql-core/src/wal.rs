@@ -60,7 +60,10 @@ pub struct Wal {
     file: File,
     path: PathBuf,
     next_lsn: u64,
-    /// Highest committed LSN (0 = nothing committed).
+    /// Highest appended Commit-frame LSN (0 = nothing appended).
+    last_commit_lsn: u64,
+    /// Highest commit LSN known durable (fsynced) — only [`Wal::sync`]
+    /// advances it, so a deferred commit can lag but never lead durability.
     pub durable_lsn: u64,
 }
 
@@ -99,6 +102,7 @@ impl Wal {
             file,
             path: path.to_path_buf(),
             next_lsn: next,
+            last_commit_lsn: durable,
             durable_lsn: durable,
         })
     }
@@ -188,10 +192,11 @@ impl Wal {
     }
 
     /// Commit without fsync — durability arrives with the next `sync`
-    /// (used to batch an explicit BEGIN..COMMIT into one flush).
+    /// (used to batch an explicit BEGIN..COMMIT into one flush). Only the
+    /// appended commit LSN moves here; `durable_lsn` follows in `sync`.
     pub fn commit_deferred(&mut self, txid: u64) -> Result<u64> {
         let lsn = self.append(KIND_COMMIT, txid, &[])?;
-        self.durable_lsn = self.durable_lsn.max(lsn);
+        self.last_commit_lsn = self.last_commit_lsn.max(lsn);
         Ok(lsn)
     }
 
@@ -200,6 +205,7 @@ impl Wal {
     /// sync simply drops those (uncommitted) transactions.
     pub fn sync(&mut self) -> Result<()> {
         self.file.sync_data()?;
+        self.durable_lsn = self.durable_lsn.max(self.last_commit_lsn);
         Ok(())
     }
 
@@ -238,6 +244,7 @@ impl Wal {
         self.file.write_all(HEADER)?;
         self.file.sync_data()?;
         self.durable_lsn = 0;
+        self.last_commit_lsn = 0;
         self.next_lsn = 1;
         Ok(())
     }

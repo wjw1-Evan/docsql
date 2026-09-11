@@ -234,6 +234,14 @@ pub fn encode_sql(sql: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Affected-row count carried by a RESP_AFFECTED payload (0 if absent).
+pub fn decode_affected(payload: &[u8]) -> u64 {
+    payload
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
+}
+
 pub fn decode_sql(payload: &[u8]) -> Result<String> {
     let (v, _) = encode::decode_prefix(payload)?;
     match v {

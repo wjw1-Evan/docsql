@@ -133,8 +133,8 @@ fn repack(page: &mut [u8]) -> Vec<(usize, usize)> {
 }
 
 /// Read the page image to mutate (staged version if this tx already wrote
-/// it). Borrowed in place — callers that mutate call `to_mut()`, so pure
-/// readers never pay a full-page copy.
+/// it). Always borrowed — mutating callers copy via `into_owned()` when they
+/// re-pack the page, so no copy is made on the read itself.
 fn staged_or_file_page<'a>(
     pager: &'a mut Pager,
     tx: &'a Tx,

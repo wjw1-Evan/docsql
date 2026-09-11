@@ -9,6 +9,16 @@ namespace Docsql.EntityFrameworkCore;
 
 internal static partial class SchemaSync
 {
+    /// <summary>整个模型的建表/补列/建索引(拦截器与 EnsureCreated 共用)。</summary>
+    public static void SyncModel(DbConnection conn, IModel model)
+    {
+        foreach (var entity in model.GetEntityTypes())
+        {
+            SyncTable(conn, entity);
+            SyncIndexes(conn, entity);
+        }
+    }
+
     public static void SyncTable(DbConnection conn, IEntityType entity)
     {
         var table = entity.GetTableName();
@@ -92,8 +102,9 @@ internal static partial class SchemaSync
     ///   IF NOT EXISTS 保证幂等;唯一索引由引擎强制执行重复检查;
     /// - 模型里删掉的索引自动 DROP。为避免误删用户手工建的索引,
     ///   只回收 EF 惯例命名(IX_ 前缀)且不在当前模型中的索引。
-    /// 引擎目前只支持单列索引;多列索引按"尽力而为"跳过 —— 索引是
-    /// 加速手段,除唯一索引的约束语义外不影响查询结果。
+    /// 引擎目前只支持单列索引:多列索引按"尽力而为"跳过创建,但它们的
+    /// 名字必须计入 wanted —— 否则回收循环会把模型仍声明的多列 IX_
+    /// 索引(手工/旧版本建的)当垃圾 DROP 掉。
     /// </summary>
     public static void SyncIndexes(DbConnection conn, IEntityType entity)
     {
@@ -103,14 +114,14 @@ internal static partial class SchemaSync
         var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var index in entity.GetIndexes())
         {
+            var iname = index.GetDatabaseName();
+            if (iname is null) continue;
+            wanted.Add(iname);
             if (index.Properties.Count != 1) continue;
             var column = index.Properties[0]
                 .GetColumnName(StoreObjectIdentifier.Table(table, entity.GetSchema()));
             if (column is null) continue;
 
-            var iname = index.GetDatabaseName();
-            if (iname is null) continue;
-            wanted.Add(iname);
             try
             {
                 // Unique drift: an existing index with the same name but

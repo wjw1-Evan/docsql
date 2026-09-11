@@ -20,7 +20,7 @@ DocSQL:Rust 实现的原生文档数据库 + .NET 客户端栈。约 1.3 万行 
 ```bash
 # 构建与测试(开发门禁,非运行方式)
 cargo build --workspace
-cargo test --workspace              # Rust 全量(约 300 用例)
+cargo test --workspace              # Rust 全量(约 420 用例)
 
 # .NET 测试(需先 cargo build 出 server 二进制)
 cd dotnet && dotnet test
@@ -63,7 +63,7 @@ ZCode 的 Mimosa 插件在 `git commit`/`git push` 前做 L3 静态扫描,high �
 
 CI(`.github/workflows/docker-image.yml`,push/PR 触发)执行同样三门禁 + dotnet 测试,通过后构建多架构镜像(amd64/arm64,`RUN_TESTS=false`)发布到 `ghcr.io/wjw1-evan/docsql`;main 分支另跑 compose 部署测试(多节点 76 项 + 单节点 34 项)。
 
-测试层次(约 300 个 Rust 用例):
+测试层次(约 420 个 Rust 用例):
 
 - **单元/内核**:core 的 pager/WAL/B+树/engine 各模块内测试;server 的 pubsub 注册表/存储辅助
 - **SQL 集成 / 协议**:各 crate tests

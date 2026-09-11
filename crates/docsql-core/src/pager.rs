@@ -54,7 +54,6 @@ pub struct Pager {
 
 struct Page {
     data: Vec<u8>,
-    dirty: bool,
 }
 
 impl Pager {
@@ -198,28 +197,19 @@ impl Pager {
             };
             self.evict_if_full();
             self.pool_order.push_back(id);
-            self.pool.insert(id, Page { data, dirty: false });
+            self.pool.insert(id, Page { data });
         }
         Ok(&self.pool.get(&id).unwrap().data)
     }
 
     fn evict_if_full(&mut self) {
-        // Evict the oldest clean page. Dirty pages rotate to the back so
-        // the scan stays O(1) amortized per eviction (no full-track pass,
-        // no allocation); if everything is dirty the pool grows past the
-        // target rather than lose data.
-        let mut scanned = 0usize;
-        while self.pool.len() >= self.max_pool && scanned < self.pool_order.len() {
-            match self.pool_order.front().copied() {
+        // Evict the oldest page (plain FIFO): pool pages only ever hold
+        // committed images — deferred ones also live in `pending_writes`
+        // until flushed — so there is no dirty/clean distinction to respect.
+        while self.pool.len() >= self.max_pool {
+            match self.pool_order.pop_front() {
                 Some(id) => {
-                    let clean = self.pool.get(&id).map(|p| !p.dirty).unwrap_or(true);
-                    if clean {
-                        self.pool_order.pop_front();
-                        self.pool.remove(&id);
-                    } else {
-                        self.pool_order.rotate_left(1);
-                        scanned += 1;
-                    }
+                    self.pool.remove(&id);
                 }
                 None => break,
             }
@@ -303,18 +293,18 @@ impl Pager {
     }
 
     /// Write `pending_writes` through to the data file and update the pool.
-    /// Entries are popped one at a time so an I/O failure leaves the rest
-    /// queued (their WAL records are already durable and replay on reopen).
+    /// A page is removed from the queue only after its write succeeded: on
+    /// an I/O failure the failing page and the rest stay queued (their WAL
+    /// records are already durable and replay on reopen); popping first
+    /// would strand a page in neither queue nor pool.
     fn flush_pending(&mut self) -> Result<()> {
-        while let Some((&id, _)) = self.pending_writes.iter().next() {
-            let (_, data) = self
-                .pending_writes
-                .pop_first()
-                .expect("key just observed present");
-            self.write_file_page(id, &data)?;
+        while let Some((id, data)) = self.pending_writes.pop_first() {
+            if let Err(e) = self.write_file_page(id, &data) {
+                self.pending_writes.insert(id, data);
+                return Err(e);
+            }
             if let Some(p) = self.pool.get_mut(&id) {
                 p.data = data;
-                p.dirty = false;
             }
         }
         Ok(())
@@ -342,7 +332,6 @@ impl Pager {
         for (id, data) in &tx.staged {
             if let Some(p) = self.pool.get_mut(id) {
                 p.data = data.clone();
-                p.dirty = false;
             }
             if !fsync {
                 self.pending_writes.insert(*id, data.clone());
@@ -395,17 +384,14 @@ pub struct Tx {
 }
 
 impl Tx {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
     /// A staged (uncommitted) image of a page, if this tx wrote it.
     pub fn staged_page(&self, id: u32) -> Option<&[u8]> {
         self.staged.get(&id).map(|v| v.as_slice())
     }
 }
 
-fn wal_path_for(path: &Path) -> PathBuf {
+/// WAL companion path for a database file (`<db>.wal`).
+pub fn wal_path_for(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".wal");
     PathBuf::from(s)

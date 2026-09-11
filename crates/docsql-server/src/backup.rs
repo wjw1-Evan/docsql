@@ -69,9 +69,6 @@ pub struct RestoreStatus {
     pub running: bool,
     pub ok: bool,
     pub error: Option<String>,
-    /// Statements applied so far / in the backup script (progress).
-    pub applied: usize,
-    pub total: usize,
     /// Post-replay cluster verification: Some(true) when every reachable
     /// peer's digest equals this node's, Some(false) when a reachable
     /// peer still differs (its restart repair heals it), None while
@@ -83,15 +80,13 @@ pub struct RestoreStatus {
 }
 
 impl RestoreStatus {
-    fn started(file: &str, total: usize) -> Self {
+    fn started(file: &str) -> Self {
         RestoreStatus {
             ts_ms: now_ms(),
             file: file.to_string(),
             running: true,
             ok: false,
             error: None,
-            applied: 0,
-            total,
             converged: None,
             note: None,
         }
@@ -109,6 +104,44 @@ pub struct BackupShared {
     pub restore: Option<RestoreStatus>,
 }
 
+/// Live restore-replay counters, shared locklessly between the replay loop
+/// and the status payloads: the replay holds `write_order` for its whole
+/// duration, and the lock discipline forbids taking the backup-state mutex
+/// under it (a REQ_STATUS reading backup would then block on the engine).
+#[derive(Default)]
+pub struct RestoreProgress {
+    pub applied: std::sync::atomic::AtomicUsize,
+    pub total: std::sync::atomic::AtomicUsize,
+}
+
+/// Resets `running` when dropped — including during a panic unwind, so a
+/// dying backup task cannot wedge local backups (and, for restores, the
+/// cluster-wide restore mutex) until restart.
+struct RunningFlagGuard<'a>(&'a ServerState);
+impl Drop for RunningFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .backup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .running = false;
+    }
+}
+
+/// Same as [`RunningFlagGuard`] for the restore flag, matching the file so
+/// a stale guard never touches a newer restore's status.
+struct RestoreFlagGuard(Arc<ServerState>, String);
+impl Drop for RestoreFlagGuard {
+    fn drop(&mut self) {
+        let mut b = self.0.backup.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = b.restore.as_mut() {
+            if r.file == self.1 && r.running {
+                r.running = false;
+            }
+        }
+    }
+}
+
 /// true = this caller owns the backup; false = one is already in flight
 /// (or a restore is running — they share the write path).
 fn try_begin_backup(state: &ServerState) -> bool {
@@ -124,6 +157,7 @@ fn try_begin_backup(state: &ServerState) -> bool {
 /// the write path, write the file, prune old backups, record the outcome
 /// in the shared state and the sync log (visible on the console logs page).
 async fn finish_backup(state: &Arc<ServerState>) -> Result<String, String> {
+    let _running = RunningFlagGuard(state);
     let res = backup_inner(state).await;
     let status = match &res {
         Ok(file) => BackupStatus {
@@ -347,8 +381,11 @@ pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Fra
                         crate::err_payload("backup/restore already in progress"),
                     );
                 }
-                b.restore = Some(RestoreStatus::started(&file, 0));
+                b.restore = Some(RestoreStatus::started(&file));
             }
+            use std::sync::atomic::Ordering;
+            state.restore_progress.applied.store(0, Ordering::Relaxed);
+            state.restore_progress.total.store(0, Ordering::Relaxed);
             let st = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_restore(&st, &file).await {
@@ -379,6 +416,7 @@ fn valid_backup_name(name: &str) -> bool {
 /// claimed `BackupShared.restore`; this finishes the status either way,
 /// including the post-replay cluster convergence pass.
 async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
+    let _running = RestoreFlagGuard(state.clone(), file.to_string());
     let res = restore_inner(state, file).await;
     // Convergence pass on success: the replay fanned out every statement,
     // but peers offline (or mid-fan-out-failure) during the restore missed
@@ -463,20 +501,21 @@ async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, Stri
         }
     }
     let applied = {
+        let applied = match &res {
+            Ok(n) => *n,
+            // Keep the progress: how far the replay got matters more than a
+            // zero on failure.
+            Err(_) => state
+                .restore_progress
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
         let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-        let mut applied = 0;
         if let Some(r) = b.restore.as_mut() {
             if r.file == file {
-                applied = match &res {
-                    Ok(n) => *n,
-                    // Keep the progress: how far the replay got matters
-                    // more than a zero on failure.
-                    Err(_) => r.applied,
-                };
                 r.running = false;
                 r.ok = res.is_ok();
                 r.error = res.as_ref().err().cloned();
-                r.applied = applied;
                 r.converged = converged;
                 r.note = note.clone();
             }
@@ -516,14 +555,9 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
         docsql_core::stmt::split_statements(&script).map_err(|e| format!("restore parse: {e}"))?
     };
     let total = stmts.len();
-    {
-        let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(r) = b.restore.as_mut() {
-            if r.file == file {
-                r.total = total;
-            }
-        }
-    }
+    use std::sync::atomic::Ordering;
+    state.restore_progress.total.store(total, Ordering::Relaxed);
+    state.restore_progress.applied.store(0, Ordering::Relaxed);
     // One write-order acquisition for the WHOLE replay: statements used to
     // contend per statement, letting client writes interleave between them
     // — a client INSERT into a just-recreated empty table would collide
@@ -554,12 +588,12 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
             ));
         }
         replayed = i + 1;
-        let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(r) = b.restore.as_mut() {
-            if r.file == file {
-                r.applied = i + 1;
-            }
-        }
+        // Progress publishes via the atomic cell: the backup mutex must not
+        // nest under write_order (lock discipline — see RestoreProgress).
+        state
+            .restore_progress
+            .applied
+            .store(replayed, Ordering::Relaxed);
     }
     drop(order);
     Ok(replayed)
@@ -589,8 +623,8 @@ pub fn backup_payload(state: &ServerState) -> Vec<u8> {
             "running": r.running,
             "ok": r.ok,
             "error": r.error,
-            "applied": r.applied,
-            "total": r.total,
+            "applied": state.restore_progress.applied.load(std::sync::atomic::Ordering::Relaxed),
+            "total": state.restore_progress.total.load(std::sync::atomic::Ordering::Relaxed),
             "converged": r.converged,
             "note": r.note,
         })),
@@ -695,7 +729,7 @@ fn read_backup_files(dir: &Path) -> Vec<String> {
     names
 }
 
-fn file_bytes(p: &Path) -> u64 {
+pub(crate) fn file_bytes(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 

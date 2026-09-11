@@ -401,10 +401,20 @@ const api = {
       ui.connState('unauth');
       // 账号门激活时会话过期/未登录:弹回登录遮罩而不是仅提示令牌。
       if (authGate.active) authGate.show('login');
-      throw new Error('未授权:请在工具栏填写正确的令牌');
+      throw new Error(authGate.active ? '会话已过期,请重新登录' : '未授权:请在工具栏填写正确的令牌');
     }
-    ui.connState('ok');
-    return r.json();
+    let body;
+    try { body = await r.json(); }
+    catch { throw new Error('响应不是有效 JSON(HTTP ' + r.status + ')'); }
+    ui.connState(r.ok ? 'ok' : 'down');
+    // In-band 错误约定:数据端点对配置缺失/节点选择失败回 HTTP 200 +
+    // {"error": …}。归一成标准错误形状,写路径才不会把它当成功。
+    if (body && typeof body === 'object' && !Array.isArray(body)
+        && body.error !== undefined && body.kind === undefined
+        && Object.keys(body).length === 1) {
+      return {kind: 'error', message: String(body.error), inBand: true};
+    }
+    return body;
   }
 };
 
@@ -424,6 +434,14 @@ const authGate = {
     $('#token').style.display = 'none';
     $('#btn-connect').style.display = 'none';
     $('[data-act="logout"]').style.display = '';
+    if (st.mode === 'login') {
+      // 有效会话 Cookie(12h 滑动)应挺过页面刷新:只有认证探测确实
+      // 401 时才弹登录遮罩,否则每次刷新都被强制重登、旧会话白白堆积。
+      try {
+        const probe = await fetch('/api/cluster');
+        if (probe.status !== 401) { this.mode = 'login'; return true; }
+      } catch {}
+    }
     this.show(st.mode, st.username);
     return false;
   },
@@ -1317,7 +1335,7 @@ function openClusterTab() {
       if (!nodes.length) {
         body.innerHTML = `<div class="card" style="max-width:600px">
           <div class="v" style="font-size:15px">单机模式</div>
-          <div class="k" style="line-height:1.7">未配置集群(DOCSQL_PEERS 为空),控制台管理默认节点${nodes.default ? ` <b>${esc(nodes.default)}</b>` : '(未配置,请在启动参数或 DOCSQL_UPSTREAM 指定)'},
+          <div class="k" style="line-height:1.7">未配置集群(DOCSQL_PEERS 为空),控制台管理默认节点${data.default ? ` <b>${esc(data.default)}</b>` : '(未配置,请在启动参数或 DOCSQL_UPSTREAM 指定)'},
           可在「视图 → 服务器仪表盘」查看其状态。集群部署时为 web 服务设置
           DOCSQL_PEERS(逗号分隔的节点地址,如 node-a:7600,node-b:7600),即可在此监控各节点。</div></div>`;
         return;

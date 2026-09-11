@@ -99,11 +99,7 @@ public sealed class DocsqlConnection : DbConnection
     /// </summary>
     public void Promote()
     {
-        var resp = Proto.Send(new Frame(FrameType.ReqPromote, 0, 0, Array.Empty<byte>()));
-        if (resp.Type == FrameType.RespError)
-        {
-            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
-        }
+        Proto.Send(new Frame(FrameType.ReqPromote, 0, 0, Array.Empty<byte>())).EnsureOk();
     }
 
     /// <summary>
@@ -114,11 +110,8 @@ public sealed class DocsqlConnection : DbConnection
     public (long Id, long Receivers) Publish(string channel, string payload)
     {
         var body = JsonSerializer.Serialize(new { channel, payload });
-        var resp = Proto.Send(new Frame(FrameType.ReqPublish, 0, 0, Encoding.UTF8.GetBytes(body)));
-        if (resp.Type == FrameType.RespError)
-        {
-            throw new DocsqlException(Encoding.UTF8.GetString(resp.Payload));
-        }
+        var resp = Proto.Send(new Frame(FrameType.ReqPublish, 0, 0, Encoding.UTF8.GetBytes(body)))
+            .EnsureOk();
         using var doc = JsonDocument.Parse(Encoding.UTF8.GetString(resp.Payload));
         var row = doc.RootElement.GetProperty("rows")[0];
         return (row[0].GetInt64(), row[1].GetInt64());
@@ -142,6 +135,30 @@ public sealed class DocsqlConnection : DbConnection
     internal static long DecodeLong(byte[] payload) =>
         payload.Length >= 8 ? BitConverter.ToInt64(payload, 0) : 0;
 
+    /// <summary>建连 + 可选 REQ_AUTH:DocsqlConnection.Open 与 DocsqlSubscriber 共用的握手骨架。</summary>
+    internal static ProtocolConnection ConnectAndAuth(
+        DocsqlConnectionStringBuilder p, string? keyOverride)
+    {
+        var proto = new ProtocolConnection(p.Host, p.Port, ParseKey(keyOverride ?? p.Key));
+        try
+        {
+            if (!string.IsNullOrEmpty(p.Token))
+            {
+                proto.Send(new Frame(
+                    FrameType.ReqAuth, 0, 0, Encoding.UTF8.GetBytes(p.Token)))
+                    .EnsureOk("auth failed: ");
+            }
+            return proto;
+        }
+        catch
+        {
+            // Never leak the socket on a failed handshake (a retry loop would
+            // orphan it).
+            proto.Dispose();
+            throw;
+        }
+    }
+
     public override void Open()
     {
         if (_state == ConnectionState.Open)
@@ -151,22 +168,10 @@ public sealed class DocsqlConnection : DbConnection
         var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
         try
         {
-            _proto = new ProtocolConnection(p.Host, p.Port, ParseKey(KeyOverride ?? p.Key));
-            // AUTH when a token is configured (REQ_AUTH carries the raw token).
-            if (!string.IsNullOrEmpty(p.Token))
-            {
-                var payload = Encoding.UTF8.GetBytes(p.Token);
-                var resp = _proto.Send(new Frame(FrameType.ReqAuth, 0, 0, payload));
-                if (resp.Type == FrameType.RespError)
-                {
-                    throw new DocsqlException("auth failed: " + Encoding.UTF8.GetString(resp.Payload));
-                }
-            }
+            _proto = ConnectAndAuth(p, KeyOverride);
         }
         catch
         {
-            // Never leak the socket on a failed open (retry would orphan it).
-            _proto?.Dispose();
             _proto = null;
             _state = ConnectionState.Broken;
             throw;
@@ -380,13 +385,17 @@ public sealed class DocsqlCommand : DbCommand
     private static string LiteralOf(DocsqlParameter p) => p.Value switch
     {
         null or DBNull => "NULL",
-        int or long or short or byte => p.Value.ToString()!,
+        // Unsigned integers render like their signed siblings; falling to
+        // the default case quoted them ('5') and silently matched nothing.
+        int or long or short or byte or uint or ulong or ushort or sbyte
+            => Convert.ToString(p.Value, System.Globalization.CultureInfo.InvariantCulture)!,
         double d => d.ToString(System.Globalization.CultureInfo.InvariantCulture),
         float f => f.ToString(System.Globalization.CultureInfo.InvariantCulture),
         // Numeric literal: the engine stores decimals as f64 — big values
         // lose precision beyond ~15-16 significant digits (no decimal type).
         decimal m => m.ToString(System.Globalization.CultureInfo.InvariantCulture),
         bool b => b ? "TRUE" : "FALSE",
+        char c => $"'{c.ToString().Replace("'", "''")}'",
         // Date/time values must round-trip in a culture-invariant,
         // lexicographically sortable text form (the engine stores TEXT):
         // a culture-dependent ToString() sorts wrongly and cannot be parsed
@@ -398,7 +407,14 @@ public sealed class DocsqlCommand : DbCommand
         // data silently — refuse loudly instead.
         byte[] => throw new NotSupportedException(
             "byte[] parameters are not supported (no BLOB storage); serialize to TEXT/Base64"),
-        _ => $"'{p.Value.ToString()!.Replace("'", "''")}'",
+        // Enums have no wire form; their ToString() name would be quoted as
+        // text and silently match nothing.
+        Enum => throw new NotSupportedException(
+            "enum parameters are not supported; convert to the underlying integer first"),
+        Guid g => $"'{g}'",
+        string s => $"'{s.Replace("'", "''")}'",
+        _ => throw new NotSupportedException(
+            $"parameter type {p.Value.GetType().Name} is not supported"),
     };
 
     private static string ErrorText(Frame f) => Encoding.UTF8.GetString(f.Payload);

@@ -138,8 +138,9 @@ public static class Program
         }
 
         // 6) 事务:BEGIN 后插入再 ROLLBACK,数据不变。
-        //    注意:引擎暂不支持 SAVEPOINT,EF 的 SaveChanges 在事务内会隐式
-        //    创建保存点,因此这里用 ADO 原生事务演示(框架层支持有限)。
+        //    SAVEPOINT 已由引擎支持,但 EF 的 SaveChanges 在显式事务内
+        //    依赖的保存点语义仍有限(见 AGENTS 已知边界),这里用 ADO
+        //    原生事务演示最直接的回滚。
         using (var conn = new DocsqlConnection(cs))
         {
             conn.Open();

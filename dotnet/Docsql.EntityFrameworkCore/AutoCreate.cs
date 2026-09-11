@@ -13,8 +13,11 @@ namespace Docsql.EntityFrameworkCore;
 
 internal sealed class DocsqlAutoCreateInterceptor : DbCommandInterceptor
 {
-    // 每条连接只做一次建表检查(EF 默认每个 DbContext 一条连接)。
-    private static readonly ConditionalWeakTable<DbConnection, object> Done = new();
+    // 每条 (连接, 模型) 组合只做一次建表检查(EF 默认每个 DbContext 一条
+    // 连接,但 UseDocsql(DocsqlConnection) 允许多个不同模型的上下文共用
+    // 一条连接 —— 只按连接记账会让第二个模型的表永远建不上)。
+    private static readonly ConditionalWeakTable<DbConnection, ConditionalWeakTable<object, object>>
+        Done = new();
 
     public override InterceptionResult<DbDataReader> ReaderExecuting(
         DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
@@ -81,13 +84,12 @@ internal sealed class DocsqlAutoCreateInterceptor : DbCommandInterceptor
                 || command.CommandText.Contains(
                     "sqlite_master", StringComparison.OrdinalIgnoreCase)))
             return;
-        if (Done.TryGetValue(command.Connection!, out _)) return;
+        var done = Done.GetValue(
+            command.Connection!,
+            static _ => new ConditionalWeakTable<object, object>());
+        if (done.TryGetValue(model, out _)) return;
 
-        foreach (var entity in model.GetEntityTypes())
-        {
-            SchemaSync.SyncTable(command.Connection!, entity);
-            SchemaSync.SyncIndexes(command.Connection!, entity);
-        }
-        Done.Add(command.Connection!, new object());
+        SchemaSync.SyncModel(command.Connection!, model);
+        done.GetValue(model, static _ => new object());
     }
 }

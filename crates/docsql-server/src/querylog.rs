@@ -17,7 +17,6 @@ use docsql_core::proto;
 use docsql_core::value::{Object, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct LogEntry {
@@ -36,6 +35,9 @@ pub struct QueryLog {
     /// for the process lifetime — the old open/append/close per entry put a
     /// full file-open syscall on every statement's critical path.
     sink: Mutex<Option<std::fs::File>>,
+    /// Set once a sink problem has been reported; a broken audit sink must
+    /// at least be visible, not silently produce no trail.
+    sink_warned: std::sync::atomic::AtomicBool,
     pub capacity: usize,
     pub slow_ms: f64,
     pub log_file: Option<String>,
@@ -52,6 +54,7 @@ impl QueryLog {
         QueryLog {
             ring: Mutex::new(VecDeque::new()),
             sink: Mutex::new(None),
+            sink_warned: std::sync::atomic::AtomicBool::new(false),
             capacity: 1000,
             slow_ms: std::env::var("DOCSQL_SLOW_MS")
                 .ok()
@@ -80,10 +83,24 @@ impl QueryLog {
                         .append(true)
                         .open(path)
                         .ok();
+                    if sink.is_none()
+                        && !self
+                            .sink_warned
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!("query log file {path}: cannot open for append");
+                    }
                 }
                 if let Some(f) = sink.as_mut() {
                     use std::io::Write;
-                    let _ = writeln!(f, "{line}");
+                    if let Err(err) = writeln!(f, "{line}") {
+                        if !self
+                            .sink_warned
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            eprintln!("query log file {path}: {err}");
+                        }
+                    }
                 }
             }
         }
@@ -105,10 +122,7 @@ impl QueryLog {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    docsql_core::now_ms()
 }
 
 /// Log one executed statement from its request/response frames.
@@ -225,25 +239,7 @@ pub fn try_serve_log_view(sql: &str, state: &Arc<ServerState>) -> Option<crate::
         o.insert("replicated".into(), Value::Bool(e.replicated));
         docs.push(o);
     }
-    let mut obj = Object::new();
-    obj.insert(
-        "columns".into(),
-        Value::Array(
-            [
-                "ts_ms",
-                "peer",
-                "sql",
-                "ms",
-                "affected",
-                "error",
-                "replicated",
-            ]
-            .iter()
-            .map(|c| Value::Str((*c).into()))
-            .collect(),
-        ),
-    );
-    let cols = [
+    const COLS: [&str; 7] = [
         "ts_ms",
         "peer",
         "sql",
@@ -252,11 +248,16 @@ pub fn try_serve_log_view(sql: &str, state: &Arc<ServerState>) -> Option<crate::
         "error",
         "replicated",
     ];
+    let mut obj = Object::new();
+    obj.insert(
+        "columns".into(),
+        Value::Array(COLS.iter().map(|c| Value::Str((*c).into())).collect()),
+    );
     let rows: Vec<Value> = docs
         .iter()
         .map(|d| {
             Value::Array(
-                cols.iter()
+                COLS.iter()
                     .map(|c| d.get(*c).cloned().unwrap_or(Value::Null))
                     .collect(),
             )

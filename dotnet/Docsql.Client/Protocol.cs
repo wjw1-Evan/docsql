@@ -72,6 +72,20 @@ public readonly record struct Frame(FrameType Type, ushort Flags, ulong Topology
     }
 }
 
+public static class FrameExtensions
+{
+    /// <summary>RESP_ERROR 帧 → DocsqlException:所有"发送后检查应答"路径共用的骨架。</summary>
+    public static Frame EnsureOk(this Frame f, string? prefix = null)
+    {
+        if (f.Type == FrameType.RespError)
+        {
+            var msg = Encoding.UTF8.GetString(f.Payload);
+            throw new DocsqlException(string.IsNullOrEmpty(prefix) ? msg : prefix + msg);
+        }
+        return f;
+    }
+}
+
 public sealed class ProtocolConnection : IDisposable
 {
     private const ushort FlagEncrypted = 0x0004;
@@ -81,11 +95,35 @@ public sealed class ProtocolConnection : IDisposable
     private readonly byte[] _header = new byte[20];
     private readonly byte[]? _key;
 
-    public ProtocolConnection(string host, int port, byte[]? key = null)
+    public ProtocolConnection(
+        string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000)
     {
-        _tcp = new TcpClient(host, port);
-        _stream = _tcp.GetStream();
-        _key = key;
+        // The synchronous TcpClient ctor blocks for the OS connect timeout
+        // (often 75s+) on unreachable hosts; bound it so callers fail fast.
+        _tcp = new TcpClient();
+        try
+        {
+            var connecting = _tcp.ConnectAsync(host, port);
+            try
+            {
+                if (!connecting.Wait(connectTimeoutMs))
+                {
+                    throw new System.IO.IOException(
+                        $"connect to {host}:{port} timed out after {connectTimeoutMs} ms");
+                }
+            }
+            catch (AggregateException ae)
+            {
+                throw ae.GetBaseException();
+            }
+            _stream = _tcp.GetStream();
+            _key = key;
+        }
+        catch
+        {
+            _tcp.Dispose();
+            throw;
+        }
     }
 
     /// SQL text payload: length-prefixed UTF-8, tag 4 (string).

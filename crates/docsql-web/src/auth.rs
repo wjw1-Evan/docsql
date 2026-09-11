@@ -386,6 +386,11 @@ fn parse_creds(bytes: &[u8]) -> Result<Creds, String> {
         .try_into()
         .map_err(|_| "corrupt credential file: hash len")?;
     let iterations = v["iterations"].as_u64().unwrap_or(PBKDF2_ITERATIONS as u64) as u32;
+    // A hand-edited 0 would hit pbkdf2_hmac_sha256's assert and panic the
+    // login handler on every attempt — corrupt like any other tampering.
+    if iterations < 1 {
+        return Err("corrupt credential file: iterations".into());
+    }
     Ok(Creds {
         username,
         salt,
@@ -549,6 +554,13 @@ impl Lockout {
             entry.1 = Some(now + LOCKOUT);
             entry.0.clear();
         }
+        // Drop idle buckets along the way: a scanner rotating source IPs
+        // would otherwise grow the map forever (buckets are otherwise only
+        // removed on that IP's successful login).
+        self.failures.retain(|_, e| {
+            e.0.retain(|f| now.duration_since(*f) < LOCK_WINDOW);
+            !e.0.is_empty() || e.1.is_some_and(|until| until > now)
+        });
     }
 
     pub fn reset(&mut self, ip: IpAddr) {

@@ -204,17 +204,8 @@ fn session_from(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-/// Length-guarded XOR fold (mirrors docsql-server's crypto helper).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+/// Length-guarded XOR fold — shared with the server's protocol auth.
+use docsql_server::crypto::constant_time_eq;
 
 /// Lockout bucket key for login-failure limiting: the direct socket peer
 /// by default; the forwarded client IP when running behind a trusted
@@ -308,11 +299,17 @@ async fn auth_setup(
             json!({"error": "尝试次数过多,请一分钟后再试"}),
         );
     }
-    let result = a
-        .store
-        .lock()
-        .unwrap()
-        .setup(&body.username, &body.password);
+    // setup() runs the PBKDF2 derivation (~tens of ms) — keep it off the
+    // async worker and out of the store mutex's critical section.
+    let st = state.clone();
+    let username = body.username.clone();
+    let password = body.password.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let a = st.auth.as_ref().expect("checked at fn entry");
+        a.store.lock().unwrap().setup(&username, &password)
+    })
+    .await
+    .unwrap_or_else(|_| Err(auth::SetupError::Io("task panicked".into())));
     match result {
         Ok(creds) => {
             a.lockout.lock().unwrap().reset(source);
@@ -361,11 +358,18 @@ async fn auth_login(
             json!({"error": "尝试次数过多,请一分钟后再试"}),
         );
     }
-    let ok = a
-        .store
-        .lock()
-        .unwrap()
-        .verify(&body.username, &body.password);
+    // verify() burns a PBKDF2 derivation — run it on the blocking pool so
+    // the async worker (and every other request behind the store mutex)
+    // is not stalled for the duration.
+    let st = state.clone();
+    let username = body.username.clone();
+    let password = body.password.clone();
+    let ok = tokio::task::spawn_blocking(move || {
+        let a = st.auth.as_ref().expect("checked at fn entry");
+        a.store.lock().unwrap().verify(&username, &password)
+    })
+    .await
+    .unwrap_or(false);
     if !ok {
         // Same generic error for wrong username and wrong password —
         // verify() burns a derivation either way, and the text must not
@@ -534,16 +538,27 @@ const PROBE_RECV_CAP: usize = 1024 * 1024;
 /// bigger than a status report, still bounded by the requested limit.
 const LOGS_RECV_CAP: usize = 4 * 1024 * 1024;
 
-async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+/// Frame write with an explicit IO budget — shared skeleton of the probe
+/// and managed-node transports.
+async fn write_frame_timed(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
     let bytes = frame.encode().map_err(std::io::Error::other)?;
-    tokio::time::timeout(PROBE_IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(PROBE_IO_TIMEOUT, stream.flush()).await??;
+    tokio::time::timeout(timeout, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(timeout, stream.flush()).await??;
     Ok(())
 }
 
-async fn read_response_frame(stream: &mut TcpStream, cap: usize) -> std::io::Result<Frame> {
+/// Frame read with an explicit IO budget and allocation cap.
+async fn read_frame_timed(
+    stream: &mut TcpStream,
+    timeout: std::time::Duration,
+    cap: usize,
+) -> std::io::Result<Frame> {
     let mut header = [0u8; proto::HEADER_LEN];
-    tokio::time::timeout(PROBE_IO_TIMEOUT, stream.read_exact(&mut header)).await??;
+    tokio::time::timeout(timeout, stream.read_exact(&mut header)).await??;
     let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
     if len > cap {
         return Err(std::io::Error::new(
@@ -553,10 +568,46 @@ async fn read_response_frame(stream: &mut TcpStream, cap: usize) -> std::io::Res
     }
     let mut buf = header.to_vec();
     let mut payload = vec![0u8; len];
-    tokio::time::timeout(PROBE_IO_TIMEOUT, stream.read_exact(&mut payload)).await??;
+    tokio::time::timeout(timeout, stream.read_exact(&mut payload)).await??;
     buf.extend_from_slice(&payload);
     let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
     Ok(f)
+}
+
+async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+    write_frame_timed(stream, frame, PROBE_IO_TIMEOUT).await
+}
+
+async fn read_response_frame(stream: &mut TcpStream, cap: usize) -> std::io::Result<Frame> {
+    read_frame_timed(stream, PROBE_IO_TIMEOUT, cap).await
+}
+
+/// Send REQ_AUTH on an established stream and refuse anything but success.
+/// Shared by the status/log probes (the managed-node leg has its own richer
+/// error text in `node_connect`).
+async fn auth_on_stream(
+    stream: &mut TcpStream,
+    token: Option<&str>,
+    cap: usize,
+) -> Result<(), (bool, String)> {
+    if let Some(t) = token {
+        write_frame(stream, &Frame::new(proto::REQ_AUTH, t.as_bytes().to_vec()))
+            .await
+            .map_err(|e| (true, e.to_string()))?;
+        let auth = read_response_frame(stream, cap)
+            .await
+            .map_err(|e| (true, e.to_string()))?;
+        if auth.frame_type == proto::RESP_ERROR {
+            return Err((
+                true,
+                format!(
+                    "node rejected AUTH: {}",
+                    String::from_utf8_lossy(&auth.payload)
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Probe one cluster node: REQ_PING for liveness + latency, then (after AUTH
@@ -607,25 +658,8 @@ async fn probe_node_inner(
             format!("unexpected response to PING: {:#06x}", pong.frame_type),
         ));
     }
-    if let Some(t) = token {
-        write_frame(
-            &mut stream,
-            &Frame::new(proto::REQ_AUTH, t.as_bytes().to_vec()),
-        )
-        .await
-        .map_err(|e| (true, e.to_string()))?;
-        let auth = read_response_frame(&mut stream, PROBE_RECV_CAP)
-            .await
-            .map_err(|e| (true, e.to_string()))?;
-        if auth.frame_type == proto::RESP_ERROR {
-            return Err((
-                true,
-                format!(
-                    "node rejected AUTH: {}",
-                    String::from_utf8_lossy(&auth.payload)
-                ),
-            ));
-        }
+    if let Err((reachable, message)) = auth_on_stream(&mut stream, token, PROBE_RECV_CAP).await {
+        return Err((reachable, message));
     }
     write_frame(&mut stream, &Frame::new(proto::REQ_STATUS, vec![]))
         .await
@@ -713,25 +747,8 @@ async fn fetch_node_logs_inner(
         .await
         .map_err(|e| (false, e.to_string()))?
         .map_err(|e| (false, e.to_string()))?;
-    if let Some(t) = token {
-        write_frame(
-            &mut stream,
-            &Frame::new(proto::REQ_AUTH, t.as_bytes().to_vec()),
-        )
-        .await
-        .map_err(|e| (true, e.to_string()))?;
-        let auth = read_response_frame(&mut stream, LOGS_RECV_CAP)
-            .await
-            .map_err(|e| (true, e.to_string()))?;
-        if auth.frame_type == proto::RESP_ERROR {
-            return Err((
-                true,
-                format!(
-                    "node rejected AUTH: {}",
-                    String::from_utf8_lossy(&auth.payload)
-                ),
-            ));
-        }
+    if let Err((reachable, message)) = auth_on_stream(&mut stream, token, LOGS_RECV_CAP).await {
+        return Err((reachable, message));
     }
     let body = serde_json::to_vec(&serde_json::json!({"limit": limit})).unwrap_or_default();
     write_frame(&mut stream, &Frame::new(proto::REQ_LOGS, body))
@@ -845,28 +862,11 @@ const NODE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const NODE_RECV_CAP: usize = 64 * 1024 * 1024;
 
 async fn node_write_frame(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
-    let bytes = frame.encode().map_err(std::io::Error::other)?;
-    tokio::time::timeout(NODE_IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(NODE_IO_TIMEOUT, stream.flush()).await??;
-    Ok(())
+    write_frame_timed(stream, frame, NODE_IO_TIMEOUT).await
 }
 
 async fn node_read_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
-    let mut header = [0u8; proto::HEADER_LEN];
-    tokio::time::timeout(NODE_IO_TIMEOUT, stream.read_exact(&mut header)).await??;
-    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-    if len > NODE_RECV_CAP {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "node response too large",
-        ));
-    }
-    let mut buf = header.to_vec();
-    let mut payload = vec![0u8; len];
-    tokio::time::timeout(NODE_IO_TIMEOUT, stream.read_exact(&mut payload)).await??;
-    buf.extend_from_slice(&payload);
-    let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
-    Ok(f)
+    read_frame_timed(stream, NODE_IO_TIMEOUT, NODE_RECV_CAP).await
 }
 
 /// Connect to a managed node and authenticate with the server's own
@@ -961,11 +961,7 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
                     }));
                 }
                 proto::RESP_AFFECTED => {
-                    let n = f
-                        .payload
-                        .get(..8)
-                        .and_then(|s| s.try_into().ok())
-                        .map_or(0, u64::from_le_bytes);
+                    let n = proto::decode_affected(&f.payload);
                     outcomes.push(serde_json::json!({"kind": "affected", "count": n}));
                 }
                 proto::RESP_ERROR => {

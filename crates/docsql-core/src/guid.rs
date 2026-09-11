@@ -11,7 +11,6 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Last emitted state packed as `(unix_ms << 12) | seq`. Compare-and-swap
 /// makes values strictly increasing even under clock regression (the
@@ -22,10 +21,7 @@ static LAST_STATE: AtomicU64 = AtomicU64::new(0);
 static ISSUE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::now_ms()
 }
 
 /// 64 bits of randomness without a rand dependency: two independently
