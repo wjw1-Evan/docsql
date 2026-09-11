@@ -100,6 +100,47 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(SqlError::Message(msg.into()))
 }
 
+/// Cooperative statement deadline for the server-side statement timeout
+/// (`DOCSQL_STATEMENT_TIMEOUT_MS`). The engine is synchronous inside one
+/// global writer — nothing can preempt a runaway statement from the
+/// outside — so long row loops (table scans, nested-loop joins, UPDATE/
+/// DELETE matching) check in here instead. The wall clock is sampled once
+/// per [`StmtDeadline::TICK_BATCH`] iterations; a fired deadline surfaces
+/// as a normal SQL error, rolling the statement back like any failure.
+#[derive(Default)]
+pub struct StmtDeadline {
+    at: std::cell::Cell<Option<std::time::Instant>>,
+    ticks: std::cell::Cell<u64>,
+}
+
+impl StmtDeadline {
+    /// Sampling granularity: Instant::now() is cheap but not free at
+    /// millions of rows — amortize it.
+    const TICK_BATCH: u64 = 1024;
+
+    pub fn set(&self, deadline: Option<std::time::Instant>) {
+        self.at.set(deadline);
+        self.ticks.set(0);
+    }
+
+    /// Call once per row iteration from long loops. Engine-global, not per
+    /// connection — the caller arms and clears it around exactly one
+    /// statement (see [`Database::set_statement_deadline`]).
+    pub fn check(&self) -> Result<()> {
+        let t = (self.ticks.get() + 1) % Self::TICK_BATCH;
+        self.ticks.set(t);
+        if t != 0 {
+            return Ok(());
+        }
+        if let Some(d) = self.at.get() {
+            if std::time::Instant::now() >= d {
+                return err("statement timeout exceeded (DOCSQL_STATEMENT_TIMEOUT_MS)");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Outcome of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecOutcome {
@@ -395,6 +436,10 @@ pub struct Database {
     /// CTEs visible to the statement currently executing (WITH ...): the
     /// body's rows, keyed by CTE name. Cleared per top-level statement.
     ctes: std::collections::BTreeMap<String, Vec<Object>>,
+    /// Cooperative deadline for the statement currently executing (see
+    /// [`StmtDeadline`]); armed per client statement by the server, never
+    /// set for replication apply / restore replay.
+    stmt_deadline: StmtDeadline,
     /// Lazily-computed AUTOINCREMENT next id per table (max(id)+1 over the
     /// heap). Invalidated by rewrites/deletes; not persisted — recomputed
     /// after restart, preserving max(existing)+1 semantics.
@@ -647,6 +692,7 @@ impl Database {
             savepoints: Vec::new(),
             tx_snapshot: None,
             ctes: std::collections::BTreeMap::new(),
+            stmt_deadline: StmtDeadline::default(),
             autoinc_cache: std::collections::HashMap::new(),
             resolved_sql: None,
             journal_next: None,
@@ -1134,6 +1180,14 @@ impl Database {
     /// True when a session transaction is open.
     pub fn in_transaction(&self) -> bool {
         self.tx_snapshot.is_some()
+    }
+
+    /// Arm the cooperative deadline for the statement about to execute
+    /// (server-side statement timeout). Engine-global, not per connection:
+    /// the caller MUST clear it (`set_statement_deadline(None)`) once the
+    /// statement finished, on every path.
+    pub fn set_statement_deadline(&self, deadline: Option<std::time::Instant>) {
+        self.stmt_deadline.set(deadline);
     }
 
     /// Execute exactly one SQL statement.
@@ -2096,6 +2150,7 @@ impl Database {
     }
 
     fn matches(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
+        self.stmt_deadline.check()?;
         match selection {
             None => Ok(true),
             Some(e) => Ok(matches!(eval_expr(e, doc)?, Value::Bool(true))),
@@ -3826,6 +3881,7 @@ impl Database {
         if let Some(cond) = &select.selection {
             let mut kept = Vec::with_capacity(rows.len());
             for doc in rows.drain(..) {
+                self.stmt_deadline.check()?;
                 if matches!(eval_expr(cond, &doc)?, Value::Bool(true)) {
                     kept.push(doc);
                 }
@@ -3887,7 +3943,7 @@ impl Database {
                 // comma-separated FROM entries: cross join their base tables
                 let (n, a, d) = self.load_table_factor(&twj.relation)?;
                 let k = a.unwrap_or(n);
-                rows = join_rows(rows, &d, &k, None, false, false)?;
+                rows = join_rows(rows, &d, &k, None, false, false, &self.stmt_deadline)?;
                 all_joins.extend(twj.joins.iter());
             }
         }
@@ -3947,7 +4003,15 @@ impl Database {
                 JoinOperator::CrossJoin(_) => (false, false, None),
                 _ => return err("unsupported join type"),
             };
-            rows = join_rows(rows, &jdocs, &jkey, on.as_ref(), left_join, right_join)?;
+            rows = join_rows(
+                rows,
+                &jdocs,
+                &jkey,
+                on.as_ref(),
+                left_join,
+                right_join,
+                &self.stmt_deadline,
+            )?;
         }
         Ok(rows)
     }
@@ -4654,12 +4718,15 @@ fn join_rows(
     on: Option<&SqlExpr>,
     left_join: bool,
     right_join: bool,
+    deadline: &StmtDeadline,
 ) -> Result<Vec<Object>> {
     let mut right_matched = vec![false; right.len()];
     let mut out = Vec::new();
     for l in &left {
+        deadline.check()?;
         let mut matched = false;
         for (ri, r) in right.iter().enumerate() {
+            deadline.check()?;
             let mut merged = l.clone();
             for (k, v) in r {
                 merged.insert(format!("{right_key}.{k}"), v.clone());
@@ -11840,5 +11907,62 @@ mod complex_query_tests {
             matches!(db.execute("SELECT id FROM t"), Ok(ExecOutcome::Rows(r)) if !r.rows.is_empty()),
             "durable after the flusher ran"
         );
+    }
+
+    #[test]
+    fn statement_deadline_fires_mid_join_and_clears() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE b (id INT)").unwrap();
+        let mut vals = String::from("INSERT INTO a VALUES (0)");
+        for i in 1..400 {
+            vals.push_str(&format!(", ({i})"));
+        }
+        db.execute(&vals).unwrap();
+        let mut vals = String::from("INSERT INTO b VALUES (0)");
+        for i in 1..400 {
+            vals.push_str(&format!(", ({i})"));
+        }
+        db.execute(&vals).unwrap();
+
+        // Deadline already in the past: the nested-loop join must abort
+        // with the timeout error (row loops are the only practical
+        // preemption point inside the synchronous engine), and — crucial —
+        // the deadline is armed per statement: after clearing it, the same
+        // join runs to completion.
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        db.set_statement_deadline(Some(expired));
+        let e = db
+            .execute("SELECT COUNT(*) FROM a, b WHERE a.id + b.id < 0")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("statement timeout"),
+            "wrong error: {e}"
+        );
+        db.set_statement_deadline(None);
+        assert!(
+            matches!(
+                db.execute("SELECT COUNT(*) FROM a, b WHERE a.id + b.id < 0"),
+                Ok(ExecOutcome::Rows(_))
+            ),
+            "cleared deadline must not poison later statements"
+        );
+        // UPDATE matching loops honor the deadline too (plain table, no
+        // index fast path: the deadline must fire in the row loop). Needs
+        // more rows than the sampling batch — a 400-row UPDATE finishes
+        // before the first clock sample by design.
+        db.execute("CREATE TABLE c (id INT)").unwrap();
+        let mut vals = String::from("INSERT INTO c VALUES (0)");
+        for i in 1..2000 {
+            vals.push_str(&format!(", ({i})"));
+        }
+        db.execute(&vals).unwrap();
+        db.set_statement_deadline(Some(expired));
+        let e = db.execute("UPDATE c SET id = id").unwrap_err();
+        assert!(
+            e.to_string().contains("statement timeout"),
+            "wrong error: {e}"
+        );
+        db.set_statement_deadline(None);
     }
 }

@@ -85,6 +85,8 @@ pub struct ServerState {
     /// Live connection budget (resource control). Acquired per accepted
     /// connection, released on close; None = unlimited.
     pub conn_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// Client-statement wall-clock budget (see ServerConfig).
+    pub statement_timeout: Option<std::time::Duration>,
     /// Auth-failure lockout threshold per source IP (0 disables lockout).
     pub auth_lock_threshold: u32,
     /// Idle-session timeout: connections silent this long are closed by
@@ -316,6 +318,12 @@ pub struct ServerConfig {
     /// Backup directory override; None = `<db dir>/backups`
     /// (DOCSQL_BACKUP_DIR).
     pub backup_dir: Option<PathBuf>,
+    /// Per-statement wall-clock budget for CLIENT statements
+    /// (DOCSQL_STATEMENT_TIMEOUT_MS; 0 = unlimited). Replication apply and
+    /// restore replay are exempt — peers must apply what the origin
+    /// confirmed regardless of their own speed, or clusters would diverge
+    /// on slow nodes.
+    pub statement_timeout_ms: u64,
 }
 
 pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
@@ -387,6 +395,8 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         conn_slots: (cfg.max_conn > 0)
             .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.max_conn))),
         auth_lock_threshold: cfg.auth_lock_threshold,
+        statement_timeout: (cfg.statement_timeout_ms > 0)
+            .then(|| std::time::Duration::from_millis(cfg.statement_timeout_ms)),
         idle_timeout: (cfg.idle_timeout_secs > 0)
             .then(|| std::time::Duration::from_secs(cfg.idle_timeout_secs)),
         replicate_to: tokio::sync::Mutex::new(cfg.replicate_to),
@@ -1243,6 +1253,17 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         }
                                     };
                                     logged = true;
+                                    // Client statements get the wall-clock
+                                    // budget; replication apply must run
+                                    // unbounded (peers apply what the
+                                    // origin confirmed, at their own speed).
+                                    let stmt_deadline = if is_replication {
+                                        None
+                                    } else {
+                                        state
+                                            .statement_timeout
+                                            .map(|t| std::time::Instant::now() + t)
+                                    };
                                     execute_sql(
                                         &state,
                                         &effective,
@@ -1252,6 +1273,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         false,
                                         None,
                                         if is_replication { None } else { user.as_ref() },
+                                        stmt_deadline,
                                     )
                                     .await
                                 }
@@ -1309,6 +1331,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         None,
                                         false,
                                         Some((&node_id, seq)),
+                                        None,
                                         None,
                                     )
                                     .await;
@@ -1647,6 +1670,7 @@ async fn execute_sql(
     order_held: bool,
     seq_pos: Option<(&str, u64)>,
     user: Option<&UserAuth>,
+    stmt_deadline: Option<std::time::Instant>,
 ) -> Frame {
     // Statement throughput/error-rate accounting: every executor caller
     // (client REQ_SQL, replication replay, restore) funnels through here,
@@ -1664,6 +1688,7 @@ async fn execute_sql(
         order_held,
         seq_pos,
         user,
+        stmt_deadline,
     )
     .await;
     if resp.frame_type == proto::RESP_ERROR {
@@ -1685,6 +1710,7 @@ async fn execute_sql_inner(
     order_held: bool,
     seq_pos: Option<(&str, u64)>,
     user: Option<&UserAuth>,
+    stmt_deadline: Option<std::time::Instant>,
 ) -> Frame {
     // One parse for the whole round-trip: the AST executes at the bottom,
     // the classification routes the request here (parse errors surface with
@@ -1854,6 +1880,10 @@ async fn execute_sql_inner(
         };
         let (out, in_tx, resolved, seq, sync_failed) = {
             let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            // Arm the client-statement deadline inside the engine lock —
+            // it is engine-global, so it must cover exactly this statement
+            // and be cleared on every path below (the guard block does).
+            db.set_statement_deadline(stmt_deadline);
             // Fuse the statement's commit with its replication bookkeeping
             // into ONE WAL fsync: journal append on the writing side,
             // position update on the receiving side. Unfused, each is an
@@ -1900,6 +1930,7 @@ async fn execute_sql_inner(
             // able to open/close a transaction between execute and
             // classification.
             let in_tx = db.in_transaction();
+            db.set_statement_deadline(None);
             (out, in_tx, resolved, seq, sync_failed)
         };
         if sync_failed {
@@ -3456,7 +3487,7 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
             .origin
             .as_ref()
             .map(|(origin, seq)| (origin.as_str(), *seq));
-        let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos, None).await;
+        let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos, None, None).await;
         if resp.frame_type == proto::RESP_ERROR {
             let msg = String::from_utf8_lossy(&resp.payload).into_owned();
             eprintln!("sync: queued replay failed: {msg}");
@@ -4398,7 +4429,8 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
                 proto::RESP_CATCHUP => {
                     for (_, sql) in decode_catchup_entries(&f.payload)? {
                         let resp =
-                            execute_sql(state, &sql, false, true, None, false, None, None).await;
+                            execute_sql(state, &sql, false, true, None, false, None, None, None)
+                                .await;
                         if resp.frame_type == proto::RESP_ERROR {
                             return Err(std::io::Error::other(format!(
                                 "catch-up replay failed: {}",

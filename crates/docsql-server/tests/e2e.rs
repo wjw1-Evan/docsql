@@ -55,6 +55,7 @@ async fn start_server_sec(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
     tokio::spawn(docsql_server::run(cfg));
     // Wait for the port to accept.
@@ -95,6 +96,7 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -538,6 +540,7 @@ async fn fanout_authenticates_with_cluster_token() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -625,6 +628,7 @@ async fn default_fill_converges_across_peers() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -917,6 +921,7 @@ async fn replication_and_failover() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     // Primary: forwards writes to the replica.
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
@@ -938,6 +943,7 @@ async fn replication_and_failover() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for addr in [&primary_addr, &replica_addr] {
         for _ in 0..100 {
@@ -1044,6 +1050,7 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            statement_timeout_ms: 0,
         }));
     }
     for addr in &addrs {
@@ -1118,6 +1125,7 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            statement_timeout_ms: 0,
         }));
     }
     for addr in &addrs {
@@ -1202,6 +1210,7 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
 
     // Two-node symmetric cluster; keep b's handle so the test can take it down.
@@ -1384,6 +1393,7 @@ async fn query_log_records_statements() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -1755,6 +1765,7 @@ async fn pubsub_cross_node_delivery() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            statement_timeout_ms: 0,
         }));
     }
     for addr in &addrs {
@@ -1835,6 +1846,7 @@ async fn symmetric_cluster_guid_autogen_converges() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            statement_timeout_ms: 0,
         }));
     }
     for addr in &addrs {
@@ -1976,6 +1988,7 @@ async fn logs_frame_over_wire() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
     // a fans out to the live peer b and a dead address: both attempts must
     // show up in the sync log (ok and error respectively).
@@ -2080,6 +2093,7 @@ async fn spawn_node(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2341,6 +2355,7 @@ async fn spawn_node_window(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..200 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2395,6 +2410,7 @@ async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..200 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -2919,6 +2935,7 @@ async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::Path
         backup_interval_secs: 1,
         backup_keep: keep,
         backup_dir: None,
+        statement_timeout_ms: 0,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -3563,6 +3580,7 @@ async fn backup_restore_refused_on_read_only_replica() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -3703,6 +3721,7 @@ async fn backup_dir_override_is_honored() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: Some(snaps.clone()),
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -4024,5 +4043,83 @@ async fn user_identity_and_admin_protocol_guards() {
     assert!(payload_str(&f).contains("admin"), "{}", payload_str(&f));
     // Her SELECT surface still works (identity intact, not locked out).
     let f = gina.sql("SELECT COUNT(*) FROM t").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+}
+
+/// DOCSQL_STATEMENT_TIMEOUT_MS wiring: a client statement over the wall-
+/// clock budget fails with the timeout error while the node keeps serving —
+/// the deadline is armed per statement, not a poisoned state. INSERT carries
+/// no row-loop deadline checks (nothing loop-shaped to preempt there), so
+/// setup data lands fine even under a 1ms budget; the nested-loop join of
+/// two tables is the deterministic runaway.
+#[tokio::test]
+async fn statement_timeout_kills_runaway_query_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("e2e.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        statement_timeout_ms: 1,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&addr).await;
+    let f = c.sql("CREATE TABLE a (id INT PRIMARY KEY)").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let f = c.sql("CREATE TABLE b (id INT)").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    for (table, start) in [("a", 0i64), ("b", 10_000)] {
+        let mut vals = format!("INSERT INTO {table} VALUES ({start})");
+        for i in 1..1000 {
+            vals.push_str(&format!(", ({})", start + i));
+        }
+        let f = c.sql(&vals).await;
+        assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    }
+
+    // Under the budget: an indexed point query answers normally.
+    let f = c.sql("SELECT id FROM a WHERE id = 5").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+
+    // Runaway: 1000x1000 nested-loop join with a never-true predicate
+    // (nothing materializes, a million ON evaluations) exceeds 1ms.
+    let f = c
+        .sql("SELECT COUNT(*) FROM a x, b y WHERE x.id + y.id < 0")
+        .await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "join must time out");
+    assert!(
+        payload_str(&f).contains("statement timeout"),
+        "{}",
+        payload_str(&f)
+    );
+
+    // The deadline was per statement: the node is healthy and fast
+    // statements still answer.
+    let f = c.sql("SELECT 1").await;
     assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
 }

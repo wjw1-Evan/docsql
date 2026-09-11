@@ -60,6 +60,14 @@
 //!                                     <db-dir>/backups — /data/backups
 //!                                     in the containers, inside the
 //!                                     data volume)
+//!     DOCSQL_STATEMENT_TIMEOUT_MS=<n> wall-clock budget per CLIENT
+//!                                     statement (0 = unlimited, the
+//!                                     default). A statement exceeding it
+//!                                     fails with a timeout error — the
+//!                                     server-side kill switch against
+//!                                     runaway queries on the single
+//!                                     writer. Replication apply and
+//!                                     restore replay are exempt.
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -117,6 +125,7 @@ async fn main() -> std::io::Result<()> {
     let catchup_window = env_num::<u64>("DOCSQL_CATCHUP_WINDOW", 100_000);
     let backup_interval_secs = env_num::<u64>("DOCSQL_BACKUP_INTERVAL_SECS", 86_400);
     let backup_keep = env_num::<usize>("DOCSQL_BACKUP_KEEP", 7);
+    let statement_timeout_ms = env_num::<u64>("DOCSQL_STATEMENT_TIMEOUT_MS", 0);
     let backup_dir = std::env::var("DOCSQL_BACKUP_DIR")
         .ok()
         .map(std::path::PathBuf::from)
@@ -163,6 +172,7 @@ async fn main() -> std::io::Result<()> {
         backup_interval_secs,
         backup_keep,
         backup_dir,
+        statement_timeout_ms,
     })
     .await
 }

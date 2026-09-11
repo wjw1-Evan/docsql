@@ -73,6 +73,7 @@ async fn start_stack(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -653,6 +654,7 @@ async fn cluster_page_probes_live_and_dead_nodes() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -721,6 +723,7 @@ async fn logs_endpoint_serves_local_and_node_reports() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -843,6 +846,7 @@ async fn node_selection_routes_sql_meta_stats() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -1221,6 +1225,7 @@ async fn backup_endpoint_lists_and_triggers() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -1329,6 +1334,7 @@ async fn backup_restore_endpoint_round_trip() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -2037,6 +2043,7 @@ async fn console_node_token_mismatch_surfaces_in_band() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -2117,6 +2124,7 @@ async fn offline_node_in_band_errors_and_restore_transport_502() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {
@@ -2243,6 +2251,7 @@ async fn backup_node_override_via_json_body_and_bare_trigger() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        statement_timeout_ms: 0,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&node_addr).await.is_ok() {

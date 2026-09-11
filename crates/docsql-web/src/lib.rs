@@ -2082,6 +2082,7 @@ mod tests {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            statement_timeout_ms: 0,
         }));
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(&addr).await.is_ok() {
@@ -2123,6 +2124,7 @@ mod tests {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            statement_timeout_ms: 0,
         };
         tokio::spawn(docsql_server::run(cfg));
         for _ in 0..100 {

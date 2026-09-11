@@ -595,7 +595,10 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
     // AUTOINCREMENT counters continue from the restored max).
     let mut replayed = 0usize;
     for (i, stmt) in stmts.iter().enumerate() {
-        let resp = crate::execute_sql(state, stmt, false, false, None, true, None, None).await;
+        // Restore replay never carries a deadline: a large dump must
+        // finish regardless of DOCSQL_STATEMENT_TIMEOUT_MS.
+        let resp =
+            crate::execute_sql(state, stmt, false, false, None, true, None, None, None).await;
         if resp.frame_type == proto::RESP_ERROR {
             drop(order);
             return Err(format!(
