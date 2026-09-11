@@ -97,6 +97,20 @@ SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡
   `ALL_INDEXES`/`USER_INDEXES`(OWNER 恒为 `DOCSQL`;单全局命名空间,USER_* 与 ALL_* 同数据;
   系统内部表不出现)。
 
+## MERGE INTO(Oracle/SQL 标准 upsert)
+
+```sql
+MERGE INTO stock USING feed ON stock.sku = feed.sku
+WHEN MATCHED THEN UPDATE SET qty = feed.qty
+WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (feed.sku, feed.qty);
+```
+
+- ON 条件为任意表达式(在合并命名空间上求值:目标列裸名、源列可用 `别名.列` 限定);
+- 一个目标行被多个源行命中 → 显式报错(Oracle ORA-30926 语义);
+- 语句作为整体原子应用并随复制扇出(对端确定性重放收敛);
+- v1 不支持:`WHEN … AND <predicate>`、`UPDATE … WHERE/DELETE WHERE`、INSERT 谓词、
+  `ROW` 形式、`BY SOURCE`;源侧不支持引用 CTE。
+
 ## 事务
 
 ```sql
