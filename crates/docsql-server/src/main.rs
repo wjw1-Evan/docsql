@@ -90,14 +90,8 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }
-    let max_conn = std::env::var("DOCSQL_MAX_CONN")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    let idle_timeout_secs = std::env::var("DOCSQL_IDLE_TIMEOUT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+    let max_conn = env_num::<usize>("DOCSQL_MAX_CONN", 0);
+    let idle_timeout_secs = env_num::<u64>("DOCSQL_IDLE_TIMEOUT", 0);
     let replicate_to = std::env::var("DOCSQL_REPLICATE_TO")
         .ok()
         .filter(|s| !s.is_empty());
@@ -120,18 +114,9 @@ async fn main() -> std::io::Result<()> {
     let async_commit = std::env::var("DOCSQL_ASYNC_COMMIT")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let catchup_window = std::env::var("DOCSQL_CATCHUP_WINDOW")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(100_000);
-    let backup_interval_secs = std::env::var("DOCSQL_BACKUP_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(86_400);
-    let backup_keep = std::env::var("DOCSQL_BACKUP_KEEP")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(7);
+    let catchup_window = env_num::<u64>("DOCSQL_CATCHUP_WINDOW", 100_000);
+    let backup_interval_secs = env_num::<u64>("DOCSQL_BACKUP_INTERVAL_SECS", 86_400);
+    let backup_keep = env_num::<usize>("DOCSQL_BACKUP_KEEP", 7);
     let backup_dir = std::env::var("DOCSQL_BACKUP_DIR")
         .ok()
         .map(std::path::PathBuf::from)
@@ -180,4 +165,20 @@ async fn main() -> std::io::Result<()> {
         backup_dir,
     })
     .await
+}
+
+/// Numeric env with fail-fast validation: a malformed value (typo like
+/// `DOCSQL_MAX_CONN=10O`) must refuse startup loudly, not silently fall
+/// back to the default and leave the operator with the wrong limits.
+fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<T>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("refusing to start: {name}: invalid integer value {v:?}");
+                std::process::exit(2);
+            }
+        },
+        _ => default,
+    }
 }

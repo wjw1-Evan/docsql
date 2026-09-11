@@ -8,7 +8,10 @@ description = "DocSQL network server: SQL protocol + auth + replication"
 [dependencies]
 sqlparser = "0.62"
 docsql-core = { path = "../docsql-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
+# TCP keepalive/NODELAY on accepted connections (session survival across
+# NAT/firewall idle timeouts).
+socket2 = "0.6"
 serde.workspace = true
 serde_json = "1"
 aes-gcm = "0.10"

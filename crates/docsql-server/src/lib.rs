@@ -30,6 +30,7 @@
 
 pub mod backup;
 pub mod crypto;
+pub mod metrics;
 pub mod pubsub;
 pub mod querylog;
 
@@ -50,6 +51,9 @@ pub fn err_payload(msg: &str) -> Vec<u8> {
 
 pub struct ServerState {
     pub db: Mutex<Database>,
+    /// Process-lifetime runtime counters, embedded into REQ_STATUS and
+    /// formatted into Prometheus text by the web console's /metrics.
+    pub metrics: std::sync::Arc<metrics::Metrics>,
     pub auth_token: Option<String>,
     /// Read-only client credential (DOCSQL_READ_TOKEN). REQ_AUTH with it
     /// marks the connection as a least-privilege client: SELECT and
@@ -375,6 +379,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     let has_users0 = db.any_user_exists().unwrap_or(false);
     let state = Arc::new(ServerState {
         db: Mutex::new(db),
+        metrics: metrics::Metrics::new(),
         auth_token: cfg.auth_token,
         read_token: cfg.read_token,
         cluster_token: cfg.cluster_token,
@@ -492,7 +497,23 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         tokio::spawn(backup::backup_task(st, cfg.backup_interval_secs));
     }
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            r = listener.accept() => r?,
+            // Graceful shutdown: SIGTERM/SIGINT stop the accept loop, then
+            // live connections get a bounded window to finish. What is
+            // still open when the window elapses is covered by the
+            // engine's disconnect-rollback plus WAL recovery.
+            _ = shutdown_signal() => {
+                eprintln!("shutdown signal: draining connections (max 10s)");
+                graceful_drain(&state).await;
+                return Ok(());
+            }
+        };
+        let stream = set_tcp_keepalive(stream);
+        state
+            .metrics
+            .connections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = state.clone();
         // Resource control: hold one slot per live connection. Over the
         // limit the connection is answered with an error and closed —
@@ -501,6 +522,10 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             Some(sem) => match sem.clone().try_acquire_owned() {
                 Ok(g) => Some(g),
                 Err(_) => {
+                    state
+                        .metrics
+                        .connections_rejected_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut s = stream;
                     let msg = Frame::new(
                         proto::RESP_ERROR,
@@ -514,13 +539,63 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             None => None,
         };
         tokio::spawn(async move {
-            let result = handle_connection(stream, state).await;
+            state
+                .metrics
+                .connections_active
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let result = handle_connection(stream, state.clone()).await;
+            state
+                .metrics
+                .connections_active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             drop(slot);
             if let Err(e) = result {
                 eprintln!("connection {peer} closed: {e}");
             }
         });
     }
+}
+
+/// Resolve when the process is asked to terminate (SIGTERM / SIGINT).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+/// Post-signal connection drain: live connections get a bounded window to
+/// finish (in-flight statements run to completion under the engine lock;
+/// idle clients are expected to leave on their own). Bounded, never
+/// indefinite — container orchestrators impose their own stop timeouts.
+async fn graceful_drain(state: &Arc<ServerState>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if state
+            .metrics
+            .connections_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            <= 0
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Long-lived client and fan-out connections must survive idle network
+/// middleboxes: enable TCP keepalive (NAT/firewall timeout is the classic
+/// silent killer of a database session) plus NODELAY for request latency.
+fn set_tcp_keepalive(s: TcpStream) -> TcpStream {
+    use socket2::{SockRef, TcpKeepalive};
+    let sock: SockRef<'_> = SockRef::from(&s);
+    let ka = TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
+    let _ = sock.set_tcp_keepalive(&ka);
+    let _ = s.set_nodelay(true);
+    s
 }
 
 /// True when `peer` resolves to a loopback address on the port we listen on
@@ -548,6 +623,9 @@ fn is_self_peer(listen: &str, peer: &str) -> bool {
 struct Conn {
     stream: tokio::net::tcp::OwnedReadHalf,
     buf: Vec<u8>,
+    /// Wire-byte accounting lives at the socket read: chunk size is the
+    /// true network bytes (a decoded frame may span several reads).
+    metrics: std::sync::Arc<metrics::Metrics>,
 }
 
 impl Conn {
@@ -578,6 +656,11 @@ impl Conn {
             }
             let mut chunk = [0u8; 8192];
             let n = self.stream.read(&mut chunk).await?;
+            if n > 0 {
+                self.metrics
+                    .bytes_in_total
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if n == 0 {
                 return Ok(None);
             }
@@ -640,6 +723,10 @@ async fn user_login_frame(
     .await
     .unwrap_or(false);
     if !ok {
+        state
+            .metrics
+            .auth_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if state.auth_lock_threshold > 0 {
             let mut failures = state.auth_failures.lock().await;
             let now = std::time::Instant::now();
@@ -709,9 +796,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let mut conn = Conn {
         stream: rd,
         buf: Vec::new(),
+        metrics: state.metrics.clone(),
     };
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
     let key = state.transport_key;
+    let wmetrics = state.metrics.clone();
 
     // Writer task: serializes responses (sealing when a transport key is
     // configured).
@@ -730,6 +819,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            wmetrics
+                .bytes_out_total
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // A stalled peer (zero TCP window, suspended laptop) must not
             // wedge the write path: replay and publish notify block on this
             // channel, so an unbounded write eventually deadlocks the node.
@@ -1005,6 +1097,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             audit(true, "read token accepted", &state);
                             Some(Frame::new(proto::RESP_AFFECTED, b"ok(read-only)".to_vec()))
                         } else {
+                            state
+                                .metrics
+                                .auth_failures_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if state.auth_lock_threshold > 0 {
                                 let mut failures = state.auth_failures.lock().await;
                                 let now = std::time::Instant::now();
@@ -1250,6 +1346,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             err_payload("PUBLISH requires the readwrite or admin role"),
                         ))
                     } else {
+                        state
+                            .metrics
+                            .publishes_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Some(handle_publish(&state, &frame).await)
                     }
                 }
@@ -1415,6 +1515,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         },
         "durable_lsn": db.durable_lsn(),
         "totals": {"tables": user_tables, "rows": total_rows},
+        "metrics": state.metrics.snapshot_json(),
         "cluster_id": state.cluster_id,
         "journal_head": db.journal_head().unwrap_or(0),
         "journal_oldest": db.journal_oldest().unwrap_or(0),
@@ -1538,6 +1639,44 @@ fn authorize_statement(
 /// position lagging the applied data (the old two-commit window).
 #[allow(clippy::too_many_arguments)]
 async fn execute_sql(
+    state: &Arc<ServerState>,
+    sql: &str,
+    allow_system_table: bool,
+    is_replication: bool,
+    conn: Option<u64>,
+    order_held: bool,
+    seq_pos: Option<(&str, u64)>,
+    user: Option<&UserAuth>,
+) -> Frame {
+    // Statement throughput/error-rate accounting: every executor caller
+    // (client REQ_SQL, replication replay, restore) funnels through here,
+    // so the counters describe node-wide SQL work in one place.
+    state
+        .metrics
+        .statements_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let resp = execute_sql_inner(
+        state,
+        sql,
+        allow_system_table,
+        is_replication,
+        conn,
+        order_held,
+        seq_pos,
+        user,
+    )
+    .await;
+    if resp.frame_type == proto::RESP_ERROR {
+        state
+            .metrics
+            .statement_errors_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    resp
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_sql_inner(
     state: &Arc<ServerState>,
     sql: &str,
     allow_system_table: bool,

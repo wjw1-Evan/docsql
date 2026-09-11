@@ -2435,3 +2435,110 @@ async fn setup_input_policy_trim_and_cookie_flags() {
     .await;
     assert_eq!(r.status, 200, "{}", r.text());
 }
+
+/// Liveness is gate-free by design: orchestrators probe it without
+/// credentials, and it must answer even when the console has no managed
+/// node configured at all (it never touches a node).
+#[tokio::test]
+async fn healthz_is_gate_free_liveness() {
+    let addr = start_web(Some("sekrit"), Vec::new(), None).await;
+    let res = http(&addr, "GET", "/healthz", None, None).await;
+    assert_eq!(res.status, 200);
+    let body = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["service"], "docsql-web");
+    assert!(body["version"].as_str().is_some());
+
+    // With the console account gate active and pre-setup, data endpoints
+    // are closed (401) while liveness stays open.
+    let dir = tempfile::tempdir().unwrap();
+    let gated = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(dir.path().join("creds.json").display().to_string()),
+    )
+    .await;
+    assert_eq!(
+        http(&gated, "GET", "/api/stats", None, None).await.status,
+        401
+    );
+    let res = http(&gated, "GET", "/healthz", None, None).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["ok"], true);
+}
+
+/// /metrics sits behind the same API gate as every other endpoint, serves
+/// Prometheus text scraped from the managed node's REQ_STATUS (now carrying
+/// the runtime counters), and counts the console's own HTTP surface with
+/// scanner-proof path bucketing.
+#[tokio::test]
+async fn metrics_endpoint_gates_formats_and_scrapes_nodes() {
+    let (_dir, addr, node) = start_stack(Some("sekrit"), Vec::new()).await;
+
+    // Gate: no token / wrong token are refused like any API call.
+    assert_eq!(http(&addr, "GET", "/metrics", None, None).await.status, 401);
+    assert_eq!(
+        http(&addr, "GET", "/metrics", Some("wrong"), None)
+            .await
+            .status,
+        401
+    );
+
+    // One statement on the node first, so the SQL counter has work to show.
+    sql(
+        &addr,
+        Some("sekrit"),
+        "CREATE TABLE mx (id INT PRIMARY KEY)",
+    )
+    .await;
+
+    let res = http(&addr, "GET", "/metrics", Some("sekrit"), None).await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    let ct = res
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(ct.starts_with("text/plain"), "content-type: {ct}");
+    let body = res.text();
+
+    // The live managed node is scraped through: up, versioned, counters
+    // present.
+    assert!(
+        body.contains(&format!("docsql_node_up{{node=\"{node}\"}} 1")),
+        "node up line missing:\n{body}"
+    );
+    assert!(
+        body.contains("docsql_node_info{node=\""),
+        "version info missing:\n{body}"
+    );
+    let stmts = body
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(&format!("docsql_sql_statements_total{{node=\"{node}\"}} "))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    assert!(stmts >= 1, "statements counter missing/zero:\n{body}");
+    assert!(
+        body.contains(&format!("docsql_network_bytes_total{{node=\"{node}\"}} ")),
+        "byte counters missing:\n{body}"
+    );
+
+    // The console's own HTTP surface is counted, and unknown paths lump
+    // under /other so scanners cannot grow the counter map.
+    http(&addr, "GET", "/no-such-path", None, None).await;
+    let body = http(&addr, "GET", "/metrics", Some("sekrit"), None)
+        .await
+        .text();
+    assert!(
+        body.contains("docsql_web_http_requests_total{"),
+        "web counters missing:\n{body}"
+    );
+    assert!(
+        body.contains("path=\"/other\""),
+        "unknown paths not bucketed:\n{body}"
+    );
+}

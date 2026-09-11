@@ -56,10 +56,19 @@ impl QueryLog {
             sink: Mutex::new(None),
             sink_warned: std::sync::atomic::AtomicBool::new(false),
             capacity: 1000,
-            slow_ms: std::env::var("DOCSQL_SLOW_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100.0),
+            // Fail fast on a malformed threshold (consistent with the
+            // server binary's numeric env validation): a typo would
+            // otherwise silently disable slow-query logging.
+            slow_ms: match std::env::var("DOCSQL_SLOW_MS") {
+                Ok(v) if !v.trim().is_empty() => match v.trim().parse() {
+                    Ok(x) => x,
+                    Err(_) => {
+                        eprintln!("refusing to start: DOCSQL_SLOW_MS: invalid number {v:?}");
+                        std::process::exit(2);
+                    }
+                },
+                _ => 100.0,
+            },
             log_file: std::env::var("DOCSQL_LOG_FILE")
                 .ok()
                 .filter(|v| !v.is_empty()),

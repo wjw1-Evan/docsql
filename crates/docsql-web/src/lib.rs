@@ -80,6 +80,11 @@ pub struct WebState {
     /// otherwise every user shares one bucket and ten wrong passwords from
     /// anyone lock out everybody.
     pub trust_proxy: bool,
+    /// Process-lifetime HTTP request counters for /metrics, keyed by
+    /// (method, normalized path, status code). Bounded cardinality: only
+    /// the console's own fixed routes are named, everything else lumps
+    /// under `/other` (a scanner probing random paths cannot grow the map).
+    pub http_requests: Mutex<std::collections::HashMap<(String, String, u16), u64>>,
 }
 
 /// Shared auth surface: the credential file store, in-memory sessions, and
@@ -134,6 +139,7 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         trust_proxy: std::env::var("DOCSQL_WEB_TRUST_PROXY")
             .ok()
             .is_some_and(|v| v.trim() == "1"),
+        http_requests: Mutex::new(std::collections::HashMap::new()),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -141,13 +147,30 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    // Graceful shutdown: SIGTERM/SIGINT stop the listener; in-flight
+    // requests finish before the process exits (container orchestrators
+    // impose their own stop timeout on top).
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .map_err(std::io::Error::other)
+}
+
+/// Resolve when the process is asked to terminate (SIGTERM / SIGINT).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(api_metrics))
         .route("/api/sql", post(api_sql))
         .route("/api/parse", post(api_parse))
         .route("/api/meta", get(api_meta))
@@ -162,7 +185,307 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/change", post(auth_change))
         .route("/api/auth/logout", post(auth_logout))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            count_requests,
+        ))
         .with_state(state)
+}
+
+/// HTTP request accounting middleware feeding
+/// `docsql_web_http_requests_total` on /metrics. Path is normalized to the
+/// console's fixed routes; anything else (scanner probes, unknown paths)
+/// lumps under `/other` so the counter map cannot grow without bound.
+async fn count_requests(
+    State(state): State<Arc<WebState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().clone();
+    let raw_path = req.uri().path().to_string();
+    const KNOWN: [&str; 17] = [
+        "/",
+        "/healthz",
+        "/metrics",
+        "/api/sql",
+        "/api/parse",
+        "/api/meta",
+        "/api/stats",
+        "/api/cluster",
+        "/api/logs",
+        "/api/users",
+        "/api/backup",
+        "/api/backup/restore",
+        "/api/auth/status",
+        "/api/auth/setup",
+        "/api/auth/login",
+        "/api/auth/change",
+        "/api/auth/logout",
+    ];
+    let path = if KNOWN.contains(&raw_path.as_str()) {
+        raw_path
+    } else {
+        "/other".to_string()
+    };
+    let resp = next.run(req).await;
+    {
+        let mut m = state
+            .http_requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *m.entry((method.to_string(), path, resp.status().as_u16()))
+            .or_default() += 1;
+    }
+    resp
+}
+
+/// Liveness probe for orchestrators: answers from the console process
+/// itself, deliberately WITHOUT the auth gate and without touching any
+/// node — "is the console up" must not depend on upstream reachability or
+/// credential state. Reveals only the service name and version.
+async fn healthz() -> impl IntoResponse {
+    Json(json!({
+        "ok": true,
+        "service": "docsql-web",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// Prometheus scrape endpoint (`text/plain; version=0.0.4`). Per-node
+/// gauges/counters come from each configured node's REQ_STATUS report (the
+/// same JSON that feeds /api/stats and /api/cluster); the console's own
+/// HTTP counters ride along with the `docsql_web_` prefix. Behind the same
+/// gate as the other API endpoints — a scraper authenticates with the
+/// server token (`X-Docsql-Token`), exactly like a programmatic API client.
+async fn api_metrics(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    // Scrape every known node in parallel — one wedged node must not stall
+    // the whole scrape past the probe budget.
+    let mut nodes: Vec<String> = Vec::new();
+    if let Some(u) = state.upstream.as_deref().filter(|u| !u.is_empty()) {
+        nodes.push(u.to_string());
+    }
+    for p in &state.peers {
+        if !nodes.contains(p) {
+            nodes.push(p.clone());
+        }
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for addr in nodes {
+        let token = state.token.clone();
+        set.spawn(async move {
+            (
+                addr.clone(),
+                remote_status_full(&addr, token.as_deref()).await,
+            )
+        });
+    }
+    let mut reports: Vec<(String, serde_json::Value)> = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(pair) = r {
+            reports.push(pair);
+        }
+    }
+    reports.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    out.push_str("# DocSQL console metrics (per-node counters come from REQ_STATUS)\n");
+    for (addr, v) in &reports {
+        let node = prom_escape(addr);
+        let up = v.get("error").is_none();
+        out.push_str(&prom_line(
+            "docsql_node_up",
+            &[("node", &node)],
+            if up { "1" } else { "0" },
+        ));
+        if !up {
+            continue;
+        }
+        out.push_str(&prom_line(
+            "docsql_node_info",
+            &[
+                ("node", &node),
+                (
+                    "version",
+                    &prom_escape(
+                        v.get("version")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown"),
+                    ),
+                ),
+            ],
+            "1",
+        ));
+        gauge(
+            &mut out,
+            "docsql_node_uptime_seconds",
+            &node,
+            &v["uptime_ms"],
+            0.001,
+        );
+        if let Some(m) = v.get("metrics") {
+            counter(
+                &mut out,
+                "docsql_connections_total",
+                &node,
+                &m["connections_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_connections_rejected_total",
+                &node,
+                &m["connections_rejected_total"],
+            );
+            gauge(
+                &mut out,
+                "docsql_connections_active",
+                &node,
+                &m["connections_active"],
+                1.0,
+            );
+            counter(
+                &mut out,
+                "docsql_sql_statements_total",
+                &node,
+                &m["statements_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_sql_statement_errors_total",
+                &node,
+                &m["statement_errors_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_publishes_total",
+                &node,
+                &m["publishes_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_auth_failures_total",
+                &node,
+                &m["auth_failures_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_network_bytes_total",
+                &node,
+                &m["bytes_in_total"],
+            );
+        }
+        gauge(
+            &mut out,
+            "docsql_tables",
+            &node,
+            &v["totals"]["tables"],
+            1.0,
+        );
+        gauge(&mut out, "docsql_rows", &node, &v["totals"]["rows"], 1.0);
+        counter(
+            &mut out,
+            "docsql_replay_failures_total",
+            &node,
+            &v["replay_failures"],
+        );
+        counter(&mut out, "docsql_journal_head", &node, &v["journal_head"]);
+        gauge(
+            &mut out,
+            "docsql_storage_bytes",
+            &node,
+            &v["storage"]["db_bytes"],
+            1.0,
+        );
+        gauge(
+            &mut out,
+            "docsql_wal_bytes",
+            &node,
+            &v["storage"]["wal_bytes"],
+            1.0,
+        );
+    }
+    // The console's own HTTP surface.
+    let reqs: Vec<((String, String, u16), u64)> = {
+        let m = state
+            .http_requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<((String, String, u16), u64)> =
+            m.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort();
+        v
+    };
+    if !reqs.is_empty() {
+        out.push_str("# HELP docsql_web_http_requests_total Console HTTP requests.\n");
+    }
+    for ((method, path, code), n) in reqs {
+        out.push_str(&prom_line(
+            "docsql_web_http_requests_total",
+            &[
+                ("method", &prom_escape(&method)),
+                ("path", &prom_escape(&path)),
+                ("code", &code.to_string()),
+            ],
+            &n.to_string(),
+        ));
+    }
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response())
+}
+
+fn prom_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn prom_line(name: &str, labels: &[(&str, &str)], value: &str) -> String {
+    let inner = labels
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{v}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}{{{inner}}} {value}\n")
+}
+
+/// Counters must never go negative even if a node's JSON shifts shape.
+fn as_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().filter(|f| f.is_finite() && *f >= 0.0)
+}
+
+fn counter(out: &mut String, name: &str, node: &str, v: &serde_json::Value) {
+    if let Some(f) = as_f64(v) {
+        out.push_str(&prom_line(name, &[("node", node)], &fmt_f64(f)));
+    }
+}
+
+fn gauge(out: &mut String, name: &str, node: &str, v: &serde_json::Value, scale: f64) {
+    if let Some(f) = as_f64(v) {
+        // Round away float-multiply noise (0.052000000000000005) so the
+        // exposition stays clean.
+        let scaled = (f * scale * 1e6).round() / 1e6;
+        out.push_str(&prom_line(name, &[("node", node)], &fmt_f64(scaled)));
+    }
+}
+
+fn fmt_f64(f: f64) -> String {
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        format!("{}", f as i64)
+    } else {
+        format!("{f}")
+    }
 }
 
 /// The API gate. Legacy behavior: `X-Docsql-Token` must match the server
@@ -1439,6 +1762,23 @@ pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value 
     .await)
 }
 
+/// The node's FULL REQ_STATUS report (raw payload, `error` key on any
+/// failure) — the /metrics scraper consumes every field, unlike the
+/// dashboard's projected [`remote_stats`].
+pub async fn remote_status_full(addr: &str, token: Option<&str>) -> serde_json::Value {
+    result_to_json(
+        async {
+            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_STATUS, vec![])).await?;
+            if f.frame_type != proto::RESP_STATUS {
+                return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
+            }
+            serde_json::from_slice(&f.payload)
+                .map_err(|e| format!("节点 {addr} 的 status 载荷无法解析: {e}"))
+        }
+        .await,
+    )
+}
+
 /// Fetch a managed node's backup report / trigger a backup (REQ_BACKUP).
 /// `trigger` is acknowledged when the node accepts the request; the backup
 /// itself completes asynchronously and its outcome shows up in the next
@@ -1628,6 +1968,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            http_requests: Mutex::new(std::collections::HashMap::new()),
         };
         assert_eq!(resolve_node(&state, &None).unwrap(), None);
         assert_eq!(resolve_node(&state, &Some(String::new())).unwrap(), None);
@@ -1657,6 +1998,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            http_requests: Mutex::new(std::collections::HashMap::new()),
         };
         assert_eq!(target_for(&state, &None).unwrap(), "node-a:7600");
         assert_eq!(
@@ -1685,6 +2027,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            http_requests: Mutex::new(std::collections::HashMap::new()),
         });
         let res = build_router(state)
             .oneshot(
