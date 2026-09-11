@@ -3258,6 +3258,110 @@ async fn backup_restore_round_trip() {
     assert!(logs.contains("\"restore\""), "no restore event: {logs}");
 }
 
+/// Integrity gate: a dump whose bytes no longer match its `.sha256`
+/// sidecar is refused before any replay — the restore status reports the
+/// failure, the sync log carries it, and the live database keeps whatever
+/// state it had (no half-applied snapshot). A sidecar-less legacy file
+/// still restores.
+#[tokio::test]
+async fn backup_restore_refuses_corrupted_file() {
+    let (_dir, backups, addr) = start_server_backup(3).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE s (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO s VALUES (1, 'keep-me')").await;
+
+    // Trigger a backup and wait for the file together with its sidecar
+    // (the pair is renamed in sequence; restore polls need both).
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        br#"{"action":"trigger"}"#.to_vec(),
+    ))
+    .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    let mut name = String::new();
+    for _ in 0..250 {
+        if let Some(n) = backup_names(&backups).first() {
+            if backups.join(format!("{n}.sha256")).is_file()
+                && std::fs::read_to_string(backups.join(n))
+                    .unwrap_or_default()
+                    .contains("keep-me")
+            {
+                name = n.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "backup never appeared");
+
+    // The list marks the fresh backup as checksum-covered.
+    let v = backup_list(&addr, None).await;
+    let entry = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == name.as_str())
+        .unwrap_or_else(|| panic!("backup {name} missing from list: {v}"));
+    assert_eq!(entry["checksum"], serde_json::Value::Bool(true));
+
+    // Corrupt the dump behind the sidecar's back; remember the original
+    // bytes for the legacy-tolerance leg below.
+    let original = std::fs::read_to_string(backups.join(&name)).unwrap();
+    std::fs::write(backups.join(&name), "-- tampered\n".to_string() + &original).unwrap();
+
+    // Damage the live state: a refused restore must leave this drop in
+    // place — the checksum check fires before any statement is replayed.
+    c.sql("DROP TABLE s").await;
+
+    let payload = format!(r#"{{"action":"restore","file":"{name}"}}"#);
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.clone().into_bytes()))
+        .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+
+    let mut err = String::new();
+    for _ in 0..250 {
+        let v = backup_list(&addr, None).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false && rs["file"] == name {
+                err = rs["error"].as_str().unwrap_or_default().to_string();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(err.contains("failed checksum"), "restore error: {err}");
+    // Nothing was replayed: the drop stands.
+    let r = c.sql("SELECT COUNT(*) FROM s").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+
+    // The refusal is audited like any restore outcome.
+    let mut cl = Client::connect(&addr).await;
+    cl.send(&Frame::new(proto::REQ_LOGS, vec![])).await;
+    let logs = String::from_utf8_lossy(&cl.recv().await.payload).to_string();
+    assert!(logs.contains("failed checksum"), "no refusal event: {logs}");
+
+    // Legacy tolerance: the same file without a sidecar restores fine.
+    std::fs::write(backups.join(&name), original).unwrap();
+    std::fs::remove_file(backups.join(format!("{name}.sha256"))).unwrap();
+    c.send(&Frame::new(proto::REQ_BACKUP, payload.into_bytes()))
+        .await;
+    assert_eq!(c.recv().await.frame_type, proto::RESP_AFFECTED);
+    let mut ok = false;
+    for _ in 0..250 {
+        let v = backup_list(&addr, None).await;
+        if let Some(rs) = v["restore"].as_object() {
+            if rs["running"] == false && rs["file"] == name && rs["ok"] == true {
+                ok = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ok, "sidecar-less restore never completed");
+    let r = c.sql("SELECT COUNT(*) FROM s").await;
+    assert!(payload_str(&r).contains("[[1]]"), "{}", payload_str(&r));
+}
+
 /// Restore's headline property is cluster convergence: replaying the
 /// snapshot on one node fans every statement out to the peers, so writes
 /// made everywhere after the backup are replaced by the backup's state

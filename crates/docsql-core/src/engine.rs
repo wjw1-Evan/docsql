@@ -12154,4 +12154,78 @@ mod complex_query_tests {
             Value::Null
         );
     }
+
+    #[test]
+    fn json_function_exception_paths() {
+        let mut db = Database::in_memory().unwrap();
+        let q = |db: &mut Database, sql: &str| -> Value {
+            match db.execute(sql).unwrap() {
+                ExecOutcome::Rows(r) => r.rows[0][0].clone(),
+                ExecOutcome::Affected(_) => panic!("expected rows"),
+            }
+        };
+        // Arity is checked before anything else: wrong argument counts are
+        // caller bugs and surface as errors, not silent NULLs.
+        for bad in [
+            "SELECT JSON_EXTRACT()",
+            "SELECT JSON_EXTRACT('{}', '$.a', 1)",
+            "SELECT JSON_TYPE()",
+            "SELECT JSON_TYPE('{}', '$', 1)",
+        ] {
+            let e = db.execute(bad).unwrap_err();
+            assert!(
+                e.to_string().contains("takes 1 or 2 arguments"),
+                "{bad}: {e}"
+            );
+        }
+        for bad in ["SELECT JSON_VALID()", "SELECT JSON_VALID('{}', 1)"] {
+            let e = db.execute(bad).unwrap_err();
+            assert!(e.to_string().contains("exactly 1"), "{bad}: {e}");
+        }
+        // A non-text path is a query bug (error); a non-text document,
+        // NULL, or malformed JSON is data and answers NULL.
+        let e = db
+            .execute(r#"SELECT JSON_EXTRACT('{"a":1}', 5)"#)
+            .unwrap_err();
+        assert!(e.to_string().contains("path must be text"), "{e}");
+        assert_eq!(q(&mut db, "SELECT JSON_EXTRACT(5, '$.a')"), Value::Null);
+        assert_eq!(q(&mut db, "SELECT JSON_EXTRACT(NULL, '$.a')"), Value::Null);
+        assert_eq!(q(&mut db, "SELECT JSON_TYPE('not json')"), Value::Null);
+        assert_eq!(q(&mut db, "SELECT JSON_TYPE(NULL)"), Value::Null);
+        assert_eq!(q(&mut db, "SELECT JSON_VALID(5)"), Value::Bool(false));
+        assert_eq!(q(&mut db, "SELECT JSON_VALID(NULL)"), Value::Bool(false));
+
+        // The path grammar refuses gracefully — every malformed or
+        // non-matching path yields NULL, never an abort: missing '$',
+        // empty member, unclosed bracket, non-numeric/negative/
+        // out-of-range index, member on array or scalar, index on object.
+        for path in [
+            "a.b", "$.a..b", "$.a[1", "$.a[x]", "$.a[-1]", "$.a[5]", "$.a.b", "$.o[0]", "$.o.b.x",
+            "$[0]",
+        ] {
+            let sql = format!(r#"SELECT JSON_EXTRACT('{{"a":[1,2],"o":{{"b":3}}}}', '{path}')"#);
+            assert_eq!(q(&mut db, &sql), Value::Null, "path {path}");
+            let sql = format!(r#"SELECT JSON_TYPE('{{"a":[1,2],"o":{{"b":3}}}}', '{path}')"#);
+            assert_eq!(q(&mut db, &sql), Value::Null, "path {path} (type)");
+        }
+
+        // Heterogeneous documents scan to completion: the broken middle
+        // row answers NULL in-line while its neighbors extract normally.
+        db.execute("CREATE TABLE mixed (id INT PRIMARY KEY, doc TEXT)")
+            .unwrap();
+        db.execute(r#"INSERT INTO mixed VALUES (1, '{"a":1}'), (2, 'broken'), (3, '{"a":2}')"#)
+            .unwrap();
+        match db
+            .execute("SELECT JSON_EXTRACT(doc, '$.a') FROM mixed ORDER BY id")
+            .unwrap()
+        {
+            ExecOutcome::Rows(r) => {
+                assert_eq!(r.rows.len(), 3);
+                assert_eq!(r.rows[0][0], Value::Int(1));
+                assert_eq!(r.rows[1][0], Value::Null);
+                assert_eq!(r.rows[2][0], Value::Int(2));
+            }
+            ExecOutcome::Affected(_) => panic!("expected rows"),
+        }
+    }
 }
