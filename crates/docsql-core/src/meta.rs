@@ -85,6 +85,10 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
                 Value::Object(Object::from([
                     ("name".into(), str(&i.name)),
                     ("column".into(), str(&i.column)),
+                    (
+                        "columns".into(),
+                        Value::Array(i.columns.iter().map(|c| str(c)).collect()),
+                    ),
                     ("unique".into(), Value::Bool(i.unique)),
                     ("auto".into(), Value::Bool(i.auto)),
                 ]))

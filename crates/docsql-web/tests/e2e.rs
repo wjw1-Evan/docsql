@@ -598,9 +598,9 @@ async fn index_management_over_http() {
     assert_eq!(
         t["index_defs"],
         json!([
-            {"name": "sqlite_autoindex_ix_1", "column": "id", "unique": true, "auto": true},
-            {"name": "ix_tag", "column": "tag", "unique": false, "auto": false},
-            {"name": "ux_email", "column": "email", "unique": true, "auto": false},
+            {"name": "sqlite_autoindex_ix_1", "column": "id", "columns": ["id"], "unique": true, "auto": true},
+            {"name": "ix_tag", "column": "tag", "columns": ["tag"], "unique": false, "auto": false},
+            {"name": "ux_email", "column": "email", "columns": ["email"], "unique": true, "auto": false},
         ])
     );
     // Constraint indexes reject DROP/CREATE like the engine does.

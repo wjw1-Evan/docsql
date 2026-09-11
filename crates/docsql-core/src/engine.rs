@@ -224,10 +224,35 @@ pub struct TableInfo {
 }
 
 /// One CREATE INDEX definition as recorded in the catalog.
+///
+/// `columns.len() >= 1`; `len() > 1` is a composite index whose B+ tree keys
+/// are `Value::Array` over the columns in order (ordered by
+/// `Value::cmp_values` element-wise — no separate byte-order encoding).
+/// `columns[0]` mirrors the legacy `column` field for tooling compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+impl IndexDef {
+    /// Catalog/tuple-compat view: first column.
+    pub fn column(&self) -> &str {
+        &self.columns[0]
+    }
+}
+
+/// One index as exposed to tooling (catalog snapshot): CREATE INDEX
+/// definitions plus the derived `sqlite_autoindex_*` constraint indexes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexInfo {
     pub name: String,
+    /// First indexed column (kept for tooling compatibility; `columns`
+    /// carries the full list for composite indexes).
     pub column: String,
+    /// Full column list in key order (single-column indexes: one entry).
+    pub columns: Vec<String>,
     pub unique: bool,
     /// PRIMARY KEY / UNIQUE constraint index, auto-created with the table
     /// (SQLite-style `sqlite_autoindex_*` name). Derived, never persisted,
@@ -270,10 +295,12 @@ struct TableMeta {
     /// Index names registered on this table (catalog-level v1; B+ tree
     /// backing arrives with the index-integration milestone).
     indexes: Vec<String>,
-    /// CREATE INDEX definitions: (name, column, unique). Drives DROP INDEX
-    /// cleanup (lifting UNIQUE enforced by a dropped unique index) and the
-    /// sqlite_master index rows.
-    index_defs: Vec<(String, String, bool)>,
+    /// CREATE INDEX definitions: name + ordered columns + uniqueness. Drives
+    /// DROP INDEX cleanup (lifting UNIQUE enforced by a dropped unique index)
+    /// and the sqlite_master index rows. Composite indexes key their tree by
+    /// the index name; single-column indexes key by the column name (legacy
+    /// layout, zero-migration for deployed databases).
+    index_defs: Vec<IndexDef>,
     /// Columns declared UNIQUE via CREATE TABLE constraints. Dropping a
     /// UNIQUE INDEX only lifts meta.unique for columns NOT in this list.
     constraint_unique: Vec<String>,
@@ -291,6 +318,31 @@ struct TableMeta {
 }
 
 impl TableMeta {
+    /// Columns making up the index behind `root_key`: the definition's
+    /// ordered column list for a named (possibly composite) index, or the
+    /// key itself for legacy single-column entries (constraint trees and
+    /// single-column CREATE INDEX key their tree by the column name).
+    fn index_columns_of(&self, root_key: &str) -> Vec<String> {
+        match self.index_defs.iter().find(|d| d.name == root_key) {
+            Some(d) => d.columns.clone(),
+            None => vec![root_key.to_string()],
+        }
+    }
+
+    /// True when the tree behind `root_key` enforces uniqueness: a PK or
+    /// UNIQUE constraint column (single-column constraint tree), or a
+    /// `CREATE UNIQUE INDEX` definition (possibly composite).
+    fn root_key_unique(&self, root_key: &str) -> bool {
+        if self.primary_key.as_deref() == Some(root_key)
+            || self.unique.contains(&root_key.to_string())
+        {
+            return true;
+        }
+        self.index_defs
+            .iter()
+            .any(|d| d.name == root_key && d.unique)
+    }
+
     /// Validate a document against declared constraints.
     fn check(&self, doc: &Object) -> Result<()> {
         for col in &self.not_null {
@@ -597,7 +649,26 @@ impl Database {
                                             t.get(2).and_then(|v| v.as_bool()),
                                         ) {
                                             (Some(n), Some(c), Some(u)) => {
-                                                Some((n.to_string(), c.to_string(), u))
+                                                // Fourth element (optional,
+                                                // new-format catalogs): the
+                                                // full ordered column list of
+                                                // a possibly composite index.
+                                                // Legacy three-element entries
+                                                // are single-column.
+                                                let columns = match t.get(3) {
+                                                    Some(Value::Array(a)) => a
+                                                        .iter()
+                                                        .filter_map(|v| {
+                                                            v.as_str().map(String::from)
+                                                        })
+                                                        .collect::<Vec<_>>(),
+                                                    _ => vec![c.to_string()],
+                                                };
+                                                Some(IndexDef {
+                                                    name: n.to_string(),
+                                                    columns,
+                                                    unique: u,
+                                                })
                                             }
                                             _ => None,
                                         },
@@ -609,7 +680,7 @@ impl Database {
                             // Index names derive from the persisted defs.
                             let indexes = index_defs
                                 .iter()
-                                .map(|(n, _, _)| n.clone())
+                                .map(|d| d.name.clone())
                                 .collect::<Vec<_>>();
                             let constraint_unique = str_list(m, "constraint_unique");
                             let defaults = match m.get("defaults") {
@@ -836,11 +907,14 @@ impl Database {
                     Value::Array(
                         meta.index_defs
                             .iter()
-                            .map(|(n, c, u)| {
+                            .map(|d| {
                                 Value::Array(vec![
-                                    Value::Str(n.clone()),
-                                    Value::Str(c.clone()),
-                                    Value::Bool(*u),
+                                    Value::Str(d.name.clone()),
+                                    Value::Str(d.column().to_string()),
+                                    Value::Bool(d.unique),
+                                    Value::Array(
+                                        d.columns.iter().map(|c| Value::Str(c.clone())).collect(),
+                                    ),
                                 ])
                             })
                             .collect(),
@@ -1300,6 +1374,7 @@ impl Database {
             .map(|(i, c)| IndexInfo {
                 name: format!("sqlite_autoindex_{table}_{}", i + 1),
                 column: (*c).clone(),
+                columns: vec![(*c).clone()],
                 unique: true,
                 auto: true,
             })
@@ -1349,10 +1424,11 @@ impl Database {
                         .collect(),
                     index_defs: auto
                         .into_iter()
-                        .chain(meta.index_defs.iter().map(|(n, c, u)| IndexInfo {
-                            name: n.clone(),
-                            column: c.clone(),
-                            unique: *u,
+                        .chain(meta.index_defs.iter().map(|d| IndexInfo {
+                            name: d.name.clone(),
+                            column: d.column().to_string(),
+                            columns: d.columns.clone(),
+                            unique: d.unique,
                             auto: false,
                         }))
                         .collect(),
@@ -1707,13 +1783,17 @@ impl Database {
             }
             ddl.push_str(&parts.join(",\n"));
             ddl.push_str("\n);\n");
-            for (iname, icol, unique) in &meta.index_defs {
+            for d in &meta.index_defs {
                 ddl.push_str(&format!(
                     "CREATE {}INDEX {} ON {} ({});\n",
-                    if *unique { "UNIQUE " } else { "" },
-                    quote_ident(iname),
+                    if d.unique { "UNIQUE " } else { "" },
+                    quote_ident(&d.name),
                     quote_ident(name),
-                    quote_ident(icol)
+                    d.columns
+                        .iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         }
@@ -1807,20 +1887,29 @@ impl Database {
                                 found = true;
                                 // The B+ tree itself stays in index_roots:
                                 // non-unique lookups still benefit from it.
-                                if let Some(dpos) =
-                                    meta.index_defs.iter().position(|(n, _, _)| n == &iname)
+                                if let Some(dpos) = meta
+                                    .index_defs
+                                    .iter()
+                                    .position(|d| d.name == iname.as_str())
                                 {
-                                    let (_, col, unique) = meta.index_defs.remove(dpos);
+                                    let def = meta.index_defs.remove(dpos);
                                     // Lift UNIQUE only when this index was
                                     // the sole source: table-declared
                                     // constraints and other unique indexes
                                     // on the same column keep it enforced.
-                                    if unique
-                                        && !meta.constraint_unique.contains(&col)
-                                        && meta.primary_key.as_deref() != Some(col.as_str())
-                                        && !meta.index_defs.iter().any(|(_, c, u)| *c == col && *u)
+                                    // Composite unique indexes never join
+                                    // meta.unique, so single-column lift
+                                    // rules cover everything here.
+                                    if def.unique
+                                        && def.columns.len() == 1
+                                        && !meta.constraint_unique.contains(&def.columns[0])
+                                        && meta.primary_key.as_deref()
+                                            != Some(def.columns[0].as_str())
+                                        && !meta.index_defs.iter().any(|d| {
+                                            d.columns.contains(&def.columns[0]) && d.unique
+                                        })
                                     {
-                                        meta.unique.retain(|c| c != &col);
+                                        meta.unique.retain(|c| c != &def.columns[0]);
                                     }
                                 }
                             }
@@ -1975,7 +2064,19 @@ impl Database {
             let loc = heap.insert(&mut self.pager, &mut tx, doc)?;
             pairs.push((loc, doc.clone()));
         }
-        let roots = self.build_trees(&mut tx, &pairs, &cols)?;
+        let roots = self.build_trees(
+            &mut tx,
+            &pairs,
+            &cols,
+            &cols
+                .iter()
+                .map(|c| meta.index_columns_of(c))
+                .collect::<Vec<_>>(),
+            &cols
+                .iter()
+                .map(|c| meta.root_key_unique(c))
+                .collect::<Vec<_>>(),
+        )?;
         // Keep the previous catalog entry so a failed persist can restore the
         // in-memory map — after `?` below the tx is dropped and its staged
         // pages never reach the data file; the map must not keep pointing at
@@ -2018,24 +2119,35 @@ impl Database {
         Ok(out)
     }
 
+    /// Build one B+ tree per (root_key, columns, unique) spec, populated
+    /// from the table's (locator, document) pairs. Single-column specs key
+    /// by the bare value (legacy layout); multi-column specs key by
+    /// `Value::Array` over the columns in order. Unique specs reject
+    /// duplicates at insert time.
     fn build_trees(
         &mut self,
         tx: &mut crate::pager::Tx,
         pairs: &[(u64, Object)],
-        cols: &[String],
+        root_keys: &[String],
+        cols_per_key: &[Vec<String>],
+        unique_keys: &[bool],
     ) -> Result<std::collections::BTreeMap<String, u32>> {
         let mut roots = std::collections::BTreeMap::new();
-        for col in cols {
-            let mut tree = BTree::create(&mut self.pager, tx).map_err(|e| index_err(col, e))?;
+        for (root_key, cols, unique) in root_keys
+            .iter()
+            .zip(cols_per_key.iter())
+            .zip(unique_keys.iter())
+            .map(|((k, c), u)| (k, c, *u))
+        {
+            let mut tree =
+                BTree::create(&mut self.pager, tx).map_err(|e| index_err(root_key, e))?;
             for (loc, doc) in pairs {
-                if let Some(v) = doc.get(col) {
-                    if !matches!(v, Value::Null) {
-                        tree.insert(&mut self.pager, tx, v.clone(), *loc, false)
-                            .map_err(|e| index_err(col, e))?;
-                    }
+                if let Some(v) = index_key_of(doc, cols) {
+                    tree.insert(&mut self.pager, tx, v, *loc, unique)
+                        .map_err(|e| index_err(root_key, e))?;
                 }
             }
-            roots.insert(col.clone(), tree.root);
+            roots.insert(root_key.clone(), tree.root);
         }
         Ok(roots)
     }
@@ -2092,11 +2204,34 @@ impl Database {
                 // Bounded range + equal filter so non-unique trees return
                 // every duplicate match (get() would yield one entry).
                 // The hi bound lets the tree stop at the first key past v
-                // instead of walking the whole right side.
+                // instead of walking the whole right side. For composite
+                // indexes v is the full Array key — element-wise cmp_values
+                // equality is exactly a key match.
                 let mut p = tree
                     .range_bounded(&mut self.pager, &tx, &v, Some((&v, true)))
                     .map_err(|e| index_err(&col, e))?;
                 p.retain(|(k, _)| Value::cmp_values(k, &v) == Ordering::Equal);
+                p
+            }
+            ProbePlan::Prefix(prefix) => {
+                // Composite prefix probe: scan from the prefix (its rank
+                // makes Array(prefix) sort right before every key extending
+                // it) and keep keys that start with it element-wise.
+                let mut p = tree
+                    .range_bounded(&mut self.pager, &tx, &prefix, None)
+                    .map_err(|e| index_err(&col, e))?;
+                if let Value::Array(pfx) = &prefix {
+                    p.retain(|(k, _)| match k {
+                        Value::Array(items) => {
+                            items.len() >= pfx.len()
+                                && items
+                                    .iter()
+                                    .zip(pfx.iter())
+                                    .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
+                        }
+                        _ => false,
+                    });
+                }
                 p
             }
             ProbePlan::Range { lo, hi } => {
@@ -2374,6 +2509,7 @@ impl Database {
             if let Err(e) = reindex_remove(
                 &mut self.pager,
                 &mut tx,
+                &meta,
                 &idx_cols,
                 &mut roots,
                 old_doc,
@@ -2410,6 +2546,7 @@ impl Database {
                 if let Err(e) = reindex_repoint(
                     &mut self.pager,
                     &mut tx,
+                    &meta,
                     &idx_cols,
                     &mut roots,
                     &before,
@@ -2591,12 +2728,21 @@ impl Database {
         let locs: Vec<u64> = targets.iter().map(|(l, _)| *l).collect();
         let moves = heap.remove_many(&mut self.pager, &mut tx, &locs)?;
         for (loc, doc) in &targets {
-            reindex_remove(&mut self.pager, &mut tx, &idx_cols, &mut roots, doc, *loc)?;
+            reindex_remove(
+                &mut self.pager,
+                &mut tx,
+                &meta,
+                &idx_cols,
+                &mut roots,
+                doc,
+                *loc,
+            )?;
         }
         for (old_l, new_l) in &moves {
             reindex_repoint(
                 &mut self.pager,
                 &mut tx,
+                &meta,
                 &idx_cols,
                 &mut roots,
                 &before,
@@ -2633,13 +2779,6 @@ impl Database {
                  PRIMARY KEY/UNIQUE constraint indexes",
             );
         }
-        if idx.columns.len() != 1 {
-            return err("only single-column indexes are supported");
-        }
-        let col = match &idx.columns[0].column.expr {
-            SqlExpr::Identifier(i) => i.value.clone(),
-            other => expr_name(other),
-        };
         // Index names share a database-wide namespace (SQLite semantics):
         // a name taken by any table blocks reuse elsewhere.
         let owner = self.tables.values().find(|m| m.indexes.contains(&iname));
@@ -2652,25 +2791,59 @@ impl Database {
         let Some(mut meta) = self.tables.get_mut(&table).cloned() else {
             return err(format!("table {table} does not exist"));
         };
-        if !meta.columns.contains(&col) {
-            return err(format!("column {col} does not exist"));
+        // Parse the indexed columns: plain identifiers only (expression
+        // indexes stay unsupported), each must exist, duplicates rejected.
+        if idx.columns.is_empty() {
+            return err("CREATE INDEX requires at least one column");
         }
-        // UNIQUE INDEX rides the constraint machinery: the column joins
-        // meta.unique, so inserts/updates enforce duplicates from here on.
-        if idx.unique && !meta.unique.contains(&col) {
+        let mut cols: Vec<String> = Vec::with_capacity(idx.columns.len());
+        for c in &idx.columns {
+            let col = match &c.column.expr {
+                SqlExpr::Identifier(i) => i.value.clone(),
+                other => expr_name(other),
+            };
+            if !meta.columns.contains(&col) {
+                return err(format!("column {col} does not exist"));
+            }
+            if cols.contains(&col) {
+                return err(format!("duplicate column {col} in index {iname}"));
+            }
+            cols.push(col);
+        }
+        // Single-column UNIQUE INDEX rides the constraint machinery: the
+        // column joins meta.unique, so inserts/updates enforce duplicates
+        // from here on. Composite unique indexes cannot use the per-column
+        // container — their tree enforces uniqueness itself (unique insert).
+        let composite = cols.len() > 1;
+        if idx.unique && !composite && !meta.unique.contains(&cols[0]) {
             let docs = self.table_docs(&table)?;
-            meta.unique.push(col.clone());
+            meta.unique.push(cols[0].clone());
             meta.check_unique(&docs)?;
         }
-        // Build the B+ tree over the existing rows (non-unique: duplicates
-        // are allowed, lookups collect every match).
+        // Build the B+ tree over the existing rows. Single-column trees are
+        // non-unique at the tree level (duplicates allowed, lookups collect
+        // every match); composite UNIQUE trees enforce duplicates on insert.
         let pairs = self.table_pairs(&table)?;
         let mut tx = self.pager.begin_tx();
-        let col_arg = [col.clone()];
-        let mut roots = self.build_trees(&mut tx, &pairs, &col_arg)?;
+        let root_key = if composite {
+            iname.clone()
+        } else {
+            cols[0].clone()
+        };
+        let mut roots = self.build_trees(
+            &mut tx,
+            &pairs,
+            std::slice::from_ref(&root_key),
+            &[cols.clone()],
+            &[idx.unique],
+        )?;
         self.commit_pager_tx(tx)?;
         meta.index_roots.append(&mut roots);
-        meta.index_defs.push((iname.clone(), col, idx.unique));
+        meta.index_defs.push(IndexDef {
+            name: iname.clone(),
+            columns: cols,
+            unique: idx.unique,
+        });
         meta.indexes.push(iname);
         self.tables.insert(table, meta);
         self.save_catalog()?;
@@ -2771,16 +2944,18 @@ impl Database {
                         }
                         // Indexes over the dropped column lose their
                         // definitions (trees above were already removed).
+                        // A composite index over the column dies with it too.
                         let dead: Vec<String> = meta
                             .index_defs
                             .iter()
-                            .filter(|(_, c, _)| c == &name)
-                            .map(|(n, _, _)| n.clone())
+                            .filter(|d| d.columns.iter().any(|c| c == name.as_str()))
+                            .map(|d| d.name.clone())
                             .collect();
                         for n in &dead {
                             meta.indexes.retain(|i| i != n);
                         }
-                        meta.index_defs.retain(|(_, c, _)| c != &name);
+                        meta.index_roots.retain(|k, _| !dead.contains(k));
+                        meta.index_defs.retain(|d| !dead.contains(&d.name));
                     }
                     let docs = self.table_docs(&tname)?;
                     let stripped: Vec<Object> = docs
@@ -2849,11 +3024,19 @@ impl Database {
                     meta.index_defs = meta
                         .index_defs
                         .iter()
-                        .map(|(n, c, u)| {
-                            if c == old {
-                                (n.clone(), new.clone(), *u)
+                        .map(|d| {
+                            if d.columns.iter().any(|c| c == old) {
+                                IndexDef {
+                                    name: d.name.clone(),
+                                    columns: d
+                                        .columns
+                                        .iter()
+                                        .map(|c| if c == old { new.clone() } else { c.clone() })
+                                        .collect(),
+                                    unique: d.unique,
+                                }
                             } else {
-                                (n.clone(), c.clone(), *u)
+                                d.clone()
                             }
                         })
                         .collect();
@@ -3318,7 +3501,16 @@ impl Database {
             .collect();
         if !constraint_cols.is_empty() {
             let mut tx = self.pager.begin_tx();
-            let roots = self.build_trees(&mut tx, &[], &constraint_cols)?;
+            let roots = self.build_trees(
+                &mut tx,
+                &[],
+                &constraint_cols,
+                &constraint_cols
+                    .iter()
+                    .map(|c| vec![c.clone()])
+                    .collect::<Vec<_>>(),
+                &vec![true; constraint_cols.len()],
+            )?;
             self.commit_pager_tx(tx)?;
             meta.index_roots = roots;
         }
@@ -3573,12 +3765,21 @@ impl Database {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
                     continue;
                 };
-                reindex_remove(&mut self.pager, &mut tx, &idx_cols, &mut roots, doc, *loc)?;
+                reindex_remove(
+                    &mut self.pager,
+                    &mut tx,
+                    &meta,
+                    &idx_cols,
+                    &mut roots,
+                    doc,
+                    *loc,
+                )?;
             }
             for (old_l, new_l) in &moves {
                 reindex_repoint(
                     &mut self.pager,
                     &mut tx,
+                    &meta,
                     &idx_cols,
                     &mut roots,
                     &before,
@@ -3631,18 +3832,20 @@ impl Database {
                     roots.insert(col.clone(), tree.root);
                 }
             }
-            // Non-constraint CREATE INDEX trees (non-unique).
+            // Non-constraint CREATE INDEX trees. Composite unique trees
+            // (CREATE UNIQUE INDEX over several columns) enforce their
+            // duplicates right here, at tree-insert time.
             for col in &idx_cols {
                 if indexed.contains(col) {
                     continue;
                 }
-                let Some(v) = doc.get(col) else { continue };
-                if matches!(v, Value::Null) {
+                let cols = meta.index_columns_of(col);
+                let Some(v) = index_key_of(&doc, &cols) else {
                     continue;
-                }
+                };
                 let root = roots[col.as_str()];
                 let mut tree = BTree::open(root);
-                tree.insert(&mut self.pager, &mut tx, v.clone(), loc, false)
+                tree.insert(&mut self.pager, &mut tx, v, loc, meta.root_key_unique(col))
                     .map_err(|e| index_err(col, e))?;
                 if tree.root != root {
                     roots.insert(col.clone(), tree.root);
@@ -4272,16 +4475,18 @@ impl Database {
                 })
                 .collect();
             for (tbl, meta) in &self.tables {
-                for (iname, col, unique) in &meta.index_defs {
+                for d in &meta.index_defs {
                     docs.push(Object::from([
                         ("type".into(), Value::Str("index".into())),
-                        ("name".into(), Value::Str(iname.clone())),
+                        ("name".into(), Value::Str(d.name.clone())),
                         ("tbl_name".into(), Value::Str(tbl.clone())),
                         (
                             "sql".into(),
                             Value::Str(format!(
                                 "CREATE {}INDEX {iname} ON {tbl} ({col})",
-                                if *unique { "UNIQUE " } else { "" }
+                                if d.unique { "UNIQUE " } else { "" },
+                                iname = d.name,
+                                col = d.columns.join(", ")
                             )),
                         ),
                     ]));
@@ -6075,6 +6280,10 @@ fn index_err(col: &str, e: BTreeError) -> SqlError {
 #[derive(Debug, Clone)]
 enum ProbePlan {
     Eq(Value),
+    /// Composite-index prefix probe: `lo` is an `Array` prefix of the full
+    /// key; every returned key must start with it (element-wise), which the
+    /// probe retains after the bounded scan.
+    Prefix(Value),
     /// (lower bound, inclusive?), (upper bound, inclusive?) — either optional.
     Range {
         lo: Option<(Value, bool)>,
@@ -6134,6 +6343,9 @@ fn probe_plan(
     let mut conjuncts = Vec::new();
     flatten_and(cond, &mut conjuncts);
     let empty = Object::new();
+    // All equality conjuncts: composite prefixes need every leading column's
+    // value, not just the first one seen.
+    let mut eq_map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let mut eq: Option<(String, Value)> = None;
     let mut range: Option<(String, Vec<(BinaryOperator, Value)>)> = None;
     for c in conjuncts {
@@ -6163,21 +6375,69 @@ fn probe_plan(
             continue;
         }
         let op = if mirror { mirror_op(&op)? } else { op };
-        let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
-            continue;
-        };
         use BinaryOperator::*;
         match op {
             Eq => {
-                eq = Some((col, v));
-                break;
+                // Composite prefixes match on declared column names, which
+                // need not be index_roots keys themselves — collect every
+                // equality (raw name), resolve the scalar path separately.
+                if eq.is_none() {
+                    if let Some(col) = resolve_indexed_col(&name, table, alias, meta) {
+                        eq = Some((col, v.clone()));
+                    }
+                }
+                eq_map.insert(name, v);
             }
-            Gt | GtEq | Lt | LtEq => match &mut range {
-                Some((c2, bounds)) if *c2 == col => bounds.push((op, v)),
-                None => range = Some((col, vec![(op, v)])),
-                _ => {}
-            },
+            Gt | GtEq | Lt | LtEq => {
+                let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+                    continue;
+                };
+                match &mut range {
+                    Some((c2, bounds)) if *c2 == col => bounds.push((op, v)),
+                    None => range = Some((col, vec![(op, v)])),
+                    _ => {}
+                }
+            }
             _ => {}
+        }
+    }
+    // Composite-index probe: longest equality prefix over the index columns
+    // wins. Full-column equality is an exact key (Eq of the Array); a
+    // partial prefix becomes a Prefix scan with a prefix retain. Non-leading
+    // columns alone cannot use the tree — they fall back to the scan.
+    if !eq_map.is_empty() {
+        let mut best: Option<(String, Vec<Value>)> = None;
+        for root_key in meta.index_roots.keys() {
+            let cols = meta.index_columns_of(root_key);
+            if cols.len() < 2 {
+                continue; // single-column trees take the scalar path below
+            }
+            let mut prefix = Vec::with_capacity(cols.len());
+            for c in &cols {
+                match eq_map.get(c) {
+                    Some(v) => prefix.push(v.clone()),
+                    None => break,
+                }
+            }
+            if prefix.is_empty() {
+                continue;
+            }
+            let longer = match &best {
+                None => true,
+                Some((_, bp)) => prefix.len() > bp.len(),
+            };
+            if longer {
+                best = Some((root_key.clone(), prefix));
+            }
+        }
+        if let Some((root_key, prefix)) = best {
+            let n = meta.index_columns_of(&root_key).len();
+            let plan = if prefix.len() == n {
+                ProbePlan::Eq(Value::Array(prefix))
+            } else {
+                ProbePlan::Prefix(Value::Array(prefix))
+            };
+            return Some((root_key, plan));
         }
     }
     if let Some((col, v)) = eq {
@@ -6245,19 +6505,15 @@ fn mirror_op(op: &BinaryOperator) -> Option<BinaryOperator> {
     })
 }
 
-/// True when `col` is a uniqueness-constraint column (its tree enforces
-/// duplicates); plain CREATE INDEX trees are non-unique.
-fn is_constraint_col(meta: &TableMeta, col: &str) -> bool {
-    meta.primary_key.as_deref() == Some(col) || meta.unique.iter().any(|c| c == col)
-}
-
 /// Re-point index entries after in-page slot moves: delete (key, old_loc)
 /// and insert (key, new_loc) in every tree. `before` holds the page's
 /// documents as they were before the mutation.
+#[allow(clippy::too_many_arguments)]
 fn reindex_repoint(
     pager: &mut Pager,
     tx: &mut crate::pager::Tx,
-    cols: &[String],
+    meta: &TableMeta,
+    root_keys: &[String],
     roots: &mut std::collections::BTreeMap<String, u32>,
     before: &[(u64, Object)],
     old_l: u64,
@@ -6266,18 +6522,17 @@ fn reindex_repoint(
     let Some((_, doc)) = before.iter().find(|(l, _)| *l == old_l) else {
         return err("index fixup: moved document not found");
     };
-    for col in cols {
-        if let Some(v) = doc.get(col) {
-            if !matches!(v, Value::Null) {
-                let root = roots[col];
-                let mut tree = BTree::open(root);
-                tree.delete_entry(pager, tx, v, old_l)
-                    .map_err(|e| index_err(col, e))?;
-                tree.insert(pager, tx, v.clone(), new_l, false)
-                    .map_err(|e| index_err(col, e))?;
-                if tree.root != root {
-                    roots.insert(col.clone(), tree.root);
-                }
+    for root_key in root_keys {
+        let cols = meta.index_columns_of(root_key);
+        if let Some(key) = index_key_of(doc, &cols) {
+            let root = roots[root_key];
+            let mut tree = BTree::open(root);
+            tree.delete_entry(pager, tx, &key, old_l)
+                .map_err(|e| index_err(root_key, e))?;
+            tree.insert(pager, tx, key, new_l, meta.root_key_unique(root_key))
+                .map_err(|e| index_err(root_key, e))?;
+            if tree.root != root {
+                roots.insert(root_key.clone(), tree.root);
             }
         }
     }
@@ -6285,51 +6540,75 @@ fn reindex_repoint(
 }
 
 /// Drop one document's index entries (fast-path DELETE).
+/// Composite/single-column index key for one document: single column → the
+/// bare value (legacy tree layout); multiple columns → `Value::Array` over
+/// the columns in key order (ordered element-wise by `cmp_values`).
+/// `None` when any key column is missing or NULL — NULL does not enter
+/// indexes (composite rule: one NULL column skips the whole key).
+fn index_key_of(doc: &Object, cols: &[String]) -> Option<Value> {
+    if cols.len() == 1 {
+        return match doc.get(&cols[0]) {
+            Some(v) if !matches!(v, Value::Null) => Some(v.clone()),
+            _ => None,
+        };
+    }
+    let mut key = Vec::with_capacity(cols.len());
+    for c in cols {
+        match doc.get(c) {
+            Some(v) if !matches!(v, Value::Null) => key.push(v.clone()),
+            _ => return None,
+        }
+    }
+    Some(Value::Array(key))
+}
+
+/// Remove one document's entries from every index tree (`root_keys` names
+/// the trees; column sets resolve through `index_columns_of`).
 fn reindex_remove(
     pager: &mut Pager,
     tx: &mut crate::pager::Tx,
-    cols: &[String],
+    meta: &TableMeta,
+    root_keys: &[String],
     roots: &mut std::collections::BTreeMap<String, u32>,
     doc: &Object,
     loc: u64,
 ) -> Result<()> {
-    for col in cols {
-        if let Some(v) = doc.get(col) {
-            if !matches!(v, Value::Null) {
-                let root = roots[col];
-                let mut tree = BTree::open(root);
-                tree.delete_entry(pager, tx, v, loc)
-                    .map_err(|e| index_err(col, e))?;
-                if tree.root != root {
-                    roots.insert(col.clone(), tree.root);
-                }
+    for root_key in root_keys {
+        let cols = meta.index_columns_of(root_key);
+        if let Some(key) = index_key_of(doc, &cols) {
+            let root = roots[root_key];
+            let mut tree = BTree::open(root);
+            tree.delete_entry(pager, tx, &key, loc)
+                .map_err(|e| index_err(root_key, e))?;
+            if tree.root != root {
+                roots.insert(root_key.clone(), tree.root);
             }
         }
     }
     Ok(())
 }
 
-/// Insert one document's index entries (fast-path UPDATE pass 2). Constraint
-/// columns enforce uniqueness on insert.
+/// Insert one document's index entries (fast-path UPDATE pass 2). Uniqueness
+/// comes from the tree: `root_key_unique` trees (constraint columns and
+/// CREATE UNIQUE INDEX) reject duplicates at insert.
 fn reindex_insert(
     pager: &mut Pager,
     tx: &mut crate::pager::Tx,
     meta: &TableMeta,
-    cols: &[String],
+    root_keys: &[String],
     roots: &mut std::collections::BTreeMap<String, u32>,
     doc: &Object,
     loc: u64,
 ) -> Result<()> {
-    for col in cols {
-        if let Some(v) = doc.get(col) {
-            if !matches!(v, Value::Null) {
-                let root = roots[col];
-                let mut tree = BTree::open(root);
-                tree.insert(pager, tx, v.clone(), loc, is_constraint_col(meta, col))
-                    .map_err(|e| index_err(col, e))?;
-                if tree.root != root {
-                    roots.insert(col.clone(), tree.root);
-                }
+    for root_key in root_keys {
+        let cols = meta.index_columns_of(root_key);
+        if let Some(key) = index_key_of(doc, &cols) {
+            let root = roots[root_key];
+            let mut tree = BTree::open(root);
+            tree.insert(pager, tx, key, loc, meta.root_key_unique(root_key))
+                .map_err(|e| index_err(root_key, e))?;
+            if tree.root != root {
+                roots.insert(root_key.clone(), tree.root);
             }
         }
     }
@@ -7068,9 +7347,9 @@ mod tests {
         // missing column
         let e = db.execute("CREATE INDEX i ON t (nope)").unwrap_err();
         assert!(e.to_string().contains("does not exist"), "{e}");
-        // multi-column indexes are not supported yet
-        let e = db.execute("CREATE INDEX i ON t (a, b)").unwrap_err();
-        assert!(e.to_string().contains("single-column"), "{e}");
+        // duplicate column inside one index
+        let e = db.execute("CREATE INDEX i ON t (a, a)").unwrap_err();
+        assert!(e.to_string().contains("duplicate column a"), "{e}");
         // duplicate name carries the name in the message
         db.execute("CREATE INDEX i ON t (a)").unwrap();
         let e = db.execute("CREATE INDEX i ON t (a)").unwrap_err();
@@ -8284,18 +8563,21 @@ mod tests {
                 IndexInfo {
                     name: "sqlite_autoindex_users_1".into(),
                     column: "id".into(),
+                    columns: vec!["id".into()],
                     unique: true,
                     auto: true,
                 },
                 IndexInfo {
                     name: "sqlite_autoindex_users_2".into(),
                     column: "email".into(),
+                    columns: vec!["email".into()],
                     unique: true,
                     auto: true,
                 },
                 IndexInfo {
                     name: "idx_users_name".into(),
                     column: "name".into(),
+                    columns: vec!["name".into()],
                     unique: false,
                     auto: false,
                 },
@@ -8326,12 +8608,14 @@ mod tests {
                 IndexInfo {
                     name: "ux_a".into(),
                     column: "a".into(),
+                    columns: vec!["a".into()],
                     unique: true,
                     auto: false,
                 },
                 IndexInfo {
                     name: "ix_b".into(),
                     column: "b".into(),
+                    columns: vec!["b".into()],
                     unique: false,
                     auto: false,
                 },
@@ -12227,5 +12511,164 @@ mod complex_query_tests {
             }
             ExecOutcome::Affected(_) => panic!("expected rows"),
         }
+    }
+
+    #[test]
+    fn composite_index_create_probe_unique_and_maintenance() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (a INT, b INT, tag TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10, 'x'), (1, 20, 'y'), (2, 10, 'z')")
+            .unwrap();
+        // Composite definition: full column list recorded, duplicate/reject
+        // rules per column.
+        db.execute("CREATE INDEX cpx ON t (a, b)").unwrap();
+        assert!(db
+            .execute("CREATE INDEX cpx2 ON t (a, a)")
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate column a"));
+        assert!(db
+            .execute("CREATE INDEX cpx3 ON t (a, nope)")
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+
+        // Full-column equality probes the exact Array key.
+        assert_eq!(
+            rows(&mut db, "SELECT tag FROM t WHERE a = 1 AND b = 20").rows,
+            vec![vec![Value::Str("y".into())]]
+        );
+        // Leading-column equality uses the prefix probe: both matching rows.
+        let r = rows(&mut db, "SELECT tag FROM t WHERE a = 1 ORDER BY b");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("x".into())], vec![Value::Str("y".into())]]
+        );
+        // Non-leading column condition cannot use the tree but stays correct.
+        assert_eq!(
+            rows(&mut db, "SELECT tag FROM t WHERE b = 10 ORDER BY a").rows,
+            vec![vec![Value::Str("x".into())], vec![Value::Str("z".into())]]
+        );
+
+        // Index maintenance through UPDATE and DELETE.
+        db.execute("UPDATE t SET b = 99 WHERE a = 2 AND b = 10")
+            .unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT tag FROM t WHERE a = 2 AND b = 99").rows,
+            vec![vec![Value::Str("z".into())]]
+        );
+        db.execute("DELETE FROM t WHERE a = 1 AND b = 20").unwrap();
+        assert_eq!(
+            ExecOutcome::Rows(QueryResult {
+                columns: vec!["n".into()],
+                rows: vec![vec![Value::Int(2)]]
+            }),
+            db.execute("SELECT COUNT(*) AS n FROM t").unwrap()
+        );
+    }
+
+    #[test]
+    fn composite_unique_index_enforces_and_allows_partial_keys() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (a INT, tag TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (1, 'b'), (2, 'a')")
+            .unwrap();
+        // (a, tag) pairs are unique; the single columns are NOT — the tree
+        // (not meta.unique, which has no column-combination container)
+        // enforces the composite uniqueness.
+        db.execute("CREATE UNIQUE INDEX ux ON t (a, tag)").unwrap();
+        let e = db.execute("INSERT INTO t VALUES (1, 'a')").unwrap_err();
+        assert!(
+            e.to_string().to_lowercase().contains("unique"),
+            "wrong error: {e}"
+        );
+        // Distinct pairs sharing each single column value coexist.
+        db.execute("INSERT INTO t VALUES (1, 'c'), (3, 'a')")
+            .unwrap();
+        // OR REPLACE does not displace composite-unique conflicts: the row
+        // conflicts on the composite key, so the insert fails loudly rather
+        // than silently replacing.
+        assert!(db
+            .execute("INSERT OR REPLACE INTO t VALUES (1, 'a')")
+            .is_err());
+        assert_eq!(
+            ExecOutcome::Rows(QueryResult {
+                columns: vec!["n".into()],
+                rows: vec![vec![Value::Int(5)]]
+            }),
+            db.execute("SELECT COUNT(*) AS n FROM t").unwrap()
+        );
+        // NULL in any key column skips the whole key: duplicate NULL pairs
+        // are allowed (composite rule: one NULL column skips the entire key).
+        db.execute("INSERT INTO t VALUES (NULL, NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL, NULL)").unwrap();
+        assert_eq!(
+            ExecOutcome::Rows(QueryResult {
+                columns: vec!["n".into()],
+                rows: vec![vec![Value::Int(7)]]
+            }),
+            db.execute("SELECT COUNT(*) AS n FROM t").unwrap()
+        );
+        // Dropping the unique index lifts the enforcement.
+        db.execute("DROP INDEX ux").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    }
+
+    #[test]
+    fn composite_index_survives_dump_catalog_and_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cpx.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (a INT, b TEXT, v INT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'x', 100), (1, 'y', 200), (2, 'x', 300)")
+                .unwrap();
+            db.execute("CREATE UNIQUE INDEX ux ON t (a, b)").unwrap();
+            db.execute("CREATE INDEX iv ON t (v)").unwrap();
+            // Catalog round-trip: composite def persists (4-element entry).
+            let mut db2 = Database::open(&path).unwrap();
+            assert!(matches!(
+                db2.execute("SELECT v FROM t WHERE a = 1 AND b = 'y'"),
+                Ok(ExecOutcome::Rows(_))
+            ));
+            assert!(db2.execute("INSERT INTO t VALUES (1, 'y', 999)").is_err());
+        }
+        // dump round-trip: full column list in the DDL, replay restores the
+        // probe (and uniqueness).
+        let dump = {
+            let mut db = Database::open(&path).unwrap();
+            db.dump_script().unwrap()
+        };
+        assert!(
+            dump.contains("CREATE UNIQUE INDEX \"ux\" ON \"t\" (\"a\", \"b\")"),
+            "composite DDL missing: {dump}"
+        );
+        let mut fresh = Database::in_memory().unwrap();
+        for stmt in crate::stmt::split_statements(&dump).unwrap() {
+            fresh.execute(&stmt).unwrap();
+        }
+        assert_eq!(
+            ExecOutcome::Rows(QueryResult {
+                columns: vec!["v".into()],
+                rows: vec![vec![Value::Int(200)]]
+            }),
+            fresh
+                .execute("SELECT v FROM t WHERE a = 1 AND b = 'y'")
+                .unwrap()
+        );
+        // RENAME COLUMN carries the composite definition along.
+        fresh
+            .execute("ALTER TABLE t RENAME COLUMN b TO b2")
+            .unwrap();
+        assert_eq!(
+            ExecOutcome::Rows(QueryResult {
+                columns: vec!["v".into()],
+                rows: vec![vec![Value::Int(300)]]
+            }),
+            fresh
+                .execute("SELECT v FROM t WHERE a = 2 AND b2 = 'x'")
+                .unwrap()
+        );
     }
 }

@@ -26,6 +26,13 @@
   保留策略随主文件一并清理,备份列表带 `checksum` 在位标记;
 - **JSON 函数族**:`JSON_EXTRACT(doc, path)`(`$.`/`.成员`/`[索引]` 点读文法,对象/数组保持结构)、
   `JSON_TYPE(doc[, path])`(SQLite 风格类型名)、`JSON_VALID(text)`;坏文本/缺路径返回 NULL 不中断扫描;
+- **多列(复合)索引**:`CREATE [UNIQUE] INDEX … ON t (a, b)`。复合键为按列序的
+  `Value::Array`(排序走 `cmp_values` 逐元素字典序,零新增编码);复合 UNIQUE 按**完整键
+  组合**判重(树级强制,任一列 NULL 跳过整键);`WHERE a = 1 AND b = 2` 全列等值走精确
+  探测,前导列等值走前缀探测(非前导列条件回退全表扫描,正确性不变);catalog 每定义
+  记录全列清单(向后兼容旧卷三元格式,无需 MAGIC 升版);`schema_hash`/摘要纳入全列,
+  跨节点收敛一致;dump/sqlite_master/`/api/meta` 带全列;设计说明见
+  `docs/design/001-composite-indexes.md`;
 - **CLI**:`-f/--file <script.sql>` 脚本批执行(快速失败,容忍缺失末尾分号)、
   `--csv`(RFC 4180)/`--json` 行导出、`help;` 内联命令(嵌入式与远程模式通用);
 - **优雅停机**:server/web 处理 SIGTERM/SIGINT——停止接受新连接,存量连接限时(10s)排空,

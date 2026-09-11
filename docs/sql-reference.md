@@ -29,13 +29,17 @@ CREATE TABLE [IF NOT EXISTS] t (
     uid     GUID AUTOINCREMENT,           -- UUID/UNIQUEIDENTIFIER/UUIDV7 别名:自动 UUIDv7
     ref     INT REFERENCES other(id)      -- 外键(RESTRICT 式;不支持 ON DELETE/UPDATE 动作)
 );
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON t (col);   -- 仅单列索引
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON t (col);          -- 单列索引
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON t (a, b);         -- 多列(复合)索引
 DROP INDEX idx;
 ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'v';            -- 不支持 PK/UNIQUE/自增;不支持 DROP COLUMN 主键
 DROP TABLE [IF EXISTS] t;
 ```
 
 - 主键与 UNIQUE 约束的 B+ 树随建表自动创建(保留名 `sqlite_autoindex_<表>_<n>`,`DROP INDEX` 对该前缀报错,`sqlite_master` 不列出);
+- **多列(复合)索引**:键为按列序的复合值,`WHERE a = 1 AND b = 2` 形态走索引点查,
+  前导列等值可用前缀探测;非前导列单独条件不走该索引(仍正确,全表扫描);
+  复合 UNIQUE 的唯一性按**完整键组合**判定,任一列 NULL 的行跳过整键(不判重);
 - auto-GUID 表不支持 `INSERT ... SELECT`(随机值无法跨节点收敛;用 VALUES);
 - ADD COLUMN 带 DEFAULT 时自动回填存量行。
 

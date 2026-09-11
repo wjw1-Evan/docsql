@@ -53,7 +53,7 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 ## 关键机制与红线(改代码前必读)
 
 1. **WAL/pager 顺序** — 一切落盘经 pager;先写 WAL 再应用页面;事务内的页面回写延迟到 WAL fsync 之后(防数据页领先日志)。动 pager 提交路径保持该顺序。
-2. **编码 ≠ 排序** — `core/encode.rs` 只保证往返一致;排序统一走 `Value::cmp_values`(B+树/ORDER BY/DISTINCT)。新增值类型必须同时扩展编码与 `cmp_values`,否则索引序被破坏。DISTINCT/UNION 按编码字节判重:Int(3) 与 Float(3.0) 比较相等但不会互相去重。
+2. **编码 ≠ 排序** — `core/encode.rs` 只保证往返一致;排序统一走 `Value::cmp_values`(B+树/ORDER BY/DISTINCT)。新增值类型必须同时扩展编码与 `cmp_values`,否则索引序被破坏。DISTINCT/UNION 按编码字节判重:Int(3) 与 Float(3.0) 比较相等但不会互相去重。**复合索引的键 = `Value::Array` 按列序**(cmp_values 逐元素字典序,设计见 `docs/design/001-composite-indexes.md`):index_roots 键已泛化为 root_key(单列=列名,复合=索引名,旧卷零迁移),一切索引键构造/唯一判定必须走 `TableMeta::index_columns_of` + `index_key_of` + `root_key_unique`,勿回退按列名直取;复合 UNIQUE 的树级判重不进 meta.unique;OR REPLACE/IGNORE 的位移机制只认约束列,复合唯一冲突直接报错(明示语义)。
 3. **自动索引是派生展示** — PK/表声明 UNIQUE 的 B+ 树随建表创建(`index_roots`);`catalog()` 按 `primary_key`+`constraint_unique` 派生 `sqlite_autoindex_<表>_<n>`(不落 catalog,旧卷零迁移、各节点重算一致);`DROP INDEX`/`CREATE INDEX` 对该前缀显式报错;`sqlite_master` 不列自动索引(EF SchemaSync 只看 sqlite_master 且只回收 `IX_` 前缀)。
 4. **B+ 树边界** — 分裂按序列化字节驱动(超页即分裂);单键编码超半页(~2KB)报 KeyTooLarge;等键 run 可横跨分裂点,查找/删除靠 `candidate_children` 对名义区间覆盖该键的子树兜底——不要假设等键同叶。
 5. **UPDATE/DELETE 快速路径 = 两阶段索引维护** — 先删所有被更新行的旧索引项,再逐行写新像;in-page repack 会移动 locator,后续 `updates` 的 locator 必须跟随 `moved`。多行唯一键位移(`SET id = id + 1`、键互换)靠此顺序才合法;改回逐行「先删后插」会误报 UNIQUE。
