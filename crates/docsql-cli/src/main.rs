@@ -7,6 +7,14 @@
 //! - `docsql connect <addr> --user <name>` username/password login
 //!   (password from DOCSQL_PASSWORD or an interactive prompt)
 //!
+//! Both modes accept:
+//! - `-f <script.sql>` / `--file <script.sql>`  execute a script file
+//!   instead of stdin (fail-fast: the first SQL error exits 1)
+//! - `--csv` / `--json`                         row output format
+//!   (default: the aligned table; CSV follows RFC 4180 quoting with NULL as
+//!   an empty field; JSON emits an array of column→value objects)
+//! - `help;`                                    inline command summary
+//!
 //! Remote mode supports the persistent pub/sub commands inline:
 //! `subscribe <ch> [earliest|latest|<id>];`, `psubscribe <pat> [from];`,
 //! `unsubscribe [ch];`, `punsubscribe [pat];`, `publish <ch> <msg...>;`,
@@ -22,32 +30,64 @@ use std::io::{BufRead, Read, Write};
 /// Cap on server-advertised frame sizes (mirrors the server's inbound cap).
 const RECV_CAP: usize = 64 * 1024 * 1024;
 
+/// Row output format (`--csv` / `--json`; default: aligned table).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Format {
+    Table,
+    Csv,
+    Json,
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("connect") {
-        let addr = args
-            .get(2)
+    let mut format = Format::Table;
+    let mut script: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--csv" => format = Format::Csv,
+            "--json" => format = Format::Json,
+            "--table" => format = Format::Table,
+            "-f" | "--file" => match it.next() {
+                Some(p) => script = Some(p),
+                None => {
+                    eprintln!("DocSQL: {a} requires a script path");
+                    std::process::exit(2);
+                }
+            },
+            _ => rest.push(a),
+        }
+    }
+    if rest.first().map(String::as_str) == Some("connect") {
+        let addr = rest
+            .get(1)
             .cloned()
             .unwrap_or_else(|| "127.0.0.1:7600".into());
         // `connect <addr> --user <name> [token]` — username/password login
         // (REQ_AUTH_USER); the password comes from DOCSQL_PASSWORD or an
         // interactive prompt, never from argv (it would leak via ps).
         let mut user: Option<String> = None;
-        let mut rest: Vec<String> = Vec::new();
-        let mut it = args.iter().skip(3);
+        let mut positional: Vec<String> = Vec::new();
+        let mut it = rest.iter().skip(2);
         while let Some(a) = it.next() {
             if a == "--user" {
                 user = it.next().cloned();
             } else {
-                rest.push(a.clone());
+                positional.push(a.clone());
             }
         }
-        let token = rest.first().cloned();
-        remote_shell(&addr, token.as_deref(), user.as_deref());
+        let token = positional.first().cloned();
+        remote_shell(
+            &addr,
+            token.as_deref(),
+            user.as_deref(),
+            format,
+            script.as_deref(),
+        );
         return;
     }
-    let path = args
-        .get(1)
+    let path = rest
+        .first()
         .cloned()
         .unwrap_or_else(|| ":memory:".to_string());
     let mut db = if path == ":memory:" {
@@ -60,9 +100,34 @@ fn main() {
         std::process::exit(1);
     });
     println!("DocSQL — type SQL statements ending with ';', quit with exit;");
-    let mut stmt = String::new();
     let stdin = std::io::BufReader::new(std::io::stdin().lock());
-    for line in stdin.lines() {
+    run_embedded(&mut db, format, script.as_deref(), stdin);
+}
+
+/// Statement loop shared by interactive stdin and `-f` script files: lines
+/// accumulate until a `;`-terminated line, then execute. In script mode an
+/// SQL error fails fast (exit 1) and a dangling trailing statement without
+/// `;` still executes.
+fn run_embedded(
+    db: &mut Database,
+    format: Format,
+    script: Option<&str>,
+    input: impl std::io::Read,
+) {
+    let source: Box<dyn std::io::Read> = match script {
+        Some(p) => match std::fs::File::open(p) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                eprintln!("DocSQL: cannot open script {p}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => Box::new(input),
+    };
+    let interactive = script.is_none();
+    let mut stmt = String::new();
+    let mut done = false;
+    for line in std::io::BufReader::new(source).lines() {
         let line = line.unwrap_or_else(|e| {
             eprintln!("read error: {e}");
             std::process::exit(1);
@@ -71,8 +136,13 @@ fn main() {
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed == "exit;" || trimmed == "exit" {
+        if interactive && (trimmed == "exit;" || trimmed == "exit") {
+            done = true;
             break;
+        }
+        if trimmed == "help;" || trimmed == "help" {
+            print_embedded_help();
+            continue;
         }
         stmt.push_str(&line);
         stmt.push('\n');
@@ -80,12 +150,39 @@ fn main() {
             continue;
         }
         match db.execute(stmt.trim()) {
-            Ok(ExecOutcome::Rows(r)) => print_rows(&r),
+            Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
             Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
-            Err(e) => eprintln!("error: {e}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                if !interactive {
+                    std::process::exit(1);
+                }
+            }
         }
         stmt.clear();
     }
+    // Scripts tolerate a missing final `;`.
+    if !done && !stmt.trim().is_empty() {
+        match db.execute(stmt.trim()) {
+            Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
+            Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                if !interactive {
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+fn print_embedded_help() {
+    println!(
+        "exit;                         leave the shell\n\
+         help;                         this summary\n\
+         SQL ends with ';' — multiple statements per line are executed in order\n\
+         flags: --csv | --json (row output), -f <script.sql> (batch, fail-fast)"
+    );
 }
 
 /// Remote-mode connection. A dedicated reader thread pulls frames off the
@@ -302,7 +399,7 @@ fn parse_pubsub_command(line: &str) -> Option<PubsubCmd> {
     }
 }
 
-fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
+fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> bool {
     let (frame_type, payload, confirm) = match &cmd {
         PubsubCmd::Subscribe {
             name,
@@ -388,7 +485,7 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
                     _ => println!("({n} rows affected)"),
                 }
             } else {
-                print_frame(&f);
+                print_frame(&f, format);
             }
         }
         Err(e) => {
@@ -399,7 +496,13 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
     true
 }
 
-fn remote_shell(addr: &str, token: Option<&str>, user: Option<&str>) {
+fn remote_shell(
+    addr: &str,
+    token: Option<&str>,
+    user: Option<&str>,
+    format: Format,
+    script: Option<&str>,
+) {
     let mut remote = match Remote::connect(addr) {
         Ok(r) => r,
         Err(e) => {
@@ -420,9 +523,20 @@ fn remote_shell(addr: &str, token: Option<&str>, user: Option<&str>) {
         "DocSQL → {addr} — SQL over the wire, quit with exit; \
          (`auth <token>;`, `subscribe <ch>;`, `publish <ch> <msg>;`)"
     );
+    let source: Box<dyn std::io::Read> = match script {
+        Some(p) => match std::fs::File::open(p) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                eprintln!("DocSQL: cannot open script {p}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => Box::new(std::io::stdin()),
+    };
+    let interactive = script.is_none();
     let mut stmt = String::new();
-    let stdin = std::io::BufReader::new(std::io::stdin().lock());
-    for line in stdin.lines() {
+    let mut stmt_failed = false;
+    for line in std::io::BufReader::new(source).lines() {
         let line = line.unwrap_or_else(|e| {
             eprintln!("read error: {e}");
             std::process::exit(1);
@@ -431,8 +545,12 @@ fn remote_shell(addr: &str, token: Option<&str>, user: Option<&str>) {
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed == "exit" || trimmed == "exit;" {
+        if interactive && (trimmed == "exit" || trimmed == "exit;") {
             break;
+        }
+        if trimmed == "help;" || trimmed == "help" {
+            print_remote_help();
+            continue;
         }
         // Inline AUTH: a dedicated auth frame, not SQL.
         if let Some(tok) = trimmed
@@ -448,7 +566,7 @@ fn remote_shell(addr: &str, token: Option<&str>, user: Option<&str>) {
         }
         // Inline pub/sub commands (single line, `;`-terminated like SQL).
         if let Some(cmd) = parse_pubsub_command(trimmed) {
-            if !run_pubsub_command(&mut remote, cmd) {
+            if !run_pubsub_command(&mut remote, cmd, format) {
                 // A failed control round trip leaves the session unusable —
                 // exit nonzero so scripts see the transport loss.
                 std::process::exit(1);
@@ -468,13 +586,48 @@ fn remote_shell(addr: &str, token: Option<&str>, user: Option<&str>) {
                 std::process::exit(1);
             }
         };
-        print_frame(&f);
+        if !print_frame(&f, format) && !interactive {
+            std::process::exit(1);
+        }
+        stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
         stmt.clear();
+    }
+    // Scripts tolerate a missing final `;`.
+    if !stmt.trim().is_empty() {
+        let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(stmt.trim()).unwrap());
+        match remote.round_trip(&frame) {
+            Ok(f) => {
+                if !print_frame(&f, format) && !interactive {
+                    std::process::exit(1);
+                }
+                stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+    if stmt_failed {
+        std::process::exit(1);
     }
 }
 
-/// Print one response frame (rows table / affected count / error).
-fn print_frame(f: &Frame) {
+fn print_remote_help() {
+    println!(
+        "auth <token>;                switch credential mid-session\n\
+         subscribe <ch> [from];       persistent subscription (earliest|latest|<id>)\n\
+         psubscribe <pat> [from];     pattern subscription\n\
+         unsubscribe [ch];            punsubscribe [pat];\n\
+         publish <ch> <msg...>;       durable publish, returns [id, receivers]\n\
+         pubsub channels|numsub|numpat|trim <ch> <n>;\n\
+         help;                        this summary\n\
+         exit;                        leave the shell\n\
+         SQL ends with ';' — flags: --csv | --json, -f <script.sql>"
+    );
+}
+
+/// Print one response frame (rows table / affected count / error). Returns
+/// false for error frames so script mode can fail fast. Errors go to
+/// stderr in every format.
+fn print_frame(f: &Frame, format: Format) -> bool {
     match f.frame_type {
         proto::RESP_ROWS => {
             if let Ok(Value::Object(o)) =
@@ -497,21 +650,89 @@ fn print_frame(f: &Frame) {
                         .collect(),
                     _ => vec![],
                 };
-                print_rows(&QueryResult { columns, rows });
+                print_rows(&QueryResult { columns, rows }, format);
             } else {
                 eprintln!("protocol error: undecodable rows payload");
             }
+            true
         }
         proto::RESP_AFFECTED => {
             let n = proto::decode_affected(&f.payload);
             println!("({n} rows affected)");
+            true
         }
-        _ => println!("error: {}", String::from_utf8_lossy(&f.payload)),
+        _ => {
+            eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
+            false
+        }
     }
 }
 
-fn print_rows(r: &QueryResult) {
-    print!("{render}", render = render_rows(r));
+fn print_rows(r: &QueryResult, format: Format) {
+    match format {
+        Format::Table => print!("{render}", render = render_rows(r)),
+        Format::Csv => print!("{}", render_csv(r)),
+        Format::Json => print!("{}", render_json(r)),
+    }
+}
+
+/// RFC 4180 CSV: quote fields containing the separator, quotes or newlines
+/// (doubling the quotes); NULL renders as an empty field.
+pub fn render_csv(r: &QueryResult) -> String {
+    let mut out = String::new();
+    out.push_str(
+        &r.columns
+            .iter()
+            .map(|c| csv_cell(c))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+    for row in &r.rows {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|v| match v {
+                Value::Null => String::new(),
+                other => csv_cell(&other.to_string()),
+            })
+            .collect();
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+fn csv_cell(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// JSON rows: an array of column→value objects, straight from the wire
+/// payload shape (NULL → null).
+pub fn render_json(r: &QueryResult) -> String {
+    let mut out = String::from("[");
+    for (i, row) in r.rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, (col, v)) in r.columns.iter().zip(row.iter()).enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\"{}\":{}",
+                escape_str(col),
+                docsql_core::json::to_string(v)
+            ));
+        }
+        out.push('}');
+    }
+    out.push_str("]\n");
+    out
 }
 
 /// Format a result table exactly as the shell prints it (pure, testable).
@@ -675,5 +896,83 @@ mod tests {
         assert!(out.contains("id") && out.contains("(2 rows)"));
         let err = db.execute("SELECT * FROM nope").unwrap_err();
         assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn csv_json_renderers() {
+        let r = QueryResult {
+            columns: vec!["id".into(), "name".into(), "note".into()],
+            rows: vec![
+                vec![Value::Int(1), Value::Str("a,b".into()), Value::Null],
+                vec![
+                    Value::Int(2),
+                    Value::Str("say \"hi\"".into()),
+                    Value::Str("x\ny".into()),
+                ],
+            ],
+        };
+        // RFC 4180: special fields quoted (quotes doubled), NULL → empty.
+        assert_eq!(
+            render_csv(&r),
+            "id,name,note\n1,\"a,b\",\n2,\"say \"\"hi\"\"\",\"x\ny\"\n"
+        );
+        // Header-only output for empty results.
+        assert_eq!(
+            render_csv(&QueryResult {
+                columns: vec!["a".into()],
+                rows: vec![],
+            }),
+            "a\n"
+        );
+        assert_eq!(
+            render_json(&QueryResult {
+                columns: vec!["a".into()],
+                rows: vec![],
+            })
+            .trim(),
+            "[]"
+        );
+        // JSON: array of column→value objects, NULL → null.
+        let js = render_json(&r);
+        let parsed = docsql_core::json::from_str(js.trim()).unwrap();
+        match parsed {
+            Value::Array(items) => {
+                assert_eq!(items.len(), 2);
+                match &items[0] {
+                    Value::Object(o) => {
+                        assert_eq!(o.get("id"), Some(&Value::Int(1)));
+                        assert_eq!(o.get("name"), Some(&Value::Str("a,b".into())));
+                        assert_eq!(o.get("note"), Some(&Value::Null));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_mode_runs_and_tolerates_missing_final_semicolon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sql");
+        std::fs::write(
+            &path,
+            "CREATE TABLE t (id INT);\nINSERT INTO t VALUES (7)\n",
+        )
+        .unwrap();
+        let mut db = Database::in_memory().unwrap();
+        run_embedded(
+            &mut db,
+            Format::Csv,
+            Some(path.to_str().unwrap()),
+            std::io::empty(),
+        );
+        // The dangling INSERT (no final `;`) still executed.
+        match db.execute("SELECT COUNT(*) FROM t").unwrap() {
+            ExecOutcome::Rows(r) => {
+                assert_eq!(r.rows[0][0], Value::Int(1), "script statements ran");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
