@@ -5926,8 +5926,102 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 .into(),
             )
         }
+        "JSON_VALID" => {
+            exact_arity(name, args, 1)?;
+            match arg(args, 0, name)? {
+                Value::Str(s) => Value::Bool(crate::json::from_str(s).is_ok()),
+                _ => Value::Bool(false),
+            }
+        }
+        "JSON_EXTRACT" | "JSON_TYPE" => {
+            // Documents live as JSON text, so point reads into them are the
+            // JSON function family's job: extract returns the sub-value
+            // (object/array stay structured), type names it SQLite-style.
+            // Malformed text or a missing path yields NULL — a query over
+            // heterogeneous documents must not abort on one bad row.
+            let want_type = name == "JSON_TYPE";
+            if args.is_empty() || args.len() > 2 {
+                return err(format!(
+                    "function {name} takes 1 or 2 arguments, got {}",
+                    args.len()
+                ));
+            }
+            let Value::Str(text) = arg(args, 0, name)? else {
+                return Ok(Value::Null);
+            };
+            let parsed = match crate::json::from_str(text) {
+                Ok(v) => v,
+                Err(_) => return Ok(Value::Null),
+            };
+            let target = if args.len() == 2 {
+                let Value::Str(path) = arg(args, 1, name)? else {
+                    return err(format!("function {name} path must be text"));
+                };
+                match json_path_lookup(&parsed, path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Value::Null),
+                }
+            } else {
+                parsed
+            };
+            if want_type {
+                Value::Str(json_type_name(&target).into())
+            } else {
+                target
+            }
+        }
         other => return err(format!("unknown function: {other}")),
     })
+}
+
+/// Navigate a JSON document by a minimal path grammar: `$` root, `.key`
+/// object members, `[n]` array indexes — the point-read subset of the
+/// SQLite/JQ path syntax documents stored as JSON text need.
+fn json_path_lookup<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let p = path.trim();
+    if !p.starts_with('$') {
+        return None;
+    }
+    let mut cur = root;
+    let mut rest = &p[1..];
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix('.') {
+            let end = stripped.find(['.', '[']).unwrap_or(stripped.len());
+            let key = &stripped[..end];
+            if key.is_empty() {
+                return None;
+            }
+            cur = match cur {
+                Value::Object(o) => o.get(key)?,
+                _ => return None,
+            };
+            rest = &stripped[end..];
+        } else {
+            let stripped = rest.strip_prefix('[')?;
+            let end = stripped.find(']')?;
+            let idx: usize = stripped[..end].parse().ok()?;
+            cur = match cur {
+                Value::Array(a) => a.get(idx)?,
+                _ => return None,
+            };
+            rest = &stripped[end + 1..];
+        }
+    }
+    Some(cur)
+}
+
+/// SQLite-style JSON type names for JSON_TYPE.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Int(_) => "integer",
+        Value::Float(_) => "real",
+        Value::Str(_) => "text",
+        Value::Bytes(_) => "blob",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// ORDER BY comparison honoring NULLS FIRST/LAST. Default places NULLs as
@@ -11964,5 +12058,100 @@ mod complex_query_tests {
             "wrong error: {e}"
         );
         db.set_statement_deadline(None);
+    }
+
+    #[test]
+    fn json_function_family_point_reads() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE docs (id INT PRIMARY KEY, doc TEXT)")
+            .unwrap();
+        db.execute(
+            r#"INSERT INTO docs VALUES (1, '{"name":"alice","tags":["a","b"],"nest":{"x":42}}')"#,
+        )
+        .unwrap();
+        let q = |db: &mut Database, sql: &str| -> Value {
+            match db.execute(sql).unwrap() {
+                ExecOutcome::Rows(r) => r.rows[0][0].clone(),
+                ExecOutcome::Affected(_) => panic!("expected rows"),
+            }
+        };
+        // Path navigation: members, nested objects, array indexes.
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_EXTRACT(doc, '$.name') FROM docs WHERE id = 1"
+            ),
+            Value::Str("alice".into())
+        );
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_EXTRACT(doc, '$.nest.x') FROM docs WHERE id = 1"
+            ),
+            Value::Int(42)
+        );
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_EXTRACT(doc, '$.tags[1]') FROM docs WHERE id = 1"
+            ),
+            Value::Str("b".into())
+        );
+        // Misses and malformed input yield NULL (heterogeneous documents
+        // must not abort the scan on one bad row).
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_EXTRACT(doc, '$.missing') FROM docs WHERE id = 1"
+            ),
+            Value::Null
+        );
+        // Objects and arrays stay structured.
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_EXTRACT(doc, '$.nest') FROM docs WHERE id = 1"
+            ),
+            crate::json::from_str(r#"{"x":42}"#).unwrap()
+        );
+        // JSON_TYPE names SQLite-style; two-arg form reads a path directly
+        // (the unwrapping extract would hand type-of a plain scalar text).
+        assert_eq!(
+            q(&mut db, "SELECT JSON_TYPE(doc) FROM docs WHERE id = 1"),
+            Value::Str("object".into())
+        );
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_TYPE(doc, '$.tags[0]') FROM docs WHERE id = 1"
+            ),
+            Value::Str("text".into())
+        );
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_TYPE(doc, '$.nest.x') FROM docs WHERE id = 1"
+            ),
+            Value::Str("integer".into())
+        );
+        // JSON_VALID.
+        assert_eq!(
+            q(&mut db, r#"SELECT JSON_VALID('{"a":1}')"#),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            q(&mut db, "SELECT JSON_VALID('{\"a\":')"),
+            Value::Bool(false)
+        );
+        // A stored non-JSON text row: NULL, not an error.
+        db.execute("INSERT INTO docs VALUES (2, 'not json')")
+            .unwrap();
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT JSON_EXTRACT(doc, '$.name') FROM docs WHERE id = 2"
+            ),
+            Value::Null
+        );
     }
 }

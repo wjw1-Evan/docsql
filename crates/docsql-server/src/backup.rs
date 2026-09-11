@@ -213,8 +213,47 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     std::fs::write(&tmp, script.as_bytes()).map_err(|e| format!("backup write: {e}"))?;
     std::fs::rename(&tmp, state.backup_dir.join(&name))
         .map_err(|e| format!("backup rename: {e}"))?;
+    // Integrity sidecar (sha256sum format: "<hex>  <name>"), written
+    // alongside the file it covers. Restore verifies it before replaying —
+    // a corrupted dump must be caught at the door, not halfway through a
+    // whole-cluster replay.
+    let digest = docsql_core::kdf::sha256(script.as_bytes());
+    let sidecar = state.backup_dir.join(format!("{name}.sha256"));
+    let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
+    std::fs::write(
+        &tmp,
+        format!("{}  {}\n", docsql_core::kdf::hex(&digest), name),
+    )
+    .map_err(|e| format!("backup checksum write: {e}"))?;
+    std::fs::rename(&tmp, sidecar).map_err(|e| format!("backup checksum rename: {e}"))?;
     prune_backups(&state.backup_dir, state.backup_keep);
     Ok(name)
+}
+
+/// Verify a backup file against its `.sha256` sidecar (sha256sum format).
+/// Missing sidecar = legacy backup, allowed (the format predates
+/// checksums). A present-but-mismatched sidecar is a hard refusal.
+fn verify_backup_checksum(dir: &Path, name: &str) -> Result<(), String> {
+    let sidecar = dir.join(format!("{name}.sha256"));
+    // Missing sidecar = legacy backup from before checksums existed:
+    // tolerated. Present-but-unreadable is an error, not a skip.
+    let recorded = match std::fs::read_to_string(&sidecar) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("checksum read: {e}")),
+    };
+    let recorded = recorded.split_whitespace().next().unwrap_or("");
+    if recorded.len() != 64 || !recorded.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("checksum file for {name} is malformed"));
+    }
+    let bytes = std::fs::read(dir.join(name)).map_err(|e| format!("backup read: {e}"))?;
+    let actual = docsql_core::kdf::hex(&docsql_core::kdf::sha256(&bytes));
+    if !docsql_core::kdf::constant_time_eq(actual.as_bytes(), recorded.as_bytes()) {
+        return Err(format!(
+            "backup {name} failed checksum verification (corrupted or tampered); refusing to restore"
+        ));
+    }
+    Ok(())
 }
 
 /// Periodic backup task: the first tick is immediate when no usable
@@ -562,6 +601,9 @@ async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, Stri
 
 async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
     // Filesystem work before any engine lock: the script is O(data).
+    // Integrity first: a sidecar mismatch refuses the whole-cluster replay
+    // up front (missing sidecar = legacy backup, tolerated).
+    verify_backup_checksum(&state.backup_dir, file)?;
     let script = std::fs::read_to_string(state.backup_dir.join(file))
         .map_err(|e| format!("restore read: {e}"))?;
     // A backup of an empty database is an empty script: restoring it is a
@@ -671,7 +713,10 @@ fn list_backups(dir: &Path) -> Vec<serde_json::Value> {
     files
         .into_iter()
         .map(|(name, bytes, ts_ms)| {
-            serde_json::json!({"name": name, "bytes": bytes, "ts_ms": ts_ms})
+            // Cheap presence flag, not a digest (list runs on every console
+            // poll; the real verification happens at restore time).
+            let checksum = dir.join(format!("{name}.sha256")).is_file();
+            serde_json::json!({"name": name, "bytes": bytes, "ts_ms": ts_ms, "checksum": checksum})
         })
         .collect()
 }
@@ -691,6 +736,8 @@ fn prune_backups(dir: &Path, keep: usize) {
             eprintln!("backup prune failed for {victim}: {e}");
             break;
         }
+        // The integrity sidecar goes with its file.
+        let _ = std::fs::remove_file(dir.join(format!("{victim}.sha256")));
     }
 }
 
@@ -820,6 +867,42 @@ mod tests {
         // keep=0 clamps to 1 (a deployment can never prune everything).
         prune_backups(dir.path(), 0);
         assert_eq!(read_backup_files(dir.path()), vec!["backup-c.sql"]);
+    }
+
+    #[test]
+    fn backup_checksum_verifies_and_prunes_with_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"DROP TABLE IF EXISTS \"t\";\nCREATE TABLE t (id INT);\n";
+        std::fs::write(dir.path().join("backup-x.sql"), payload).unwrap();
+        let digest = docsql_core::kdf::sha256(payload);
+        std::fs::write(
+            dir.path().join("backup-x.sql.sha256"),
+            format!("{}  backup-x.sql\n", docsql_core::kdf::hex(&digest)),
+        )
+        .unwrap();
+
+        // Matching sidecar verifies; missing sidecar = legacy backup,
+        // tolerated.
+        assert!(verify_backup_checksum(dir.path(), "backup-x.sql").is_ok());
+        std::fs::remove_file(dir.path().join("backup-x.sql.sha256")).unwrap();
+        assert!(verify_backup_checksum(dir.path(), "backup-x.sql").is_ok());
+
+        // A present-but-wrong or malformed sidecar is a hard refusal.
+        std::fs::write(
+            dir.path().join("backup-x.sql.sha256"),
+            format!("{}  backup-x.sql\n", docsql_core::kdf::hex(&[0u8; 32])),
+        )
+        .unwrap();
+        let e = verify_backup_checksum(dir.path(), "backup-x.sql").unwrap_err();
+        assert!(e.contains("failed checksum"), "{e}");
+        std::fs::write(dir.path().join("backup-x.sql.sha256"), "not-a-digest\n").unwrap();
+        assert!(verify_backup_checksum(dir.path(), "backup-x.sql").is_err());
+
+        // Retention removes the sidecar together with its file.
+        std::fs::write(dir.path().join("backup-y.sql"), b"y").unwrap();
+        prune_backups(dir.path(), 1);
+        assert_eq!(read_backup_files(dir.path()), vec!["backup-y.sql"]);
+        assert!(!dir.path().join("backup-y.sql.sha256").is_file());
     }
 
     #[test]

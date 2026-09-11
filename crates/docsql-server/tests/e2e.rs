@@ -3012,12 +3012,16 @@ async fn backup_periodic_with_retention_and_status() {
         2,
         "retention did not prune to keep=2: {names:?}"
     );
-    // No temp residue: `.tmp` side files never count as backups.
+    // No temp residue: `.tmp` side files never count as backups. The only
+    // legitimate contents are backups and their .sha256 sidecars.
     assert!(
         std::fs::read_dir(&backups)
             .unwrap()
             .filter_map(|e| e.ok())
-            .all(|e| e.file_name().to_string_lossy().ends_with(".sql")),
+            .all(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.ends_with(".sql") || n.ends_with(".sql.sha256")
+            }),
         "stray files in backup dir"
     );
 
