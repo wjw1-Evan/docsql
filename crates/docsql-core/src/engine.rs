@@ -639,6 +639,38 @@ impl Database {
         Database::open(&path)
     }
 
+    /// Record a statement's resulting heap layout and index roots in the
+    /// catalog inside `tx`. On save failure the catalog map is restored to
+    /// the pre-statement truth: the tx is dropped on that path, so its
+    /// staged pages never reach the data file, and a map left pointing at
+    /// them would let a later successful save persist ghost pages.
+    fn sync_table_layout(
+        &mut self,
+        tx: &mut crate::pager::Tx,
+        tname: &str,
+        pages: Vec<u32>,
+        roots: std::collections::BTreeMap<String, u32>,
+    ) -> Result<()> {
+        let prev = self
+            .tables
+            .get(tname)
+            .map(|m| (m.pages.clone(), m.index_roots.clone()));
+        if let Some(m) = self.tables.get_mut(tname) {
+            m.pages = pages;
+            m.index_roots = roots;
+        }
+        if let Err(e) = self.save_catalog_into(tx) {
+            if let Some((pages, index_roots)) = prev {
+                if let Some(m) = self.tables.get_mut(tname) {
+                    m.pages = pages;
+                    m.index_roots = index_roots;
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn save_catalog_into(&mut self, tx: &mut crate::pager::Tx) -> Result<()> {
         let mut tables = Object::new();
         for (name, meta) in &self.tables {
@@ -2234,29 +2266,8 @@ impl Database {
                 return Err(e);
             }
         }
-        let pages_changed = heap.pages != meta.pages;
-        let roots_changed = roots != meta.index_roots;
-        if pages_changed || roots_changed {
-            let prev = self
-                .tables
-                .get(&tname)
-                .map(|m| (m.pages.clone(), m.index_roots.clone()));
-            if let Some(m) = self.tables.get_mut(&tname) {
-                m.pages = heap.pages.clone();
-                m.index_roots = roots;
-            }
-            if let Err(e) = self.save_catalog_into(&mut tx) {
-                // The tx is dropped on this path, so its staged pages never
-                // reach the data file; the catalog map must not keep pointing
-                // at them or a later successful save persists ghost pages.
-                if let Some((pages, index_roots)) = prev {
-                    if let Some(m) = self.tables.get_mut(&tname) {
-                        m.pages = pages;
-                        m.index_roots = index_roots;
-                    }
-                }
-                return Err(e);
-            }
+        if heap.pages != meta.pages || roots != meta.index_roots {
+            self.sync_table_layout(&mut tx, &tname, heap.pages.clone(), roots)?;
         }
         self.commit_pager_tx(tx)?;
         // Explicit ids may bump the AUTOINCREMENT watermark.
@@ -2413,29 +2424,8 @@ impl Database {
                 *new_l,
             )?;
         }
-        let pages_changed = heap.pages != meta.pages;
-        let roots_changed = roots != meta.index_roots;
-        if pages_changed || roots_changed {
-            let prev = self
-                .tables
-                .get(&tname)
-                .map(|m| (m.pages.clone(), m.index_roots.clone()));
-            if let Some(m) = self.tables.get_mut(&tname) {
-                m.pages = heap.pages.clone();
-                m.index_roots = roots;
-            }
-            if let Err(e) = self.save_catalog_into(&mut tx) {
-                // The tx is dropped on this path, so its staged pages never
-                // reach the data file; the catalog map must not keep pointing
-                // at them or a later successful save persists ghost pages.
-                if let Some((pages, index_roots)) = prev {
-                    if let Some(m) = self.tables.get_mut(&tname) {
-                        m.pages = pages;
-                        m.index_roots = index_roots;
-                    }
-                }
-                return Err(e);
-            }
+        if heap.pages != meta.pages || roots != meta.index_roots {
+            self.sync_table_layout(&mut tx, &tname, heap.pages.clone(), roots)?;
         }
         self.commit_pager_tx(tx)?;
         // Deleted rows may have held the AUTOINCREMENT watermark.
@@ -3488,30 +3478,8 @@ impl Database {
             }
         }
         let count = placed.len() as u64;
-        let pages_changed = heap.pages != meta.pages;
-        let roots_changed = roots != meta.index_roots;
-        if pages_changed || roots_changed {
-            let prev = self
-                .tables
-                .get(&table)
-                .map(|m| (m.pages.clone(), m.index_roots.clone()));
-            let m = self
-                .tables
-                .get_mut(&table)
-                .expect("table existed at statement start");
-            m.pages = heap.pages.clone();
-            m.index_roots = roots;
-            if let Err(e) = self.save_catalog_into(&mut tx) {
-                // Same ghost-page hazard as the update/delete paths: the tx is
-                // dropped, so restore the map to the on-disk truth.
-                if let Some((pages, index_roots)) = prev {
-                    if let Some(m) = self.tables.get_mut(&table) {
-                        m.pages = pages;
-                        m.index_roots = index_roots;
-                    }
-                }
-                return Err(e);
-            }
+        if heap.pages != meta.pages || roots != meta.index_roots {
+            self.sync_table_layout(&mut tx, &table, heap.pages.clone(), roots)?;
         }
         self.commit_pager_tx(tx)?;
         // AUTOINCREMENT counter: never regress, follow explicit max.

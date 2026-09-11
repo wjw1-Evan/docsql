@@ -84,8 +84,10 @@ fn write_value(out: &mut String, v: &Value) {
     }
 }
 
-fn write_json_string(out: &mut String, s: &str) {
-    out.push('"');
+/// Escape `s` for embedding inside a JSON string literal — the escaped
+/// body only, no surrounding quotes (for callers assembling JSON by hand).
+pub fn escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -99,6 +101,12 @@ fn write_json_string(out: &mut String, s: &str) {
             c => out.push(c),
         }
     }
+    out
+}
+
+fn write_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    out.push_str(&escape_str(s));
     out.push('"');
 }
 

@@ -44,6 +44,7 @@
 
 use crate::querylog;
 use crate::{ConnRole, ServerState};
+use docsql_core::now_ms;
 use docsql_core::proto::{self, Frame};
 use std::path::Path;
 use std::sync::Arc;
@@ -696,13 +697,6 @@ fn read_backup_files(dir: &Path) -> Vec<String> {
 
 fn file_bytes(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Fixed-width UTC stamp with millisecond resolution:

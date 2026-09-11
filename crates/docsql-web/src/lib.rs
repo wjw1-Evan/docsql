@@ -44,6 +44,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use docsql_core::engine::Database;
+use docsql_core::now_ms;
 use docsql_core::proto::{self, Frame};
 use docsql_server::querylog::{self, LogEntry};
 use serde_json::json;
@@ -413,13 +414,6 @@ struct SqlBody {
 #[derive(serde::Deserialize)]
 struct NodeParams {
     node: Option<String>,
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// One console SQL call → one audit entry. `peer` is the node the statement
@@ -903,6 +897,28 @@ async fn node_connect(addr: &str, token: Option<&str>) -> Result<TcpStream, Stri
     Ok(stream)
 }
 
+/// One managed-node round trip: send a frame, read the response frame.
+/// The shared skeleton of every single-frame `remote_*` proxy call; the
+/// console's Chinese error strings for the request/response legs live here.
+async fn node_roundtrip(addr: &str, token: Option<&str>, frame: Frame) -> Result<Frame, String> {
+    let mut stream = node_connect(addr, token).await?;
+    node_write_frame(&mut stream, &frame)
+        .await
+        .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
+    node_read_frame(&mut stream)
+        .await
+        .map_err(|e| format!("节点 {addr} 无响应: {e}"))
+}
+
+/// The console's in-band error convention: a proxied data call never fails
+/// the HTTP layer for node-side errors — they surface as `{"error": …}`.
+fn result_to_json(run: Result<serde_json::Value, String>) -> serde_json::Value {
+    match run {
+        Ok(v) => v,
+        Err(m) => serde_json::json!({"error": m}),
+    }
+}
+
 /// Execute a batch on a managed node over the wire protocol and shape the
 /// response: single statements keep the legacy shape, batches report
 /// per-statement results plus the first-error index. All statements run in
@@ -990,38 +1006,24 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
 /// assembles it with the same `core::meta::build_meta` walk the console
 /// UI renders, so the payload is shape-stable for the frontend surface.
 pub async fn remote_meta(addr: &str, token: Option<&str>) -> serde_json::Value {
-    let run: Result<serde_json::Value, String> = async {
-        let mut stream = node_connect(addr, token).await?;
-        node_write_frame(&mut stream, &Frame::new(proto::REQ_META, vec![]))
-            .await
-            .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
-        let f = node_read_frame(&mut stream)
-            .await
-            .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
-        if f.frame_type != proto::RESP_META {
-            return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
+    result_to_json(
+        async {
+            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_META, vec![])).await?;
+            if f.frame_type != proto::RESP_META {
+                return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
+            }
+            serde_json::from_slice(&f.payload)
+                .map_err(|e| format!("节点 {addr} 的 meta 载荷无法解析: {e}"))
         }
-        serde_json::from_slice(&f.payload)
-            .map_err(|e| format!("节点 {addr} 的 meta 载荷无法解析: {e}"))
-    }
-    .await;
-    match run {
-        Ok(v) => v,
-        Err(m) => serde_json::json!({"error": m}),
-    }
+        .await,
+    )
 }
 
 /// Fetch a managed node's counters (REQ_STATUS) and map them onto the
 /// `/api/stats` shape, so the dashboard card builder works unchanged.
 pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value {
-    let run: Result<serde_json::Value, String> = async {
-        let mut stream = node_connect(addr, token).await?;
-        node_write_frame(&mut stream, &Frame::new(proto::REQ_STATUS, vec![]))
-            .await
-            .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
-        let f = node_read_frame(&mut stream)
-            .await
-            .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
+    result_to_json(async {
+        let f = node_roundtrip(addr, token, Frame::new(proto::REQ_STATUS, vec![])).await?;
         if f.frame_type != proto::RESP_STATUS {
             return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
         }
@@ -1036,11 +1038,7 @@ pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value 
             "uptime_ms": s.get("uptime_ms").cloned().unwrap_or_else(|| serde_json::json!(0)),
         }))
     }
-    .await;
-    match run {
-        Ok(v) => v,
-        Err(m) => serde_json::json!({"error": m}),
-    }
+    .await)
 }
 
 /// Fetch a managed node's backup report / trigger a backup (REQ_BACKUP).
@@ -1048,30 +1046,22 @@ pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value 
 /// itself completes asynchronously and its outcome shows up in the next
 /// `list` (or REQ_STATUS) poll.
 pub async fn remote_backup(addr: &str, token: Option<&str>, trigger: bool) -> serde_json::Value {
-    let run: Result<serde_json::Value, String> = async {
-        let mut stream = node_connect(addr, token).await?;
-        let action = if trigger { "trigger" } else { "list" };
-        let payload =
-            serde_json::to_vec(&serde_json::json!({"action": action})).unwrap_or_default();
-        node_write_frame(&mut stream, &Frame::new(proto::REQ_BACKUP, payload))
-            .await
-            .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
-        let f = node_read_frame(&mut stream)
-            .await
-            .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
-        match f.frame_type {
-            proto::RESP_BACKUP => serde_json::from_slice(&f.payload)
-                .map_err(|e| format!("节点 {addr} 的 backup 载荷无法解析: {e}")),
-            proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
-            proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
-            other => Err(format!("节点 {addr} 返回了意外帧: {other:#06x}")),
+    result_to_json(
+        async {
+            let action = if trigger { "trigger" } else { "list" };
+            let payload =
+                serde_json::to_vec(&serde_json::json!({"action": action})).unwrap_or_default();
+            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload)).await?;
+            match f.frame_type {
+                proto::RESP_BACKUP => serde_json::from_slice(&f.payload)
+                    .map_err(|e| format!("节点 {addr} 的 backup 载荷无法解析: {e}")),
+                proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
+                proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
+                other => Err(format!("节点 {addr} 返回了意外帧: {other:#06x}")),
+            }
         }
-    }
-    .await;
-    match run {
-        Ok(v) => v,
-        Err(m) => serde_json::json!({"error": m}),
-    }
+        .await,
+    )
 }
 
 /// Backup management page data for one managed node (list; `?node=`).
@@ -1133,15 +1123,9 @@ pub async fn remote_backup_restore(
     token: Option<&str>,
     file: &str,
 ) -> Result<serde_json::Value, String> {
-    let mut stream = node_connect(addr, token).await?;
     let payload = serde_json::to_vec(&serde_json::json!({"action": "restore", "file": file}))
         .unwrap_or_default();
-    node_write_frame(&mut stream, &Frame::new(proto::REQ_BACKUP, payload))
-        .await
-        .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
-    let f = node_read_frame(&mut stream)
-        .await
-        .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
+    let f = node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload)).await?;
     match f.frame_type {
         proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
         proto::RESP_ERROR => Ok(serde_json::json!({

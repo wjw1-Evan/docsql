@@ -12,6 +12,7 @@
 //! `[pubsub] message <channel> #<id> <payload>` the moment they arrive.
 
 use docsql_core::engine::{Database, ExecOutcome, QueryResult};
+use docsql_core::json::escape_str;
 use docsql_core::proto::{self, Frame};
 use docsql_core::value::Value;
 use std::io::{BufRead, Read, Write};
@@ -182,23 +183,6 @@ fn auth(remote: &mut Remote, token: &str) -> bool {
     }
 }
 
-/// JSON string escaping for the pub/sub command payloads.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// One parsed inline pub/sub command (the `;` already stripped).
 #[derive(Debug)]
 enum PubsubCmd {
@@ -280,8 +264,8 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
             let key = if *pattern { "pattern" } else { "channel" };
             let body = format!(
                 r#"{{"{key}":"{}","from":"{}"}}"#,
-                json_escape(name),
-                json_escape(from)
+                escape_str(name),
+                escape_str(from)
             );
             (
                 if *pattern {
@@ -295,7 +279,7 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
         }
         PubsubCmd::Unsubscribe { name, pattern } => {
             let names = match name {
-                Some(n) => format!("[\"{}\"]", json_escape(n)),
+                Some(n) => format!("[\"{}\"]", escape_str(n)),
                 None => "[]".to_string(),
             };
             (
@@ -312,8 +296,8 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
             proto::REQ_PUBLISH,
             format!(
                 r#"{{"channel":"{}","payload":"{}"}}"#,
-                json_escape(channel),
-                json_escape(payload)
+                escape_str(channel),
+                escape_str(payload)
             )
             .into_bytes(),
             "",
@@ -324,7 +308,7 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
                 r#"{{"sub":"channels"{} }}"#,
                 filter
                     .as_ref()
-                    .map(|p| format!(",\"pattern\":\"{}\"", json_escape(p)))
+                    .map(|p| format!(",\"pattern\":\"{}\"", escape_str(p)))
                     .unwrap_or_default()
             )
             .into_bytes(),
@@ -336,7 +320,7 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
             proto::REQ_PUBSUB,
             format!(
                 r#"{{"sub":"trim","channel":"{}","keep":{keep}}}"#,
-                json_escape(channel)
+                escape_str(channel)
             )
             .into_bytes(),
             "trimmed",
@@ -622,10 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_specials() {
-        assert_eq!(json_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
-        assert_eq!(json_escape("plain"), "plain");
-        assert_eq!(json_escape("x\u{1}y"), "x\\u0001y");
+    fn escape_str_specials() {
+        assert_eq!(escape_str("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+        assert_eq!(escape_str("plain"), "plain");
+        assert_eq!(escape_str("x\u{1}y"), "x\\u0001y");
     }
 
     #[test]

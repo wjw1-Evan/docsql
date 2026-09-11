@@ -34,6 +34,7 @@ pub mod pubsub;
 pub mod querylog;
 
 use docsql_core::engine::{Database, ExecOutcome, TableDigest, TxControl};
+use docsql_core::now_ms;
 use docsql_core::proto::{self, Frame};
 use docsql_core::value::Value;
 use std::path::PathBuf;
@@ -1548,10 +1549,7 @@ async fn auth_on(
         frame.payload = crypto::seal(k, &frame.payload);
         frame.flags |= crypto::FLAG_ENCRYPTED;
     }
-    let bytes = frame.encode().map_err(std::io::Error::other)?;
-    use tokio::io::AsyncWriteExt;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    write_frame_on(stream, &frame).await?;
     let resp = read_response_frame(stream).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
@@ -1575,6 +1573,30 @@ async fn open_peer_conn(
     Ok(stream)
 }
 
+/// Build a replication-internal frame: FLAG_REPLICATION plus transport
+/// sealing when a key is configured.
+fn replication_frame(
+    frame_type: u16,
+    payload: Vec<u8>,
+    key: Option<&crypto::TransportKey>,
+) -> Frame {
+    let mut frame = Frame::new(frame_type, payload);
+    frame.flags = FLAG_REPLICATION;
+    if let Some(k) = key {
+        frame.payload = crypto::seal(k, &frame.payload);
+        frame.flags |= crypto::FLAG_ENCRYPTED;
+    }
+    frame
+}
+
+/// Encode + write + flush one frame under the IO timeout.
+async fn write_frame_on(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+    let bytes = frame.encode().map_err(std::io::Error::other)?;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    Ok(())
+}
+
 /// Write one replication-internal frame and read its response; the stream
 /// comes back so the caller can pool it. Encryption is per frame.
 async fn send_frame_on(
@@ -1583,16 +1605,8 @@ async fn send_frame_on(
     payload: &[u8],
     key: Option<&crypto::TransportKey>,
 ) -> std::io::Result<(Frame, TcpStream)> {
-    let mut frame = Frame::new(frame_type, payload.to_vec());
-    frame.flags = FLAG_REPLICATION;
-    if let Some(k) = key {
-        frame.payload = crypto::seal(k, &frame.payload);
-        frame.flags |= crypto::FLAG_ENCRYPTED;
-    }
-    let bytes = frame.encode().map_err(std::io::Error::other)?;
-    use tokio::io::AsyncWriteExt;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let frame = replication_frame(frame_type, payload.to_vec(), key);
+    write_frame_on(&mut stream, &frame).await?;
     let resp = read_response_frame(&mut stream).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
@@ -1722,6 +1736,17 @@ fn advance_position(db: &mut docsql_core::engine::Database, node_id: &str, seq: 
     }
 }
 
+/// Fan-out destinations: the replication upstream (replicate_to) first,
+/// then every symmetric peer (DOCSQL_PEERS).
+async fn fanout_targets(state: &ServerState) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(target) = state.replicate_to.lock().await.clone() {
+        targets.push(target);
+    }
+    targets.extend(state.peers.lock().await.clone());
+    targets
+}
+
 /// Fan one SQL write out to the replication upstream and every peer, in
 /// parallel. Each attempt lands in the sync log so the console's logs page
 /// shows the replication trail (target, statement, ok/error). Per-target
@@ -1730,11 +1755,7 @@ fn advance_position(db: &mut docsql_core::engine::Database, node_id: &str, seq: 
 pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u64>) {
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
-    let mut targets: Vec<String> = Vec::new();
-    if let Some(target) = state.replicate_to.lock().await.clone() {
-        targets.push(target);
-    }
-    targets.extend(state.peers.lock().await.clone());
+    let targets = fanout_targets(state).await;
     let mut tasks = tokio::task::JoinSet::new();
     for target in targets {
         let sql = sql.to_string();
@@ -1813,13 +1834,6 @@ pub async fn drain_tx_pending(state: &Arc<ServerState>) {
 // ---------------------------------------------------------------------------
 // Pub/sub frames.
 // ---------------------------------------------------------------------------
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Acquire the write path (write_order) once no explicit transaction is
 /// open. Protocol-level writes (PUBLISH, TRIM) must not join a client
@@ -2178,11 +2192,7 @@ async fn forward_pubsub_all(
     };
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
-    let mut targets: Vec<String> = Vec::new();
-    if let Some(target) = state.replicate_to.lock().await.clone() {
-        targets.push(target);
-    }
-    targets.extend(state.peers.lock().await.clone());
+    let targets = fanout_targets(state).await;
     let mut tasks = tokio::task::JoinSet::new();
     for target in targets {
         let payload = payload.to_vec();
@@ -2300,12 +2310,11 @@ async fn hold_peer(
             .await
             .map_err(|e| HoldFail::Busy(format!("auth: {e}")))?;
     }
-    let mut frame = Frame::new(proto::REQ_HOLD, advertise.as_bytes().to_vec());
-    frame.flags = FLAG_REPLICATION;
-    if let Some(k) = state.transport_key.as_ref() {
-        frame.payload = crypto::seal(k, &frame.payload);
-        frame.flags |= crypto::FLAG_ENCRYPTED;
-    }
+    let frame = replication_frame(
+        proto::REQ_HOLD,
+        advertise.as_bytes().to_vec(),
+        state.transport_key.as_ref(),
+    );
     let bytes = match frame.encode() {
         Ok(b) => b,
         Err(e) => return Err(HoldFail::Unreachable(e.to_string())),
@@ -2676,26 +2685,18 @@ enum JoinApply {
 /// Ask one peer for the cluster state and return the dump script.
 async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<String> {
     let attempt = async {
-        let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
-        if let Some(token) = fanout_auth(state) {
-            auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
-        }
-        let mut frame = Frame::new(
+        let mut stream =
+            open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+        let frame = replication_frame(
             proto::REQ_SYNC,
             state
                 .advertise
                 .as_deref()
                 .map(|a| a.as_bytes().to_vec())
                 .unwrap_or_default(),
+            state.transport_key.as_ref(),
         );
-        frame.flags = FLAG_REPLICATION;
-        if let Some(k) = state.transport_key.as_ref() {
-            frame.payload = crypto::seal(k, &frame.payload);
-            frame.flags |= crypto::FLAG_ENCRYPTED;
-        }
-        let bytes = frame.encode().map_err(std::io::Error::other)?;
-        tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-        tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+        write_frame_on(&mut stream, &frame).await?;
         let mut script = String::new();
         loop {
             let f = read_response_frame(&mut stream).await?;
@@ -3544,19 +3545,9 @@ pub(crate) async fn probe_peer_digests(
     state: &Arc<ServerState>,
     peer: &str,
 ) -> std::io::Result<Vec<TableDigest>> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
-    if let Some(token) = fanout_auth(state) {
-        auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
-    }
-    let mut frame = Frame::new(proto::REQ_DIGEST, vec![]);
-    frame.flags = FLAG_REPLICATION;
-    if let Some(k) = state.transport_key.as_ref() {
-        frame.payload = crypto::seal(k, &frame.payload);
-        frame.flags |= crypto::FLAG_ENCRYPTED;
-    }
-    let bytes = frame.encode().map_err(std::io::Error::other)?;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+    let frame = replication_frame(proto::REQ_DIGEST, vec![], state.transport_key.as_ref());
+    write_frame_on(&mut stream, &frame).await?;
     let resp = read_response_frame(&mut stream).await?;
     if resp.frame_type != proto::RESP_DIGEST {
         return Err(std::io::Error::other(format!(
@@ -3589,19 +3580,9 @@ pub(crate) async fn probe_peer_info(
     state: &Arc<ServerState>,
     peer: &str,
 ) -> std::io::Result<PeerInfo> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
-    if let Some(token) = fanout_auth(state) {
-        auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
-    }
-    let mut frame = Frame::new(proto::REQ_STATUS, vec![]);
-    frame.flags = FLAG_REPLICATION;
-    if let Some(k) = state.transport_key.as_ref() {
-        frame.payload = crypto::seal(k, &frame.payload);
-        frame.flags |= crypto::FLAG_ENCRYPTED;
-    }
-    let bytes = frame.encode().map_err(std::io::Error::other)?;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+    let frame = replication_frame(proto::REQ_STATUS, vec![], state.transport_key.as_ref());
+    write_frame_on(&mut stream, &frame).await?;
     let resp = read_response_frame(&mut stream).await?;
     if resp.frame_type != proto::RESP_STATUS {
         return Err(std::io::Error::other(format!(
@@ -3798,19 +3779,14 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
 /// the repair then falls back to snapshot adoption.
 async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std::io::Result<u64> {
     let attempt = async {
-        let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await??;
-        if let Some(token) = fanout_auth(state) {
-            auth_on(&mut stream, token, state.transport_key.as_ref()).await?;
-        }
-        let mut frame = Frame::new(proto::REQ_CATCHUP, after.to_le_bytes().to_vec());
-        frame.flags = FLAG_REPLICATION;
-        if let Some(k) = state.transport_key.as_ref() {
-            frame.payload = crypto::seal(k, &frame.payload);
-            frame.flags |= crypto::FLAG_ENCRYPTED;
-        }
-        let bytes = frame.encode().map_err(std::io::Error::other)?;
-        tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
-        tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+        let mut stream =
+            open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+        let frame = replication_frame(
+            proto::REQ_CATCHUP,
+            after.to_le_bytes().to_vec(),
+            state.transport_key.as_ref(),
+        );
+        write_frame_on(&mut stream, &frame).await?;
         loop {
             let f = tokio::time::timeout(IO_TIMEOUT, read_response_frame(&mut stream)).await??;
             match f.frame_type {
