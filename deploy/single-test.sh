@@ -15,10 +15,10 @@ PASS=0; FAIL=0
 ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
-sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$CTR" docsql-cli connect "$1" 2>/dev/null; }
+sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$CTR" docsql-cli connect "$1" 2>&1; }
 # 事务必须在同一会话内执行:BEGIN 的连接拥有该事务,连接断开即回滚,
 # 外来连接的写也不会并入它。
-sqltx() { local a="$1"; shift; { printf '%s\n' "$@"; echo "exit;"; } | docker exec -i "$CTR" docsql-cli connect "$a" 2>/dev/null; }
+sqltx() { local a="$1"; shift; { printf '%s\n' "$@"; echo "exit;"; } | docker exec -i "$CTR" docsql-cli connect "$a" 2>&1; }
 
 echo "== 1. standalone SQL =="
 out=$(sql "$A" "CREATE TABLE solo (id INT PRIMARY KEY, tag TEXT);")
@@ -40,7 +40,7 @@ echo "== 3. persistence across container restart =="
 docker restart "$CTR" >/dev/null
 up=""
 for _ in $(seq 1 60); do
-  out=$(sql "$A" "SELECT id FROM solo WHERE id = 2;" 2>/dev/null)
+  out=$(sql "$A" "SELECT id FROM solo WHERE id = 2;" 2>&1)
   echo "$out" | grep -qE "^[[:space:]]*2[[:space:]]*$" && { up=1; break; }
   sleep 0.5
 done
@@ -75,7 +75,7 @@ echo "$r" | grep -q '"rows":\[\[1\]\]' && ok "node tables visible via web (same 
 echo "== 5. isolation from the cluster profile =="
 if docker ps --filter "name=docsql-a" --format "{{.Names}}" | grep -q .; then
   sql "$A" "CREATE TABLE solo_only (k TEXT);" >/dev/null
-  out=$(printf 'SELECT k FROM solo_only;\nexit;\n' | docker exec -i docsql-a docsql-cli connect node-a:7600 2>/dev/null)
+  out=$(printf 'SELECT k FROM solo_only;\nexit;\n' | docker exec -i docsql-a docsql-cli connect node-a:7600 2>&1)
   echo "$out" | grep -qi "does not exist" && ok "cluster cannot see single's tables" || bad "leak cluster<-single: $out"
   printf 'CREATE TABLE cluster_only (k TEXT);\nexit;\n' | docker exec -i docsql-a docsql-cli connect node-a:7600 >/dev/null 2>&1
   out=$(sql "$A" "SELECT k FROM cluster_only;" 2>&1)
@@ -89,7 +89,7 @@ ch="solo-$(date +%s)"
 tmp=$(mktemp)
 # 后台订阅(输出落宿主临时文件),另一连接发布,断言实时推送。
 ( printf "subscribe %s latest;\n" "$ch"; sleep 3; printf "exit;\n" ) \
-  | docker exec -i "$CTR" docsql-cli connect "$A" >"$tmp" 2>/dev/null &
+  | docker exec -i "$CTR" docsql-cli connect "$A" >"$tmp" 2>&1 &
 sub=$!
 # 轮询等订阅确认(docker exec 冷启动可能 >1s,固定 sleep 会抢跑)。
 sub_ready=""
@@ -97,7 +97,7 @@ for _ in $(seq 1 40); do
   grep -q "subscribed" "$tmp" && { sub_ready=1; break; }
   sleep 0.5
 done
-out=$(printf "publish %s solo-msg;\nexit;\n" "$ch" | docker exec -i "$CTR" docsql-cli connect "$A" 2>/dev/null)
+out=$(printf "publish %s solo-msg;\nexit;\n" "$ch" | docker exec -i "$CTR" docsql-cli connect "$A" 2>&1)
 wait $sub
 echo "$out" | grep -qE "\|[[:space:]]*1[[:space:]]*$" && ok "publish reports 1 live receiver" || bad "publish: $out"
 grep -q "\[pubsub\] message $ch #" "$tmp" && grep -q "solo-msg" "$tmp" \
@@ -112,7 +112,7 @@ for _ in $(seq 1 60); do
 done
 if [ -n "$up" ]; then
   ( printf "subscribe %s earliest;\n" "$ch"; sleep 2; printf "exit;\n" ) \
-    | docker exec -i "$CTR" docsql-cli connect "$A" >"$tmp" 2>/dev/null
+    | docker exec -i "$CTR" docsql-cli connect "$A" >"$tmp" 2>&1
   # 回放帧紧随确认;等确认+回放都到齐再断言。
   for _ in $(seq 1 20); do
     grep -q "solo-msg" "$tmp" && break
@@ -161,7 +161,7 @@ echo "== 8. automatic backups (interval 5s via run-tests.sh) =="
 # 恢复 = 重放备份文件(整库替换,集群内会经扇出传播收敛)。
 # 容器内文件一律 docker exec cat 中转,命令走参数列表,不拼 shell 字符串。
 BK="/data/backups"
-backup_names() { docker exec "$CTR" ls "$BK" 2>/dev/null | grep -E '^backup-.*\.sql$' | sort; }
+backup_names() { docker exec "$CTR" ls "$BK" 2>&1 | grep -E '^backup-.*\.sql$' | sort; }
 newest() { backup_names | tail -1; }
 # 备份文件出现(首拍即触发,栈就绪后应已有;轮询兜底)。
 bk=""
@@ -218,7 +218,7 @@ if [ -n "$sgbk" ]; then
     docker exec "$CTR" cat "$BK/$sgbk" | docker exec -i "$CTR" docsql-cli connect "$A" >/dev/null 2>&1
     restored=""
     for _ in $(seq 1 20); do
-      out=$(sql "$A" "SELECT COUNT(id) FROM sg;" 2>/dev/null)
+      out=$(sql "$A" "SELECT COUNT(id) FROM sg;" 2>&1)
       echo "$out" | grep -qE "^[[:space:]]*3[[:space:]]*$" && { restored=1; break; }
       sleep 0.5
     done
@@ -238,7 +238,7 @@ wname=""
 for _ in $(seq 1 30); do
   w=$(newest)
   [ -n "$w" ] || { sleep 1; continue; }
-  out=$(docker exec "$CTR" cat "$BK/$w" 2>/dev/null)
+  out=$(docker exec "$CTR" cat "$BK/$w" 2>&1)
   echo "$out" | grep -q "webrestore" && { wname="$w"; break; }
   sleep 1
 done
@@ -249,7 +249,7 @@ if [ -n "$wname" ]; then
   echo "$r" | grep -q '"ok":true' && ok "web restore accepted" || bad "web restore trigger: $r"
   wr=""
   for _ in $(seq 1 20); do
-    out=$(sql "$A" "SELECT v FROM wbk WHERE id = 9;" 2>/dev/null)
+    out=$(sql "$A" "SELECT v FROM wbk WHERE id = 9;" 2>&1)
     echo "$out" | grep -q "webrestore" && { wr=1; break; }
     sleep 0.5
   done

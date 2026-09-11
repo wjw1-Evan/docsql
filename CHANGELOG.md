@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### 商用交付加固批次(2026-09-11)
+
+#### 新增
+
+- **许可与治理**:双许可文本(LICENSE-MIT / LICENSE-APACHE,对应 Cargo.toml 声明的 `MIT OR Apache-2.0`)、
+  SECURITY.md(私密漏洞报告渠道与响应目标)、CONTRIBUTING.md、CHANGELOG.md;
+- **可观测性**:服务端运行时计数器(连接总数/活跃/拒绝、语句总数/错误、发布数、认证失败、网络字节)
+  随 `REQ_STATUS` 的 `metrics` 对象暴露;Web 控制台 `GET /metrics` 输出 Prometheus 文本
+  (逐节点并行抓取,`docsql_*` 指标族 + 控制台自身 `docsql_web_http_requests_total`),
+  `GET /healthz` 无门禁存活探针;抓取认证与其他 API 一致(`X-Docsql-Token`);
+- **语句超时**:`DOCSQL_STATEMENT_TIMEOUT_MS`(默认 0=不限)为客户端语句设置墙钟预算,
+  引擎在嵌套循环 JOIN/SELECT WHERE/UPDATE·DELETE 行循环协作式采样(每 1024 行)超时报错回滚;
+  复制 apply 与恢复重放**不受限**(慢节点不得偏离主节点已确认的写入);
+- **语句级参数绑定(服务端)**:预留帧 REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT 落地为真实服务端
+  prepared statements——`?` 占位符在服务端按位置绑定类型化字面量(引号感知:字符串字面量内的
+  `?` 是数据;字符串值单引号翻倍转义,注入载荷无法逃逸字面量),授权/超时/审计与 REQ_SQL 全同路径;
+- **备份完整性**:每份备份写入 sha256sum 格式校验和 sidecar(`backup-*.sql.sha256`),
+  恢复前强校验(损坏/被篡改的转储在触碰集群前被拒),缺失 sidecar 容忍旧备份,
+  保留策略随主文件一并清理,备份列表带 `checksum` 在位标记;
+- **JSON 函数族**:`JSON_EXTRACT(doc, path)`(`$.`/`.成员`/`[索引]` 点读文法,对象/数组保持结构)、
+  `JSON_TYPE(doc[, path])`(SQLite 风格类型名)、`JSON_VALID(text)`;坏文本/缺路径返回 NULL 不中断扫描;
+- **CLI**:`-f/--file <script.sql>` 脚本批执行(快速失败,容忍缺失末尾分号)、
+  `--csv`(RFC 4180)/`--json` 行导出、`help;` 内联命令(嵌入式与远程模式通用);
+- **优雅停机**:server/web 处理 SIGTERM/SIGINT——停止接受新连接,存量连接限时(10s)排空,
+  引擎断连回滚 + WAL 恢复兜底;axum 挂接 graceful shutdown;
+- **TCP keepalive(60s)+ NODELAY**:长会话不再死于 NAT/防火墙静默超时;
+- **配置校验**:数值型环境变量(`DOCSQL_MAX_CONN`/`DOCSQL_IDLE_TIMEOUT`/`DOCSQL_CATCHUP_WINDOW`/
+  `DOCSQL_BACKUP_*`/`DOCSQL_SLOW_MS`/`DOCSQL_STATEMENT_TIMEOUT_MS`)非法值拒绝启动(exit 2),
+  不再静默回退默认值;
+- **NuGet 打包**:Docsql.Client 与 Docsql.EntityFrameworkCore 具备完整包元数据
+  (LicenseExpression `MIT OR Apache-2.0`、包 README),`dotnet pack` 可出包。
+
+#### 修正
+
+- README 两处失真:EF Core 描述更新为独立原生提供程序(不再"借壳 SQLite 管线");
+  安全对照表不再宣称未实现的参数化帧(随本批实现已成立)。
+
 ## [0.1.0] - 2026-09-11
 
 首个公开基线版本。

@@ -13,6 +13,7 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d
 
 # SQL 远程 shell(镜像自带 CLI,容器内执行)
 docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
+#   常用参数:--csv / --json(行导出格式)、-f script.sql(脚本批执行,快速失败)、help;(内联帮助)
 
 # 多节点部署(生产,3 节点对等集群:node-a 18601 + node-b 18602 + node-c 18603 + web 18700)
 cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
@@ -86,8 +87,8 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | 领域 | 支持 |
 |---|---|
 | 存储 | JSON 文档整体存储(无强制 schema)、WAL 崩溃恢复、手写分页器与 B+ 树 |
-| SQL | CREATE/ALTER/DROP TABLE+INDEX、INSERT(多行/RETURNING)、UPDATE/DELETE(RETURNING)、SELECT(WHERE/ORDER/LIMIT/OFFSET/GROUP BY+HAVING/COUNT/SUM/AVG/MIN/MAX/JOIN:INNER/LEFT/CROSS/USING/子查询派生表/UNION(ALL)/IN)、事务 BEGIN/COMMIT/ROLLBACK、PRIMARY KEY/UNIQUE/NOT NULL/AUTOINCREMENT、GUID 主键(UUIDv7 时序有序自动生成)、information_schema、sqlite_master 兼容视图、PRAGMA 兼容 |
-| 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告、REQ_BACKUP 备份管理与手动触发 |
+| SQL | CREATE/ALTER/DROP TABLE+INDEX、INSERT(多行/RETURNING)、UPDATE/DELETE(RETURNING)、SELECT(WHERE/ORDER/LIMIT/OFFSET/GROUP BY+HAVING/COUNT/SUM/AVG/MIN/MAX/JOIN:INNER/LEFT/CROSS/USING/子查询派生表/UNION(ALL)/IN)、事务 BEGIN/COMMIT/ROLLBACK、PRIMARY KEY/UNIQUE/NOT NULL/AUTOINCREMENT、GUID 主键(UUIDv7 时序有序自动生成)、JSON 函数(JSON_EXTRACT/JSON_TYPE/JSON_VALID:文档点读路径 `$.a.b[0]`)、information_schema、sqlite_master 兼容视图、PRAGMA 兼容 |
+| 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告(含运行时计数器:连接/语句/字节/认证失败,可直接喂 `/metrics`)、REQ_BACKUP 备份管理与手动触发、REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT 服务端参数化(占位符在服务端引号感知绑定,注入载荷无法逃逸字面量) |
 | 发布订阅 | 持久化 pub/sub(参考 Redis 命令面):PUBLISH/SUBSCRIBE/PSUBSCRIBE(glob `*` `?` `[...]`)/UNSUBSCRIBE/PUBSUB CHANNELS·NUMSUB·NUMPAT·TRIM;消息先经 WAL 落盘再推送,重启不丢;订阅可指定起点(`earliest` 全量回放 / `latest` 仅新消息 / 指定 id 续传),断线用最后收到的 id 重新订阅即补齐(at-least-once);集群内发布自动扇出到全部节点,各节点本地落盘并推送本地订阅者;`docsql_pubsub` 系统视图可查消息历史 |
 | Web | **DocSQL Studio**(SSMS 风格管理控制台,纯管理工具、自身不存数据,默认连接并管理指定节点):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/删行)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、备份管理页(备份状态/文件列表/立即备份/一键恢复——恢复需输入完整文件名确认)、节点切换(默认管理节点 ↔ 任意 `DOCSQL_PEERS` 节点);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs /api/backup,其中数据端点 /api/sql /api/meta /api/stats /api/backup 可带 `node` 参数指定目标节点) |
 | EF Core | `UseDocsql(connectionString)`(独立原生提供程序,基于 Docsql ADO.NET,不依赖 SQLite):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引(含唯一索引;模型增删索引均自动同步,免迁移) |
@@ -224,11 +225,11 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 | 口令/凭据复杂度 | 服务器启动时校验所有已配置凭据:长度不足 8 或单一字符重复即拒绝启动(进程退出码 2) |
 | 访问控制(最小权限) | `DOCSQL_READ_TOKEN` 只读身份:可查询、可订阅,一切持久化写在协议层拒绝;**数据库角色**:内置 `admin`/`readwrite`/`readonly` + 自定义角色表级 DML 授权(GRANT/REVOKE 即时生效,DDL 与管理操作仅 admin,读目标含子查询 fail-closed);存在任一用户后匿名连接关闭;副本模式 `DOCSQL_READ_ONLY=1` 整节点只读;Web 控制台独立 token 门禁 |
 | 安全审计 | 语句审计(`docsql_log` 环形缓冲,含语句文本/耗时/影响行数/是否复制/错误)、认证事件审计(成功与失败均记录,来源 IP + 授予身份/失败原因,web 控制台日志页可见)、`DOCSQL_LOG_FILE` 可同步落 JSONL 文件留存 |
-| 资源控制 | `DOCSQL_MAX_CONN` 并发连接数上限(超限立即拒绝不排队);`DOCSQL_IDLE_TIMEOUT` 空闲会话超时(服务端主动断开,订阅客户端需定期 PING 保活);单帧 64MB 上限;对端 IO 预算(连接 3s/读写 10s) |
-| 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);绑定非回环地址且未配置 `DOCSQL_KEY` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1` |
-| SQL 注入防护 | ADO.NET/EF Core 参数绑定(参数在客户端转义为类型化字面量:字符串单引号强转义、二进制 hex 字面量);服务端不拼接外部输入;系统表 `_pubsub_messages` 对 SQL 客户端隐藏 |
+| 资源控制 | `DOCSQL_MAX_CONN` 并发连接数上限(超限立即拒绝不排队);`DOCSQL_IDLE_TIMEOUT` 空闲会话超时(服务端主动断开,订阅客户端需定期 PING 保活);`DOCSQL_STATEMENT_TIMEOUT_MS` 客户端语句墙钟预算(超时即报错回滚;复制 apply 与恢复重放不受限,慢节点不偏离已确认写入);单帧 64MB 上限;对端 IO 预算(连接 3s/读写 10s);TCP keepalive + NODELAY(NAT/防火墙后的长会话不被静默掐断) |
+| 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);绑定非回环地址且未配置 `DOCSQL_KEY` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1`;生产 Web 控制台应置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`) |
+| SQL 注入防护 | ADO.NET/EF Core 参数绑定(参数在客户端转义为类型化字面量:字符串单引号强转义、二进制 hex 字面量);**服务端 prepared statements**(REQ_PREPARE/REQ_EXECUTE:占位符在服务端引号感知绑定,字符串值翻倍转义,任何取值都无法逃逸字面量);服务端不拼接外部输入;系统表 `_pubsub_messages` 对 SQL 客户端隐藏 |
 | 数据完整性 | WAL 先写日志后落数据、崩溃恢复;节点间复制依赖独立集群凭据防伪造 |
-| 数据备份 | 自动定时备份(默认每日,`DOCSQL_BACKUP_INTERVAL_SECS`/`DOCSQL_BACKUP_KEEP` 可调):整库一致点逻辑快照,随数据卷持久;恢复为整库重放,控制台备份页可手动触发;备份成败计入审计日志 |
+| 数据备份 | 自动定时备份(默认每日,`DOCSQL_BACKUP_INTERVAL_SECS`/`DOCSQL_BACKUP_KEEP` 可调):整库一致点逻辑快照,随数据卷持久;**每份备份带 sha256 校验和 sidecar,恢复前强校验**(损坏/被篡改的转储在重放前被拒,旧备份无 sidecar 仍可恢复);恢复为整库重放,控制台备份页可手动触发;备份成败计入审计日志 |
 
 已知边界:审计环形缓冲在内存(重启丢失,需要长期留存请启用 `DOCSQL_LOG_FILE` 外发);静态数据加密(TDE)暂未内置(可部署在加密卷之上)。
 
@@ -246,6 +247,17 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 | 点查 WHERE id=?(1k 行) | ~38,000 次/秒 | ~5,600 | ~241,000 |
 
 写入吞吐受每语句一次 fsync 支配(与 SQLite FULL 同语义);点查为解析+索引开销。
+
+## 运维与监控
+
+- **存活探针**:`GET /healthz` 无门禁回答控制台进程自身状态(不触碰数据库节点,setup 前同样可用);
+- **Prometheus 指标**:`GET /metrics`(抓取认证与其它 API 一致,`X-Docsql-Token`)——逐节点并行抓取
+  REQ_STATUS,输出 `docsql_node_up`/`docsql_sql_statements_total`/`docsql_connections_active`/
+  `docsql_network_bytes_total`/`docsql_auth_failures_total`/存储与期刊收敛等指标族(节点标签 `node`),
+  另有控制台自身 `docsql_web_http_requests_total`;
+- **优雅停机**:节点与控制台处理 SIGTERM/SIGINT——停止接受新连接,存量连接限时排空(节点侧最长 10s),
+  未及收尾的事务由断连回滚 + WAL 恢复兜底,`docker stop`/滚动发布安全;
+- **配置快速失败**:数值型环境变量非法值拒绝启动(exit 2),不再静默回退默认值。
 
 ## 已知边界(v1)
 

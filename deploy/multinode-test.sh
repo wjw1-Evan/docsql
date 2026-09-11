@@ -21,10 +21,10 @@ PASS=0; FAIL=0
 ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
-sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$(ctr_of "$1")" docsql-cli connect "$1" 2>/dev/null; }
+sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$(ctr_of "$1")" docsql-cli connect "$1" 2>&1; }
 # 事务必须在同一会话内执行:BEGIN 的连接拥有该事务,连接断开即回滚,
 # 外来连接的写也不会并入它。
-sqltx() { local a="$1"; shift; { printf '%s\n' "$@"; echo "exit;"; } | docker exec -i "$(ctr_of "$a")" docsql-cli connect "$a" 2>/dev/null; }
+sqltx() { local a="$1"; shift; { printf '%s\n' "$@"; echo "exit;"; } | docker exec -i "$(ctr_of "$a")" docsql-cli connect "$a" 2>&1; }
 
 # wait_row <node> <sql> <ERE pattern>: poll until the query output matches.
 wait_row() {
@@ -135,14 +135,14 @@ echo "== 8. persistent pub/sub across nodes =="
 ch="ops-$(date +%s)"
 tmp=$(mktemp)
 ( printf "subscribe %s latest;\n" "$ch"; sleep 4; printf "exit;\n" ) \
-  | docker exec -i docsql-a docsql-cli connect "$A" >"$tmp" 2>/dev/null &
+  | docker exec -i docsql-a docsql-cli connect "$A" >"$tmp" 2>&1 &
 sub=$!
 # 轮询等订阅确认(docker exec 冷启动可能 >1s,固定 sleep 会抢跑)。
 for _ in $(seq 1 40); do
   grep -q "subscribed" "$tmp" && break
   sleep 0.5
 done
-out=$(printf "publish %s hello-from-b;\nexit;\n" "$ch" | docker exec -i docsql-b docsql-cli connect "$B" 2>/dev/null)
+out=$(printf "publish %s hello-from-b;\nexit;\n" "$ch" | docker exec -i docsql-b docsql-cli connect "$B" 2>&1)
 wait $sub
 # publish 回 [id, receivers] 表格;receivers 是行尾单元格,断言 = 1。
 echo "$out" | grep -qE "\|[[:space:]]*1[[:space:]]*$" && ok "publish on b reports 1 live receiver" || bad "publish receivers: $out"
@@ -163,7 +163,7 @@ done
 if [ -n "$up" ]; then
   tmp2=$(mktemp)
   ( printf "subscribe %s earliest;\n" "$ch"; sleep 2; printf "exit;\n" ) \
-    | docker exec -i docsql-a docsql-cli connect "$A" >"$tmp2" 2>/dev/null
+    | docker exec -i docsql-a docsql-cli connect "$A" >"$tmp2" 2>&1
   # 回放帧紧随确认;等回放内容到齐再断言。
   for _ in $(seq 1 20); do
     grep -q "hello-from-b" "$tmp2" && break
@@ -230,7 +230,7 @@ wait_row "$A" "SELECT id FROM nodes WHERE id = 23;" "^[[:space:]]*23[[:space:]]*
 echo "== 10. partition: both sides accept writes, divergence until a restart heals it =="
 # 分区周期后 c 的自名解析(容器内解析 node-c)可能持续损坏,直到 compose 网络
 # 被重建(down -v)才恢复——分区测试中所有 c 侧交互一律走 127.0.0.1 回环。
-sqlc() { printf "%s\nexit;\n" "$1" | docker exec -i docsql-c docsql-cli connect 127.0.0.1:7600 2>/dev/null; }
+sqlc() { printf "%s\nexit;\n" "$1" | docker exec -i docsql-c docsql-cli connect 127.0.0.1:7600 2>&1; }
 wait_row_c() {
   local out=""
   for _ in $(seq 1 40); do
@@ -344,7 +344,7 @@ echo "== 12. joining node bootstraps the full cluster state automatically =="
 #      重建保证幂等。dev compose(默认文件)从仓库 deploy/ 目录起。
 D="node-d:7600"
 ctr_of_d() { echo docsql-d; }
-sqld() { printf "%s\nexit;\n" "$1" | docker exec -i "$(ctr_of_d)" docsql-cli connect "$D" 2>/dev/null; }
+sqld() { printf "%s\nexit;\n" "$1" | docker exec -i "$(ctr_of_d)" docsql-cli connect "$D" 2>&1; }
 wait_row_d() {
   local out=""
   for _ in $(seq 1 60); do
@@ -432,14 +432,14 @@ echo "$out" | grep -qiE "error" && bad "create user + grant failed: $out" || ok 
 # 13.2 用户随集群复制:b 上同名密码可登录(CLI --user,密码走 DOCSQL_PASSWORD)。
 b_ok=""
 for _ in $(seq 1 40); do
-  out=$(printf "SELECT COUNT(id) FROM nodes;\nexit;\n" | docker exec -e DOCSQL_PASSWORD="$UPW" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>/dev/null)
+  out=$(printf "SELECT COUNT(id) FROM nodes;\nexit;\n" | docker exec -e DOCSQL_PASSWORD="$UPW" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>&1)
   echo "$out" | grep -qE "^[[:space:]]*[0-9]+[[:space:]]*$" && { b_ok="$out"; break; }
   sleep 0.5
 done
 [ -n "$b_ok" ] && ok "user replicated to b and can log in" || bad "user login on b never worked"
 
 # 13.3 角色约束在 b 生效:readonly 用户的写被拒。
-out=$(printf "INSERT INTO nodes VALUES (99, 'nope');\nexit;\n" | docker exec -e DOCSQL_PASSWORD="$UPW" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>/dev/null)
+out=$(printf "INSERT INTO nodes VALUES (99, 'nope');\nexit;\n" | docker exec -e DOCSQL_PASSWORD="$UPW" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>&1)
 echo "$out" | grep -q "requires" && ok "readonly write rejected on b" || bad "readonly write was NOT rejected on b: $out"
 
 # 13.4 匿名连接在存在用户后关闭(新连接)。
@@ -448,7 +448,7 @@ echo "$out" | grep -q "authentication required" && ok "anonymous access closed o
 
 # 13.5 错误密码被拒:CLI 在认证阶段即失败退出(stderr 被丢弃),成功路径的
 #      查询输出(数字行)绝不能出现。
-out=$(printf "SELECT 1;\nexit;\n" | docker exec -e DOCSQL_PASSWORD="wrong-password" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>/dev/null)
+out=$(printf "SELECT 1;\nexit;\n" | docker exec -e DOCSQL_PASSWORD="wrong-password" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>&1)
 echo "$out" | grep -qE "^[[:space:]]*1[[:space:]]*$" && bad "wrong password was ACCEPTED on b: $out" || ok "wrong password rejected on b"
 
 echo
