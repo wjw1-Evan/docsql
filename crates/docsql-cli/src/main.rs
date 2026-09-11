@@ -4,6 +4,8 @@
 //! - `docsql :memory:`              embedded in-memory
 //! - `docsql connect <addr> [token]` remote mode over the v1 protocol
 //!   (`auth <token>;` also works mid-session)
+//! - `docsql connect <addr> --user <name>` username/password login
+//!   (password from DOCSQL_PASSWORD or an interactive prompt)
 //!
 //! Remote mode supports the persistent pub/sub commands inline:
 //! `subscribe <ch> [earliest|latest|<id>];`, `psubscribe <pat> [from];`,
@@ -27,8 +29,21 @@ fn main() {
             .get(2)
             .cloned()
             .unwrap_or_else(|| "127.0.0.1:7600".into());
-        let token = args.get(3).cloned();
-        remote_shell(&addr, token.as_deref());
+        // `connect <addr> --user <name> [token]` — username/password login
+        // (REQ_AUTH_USER); the password comes from DOCSQL_PASSWORD or an
+        // interactive prompt, never from argv (it would leak via ps).
+        let mut user: Option<String> = None;
+        let mut rest: Vec<String> = Vec::new();
+        let mut it = args.iter().skip(3);
+        while let Some(a) = it.next() {
+            if a == "--user" {
+                user = it.next().cloned();
+            } else {
+                rest.push(a.clone());
+            }
+        }
+        let token = rest.first().cloned();
+        remote_shell(&addr, token.as_deref(), user.as_deref());
         return;
     }
     let path = args
@@ -171,6 +186,39 @@ fn print_push(f: &Frame) {
 /// AUTH against a token-protected server (REQ_AUTH frame). Returns success.
 fn auth(remote: &mut Remote, token: &str) -> bool {
     match remote.round_trip(&Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec())) {
+        Ok(f) if f.frame_type != proto::RESP_ERROR => true,
+        Ok(f) => {
+            eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
+            false
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            false
+        }
+    }
+}
+
+/// Username/password login (REQ_AUTH_USER, JSON body). The password is
+/// taken from DOCSQL_PASSWORD or an interactive prompt.
+fn auth_user(remote: &mut Remote, user: &str) -> bool {
+    let password = match std::env::var("DOCSQL_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            eprint!("password for {user}: ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                eprintln!("cannot read password from stdin");
+                return false;
+            }
+            line.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    let body = docsql_core::json::to_string(&Value::Object(docsql_core::value::Object::from([
+        ("user".to_string(), Value::Str(user.to_string())),
+        ("password".to_string(), Value::Str(password)),
+    ])));
+    match remote.round_trip(&Frame::new(proto::REQ_AUTH_USER, body.into_bytes())) {
         Ok(f) if f.frame_type != proto::RESP_ERROR => true,
         Ok(f) => {
             eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
@@ -351,7 +399,7 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd) -> bool {
     true
 }
 
-fn remote_shell(addr: &str, token: Option<&str>) {
+fn remote_shell(addr: &str, token: Option<&str>, user: Option<&str>) {
     let mut remote = match Remote::connect(addr) {
         Ok(r) => r,
         Err(e) => {
@@ -359,7 +407,11 @@ fn remote_shell(addr: &str, token: Option<&str>) {
             std::process::exit(1);
         }
     };
-    if let Some(t) = token {
+    if let Some(u) = user {
+        if !auth_user(&mut remote, u) {
+            std::process::exit(2);
+        }
+    } else if let Some(t) = token {
         if !auth(&mut remote, t) {
             std::process::exit(2);
         }

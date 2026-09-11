@@ -70,6 +70,16 @@ pub fn is_system_table(name: &str) -> bool {
         || name == CLUSTER_ID_TABLE
 }
 
+/// Internal tables in the broad sense: engine system tables (excluded from
+/// replication — digests/snapshots never carry them) PLUS the user/role
+/// storage tables, which DO replicate (they are regular data) but are
+/// shielded from direct SQL writes and hidden from the object browser.
+/// Display filters and the server's write gate use this predicate;
+/// replication-exclusion logic must keep using `is_system_table`.
+pub fn is_internal_table(name: &str) -> bool {
+    is_system_table(name) || crate::useradmin::is_user_table(name)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
     #[error("heap error: {0}")]
@@ -120,9 +130,19 @@ pub enum TxControl {
 /// (write path, transaction control, replication timing) without re-parsing
 /// the text.
 pub struct ParsedStatement {
-    pub stmt: Statement,
+    pub stmt: AnyStmt,
     pub tx: TxControl,
     pub is_write: bool,
+}
+
+/// A parsed statement: standard SQL (`sqlparser` AST) or one of the
+/// hand-parsed user-management statements (sqlparser 0.62 does not accept
+/// `CREATE USER … PASSWORD` / `GRANT role TO user`). The SQL AST is boxed —
+/// it dwarfs the user-admin shape by two orders of magnitude.
+#[derive(Debug, Clone)]
+pub enum AnyStmt {
+    Sql(Box<Statement>),
+    UserAdmin(crate::useradmin::UserAdminStmt),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -383,8 +403,8 @@ pub struct Database {
     /// GUID values (explicit generated ids embedded). Replicating callers
     /// must forward this text instead of the original: random GUIDs cannot
     /// be re-derived on peers the way AUTOINCREMENT's deterministic max+1
-    /// can. Reset at the start of every statement; see `take_resolved_insert`.
-    resolved_insert: Option<String>,
+    /// can. Reset at the start of every statement; see `take_resolved_sql`.
+    resolved_sql: Option<String>,
     /// Next seq for the catch-up journal ([`Database::journal_append`]).
     /// Seeded lazily from MAX(seq)+1 (in-memory counter under the write
     /// lock; gaps from failed statements are harmless — positions pull
@@ -393,6 +413,10 @@ pub struct Database {
     /// This node's persistent random identity (see CLUSTER_ID_TABLE),
     /// cached after first read.
     cluster_id: Option<String>,
+    /// Set only while `ensure_user_tables` runs its own DDL: the reserved
+    /// user/role table names are otherwise rejected in CREATE TABLE so
+    /// clients cannot shadow them.
+    pub(crate) internal_ddl: bool,
 }
 
 impl Database {
@@ -624,9 +648,10 @@ impl Database {
             tx_snapshot: None,
             ctes: std::collections::BTreeMap::new(),
             autoinc_cache: std::collections::HashMap::new(),
-            resolved_insert: None,
+            resolved_sql: None,
             journal_next: None,
             cluster_id: None,
+            internal_ddl: false,
         })
     }
 
@@ -1018,10 +1043,73 @@ impl Database {
         }
     }
 
+    /// Tables a statement READS (authorization input for user connections):
+    /// every table referenced in a query's FROM/JOINs (derived tables and
+    /// subqueries included — inside CTE bodies, projections and predicates
+    /// too) and the source of an INSERT ... SELECT. Fails CLOSED: a query
+    /// shape the walker cannot fully classify returns `None`, and the
+    /// caller must deny rather than guess.
+    pub fn stmt_read_targets(stmt: &Statement) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        match stmt {
+            Statement::Query(q) => walk_query(q, &mut out)?,
+            Statement::Insert(insert) => {
+                if let Some(source) = &insert.source {
+                    walk_query(source, &mut out)?;
+                }
+            }
+            Statement::Update(u) => {
+                // The update target itself is a WRITE target; extra FROM
+                // tables are reads.
+                if let Some(kind) = &u.from {
+                    let list = match kind {
+                        sqlparser::ast::UpdateTableFromKind::BeforeSet(v)
+                        | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => v,
+                    };
+                    for twj in list {
+                        walk_factor(&twj.relation, &mut out)?;
+                    }
+                }
+                if let Some(sel) = &u.selection {
+                    walk_expr(sel, &mut out)?;
+                }
+            }
+            Statement::Delete(d) => {
+                // USING tables are reads; the delete targets come from
+                // stmt_write_targets.
+                if let Some(using) = &d.using {
+                    for twj in using {
+                        walk_factor(&twj.relation, &mut out)?;
+                    }
+                }
+                if let Some(sel) = &d.selection {
+                    walk_expr(sel, &mut out)?;
+                }
+            }
+            _ => {}
+        }
+        out.sort();
+        out.dedup();
+        Some(out)
+    }
+
     /// Parse a single statement once and classify it in the same pass: the
     /// AST feeds [`Database::execute_parsed`], the flags route the request
     /// (write path, transaction control) without re-parsing the text.
+    /// User-management statements are hand-parsed first (sqlparser 0.62
+    /// rejects their grammar) and always classify as writes.
     pub fn parse_classified(sql: &str) -> Result<ParsedStatement> {
+        match crate::useradmin::parse(sql) {
+            Some(Ok(ua)) => {
+                return Ok(ParsedStatement {
+                    stmt: AnyStmt::UserAdmin(ua),
+                    tx: TxControl::None,
+                    is_write: true,
+                })
+            }
+            Some(Err(m)) => return err(m),
+            None => {}
+        }
         let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)
             .map_err(|e| SqlError::Parse(e.to_string()))?;
         let stmt = match stmts.len() {
@@ -1031,7 +1119,16 @@ impl Database {
         };
         let tx = Self::classify_tx(&stmt);
         let is_write = Self::stmt_is_write(&stmt);
-        Ok(ParsedStatement { stmt, tx, is_write })
+        Ok(ParsedStatement {
+            stmt: AnyStmt::Sql(Box::new(stmt)),
+            tx,
+            is_write,
+        })
+    }
+
+    /// True when the catalog holds a table with this exact name.
+    pub(crate) fn table_exists(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
     }
 
     /// True when a session transaction is open.
@@ -1051,53 +1148,50 @@ impl Database {
     /// use after [`Database::parse_classified`] routed the request.
     pub fn execute_parsed(&mut self, parsed: ParsedStatement) -> Result<ExecOutcome> {
         self.ctes.clear();
-        self.resolved_insert = None;
-        self.exec_stmt(parsed.stmt)
+        self.resolved_sql = None;
+        match parsed.stmt {
+            AnyStmt::Sql(stmt) => self.exec_stmt(*stmt),
+            AnyStmt::UserAdmin(ua) => self.exec_user_admin(&ua),
+        }
     }
 
     /// Parse-check a statement batch without executing anything (the web
     /// console's "parse" button).
     pub fn parse_check(sql: &str) -> std::result::Result<(), String> {
-        match Parser::parse_sql(&GenericDialect {}, sql) {
-            Ok(stmts) if !stmts.is_empty() => Ok(()),
-            Ok(_) => Err("empty statement".into()),
-            Err(e) => Err(e.to_string()),
+        match crate::useradmin::parse(sql) {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(m)) => Err(m),
+            None => match Parser::parse_sql(&GenericDialect {}, sql) {
+                Ok(stmts) if !stmts.is_empty() => Ok(()),
+                Ok(_) => Err("empty statement".into()),
+                Err(e) => Err(e.to_string()),
+            },
         }
     }
 
     /// Execute every statement in `sql`, in order, stopping at the first
     /// error. Successfully executed prefixes are still reported so callers
-    /// (e.g. the web console) can render partial results.
+    /// (e.g. the web console) can render partial results. Splitting first
+    /// lets a batch mix plain SQL with the hand-parsed user-management
+    /// statements (join snapshots and backups embed them).
     pub fn execute_batch(&mut self, sql: &str) -> BatchResult {
-        let stmts = match Parser::parse_sql(&GenericDialect {}, sql) {
-            Ok(s) if s.is_empty() => {
+        let parts = match crate::stmt::split_statements(sql) {
+            Ok(p) => p,
+            Err(m) => {
                 return BatchResult {
                     statements: 0,
                     outcomes: vec![],
                     error: Some(BatchError {
                         statement: 0,
-                        message: "empty statement".into(),
-                    }),
-                }
-            }
-            Ok(s) => s,
-            Err(e) => {
-                return BatchResult {
-                    statements: 0,
-                    outcomes: vec![],
-                    error: Some(BatchError {
-                        statement: 0,
-                        message: SqlError::Parse(e.to_string()).to_string(),
+                        message: m,
                     }),
                 }
             }
         };
-        let statements = stmts.len();
+        let statements = parts.len();
         let mut outcomes = Vec::new();
-        for (i, stmt) in stmts.into_iter().enumerate() {
-            self.ctes.clear();
-            self.resolved_insert = None;
-            match self.exec_stmt(stmt) {
+        for (i, part) in parts.into_iter().enumerate() {
+            match self.execute(&part) {
                 Ok(o) => outcomes.push(o),
                 Err(e) => {
                     return BatchResult {
@@ -1118,11 +1212,19 @@ impl Database {
         }
     }
 
-    /// Take the canonical rewrite of the last statement, present only when
-    /// it auto-filled GUID values. Replicating callers replace the original
-    /// statement text with this one so peers apply the exact generated ids.
-    pub fn take_resolved_insert(&mut self) -> Option<String> {
-        self.resolved_insert.take()
+    /// Take the canonical rewrite of the last statement: the auto-GUID
+    /// INSERT rewrite or the canonical user-management form (password in
+    /// stored-hash form). Replicating callers replace the original
+    /// statement text with this one so peers apply the exact same values.
+    pub fn take_resolved_sql(&mut self) -> Option<String> {
+        self.resolved_sql.take()
+    }
+
+    /// Publish the canonical rewrite of the executing statement (used by
+    /// the user-management family; auto-GUID INSERTs write the field
+    /// directly inside `exec_insert`).
+    pub(crate) fn set_resolved_sql(&mut self, sql: String) {
+        self.resolved_sql = Some(sql);
     }
 
     /// PRIMARY KEY / UNIQUE constraint indexes as named entries,
@@ -1496,7 +1598,7 @@ impl Database {
         let names: Vec<String> = self
             .tables
             .keys()
-            .filter(|n| !is_system_table(n))
+            .filter(|n| !is_internal_table(n))
             .cloned()
             .collect();
         let mut ddl = String::new();
@@ -1588,6 +1690,25 @@ impl Database {
         // the engine lock, so a third full-size copy would double the peak
         // memory for nothing.
         ddl.push_str(&dml);
+        // Users/roles ride the dump as canonical user-management statements
+        // (passwords already in stored-hash form): plain INSERTs against the
+        // reserved tables are rejected by the write gate, so the statement
+        // family is the one replication form everywhere. The DROP prelude
+        // above does not cover the reserved tables — restoring a backup with
+        // fewer users must still remove the extras — so drop them here; the
+        // replaying node re-creates them via ensure_user_tables before the
+        // first CREATE USER applies.
+        ddl.push_str(&format!(
+            "DROP TABLE IF EXISTS {}, {}, {}, {};\n",
+            crate::useradmin::USERS_TABLE,
+            crate::useradmin::ROLES_TABLE,
+            crate::useradmin::MEMBERS_TABLE,
+            crate::useradmin::GRANTS_TABLE
+        ));
+        for s in crate::useradmin::dump_user_statements(self)? {
+            ddl.push_str(&s);
+            ddl.push_str(";\n");
+        }
         Ok(ddl)
     }
 
@@ -1688,6 +1809,20 @@ impl Database {
                             "cannot drop table {name}: referenced by FOREIGN KEY in {}",
                             referencing.join(", ")
                         ));
+                    }
+                }
+                // Table grants for a dropped table are garbage: clean them
+                // before the catalog change (autocommit statements; replay
+                // order on peers is identical).
+                for name in &dropping {
+                    if !is_internal_table(name) {
+                        let lit_name = format!("'{}'", name.replace('\'', "''"));
+                        self.execute(&format!(
+                            "DELETE FROM {} WHERE tbl = {}",
+                            crate::useradmin::GRANTS_TABLE,
+                            lit_name
+                        ))
+                        .ok();
                     }
                 }
                 for name in &dropping {
@@ -1950,7 +2085,7 @@ impl Database {
         Ok(Some(out))
     }
 
-    fn table_docs(&mut self, table: &str) -> Result<Vec<Object>> {
+    pub(crate) fn table_docs(&mut self, table: &str) -> Result<Vec<Object>> {
         let Some(meta) = self.tables.get(table) else {
             return err(format!("table {table} does not exist"));
         };
@@ -2987,6 +3122,11 @@ impl Database {
     fn exec_create(&mut self, create: sqlparser::ast::CreateTable) -> Result<ExecOutcome> {
         use sqlparser::ast::ColumnOption as CO;
         let name = obj_name(&create.name);
+        if crate::useradmin::is_user_table(&name) && !self.internal_ddl {
+            return err(format!(
+                "table name {name} is reserved for the user/role subsystem"
+            ));
+        }
         if self.tables.contains_key(&name) {
             if create.if_not_exists {
                 return Ok(ExecOutcome::Affected(0));
@@ -3320,7 +3460,7 @@ impl Database {
                 rendered.push(format!("({})", vals.join(", ")));
             }
             sql.push_str(&rendered.join(", "));
-            self.resolved_insert = Some(sql);
+            self.resolved_sql = Some(sql);
         }
 
         // One pager transaction for heap pages and index trees alike: a
@@ -4812,6 +4952,216 @@ fn collect_from_names(q: &Query, out: &mut std::collections::BTreeSet<String>) {
                 }
             }
         }
+    }
+}
+
+// ---- read-target walkers (stmt_read_targets) ----
+// Every walker returns Option<()>: `None` means "shape not fully
+// classifiable" and the authorization caller must DENY (fail closed).
+
+fn walk_query(q: &Query, out: &mut Vec<String>) -> Option<()> {
+    if let Some(w) = &q.with {
+        for cte in &w.cte_tables {
+            walk_query(&cte.query, out)?;
+        }
+    }
+    walk_setexpr(&q.body, out)?;
+    if let Some(order_by) = &q.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            for obe in exprs {
+                walk_expr(&obe.expr, out)?;
+            }
+        }
+    }
+    Some(())
+}
+
+fn walk_setexpr(se: &SetExpr, out: &mut Vec<String>) -> Option<()> {
+    match se {
+        SetExpr::Select(sel) => {
+            for twj in &sel.from {
+                walk_factor(&twj.relation, out)?;
+                for j in &twj.joins {
+                    walk_factor(&j.relation, out)?;
+                    if let Some(e) = join_on_expr(&j.join_operator) {
+                        walk_expr(e, out)?;
+                    }
+                }
+            }
+            for item in &sel.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        walk_expr(e, out)?
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(sel_expr) = &sel.selection {
+                walk_expr(sel_expr, out)?;
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+                for e in exprs {
+                    walk_expr(e, out)?;
+                }
+            }
+            if let Some(having) = &sel.having {
+                walk_expr(having, out)?;
+            }
+            Some(())
+        }
+        SetExpr::Query(inner) => walk_query(inner, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            walk_setexpr(left, out)?;
+            walk_setexpr(right, out)
+        }
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for e in row.content.iter() {
+                    walk_expr(e, out)?;
+                }
+            }
+            Some(())
+        }
+        // TABLE / InsertStatements shapes: no table refs to collect.
+        _ => Some(()),
+    }
+}
+
+/// The ON predicate of a join, when it has one (USING lists reference
+/// already-counted tables; NATURAL/CROSS have no predicate).
+fn join_on_expr(op: &sqlparser::ast::JoinOperator) -> Option<&SqlExpr> {
+    use sqlparser::ast::JoinConstraint as JC;
+    use sqlparser::ast::JoinOperator as JO;
+    let constraint = match op {
+        JO::Inner(c)
+        | JO::LeftOuter(c)
+        | JO::RightOuter(c)
+        | JO::FullOuter(c)
+        | JO::LeftSemi(c)
+        | JO::RightSemi(c)
+        | JO::LeftAnti(c)
+        | JO::RightAnti(c) => c,
+        _ => return None,
+    };
+    match constraint {
+        JC::On(e) => Some(e),
+        _ => None,
+    }
+}
+
+fn walk_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) -> Option<()> {
+    match tf {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            out.push(obj_name(name));
+            Some(())
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => walk_query(subquery, out),
+        sqlparser::ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            walk_factor(&table_with_joins.relation, out)?;
+            for j in &table_with_joins.joins {
+                walk_factor(&j.relation, out)?;
+            }
+            Some(())
+        }
+        // Table functions / UNNEST: unsupported shapes — deny.
+        _ => None,
+    }
+}
+
+fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
+    use SqlExpr::*;
+    match e {
+        Value(_) | Identifier(_) | CompoundIdentifier(_) | TypedString { .. } => Some(()),
+        IsNull(i) | IsNotNull(i) | Nested(i) | Cast { expr: i, .. } => walk_expr(i, out),
+        UnaryOp { expr, .. } => walk_expr(expr, out),
+        BinaryOp { left, right, .. } => {
+            walk_expr(left, out)?;
+            walk_expr(right, out)
+        }
+        Between {
+            expr, low, high, ..
+        } => {
+            walk_expr(expr, out)?;
+            walk_expr(low, out)?;
+            walk_expr(high, out)
+        }
+        Like { expr, pattern, .. } | ILike { expr, pattern, .. } => {
+            walk_expr(expr, out)?;
+            walk_expr(pattern, out)
+        }
+        InList { expr, list, .. } => {
+            walk_expr(expr, out)?;
+            for item in list {
+                walk_expr(item, out)?;
+            }
+            Some(())
+        }
+        InSubquery { expr, subquery, .. } => {
+            walk_expr(expr, out)?;
+            walk_query(subquery, out)
+        }
+        Subquery(q) => walk_query(q, out),
+        Exists { subquery, .. } => walk_query(subquery, out),
+        Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                walk_expr(o, out)?;
+            }
+            for w in conditions {
+                walk_expr(&w.condition, out)?;
+                walk_expr(&w.result, out)?;
+            }
+            if let Some(r) = else_result {
+                walk_expr(r, out)?;
+            }
+            Some(())
+        }
+        Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        walk_expr(inner, out)?;
+                    }
+                }
+            }
+            Some(())
+        }
+        Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            walk_expr(expr, out)?;
+            if let Some(f) = substring_from {
+                walk_expr(f, out)?;
+            }
+            if let Some(l) = substring_for {
+                walk_expr(l, out)?;
+            }
+            Some(())
+        }
+        Trim {
+            expr, trim_what, ..
+        } => {
+            walk_expr(expr, out)?;
+            if let Some(w) = trim_what {
+                walk_expr(w, out)?;
+            }
+            Some(())
+        }
+        // ANY/ALL and the long tail of rare expression shapes: deny rather
+        // than risk authorizing an unread subquery (fail closed).
+        _ => None,
     }
 }
 
@@ -7514,7 +7864,7 @@ mod tests {
     }
 
     #[test]
-    fn guid_resolved_insert_replays_identically() {
+    fn guid_resolved_sql_replays_identically() {
         let mut a = Database::in_memory().unwrap();
         run(
             &mut a,
@@ -7522,7 +7872,7 @@ mod tests {
         );
         a.execute("INSERT INTO t (v) VALUES ('it''s quoted'), ('b')")
             .unwrap();
-        let resolved = a.take_resolved_insert().expect("resolved rewrite");
+        let resolved = a.take_resolved_sql().expect("resolved rewrite");
         assert!(resolved.starts_with("INSERT INTO "));
         assert!(resolved.contains("'it''s quoted'"), "in {resolved}");
         // Replication replay: a second node applies the rewrite verbatim.
@@ -7532,14 +7882,14 @@ mod tests {
             "CREATE TABLE t (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT)",
         );
         b.execute(&resolved).unwrap();
-        assert!(b.take_resolved_insert().is_none(), "no re-generation");
+        assert!(b.take_resolved_sql().is_none(), "no re-generation");
         let ra = rows(&mut a, "SELECT id, v FROM t ORDER BY v");
         let rb = rows(&mut b, "SELECT id, v FROM t ORDER BY v");
         assert_eq!(ra.rows, rb.rows);
         // Conflict policy survives the rewrite.
         a.execute("INSERT OR IGNORE INTO t (v) VALUES ('c')")
             .unwrap();
-        let resolved = a.take_resolved_insert().unwrap();
+        let resolved = a.take_resolved_sql().unwrap();
         assert!(
             resolved.starts_with("INSERT OR IGNORE INTO "),
             "in {resolved}"
@@ -7547,7 +7897,7 @@ mod tests {
         // Statements without generation produce no rewrite.
         a.execute("INSERT INTO t (id, v) VALUES ('00000000-0000-7000-8000-000000000009', 'x')")
             .unwrap();
-        assert!(a.take_resolved_insert().is_none());
+        assert!(a.take_resolved_sql().is_none());
     }
 
     #[test]
@@ -7563,7 +7913,7 @@ mod tests {
         );
         db.execute("INSERT OR REPLACE INTO t (v) VALUES ('dup')")
             .unwrap();
-        let resolved = db.take_resolved_insert().expect("resolved rewrite");
+        let resolved = db.take_resolved_sql().expect("resolved rewrite");
         assert!(
             resolved.starts_with("INSERT OR REPLACE INTO "),
             "in {resolved}"
@@ -7601,7 +7951,7 @@ mod tests {
              ('00000000-0000-7000-8000-000000000005', 'e'), (NULL, 'g')",
         )
         .unwrap();
-        let resolved = db.take_resolved_insert().expect("resolved rewrite");
+        let resolved = db.take_resolved_sql().expect("resolved rewrite");
         // Both rows carry explicit ids in the rewrite — the NULL was filled.
         assert!(
             resolved.contains("'00000000-0000-7000-8000-000000000005'"),
@@ -9300,8 +9650,8 @@ mod tests {
         );
         run(&mut db, "INSERT INTO t (n) VALUES (7)");
         // Take the writeback before any other statement — it resets per
-        // statement (take_resolved_insert is the server's fanout hook).
-        let resolved = db.take_resolved_insert().expect("resolved insert text");
+        // statement (take_resolved_sql is the server's fanout hook).
+        let resolved = db.take_resolved_sql().expect("resolved insert text");
         let r = rows(&mut db, "SELECT id, v, n FROM t");
         let row = &r.rows[0];
         assert_eq!(&row[0].as_str().unwrap()[14..15], "7");
@@ -9316,7 +9666,7 @@ mod tests {
         assert!(resolved.contains("'d'"), "default pinned: {resolved}");
         assert!(resolved.contains(" 7, 'd'"), "values pinned: {resolved}");
         // Consuming the writeback clears it.
-        assert!(db.take_resolved_insert().is_none());
+        assert!(db.take_resolved_sql().is_none());
     }
 
     #[test]

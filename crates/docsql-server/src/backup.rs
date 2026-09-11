@@ -262,7 +262,12 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
 /// `{"action": "restore", "file": "backup-….sql"}` replays that backup
 /// through the write path (whole-cluster restore). trigger/restore answer
 /// immediately — the outcome shows up in REQ_STATUS/REQ_BACKUP.
-pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Frame) -> Frame {
+pub(crate) async fn handle_backup(
+    state: &Arc<ServerState>,
+    role: ConnRole,
+    frame: &Frame,
+    user: Option<&crate::UserAuth>,
+) -> Frame {
     let action = if frame.payload.is_empty() {
         "list".to_string()
     } else {
@@ -286,6 +291,12 @@ pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Fra
                 return Frame::new(
                     proto::RESP_ERROR,
                     crate::err_payload("read-only token; writes are not permitted"),
+                );
+            }
+            if user.is_some_and(|u| !u.grants.admin) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("backup trigger requires the admin role"),
                 );
             }
             // Same window rule as the timer and restore: a snapshot taken
@@ -330,6 +341,12 @@ pub async fn handle_backup(state: &Arc<ServerState>, role: ConnRole, frame: &Fra
                 .ok()
                 .and_then(|v| v["file"].as_str().map(String::from))
                 .unwrap_or_default();
+            if user.is_some_and(|u| !u.grants.admin) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("restore requires the admin role"),
+                );
+            }
             if !valid_backup_name(&file) {
                 return Frame::new(
                     proto::RESP_ERROR,
@@ -578,7 +595,7 @@ async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, St
     // AUTOINCREMENT counters continue from the restored max).
     let mut replayed = 0usize;
     for (i, stmt) in stmts.iter().enumerate() {
-        let resp = crate::execute_sql(state, stmt, false, false, None, true, None).await;
+        let resp = crate::execute_sql(state, stmt, false, false, None, true, None, None).await;
         if resp.frame_type == proto::RESP_ERROR {
             drop(order);
             return Err(format!(

@@ -33,7 +33,7 @@ pub mod crypto;
 pub mod pubsub;
 pub mod querylog;
 
-use docsql_core::engine::{Database, ExecOutcome, TableDigest, TxControl};
+use docsql_core::engine::{AnyStmt, Database, ExecOutcome, TableDigest, TxControl};
 use docsql_core::now_ms;
 use docsql_core::proto::{self, Frame};
 use docsql_core::value::Value;
@@ -64,6 +64,14 @@ pub struct ServerState {
     /// Restore replay progress (applied/total), published locklessly so
     /// the replay loop never takes the backup mutex under `write_order`.
     pub restore_progress: std::sync::Arc<backup::RestoreProgress>,
+    /// Bumped whenever user/role state changes (CREATE USER / GRANT / …):
+    /// user connections re-resolve their grants when they notice a new
+    /// epoch, so revocations take effect on the next statement.
+    pub grants_epoch: std::sync::atomic::AtomicU64,
+    /// True once at least one database user exists — token-less anonymous
+    /// access closes from then on (legacy open mode covers user-less
+    /// deployments only).
+    pub has_users: std::sync::atomic::AtomicBool,
     /// Auth-failure lockout (identity-authentication failure handling):
     /// source IP -> failure timestamps. At AUTH_LOCK_THRESHOLD failures
     /// inside AUTH_LOCK_WINDOW the source is locked out for
@@ -243,6 +251,14 @@ pub enum ConnRole {
     Peer,
 }
 
+/// A database-user identity bound to one connection (REQ_AUTH_USER), with
+/// its resolved privileges; refreshed by the connection loop whenever the
+/// server-wide grants epoch moves.
+pub(crate) struct UserAuth {
+    name: String,
+    grants: docsql_core::useradmin::UserGrants,
+}
+
 pub struct ServerConfig {
     pub db_path: PathBuf,
     pub listen: String,
@@ -353,6 +369,10 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         dir.push("backups");
         dir
     });
+    // User tables are created lazily by the first user-management statement;
+    // a user-less node stays catalog-clean (digests/snapshots consistent
+    // with pre-upgrade peers).
+    let has_users0 = db.any_user_exists().unwrap_or(false);
     let state = Arc::new(ServerState {
         db: Mutex::new(db),
         auth_token: cfg.auth_token,
@@ -389,6 +409,8 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         backup_dir,
         backup: Mutex::new(backup::BackupShared::default()),
         restore_progress: std::sync::Arc::new(backup::RestoreProgress::default()),
+        grants_epoch: std::sync::atomic::AtomicU64::new(0),
+        has_users: std::sync::atomic::AtomicBool::new(has_users0),
         replay_failures: std::sync::atomic::AtomicU64::new(0),
         db_path: cfg.db_path,
         started: std::time::Instant::now(),
@@ -564,6 +586,120 @@ impl Conn {
     }
 }
 
+/// REQ_AUTH_USER: verify a username/password pair and resolve the user's
+/// privileges. Returns (response frame, identity on success). The PBKDF2
+/// derivation runs on the blocking pool; the stored credential and the
+/// grants are read under the engine lock on either side of it. Failure
+/// accounting (per-source lockout + audit trail) mirrors token auth, and a
+/// missing user burns the same derivation so timing reveals nothing.
+async fn user_login_frame(
+    state: &Arc<ServerState>,
+    source_ip: &str,
+    payload: &[u8],
+) -> (Frame, Option<UserAuth>) {
+    let bad = || Frame::new(proto::RESP_ERROR, err_payload("bad username or password"));
+    let parsed: std::result::Result<(String, String), String> = (|| {
+        let v: serde_json::Value =
+            serde_json::from_slice(payload).map_err(|e| format!("user auth: bad payload: {e}"))?;
+        let name = v["user"]
+            .as_str()
+            .ok_or("user auth: expected {\"user\",\"password\"}")?;
+        let pw = v["password"]
+            .as_str()
+            .ok_or("user auth: expected {\"user\",\"password\"}")?;
+        Ok((name.trim().to_lowercase(), pw.to_string()))
+    })();
+    let (name, pw) = match parsed {
+        Ok(c) => c,
+        Err(m) => return (Frame::new(proto::RESP_ERROR, err_payload(&m)), None),
+    };
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    {
+        return (bad(), None);
+    }
+    let stored = {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.user_stored_pw(&name)
+    };
+    let ok = tokio::task::spawn_blocking(move || match stored {
+        Some(s) => docsql_core::kdf::StoredPw::parse(&s)
+            .map(|p| p.verify(&pw))
+            .unwrap_or(false),
+        None => {
+            let decoy = docsql_core::kdf::hash_password("x", &[0u8; 16]);
+            if let Some(p) = docsql_core::kdf::StoredPw::parse(&decoy) {
+                let _ = p.verify(&pw);
+            }
+            false
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !ok {
+        if state.auth_lock_threshold > 0 {
+            let mut failures = state.auth_failures.lock().await;
+            let now = std::time::Instant::now();
+            failures.retain(|_, list| {
+                list.retain(|t| now.duration_since(*t) < AUTH_LOCK_WINDOW);
+                !list.is_empty()
+            });
+            let list = failures.entry(source_ip.to_string()).or_default();
+            list.push(now);
+            if list.len() as u32 == state.auth_lock_threshold {
+                querylog::sync_event(
+                    &state.sync_log,
+                    "auth",
+                    source_ip,
+                    None,
+                    false,
+                    Some("lockout: repeated auth failures".into()),
+                );
+            }
+        }
+        querylog::sync_event(
+            &state.sync_log,
+            "auth",
+            source_ip,
+            None,
+            false,
+            Some("user login failed".into()),
+        );
+        return (bad(), None);
+    }
+    let grants = {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        docsql_core::useradmin::resolve_grants(&mut db, &name)
+            .ok()
+            .flatten()
+    };
+    match grants {
+        Some(g) => {
+            state.auth_failures.lock().await.remove(source_ip);
+            querylog::sync_event(
+                &state.sync_log,
+                "auth",
+                source_ip,
+                None,
+                true,
+                Some(format!("user {name} logged in")),
+            );
+            (
+                Frame::new(
+                    proto::RESP_AFFECTED,
+                    format!("ok(user:{name})").into_bytes(),
+                ),
+                Some(UserAuth { name, grants: g }),
+            )
+        }
+        // Raced with DROP USER between verify and resolve.
+        None => (bad(), None),
+    }
+}
+
 pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
     let peer = stream
         .peer_addr()
@@ -619,6 +755,17 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     } else {
         ConnRole::Unauthed
     };
+    // Token authentication state (distinguishes a token-authed Client from
+    // the legacy anonymous Client) and the REQ_AUTH_USER identity, if any.
+    let mut token_authed = false;
+    let mut user: Option<UserAuth> = None;
+    let mut user_epoch = 0u64;
+    // Legacy anonymous access is judged at connection start: connections
+    // that were legitimate when they opened (user-less node) keep working
+    // — the operator bootstrap (CREATE USER + GRANT over one session)
+    // must not lock itself out mid-flight — while NEW anonymous
+    // connections close once users exist.
+    let anon_open = !state.has_users.load(std::sync::atomic::Ordering::SeqCst);
     // Auth-failure lockout: a source past the threshold is rejected unread
     // until the lockout elapses (identity-authentication failure handling).
     let source_ip = peer.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&peer);
@@ -652,7 +799,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                         })
                         .unwrap_or(false)
                 };
-                if locked && frame.frame_type == proto::REQ_AUTH {
+                if locked && matches!(frame.frame_type, proto::REQ_AUTH | proto::REQ_AUTH_USER) {
                     querylog::sync_event(
                         &state.sync_log,
                         "auth",
@@ -749,6 +896,34 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     continue;
                 }
             }
+            // Once at least one database user exists, legacy anonymous
+            // (token-less) access closes: data operations then require the
+            // client token (admin) or a REQ_AUTH_USER login.
+            if role == ConnRole::Client
+                && !token_authed
+                && user.is_none()
+                && !anon_open
+                && frame.flags & FLAG_REPLICATION == 0
+                && matches!(
+                    frame.frame_type,
+                    proto::REQ_SQL
+                        | proto::REQ_PUBLISH
+                        | proto::REQ_PUBSUB
+                        | proto::REQ_PROMOTE
+                        | proto::REQ_BACKUP
+                )
+            {
+                let _ = tx
+                    .send(Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload(
+                            "authentication required: this node has user accounts \
+                             (use the client token or a username/password login)",
+                        ),
+                    ))
+                    .await;
+                continue;
+            }
             // None = the handler already sent everything (subscribe
             // confirmation + replay) straight through the writer.
             let resp = match frame.frame_type {
@@ -779,6 +954,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     };
                     if cluster_match {
                         role = ConnRole::Peer;
+                        token_authed = true;
                         state.auth_failures.lock().await.remove(source_ip);
                         audit(true, "cluster token accepted", &state);
                         Some(Frame::new(proto::RESP_AFFECTED, b"ok".to_vec()))
@@ -793,6 +969,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             state.auth_token.is_none() && state.read_token.is_none();
                         if client_match || auth_disabled {
                             role = ConnRole::Client;
+                            if client_match {
+                                token_authed = true;
+                            }
                             state.auth_failures.lock().await.remove(source_ip);
                             if state.auth_token.is_some() {
                                 audit(true, "client token accepted", &state);
@@ -800,6 +979,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             Some(Frame::new(proto::RESP_AFFECTED, b"ok".to_vec()))
                         } else if read_match {
                             role = ConnRole::ReadOnly;
+                            token_authed = true;
                             state.auth_failures.lock().await.remove(source_ip);
                             audit(true, "read token accepted", &state);
                             Some(Frame::new(proto::RESP_AFFECTED, b"ok(read-only)".to_vec()))
@@ -825,16 +1005,44 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                         }
                     }
                 }
+                proto::REQ_AUTH_USER if role != ConnRole::Peer => {
+                    // Username/password login (JSON {"user","password"}):
+                    // binds a user identity with resolved privileges to
+                    // this connection. Peer connections never authenticate
+                    // as users.
+                    if token_authed || user.is_some() {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("already authenticated; reconnect to switch identity"),
+                        ))
+                    } else {
+                        let (f, u) = user_login_frame(&state, source_ip, &frame.payload).await;
+                        if let Some(u) = u {
+                            role = ConnRole::Client;
+                            user_epoch =
+                                state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                            user = Some(u);
+                        }
+                        Some(f)
+                    }
+                }
                 proto::REQ_PROMOTE if authed => {
-                    // Failover: leave replica mode. Mirrors the former KV
-                    // PROMOTE command — clears read-only and detaches the
-                    // replication upstream so this node owns its writes.
-                    state
-                        .read_only
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    *state.replicate_to.lock().await = None;
-                    querylog::sync_event(&state.sync_log, "promote", "", None, true, None);
-                    Some(Frame::new(proto::RESP_AFFECTED, b"promoted".to_vec()))
+                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("PROMOTE requires the admin role"),
+                        ))
+                    } else {
+                        // Failover: leave replica mode. Mirrors the former KV
+                        // PROMOTE command — clears read-only and detaches the
+                        // replication upstream so this node owns its writes.
+                        state
+                            .read_only
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        *state.replicate_to.lock().await = None;
+                        querylog::sync_event(&state.sync_log, "promote", "", None, true, None);
+                        Some(Frame::new(proto::RESP_AFFECTED, b"promoted".to_vec()))
+                    }
                 }
                 proto::REQ_STATUS if authed => {
                     // Read-only node report for cluster monitoring; not an SQL
@@ -872,6 +1080,25 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     ))
                 }
                 proto::REQ_SQL if authed => {
+                    // Refresh a user connection's grants when user/role
+                    // state changed since its last statement (revocations
+                    // take effect immediately; a dropped user loses access
+                    // on the next statement).
+                    if user.is_some()
+                        && state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst)
+                            != user_epoch
+                    {
+                        let name = user.as_ref().expect("checked just above").name.clone();
+                        let refreshed = {
+                            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+                            docsql_core::useradmin::resolve_grants(&mut db, &name)
+                                .ok()
+                                .flatten()
+                                .map(|g| UserAuth { name, grants: g })
+                        };
+                        user = refreshed;
+                        user_epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    }
                     let started = std::time::Instant::now();
                     // Full statement text: the query log truncates its own
                     // copy (querylog::record), and cutting here would
@@ -925,6 +1152,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         if is_replication { None } else { Some(conn_id) },
                                         false,
                                         None,
+                                        if is_replication { None } else { user.as_ref() },
                                     )
                                     .await
                                 }
@@ -982,6 +1210,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         None,
                                         false,
                                         Some((&node_id, seq)),
+                                        None,
                                     )
                                     .await;
                                     // Same audit trail as plain REQ_SQL applies.
@@ -1007,7 +1236,20 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     handle_catchup(&state, &frame, &tx).await;
                     None
                 }
-                proto::REQ_PUBLISH if authed => Some(handle_publish(&state, &frame).await),
+                proto::REQ_PUBLISH if authed => {
+                    // PUBLISH is a durable write: readwrite or admin.
+                    if user
+                        .as_ref()
+                        .is_some_and(|u| !u.grants.admin && !u.grants.readwrite)
+                    {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("PUBLISH requires the readwrite or admin role"),
+                        ))
+                    } else {
+                        Some(handle_publish(&state, &frame).await)
+                    }
+                }
                 proto::REQ_SUBSCRIBE if authed => {
                     handle_subscribe(&state, conn_id, &frame, &tx, pubsub::SubKind::Channel).await;
                     None
@@ -1022,9 +1264,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 proto::REQ_PUNSUBSCRIBE if authed => Some(
                     handle_unsubscribe(&state, conn_id, &frame, pubsub::SubKind::Pattern).await,
                 ),
-                proto::REQ_PUBSUB if authed => Some(handle_pubsub_cmd(&state, &frame).await),
+                proto::REQ_PUBSUB if authed => {
+                    Some(handle_pubsub_cmd(&state, &frame, user.as_ref()).await)
+                }
                 proto::REQ_BACKUP if authed => {
-                    Some(backup::handle_backup(&state, role, &frame).await)
+                    Some(backup::handle_backup(&state, role, &frame, user.as_ref()).await)
                 }
                 // Cluster-join frames are node-internal: they always ride
                 // FLAG_REPLICATION (peer connections under cluster-token
@@ -1137,7 +1381,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
     for t in &db.catalog() {
         // The pubsub backing table and the catch-up journal/positions are
         // system storage, not user objects.
-        if docsql_core::engine::is_system_table(&t.name) {
+        if docsql_core::engine::is_internal_table(&t.name) {
             continue;
         }
         user_tables += 1;
@@ -1202,6 +1446,80 @@ pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: toki
     }
 }
 
+/// Tables every authenticated connection may read (engine system tables
+/// and compatibility views mirror the read-only token's reach).
+fn readable_by_all(t: &str) -> bool {
+    docsql_core::engine::is_system_table(t)
+        || matches!(
+            t,
+            "sqlite_master" | "sqlite_temporal_master" | "information_schema"
+        )
+        || t.starts_with('@')
+}
+
+/// Per-statement privilege check for username/password connections.
+/// Token/anonymous-legacy connections never reach here. Fails closed: a
+/// query shape the read-target walker cannot fully classify is denied.
+fn authorize_statement(
+    stmt: &AnyStmt,
+    tx_kind: &TxControl,
+    is_write: bool,
+    g: &docsql_core::useradmin::UserGrants,
+) -> std::result::Result<(), String> {
+    use docsql_core::useradmin::{PRIV_DELETE, PRIV_INSERT, PRIV_UPDATE};
+    if g.admin {
+        return Ok(());
+    }
+    match stmt {
+        AnyStmt::UserAdmin(_) => Err("user and role management requires the admin role".into()),
+        AnyStmt::Sql(s) => {
+            // Transaction control itself is not privileged; the buffered
+            // statements were each authorized when they arrived.
+            if !matches!(tx_kind, TxControl::None) {
+                return Ok(());
+            }
+            use sqlparser::ast::Statement as S;
+            if !is_write {
+                let Some(targets) = Database::stmt_read_targets(s) else {
+                    return Err(
+                        "this statement shape cannot be authorized for user connections".into(),
+                    );
+                };
+                for t in &targets {
+                    if docsql_core::useradmin::is_user_table(t) {
+                        return Err("user/role data is visible to the admin role only".into());
+                    }
+                    if readable_by_all(t) {
+                        continue;
+                    }
+                    if !g.may_select(t) {
+                        return Err(format!(
+                            "SELECT on table {t} requires the readonly/readwrite role \
+                             or a table grant"
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            let (bit, label) = match s.as_ref() {
+                S::Insert(_) => (PRIV_INSERT, "INSERT"),
+                S::Update(_) => (PRIV_UPDATE, "UPDATE"),
+                S::Delete(_) => (PRIV_DELETE, "DELETE"),
+                S::Truncate(_) => (PRIV_DELETE, "TRUNCATE"),
+                _ => return Err("DDL and administrative statements require the admin role".into()),
+            };
+            for t in Database::stmt_write_targets(s) {
+                if !g.may_dml(&t, bit) {
+                    return Err(format!(
+                        "{label} on table {t} requires the readwrite role or a table grant"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Execute one SQL statement. `allow_system_table` marks the rewritten
 /// `docsql_pubsub` view; system tables are otherwise blocked for anything
 /// that could mutate them, while read-only queries may reference them (the
@@ -1215,6 +1533,7 @@ pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: toki
 /// advanced **in the same fused write unit** — one WAL fsync lands the
 /// write and its bookkeeping together, so a crash can no longer leave the
 /// position lagging the applied data (the old two-commit window).
+#[allow(clippy::too_many_arguments)]
 async fn execute_sql(
     state: &Arc<ServerState>,
     sql: &str,
@@ -1223,6 +1542,7 @@ async fn execute_sql(
     conn: Option<u64>,
     order_held: bool,
     seq_pos: Option<(&str, u64)>,
+    user: Option<&UserAuth>,
 ) -> Frame {
     // One parse for the whole round-trip: the AST executes at the bottom,
     // the classification routes the request here (parse errors surface with
@@ -1234,6 +1554,12 @@ async fn execute_sql(
     let p = parsed.as_ref().expect("parsed just above");
     let is_write = p.is_write;
     let tx_kind = p.tx.clone();
+    let is_user_admin_stmt = matches!(p.stmt, AnyStmt::UserAdmin(_));
+    let user_count_changed = matches!(
+        p.stmt,
+        AnyStmt::UserAdmin(docsql_core::useradmin::UserAdminStmt::CreateUser { .. })
+            | AnyStmt::UserAdmin(docsql_core::useradmin::UserAdminStmt::DropUser { .. })
+    );
     // System tables are shielded from anything that could mutate them.
     // The check runs on the classified AST twice over: write-vs-read comes
     // from the classifier, and the table comparison uses the statement's
@@ -1242,10 +1568,19 @@ async fn execute_sql(
     // literal or comment. Read-only queries go through to the console's
     // read-only 系统表 branch.
     if !allow_system_table && is_write {
-        let targets = Database::stmt_write_targets(&p.stmt);
-        let hit = targets
-            .iter()
-            .find(|t| docsql_core::engine::is_system_table(t));
+        let targets = match &p.stmt {
+            AnyStmt::Sql(stmt) => Database::stmt_write_targets(stmt),
+            // The user-management family IS the sanctioned path into the
+            // reserved user/role tables; what the gate stops is plain DML.
+            AnyStmt::UserAdmin(_) => vec![],
+        };
+        // The restore path (conn None, not replication) replays dumps that
+        // drop and rebuild the reserved user tables wholesale.
+        let internal_ok = conn.is_none() && !is_replication;
+        let hit = targets.iter().find(|t| {
+            docsql_core::engine::is_system_table(t)
+                || (docsql_core::engine::is_internal_table(t) && !internal_ok)
+        });
         if let Some(target) = hit {
             return Frame::new(
                 proto::RESP_ERROR,
@@ -1254,6 +1589,13 @@ async fn execute_sql(
                      SELECT is allowed (docsql_pubsub view / PUBSUB TRIM for _pubsub_messages)"
                 )),
             );
+        }
+    }
+    // Per-user authorization (token/anonymous-legacy connections carry no
+    // user identity and are not restricted here).
+    if let Some(u) = user {
+        if let Err(denial) = authorize_statement(&p.stmt, &tx_kind, is_write, &u.grants) {
+            return Frame::new(proto::RESP_ERROR, err_payload(&denial));
         }
     }
     // Replica read-only gate (replication-internal frames pass through).
@@ -1387,7 +1729,7 @@ async fn execute_sql(
                     Some(p) => unit.execute_parsed(p),
                     None => unit.execute(sql),
                 };
-                let resolved = unit.take_resolved_insert();
+                let resolved = unit.take_resolved_sql();
                 let mut seq = None;
                 if out.is_ok() {
                     // Auto-generated GUID values are random: peers cannot
@@ -1409,7 +1751,7 @@ async fn execute_sql(
                     // failed attempt left no state behind) and retry.
                     None => db.execute(sql),
                 };
-                let resolved = db.take_resolved_insert();
+                let resolved = db.take_resolved_sql();
                 (out, resolved, None, false)
             };
             // Capture inside the same lock: another connection must not be
@@ -1440,6 +1782,26 @@ async fn execute_sql(
         }
         break (out, in_tx, guard, resolved, seq);
     };
+    // Successful user-management statements move the grants epoch (user
+    // connections re-resolve) and may flip the has-users flag that closes
+    // anonymous access. Runs on every node that applies the statement —
+    // including replication/restore applies — so the whole mesh converges.
+    if outcome.is_ok() && is_user_admin_stmt {
+        state
+            .grants_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if user_count_changed {
+            let has = state
+                .db
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .any_user_exists()
+                .unwrap_or(false);
+            state
+                .has_users
+                .store(has, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     // Replication timing follows engine transaction state: writes inside an
     // open transaction buffer until COMMIT (ROLLBACK discards them), so peers
     // never observe writes this node later undoes. COMMIT/EXEC drain the
@@ -2083,7 +2445,11 @@ fn parse_name_array(payload: &[u8]) -> Result<Vec<String>, String> {
 
 /// REQ_PUBSUB: channels / numsub / numpat introspection (local registry)
 /// and trim (replicated write).
-async fn handle_pubsub_cmd(state: &Arc<ServerState>, frame: &Frame) -> Frame {
+async fn handle_pubsub_cmd(
+    state: &Arc<ServerState>,
+    frame: &Frame,
+    user: Option<&UserAuth>,
+) -> Frame {
     let is_replication = frame.flags & FLAG_REPLICATION != 0;
     let v: serde_json::Value = match serde_json::from_slice(&frame.payload) {
         Ok(v) => v,
@@ -2126,6 +2492,13 @@ async fn handle_pubsub_cmd(state: &Arc<ServerState>, frame: &Frame) -> Frame {
             )
         }
         Some("trim") => {
+            // TRIM deletes persisted messages: readwrite or admin.
+            if user.is_some_and(|u| !u.grants.admin && !u.grants.readwrite) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload("PUBSUB TRIM requires the readwrite or admin role"),
+                );
+            }
             let (Some(channel), Some(keep)) = (v["channel"].as_str(), v["keep"].as_i64()) else {
                 return Frame::new(
                     proto::RESP_ERROR,
@@ -2282,7 +2655,7 @@ const SYNC_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(
 fn has_user_tables(db: &Database) -> bool {
     db.catalog()
         .iter()
-        .any(|t| !docsql_core::engine::is_system_table(&t.name))
+        .any(|t| !docsql_core::engine::is_internal_table(&t.name))
 }
 
 /// Why a REQ_HOLD did not grant. `Unreachable` means the peer could not be
@@ -2489,7 +2862,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
         let db = state.db.lock().unwrap_or_else(|p| p.into_inner());
         db.catalog()
             .iter()
-            .filter(|t| !docsql_core::engine::is_system_table(&t.name))
+            .filter(|t| !docsql_core::engine::is_internal_table(&t.name))
             .count() as u64
     };
     // Register the joiner still under the write path: every write before
@@ -2842,6 +3215,20 @@ async fn finish_snapshot_adopt<'a>(
     drain_sync_queue(state, true).await;
     drop(order);
     seed_fresh_positions(state).await;
+    // The snapshot replayed through the engine batch path (not execute_sql),
+    // so the epoch/has-users bookkeeping needs an explicit nudge: user
+    // connections on THIS node must re-resolve, and if the snapshot carried
+    // the first user, anonymous access closes now.
+    state
+        .grants_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let has = {
+        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        db.any_user_exists().unwrap_or(false)
+    };
+    state
+        .has_users
+        .store(has, std::sync::atomic::Ordering::SeqCst);
     eprintln!("{label} from {peer} complete");
     querylog::sync_event(
         &state.sync_log,
@@ -2927,7 +3314,7 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
             .origin
             .as_ref()
             .map(|(origin, seq)| (origin.as_str(), *seq));
-        let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos).await;
+        let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos, None).await;
         if resp.frame_type == proto::RESP_ERROR {
             let msg = String::from_utf8_lossy(&resp.payload).into_owned();
             eprintln!("sync: queued replay failed: {msg}");
@@ -3868,7 +4255,8 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
             match f.frame_type {
                 proto::RESP_CATCHUP => {
                     for (_, sql) in decode_catchup_entries(&f.payload)? {
-                        let resp = execute_sql(state, &sql, false, true, None, false, None).await;
+                        let resp =
+                            execute_sql(state, &sql, false, true, None, false, None, None).await;
                         if resp.frame_type == proto::RESP_ERROR {
                             return Err(std::io::Error::other(format!(
                                 "catch-up replay failed: {}",

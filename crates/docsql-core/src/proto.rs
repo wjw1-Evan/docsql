@@ -117,6 +117,10 @@ pub const REQ_CATCHUP: u16 = 0x0016;
 /// rejected for read-only connections. All respond RESP_BACKUP (list) or
 /// RESP_AFFECTED (accepted trigger/restore); errors ride RESP_ERROR.
 pub const REQ_BACKUP: u16 = 0x0017;
+/// Username/password login (distinct from token REQ_AUTH). Payload is
+/// JSON `{"user","password"}`; success answers RESP_AFFECTED and the
+/// connection then carries the user's resolved privileges.
+pub const REQ_AUTH_USER: u16 = 0x0018;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;

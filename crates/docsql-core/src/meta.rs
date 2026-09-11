@@ -5,7 +5,7 @@
 //! builds locally — including index definitions, observed columns, and
 //! storage counters.
 
-use crate::engine::{is_system_table, Database, ExecOutcome};
+use crate::engine::{is_internal_table, Database, ExecOutcome};
 use crate::value::{Object, Value};
 use std::path::Path;
 use std::time::Instant;
@@ -42,7 +42,7 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
             }
             _ => 0,
         };
-        if is_system_table(&t.name) {
+        if is_internal_table(&t.name) {
             system_tables.push(Value::Object(Object::from([
                 ("name".into(), str(&t.name)),
                 ("row_count".into(), int(row_count)),

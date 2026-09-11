@@ -64,7 +64,7 @@ INSERT INTO orders (id, note)
 cargo build --workspace
 cargo test --workspace          # Rust 全量测试(开发门禁;本地 Docker 构建亦内置)
 cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二进制)
-./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 76 项 + 单节点 34 项)
+./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 81 项 + 单节点 34 项)
 ```
 
 ## DocSQL Studio(Web 管理控制台)
@@ -106,9 +106,9 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 ## 测试
 
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
-- Docker:compose 双 profile 部署测试全绿——多节点 76 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
-- .NET:xUnit(ADO.NET Client 59 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型与长语句契约)
-- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(76 + 34 项)
+- Docker:compose 双 profile 部署测试全绿——多节点 81 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
+- .NET:xUnit(ADO.NET Client 62 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型与长语句契约)
+- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(81 + 34 项)
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)
 
@@ -176,9 +176,40 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 
 > 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)互不相同,两套拓扑可同时运行、互不共享数据。
 
-部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 76 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub、自动备份与恢复演练)。
+部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 81 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub、自动备份与恢复演练)。
 
 > 注:镜像基于 mcr.microsoft.com/azurelinux(本环境 docker.io 不可达)。
+
+## 数据库用户与角色(SQL 级访问控制)
+
+除 token 认证外,DocSQL 支持在数据库内管理用户、角色与表级权限——用户定义随集群复制(在任一节点创建,全网格生效),并随备份/快照一致传播:
+
+```sql
+-- 管理员(持有 DOCSQL_TOKEN 的连接,或尚未创建任何用户时的开放连接)建号授权:
+CREATE USER analyst PASSWORD '至少8位密码';
+ALTER USER analyst PASSWORD '新密码';
+GRANT readonly   TO analyst;            -- 内置角色:只读(可 SELECT 全部业务表)
+GRANT readwrite  TO app_service;        -- 内置角色:读写(DML + PUBLISH/TRIM,无 DDL)
+GRANT admin      TO ops_backup;         -- 内置角色:完全权限(DDL、用户管理、备份/恢复、PROMOTE)
+
+-- 自定义角色 + 表级权限:
+CREATE ROLE reporting;
+GRANT SELECT, UPDATE ON orders TO reporting;   -- SELECT/INSERT/UPDATE/DELETE/ALL
+GRANT reporting TO analyst;
+REVOKE UPDATE ON orders FROM reporting;
+REVOKE reporting FROM analyst;                 -- 撤销立即生效(同连接下一条语句起)
+DROP USER analyst;                             -- 级联清理其授权与角色成员关系
+```
+
+**权限矩阵**:admin=全部;readwrite=全部表 DML + `PUBLISH`/`PUBSUB TRIM`;readonly=全部表 `SELECT`;自定义角色=被授予的表级 DML 位。DDL(`CREATE/DROP/ALTER TABLE`、`CREATE INDEX`)与用户管理、备份触发/恢复、`PROMOTE` 仅 admin。子查询同样受读权限约束,无法分类的语句形状按拒绝处理(_fail-closed_)。
+
+**登录方式**:
+
+- 协议帧 `REQ_AUTH_USER`(JSON `{"user","password"}`);密码以盐化 PBKDF2-HMAC-SHA256(60000 轮)存储,校验常数时间;未知用户与错误密码返回同一错误并执行等价计算(防用户名枚举);失败同样按来源 IP 锁定(10 次/60 秒)。
+- ADO.NET 连接串:`host=...;port=...;user=analyst;password=...`(与 `token=` 二选一,同时给出时用户登录优先);EF Core `UseDocsql("...")` 同一连接串。
+- CLI:`docsql-cli connect 127.0.0.1:7600 --user analyst`(密码从 `DOCSQL_PASSWORD` 或交互提示读取,不走命令行参数)。
+
+**兼容与过渡**:`DOCSQL_TOKEN` 恒为管理员身份(存量部署零变化);未配置 token 且从未创建用户的节点维持开放访问(开发模式);**一旦存在任一用户,新建的匿名连接即被拒绝**(判定取连接建立时刻——正在建号授权的会话不会被自己锁死)。用户/角色数据存于保留名内部表(`docsql_users` 等,复制但不可直接读写),明文密码只在执行节点出现,日志、复制流、备份里均为 PBKDF2 哈希形式。
 
 ## 安全(对照等保 2.0 / GB/T 20273 数据库管理系统安全技术要求)
 
@@ -186,10 +217,10 @@ docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三�
 
 | 控制项 | DocSQL 实现 |
 |---|---|
-| 身份标识与鉴别 | 协议层 token 认证(REQ_AUTH,常数时间比较防时序侧信道);三种凭据:`DOCSQL_TOKEN`(客户端)、`DOCSQL_READ_TOKEN`(只读客户端)、`DOCSQL_CLUSTER_TOKEN`(节点间,`FLAG_REPLICATION` 复制帧仅接受节点身份);Web 控制台账号门:首次使用强制设置用户名/密码(盐化 PBKDF2-HMAC-SHA256 存储,常数时间校验),HttpOnly 会话 Cookie,`DOCSQL_TOKEN` 可作为程序化旁路 |
+| 身份标识与鉴别 | 协议层 token 认证(REQ_AUTH,常数时间比较防时序侧信道);三种凭据:`DOCSQL_TOKEN`(客户端)、`DOCSQL_READ_TOKEN`(只读客户端)、`DOCSQL_CLUSTER_TOKEN`(节点间,`FLAG_REPLICATION` 复制帧仅接受节点身份);**数据库用户**(REQ_AUTH_USER,盐化 PBKDF2-HMAC-SHA256 存储,常数时间校验,未知用户等价计算防枚举),角色与表级权限随集群复制;Web 控制台账号门:首次使用强制设置用户名/密码,HttpOnly 会话 Cookie,`DOCSQL_TOKEN` 可作为程序化旁路 |
 | 登录失败处理 | 同一来源 IP 在 60 秒窗口内认证失败达 10 次(阈值可按部署调严)即锁定 60 秒,期间任何 token(含正确值)均被拒绝;锁定事件写入审计日志;Web 控制台登录门同策略(10 次/60 秒窗口,锁定 60 秒,按来源 IP) |
 | 口令/凭据复杂度 | 服务器启动时校验所有已配置凭据:长度不足 8 或单一字符重复即拒绝启动(进程退出码 2) |
-| 访问控制(最小权限) | `DOCSQL_READ_TOKEN` 只读身份:可查询、可订阅,一切持久化写(SQL 写/`PUBLISH`/`PUBSUB TRIM`/`PROMOTE`)在协议层拒绝;副本模式 `DOCSQL_READ_ONLY=1` 整节点只读;Web 控制台独立 token 门禁 |
+| 访问控制(最小权限) | `DOCSQL_READ_TOKEN` 只读身份:可查询、可订阅,一切持久化写在协议层拒绝;**数据库角色**:内置 `admin`/`readwrite`/`readonly` + 自定义角色表级 DML 授权(GRANT/REVOKE 即时生效,DDL 与管理操作仅 admin,读目标含子查询 fail-closed);存在任一用户后匿名连接关闭;副本模式 `DOCSQL_READ_ONLY=1` 整节点只读;Web 控制台独立 token 门禁 |
 | 安全审计 | 语句审计(`docsql_log` 环形缓冲,含语句文本/耗时/影响行数/是否复制/错误)、认证事件审计(成功与失败均记录,来源 IP + 授予身份/失败原因,web 控制台日志页可见)、`DOCSQL_LOG_FILE` 可同步落 JSONL 文件留存 |
 | 资源控制 | `DOCSQL_MAX_CONN` 并发连接数上限(超限立即拒绝不排队);`DOCSQL_IDLE_TIMEOUT` 空闲会话超时(服务端主动断开,订阅客户端需定期 PING 保活);单帧 64MB 上限;对端 IO 预算(连接 3s/读写 10s) |
 | 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);绑定非回环地址且未配置 `DOCSQL_KEY` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1` |

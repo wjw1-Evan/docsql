@@ -421,6 +421,36 @@ else
   bad "node-d did not come back after restart"
 fi
 
+echo "== 13. database users and roles: created on a, usable on b, enforced =="
+# 13.1 在 a 上建号授权(dev compose 未配 client token,开放模式即管理员;
+#      用户的创建即关闭新的匿名连接,但建号会话判定于连接建立时,不受影响)。
+UPW="deploy-pw-1300"
+# 建号与授权必须在同一会话(连接建立时无用户=开放;新匿名连接随用户创建而关闭)。
+out=$(sqltx "$A" "CREATE USER reporter PASSWORD '$UPW';" "GRANT readonly TO reporter;")
+echo "$out" | grep -qiE "error" && bad "create user + grant failed: $out" || ok "user created and granted readonly on a"
+
+# 13.2 用户随集群复制:b 上同名密码可登录(CLI --user,密码走 DOCSQL_PASSWORD)。
+b_ok=""
+for _ in $(seq 1 40); do
+  out=$(printf "SELECT COUNT(id) FROM nodes;\nexit;\n" | docker exec -e DOCSQL_PASSWORD="$UPW" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>/dev/null)
+  echo "$out" | grep -qE "^[[:space:]]*[0-9]+[[:space:]]*$" && { b_ok="$out"; break; }
+  sleep 0.5
+done
+[ -n "$b_ok" ] && ok "user replicated to b and can log in" || bad "user login on b never worked"
+
+# 13.3 角色约束在 b 生效:readonly 用户的写被拒。
+out=$(printf "INSERT INTO nodes VALUES (99, 'nope');\nexit;\n" | docker exec -e DOCSQL_PASSWORD="$UPW" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>/dev/null)
+echo "$out" | grep -q "requires" && ok "readonly write rejected on b" || bad "readonly write was NOT rejected on b: $out"
+
+# 13.4 匿名连接在存在用户后关闭(新连接)。
+out=$(sql "$B" "SELECT 1;")
+echo "$out" | grep -q "authentication required" && ok "anonymous access closed on b" || bad "anonymous access still open on b: $out"
+
+# 13.5 错误密码被拒:CLI 在认证阶段即失败退出(stderr 被丢弃),成功路径的
+#      查询输出(数字行)绝不能出现。
+out=$(printf "SELECT 1;\nexit;\n" | docker exec -e DOCSQL_PASSWORD="wrong-password" -i "$(ctr_of "$B")" docsql-cli connect "$B" --user reporter 2>/dev/null)
+echo "$out" | grep -qE "^[[:space:]]*1[[:space:]]*$" && bad "wrong password was ACCEPTED on b: $out" || ok "wrong password rejected on b"
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

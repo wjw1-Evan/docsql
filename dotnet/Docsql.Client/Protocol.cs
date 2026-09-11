@@ -13,6 +13,8 @@ public enum FrameType : ushort
     ReqSql = 0x0001,
     /// <summary>会话认证:载荷为 token 原始字节。</summary>
     ReqAuth = 0x0002,
+    /// <summary>用户名/密码登录(REQ_AUTH_USER):载荷 JSON {"user","password"}。</summary>
+    ReqAuthUser = 0x0018,
     ReqPrepare = 0x0003,
     ReqExecute = 0x0004,
     ReqCloseStmt = 0x0005,

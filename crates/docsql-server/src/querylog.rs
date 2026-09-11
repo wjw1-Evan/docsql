@@ -144,10 +144,13 @@ pub fn record(
     } else {
         None
     };
+    // Plaintext passwords (CREATE/ALTER USER) must never land in the audit
+    // trail; pre-hashed replays are left as-is.
+    let redacted = docsql_core::useradmin::redact_sql(sql);
     state.query_log.push(LogEntry {
         ts_ms: now_ms(),
         peer: peer.to_string(),
-        sql: sql.chars().take(512).collect(),
+        sql: redacted.chars().take(512).collect(),
         ms,
         affected,
         error,

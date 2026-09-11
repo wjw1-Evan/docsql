@@ -3,29 +3,121 @@
 //! batches; this module re-splits a batch into per-statement texts on the
 //! sending side (see the web console's remote node switching).
 
-use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+
+/// Quote/comment-aware split on top-level semicolons: string literals,
+/// quoted identifiers, `--` line comments and `/* */` block comments never
+/// split. Needed because user-management statements are hand-parsed and
+/// cannot ride the sqlparser AST (their grammar is not accepted).
+fn text_chunks(sql: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            // quoted run with doubling escapes; always stays inside the
+            // current chunk
+            let quote = c;
+            cur.push(c);
+            i += 1;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        cur.push(*chars.get(i + 1).unwrap());
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                cur.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            cur.push('/');
+            cur.push('*');
+            i += 2;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    cur.push('*');
+                    cur.push('/');
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == ';' {
+            chunks.push(std::mem::take(&mut cur));
+            i += 1;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    chunks.push(cur);
+    chunks
+}
 
 /// Split `sql` into individual statement texts.
 ///
 /// A single-statement input is returned verbatim (trimmed) so the common
 /// case never depends on AST rendering. Multi-statement batches are
 /// re-rendered from the parsed AST — the parser is shared with the engine,
-/// so rendered text parses to the same statement. Parse failures and empty
-/// input surface as `Err` with the parser's message.
+/// so rendered text parses to the same statement. User-management
+/// statements (hand-parsed; see `useradmin`) pass through verbatim.
+/// Parse failures and empty input surface as `Err` with the parser's
+/// message.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, String> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| e.to_string())?;
-    if stmts.is_empty() {
+    let chunks: Vec<String> = text_chunks(sql)
+        .into_iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    if chunks.is_empty() {
         return Err("empty statement".into());
     }
-    if stmts.len() == 1 {
+    if chunks.len() == 1 {
+        // Single statement: validate parseability (malformed input must
+        // error like before), then return the original text verbatim so
+        // execution never depends on AST rendering.
+        if crate::useradmin::parse(&chunks[0]).is_some() {
+            return Ok(vec![sql.trim().to_string()]);
+        }
+        let stmts = Parser::parse_sql(&GenericDialect {}, &chunks[0]).map_err(|e| e.to_string())?;
+        if stmts.is_empty() {
+            return Err("empty statement".into());
+        }
         return Ok(vec![sql.trim().to_string()]);
     }
-    Ok(stmts
-        .into_iter()
-        .map(|s: Statement| format!("{s};"))
-        .collect())
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if crate::useradmin::parse(&chunk).is_some() {
+            out.push(chunk.trim().to_string());
+            continue;
+        }
+        let stmts = Parser::parse_sql(&GenericDialect {}, &chunk).map_err(|e| e.to_string())?;
+        for s in stmts {
+            out.push(format!("{s};"));
+        }
+    }
+    if out.is_empty() {
+        return Err("empty statement".into());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

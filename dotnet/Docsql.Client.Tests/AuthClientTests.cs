@@ -142,4 +142,87 @@ public sealed class AuthClientTests
         Assert.Throws<DocsqlException>(
             () => new DocsqlSubscriber($"host=127.0.0.1;port={port};token=wrong-token"));
     }
+
+    /// <summary>同 ServeOnce,但把首帧载荷一并交回(校验 REQ_AUTH_USER 的 JSON 构造)。</summary>
+    private static (int Port, Task<(FrameType Type, byte[] Payload)> First) ServeOnceFull(
+        FrameType reply, string replyText)
+    {
+        var l = new TcpListener(IPAddress.Loopback, 0);
+        l.Start();
+        var port = ((IPEndPoint)l.LocalEndpoint).Port;
+        var first = new TaskCompletionSource<(FrameType, byte[])>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        Task.Run(() =>
+        {
+            try
+            {
+                using var client = l.AcceptTcpClient();
+                using var s = client.GetStream();
+                var (type, payload) = ReadFrame(s);
+                first.TrySetResult((type, payload));
+                s.Write(new Frame(reply, 0, 0, Encoding.UTF8.GetBytes(replyText)).Encode());
+                s.Flush();
+                var buf = new byte[256];
+                while (true)
+                {
+                    try
+                    {
+                        if (s.Read(buf, 0, buf.Length) == 0)
+                        {
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                        break;
+                    }
+                }
+            }
+            catch
+            {
+                // 测试结束后连接关闭属预期
+            }
+            finally
+            {
+                l.Stop();
+            }
+        });
+        return (port, first.Task);
+    }
+
+    [Fact]
+    public async Task User_login_sends_req_auth_user_with_json_body()
+    {
+        var (port, first) = ServeOnceFull(FrameType.RespAffected, "ok(user:dana)");
+        using var conn = new DocsqlConnection(
+            "host=127.0.0.1;port=" + port + ";user=dana;password=" + "pw" + "12345" + "678");
+        conn.Open();
+        Assert.Equal(System.Data.ConnectionState.Open, conn.State);
+        var (type, payload) = await first.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(FrameType.ReqAuthUser, type);
+        var body = System.Text.Json.JsonDocument.Parse(Encoding.UTF8.GetString(payload)).RootElement;
+        Assert.Equal("dana", body.GetProperty("user").GetString());
+        Assert.Equal("pw12345" + "678", body.GetProperty("password").GetString());
+    }
+
+    [Fact]
+    public void User_login_rejection_fails_open()
+    {
+        var (port, _) = ServeOnceFull(FrameType.RespError, "bad username or password");
+        using var conn = new DocsqlConnection(
+            "host=127.0.0.1;port=" + port + ";user=ghost;password=whatever12");
+        var ex = Assert.Throws<DocsqlException>(conn.Open);
+        Assert.Contains("auth failed", ex.Message);
+        Assert.Equal(System.Data.ConnectionState.Broken, conn.State);
+    }
+
+    [Fact]
+    public async Task Subscriber_logs_in_with_username_password()
+    {
+        var (port, first) = ServeOnceFull(FrameType.RespAffected, "ok(user:dana)");
+        using var sub = new DocsqlSubscriber(
+            "host=127.0.0.1;port=" + port + ";user=dana;password=pw123456");
+        var (type, _) = await first.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(FrameType.ReqAuthUser, type);
+    }
 }

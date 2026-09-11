@@ -43,6 +43,20 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
         get => TryGetValue("key", out var v) ? (string)v : "";
         set => this["key"] = value;
     }
+
+    /// <summary>数据库用户名(REQ_AUTH_USER 登录;与 token 二选一,同时给出时优先用户登录)。</summary>
+    public string User
+    {
+        get => TryGetValue("user", out var v) ? (string)v : "";
+        set => this["user"] = value;
+    }
+
+    /// <summary>数据库用户密码。</summary>
+    public string Password
+    {
+        get => TryGetValue("password", out var v) ? (string)v : "";
+        set => this["password"] = value;
+    }
 }
 
 public sealed class DocsqlConnection : DbConnection
@@ -135,14 +149,23 @@ public sealed class DocsqlConnection : DbConnection
     internal static long DecodeLong(byte[] payload) =>
         payload.Length >= 8 ? BitConverter.ToInt64(payload, 0) : 0;
 
-    /// <summary>建连 + 可选 REQ_AUTH:DocsqlConnection.Open 与 DocsqlSubscriber 共用的握手骨架。</summary>
+    /// <summary>建连 + 认证(用户名/密码走 REQ_AUTH_USER,否则 token 走 REQ_AUTH):
+    /// DocsqlConnection.Open 与 DocsqlSubscriber 共用的握手骨架。</summary>
     internal static ProtocolConnection ConnectAndAuth(
         DocsqlConnectionStringBuilder p, string? keyOverride)
     {
         var proto = new ProtocolConnection(p.Host, p.Port, ParseKey(keyOverride ?? p.Key));
         try
         {
-            if (!string.IsNullOrEmpty(p.Token))
+            if (!string.IsNullOrEmpty(p.User))
+            {
+                var body = JsonSerializer.Serialize(
+                    new { user = p.User, password = p.Password });
+                proto.Send(new Frame(
+                    FrameType.ReqAuthUser, 0, 0, Encoding.UTF8.GetBytes(body)))
+                    .EnsureOk("auth failed: ");
+            }
+            else if (!string.IsNullOrEmpty(p.Token))
             {
                 proto.Send(new Frame(
                     FrameType.ReqAuth, 0, 0, Encoding.UTF8.GetBytes(p.Token)))

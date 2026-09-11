@@ -9,10 +9,12 @@ pub mod engine;
 pub mod guid;
 pub mod heap;
 pub mod json;
+pub mod kdf;
 pub mod meta;
 pub mod pager;
 pub mod proto;
 pub mod stmt;
+pub mod useradmin;
 pub mod value;
 pub mod wal;
 

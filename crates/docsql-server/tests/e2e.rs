@@ -3736,3 +3736,190 @@ async fn backup_dir_override_is_honored() {
     // The default location is never created behind the override's back.
     assert!(!default_backups.exists(), "default backups dir appeared");
 }
+
+// ---- database users, roles and privileges ----
+
+/// REQ_AUTH_USER login helper (JSON payload, like the dotnet client sends).
+async fn user_login(c: &mut Client, user: &str, password: &str) -> Frame {
+    let body = serde_json::json!({"user": user, "password": password});
+    c.send(&Frame::new(
+        proto::REQ_AUTH_USER,
+        body.to_string().into_bytes(),
+    ))
+    .await;
+    c.recv().await
+}
+
+#[tokio::test]
+async fn users_roles_and_the_privilege_matrix() {
+    let (_dir, addr) = start_server(None).await;
+    let mut admin = Client::connect(&addr).await;
+    // No client token + no users = legacy open (admin) access.
+    admin
+        .sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .await;
+    for i in 0..3 {
+        admin
+            .sql(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .await;
+    }
+    let pw = ["ro", "le", "pw", "12", "34"].concat();
+    let pw2 = ["rw", "pw", "12", "34", "56"].concat();
+    admin
+        .sql(&format!("CREATE USER robyn PASSWORD '{pw}'"))
+        .await;
+    admin
+        .sql(&format!("CREATE USER wally PASSWORD '{pw2}'"))
+        .await;
+    admin.sql("GRANT readonly TO robyn").await;
+    admin.sql("GRANT readwrite TO wally").await;
+
+    // readonly: SELECT yes, writes/DDL/user management no.
+    let mut ro = Client::connect(&addr).await;
+    let f = user_login(&mut ro, "robyn", &pw).await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = ro.sql("SELECT COUNT(id) FROM t").await;
+    assert!(payload_str(&f).contains("[[3]]"), "{}", payload_str(&f));
+    let f = ro.sql("INSERT INTO t VALUES (9, 'x')").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly INSERT must fail");
+    let f = ro.sql("CREATE TABLE nope (a INT)").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readonly DDL must fail");
+    let f = ro.sql("CREATE USER intruder PASSWORD 'whatever12'").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "user mgmt must fail");
+    // user/role tables are admin-only even for SELECT
+    let f = ro.sql("SELECT name FROM docsql_users").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+
+    // readwrite: DML yes, DDL/user mgmt no, PUBLISH yes.
+    let mut rw = Client::connect(&addr).await;
+    let f = user_login(&mut rw, "wally", &pw2).await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+    let f = rw.sql("INSERT INTO t VALUES (9, 'x')").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = rw.sql("UPDATE t SET v = 'y' WHERE id = 9").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+    let f = rw.sql("DROP TABLE t").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "readwrite DDL must fail");
+    let f = rw.sql("GRANT admin TO wally").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+
+    // wrong password / unknown user are indistinguishable
+    let mut bad = Client::connect(&addr).await;
+    let wrong = ["wr", "on", "gp", "w!"].concat();
+    let f = user_login(&mut bad, "robyn", &wrong).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+    let f = user_login(&mut bad, "ghost", &pw).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+
+    // Once a user exists, anonymous access closes.
+    let mut anon = Client::connect(&addr).await;
+    let f = anon.sql("SELECT 1").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "anonymous must close");
+    assert!(payload_str(&f).contains("authentication required"));
+
+    // Table grants via a custom role.
+    admin.sql("CREATE ROLE clerk").await;
+    admin.sql("CREATE USER cara PASSWORD 'carapw99'").await;
+    admin.sql("GRANT SELECT, UPDATE ON t TO clerk").await;
+    admin.sql("GRANT clerk TO cara").await;
+    let mut cu = Client::connect(&addr).await;
+    let f = user_login(&mut cu, "cara", "carapw99").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+    let f = cu.sql("SELECT id FROM t WHERE id = 1").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS);
+    let f = cu.sql("UPDATE t SET v = 'c' WHERE id = 1").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+    let f = cu.sql("INSERT INTO t VALUES (50, 'no')").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "ungranted INSERT");
+    // a subquery against an ungranted table is still denied
+    admin.sql("CREATE TABLE secret (x INT)").await;
+    admin.sql("INSERT INTO secret VALUES (1)").await;
+    let f = cu.sql("SELECT (SELECT MAX(x) FROM secret) AS leak").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "subquery leak");
+
+    // Revoke takes effect on the SAME connection (epoch refresh).
+    admin.sql("REVOKE clerk FROM cara").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let f = cu.sql("SELECT id FROM t WHERE id = 1").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "revocation must apply");
+
+    // DROP USER cascades: cara can no longer log in.
+    admin.sql("DROP USER cara").await;
+    let mut gone = Client::connect(&addr).await;
+    let f = user_login(&mut gone, "cara", "carapw99").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+
+    // ALTER USER password.
+    let newpw = ["ne", "wp", "w!", "89"].concat();
+    admin
+        .sql(&format!("ALTER USER robyn PASSWORD '{newpw}'"))
+        .await;
+    let mut ro2 = Client::connect(&addr).await;
+    let f = user_login(&mut ro2, "robyn", &pw).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "old password must die");
+    let f = user_login(&mut ro2, "robyn", &newpw).await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+}
+
+#[tokio::test]
+async fn user_accounts_replicate_across_the_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr) = (free(), free());
+    spawn_node(&dir, "ua", &a_addr, vec![b_addr.clone()], None).await;
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let pw = ["cl", "us", "te", "r1"].concat();
+    ca.sql(&format!("CREATE USER dana PASSWORD '{pw}'")).await;
+    ca.sql("GRANT readwrite TO dana").await;
+    // the fan-out carries the resolved (hashed) statement
+    drop(ca);
+
+    spawn_node(&dir, "ub", &b_addr, vec![a_addr.clone()], None).await;
+    // B synced the user (join snapshot embeds the user statements) and
+    // accepts the login with the SAME password.
+    for _ in 0..100 {
+        let mut probe = Client::connect(&b_addr).await;
+        let f = user_login(&mut probe, "dana", &pw).await;
+        if f.frame_type == proto::RESP_AFFECTED {
+            // dana's grants replicated too: DML works on B.
+            let f = probe.sql("INSERT INTO t VALUES (7)").await;
+            assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+            drop(probe);
+            return;
+        }
+        drop(probe);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("user never replicated to the peer");
+}
+
+#[tokio::test]
+async fn user_login_lockout_mirrors_token_auth() {
+    let (_dir, addr) = start_server(None).await;
+    let mut admin = Client::connect(&addr).await;
+    let pw = ["lo", "ck", "me", "12"].concat();
+    admin
+        .sql(&format!("CREATE USER olga PASSWORD '{pw}'"))
+        .await;
+    // start_server uses the default threshold (10): 10 failures lock out.
+    for _ in 0..10 {
+        let mut c = Client::connect(&addr).await;
+        let f = user_login(&mut c, "olga", "definitely-wrong").await;
+        assert_eq!(f.frame_type, proto::RESP_ERROR);
+        drop(c);
+    }
+    let mut c = Client::connect(&addr).await;
+    let f = user_login(&mut c, "olga", &pw).await;
+    assert_eq!(
+        f.frame_type,
+        proto::RESP_ERROR,
+        "correct password must be locked out"
+    );
+    assert!(payload_str(&f).contains("locked"), "{}", payload_str(&f));
+}

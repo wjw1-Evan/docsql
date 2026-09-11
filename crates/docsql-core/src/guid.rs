@@ -35,6 +35,17 @@ fn rand64() -> u64 {
     a.finish() ^ b.finish().rotate_left(29)
 }
 
+/// `n` pseudorandom bytes (user-credential salts) from the same
+/// no-dependency source.
+pub fn rand_bytes(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        out.extend_from_slice(&rand64().to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}
+
 /// Reserve the next (timestamp, counter) pair, strictly increasing.
 fn next_time_seq() -> (u64, u16) {
     loop {
