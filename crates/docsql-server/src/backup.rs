@@ -200,7 +200,7 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     // Block scope: the engine guard drops before any further await (the
     // dump itself is synchronous, O(data) in memory).
     let script = {
-        let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.dump_script().map_err(|e| format!("backup dump: {e}"))?
     };
     drop(_order);
@@ -513,7 +513,7 @@ async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, Stri
         }
         // Verify against every reachable peer's digest.
         let local = {
-            let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             db.digests()
         };
         if let Ok(local) = local {
