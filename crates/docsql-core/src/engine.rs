@@ -1156,6 +1156,7 @@ impl Database {
                 TableObject::TableName(n) => vec![obj_name(n)],
                 _ => vec![],
             },
+            Statement::Merge(m) => factor_name(&m.table).into_iter().collect(),
             Statement::Update(u) => factor_name(&u.table.relation).into_iter().collect(),
             Statement::Delete(d) => match &d.from {
                 sqlparser::ast::FromTable::WithFromKeyword(tables) => tables
@@ -1244,6 +1245,12 @@ impl Database {
                 if let Some(sel) = &d.selection {
                     walk_expr(sel, &mut out)?;
                 }
+            }
+            Statement::Merge(m) => {
+                // The USING side is a read; the merge target comes from
+                // stmt_write_targets. ON/assignments referencing the target
+                // are writes, not reads.
+                walk_factor(&m.source, &mut out)?;
             }
             _ => {}
         }
@@ -2088,6 +2095,7 @@ impl Database {
             Statement::Savepoint { name } => self.savepoint(&name.value),
             Statement::ReleaseSavepoint { name } => self.release_savepoint(&name.value),
             Statement::CreateIndex(idx) => self.exec_create_index(idx),
+            Statement::Merge(m) => self.exec_merge(m.clone()),
             Statement::Query(q) => self.exec_query(*q),
             Statement::Truncate(tr) => {
                 // Empty the tables; shape (columns/constraints) is kept.
@@ -4345,6 +4353,295 @@ impl Database {
             )?;
         }
         Ok(rows)
+    }
+
+    /// MERGE INTO target USING source ON (cond) — Oracle/SQL-standard
+    /// upsert over arbitrary match conditions (ON CONFLICT only covers
+    /// unique-key conflicts). Execution: load the source rows, evaluate ON
+    /// against every (target, source) pair, then apply per pair —
+    /// WHEN MATCHED THEN UPDATE SET …, WHEN NOT MATCHED THEN INSERT ….
+    /// Determinism: the merge walks target storage order, so replication
+    /// replays converge. Two source rows matching one target row is an
+    /// error (Oracle ORA-30926 semantics).
+    fn exec_merge(&mut self, merge: sqlparser::ast::Merge) -> Result<ExecOutcome> {
+        use sqlparser::ast::{MergeAction, MergeClauseKind};
+
+        // Target: a simple table.
+        let sqlparser::ast::TableFactor::Table {
+            name: tname_ident,
+            alias: talias,
+            ..
+        } = &merge.table
+        else {
+            return err("MERGE target must be a simple table");
+        };
+        let tname = obj_name(tname_ident);
+        let tkey = talias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| tname.clone());
+        let Some(meta) = self.tables.get(&tname).cloned() else {
+            return err(format!("table {tname} does not exist"));
+        };
+
+        // Exactly one WHEN MATCHED (UPDATE) and one WHEN NOT MATCHED
+        // (INSERT) clause; per-clause predicates, BY SOURCE, DELETE WHERE
+        // and UPDATE WHERE are rejected loudly (v1 surface).
+        let mut matched_upd: Option<Vec<sqlparser::ast::Assignment>> = None;
+        let mut not_matched_ins: Option<(Vec<String>, Vec<SqlExpr>)> = None;
+        for cl in &merge.clauses {
+            if cl.predicate.is_some() {
+                return err("MERGE WHEN … AND <predicate> is not supported");
+            }
+            match cl.clause_kind {
+                MergeClauseKind::NotMatchedBySource => {
+                    return err("WHEN … BY SOURCE is not supported");
+                }
+                MergeClauseKind::Matched | MergeClauseKind::NotMatchedByTarget => {
+                    if matched_upd.is_some() {
+                        return err("duplicate WHEN MATCHED clause");
+                    }
+                    let MergeAction::Update(upd) = &cl.action else {
+                        return err("WHEN MATCHED THEN INSERT is not supported");
+                    };
+                    if upd.update_predicate.is_some() || upd.delete_predicate.is_some() {
+                        return err("MERGE UPDATE WHERE/DELETE WHERE is not supported");
+                    }
+                    matched_upd = Some(upd.assignments.clone());
+                }
+                MergeClauseKind::NotMatched => {
+                    if not_matched_ins.is_some() {
+                        return err("duplicate WHEN NOT MATCHED clause");
+                    }
+                    let MergeAction::Insert(ins) = &cl.action else {
+                        return err("WHEN NOT MATCHED THEN UPDATE is not supported");
+                    };
+                    if ins.insert_predicate.is_some() {
+                        return err("MERGE INSERT predicate is not supported");
+                    }
+                    let sqlparser::ast::MergeInsertKind::Values(values) = &ins.kind else {
+                        return err("MERGE INSERT ROW is not supported");
+                    };
+                    if values.rows.len() != 1 {
+                        return err("MERGE INSERT VALUES must have exactly one row");
+                    }
+                    let mut cols = Vec::new();
+                    for c in &ins.columns {
+                        let col = obj_name(c);
+                        if !meta.columns.contains(&col) {
+                            return err(format!("column {col} does not exist"));
+                        }
+                        cols.push(col);
+                    }
+                    let mut exprs = Vec::new();
+                    for row in &values.rows {
+                        for e in row.content.iter() {
+                            exprs.push(e.clone());
+                        }
+                    }
+                    not_matched_ins = Some((cols, exprs));
+                }
+            }
+        }
+        // Source rows: plain table or derived subquery (no CTE access in
+        // v1 — the MERGE statement is not a SELECT statement).
+        let (_, _, src_rows) = self.load_table_factor(&merge.source, &Ctes::new())?;
+        let skey = match &merge.source {
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| obj_name(name)),
+            _ => "source".to_string(),
+        };
+
+        // Target rows with locators (storage order — deterministic replay
+        // on replication peers).
+        let theap = meta.heap_of();
+        let mut tdocs: Vec<(u64, Object)> = Vec::new();
+        {
+            let rtx = self.pager.begin_tx();
+            for &pid in &theap.pages {
+                tdocs.extend(theap.page_docs(&self.pager, &rtx, pid)?);
+            }
+        }
+
+        // Pair every source row with its matching target row: ON evaluates
+        // on the merged namespace (target columns first; source columns are
+        // additionally available qualified as `skey.col`).
+        let mut pairs: Vec<(u64, Object, usize)> = Vec::new(); // (t_loc, t_doc, s_idx)
+        let mut s_consumed = vec![false; src_rows.len()];
+        for (t_loc, t_doc) in &tdocs {
+            let mut hits = 0;
+            for (si, s_doc) in src_rows.iter().enumerate() {
+                let row = Self::merge_join_row(t_doc, tkey.as_str(), s_doc, &skey);
+                if matches!(eval_expr(&merge.on, &row)?, Value::Bool(true)) {
+                    hits += 1;
+                    if hits > 1 {
+                        return err(format!(
+                            "MERGE cannot update the same row of {tname} twice \
+                             (multiple source rows matched)"
+                        ));
+                    }
+                    pairs.push((*t_loc, t_doc.clone(), si));
+                    s_consumed[si] = true;
+                }
+            }
+        }
+
+        // Build the matched updates: assignments evaluate on the merged
+        // namespace (target columns and qualified source columns).
+        let mut updates: Vec<(u64, Object, Object)> = Vec::new();
+        if let Some(assignments) = &matched_upd {
+            for (t_loc, t_doc, si) in &pairs {
+                let s_doc = &src_rows[*si];
+                let row = Self::merge_join_row(t_doc, tkey.as_str(), s_doc, &skey);
+                let mut new_doc = t_doc.clone();
+                for a in assignments {
+                    let col = match &a.target {
+                        sqlparser::ast::AssignmentTarget::ColumnName(c) => obj_name(c),
+                        other => {
+                            return err(format!("unsupported MERGE assignment target: {other}"))
+                        }
+                    };
+                    let v = eval_expr(&a.value, &row)?;
+                    new_doc.insert(col, v);
+                }
+                updates.push((*t_loc, t_doc.clone(), new_doc));
+            }
+            // Updated target rows must not orphan referenced parents.
+            let old_docs: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
+            let new_docs: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
+            self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
+        }
+
+        // One pager transaction for heap pages and index trees alike.
+        let mut heap = Heap {
+            pages: meta.pages.clone(),
+            overflow_free: meta.overflow_free.clone(),
+        };
+        let mut roots = meta.index_roots.clone();
+        let idx_cols: Vec<String> = roots.keys().cloned().collect();
+        let mut tx = self.pager.begin_tx();
+
+        // Pass 1: drop every matched row's old index entries before any
+        // replacement lands (a multi-row key shift must not collide with a
+        // not-yet-replaced row's still-present old key).
+        for (loc, old_doc, _) in &updates {
+            if let Err(e) = reindex_remove(
+                &mut self.pager,
+                &mut tx,
+                &meta,
+                &idx_cols,
+                &mut roots,
+                old_doc,
+                *loc,
+            ) {
+                self.pager.abort_tx(tx)?;
+                return Err(e);
+            }
+        }
+        // Pass 2: replace the matched rows, following in-page repacks.
+        for i in 0..updates.len() {
+            let (loc, _, new_doc) = updates[i].clone();
+            let page = crate::heap::unpack_loc(loc).0;
+            let before = heap.page_docs(&self.pager, &tx, page)?;
+            let out = heap.replace(&mut self.pager, &mut tx, loc, &new_doc)?;
+            if !out.moved.is_empty() {
+                for pending in updates.iter_mut().skip(i + 1) {
+                    if let Some((_, new_l)) = out.moved.iter().find(|(old, _)| *old == pending.0) {
+                        pending.0 = *new_l;
+                    }
+                }
+            }
+            for (old_l, new_l) in &out.moved {
+                if *old_l == loc || updates.iter().any(|(l, _, _)| l == old_l) {
+                    continue;
+                }
+                if let Err(e) = reindex_repoint(
+                    &mut self.pager,
+                    &mut tx,
+                    &meta,
+                    &idx_cols,
+                    &mut roots,
+                    &before,
+                    *old_l,
+                    *new_l,
+                ) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
+            }
+            if let Err(e) = reindex_insert(
+                &mut self.pager,
+                &mut tx,
+                &meta,
+                &idx_cols,
+                &mut roots,
+                &new_doc,
+                out.placed,
+            ) {
+                self.pager.abort_tx(tx)?;
+                return Err(e);
+            }
+        }
+        // WHEN NOT MATCHED THEN INSERT: appended rows go through the same
+        // tree inserts (unique trees reject duplicates) and FK checks as
+        // plain inserts. Only source rows that matched no target row are
+        // inserted.
+        let mut inserted = 0usize;
+        if let Some((cols, exprs)) = &not_matched_ins {
+            for (si, s_doc) in src_rows.iter().enumerate() {
+                if s_consumed[si] {
+                    continue;
+                }
+                let mut doc = Object::new();
+                for (c, e) in cols.iter().zip(exprs.iter()) {
+                    let v = eval_expr(e, s_doc)?;
+                    doc.insert(c.clone(), v);
+                }
+                self.check_fks(&meta, &doc)?;
+                let loc = heap.insert(&mut self.pager, &mut tx, &doc)?;
+                reindex_insert(
+                    &mut self.pager,
+                    &mut tx,
+                    &meta,
+                    &idx_cols,
+                    &mut roots,
+                    &doc,
+                    loc,
+                )?;
+                inserted += 1;
+            }
+        }
+        if heap.pages != meta.pages
+            || roots != meta.index_roots
+            || heap.overflow_free != meta.overflow_free
+        {
+            self.sync_table_layout(
+                &mut tx,
+                &tname,
+                heap.pages.clone(),
+                roots,
+                heap.overflow_free.clone(),
+            )?;
+        }
+        self.commit_pager_tx(tx)?;
+        Ok(ExecOutcome::Affected((updates.len() + inserted) as u64))
+    }
+
+    /// Merge-namespaced evaluation row: target columns (unqualified) plus
+    /// source columns (qualified `skey.col`, and unqualified when the name
+    /// is not taken by the target).
+    fn merge_join_row(t_doc: &Object, t_key: &str, s_doc: &Object, s_key: &str) -> Object {
+        let _ = t_key;
+        let mut row = t_doc.clone();
+        for (k, v) in s_doc {
+            row.insert(format!("{s_key}.{k}"), v.clone());
+            if !row.contains_key(k.as_str()) {
+                row.insert(k.clone(), v.clone());
+            }
+        }
+        row
     }
 
     /// No aggregation: project expressions over rows.
@@ -13397,5 +13694,81 @@ mod complex_query_tests {
             q(&mut db, "SELECT SYSDATE()"),
             Value::Str(s) if s.len() >= 19 && s.contains('T')
         ));
+    }
+
+    #[test]
+    fn merge_into_upsert_over_arbitrary_match() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE stock (sku INT PRIMARY KEY, qty INT)")
+            .unwrap();
+        db.execute("INSERT INTO stock VALUES (1, 10), (2, 20)")
+            .unwrap();
+        db.execute("CREATE TABLE feed (sku INT, qty INT)").unwrap();
+        db.execute("INSERT INTO feed VALUES (1, 5), (3, 30)")
+            .unwrap();
+
+        // Oracle-style MERGE: matched → qty update, not-matched → insert.
+        db.execute(
+            "MERGE INTO stock USING feed ON stock.sku = feed.sku \
+             WHEN MATCHED THEN UPDATE SET qty = feed.qty \
+             WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (feed.sku, feed.qty)",
+        )
+        .unwrap();
+        let r = rows(&mut db, "SELECT sku, qty FROM stock ORDER BY sku");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(2), Value::Int(20)],
+                vec![Value::Int(3), Value::Int(30)],
+            ]
+        );
+
+        // Cross-check the table-local translation on a second database.
+        let mut db2 = Database::in_memory().unwrap();
+        db2.execute("CREATE TABLE s (k INT, v TEXT)").unwrap();
+        db2.execute("INSERT INTO s VALUES (1, 'a')").unwrap();
+        db2.execute("CREATE TABLE src (k INT, v TEXT)").unwrap();
+        db2.execute("INSERT INTO src VALUES (1, 'x'), (2, 'y')")
+            .unwrap();
+        db2.execute(
+            "MERGE INTO s USING src ON s.k = src.k \
+             WHEN MATCHED THEN UPDATE SET v = src.v \
+             WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v)",
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&mut db2, "SELECT k, v FROM s ORDER BY k").rows,
+            vec![
+                vec![Value::Int(1), Value::Str("x".into())],
+                vec![Value::Int(2), Value::Str("y".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_rejects_double_match_and_keeps_row() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute("CREATE TABLE s (id INT)").unwrap();
+        // Two source rows matching one target row: ORA-30926-style refusal.
+        db.execute("INSERT INTO s VALUES (1), (1)").unwrap();
+        let e = db
+            .execute(
+                "MERGE INTO t USING s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = 'x'",
+            )
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("multiple source rows matched"),
+            "{e}"
+        );
+        // The target row is untouched.
+        assert_eq!(
+            rows(&mut db, "SELECT v FROM t WHERE id = 1").rows,
+            vec![vec![Value::Str("a".into())]]
+        );
     }
 }
