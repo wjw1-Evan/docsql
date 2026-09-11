@@ -28,8 +28,11 @@
 ## 路线(按商用优先级)
 
 1. **驱动扩展**:基于 REQ_PREPARE/REQ_EXECUTE 服务端绑定实现第二/第三语言驱动(JDBC/Python);
-2. **引擎**:MVCC/读写并发、DECIMAL/TIMESTAMP 类型、JSON 路径索引、VACUUM(溢出链孤儿页回收)、
-   JSON 路径索引、DECIMAL/TIMESTAMP;
+2. **MVCC/读写并发** — 设计已定稿(`docs/design/003-mvcc-read-concurrency.md`):
+   阶段 A 读-读并发(`db: Mutex → RwLock` 分级 + pager 读取去借用化 + SELECT 执行链
+   `&self` 化),阶段 B 快照读(WAL 即版本链、commit LSN 可见性、与 write_unit 融合/
+   复制 apply 的兼容矩阵已给出);实现按阶段 A → B 推进,每阶段全量兼容回归;
+   附:DECIMAL/TIMESTAMP 类型、JSON 路径索引、VACUUM(溢出链孤儿页回收);
 3. **性能**:JOIN 优化(hash join)、EXPLAIN、统计信息;
 4. **数据安全**:TCP 协议层原生 TLS(控制台已原生支持;数据面走 AES-GCM 帧加密或 TLS 反代/加密卷)、
    增量备份/PITR;
