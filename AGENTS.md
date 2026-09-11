@@ -72,7 +72,7 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 17. **EF Core** — 复用 SQLite 管线 + Docsql ADO.NET,不重写关系生成;EnsureCreated/惰性建表与索引同步默认开启(模型增删表、索引自动同步,无需 Migrations);`Database.Migrate()` 显式报错;EF 事务内 SaveChanges 依赖 SAVEPOINT 有限语义——相关改动必须跑两个 dotnet 套件。
 18. **不支持的 SQL 显式报错** — 窗口函数(OVER)/DISTINCT ON/ON CONFLICT DO UPDATE/ON DUPLICATE KEY UPDATE/自定义 TRIM 字符集/FK 的 ON DELETE|UPDATE 动作/相关子查询/无 GROUP BY 的 HAVING;`PRAGMA` 是有意接受并忽略的兼容垫片。已支持 WITH(非递归)/CTAS/ON CONFLICT DO NOTHING|REPLACE/`SELECT *, expr`。新增不支持语法时在解析/执行层报错,不要静默吞掉。
 19. **PK ≠ NOT NULL** — 主键当前不隐含 NOT NULL(与主流不同);动约束逻辑需全量回归约束测试。
-20. **deploy 钉子与本机环境** — `deploy/multinode-test.sh` 断言固定 REST/协议字段,改协议/REST 先同步该脚本与 dotnet 客户端;分区重连必须 `docker network connect --alias node-c <net> docsql-c`(裸 connect 丢别名,DNS/healthcheck/扇出静默失效,restart 不恢复),节点侧查询走 127.0.0.1;`DOCSQL_DEV_IMAGE_TAG`(dev)与 `DOCSQL_IMAGE_TAG`(prod)刻意分开,`.env` 的 prod tag 不会泄漏到 dev;本机到 github.com:443 间歇阻断,推送失败用 `git -c http.version=HTTP/1.1 push` 重试;Docker 构建基于 mcr.microsoft.com/azurelinux(docker.io 不可达);dotnet 的 bin/obj 不入库,新项目沿用。
+20. **deploy 钉子与本机环境** — `deploy/multinode-test.sh` 断言固定 REST/协议字段,改协议/REST 先同步该脚本与 dotnet 客户端;分区重连必须 `docker network connect --alias node-c <net> docsql-c`(裸 connect 丢别名,DNS/healthcheck/扇出静默失效,restart 不恢复),节点侧查询走 127.0.0.1;`DOCSQL_DEV_IMAGE_TAG`(dev)与 `DOCSQL_IMAGE_TAG`(prod)刻意分开,`.env` 的 prod tag 不会泄漏到 dev;本机到 github.com:443 间歇阻断,推送失败用 `git -c http.version=HTTP/1.1 push` 重试;Docker 构建基于 mcr.microsoft.com/azurelinux(docker.io 不可达);dotnet 的 bin/obj 不入库,新项目沿用;镜像运行层必须预建全部 compose 挂载点并 `chown 1000:1000`(/data、/auth——全新命名卷的属主继承自镜像内同名目录,镜像缺该目录则挂载点归 root,uid 1000 进程写入即 os error 13,console 凭据写入曾栽在此)。
 
 ## 工作流约定
 
