@@ -4,6 +4,21 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- NuGet packaging surface (dotnet pack) -->
+    <PackageId>Docsql.Client</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>DocSQL Contributors</Authors>
+    <Description>ADO.NET provider for DocSQL: wire-protocol client with token/user authentication, transactions, persistent pub/sub and AES-GCM transport encryption support.</Description>
+    <PackageTags>docsql;database;adonet;ado.net;document;sql</PackageTags>
+    <RepositoryUrl>https://github.com/wjw1-Evan/docsql</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/wjw1-Evan/docsql</PackageProjectUrl>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>

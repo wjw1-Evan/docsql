@@ -23,8 +23,19 @@ pub const REQ_SQL: u16 = 0x0001;
 /// Session authentication: payload = token bytes; success responds with
 /// RESP_AFFECTED ("ok"), failure with RESP_ERROR.
 pub const REQ_AUTH: u16 = 0x0002;
+/// Server-side prepared statement: payload = SQL text with `?` place-
+/// holders. Responds RESP_PREPARED `{"handle": n}` — handles are per
+/// connection and die with it.
 pub const REQ_PREPARE: u16 = 0x0003;
+/// Execute a prepared statement: payload = JSON `{"handle": n,
+/// "params": [...]}`. Params bind to the placeholders in order; the
+/// server renders typed literals itself (string values are quote-escaped
+/// server-side, so a value can never break out of the literal — the
+/// injection surface client-side binding leaves open). A `?` inside a
+/// string literal is data, not a placeholder. Responds exactly like
+/// REQ_SQL.
 pub const REQ_EXECUTE: u16 = 0x0004;
+/// Drop a prepared statement handle: payload = JSON `{"handle": n}`.
 pub const REQ_CLOSE_STMT: u16 = 0x0005;
 pub const REQ_PING: u16 = 0x0006;
 /// Failover promotion: clears read-only mode on this node (requires an
@@ -160,6 +171,9 @@ pub const RESP_CATCHUP: u16 = 0x010C;
 /// last: {ts_ms, file, ok, error}?,
 /// restore: {ts_ms, file, running, ok, error, applied, total}?}`.
 pub const RESP_BACKUP: u16 = 0x010D;
+/// Prepared statement registered (REQ_PREPARE): payload = JSON
+/// `{"handle": n}`.
+pub const RESP_PREPARED: u16 = 0x010E;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

@@ -862,6 +862,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let mut token_authed = false;
     let mut user: Option<UserAuth> = None;
     let mut user_epoch = 0u64;
+    // Server-side prepared statements (REQ_PREPARE/REQ_EXECUTE): handle →
+    // template SQL with `?` placeholders. Per connection, dies with it.
+    let mut prepared: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut next_stmt_handle: u64 = 1;
     // Legacy anonymous access is judged at connection start: connections
     // that were legitimate when they opened (user-less node) keep working
     // — the operator bootstrap (CREATE USER + GRANT over one session)
@@ -1292,6 +1296,99 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     }
                     Some(resp)
                 }
+                proto::REQ_PREPARE if authed => {
+                    // Server-side prepared statements: the template carries
+                    // `?` placeholders; binding happens at REQ_EXECUTE with
+                    // typed literals rendered inside the server.
+                    let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
+                    if sql.trim().is_empty() {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("prepare: empty statement"),
+                        ))
+                    } else {
+                        let h = next_stmt_handle;
+                        next_stmt_handle += 1;
+                        prepared.insert(h, sql);
+                        Some(Frame::new(
+                            proto::RESP_PREPARED,
+                            format!(r#"{{"handle":{h}}}"#).into_bytes(),
+                        ))
+                    }
+                }
+                proto::REQ_EXECUTE if authed => {
+                    // Bound execution runs the rendered text through the
+                    // normal client path — grants, deadline and the query
+                    // log all apply exactly like REQ_SQL (the log shows the
+                    // rendered statement, same as client-side binding did).
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&frame.payload).unwrap_or(serde_json::Value::Null);
+                    let handle = body.get("handle").and_then(|v| v.as_u64());
+                    let params: Vec<Value> = body
+                        .get("params")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().map(json_param_to_value).collect())
+                        .unwrap_or_default();
+                    let rendered = handle
+                        .and_then(|h| prepared.get(&h))
+                        .map(|tpl| bind_params(tpl, &params));
+                    match rendered {
+                        Some(Ok(sql)) => {
+                            let started = std::time::Instant::now();
+                            let deadline = state
+                                .statement_timeout
+                                .map(|t| std::time::Instant::now() + t);
+                            let (resp, logged) = match querylog::try_serve_log_view(&sql, &state) {
+                                // 读日志的查询本身不写日志(避免读日志刷日志)。
+                                Some(f) => (f, false),
+                                None => (
+                                    execute_sql(
+                                        &state,
+                                        &sql,
+                                        false,
+                                        false,
+                                        Some(conn_id),
+                                        false,
+                                        None,
+                                        user.as_ref(),
+                                        deadline,
+                                    )
+                                    .await,
+                                    true,
+                                ),
+                            };
+                            if logged {
+                                querylog::record(
+                                    &state,
+                                    &peer,
+                                    &sql,
+                                    started.elapsed().as_secs_f64() * 1000.0,
+                                    &resp,
+                                    false,
+                                );
+                            }
+                            Some(resp)
+                        }
+                        Some(Err(e)) => Some(Frame::new(proto::RESP_ERROR, err_payload(&e))),
+                        None => Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("execute: unknown statement handle"),
+                        )),
+                    }
+                }
+                proto::REQ_CLOSE_STMT if authed => {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&frame.payload).unwrap_or(serde_json::Value::Null);
+                    match body.get("handle").and_then(|v| v.as_u64()) {
+                        Some(h) if prepared.remove(&h).is_some() => {
+                            Some(Frame::new(proto::RESP_AFFECTED, Vec::new()))
+                        }
+                        _ => Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("close: unknown statement handle"),
+                        )),
+                    }
+                }
                 proto::REQ_SQL_SEQ if authed && frame.flags & FLAG_REPLICATION != 0 => {
                     // Sequenced replication write: apply it like any
                     // replicated write, then record (origin node_id, seq)
@@ -1490,6 +1587,104 @@ pub fn check_token_strength(name: &str, token: &str) -> Result<(), String> {
         return Err(format!("{name} is too weak: single repeated character"));
     }
     Ok(())
+}
+
+/// Wire param (JSON) → engine value. Nested objects/arrays keep their JSON
+/// text shape — render_param quotes them as text literals.
+fn json_param_to_value(p: &serde_json::Value) -> Value {
+    match p {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .unwrap_or_else(|| Value::Float(n.as_f64().unwrap_or(0.0))),
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        other => Value::Str(other.to_string()),
+    }
+}
+
+/// Server-side parameter binding for REQ_EXECUTE: substitute `?`
+/// placeholders with typed literals rendered from the JSON param array.
+/// The scan is quote-aware — a `?` inside a string literal (or a doubled
+/// `''` escape) is data, not a placeholder. String params escape single
+/// quotes by doubling, so a value can never terminate the literal early:
+/// that closes the injection surface client-side binding leaves open.
+fn bind_params(sql: &str, params: &[Value]) -> Result<String, String> {
+    let mut out = String::with_capacity(sql.len() + 16 * params.len());
+    let mut in_quote = false;
+    let mut next = 0usize;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quote {
+            out.push(c);
+            if c == '\'' {
+                // '' inside a literal is an escaped quote, not the end.
+                if chars.peek() == Some(&'\'') {
+                    out.push('\'');
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_quote = true;
+                out.push(c);
+            }
+            '?' => {
+                let Some(p) = params.get(next) else {
+                    return Err(format!(
+                        "statement has more ? placeholders than the {} parameter(s) supplied",
+                        params.len()
+                    ));
+                };
+                next += 1;
+                out.push_str(&render_param(p));
+            }
+            _ => out.push(c),
+        }
+    }
+    if next < params.len() {
+        return Err(format!(
+            "{} parameter(s) supplied but the statement has only {next} ? placeholder(s)",
+            params.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// Typed SQL literal for one bound parameter.
+fn render_param(p: &Value) -> String {
+    match p {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Bytes(b) => {
+            let mut hex = String::with_capacity(b.len() * 2 + 3);
+            hex.push_str("x'");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex.push('\'');
+            hex
+        }
+        // Nested documents/arrays travel as JSON text literals.
+        other => format!(
+            "'{}'",
+            docsql_core::json::to_string(other).replace('\'', "''")
+        ),
+    }
 }
 
 /// Assemble the REQ_STATUS payload: everything a monitoring console needs to
@@ -4462,6 +4657,42 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn bind_params_is_quote_aware_and_escapes_values() {
+        // Plain positional binding of every value type.
+        assert_eq!(
+            bind_params(
+                "INSERT INTO t VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::Int(7),
+                    Value::Float(1.5),
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::Str("it's".into()),
+                ]
+            )
+            .unwrap(),
+            "INSERT INTO t VALUES (7, 1.5, TRUE, NULL, 'it''s')"
+        );
+        // A `?` inside a string literal (and a doubled '' escape) is data.
+        assert_eq!(
+            bind_params("SELECT 'a?b''c?' , ? FROM t", &[Value::Int(1)]).unwrap(),
+            "SELECT 'a?b''c?' , 1 FROM t"
+        );
+        // Bytes render as hex literals.
+        assert_eq!(
+            bind_params(
+                "INSERT INTO b VALUES (?)",
+                &[Value::Bytes(vec![0xde, 0xad])]
+            )
+            .unwrap(),
+            "INSERT INTO b VALUES (x'dead')"
+        );
+        // Arity mismatches are errors, never partial binds.
+        assert!(bind_params("SELECT ?", &[]).is_err());
+        assert!(bind_params("SELECT 1", &[Value::Int(1)]).is_err());
+    }
 
     #[test]
     fn token_strength_rejects_weak_secrets() {

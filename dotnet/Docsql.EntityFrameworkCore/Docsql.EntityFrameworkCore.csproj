@@ -1,5 +1,26 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- NuGet packaging surface (dotnet pack) -->
+    <PackageId>Docsql.EntityFrameworkCore</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>DocSQL Contributors</Authors>
+    <Description>Entity Framework Core provider for DocSQL (native, on Docsql.Client): EnsureCreated, lazy table creation, model/index auto-sync. Migrations are intentionally unsupported.</Description>
+    <PackageTags>docsql;database;efcore;entity-framework-core;provider</PackageTags>
+    <RepositoryUrl>https://github.com/wjw1-Evan/docsql</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/wjw1-Evan/docsql</PackageProjectUrl>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\Docsql.Client\Docsql.Client.csproj" />
   </ItemGroup>
@@ -7,11 +28,5 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.11" />
   </ItemGroup>
-
-  <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
 
 </Project>

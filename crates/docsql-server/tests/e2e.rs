@@ -4231,3 +4231,104 @@ async fn statement_timeout_kills_runaway_query_only() {
     let f = c.sql("SELECT 1").await;
     assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
 }
+
+/// Server-side prepared statements (REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT):
+/// the server renders typed literals itself, so a hostile string value can
+/// never break out of the literal — the classic `' OR '1'='1` payload binds
+/// as data. Handles are per connection; the query log shows the rendered
+/// statement.
+#[tokio::test]
+async fn server_side_prepared_statements_bind_safely() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE p (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO p VALUES (1, 'one'), (2, 'two')").await;
+
+    // Prepare returns a numeric handle.
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("SELECT v FROM p WHERE id = ?").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_PREPARED, "{}", payload_str(&f));
+    let body: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+    let h = body["handle"].as_u64().expect("handle");
+
+    // Bound execution answers like REQ_SQL.
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":[2]}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(payload_str(&f).contains("two"), "{}", payload_str(&f));
+
+    // Injection attempt as a string param: bound as the literal text —
+    // the row set stays empty instead of leaking the table.
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":["2 OR 1=1"]}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(
+        !payload_str(&f).contains("one") && !payload_str(&f).contains("two"),
+        "injection payload leaked rows: {}",
+        payload_str(&f)
+    );
+
+    // Quotes inside a bound string survive round-trip ('' escaping).
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("INSERT INTO p VALUES (?, ?)").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_PREPARED, "{}", payload_str(&f));
+    let body: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+    let hi = body["handle"].as_u64().unwrap();
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{hi},"params":[3,"it's fine"]}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = c.sql("SELECT v FROM p WHERE id = 3").await;
+    assert!(payload_str(&f).contains("it's fine"), "{}", payload_str(&f));
+
+    // Arity mismatch and unknown handles are errors, never partial binds.
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{hi},"params":[]}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        br#"{"handle":9999,"params":[]}"#.to_vec(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert!(payload_str(&f).contains("unknown statement handle"));
+
+    // CLOSE drops the handle for good.
+    c.send(&Frame::new(
+        proto::REQ_CLOSE_STMT,
+        format!(r#"{{"handle":{h}}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":[1]}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert!(payload_str(&f).contains("unknown statement handle"));
+}
