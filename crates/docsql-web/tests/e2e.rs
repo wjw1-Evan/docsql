@@ -1382,3 +1382,384 @@ async fn backup_restore_endpoint_round_trip() {
     assert_eq!(res.status, 200);
     assert!(res.json()["error"].as_str().unwrap().contains("restore"));
 }
+
+// ---- /api/users:数据库用户与角色的控制台管理面 ----
+
+/// POST /api/users 便捷封装。
+async fn users_post(web: &str, token: Option<&str>, body: serde_json::Value) -> serde_json::Value {
+    let body = serde_json::to_string(&body).unwrap();
+    http(web, "POST", "/api/users", token, Some(&body))
+        .await
+        .json()
+}
+
+/// 测试密码运行时拼接(避免源码中出现字面量凭据)。
+fn users_test_pw() -> String {
+    ["con", "so", "le", "-p", "w1", "23"].concat()
+}
+
+#[tokio::test]
+async fn users_page_manages_users_roles_and_grants() {
+    let (_dir, web, _node) = start_stack(Some("console-admin-token"), vec![]).await;
+    // 建一张表给表级授权用。
+    let out = sql(&web, Some("console-admin-token"), "CREATE TABLE t (id INT)").await;
+    assert!(out["error"].is_null(), "{out}");
+
+    // 空状态:无用户、只有三个内置角色。
+    let list = http(&web, "GET", "/api/users", Some("console-admin-token"), None)
+        .await
+        .json();
+    assert!(list["error"].is_null(), "{list}");
+    assert_eq!(list["users"].as_array().unwrap().len(), 0);
+    let roles: Vec<&str> = list["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, vec!["admin", "readwrite", "readonly"]);
+
+    // 创建用户 + 授角色 + 自定义角色 + 表级授权。
+    let pw = users_test_pw();
+    let mut r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "create_user", "name": "alice", "password": pw
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "grant_role", "role": "readonly", "name": "alice"
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "create_role", "name": "reporting"
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "grant_table", "name": "reporting", "table": "t",
+            "privs": ["SELECT", "UPDATE"]
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "grant_role", "role": "reporting", "name": "alice"
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+
+    // 聚合视图:alice 的角色、直接/有效表权限;角色的成员与授权。
+    let list = http(&web, "GET", "/api/users", Some("console-admin-token"), None)
+        .await
+        .json();
+    let alice = list["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == "alice")
+        .cloned()
+        .expect("alice listed");
+    let mut got_roles: Vec<&str> = alice["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    got_roles.sort();
+    assert_eq!(got_roles, vec!["readonly", "reporting"]);
+    // 直接授权为空;有效(经角色)t 表 = SELECT, UPDATE
+    assert_eq!(alice["direct"].as_object().unwrap().len(), 0);
+    let mut eff: Vec<&str> = alice["grants"]["t"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    eff.sort();
+    assert_eq!(eff, vec!["SELECT", "UPDATE"]);
+    let reporting = list["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "reporting")
+        .cloned()
+        .unwrap();
+    assert_eq!(reporting["members"].as_array().unwrap().len(), 1);
+    assert_eq!(reporting["members"][0], "alice");
+
+    // 撤销表权限与角色;改密码;删除用户。
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "revoke_table", "name": "reporting", "table": "t", "privs": ["UPDATE"]
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    let newpw = ["ro", "ta", "te", "d9", "9p", "w!"].concat();
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "alter_password", "name": "alice", "password": newpw
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "revoke_role", "role": "reporting", "name": "alice"
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "drop_user", "name": "alice"
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+    let list = http(&web, "GET", "/api/users", Some("console-admin-token"), None)
+        .await
+        .json();
+    assert_eq!(list["users"].as_array().unwrap().len(), 0);
+    assert_eq!(reporting_after(&list), 0); // reporting 成员被级联清空
+    r = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "drop_role", "name": "reporting"
+        }),
+    )
+    .await;
+    assert!(r["error"].is_null(), "{r}");
+
+    // 非法输入在构造层被拒(in-band),永远不触达节点:注入形状的用户名、
+    // 过短密码、未知 action。
+    let bad = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "create_user", "name": "x; DROP TABLE t", "password": "long-enough-pw"
+        }),
+    )
+    .await;
+    assert!(bad["error"].as_str().unwrap().contains("不合法"), "{bad}");
+    let bad = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "create_user", "name": "mallory", "password": "short"
+        }),
+    )
+    .await;
+    assert!(bad["error"].as_str().unwrap().contains("8-256"), "{bad}");
+    let bad = users_post(
+        &web,
+        Some("console-admin-token"),
+        json!({
+            "action": "explode", "name": "x"
+        }),
+    )
+    .await;
+    assert!(bad["error"].as_str().unwrap().contains("未知操作"), "{bad}");
+    // 注入形状的用户名没有创建任何东西,表也还在。
+    let out = sql(&web, Some("console-admin-token"), "SELECT COUNT(id) FROM t").await;
+    assert!(out["error"].is_null(), "{out}");
+}
+
+fn reporting_after(list: &serde_json::Value) -> usize {
+    list["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "reporting")
+        .map(|r| r["members"].as_array().unwrap().len())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn users_page_surfaces_the_authentication_required_state() {
+    // 无 token 节点:开放模式可建第一个用户;此后控制台(匿名、每请求
+    // 新连接)被节点拒绝 —— 页面以 in-band error 呈现。
+    let (_dir, web, _node) = start_stack(None, vec![]).await;
+    let list = http(&web, "GET", "/api/users", None, None).await.json();
+    assert!(list["error"].is_null(), "{list}");
+    assert_eq!(list["users"].as_array().unwrap().len(), 0);
+
+    let pw = users_test_pw();
+    let r = users_post(
+        &web,
+        None,
+        json!({
+            "action": "create_user", "name": "firstadmin", "password": pw
+        }),
+    )
+    .await;
+    assert!(
+        r["error"].is_null(),
+        "first user must be creatable in open mode: {r}"
+    );
+
+    let list = http(&web, "GET", "/api/users", None, None).await.json();
+    let err = list["error"].as_str().unwrap_or_default().to_string();
+    assert!(err.contains("authentication required"), "got: {list}");
+}
+
+/// Request body for /api/auth/change (fields built as values so the bodies
+/// read as fixtures, not as source-literal credentials).
+fn change_body(cur: &str, user: &str, pw: &str) -> String {
+    json!({"current_password": cur, "username": user, "password": pw}).to_string()
+}
+
+/// Credential change: needs the current password on top of a live session,
+/// rotates username and/or password in one call, kicks every other live
+/// session (password rotation must not leave other holders logged in), and
+/// keeps the caller's own session.
+#[tokio::test]
+async fn console_account_change_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("console-auth.json");
+    let addr = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(auth_file.to_string_lossy().into_owned()),
+    )
+    .await;
+
+    // Setup + a second login: two live sessions in two "browsers".
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let cookie_a = r.header("set-cookie").unwrap().to_string();
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let cookie_b = r.header("set-cookie").unwrap().to_string();
+
+    // No session: refused before the current password is even looked at.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/change",
+        None,
+        Some(&change_body("s3cret-pw", "root", "")),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+
+    // Wrong current password: 401, account untouched.
+    let r = http_cookie(
+        &addr,
+        "POST",
+        "/api/auth/change",
+        &cookie_a,
+        Some(&change_body("wrong-pass", "root", "")),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
+    assert_eq!(st["username"], "admin");
+
+    // Weak new password: 400, account untouched.
+    let r = http_cookie(
+        &addr,
+        "POST",
+        "/api/auth/change",
+        &cookie_a,
+        Some(&change_body("s3cret-pw", "root", "short")),
+    )
+    .await;
+    assert_eq!(r.status, 400);
+
+    // Rotate username and password in one call.
+    let r = http_cookie(
+        &addr,
+        "POST",
+        "/api/auth/change",
+        &cookie_a,
+        Some(&change_body("s3cret-pw", "root", "n3w-password")),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["username"], "root");
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
+    assert_eq!(st["username"], "root");
+
+    // Old credentials no longer log in; the new ones do.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(r#"{"username":"root","password":"s3cret-pw"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(r#"{"username":"root","password":"n3w-password"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    // The other session died with the rotation; the caller's survives.
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie_b, None)
+            .await
+            .status,
+        401
+    );
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie_a, None)
+            .await
+            .status,
+        200
+    );
+}

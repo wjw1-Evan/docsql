@@ -47,6 +47,10 @@
     border-bottom: 1px solid var(--border); padding: 0 6px; flex: none;
   }
   #menubar .brand { font-weight: 600; color: var(--accent-dk); margin-right: 10px; }
+.role-badge { display:inline-block; padding:1px 8px; border-radius:9px; background:var(--accent-bg, #e7f0ea); color:var(--accent-dk); font-size:12px; margin-right:4px; }
+.role-badge.builtin { background:#eee; color:#555; font-weight:600; }
+.grant-chip { display:inline-block; padding:1px 7px; border-radius:8px; background:#f2f2f2; border:1px solid #e2e2e2; font-size:11.5px; margin:1px 3px 1px 0; font-family:var(--mono); }
+button.danger { color:var(--err); }
   #menubar .brand small { color: var(--txt3); font-weight: 400; }
   .menu { position: relative; }
   .menu > span { display: inline-block; padding: 4px 10px; border-radius: 2px; cursor: default; }
@@ -269,6 +273,7 @@
     <div data-act="new-table">新建表…</div>
     <hr>
     <div data-act="close-tab">关闭当前文档</div>
+    <div data-act="account" style="display:none">修改账号…</div>
     <div data-act="logout" style="display:none">退出登录</div>
   </div></div>
   <div class="menu" data-menu><span>视图</span><div class="menu-drop">
@@ -418,7 +423,7 @@ const api = {
   }
 };
 
-/* ================= 控制台账号(首次使用设置 + 登录) ================= */
+/* ================= 控制台账号(首次使用设置 + 登录 + 修改) ================= */
 // 服务端启用 DOCSQL_WEB_AUTH_FILE 时:第一次使用强制创建账号,之后每次
 // 进入需登录(会话 Cookie,HttpOnly)。账号与密码哈希(PBKDF2)保存在控制台
 // 凭据文件中;off 模式维持原有令牌行为。
@@ -434,6 +439,7 @@ const authGate = {
     $('#token').style.display = 'none';
     $('#btn-connect').style.display = 'none';
     $('[data-act="logout"]').style.display = '';
+    $('[data-act="account"]').style.display = '';
     if (st.mode === 'login') {
       // 有效会话 Cookie(12h 滑动)应挺过页面刷新:只有认证探测确实
       // 401 时才弹登录遮罩,否则每次刷新都被强制重登、旧会话白白堆积。
@@ -479,6 +485,43 @@ const authGate = {
     } catch (e) { err('请求失败:' + e.message); }
   }
 };
+
+/* ================= 修改控制台账号 ================= */
+// 「文件 → 修改账号…」:需当前密码(防被劫持的页面静默换凭据);改密码
+// 后其他已登录会话在服务端全部下线(keep_only),当前会话保留。新密码
+// 留空 = 只改用户名。密码不做 trim(口令前后空格有效)。
+function accountDialog() {
+  if (!authGate.active) return;
+  const ov = showModal(`<div class="dialog" style="min-width:380px"><h3>修改控制台账号</h3><div class="body">
+    <div class="row"><label>当前密码</label><input type="password" id="acc-cur" autocomplete="current-password"></div>
+    <div class="row"><label>新用户名</label><input type="text" id="acc-user" value="${esc(authGate.lastUser || '')}" autocomplete="username"></div>
+    <div class="row"><label>新密码</label><input type="password" id="acc-pass" placeholder="留空则不修改密码" autocomplete="new-password"></div>
+    <div class="row"><label>确认新密码</label><input type="password" id="acc-confirm" autocomplete="new-password"></div>
+    <div class="hint">修改密码后,其他已登录的会话将全部退出,当前浏览器会话保持不变。账号保存在控制台凭据文件中,与数据库用户无关。</div>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`,
+    '#acc-cur');
+  $('[data-ok]', ov).onclick = async () => {
+    const err = (m) => { $('[data-err]', ov).textContent = m || ''; };
+    const cur = $('#acc-cur', ov).value;
+    const u = $('#acc-user', ov).value.trim();
+    const p = $('#acc-pass', ov).value, pc = $('#acc-confirm', ov).value;
+    if (!cur) return err('请输入当前密码');
+    if (!u) return err('请输入新用户名');
+    if (p && p.length < 8) return err('新密码至少 8 个字符');
+    if (p && p !== pc) return err('两次输入的新密码不一致');
+    try {
+      const r = await fetch('/api/auth/change', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                   body: JSON.stringify({current_password: cur, username: u, password: p})});
+      const out = await r.json();
+      if (!r.ok) return err(out.error || ('失败(' + r.status + ')'));
+      authGate.lastUser = out.username || u;
+      closeModal();
+      ui.toast('账号已更新');
+    } catch (e) { err('请求失败:' + e.message); }
+  };
+  ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
+}
 
 /* ================= UI 反馈 ================= */
 const ui = {
@@ -588,7 +631,7 @@ function showModal(html, focusSel) {
 }
 function dialog(title, fields, okText, onOk) {
   const ov = showModal(`<div class="dialog"><h3>${esc(title)}</h3><div class="body">` +
-    fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="text" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
+    fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="${esc(f.type||'text')}" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
     `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`,
     'input[data-f]');
   $('[data-ok]', ov).onclick = async () => {
@@ -1000,7 +1043,7 @@ const tabs = {
     this.activate(t);
     return t;
   },
-  kindIcon(kind) { return { query: 'query', data: 'table', dash: 'dashboard', cluster: 'cluster', logs: 'log' }[kind] || 'view'; },
+  kindIcon(kind) { return { query: 'query', data: 'table', dash: 'dashboard', cluster: 'cluster', logs: 'log', users: 'key', backup: 'server' }[kind] || 'view'; },
   activate(t) {
     this.active = t;
     $$('.tab').forEach(el => el.classList.remove('active'));
@@ -1403,6 +1446,242 @@ function openClusterTab() {
     t.load();
   });
 }
+
+/* ================= 用户与角色 ================= */
+// 数据库用户/角色/表级权限的管理页(GET+POST /api/users;动作在受管节点
+// 上以管理员身份执行,语句由后端固定模板构造)。页面对 in-band error
+// (节点要求认证、权限不足等)整卡显示;每个成功动作后整页刷新。
+const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
+function openUsersTab() {
+  tabs.open('users', 'users', '用户与角色', (t) => {
+    t.el.innerHTML = `<div class="dash">
+      <h2>用户与角色</h2>
+      <div class="sub">数据库级访问控制 · 变更经默认管理节点执行并随集群复制 · 详见 README「数据库用户与角色」</div>
+      <div class="dash-actions">
+        <button class="primary" data-do="newuser">新建用户</button>
+        <button data-do="newrole">新建角色</button>
+        <button data-do="refresh">刷新</button>
+        <span class="meta" data-at style="color:var(--txt3)"></span>
+      </div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)">正在读取用户与角色…</div></div>
+    </div>`;
+    $('[data-do="newuser"]', t.el).onclick = () => usersPage.newUserDialog(t);
+    $('[data-do="newrole"]', t.el).onclick = () => usersPage.newRoleDialog(t);
+    $('[data-do="refresh"]', t.el).onclick = () => t.load();
+    t.render = (data) => usersPage.render(t, data);
+    t.load = async () => {
+      let data;
+      try {
+        data = await api.get('/api/users');
+        if (!data.error) {
+          const meta = await api.get('/api/meta');
+          data.tables = (meta.tables || []).map(x => x.name).filter(n => n);
+        }
+      } catch (e) { data = {error: e.message}; }
+      t.render(data);
+      $('[data-at]', t.el).textContent = '更新于 ' + new Date().toLocaleTimeString();
+    };
+    t.load();
+  });
+}
+
+const usersPage = {
+  badge(name, builtin) {
+    return `<span class="role-badge${builtin ? ' builtin' : ''}">${esc(name)}</span>`;
+  },
+  grantChips(grants) {
+    const keys = Object.keys(grants || {});
+    if (!keys.length) return '<span class="null">—</span>';
+    return keys.sort().map(tbl =>
+      `<span class="grant-chip" title="表 ${esc(tbl)} 上的权限">${esc(tbl)}: ${esc((grants[tbl]||[]).sort().join(', '))}</span>`).join(' ');
+  },
+  render(t, data) {
+    const body = $('[data-body]', t.el);
+    if (data.error) {
+      const needAuth = /authentication required/.test(data.error);
+      body.innerHTML = `<div class="card" style="max-width:640px">
+        <div class="v" style="font-size:15px;color:var(--err)">无法读取用户与角色</div>
+        <div class="k" style="line-height:1.7">${esc(data.error)}${needAuth ? '<br>该节点已启用数据库用户:为 Web 服务与节点配置一致的 <b>DOCSQL_TOKEN</b>(管理员凭据)后即可在此管理。' : ''}</div></div>`;
+      return;
+    }
+    const users = data.users || [], roles = data.roles || [];
+    const cards = [
+      [`${users.length}<small> 个</small>`, '数据库用户'],
+      [`${roles.length}<small> 个</small>`, '角色(含内置 3 个)'],
+      [`${roles.filter(r => !r.builtin).length}<small> 个</small>`, '自定义角色'],
+    ];
+    let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
+      `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
+    html += `<h3 style="margin:10px 0 6px">用户</h3>`;
+    if (!users.length) {
+      html += `<div class="k" style="color:var(--txt3)">尚无数据库用户:节点处于开放模式(或仅 token 认证)。创建第一个用户后,新的匿名连接将被拒绝 —— 建议先为节点配置 DOCSQL_TOKEN。</div>`;
+    } else {
+      html += `<table class="grid"><thead><tr><th>用户名</th><th>角色</th><th>表级权限</th><th style="width:290px">操作</th></tr></thead><tbody>`;
+      for (const u of users) {
+        html += `<tr>
+          <td style="font-family:var(--mono)">${esc(u.name)}</td>
+          <td>${(u.roles||[]).map(r => this.badge(r)).join(' ') || '<span class="null">无(仅直授权限)</span>'}</td>
+          <td>${this.grantChips(u.grants)}</td>
+          <td>
+            <button data-act="pw" data-name="${esc(u.name)}">改密码</button>
+            <button data-act="role" data-name="${esc(u.name)}">角色</button>
+            <button data-act="tgrants" data-name="${esc(u.name)}" data-kind="user">表权限</button>
+            <button data-act="drop" data-name="${esc(u.name)}" class="danger">删除</button>
+          </td></tr>`;
+      }
+      html += `</tbody></table>`;
+    }
+    html += `<h3 style="margin:16px 0 6px">角色</h3><table class="grid"><thead><tr><th>角色</th><th>说明</th><th>成员</th><th>表级权限</th><th style="width:230px">操作</th></tr></thead><tbody>`;
+    const DESC = {admin: '全部权限(DDL/用户管理/备份/恢复/PROMOTE)', readwrite: '全部表 DML + PUBLISH/TRIM', readonly: '全部表 SELECT'};
+    for (const r of roles) {
+      html += `<tr>
+        <td style="font-family:var(--mono)">${this.badge(r.name, r.builtin)}</td>
+        <td class="k">${r.builtin ? esc(DESC[r.name] || '') : '自定义角色(表级权限)'}</td>
+        <td>${(r.members||[]).map(m => esc(m)).join(', ') || '<span class="null">—</span>'}</td>
+        <td>${this.grantChips(r.grants)}</td>
+        <td>
+          <button data-act="role" data-name="${esc(r.name)}" data-asrole="1">成员</button>
+          <button data-act="tgrants" data-name="${esc(r.name)}" data-kind="role">表权限</button>
+          ${r.builtin ? '' : `<button data-act="droprole" data-name="${esc(r.name)}" class="danger">删除</button>`}
+        </td></tr>`;
+    }
+    html += `</tbody></table>`;
+    body.innerHTML = html;
+    $$('button[data-act]', body).forEach(b => { b.onclick = () => this.dispatch(t, b, data); });
+  },
+
+  async dispatch(t, b, data) {
+    const name = b.dataset.name, act = b.dataset.act;
+    if (act === 'pw') return this.passwordDialog(t, name);
+    if (act === 'role') return this.roleDialog(t, name, !!b.dataset.asrole, data);
+    if (act === 'tgrants') return this.tableGrantsDialog(t, name, b.dataset.kind, data);
+    if (act === 'drop') {
+      return dialog(`删除用户 ${name}`, [{name: 'name', label: '输入用户名以确认', value: '', ph: name}], '删除', async (v, err) => {
+        if (v.name !== name) return err('用户名不一致');
+        const r = await api.post('/api/users', {action: 'drop_user', name});
+        if (r.error) return err(r.error);
+        ui.toast(`已删除用户 ${name}`); t.load();
+      });
+    }
+    if (act === 'droprole') {
+      return dialog(`删除角色 ${name}`, [{name: 'name', label: '输入角色名以确认', value: '', ph: name}], '删除', async (v, err) => {
+        if (v.name !== name) return err('角色名不一致');
+        const r = await api.post('/api/users', {action: 'drop_role', name});
+        if (r.error) return err(r.error);
+        ui.toast(`已删除角色 ${name}`); t.load();
+      });
+    }
+  },
+
+  newUserDialog(t) {
+    dialog('新建用户', [
+      {name: 'name', label: '用户名', ph: '字母开头,可含数字/_/$'},
+      {name: 'password', label: '密码', type: 'password', ph: '至少 8 位'},
+      {name: 'confirm', label: '确认密码', type: 'password'},
+    ], '创建', async (v, err) => {
+      if (!v.name) return err('请输入用户名');
+      if (v.password !== v.confirm) return err('两次输入的密码不一致');
+      const r = await api.post('/api/users', {action: 'create_user', name: v.name, password: v.password});
+      if (r.error) return err(r.error);
+      ui.toast(`已创建用户 ${v.name}`); t.load();
+    });
+  },
+
+  newRoleDialog(t) {
+    dialog('新建角色', [{name: 'name', label: '角色名', ph: '如 reporting'}], '创建', async (v, err) => {
+      if (!v.name) return err('请输入角色名');
+      const r = await api.post('/api/users', {action: 'create_role', name: v.name});
+      if (r.error) return err(r.error);
+      ui.toast(`已创建角色 ${v.name}`); t.load();
+    });
+  },
+
+  passwordDialog(t, name) {
+    dialog(`修改 ${name} 的密码`, [
+      {name: 'password', label: '新密码', type: 'password', ph: '至少 8 位'},
+      {name: 'confirm', label: '确认新密码', type: 'password'},
+    ], '修改', async (v, err) => {
+      if (v.password !== v.confirm) return err('两次输入的密码不一致');
+      const r = await api.post('/api/users', {action: 'alter_password', name, password: v.password});
+      if (r.error) return err(r.error);
+      ui.toast(`已修改 ${name} 的密码`); t.load();
+    });
+  },
+
+  roleDialog(t, name, asRole, data) {
+    // asRole: name 是角色 → 选择要添加/移除的成员;否则 name 是用户 → 选择角色
+    const options = asRole
+      ? (data.users || []).map(u => u.name)
+      : (data.roles || []).map(r => r.name);
+    const ov = showModal(`<div class="dialog"><h3>${asRole ? `管理角色 ${esc(name)} 的成员` : `管理用户 ${esc(name)} 的角色`}</h3><div class="body">
+      <div class="row"><label>${asRole ? '成员(用户)' : '角色'}</label>
+        <select data-f="target" style="flex:1">${options.map(o => `<option>${esc(o)}</option>`).join('')}</select>
+        <button data-remove style="margin-left:6px;color:var(--err)">移除</button></div>
+      <div class="hint">${asRole ? '移除 = REVOKE 该用户的此角色。' : '移除 = REVOKE 该角色;立即生效(其已有连接的下一条语句起)。'}</div>
+      <div class="err-line" data-err></div></div>
+      <div class="foot"><button data-cancel>关闭</button><button class="primary" data-ok>授予</button></div></div>`,
+      'select[data-f="target"]');
+    const target = () => $('select[data-f="target"]', ov).value;
+    const run = async (action, err) => {
+      const body = asRole
+        ? {action, role: name, name: target()}
+        : {action, role: target(), name};
+      const r = await api.post('/api/users', body);
+      if (r.error) return err(r.error);
+      ui.toast('已更新'); closeModal(); t.load();
+    };
+    $('[data-ok]', ov).onclick = () => run('grant_role', m => $('[data-err]', ov).textContent = m || '');
+    $('[data-remove]', ov).onclick = () => run('revoke_role', m => $('[data-err]', ov).textContent = m || '');
+  },
+
+  tableGrantsDialog(t, name, kind, data) {
+    // 当前有效权限(用户 = 直接 + 角色聚合;角色 = 自身)。保存时对每个
+    // (表, 权限) 做 diff:新增 → grant_table,取消 → revoke_table。
+    const src = kind === 'user'
+      ? (data.users || []).find(u => u.name === name)
+      : (data.roles || []).find(r => r.name === name);
+    // 用户编辑直接授予部分;角色携带的权限在角色区管理(取消这里的
+    // 勾选不会影响其经角色的生效)。
+    const current = (src && (kind === 'user' ? src.direct : src.grants)) || {};
+    const tables = data.tables || [];
+    if (!tables.length) {
+      ui.toast('没有可授权的表(先建表)', true); return;
+    }
+    const row = (tbl) => `<tr>
+      <td style="font-family:var(--mono)">${esc(tbl)}</td>
+      ${PRIVS.map(p => `<td style="text-align:center"><input type="checkbox" data-t="${esc(tbl)}" data-p="${p}"${(current[tbl] || []).includes(p) ? ' checked' : ''}></td>`).join('')}
+    </tr>`;
+    const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:760px"><h3>表级权限 — ${esc(name)}${kind === 'role' ? '(角色)' : ''}</h3><div class="body">
+      <table class="colgrid"><thead><tr><th style="width:34%">表</th>${PRIVS.map(p => `<th>${p}</th>`).join('')}</tr></thead>
+      <tbody>${tables.map(row).join('')}</tbody></table>
+      <div class="hint">${kind === 'user' ? '此处编辑直接授予的表级权限;用户通过角色获得的权限请在「角色」区管理(它们不在此显示)。' : '角色的表级权限对其全部成员生效。'}</div>
+      <div class="err-line" data-err></div></div>
+      <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`,
+      'input[type="checkbox"]');
+    $('[data-ok]', ov).onclick = async () => {
+      const err = $('[data-err]', ov);
+      err.textContent = '';
+      const want = {};
+      $$('input[type="checkbox"]', ov).forEach(cb => {
+        if (cb.checked) (want[cb.dataset.t] = want[cb.dataset.t] || []).push(cb.dataset.p);
+      });
+      const ops = [];
+      for (const tbl of tables) {
+        const have = current[tbl] || [];
+        const add = (want[tbl] || []).filter(p => !have.includes(p));
+        const del = have.filter(p => !(want[tbl] || []).includes(p));
+        if (add.length) ops.push({action: 'grant_table', table: tbl, privs: add});
+        if (del.length) ops.push({action: 'revoke_table', table: tbl, privs: del});
+      }
+      if (!ops.length) { closeModal(); return; }
+      for (const op of ops) {
+        const r = await api.post('/api/users', Object.assign({name}, op));
+        if (r.error) { err.textContent = r.error; return; }
+      }
+      ui.toast('表级权限已更新'); closeModal(); t.load();
+    };
+  },
+};
 
 /* ================= 备份管理 ================= */
 // 当前管理目标(节点切换器选定)的自动备份状态与备份文件列表(GET
@@ -1890,6 +2169,7 @@ const explorer = {
       ctx.open([
         {id: 'newtable', label: '新建表…', act: () => newTableDialog()},
         {id: 'dash', label: '服务器仪表盘', act: () => openDashboard()},
+        {id: 'users', label: '用户与角色', act: () => openUsersTab()},
         {id: 'cluster', label: '集群状态', act: () => openClusterTab()},
         {id: 'logs', label: '日志', act: () => openLogsTab()},
         {id: 'backup', label: '备份管理', act: () => openBackupTab()},
@@ -1972,9 +2252,11 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'close-tab') { if (tabs.active) tabs.close(tabs.active); }
     else if (act === 'refresh') explorer.refresh();
     else if (act === 'dashboard') openDashboard();
+    else if (act === 'users') openUsersTab();
     else if (act === 'cluster') openClusterTab();
     else if (act === 'logs') openLogsTab();
     else if (act === 'backup') openBackupTab();
+    else if (act === 'account') accountDialog();
     else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST'}).finally(() => location.reload());
     else if (act === 'about') dialog('关于 DocSQL Studio', [
       {name:'a', label: '产品', value: 'DocSQL Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},

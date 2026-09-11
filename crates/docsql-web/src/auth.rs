@@ -309,6 +309,55 @@ impl AuthStore {
         docsql_server::crypto::constant_time_eq(&candidate, &creds.hash)
     }
 
+    /// Change the account's username and/or password. The caller must prove
+    /// the current password even though the endpoint is session-gated: the
+    /// session keeps drive-by attackers out, the current password keeps a
+    /// hijacked tab from silently taking over the credential file. An absent
+    /// new password keeps the current one (username-only rename). The file
+    /// is rewritten before the in-memory copy moves, so a failed write
+    /// leaves the old credentials authoritative.
+    pub fn change_credentials(
+        &mut self,
+        current_password: &str,
+        new_username: &str,
+        new_password: Option<&str>,
+    ) -> Result<Creds, ChangeError> {
+        let Some(creds) = &self.creds else {
+            return Err(ChangeError::Auth);
+        };
+        let candidate = derive_hash(current_password, &creds.salt, creds.iterations);
+        if !docsql_server::crypto::constant_time_eq(&candidate, &creds.hash) {
+            return Err(ChangeError::Auth);
+        }
+        let new_username = new_username.trim();
+        if let Err(msg) = validate_username(new_username) {
+            return Err(ChangeError::Invalid(msg));
+        }
+        let next = match new_password {
+            Some(pw) => {
+                if let Err(msg) = validate_password(pw) {
+                    return Err(ChangeError::Invalid(msg));
+                }
+                // Fresh salt on re-key: the stored hash never rests on a
+                // (password, salt) pair an attacker may already hold.
+                let salt = random_salt();
+                Creds {
+                    username: new_username.to_string(),
+                    salt,
+                    iterations: PBKDF2_ITERATIONS,
+                    hash: derive_hash(pw, &salt, PBKDF2_ITERATIONS),
+                }
+            }
+            None => Creds {
+                username: new_username.to_string(),
+                ..creds.clone()
+            },
+        };
+        self.write(&next).map_err(ChangeError::Io)?;
+        self.creds = Some(next.clone());
+        Ok(next)
+    }
+
     fn write(&self, creds: &Creds) -> Result<(), String> {
         let doc = json!({
             "version": 1,
@@ -429,6 +478,18 @@ pub enum SetupError {
     Io(String),
 }
 
+/// Why a credential-change attempt failed. Same lockout split as
+/// `SetupError`: `Auth` is a guess at the current password (possibly
+/// hostile, counts toward the lockout); validation errors are honest
+/// fumbling and do not.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeError {
+    /// Current password did not verify (or no account exists yet).
+    Auth,
+    Invalid(String),
+    Io(String),
+}
+
 pub fn derive_hash(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations, &mut out);
@@ -508,6 +569,16 @@ impl Sessions {
 
     pub fn drop_session(&self, token: &str) {
         self.map.lock().unwrap().remove(token);
+    }
+
+    /// Drop every session except `keep` (`None` = drop all). Credential
+    /// rotation must not leave other logged-in holders live; the caller's
+    /// own session (or a token-bypass caller, which holds none) survives.
+    pub fn keep_only(&self, keep: Option<&str>) {
+        self.map
+            .lock()
+            .unwrap()
+            .retain(|token, _| Some(token.as_str()) == keep);
     }
 }
 
@@ -735,5 +806,98 @@ mod tests {
         assert!(s.verify(t.as_str()));
         s.drop_session(t.as_str());
         assert!(!s.verify(t.as_str()));
+    }
+
+    #[test]
+    fn change_credentials_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-auth.json");
+        let mut store = AuthStore::open(&path).unwrap();
+        store.setup("admin", "s3cret-pw").unwrap();
+
+        // Rename + re-key in one call: old identity is gone in memory.
+        let creds = store
+            .change_credentials("s3cret-pw", "root", Some("n3w-password"))
+            .unwrap();
+        assert_eq!(creds.username, "root");
+        assert!(store.verify("root", "n3w-password"));
+        assert!(!store.verify("admin", "s3cret-pw"));
+        assert!(!store.verify("root", "s3cret-pw"));
+
+        // The rewrite is durable: a fresh store sees the new identity only.
+        let store = AuthStore::open(&path).unwrap();
+        assert_eq!(store.username(), Some("root"));
+        assert!(store.verify("root", "n3w-password"));
+        assert!(!store.verify("admin", "s3cret-pw"));
+    }
+
+    #[test]
+    fn change_requires_current_password_and_valid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-auth.json");
+        let mut store = AuthStore::open(&path).unwrap();
+        // No account yet: nothing to authenticate against.
+        assert_eq!(
+            store
+                .change_credentials("whatever1", "root", None)
+                .unwrap_err(),
+            ChangeError::Auth
+        );
+        store.setup("admin", "s3cret-pw").unwrap();
+
+        // Wrong current password: refused, identity unchanged.
+        assert_eq!(
+            store
+                .change_credentials("wrong-pass", "root", None)
+                .unwrap_err(),
+            ChangeError::Auth
+        );
+        assert!(store.verify("admin", "s3cret-pw"));
+
+        // Policy violations on the new values: refused, identity unchanged.
+        assert_eq!(
+            store.change_credentials("s3cret-pw", "", None).unwrap_err(),
+            ChangeError::Invalid("用户名需为 1-64 个字符".into())
+        );
+        assert_eq!(
+            store
+                .change_credentials("s3cret-pw", "root", Some("short"))
+                .unwrap_err(),
+            ChangeError::Invalid("密码至少 8 个字符".into())
+        );
+        assert_eq!(
+            store
+                .change_credentials("s3cret-pw", "root", Some("aaaaaaaa"))
+                .unwrap_err(),
+            ChangeError::Invalid("密码不能为单一字符重复".into())
+        );
+        assert_eq!(store.username(), Some("admin"));
+        assert!(store.verify("admin", "s3cret-pw"));
+    }
+
+    #[test]
+    fn change_username_only_keeps_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-auth.json");
+        let mut store = AuthStore::open(&path).unwrap();
+        store.setup("admin", "s3cret-pw").unwrap();
+        store.change_credentials("s3cret-pw", "ops", None).unwrap();
+        assert!(store.verify("ops", "s3cret-pw"));
+        assert!(!store.verify("admin", "s3cret-pw"));
+        let reopened = AuthStore::open(&path).unwrap();
+        assert_eq!(reopened.username(), Some("ops"));
+        assert!(reopened.verify("ops", "s3cret-pw"));
+    }
+
+    #[test]
+    fn sessions_keep_only_survivor() {
+        let s = Sessions::new();
+        let a = s.create();
+        let b = s.create();
+        s.keep_only(Some(a.as_str()));
+        assert!(s.verify(a.as_str()));
+        assert!(!s.verify(b.as_str()));
+        s.keep_only(None);
+        assert!(!s.verify(a.as_str()));
     }
 }

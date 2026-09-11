@@ -154,11 +154,13 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/cluster", get(api_cluster))
         .route("/api/logs", get(api_logs))
+        .route("/api/users", get(api_users).post(api_users_action))
         .route("/api/backup", get(api_backup).post(api_backup_trigger))
         .route("/api/backup/restore", post(api_backup_restore))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/setup", post(auth_setup))
         .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/change", post(auth_change))
         .route("/api/auth/logout", post(auth_logout))
         .with_state(state)
 }
@@ -408,6 +410,85 @@ async fn auth_logout(State(state): State<Arc<WebState>>, headers: HeaderMap) -> 
 }
 
 #[derive(serde::Deserialize)]
+struct ChangeBody {
+    current_password: String,
+    /// New username (the console account is a single identity).
+    username: String,
+    /// New password; empty = keep the current one (username-only change).
+    password: String,
+}
+
+/// Change the console account's username and/or password. Double-gated: a
+/// live session (or the token bypass) AND the account's current password —
+/// the session keeps drive-by attackers out, the current password keeps a
+/// hijacked tab from silently rotating the credentials. A wrong current
+/// password counts toward the same per-IP login lockout. On success every
+/// other live session is dropped (a password rotation kicks other holders
+/// out); the caller's own session survives, token-bypass callers hold no
+/// session so all of them go.
+async fn auth_change(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChangeBody>,
+) -> Response {
+    let Some(a) = &state.auth else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": "console account is not enabled"}),
+        );
+    };
+    if check_auth(&state, &headers).is_some() {
+        return json_response(StatusCode::UNAUTHORIZED, json!({"error": "请先登录"}));
+    }
+    let source = lockout_key(&state, &headers, peer);
+    if a.lockout.lock().unwrap().check(source) {
+        return json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "尝试次数过多,请一分钟后再试"}),
+        );
+    }
+    let caller_session = session_from(&headers);
+    // PBKDF2 verify/derive — same blocking-pool discipline as login/setup.
+    let st = state.clone();
+    let cur_pw = body.current_password.clone();
+    let new_user = body.username.clone();
+    let new_pw = (!body.password.is_empty()).then(|| body.password.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        let a = st.auth.as_ref().expect("checked at fn entry");
+        a.store
+            .lock()
+            .unwrap()
+            .change_credentials(&cur_pw, &new_user, new_pw.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| Err(auth::ChangeError::Io("task panicked".into())));
+    match result {
+        Ok(creds) => {
+            a.lockout.lock().unwrap().reset(source);
+            a.sessions.keep_only(caller_session.as_deref());
+            json_response(
+                StatusCode::OK,
+                json!({"ok": true, "username": creds.username}),
+            )
+        }
+        Err(auth::ChangeError::Auth) => {
+            a.lockout.lock().unwrap().record_failure(source);
+            // Same generic shape as login: no hint which part failed (the
+            // current password is the only secret here).
+            json_response(StatusCode::UNAUTHORIZED, json!({"error": "当前密码不正确"}))
+        }
+        Err(auth::ChangeError::Invalid(msg)) => {
+            json_response(StatusCode::BAD_REQUEST, json!({"error": msg}))
+        }
+        Err(auth::ChangeError::Io(msg)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": format!("凭据写入失败:{msg}")}),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct SqlBody {
     sql: String,
     /// Managed-node override (node switching): must be one of DOCSQL_PEERS.
@@ -499,6 +580,327 @@ async fn api_parse(
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(m) => Ok(Json(serde_json::json!({"ok": false, "message": m}))),
     }
+}
+
+// ---- 数据库用户与角色管理(/api/users)----
+//
+// 控制台把用户/角色的增删改授权转发给受管节点(REQ_SQL;控制台自身的
+// 节点连接是 token 管理员身份)。语句绝不做任意拼接:全部来自固定模板,
+// 模板参数只接受两种形式之一——
+//   * 标识符(用户/角色/权限名):按引擎 `useradmin::validate_name` 的
+//     同一字符集白名单校验([A-Za-z_][A-Za-z0-9_$]*,≤64);
+//   * 密码:单引号字面量,内部 ' 双写转义;
+//   * 表名:双引号标识符,内部 " 双写转义(表名可为任意 Unicode)。
+// 其余输入一律拒绝。读侧仅运行四条固定 SELECT。
+
+/// 用户/角色名的字符集白名单(镜像引擎校验,前端给出友好错误)。
+fn valid_user_ident(name: &str) -> bool {
+    let n = name.len();
+    if n == 0 || n > 64 {
+        return false;
+    }
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+fn sql_str_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn sql_ident_lit(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+#[derive(serde::Deserialize)]
+struct UsersActionBody {
+    action: String,
+    /// Managed-node override (the console's api.post merges the selected
+    /// node into the JSON body).
+    node: Option<String>,
+    /// 用户名 / 角色名 / 成员 / 权限接收方(grantee),按 action 取义。
+    name: Option<String>,
+    password: Option<String>,
+    /// grant_role/revoke_role 的角色名(可为内置角色)。
+    role: Option<String>,
+    /// grant_table/revoke_table 的表名。
+    table: Option<String>,
+    /// 表级权限(SELECT/INSERT/UPDATE/DELETE/ALL)。
+    privs: Option<Vec<String>>,
+}
+
+/// Build the fixed user-management statement for one action. Validation
+/// errors surface as `Err` and become in-band `{"error": …}` responses.
+fn build_user_admin_statement(b: &UsersActionBody) -> Result<String, String> {
+    let ident = |v: &Option<String>, what: &str| -> Result<String, String> {
+        let Some(name) = v else {
+            return Err(format!("缺少 {what}"));
+        };
+        if !valid_user_ident(name) {
+            return Err(format!(
+                "{what} {name:?} 不合法:1-64 个字符,首字符为字母或下划线,其余为字母/数字/_/$"
+            ));
+        }
+        Ok(name.clone())
+    };
+    let password = |v: &Option<String>| -> Result<String, String> {
+        let Some(p) = v else {
+            return Err("缺少密码".into());
+        };
+        let len = p.chars().count();
+        if !(8..=256).contains(&len) {
+            return Err(format!("密码长度必须为 8-256 个字符(当前 {len})"));
+        }
+        Ok(p.clone())
+    };
+    let privs = |v: &Option<Vec<String>>| -> Result<String, String> {
+        let list = v.clone().unwrap_or_default();
+        if list.is_empty() {
+            return Err("缺少权限列表(SELECT/INSERT/UPDATE/DELETE/ALL)".into());
+        }
+        for p in &list {
+            if !matches!(
+                p.to_uppercase().as_str(),
+                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "ALL"
+            ) {
+                return Err(format!(
+                    "未知权限 {p:?}(可选 SELECT/INSERT/UPDATE/DELETE/ALL)"
+                ));
+            }
+        }
+        Ok(list.join(", "))
+    };
+    match b.action.as_str() {
+        "create_user" => Ok(format!(
+            "CREATE USER {} PASSWORD {}",
+            ident(&b.name, "用户名")?,
+            sql_str_lit(&password(&b.password)?)
+        )),
+        "alter_password" => Ok(format!(
+            "ALTER USER {} PASSWORD {}",
+            ident(&b.name, "用户名")?,
+            sql_str_lit(&password(&b.password)?)
+        )),
+        "drop_user" => Ok(format!("DROP USER {}", ident(&b.name, "用户名")?)),
+        "create_role" => Ok(format!("CREATE ROLE {}", ident(&b.name, "角色名")?)),
+        "drop_role" => Ok(format!("DROP ROLE {}", ident(&b.name, "角色名")?)),
+        "grant_role" => Ok(format!(
+            "GRANT {} TO {}",
+            ident(&b.role, "角色名")?,
+            ident(&b.name, "用户名")?
+        )),
+        "revoke_role" => Ok(format!(
+            "REVOKE {} FROM {}",
+            ident(&b.role, "角色名")?,
+            ident(&b.name, "用户名")?
+        )),
+        "grant_table" | "revoke_table" => {
+            let grantee = ident(&b.name, "授权对象(用户或角色名)")?;
+            let Some(table) = &b.table else {
+                return Err("缺少表名".into());
+            };
+            if table.is_empty() || table.len() > 128 {
+                return Err("表名长度必须为 1-128 个字符".into());
+            }
+            let keyword = if b.action == "grant_table" {
+                "TO"
+            } else {
+                "FROM"
+            };
+            Ok(format!(
+                "{} {} ON {} {keyword} {grantee}",
+                if b.action == "grant_table" {
+                    "GRANT"
+                } else {
+                    "REVOKE"
+                },
+                privs(&b.privs)?,
+                sql_ident_lit(table)
+            ))
+        }
+        other => Err(format!(
+            "未知操作 {other:?}(create_user/alter_password/drop_user/create_role/drop_role/\
+             grant_role/revoke_role/grant_table/revoke_table)"
+        )),
+    }
+}
+
+/// 用户与角色的聚合视图(GET /api/users):四条固定 SELECT 拉取节点上的
+/// 用户、角色、成员与表级授权,拼成控制台页面所需的形状。表尚不存在
+/// (=从未创建过用户)按空集处理。
+async fn api_users(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(params): Query<NodeParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    let out = result_to_json(
+        (async {
+            let target = target_for(&state, &params.node)
+                .map_err(|e| e["error"].as_str().unwrap_or_default().to_string())?;
+            let query = |sql: &'static str| {
+                let addr = target.clone();
+                let token = state.token.clone();
+                async move {
+                    let payload = proto::encode_sql(sql).map_err(|e| e.to_string())?;
+                    let f = node_roundtrip(
+                        &addr,
+                        token.as_deref(),
+                        Frame::new(proto::REQ_SQL, payload),
+                    )
+                    .await?;
+                    match f.frame_type {
+                        proto::RESP_ROWS => {
+                            let v: serde_json::Value = serde_json::from_slice(&f.payload)
+                                .map_err(|e| format!("节点 {addr} 返回了无法解析的结果: {e}"))?;
+                            Ok(v["rows"].as_array().cloned().unwrap_or_default())
+                        }
+                        // 无用户节点尚未建表:按空集处理。
+                        proto::RESP_ERROR
+                            if String::from_utf8_lossy(&f.payload).contains("does not exist") =>
+                        {
+                            Ok(Vec::new())
+                        }
+                        proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
+                        other => Err(format!("节点 {addr} 返回了意外帧: {other:#06x}")),
+                    }
+                }
+            };
+            let user_rows = query("SELECT name FROM docsql_users").await?;
+            let role_rows = query("SELECT name FROM docsql_roles").await?;
+            let member_rows = query("SELECT role, member FROM docsql_role_members").await?;
+            let grant_rows = query("SELECT grantee, priv, tbl FROM docsql_grants").await?;
+            let col = |row: &serde_json::Value, i: usize| {
+                row.as_array()
+                    .and_then(|a| a.get(i))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            // grantee -> {table -> [priv, ...]}
+            let mut grants: std::collections::BTreeMap<
+                String,
+                serde_json::Map<String, serde_json::Value>,
+            > = Default::default();
+            for row in &grant_rows {
+                let (grantee, priv_, tbl) = (col(row, 0), col(row, 1), col(row, 2));
+                grants
+                    .entry(grantee)
+                    .or_default()
+                    .entry(tbl)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .expect("just created as array")
+                    .push(serde_json::json!(priv_));
+            }
+            let grants_json = |grantee: &str, roles: &[String]| -> serde_json::Value {
+                let mut out = serde_json::Map::new();
+                for g in std::iter::once(&grantee.to_string()).chain(roles.iter()) {
+                    if let Some(tables) = grants.get(g) {
+                        for (tbl, privs) in tables {
+                            let arr = out
+                                .entry(tbl.clone())
+                                .or_insert_with(|| serde_json::json!([]));
+                            if let Some(a) = arr.as_array_mut() {
+                                for p in privs.as_array().cloned().unwrap_or_default() {
+                                    if !a.contains(&p) {
+                                        a.push(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                serde_json::Value::Object(out)
+            };
+            let users: Vec<serde_json::Value> = user_rows
+                .iter()
+                .map(|row| {
+                    let name = col(row, 0);
+                    let roles: Vec<String> = member_rows
+                        .iter()
+                        .filter(|m| col(m, 1) == name)
+                        .map(|m| col(m, 0))
+                        .collect();
+                    // `grants` 为展示用的有效权限(直接 + 角色);`direct` 是
+                    // 编辑器使用的直接授予部分 —— 取消角色携带的位不是直接
+                    // REVOKE 能表达的,角色权限在角色区管理。
+                    let direct = grants.get(&name).cloned().unwrap_or_default();
+                    serde_json::json!({
+                        "name": name,
+                        "roles": roles,
+                        "grants": grants_json(&name, &roles),
+                        "direct": serde_json::Value::Object(direct),
+                    })
+                })
+                .collect();
+            // 内置角色行只在首条用户管理写时播种:无用户节点上合成它们,
+            // 页面从第一天起就能展示/选择内置角色(授予随首个用户的创建
+            // 落地 —— 引擎届时建表播种)。
+            let mut role_rows = role_rows;
+            if role_rows.is_empty() {
+                role_rows = ["admin", "readwrite", "readonly"]
+                    .iter()
+                    .map(|n| serde_json::json!([n]))
+                    .collect();
+            }
+            let roles: Vec<serde_json::Value> = role_rows
+                .iter()
+                .map(|row| {
+                    let name = col(row, 0);
+                    serde_json::json!({
+                        "name": name,
+                        "builtin": matches!(name.as_str(), "admin" | "readwrite" | "readonly"),
+                        "members": member_rows.iter().filter(|m| col(m, 0) == name)
+                            .map(|m| col(m, 1)).collect::<Vec<_>>(),
+                        "grants": grants_json(&name, &[]),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({"users": users, "roles": roles}))
+        })
+        .await,
+    );
+    Ok(Json(out))
+}
+
+/// 用户/角色变更(POST /api/users):构造一条固定模板的用户管理语句并
+/// 在受管节点上执行;节点的拒绝(已存在/权限不足等)按 in-band error
+/// 原样透传。密码不进控制台侧语句日志(节点自身的查询日志已脱敏)。
+async fn api_users_action(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(body): Json<UsersActionBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    let out = result_to_json(
+        (async {
+            let stmt = build_user_admin_statement(&body)?;
+            let target = target_for(&state, &body.node)
+                .map_err(|e| e["error"].as_str().unwrap_or_default().to_string())?;
+            let payload = proto::encode_sql(&stmt).map_err(|e| e.to_string())?;
+            let f = node_roundtrip(
+                &target,
+                state.token.as_deref(),
+                Frame::new(proto::REQ_SQL, payload),
+            )
+            .await?;
+            match f.frame_type {
+                proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
+                proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
+                other => Err(format!("节点 {target} 返回了意外帧: {other:#06x}")),
+            }
+        })
+        .await,
+    );
+    Ok(Json(out))
 }
 
 async fn api_meta(
