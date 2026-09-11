@@ -23,7 +23,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 # 提交门禁(全部通过才能提交)
 cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                      # 452 用例
+cargo test --workspace                      # 460 用例
 
 # 改 dotnet 或协议时(cargo build 先行:测试进程会启动 target/debug/docsql-server)
 cargo build -p docsql-server

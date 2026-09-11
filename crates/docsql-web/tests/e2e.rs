@@ -138,6 +138,20 @@ async fn http_full(
     cookie: Option<&str>,
     body: Option<&str>,
 ) -> HttpResponse {
+    http_headers(addr, method, path, token, cookie, body, &[]).await
+}
+
+/// Same with extra raw header lines (e.g. X-Forwarded-For probes for the
+/// login-lockout bucketing).
+async fn http_headers(
+    addr: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    cookie: Option<&str>,
+    body: Option<&str>,
+    extra_headers: &[String],
+) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     if let Some(t) = token {
@@ -145,6 +159,10 @@ async fn http_full(
     }
     if let Some(c) = cookie {
         req.push_str(&format!("Cookie: {c}\r\n"));
+    }
+    for line in extra_headers {
+        req.push_str(line);
+        req.push_str("\r\n");
     }
     if let Some(b) = body {
         req.push_str("Content-Type: application/json\r\n");
@@ -204,6 +222,36 @@ fn dechunk(mut body: Vec<u8>) -> Vec<u8> {
         body.drain(..size + 2);
     }
     out
+}
+
+/// 控制台账号的错误测试密码(运行时拼接,避免源码字面量凭据)。
+fn console_wrong_pw() -> String {
+    ["wr", "on", "g-w", "ro", "ng-p", "w9"].concat()
+}
+
+/// 单字符重复的非法密码(密码策略拒绝用)。
+fn repeat_pw(c: &str) -> String {
+    c.repeat(8)
+}
+
+/// 账号接口的 JSON body 组装。
+fn creds_body(username: &str, password: &str) -> String {
+    serde_json::to_string(&json!({ "username": username, "password": password })).unwrap()
+}
+
+/// 轮询一个单值查询直到其首格等于 expect(有界)。服务端在控制台断连
+/// 读到 EOF 时回滚被遗弃的事务,这与下一次调用的新连接存在竞态;被轮询
+/// 的行只会消失不会复现,poll-until-match 因此是可靠的。
+async fn wait_for_scalar(addr: &str, q: &str, expect: serde_json::Value) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..250 {
+        last = sql(addr, None, q).await["rows"].clone();
+        if last == expect {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    last
 }
 
 async fn sql(addr: &str, token: Option<&str>, sql: &str) -> serde_json::Value {
@@ -1762,4 +1810,628 @@ async fn console_account_change_credentials() {
             .status,
         200
     );
+}
+
+// ---- 补充覆盖:事务契约 / 锁定 / 关闭面 / 节点错误面 / 参数钳制 / 输入策略 ----
+
+/// One /api/sql call runs its whole batch on ONE node connection: a
+/// BEGIN/COMMIT batch is a real transaction, and a batch that abandons one
+/// (no COMMIT, or an error mid-batch) is rolled back when the console
+/// drops its connection — the next call's fresh connection sees the old
+/// state. This is the documented connection-per-call contract the console
+/// editor's multi-statement runs rely on.
+#[tokio::test]
+async fn batch_transaction_spans_one_call_and_abandoned_rolls_back() {
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
+    assert_eq!(
+        sql(&addr, None, "CREATE TABLE tx (id INT PRIMARY KEY, v TEXT)").await,
+        json!({"kind": "affected", "count": 0})
+    );
+
+    // Committed batch: BEGIN, INSERT, COMMIT ride one connection, so the
+    // row survives into the next call.
+    let r = sql(
+        &addr,
+        None,
+        "BEGIN; INSERT INTO tx VALUES (1, 'kept'); COMMIT",
+    )
+    .await;
+    assert_eq!(r["kind"], "batch", "{r}");
+    assert!(r["error"].is_null(), "{r}");
+    let results = r["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|o| o["kind"] == "affected"), "{r}");
+    let r = sql(&addr, None, "SELECT v FROM tx").await;
+    assert_eq!(r["rows"], json!([["kept"]]), "{r}");
+
+    // Abandoned batch: BEGIN + INSERT without COMMIT — the console hangs
+    // up after answering, and the server rolls the ownerless transaction
+    // back.
+    let r = sql(&addr, None, "BEGIN; INSERT INTO tx VALUES (2, 'ghost')").await;
+    assert_eq!(r["kind"], "batch", "{r}");
+    assert!(r["error"].is_null(), "{r}");
+    let rows = wait_for_scalar(&addr, "SELECT COUNT(*) FROM tx", json!([[1]])).await;
+    assert_eq!(rows, json!([[1]]), "abandoned transaction must roll back");
+
+    // Error mid-batch aborts the call with the partial results + index;
+    // the statements that DID run inside the open transaction roll back
+    // with it.
+    let r = sql(
+        &addr,
+        None,
+        "BEGIN; INSERT INTO tx VALUES (3, 'doomed'); SELECT * FROM missing",
+    )
+    .await;
+    assert_eq!(r["kind"], "batch", "{r}");
+    assert_eq!(r["error"]["statement"], 2, "{r}");
+    assert_eq!(r["results"].as_array().unwrap().len(), 2);
+    let rows = wait_for_scalar(&addr, "SELECT COUNT(*) FROM tx", json!([[1]])).await;
+    assert_eq!(rows, json!([[1]]), "mid-batch failure must roll back");
+}
+
+/// Login lockout over HTTP: LOCK_THRESHOLD wrong passwords from one source
+/// lock the bucket — even the CORRECT password is refused with 429 until
+/// the lockout expires. Spoofed X-Forwarded-For values must not rotate the
+/// bucket: without DOCSQL_WEB_TRUST_PROXY a client-supplied header never
+/// chooses the bucket (the socket peer does).
+#[tokio::test]
+async fn login_lockout_after_threshold_ignores_spoofed_xff() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(
+            dir.path()
+                .join("console-auth.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    )
+    .await;
+    let body = creds_body("admin", &users_test_pw());
+    let r = http(&addr, "POST", "/api/auth/setup", None, Some(&body)).await;
+    assert_eq!(r.status, 200);
+
+    // Exactly the threshold of failures, each claiming a different
+    // forwarded client — they all land in the same socket-IP bucket.
+    let wrong = creds_body("admin", &console_wrong_pw());
+    for i in 0..docsql_web::auth::LOCK_THRESHOLD {
+        let xff = format!("X-Forwarded-For: 10.9.0.{i}");
+        let r = http_headers(
+            &addr,
+            "POST",
+            "/api/auth/login",
+            None,
+            None,
+            Some(&wrong),
+            &[xff],
+        )
+        .await;
+        assert_eq!(r.status, 401, "failure {i} must be a plain 401");
+        assert_eq!(
+            r.json()["error"].as_str().unwrap(),
+            "用户名或密码不正确",
+            "generic message must not narrow the guess"
+        );
+    }
+
+    // Locked: the correct password is refused too, whether it arrives with
+    // a fresh spoofed XFF or with none at all (same bucket either way).
+    let right = creds_body("admin", &users_test_pw());
+    for extra in [vec!["X-Forwarded-For: 10.9.0.99".to_string()], Vec::new()] {
+        let r = http_headers(
+            &addr,
+            "POST",
+            "/api/auth/login",
+            None,
+            None,
+            Some(&right),
+            &extra,
+        )
+        .await;
+        assert_eq!(r.status, 429, "{extra:?}");
+        assert!(
+            r.json()["error"].as_str().unwrap().contains("尝试次数过多"),
+            "{extra:?}"
+        );
+    }
+}
+
+/// With the credential file unset the account surface is off: status
+/// reports "off", setup/login/change answer 404, logout stays idempotently
+/// safe (ok + cookie clear), the backup endpoints join the other data
+/// endpoints in reporting the missing managed node in-band, and unknown
+/// routes are plain 404s.
+#[tokio::test]
+async fn auth_disabled_surface_and_no_upstream_backup() {
+    let addr = start_web(None, Vec::new(), None).await;
+
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
+    assert_eq!(st, json!({"mode": "off"}));
+    let body = creds_body("admin", &users_test_pw());
+    assert_eq!(
+        http(&addr, "POST", "/api/auth/setup", None, Some(&body))
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        http(&addr, "POST", "/api/auth/login", None, Some(&body))
+            .await
+            .status,
+        404
+    );
+    let change = serde_json::to_string(
+        &json!({"current_password": users_test_pw(), "username": "root", "password": ""}),
+    )
+    .unwrap();
+    assert_eq!(
+        http(&addr, "POST", "/api/auth/change", None, Some(&change))
+            .await
+            .status,
+        404
+    );
+    let r = http(&addr, "POST", "/api/auth/logout", None, None).await;
+    assert_eq!(r.status, 200);
+    let clear = r.header("set-cookie").unwrap().to_string();
+    assert_eq!(r.json()["ok"], true);
+    assert!(
+        clear.contains("Max-Age=0"),
+        "logout must clear the cookie: {clear}"
+    );
+
+    // Backup endpoints without a managed node: in-band config error, same
+    // convention as /api/sql + /api/meta + /api/stats.
+    let v = http(&addr, "GET", "/api/backup", None, None).await.json();
+    assert!(
+        v["error"].as_str().unwrap().contains("未配置管理目标节点"),
+        "{v}"
+    );
+    let v = http(&addr, "POST", "/api/backup", None, Some("{}"))
+        .await
+        .json();
+    assert!(
+        v["error"].as_str().unwrap().contains("未配置管理目标节点"),
+        "{v}"
+    );
+
+    assert_eq!(
+        http(&addr, "GET", "/api/nope", None, None).await.status,
+        404
+    );
+}
+
+/// A console whose token does not match the managed node's: the web gate
+/// passes (the browser presented the console's own token) but the
+/// node-side AUTH fails — data endpoints answer with the node's refusal
+/// in-band, and the cluster probe reports the node alive-but-refusing
+/// (PING needs no auth, so reachable stays true with the error and no
+/// status). The console page itself still loads: the misconfiguration is
+/// a backend concern.
+#[tokio::test]
+async fn console_node_token_mismatch_surfaces_in_band() {
+    let node_dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let node_addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: node_dir.path().join("node.db"),
+        listen: node_addr.clone(),
+        auth_token: Some("node-secret".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let addr = start_web(
+        Some("web-secret"),
+        vec![node_addr.clone()],
+        Some(node_addr.clone()),
+    )
+    .await;
+
+    assert_eq!(http(&addr, "GET", "/", None, None).await.status, 200);
+
+    let r = sql(&addr, Some("web-secret"), "SELECT 1").await;
+    assert_eq!(r["kind"], "error", "{r}");
+    assert!(r["message"].as_str().unwrap().contains("拒绝认证"), "{r}");
+    let m = http(&addr, "GET", "/api/meta", Some("web-secret"), None)
+        .await
+        .json();
+    assert!(m["error"].as_str().unwrap().contains("拒绝认证"), "{m}");
+    let s = http(&addr, "GET", "/api/stats", Some("web-secret"), None)
+        .await
+        .json();
+    assert!(s["error"].as_str().unwrap().contains("拒绝认证"), "{s}");
+
+    let c = http(&addr, "GET", "/api/cluster", Some("web-secret"), None)
+        .await
+        .json();
+    let nodes = c["nodes"].as_array().unwrap();
+    assert_eq!(nodes[0]["addr"], node_addr);
+    assert_eq!(nodes[0]["reachable"], true, "{c}");
+    // Latency only surfaces on the full-success path; an AUTH refusal
+    // keeps it null alongside the error.
+    assert!(nodes[0]["latency_ms"].is_null(), "{c}");
+    assert!(
+        nodes[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("node rejected AUTH"),
+        "{c}"
+    );
+    assert!(nodes[0]["status"].is_null(), "{c}");
+}
+
+/// Configured-but-offline peers surface as in-band errors on every data
+/// endpoint (meta/stats/backup), the live peer still serves explicit
+/// `?node=` traffic, a restore whose target is unreachable fails the HTTP
+/// layer with 502 (transport failure — scripts tell it apart from the
+/// node's own refusals), and a well-named but missing backup file on a
+/// live node stays an in-band 200 error.
+#[tokio::test]
+async fn offline_node_in_band_errors_and_restore_transport_502() {
+    // Live node (default managed target) + a dead configured peer.
+    let node_dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let node_addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: node_dir.path().join("node.db"),
+        listen: node_addr.clone(),
+        auth_token: Some("sekrit".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let addr = start_web(
+        Some("sekrit"),
+        vec![node_addr.clone(), "127.0.0.1:1".into()],
+        Some(node_addr.clone()),
+    )
+    .await;
+
+    for path in [
+        "/api/meta?node=127.0.0.1:1",
+        "/api/stats?node=127.0.0.1:1",
+        "/api/backup?node=127.0.0.1:1",
+    ] {
+        let v = http(&addr, "GET", path, Some("sekrit"), None).await.json();
+        assert!(
+            v["error"].as_str().unwrap().contains("不可达"),
+            "{path}: {v}"
+        );
+    }
+
+    // The live peer under its explicit name: meta + stats render fine.
+    let m = http(
+        &addr,
+        "GET",
+        &format!("/api/meta?node={node_addr}"),
+        Some("sekrit"),
+        None,
+    )
+    .await
+    .json();
+    assert!(m.get("error").is_none(), "{m}");
+    assert!(m["totals"].is_object(), "{m}");
+    let s = http(
+        &addr,
+        "GET",
+        &format!("/api/stats?node={node_addr}"),
+        Some("sekrit"),
+        None,
+    )
+    .await
+    .json();
+    assert!(s.get("error").is_none(), "{s}");
+    assert!(s["uptime_ms"].as_u64().is_some(), "{s}");
+
+    // Restore against the offline peer: transport failure → 502.
+    let body = serde_json::to_string(&json!({
+        "file": "backup-x.sql",
+        "confirm": "backup-x.sql",
+    }))
+    .unwrap();
+    let res = http(
+        &addr,
+        "POST",
+        "/api/backup/restore?node=127.0.0.1:1",
+        Some("sekrit"),
+        Some(&body),
+    )
+    .await;
+    let status = res.status;
+    let text = res.text();
+    assert_eq!(status, 502, "{text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(v["error"].as_str().unwrap().contains("不可达"), "{text}");
+
+    // Same request on the live node, but the file does not exist: the
+    // node's own refusal, in-band with 200.
+    let body = serde_json::to_string(&json!({
+        "file": "backup-missing.sql",
+        "confirm": "backup-missing.sql",
+    }))
+    .unwrap();
+    let res = http(
+        &addr,
+        "POST",
+        "/api/backup/restore",
+        Some("sekrit"),
+        Some(&body),
+    )
+    .await;
+    let status = res.status;
+    let text = res.text();
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        text.contains("no such backup file"),
+        "missing-file restore must be an in-band refusal: {text}"
+    );
+}
+
+/// The JSON body carries the node override too (the console's api.post
+/// merges the selected node into the body): POST /api/backup honors
+/// {"node": …}, POST /api/backup/restore restores by {"node": …} without
+/// a query param, and a bare trigger (no body at all) lands on the
+/// default managed node.
+#[tokio::test]
+async fn backup_node_override_via_json_body_and_bare_trigger() {
+    // Real node as default managed target AND whitelisted peer.
+    let node_dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let node_addr = format!("127.0.0.1:{port}");
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: node_dir.path().join("node.db"),
+        listen: node_addr.clone(),
+        auth_token: Some("sekrit".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let web = start_web(
+        Some("sekrit"),
+        vec![node_addr.clone()],
+        Some(node_addr.clone()),
+    )
+    .await;
+    sql(
+        &web,
+        Some("sekrit"),
+        "CREATE TABLE bj (id INT PRIMARY KEY, v TEXT)",
+    )
+    .await;
+    sql(
+        &web,
+        Some("sekrit"),
+        "INSERT INTO bj VALUES (1, 'json-node')",
+    )
+    .await;
+
+    // Bare trigger: no body at all → default managed node.
+    let res = http(&web, "POST", "/api/backup", Some("sekrit"), None).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["ok"], true);
+
+    // JSON-body node override triggers on the named peer too.
+    let body = serde_json::to_string(&json!({ "node": node_addr })).unwrap();
+    let res = http(&web, "POST", "/api/backup", Some("sekrit"), Some(&body)).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["ok"], true);
+
+    let mut name = String::new();
+    for _ in 0..250 {
+        let v = http(&web, "GET", "/api/backup", Some("sekrit"), None)
+            .await
+            .json();
+        if v["count"].as_u64().unwrap_or(0) >= 1 && v["last"]["ok"] == true {
+            name = v["files"][0]["name"].as_str().unwrap_or("").to_string();
+            if !name.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!name.is_empty(), "triggered backup never appeared");
+
+    // Restore via the JSON-body node (no query param): the dropped table
+    // comes back.
+    sql(&web, Some("sekrit"), "DROP TABLE bj").await;
+    let body = serde_json::to_string(&json!({
+        "file": name,
+        "confirm": name,
+        "node": node_addr,
+    }))
+    .unwrap();
+    let res = http(
+        &web,
+        "POST",
+        "/api/backup/restore",
+        Some("sekrit"),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    assert_eq!(res.json()["ok"], true);
+    let mut done = false;
+    for _ in 0..250 {
+        let v = http(&web, "GET", "/api/backup", Some("sekrit"), None)
+            .await
+            .json();
+        if v["restore"]["running"] == false && v["restore"]["ok"] == true {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(done, "restore never completed");
+    let out = sql(&web, Some("sekrit"), "SELECT v FROM bj WHERE id = 1").await;
+    assert!(
+        out.to_string().contains("json-node"),
+        "rows not restored: {out}"
+    );
+}
+
+/// ?limit= on /api/logs is clamped into [1, 1000]: the newest entry
+/// survives a limit of 1, and an oversized (or absent) limit serves the
+/// full ring instead of erroring.
+#[tokio::test]
+async fn logs_limit_param_is_clamped() {
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
+    sql(&addr, None, "CREATE TABLE lg (id INT)").await;
+    sql(&addr, None, "INSERT INTO lg VALUES (1)").await;
+    sql(&addr, None, "SELECT id FROM lg").await;
+
+    // Newest first: a limit of 1 keeps exactly the last statement.
+    let v = http(&addr, "GET", "/api/logs?limit=1", None, None)
+        .await
+        .json();
+    let query = v["local"]["query"].as_array().unwrap();
+    assert_eq!(query.len(), 1, "{v}");
+    assert_eq!(query[0]["sql"], "SELECT id FROM lg", "{v}");
+
+    for path in ["/api/logs?limit=100000", "/api/logs"] {
+        let v = http(&addr, "GET", path, None, None).await.json();
+        let query = v["local"]["query"].as_array().unwrap();
+        assert_eq!(query.len(), 3, "{path}: {v}");
+        assert_eq!(query[0]["sql"], "SELECT id FROM lg", "{path}: {v}");
+        assert_eq!(query[2]["sql"], "CREATE TABLE lg (id INT)", "{path}: {v}");
+    }
+}
+
+/// Setup input policy over HTTP: username length (counted in characters,
+/// not bytes) and the single-char-repeat password rule are rejected with
+/// 400, invalid input never counts toward the lockout (a real user may
+/// fumble the rules — LOCK_THRESHOLD+1 bad attempts still leave setup
+/// open), the stored username is trimmed, and the session cookie carries
+/// its hardening flags.
+#[tokio::test]
+async fn setup_input_policy_trim_and_cookie_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(
+            dir.path()
+                .join("console-auth.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    )
+    .await;
+
+    let long_name = "a".repeat(65);
+    let wide_name = "好".repeat(65); // 65 characters, 195 bytes
+    let attempts = [
+        creds_body("", "long-enough-pw"),
+        creds_body(&long_name, "long-enough-pw"),
+        creds_body(&wide_name, "long-enough-pw"),
+        creds_body("admin", &repeat_pw("a")),
+    ];
+    for i in 0..(docsql_web::auth::LOCK_THRESHOLD + 1) {
+        let r = http(
+            &addr,
+            "POST",
+            "/api/auth/setup",
+            None,
+            Some(&attempts[i % attempts.len()]),
+        )
+        .await;
+        assert_eq!(r.status, 400, "attempt {i}: {}", r.text());
+        assert!(!r.json()["error"].as_str().unwrap().is_empty());
+    }
+
+    // Still not locked: validation failures never touch the lockout.
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/setup",
+        None,
+        Some(&creds_body(" admin ", &users_test_pw())),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let cookie_hdr = r.header("set-cookie").expect("session cookie").to_string();
+    assert!(cookie_hdr.starts_with("docsql_session="), "{cookie_hdr}");
+    for flag in ["HttpOnly", "SameSite=Lax", "Path=/", "Max-Age="] {
+        assert!(cookie_hdr.contains(flag), "{flag} missing: {cookie_hdr}");
+    }
+
+    // The stored username is the trimmed form; logging in with it works.
+    let st = http(&addr, "GET", "/api/auth/status", None, None)
+        .await
+        .json();
+    assert_eq!(st["mode"], "login");
+    assert_eq!(st["username"], "admin");
+    let r = http(
+        &addr,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&creds_body("admin", &users_test_pw())),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
 }
