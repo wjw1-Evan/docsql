@@ -8,7 +8,7 @@
 
 use crate::wal::{Wal, WalError, KIND_WRITE};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -36,13 +36,20 @@ pub enum PagerError {
 pub type Result<T> = std::result::Result<T, PagerError>;
 
 pub struct Pager {
-    file: File,
+    /// Raw data file, behind a mutex: the shared-reader path (`&Pager`)
+    /// must seek+read it, and a shared cursor cannot be used from two
+    /// threads at once.
+    file: std::sync::Mutex<std::fs::File>,
     path: PathBuf,
     wal: Wal,
     num_pages: u32,
     next_txid: u64,
-    pool: HashMap<u32, Page>,
-    pool_order: std::collections::VecDeque<u32>, // FIFO eviction track
+    /// Buffer pool, behind a lock so that **read-only** callers (`&Pager`,
+    /// MVCC stage A: concurrent SELECTs under the server's read lock) can
+    /// fetch pages while the write path holds nothing but this short-lived
+    /// lock. Write-path mutators take `&mut self`, which locks out readers
+    /// through the engine's write lock anyway.
+    pool: std::sync::Mutex<PoolState>,
     max_pool: usize,
     /// Committed page images not yet written to the data file (deferred
     /// commits). They are WAL-logged but the data file must not see them
@@ -54,6 +61,13 @@ pub struct Pager {
 
 struct Page {
     data: Vec<u8>,
+}
+
+/// Buffer pool state guarded by `Pager.pool`'s mutex.
+#[derive(Default)]
+struct PoolState {
+    map: HashMap<u32, Page>,
+    order: std::collections::VecDeque<u32>, // FIFO eviction track
 }
 
 impl Pager {
@@ -89,13 +103,12 @@ impl Pager {
             u32::from_le_bytes(header[12..16].try_into().unwrap())
         };
         let mut pager = Pager {
-            file,
+            file: std::sync::Mutex::new(file),
             path: path.to_path_buf(),
             wal,
             num_pages,
             next_txid: 1,
-            pool: HashMap::new(),
-            pool_order: std::collections::VecDeque::new(),
+            pool: std::sync::Mutex::new(PoolState::default()),
             max_pool: DEFAULT_POOL_PAGES,
             pending_writes: std::collections::BTreeMap::new(),
         };
@@ -145,20 +158,29 @@ impl Pager {
                 self.write_file_page(*id, data)?;
             }
             self.persist_header()?;
-            self.file.sync_all()?;
+            self.file
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sync_all()?;
         }
         self.wal.checkpoint()?;
         Ok(())
     }
 
-    fn read_file_page(&mut self, id: u32) -> Result<Vec<u8>> {
+    fn read_file_page(&self, id: u32) -> Result<Vec<u8>> {
         if id >= self.num_pages {
             return Err(PagerError::OutOfRange(id, self.num_pages));
         }
         let mut buf = vec![0u8; PAGE_SIZE];
-        self.file
-            .seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
-        self.file.read_exact(&mut buf)?;
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        file.seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
+        if let Err(e) = file.read_exact(&mut buf) {
+            eprintln!(
+                "DBG read_file_page failed: id={id} num_pages={} err={e}",
+                self.num_pages
+            );
+            return Err(e.into());
+        }
         Ok(buf)
     }
 
@@ -168,9 +190,9 @@ impl Pager {
             self.num_pages = id + 1;
             self.persist_header()?;
         }
-        self.file
-            .seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
-        self.file.write_all(data)?;
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        file.seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
+        file.write_all(data)?;
         Ok(())
     }
 
@@ -179,41 +201,76 @@ impl Pager {
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
         header[12..16].copy_from_slice(&self.num_pages.to_le_bytes());
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&header)?;
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)?;
         Ok(())
     }
 
-    /// Read a page (buffered). Page 0 is the header — callers use data pages.
-    pub fn read_page(&mut self, id: u32) -> Result<&[u8]> {
+    /// Read a page (buffered). Page 0 is the header — callers use data
+    /// pages. Owned copy: the pool is behind a mutex (MVCC stage A shared
+    /// readers), so borrowed access is no longer possible.
+    pub fn read_page(&mut self, id: u32) -> Result<Vec<u8>> {
         if id == 0 {
             return Err(PagerError::OutOfRange(0, self.num_pages));
         }
-        if !self.pool.contains_key(&id) {
+        let mut st = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+        if !st.map.contains_key(&id) {
             let data = if let Some(p) = self.pending_writes.get(&id) {
                 p.clone()
             } else {
                 self.read_file_page(id)?
             };
-            self.evict_if_full();
-            self.pool_order.push_back(id);
-            self.pool.insert(id, Page { data });
+            while st.map.len() >= self.max_pool {
+                match st.order.pop_front() {
+                    Some(old) => {
+                        st.map.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            st.order.push_back(id);
+            st.map.insert(id, Page { data });
         }
-        Ok(&self.pool.get(&id).unwrap().data)
+        Ok(st.map.get(&id).unwrap().data.clone())
     }
 
-    fn evict_if_full(&mut self) {
-        // Evict the oldest page (plain FIFO): pool pages only ever hold
-        // committed images — deferred ones also live in `pending_writes`
-        // until flushed — so there is no dirty/clean distinction to respect.
-        while self.pool.len() >= self.max_pool {
-            match self.pool_order.pop_front() {
-                Some(id) => {
-                    self.pool.remove(&id);
-                }
-                None => break,
-            }
+    /// Shared-reader page read: owned copy, callable from `&Pager` while
+    /// several MVCC stage-A readers run concurrently. Same visibility rules
+    /// as [`Pager::read_page`] (pool → pending deferred writes → data file).
+    /// Returns an owned copy because the pool is behind a mutex.
+    pub fn read_page_shared(&self, id: u32) -> Result<Vec<u8>> {
+        if id == 0 {
+            return Err(PagerError::OutOfRange(0, self.num_pages));
         }
+        let mut st = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+        if !st.map.contains_key(&id) {
+            if id >= self.num_pages {
+                return Err(PagerError::OutOfRange(id, self.num_pages));
+            }
+            let data = if let Some(p) = self.pending_writes.get(&id) {
+                p.clone()
+            } else {
+                // Raw File seek+read uses a shared cursor: serialize it
+                // against concurrent shared readers.
+                let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+                let mut buf = vec![0u8; PAGE_SIZE];
+                file.seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
+                file.read_exact(&mut buf)?;
+                buf
+            };
+            while st.map.len() >= self.max_pool {
+                match st.order.pop_front() {
+                    Some(old) => {
+                        st.map.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            st.order.push_back(id);
+            st.map.insert(id, Page { data });
+        }
+        Ok(st.map.get(&id).unwrap().data.clone())
     }
 
     /// Allocate a new page, zero-filled (visible only after commit).
@@ -243,7 +300,13 @@ impl Pager {
     /// I/O error and must propagate — silently staging a zero page would
     /// commit 4 KB of zeros over live data.
     fn current_page_image(&mut self, id: u32) -> Result<Vec<u8>> {
-        if let Some(p) = self.pool.get(&id) {
+        if let Some(p) = self
+            .pool
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map
+            .get(&id)
+        {
             return Ok(p.data.clone());
         }
         if let Some(p) = self.pending_writes.get(&id) {
@@ -303,7 +366,13 @@ impl Pager {
                 self.pending_writes.insert(id, data);
                 return Err(e);
             }
-            if let Some(p) = self.pool.get_mut(&id) {
+            if let Some(p) = self
+                .pool
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map
+                .get_mut(&id)
+            {
                 p.data = data;
             }
         }
@@ -330,7 +399,13 @@ impl Pager {
         // the data file is deliberately left alone until `sync_wal`, so a
         // crash can never leave uncommitted page images in the data file.
         for (id, data) in &tx.staged {
-            if let Some(p) = self.pool.get_mut(id) {
+            if let Some(p) = self
+                .pool
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map
+                .get_mut(id)
+            {
                 p.data = data.clone();
             }
             if !fsync {
@@ -357,7 +432,10 @@ impl Pager {
         if self.wal.file_len()? < WAL_LIMIT {
             return Ok(());
         }
-        self.file.sync_all()?;
+        self.file
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sync_all()?;
         self.wal.checkpoint()?;
         Ok(())
     }
@@ -373,7 +451,11 @@ impl Pager {
 
     /// Sync the data file (e.g. before checkpointing in the future).
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_all().map_err(PagerError::Io)
+        self.file
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sync_all()
+            .map_err(PagerError::Io)
     }
 }
 

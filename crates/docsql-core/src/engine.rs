@@ -2150,7 +2150,7 @@ impl Database {
         let mut out = Vec::new();
         let rtx = self.pager.begin_tx();
         for &pid in &heap.pages {
-            out.extend(heap.page_docs(&mut self.pager, &rtx, pid)?);
+            out.extend(heap.page_docs(&self.pager, &rtx, pid)?);
         }
         self.pager.abort_tx(rtx)?;
         Ok(out)
@@ -2201,7 +2201,7 @@ impl Database {
                 pages: meta.pages.clone(),
                 overflow_free: meta.overflow_free.clone(),
             }
-            .scan(&mut self.pager)?;
+            .scan(&self.pager)?;
             for d in &docs {
                 if let Some(Value::Int(i)) = d.get(col) {
                     max = max.max(*i);
@@ -2244,7 +2244,7 @@ impl Database {
                 // indexes v is the full Array key — element-wise cmp_values
                 // equality is exactly a key match.
                 let mut p = tree
-                    .range_bounded(&mut self.pager, &tx, &v, Some((&v, true)))
+                    .range_bounded(&self.pager, &tx, &v, Some((&v, true)))
                     .map_err(|e| index_err(&col, e))?;
                 p.retain(|(k, _)| Value::cmp_values(k, &v) == Ordering::Equal);
                 p
@@ -2254,7 +2254,7 @@ impl Database {
                 // makes Array(prefix) sort right before every key extending
                 // it) and keep keys that start with it element-wise.
                 let mut p = tree
-                    .range_bounded(&mut self.pager, &tx, &prefix, None)
+                    .range_bounded(&self.pager, &tx, &prefix, None)
                     .map_err(|e| index_err(&col, e))?;
                 if let Value::Array(pfx) = &prefix {
                     p.retain(|(k, _)| match k {
@@ -2274,19 +2274,19 @@ impl Database {
                 let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
                 let mut pairs = match &lo {
                     Some((v, true)) => tree
-                        .range_bounded(&mut self.pager, &tx, v, hi_ref)
+                        .range_bounded(&self.pager, &tx, v, hi_ref)
                         .map_err(|e| index_err(&col, e))?,
                     Some((v, false)) => {
                         // strict lower bound: start at v, then drop the equal run
                         let mut p = tree
-                            .range_bounded(&mut self.pager, &tx, v, hi_ref)
+                            .range_bounded(&self.pager, &tx, v, hi_ref)
                             .map_err(|e| index_err(&col, e))?;
                         p.retain(|(k, _)| Value::cmp_values(k, v) != std::cmp::Ordering::Equal);
                         p
                     }
                     // No lower bound: full tree scan (rare: WHERE col < x).
                     None => tree
-                        .scan(&mut self.pager, &tx)
+                        .scan(&self.pager, &tx)
                         .map_err(|e| index_err(&col, e))?,
                 };
                 if let Some((v, incl)) = &hi {
@@ -2301,7 +2301,7 @@ impl Database {
         self.pager.abort_tx(tx)?;
         let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
         for (_, loc) in pairs {
-            if let Some(doc) = heap.doc_at(&mut self.pager, loc)? {
+            if let Some(doc) = heap.doc_at(&self.pager, loc)? {
                 out.push((loc, doc));
             }
         }
@@ -2315,7 +2315,7 @@ impl Database {
             return err(format!("table {table} does not exist"));
         };
         let heap = meta.heap_of();
-        heap.scan(&mut self.pager).map_err(Into::into)
+        heap.scan(&self.pager).map_err(Into::into)
     }
 
     fn matches(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
@@ -2558,7 +2558,7 @@ impl Database {
         for i in 0..updates.len() {
             let (loc, _, new_doc) = updates[i].clone();
             let page = crate::heap::unpack_loc(loc).0;
-            let before = heap.page_docs(&mut self.pager, &tx, page)?;
+            let before = heap.page_docs(&self.pager, &tx, page)?;
             let out = heap.replace(&mut self.pager, &mut tx, loc, &new_doc)?;
             // An in-page re-pack moved this page's survivors: pending locators
             // must follow, or a later update would target whatever document
@@ -2768,7 +2768,7 @@ impl Database {
             .collect();
         let mut before = Vec::new();
         for pid in affected {
-            before.extend(heap.page_docs(&mut self.pager, &tx, pid)?);
+            before.extend(heap.page_docs(&self.pager, &tx, pid)?);
         }
         let locs: Vec<u64> = targets.iter().map(|(l, _)| *l).collect();
         let moves = heap.remove_many(&mut self.pager, &mut tx, &locs)?;
@@ -3798,7 +3798,7 @@ impl Database {
                         continue;
                     }
                     if let Some(loc) = BTree::open(roots[col])
-                        .get(&mut self.pager, &tx, v)
+                        .get(&self.pager, &tx, v)
                         .map_err(|e| index_err(col, e))?
                     {
                         displaced.push(loc);
@@ -3813,7 +3813,7 @@ impl Database {
                 .collect();
             let mut before = Vec::new();
             for pid in affected {
-                before.extend(heap.page_docs(&mut self.pager, &tx, pid)?);
+                before.extend(heap.page_docs(&self.pager, &tx, pid)?);
             }
             let moves = heap.remove_many(&mut self.pager, &mut tx, &displaced)?;
             for loc in &displaced {
@@ -3857,7 +3857,7 @@ impl Database {
                         continue;
                     }
                     if BTree::open(roots[col])
-                        .get(&mut self.pager, &tx, v)
+                        .get(&self.pager, &tx, v)
                         .map_err(|e| index_err(col, e))?
                         .is_some()
                     {
@@ -3921,7 +3921,7 @@ impl Database {
                 pages: meta.pages.clone(),
                 overflow_free: meta.overflow_free.clone(),
             }
-            .scan(&mut self.pager))
+            .scan(&self.pager))
             {
                 Ok(docs) => docs,
                 Err(e) => {

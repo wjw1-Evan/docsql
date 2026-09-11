@@ -168,13 +168,13 @@ impl BTree {
         BTree { root }
     }
 
-    fn read_node(pager: &mut Pager, tx: &Tx, id: u32) -> Result<Node> {
-        // Borrow the page bytes in place (staged image or pool) — decoding
-        // only reads them, and a full-page copy here would run on every
-        // node visit of every tree operation.
-        let page: &[u8] = match tx.staged_page(id) {
-            Some(p) => p,
-            None => pager.read_page(id)?,
+    fn read_node(pager: &Pager, tx: &Tx, id: u32) -> Result<Node> {
+        // Owned page copy: btree reads run on `&Pager` under the server's
+        // read lock (MVCC stage A), where a shared-reader pool read is the
+        // only access. A 4 KiB copy per node visit is noise next to decode.
+        let page: Vec<u8> = match tx.staged_page(id) {
+            Some(p) => p.to_vec(),
+            None => pager.read_page_shared(id)?,
         };
         // All offsets below come from the page bytes; a damaged file must
         // surface as Corrupt, not as a slice panic.
@@ -189,11 +189,12 @@ impl BTree {
                 let mut cells = Vec::with_capacity(count.min(PAGE_SIZE / 10));
                 let mut pos = 3;
                 for _ in 0..count {
-                    let klen = u16::from_le_bytes(take(page, pos, 2)?.try_into().unwrap()) as usize;
+                    let klen =
+                        u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(take(page, pos, klen)?)?;
+                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
                     pos += used;
-                    let val = u64::from_le_bytes(take(page, pos, 8)?.try_into().unwrap());
+                    let val = u64::from_le_bytes(take(&page, pos, 8)?.try_into().unwrap());
                     pos += 8;
                     cells.push((k, val));
                 }
@@ -204,11 +205,12 @@ impl BTree {
                 let mut pos = 7;
                 let mut cells = Vec::with_capacity(count.min(PAGE_SIZE / 10));
                 for _ in 0..count {
-                    let klen = u16::from_le_bytes(take(page, pos, 2)?.try_into().unwrap()) as usize;
+                    let klen =
+                        u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(take(page, pos, klen)?)?;
+                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
                     pos += used;
-                    let child = u32::from_le_bytes(take(page, pos, 4)?.try_into().unwrap());
+                    let child = u32::from_le_bytes(take(&page, pos, 4)?.try_into().unwrap());
                     pos += 4;
                     cells.push((k, child));
                 }
@@ -266,11 +268,11 @@ impl BTree {
     }
 
     /// Exact lookup.
-    pub fn get(&self, pager: &mut Pager, tx: &Tx, key: &Value) -> Result<Option<u64>> {
+    pub fn get(&self, pager: &Pager, tx: &Tx, key: &Value) -> Result<Option<u64>> {
         Self::get_at(pager, tx, self.root, key)
     }
 
-    fn get_at(pager: &mut Pager, tx: &Tx, id: u32, key: &Value) -> Result<Option<u64>> {
+    fn get_at(pager: &Pager, tx: &Tx, id: u32, key: &Value) -> Result<Option<u64>> {
         match Self::read_node(pager, tx, id)? {
             Node::Leaf { cells } => Ok(cells
                 .iter()
@@ -405,14 +407,14 @@ impl BTree {
     }
 
     /// In-order scan of all (key, val) pairs.
-    pub fn scan(&self, pager: &mut Pager, tx: &Tx) -> Result<Vec<(Value, u64)>> {
+    pub fn scan(&self, pager: &Pager, tx: &Tx) -> Result<Vec<(Value, u64)>> {
         // Leaves are not chained in v0; walk the tree recursively.
         let mut out = Vec::new();
         Self::scan_rec(pager, tx, self.root, &mut out)?;
         Ok(out)
     }
 
-    fn scan_rec(pager: &mut Pager, tx: &Tx, id: u32, out: &mut Vec<(Value, u64)>) -> Result<()> {
+    fn scan_rec(pager: &Pager, tx: &Tx, id: u32, out: &mut Vec<(Value, u64)>) -> Result<()> {
         match Self::read_node(pager, tx, id)? {
             Node::Leaf { cells } => out.extend(cells),
             Node::Internal { leftmost, cells } => {
@@ -530,7 +532,7 @@ impl BTree {
     /// right side of the tree.
     pub fn range_bounded(
         &self,
-        pager: &mut Pager,
+        pager: &Pager,
         tx: &Tx,
         lo: &Value,
         hi: Option<(&Value, bool)>,
@@ -550,7 +552,7 @@ impl BTree {
     }
 
     fn range_bounded_rec(
-        pager: &mut Pager,
+        pager: &Pager,
         tx: &Tx,
         id: u32,
         lo: &Value,
@@ -652,11 +654,11 @@ mod tests {
         let tx = pager.begin_tx();
         for i in 0..100i64 {
             assert_eq!(
-                tree.get(&mut pager, &tx, &Value::Int(i)).unwrap(),
+                tree.get(&pager, &tx, &Value::Int(i)).unwrap(),
                 Some(i as u64 * 10)
             );
         }
-        assert_eq!(tree.get(&mut pager, &tx, &Value::Int(999)).unwrap(), None);
+        assert_eq!(tree.get(&pager, &tx, &Value::Int(999)).unwrap(), None);
     }
 
     #[test]
@@ -675,7 +677,7 @@ mod tests {
             .unwrap();
         pager.commit_tx(tx).unwrap();
         let tx = pager.begin_tx();
-        let all = tree.scan(&mut pager, &tx).unwrap();
+        let all = tree.scan(&pager, &tx).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].1, 1);
         assert_eq!(all[1].1, 2);
@@ -697,7 +699,7 @@ mod tests {
         }
         pager.commit_tx(tx).unwrap();
         let tx = pager.begin_tx();
-        let all = tree.scan(&mut pager, &tx).unwrap();
+        let all = tree.scan(&pager, &tx).unwrap();
         assert_eq!(all.len(), 500);
         // grouped and sorted by key, locators ascending within each run
         let mut last_key = i64::MIN;
@@ -735,7 +737,7 @@ mod tests {
         }
         pager.commit_tx(tx).unwrap();
         let tx = pager.begin_tx();
-        let all = tree.scan(&mut pager, &tx).unwrap();
+        let all = tree.scan(&pager, &tx).unwrap();
         assert_eq!(all.len(), 500);
         for (i, (k, v)) in all.iter().enumerate() {
             assert_eq!(*k, Value::Int(i as i64));
@@ -760,7 +762,7 @@ mod tests {
         let tx = pager.begin_tx();
         for i in 0..200i64 {
             let expect = if i % 2 == 0 { None } else { Some(i as u64) };
-            assert_eq!(tree.get(&mut pager, &tx, &Value::Int(i)).unwrap(), expect);
+            assert_eq!(tree.get(&pager, &tx, &Value::Int(i)).unwrap(), expect);
         }
     }
 
@@ -782,11 +784,8 @@ mod tests {
         let mut pager = Pager::open(&d.path().join("bt5.db")).unwrap();
         let tree = BTree::open(root);
         let tx = pager.begin_tx();
-        assert_eq!(
-            tree.get(&mut pager, &tx, &Value::Int(299)).unwrap(),
-            Some(299)
-        );
-        assert_eq!(tree.get(&mut pager, &tx, &Value::Int(0)).unwrap(), Some(0));
+        assert_eq!(tree.get(&pager, &tx, &Value::Int(299)).unwrap(), Some(299));
+        assert_eq!(tree.get(&pager, &tx, &Value::Int(0)).unwrap(), Some(0));
     }
 
     #[test]
@@ -827,12 +826,12 @@ mod tests {
                 .unwrap();
         }
         // Non-unique inserts append separate entries per locator.
-        assert_eq!(tree.scan(&mut pager, &tx).unwrap().len(), 3);
+        assert_eq!(tree.scan(&pager, &tx).unwrap().len(), 3);
         assert!(tree
             .delete_entry(&mut pager, &mut tx, &Value::Str("k".into()), 20)
             .unwrap());
         let left: Vec<u64> = tree
-            .scan(&mut pager, &tx)
+            .scan(&pager, &tx)
             .unwrap()
             .into_iter()
             .map(|(_, v)| v)
@@ -885,12 +884,12 @@ mod tests {
         let tx = pager.begin_tx();
         for (k, v) in &model {
             assert_eq!(
-                tree.get(&mut pager, &tx, &Value::Int(*k)).unwrap(),
+                tree.get(&pager, &tx, &Value::Int(*k)).unwrap(),
                 Some(*v),
                 "key {k}"
             );
         }
-        let scanned = tree.scan(&mut pager, &tx).unwrap();
+        let scanned = tree.scan(&pager, &tx).unwrap();
         assert_eq!(scanned.len(), model.len());
         for ((k, v), (mk, mv)) in scanned.iter().zip(model.iter()) {
             assert_eq!(k.as_i64(), Some(*mk));
@@ -968,12 +967,12 @@ mod tests {
         let tx = pager.begin_tx();
         for i in 0..200i64 {
             assert_eq!(
-                tree.get(&mut pager, &tx, &key(i)).unwrap(),
+                tree.get(&pager, &tx, &key(i)).unwrap(),
                 Some(i as u64),
                 "key {i}"
             );
         }
-        let all = tree.scan(&mut pager, &tx).unwrap();
+        let all = tree.scan(&pager, &tx).unwrap();
         assert_eq!(all.len(), 200);
         let mut sorted = all.clone();
         sorted.sort_by(|a, b| Value::cmp_values(&a.0, &b.0));
@@ -1007,7 +1006,7 @@ mod tests {
         }
         let tx = pager.begin_tx();
         assert!(
-            tree.scan(&mut pager, &tx).unwrap().is_empty(),
+            tree.scan(&pager, &tx).unwrap().is_empty(),
             "no ghost entries may survive"
         );
         pager.abort_tx(tx).unwrap();

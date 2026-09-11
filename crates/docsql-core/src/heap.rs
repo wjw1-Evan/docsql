@@ -159,13 +159,13 @@ fn repack(page: &mut [u8]) -> Vec<(usize, usize)> {
 /// Read a page image (staged version if this tx wrote it), owned copy —
 /// overflow slots need `&mut Pager` while assembling the chain, so borrowed
 /// page reads would alias. `tx = None` reads the committed image.
-fn load_page_owned(pager: &mut Pager, tx: Option<&Tx>, id: u32) -> Result<Vec<u8>> {
+fn load_page_owned(pager: &Pager, tx: Option<&Tx>, id: u32) -> Result<Vec<u8>> {
     if let Some(tx) = tx {
         if let Some(p) = tx.staged_page(id) {
             return Ok(p.to_vec());
         }
     }
-    Ok(pager.read_page(id)?.to_vec())
+    Ok(pager.read_page_shared(id)?)
 }
 
 /// Assemble one slot's document bytes: a plain slot's content is the
@@ -173,7 +173,7 @@ fn load_page_owned(pager: &mut Pager, tx: Option<&Tx>, id: u32) -> Result<Vec<u8
 /// `[mark][total:u32][chain_head:u32][inline prefix]` and the rest is
 /// assembled along the chain page list.
 fn slot_document_bytes(
-    pager: &mut Pager,
+    pager: &Pager,
     tx: Option<&Tx>,
     page_id: u32,
     page: &[u8],
@@ -275,10 +275,10 @@ fn tombstone(page: &mut [u8], i: usize) {
 
 impl Heap {
     /// Read every live document in insertion order.
-    pub fn scan(&self, pager: &mut Pager) -> Result<Vec<Object>> {
+    pub fn scan(&self, pager: &Pager) -> Result<Vec<Object>> {
         let mut out = Vec::new();
         for &pid in &self.pages {
-            let page = pager.read_page(pid)?.to_vec();
+            let page = pager.read_page_shared(pid)?;
             validate_page(&page, pid)?;
             for i in 0..count_of(&page) {
                 let (off, len) = slot(&page, i);
@@ -298,7 +298,7 @@ impl Heap {
     /// Live (locator, document) pairs of one page, in slot order. Staged
     /// pages of an open transaction are preferred, so consecutive
     /// mutations within one statement see each other.
-    pub fn page_docs(&self, pager: &mut Pager, tx: &Tx, page: u32) -> Result<Vec<(u64, Object)>> {
+    pub fn page_docs(&self, pager: &Pager, tx: &Tx, page: u32) -> Result<Vec<(u64, Object)>> {
         let buf = load_page_owned(pager, Some(tx), page)?;
         validate_page(&buf, page)?;
         let mut out = Vec::new();
@@ -317,9 +317,9 @@ impl Heap {
     }
 
     /// One document by locator; None for a tombstone/empty slot.
-    pub fn doc_at(&self, pager: &mut Pager, loc: u64) -> Result<Option<Object>> {
+    pub fn doc_at(&self, pager: &Pager, loc: u64) -> Result<Option<Object>> {
         let (page, slot_i) = unpack_loc(loc);
-        let buf = pager.read_page(page)?.to_vec();
+        let buf = pager.read_page_shared(page)?;
         validate_page(&buf, page)?;
         if slot_i >= count_of(&buf) {
             return Err(HeapError::Page(page, "slot out of range"));
@@ -617,7 +617,7 @@ mod tests {
                 .unwrap();
             pager.commit_tx(tx).unwrap();
         }
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), 50);
         assert_eq!(docs[0].get("_id").unwrap(), &Value::Int(0));
         assert!(docs[0]
@@ -642,8 +642,8 @@ mod tests {
             pager.commit_tx(tx).unwrap();
         }
         drop(pager);
-        let mut pager = Pager::open(&d.path().join("heap2.db")).unwrap();
-        let docs = heap.scan(&mut pager).unwrap();
+        let pager = Pager::open(&d.path().join("heap2.db")).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), 10);
     }
 
@@ -662,7 +662,7 @@ mod tests {
         let mut tx = pager.begin_tx();
         let loc = heap.insert(&mut pager, &mut tx, &ok).unwrap();
         pager.commit_tx(tx).unwrap();
-        let back = heap.doc_at(&mut pager, loc).unwrap().unwrap();
+        let back = heap.doc_at(&pager, loc).unwrap().unwrap();
         assert_eq!(back.get("blob").unwrap(), &Value::Str("x".repeat(9000)));
     }
 
@@ -681,7 +681,7 @@ mod tests {
             heap.insert(&mut pager, &mut tx, &doc).unwrap();
             pager.commit_tx(tx).unwrap();
         }
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), specs.len());
         for ((id, size), d) in specs.iter().zip(&docs) {
             assert_eq!(d.get("_id"), Some(&Value::Int(*id)));
@@ -731,7 +731,7 @@ mod tests {
             "reuse must not allocate"
         );
         assert!(heap.overflow_free.is_empty(), "free list drained");
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         // The small replacement row and the new oversized row both live.
         assert_eq!(docs.len(), 2);
         assert!(docs
@@ -757,7 +757,7 @@ mod tests {
             .unwrap();
         pager.commit_tx(tx).unwrap();
         assert_eq!(heap.pages, pages_before, "no new page needed");
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), 20);
         // Row order is preserved and the replaced doc kept its position.
         for (i, d) in docs.iter().enumerate() {
@@ -770,7 +770,7 @@ mod tests {
             .unwrap()
             .starts_with("NEW!"));
         // The replaced doc is reachable at its reported locator.
-        let at = heap.doc_at(&mut pager, out.placed).unwrap().unwrap();
+        let at = heap.doc_at(&pager, out.placed).unwrap().unwrap();
         assert_eq!(at.get("_id"), Some(&Value::Int(5)));
         assert!(at
             .get("text")
@@ -780,7 +780,7 @@ mod tests {
             .starts_with("NEW!"));
         // Survivors whose slots moved are readable at the new locators.
         for (_, new) in &out.moved {
-            let d = heap.doc_at(&mut pager, *new).unwrap().unwrap();
+            let d = heap.doc_at(&pager, *new).unwrap().unwrap();
             assert!(d.contains_key("_id"));
         }
     }
@@ -798,7 +798,7 @@ mod tests {
         let mut tx = pager.begin_tx();
         let moves = heap.remove_many(&mut pager, &mut tx, &locs[..5]).unwrap();
         pager.commit_tx(tx).unwrap();
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), 5);
         for (i, d) in docs.iter().enumerate() {
             assert_eq!(d.get("_id"), Some(&Value::Int(i as i64 + 5)));
@@ -808,13 +808,13 @@ mod tests {
         // (key, locator) before repacking, so this is invisible to queries.
         // Survivors listed as moved are live at their new locators.
         for (_, new) in &moves {
-            assert!(heap.doc_at(&mut pager, *new).unwrap().is_some());
+            assert!(heap.doc_at(&pager, *new).unwrap().is_some());
         }
         // Emptying the whole heap drops every page. Locators were re-issued
         // by the first repack, so read the current ones.
         let mut tx = pager.begin_tx();
         let cur: Vec<u64> = heap
-            .page_docs(&mut pager, &tx, heap.pages[0])
+            .page_docs(&pager, &tx, heap.pages[0])
             .unwrap()
             .into_iter()
             .map(|(l, _)| l)
@@ -822,7 +822,7 @@ mod tests {
         heap.remove_many(&mut pager, &mut tx, &cur).unwrap();
         pager.commit_tx(tx).unwrap();
         assert!(heap.pages.is_empty());
-        assert_eq!(heap.scan(&mut pager).unwrap().len(), 0);
+        assert_eq!(heap.scan(&pager).unwrap().len(), 0);
     }
     // ---- 覆盖率补充:超大文档 / 坏槽位 / tombstone 扫描 ----
 
@@ -854,14 +854,14 @@ mod tests {
         heap.remove_many(&mut pager, &mut tx, &[l2]).unwrap();
         pager.commit_tx(tx).unwrap();
         assert!(matches!(
-            heap.doc_at(&mut pager, l2),
+            heap.doc_at(&pager, l2),
             Err(HeapError::Page(_, "slot out of range"))
         ));
         // 删除+重插使扫描跳过被删文档
         let mut tx = pager.begin_tx();
         heap.insert(&mut pager, &mut tx, &doc(5, "new")).unwrap();
         pager.commit_tx(tx).unwrap();
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), 2);
     }
     #[test]
@@ -880,7 +880,7 @@ mod tests {
         let mut tx = pager.begin_tx();
         let _ = heap.replace(&mut pager, &mut tx, l1, &doc(3, "ccc"));
         pager.abort_tx(tx).unwrap();
-        let docs = heap.scan(&mut pager).unwrap();
+        let docs = heap.scan(&pager).unwrap();
         assert_eq!(docs.len(), 1);
     }
 }

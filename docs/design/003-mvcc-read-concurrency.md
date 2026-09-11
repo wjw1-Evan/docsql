@@ -1,7 +1,11 @@
 # 设计说明:MVCC / 读写并发(分阶段路线)
 
-状态:**设计定稿,分阶段实施**。本文是权威设计;第一阶段(阶段 A)的前置兼容改动
-随本文件同批落地。任何并发/可见性相关改动先对照本文的兼容矩阵。
+状态:**设计定稿;阶段 A 第一步(pager 读取去借用化)已落地**——`read_page` 改为
+owned 返回,新增 `read_page_shared(&self)`(pool/file 走 Mutex,共享读者并发取页),
+heap/btree 的全部读方法已接受 `&Pager`;engine 的 `table_docs`/`table_pairs`/
+`index_probe`/`heap_of` 读路径同步去 `&mut`。下一步是 §2.2 的 SELECT 执行链
+`&self` 化(`exec_select` 的 CTE 写入状态参数化)与 §2.3 的服务器锁分级。
+本文是权威设计;任何并发/可见性相关改动先对照本文的兼容矩阵。
 
 ## 0. 现状(精确事实)
 
