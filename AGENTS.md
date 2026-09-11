@@ -23,11 +23,11 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 # 提交门禁(全部通过才能提交)
 cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                      # 421 用例
+cargo test --workspace                      # 452 用例
 
 # 改 dotnet 或协议时(cargo build 先行:测试进程会启动 target/debug/docsql-server)
 cargo build -p docsql-server
-cd dotnet && dotnet test                    # Client 59 + EFCore 22
+cd dotnet && dotnet test                    # Client 62 + EFCore 22
 
 # 改复制/部署逻辑后必跑;默认先构建 :local 镜像(构建内含 cargo test 门禁)
 ./deploy/run-tests.sh                       # single 34 + cluster 81
