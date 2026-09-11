@@ -21,6 +21,17 @@ async fn start_web_auth(
     upstream: Option<String>,
     auth_file: Option<String>,
 ) -> String {
+    start_web_full(token, peers, upstream, auth_file, None).await
+}
+
+/// Full-control console start, including optional native TLS (PEM paths).
+async fn start_web_full(
+    token: Option<&str>,
+    peers: Vec<String>,
+    upstream: Option<String>,
+    auth_file: Option<String>,
+    tls: Option<(String, String)>,
+) -> String {
     // Pick a free port by binding a listener first.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -31,6 +42,10 @@ async fn start_web_auth(
         token: token.map(String::from),
         peers,
         auth_file,
+        tls: tls.map(|(cert_path, key_path)| docsql_web::TlsConfig {
+            cert_path,
+            key_path,
+        }),
     };
     let listen = addr.clone();
     tokio::spawn(async move { docsql_web::run(cfg, &listen).await });
@@ -2549,5 +2564,68 @@ async fn metrics_endpoint_gates_formats_and_scrapes_nodes() {
     assert!(
         body.contains("path=\"/other\""),
         "unknown paths not bucketed:\n{body}"
+    );
+}
+
+/// 原生 TLS:配了 PEM 证书的控制台以 HTTPS 服务全 API 面 —— 自签信任链下
+/// 客户端握手成功,/healthz 经 TLS 应答;明文 HTTP 落在 TLS 端口上得不到
+/// 任何 HTTP 应答(握手被拒,连接关闭)。
+#[tokio::test]
+async fn tls_listener_serves_https_and_rejects_plaintext() {
+    // 自签证书(SAN: localhost)。
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.key_pair.serialize_pem()).unwrap();
+
+    let addr = start_web_full(
+        Some("sekrit"),
+        Vec::new(),
+        None,
+        None,
+        Some((cert.display().to_string(), key.display().to_string())),
+    )
+    .await;
+
+    // rustls 客户端:信任自签证书本身(作根)。
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ck.cert.der().clone()).unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+
+    let stream = TcpStream::connect(&addr).await.unwrap();
+    let mut tls = connector
+        .connect("localhost".try_into().unwrap(), stream)
+        .await
+        .expect("TLS handshake with the trusted self-signed cert");
+    tls.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 200"), "no HTTPS 200: {text}");
+    assert!(text.contains("\"ok\":true"), "healthz body missing: {text}");
+
+    // 明文 HTTP 落在 TLS 端口:不得有任何 HTTP 应答(TLS 层拒绝后关闭)。
+    let mut plain = TcpStream::connect(&addr).await.unwrap();
+    plain
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    plain.flush().await.unwrap();
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), plain.read_to_end(&mut raw)).await;
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        !text.contains("HTTP/1.1 200"),
+        "plaintext request got an HTTP answer on the TLS port: {text}"
     );
 }

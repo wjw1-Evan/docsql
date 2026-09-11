@@ -30,6 +30,9 @@
   `--csv`(RFC 4180)/`--json` 行导出、`help;` 内联命令(嵌入式与远程模式通用);
 - **优雅停机**:server/web 处理 SIGTERM/SIGINT——停止接受新连接,存量连接限时(10s)排空,
   引擎断连回滚 + WAL 恢复兜底;axum 挂接 graceful shutdown;
+- **Web 控制台原生 TLS**:`DOCSQL_WEB_TLS_CERT`/`DOCSQL_WEB_TLS_KEY`(PEM)以 rustls 服务 HTTPS
+  (ring 后端,无 cmake 工具链依赖;只设其一拒绝启动);明文请求落在 TLS 端口得不到 HTTP 应答;
+  未配置仍为明文 HTTP(反代场景),`DOCSQL_WEB_COOKIE_SECURE=1` 配套;
 - **TCP keepalive(60s)+ NODELAY**:长会话不再死于 NAT/防火墙静默超时;
 - **配置校验**:数值型环境变量(`DOCSQL_MAX_CONN`/`DOCSQL_IDLE_TIMEOUT`/`DOCSQL_CATCHUP_WINDOW`/
   `DOCSQL_BACKUP_*`/`DOCSQL_SLOW_MS`/`DOCSQL_STATEMENT_TIMEOUT_MS`)非法值拒绝启动(exit 2),

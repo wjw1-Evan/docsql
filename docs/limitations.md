@@ -20,16 +20,19 @@
 - 可观测性:`/metrics`(Prometheus)、`/healthz`、REQ_STATUS 运行时计数器、审计 JSONL、慢查询日志;
 - 运维韧性:优雅停机(SIGTERM 排空)、TCP keepalive、配置快速失败、`DOCSQL_MAX_CONN`/`IDLE_TIMEOUT`/`STATEMENT_TIMEOUT_MS`;
 - 数据完整性:WAL 先日志后数据、备份 sha256 校验和、恢复后跨节点摘要收敛验证、集群反熵自愈;
-- 安全:三凭据 + 数据库用户/角色(即时撤销)、登录锁定、服务端参数化绑定、等保三级能力对照;
-- 生态:.NET ADO.NET + EF Core(NuGet 可打包)、CLI(csv/json/脚本)、Web 控制台、单语言驱动之外的服务端
-  prepared statements 线协议(第二语言驱动的基础)。
+- 安全:三凭据 + 数据库用户/角色(即时撤销)、登录锁定、**服务端参数化绑定(驱动默认路径)**、
+  **Web 控制台原生 TLS(rustls)**、等保三级能力对照;
+- 生态:.NET ADO.NET(连接池默认开启 + 服务端绑定)+ EF Core(NuGet 可打包)、
+  CLI(csv/json/脚本)、Web 控制台、单语言驱动之外的服务端 prepared statements 线协议(第二语言驱动的基础)。
 
 ## 路线(按商用优先级)
 
 1. **驱动扩展**:基于 REQ_PREPARE/REQ_EXECUTE 服务端绑定实现第二/第三语言驱动(JDBC/Python);
-2. **性能**:多列索引、JOIN 优化(hash join)、EXPLAIN、统计信息;
-3. **引擎**:MVCC/读写并发、文档 >4KB(溢出页)、JSON 路径索引、DECIMAL/TIMESTAMP;
-4. **数据安全**:原生 TLS(rustls)、增量备份/PITR;
+2. **引擎**:多列索引(复合键编码与 catalog 版本策略)、文档 >4KB(溢出页链)、MVCC/读写并发、
+   JSON 路径索引、DECIMAL/TIMESTAMP;
+3. **性能**:JOIN 优化(hash join)、EXPLAIN、统计信息;
+4. **数据安全**:TCP 协议层原生 TLS(控制台已原生支持;数据面走 AES-GCM 帧加密或 TLS 反代/加密卷)、
+   增量备份/PITR;
 5. **生态**:Kafka/CDC 连接器、视图与触发器、全文检索。
 
 以上边界均为**显式行为**(报错或文档化策略),不存在静默数据风险;未列出的 SQL 语法一律显式报错。

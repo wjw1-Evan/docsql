@@ -36,6 +36,9 @@
 ## 监控
 
 - `GET /healthz` — 无门禁存活探针,只反映控制台进程自身;
+- **原生 TLS**:`DOCSQL_WEB_TLS_CERT` + `DOCSQL_WEB_TLS_KEY`(PEM 证书/私钥路径)同时设置即以
+  HTTPS 服务控制台全 API 面(rustls;只设其一会拒绝启动);TLS 节点建议配
+  `DOCSQL_WEB_COOKIE_SECURE=1`;未配置为明文 HTTP,生产亦可置于 TLS 反代之后;
 - `GET /metrics` — Prometheus 文本。抓取认证与其它 API 一致(带 `X-Docsql-Token`):
 
   ```yaml

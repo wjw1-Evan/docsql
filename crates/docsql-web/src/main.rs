@@ -48,12 +48,37 @@ async fn main() -> std::io::Result<()> {
              data endpoints report an error until one is set)"
         ),
     }
+    // Native TLS: both vars must be set to serve HTTPS directly. Without
+    // them the console is plain HTTP — put a TLS-terminating reverse proxy
+    // in front for production (and set DOCSQL_WEB_COOKIE_SECURE=1).
+    let tls = match (
+        std::env::var("DOCSQL_WEB_TLS_CERT")
+            .ok()
+            .filter(|p| !p.is_empty()),
+        std::env::var("DOCSQL_WEB_TLS_KEY")
+            .ok()
+            .filter(|p| !p.is_empty()),
+    ) {
+        (Some(cert), Some(key)) => {
+            eprintln!("docsql web console serving HTTPS (cert {cert})");
+            Some(docsql_web::TlsConfig {
+                cert_path: cert,
+                key_path: key,
+            })
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("refusing to start: DOCSQL_WEB_TLS_CERT and DOCSQL_WEB_TLS_KEY must be set together");
+            std::process::exit(2);
+        }
+        (None, None) => None,
+    };
     docsql_web::run(
         docsql_web::WebConfig {
             upstream,
             token,
             peers,
             auth_file,
+            tls,
         },
         &listen,
     )

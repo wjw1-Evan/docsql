@@ -122,6 +122,16 @@ pub struct WebConfig {
     /// Path of the console credential file. `None` (or empty) disables the
     /// username/password gate entirely (legacy behavior).
     pub auth_file: Option<String>,
+    /// Native TLS for the console listener (PEM cert + key paths). `None` =
+    /// plain HTTP (production behind a TLS-terminating reverse proxy).
+    pub tls: Option<TlsConfig>,
+}
+
+/// Native-TLS listener configuration (PEM cert + key paths,
+/// `DOCSQL_WEB_TLS_CERT` / `DOCSQL_WEB_TLS_KEY`).
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
@@ -129,6 +139,7 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         Some(path) => Some(AuthShared::open(path).map_err(std::io::Error::other)?),
         None => None,
     };
+    let tls = cfg.tls;
     let state = Arc::new(WebState {
         upstream: cfg.upstream,
         token: cfg.token,
@@ -143,16 +154,103 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    // Graceful shutdown: SIGTERM/SIGINT stop the listener; in-flight
-    // requests finish before the process exits (container orchestrators
-    // impose their own stop timeout on top).
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .map_err(std::io::Error::other)
+    match tls {
+        // Native HTTPS: axum::serve only accepts a plain TcpListener, so the
+        // TLS path drives hyper's connection builder per accepted stream.
+        Some(tls) => {
+            let acceptor = load_tls_acceptor(&tls)?;
+            let shutdown = shutdown_signal();
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    r = listener.accept() => {
+                        let (stream, peer) = r?;
+                        let acceptor = acceptor.clone();
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                                // A non-TLS client (or a scanner) on the TLS
+                                // port: log and close, never crash the loop.
+                                eprintln!("tls handshake from {peer} failed");
+                                return;
+                            };
+                            // Router (a tower Service) → hyper Service; the
+                            // TLS stream is tokio-style IO, hyper needs the
+                            // TokioIo adapter on top.
+                            let service =
+                                hyper_util::service::TowerToHyperService::new(
+                                    tower::service_fn(move |req| {
+                                        let app = app.clone();
+                                        async move {
+                                            use tower::ServiceExt;
+                                            app.oneshot(req)
+                                                .await
+                                                .map_err(std::io::Error::other)
+                                        }
+                                    }),
+                                );
+                            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection_with_upgrades(
+                                hyper_util::rt::TokioIo::new(tls_stream),
+                                service,
+                            )
+                            .await
+                            {
+                                // Mid-connection failures (client closed
+                                // mid-request, TLS renegotiation) are noise.
+                                eprintln!("https connection error: {e}");
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        None => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            // Graceful shutdown: SIGTERM/SIGINT stop the listener; in-flight
+            // requests finish before the process exits (container
+            // orchestrators impose their own stop timeout on top).
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(std::io::Error::other)
+        }
+    }
+}
+
+/// Load the PEM cert chain + private key into a TLS acceptor. Fails loudly
+/// at startup: a console asked to serve HTTPS must not silently fall back
+/// to plaintext.
+fn load_tls_acceptor(tls: &TlsConfig) -> std::io::Result<tokio_rustls::TlsAcceptor> {
+    use rustls::pki_types::CertificateDer;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(&tls.cert_path)?,
+    ))
+    .collect::<Result<_, _>>()
+    .map_err(|e| std::io::Error::other(format!("tls cert PEM: {e}")))?;
+    if certs.is_empty() {
+        return Err(std::io::Error::other(
+            "tls cert PEM contains no certificates",
+        ));
+    }
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(
+        &tls.key_path,
+    )?))?
+    .ok_or_else(|| std::io::Error::other("tls key PEM contains no private key"))?;
+    // ring provider: same crypto backend as the build image, no cmake.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| std::io::Error::other(format!("tls protocol versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| std::io::Error::other(format!("tls config: {e}")))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Resolve when the process is asked to terminate (SIGTERM / SIGINT).

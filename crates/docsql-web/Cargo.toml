@@ -16,6 +16,17 @@ serde_json = "1.0.151"
 serde.workspace = true
 # Credential salt + session tokens: OS-backed randomness (auth.rs).
 rand = "0.8"
+# Native TLS for the console listener (DOCSQL_WEB_TLS_CERT/KEY): ring
+# provider — no aws-lc-rs cmake toolchain needed in the build image.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+# Manual HTTPS serving: axum::serve only accepts a plain TcpListener, so
+# the TLS path drives hyper's connection builder directly.
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -23,3 +34,5 @@ http = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["io-util"] }
+# Self-signed certificate generation for the TLS e2e test.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
