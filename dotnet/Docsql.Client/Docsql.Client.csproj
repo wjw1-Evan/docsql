@@ -21,4 +21,9 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- 连接池计数器与 InTransaction 标志为 internal,测试断言池行为用。 -->
+    <InternalsVisibleTo Include="Docsql.Client.Tests" />
+  </ItemGroup>
+
 </Project>

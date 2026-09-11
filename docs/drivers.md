@@ -17,8 +17,26 @@ await using var reader = await cmd.ExecuteReaderAsync();
 - `RETURNING` 可直接 `ExecuteScalar/ExecuteReader`;
 - 持久化 pub/sub:`conn.Publish(channel, payload)` 返回 `(id, receivers)`;
   `DocsqlSubscriber` 专用连接 + 专职读线程(订阅必须独占连接),断线按最后 id 续传;
-- 服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM;
-- 参数在客户端转义为类型化字面量(见[安全指南](security.md#sql-注入防护双层))。
+- 服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM。
+
+### 参数绑定:服务端 prepared statements(默认路径)
+
+带参数的命令**不再在客户端拼接字面量**:`@name` 改写为 `?` 占位符,模板经 REQ_PREPARE
+注册(物理连接内按句柄缓存,同一模板重复执行零注册开销),参数数组经 REQ_EXECUTE 执行。
+值在**服务端**渲染为类型化字面量(引号感知、字符串翻倍转义)——任何取值都无法逃逸
+字面量,注入载荷只能是数据。授权/语句超时/审计与普通语句同路径。`cmd.Prepare()`
+可预注册句柄。
+
+### 连接池(默认开启)
+
+- `Close()` 归还物理连接而非断开;`Open()` 借出前 PING 验活,死连接自动丢弃重建
+  (服务器重启后的客户端韧性由此免费获得);
+- 池键 = host/port/user/password/token/key/max pool size:不同身份绝不共享物理连接;
+- **事务安全**:事务未了结就 `Close()` 的连接被物理丢弃(服务器对断连自动 ROLLBACK),
+  残留事务不可能泄漏给下一个借出者;
+- 池化连接的服务端 prepared 句柄缓存随物理连接有效,复用零成本;
+- 开关:`pooling=false`(直连模式);`max pool size=N`(池上限,默认 100,超限归还即关闭);
+- `ClearPool()` / `ClearAllPools()` 物理清空空闲连接。
 
 ## .NET EF Core(Docsql.EntityFrameworkCore)
 

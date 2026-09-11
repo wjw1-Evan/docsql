@@ -57,6 +57,8 @@ public enum FrameType : ushort
     RespSync = 0x0109,
     /// <summary>REQ_META 的应答载荷。</summary>
     RespMeta = 0x010A,
+    /// <summary>REQ_PREPARE 的应答:JSON {"handle":n} — 句柄按连接隔离,随连接生死。</summary>
+    RespPrepared = 0x010E,
 }
 
 public readonly record struct Frame(FrameType Type, ushort Flags, ulong TopologyVersion, byte[] Payload)
@@ -97,6 +99,14 @@ public sealed class ProtocolConnection : IDisposable
     private readonly byte[] _header = new byte[20];
     private readonly byte[]? _key;
 
+    /// <summary>
+    /// 服务端 prepared statement 句柄缓存:模板 SQL → REQ_PREPARE 句柄。
+    /// 句柄按物理连接隔离且随连接生死 —— 池化复用同一物理连接即缓存有效;
+    /// 超过容量上限时逐个 REQ_CLOSE_STMT 后清空(服务器侧无自动逐出)。
+    /// </summary>
+    private readonly Dictionary<string, ulong> _prepared = new();
+    private const int PreparedCapacity = 96;
+
     public ProtocolConnection(
         string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000)
     {
@@ -126,6 +136,53 @@ public sealed class ProtocolConnection : IDisposable
             _tcp.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// 取模板的 prepared 句柄(缓存命中不发帧);未缓存则 REQ_PREPARE 注册。
+    /// 返回 (句柄, 是否命中缓存)。注册失败(语法错误等)直接抛出,不入缓存。
+    /// </summary>
+    internal (ulong Handle, bool Cached) GetOrPrepare(string template)
+    {
+        if (_prepared.TryGetValue(template, out var cached))
+        {
+            return (cached, true);
+        }
+        if (_prepared.Count >= PreparedCapacity)
+        {
+            ClearPrepared();
+        }
+        var resp = Send(new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)))
+            .EnsureOk("prepare failed: ");
+        if (resp.Type != FrameType.RespPrepared)
+        {
+            throw new DocsqlException($"unexpected response to PREPARE: {resp.Type}");
+        }
+        using var doc = System.Text.Json.JsonDocument.Parse(
+            System.Text.Encoding.UTF8.GetString(resp.Payload));
+        var handle = doc.RootElement.GetProperty("handle").GetUInt64();
+        _prepared[template] = handle;
+        return (handle, false);
+    }
+
+    /// <summary>显式关闭全部缓存句柄(容量逐出/连接归还前清扫)。</summary>
+    internal void ClearPrepared()
+    {
+        foreach (var h in _prepared.Values)
+        {
+            try
+            {
+                Send(new Frame(
+                    FrameType.ReqCloseStmt, 0, 0,
+                    System.Text.Encoding.UTF8.GetBytes($"{{\"handle\":{h}}}")));
+            }
+            catch
+            {
+                // 连接已坏:句柄随物理连接消亡,无需逐个关闭。
+                break;
+            }
+        }
+        _prepared.Clear();
     }
 
     /// SQL text payload: length-prefixed UTF-8, tag 4 (string).

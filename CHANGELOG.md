@@ -35,7 +35,15 @@
   `DOCSQL_BACKUP_*`/`DOCSQL_SLOW_MS`/`DOCSQL_STATEMENT_TIMEOUT_MS`)非法值拒绝启动(exit 2),
   不再静默回退默认值;
 - **NuGet 打包**:Docsql.Client 与 Docsql.EntityFrameworkCore 具备完整包元数据
-  (LicenseExpression `MIT OR Apache-2.0`、包 README),`dotnet pack` 可出包。
+  (LicenseExpression `MIT OR Apache-2.0`、包 README),`dotnet pack` 可出包;
+- **ADO.NET 连接池**:默认开启(`pooling=false` 关闭;`max pool size=N` 池上限,默认 100)。
+  Close 归还、Open 借出前 PING 验活(死连接自动丢弃重建,服务器重启后客户端自愈);
+  池键含全部凭据(不同身份不共享物理连接);**事务未了结的 Close 物理丢弃连接**
+  (断连自动回滚,残留事务不可能泄漏给下一个借出者);`ClearPool()`/`ClearAllPools()`;
+- **ADO.NET 参数绑定切换服务端**:带参数命令改走 REQ_PREPARE/REQ_EXECUTE ——
+  `@name` 改写 `?` 占位符,模板按物理连接缓存句柄(重复执行零注册开销),
+  值在服务端渲染为类型化字面量(引号感知、字符串翻倍转义,注入载荷只能是数据),
+  授权/超时/审计同路径;`cmd.Prepare()` 预注册句柄。原有 62 项行为测试在切换下直接通过。
 
 #### 修正
 

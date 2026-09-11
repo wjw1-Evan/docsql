@@ -1,5 +1,6 @@
 // ADO.NET provider surface for DocSQL.
 
+using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
@@ -57,12 +58,124 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
         get => TryGetValue("password", out var v) ? (string)v : "";
         set => this["password"] = value;
     }
+
+    /// <summary>连接池(默认开启;false = 每次 Open 物理建连、Close 即断)。</summary>
+    public bool Pooling
+    {
+        get => TryGetValue("pooling", out var v)
+            ? !(v as string ?? "").Equals("false", StringComparison.OrdinalIgnoreCase)
+            : true;
+        set => this["pooling"] = value.ToString();
+    }
+
+    /// <summary>每个连接串的池上限:池满时归还的物理连接直接关闭。</summary>
+    public int MaxPoolSize
+    {
+        get => TryGetValue("max pool size", out var v) && int.TryParse((string)v, out var n)
+            ? Math.Max(1, n)
+            : 100;
+        set => this["max pool size"] = value.ToString();
+    }
+}
+
+/// <summary>
+/// 物理连接池:按"唯一确定一条已认证会话"的键(host/port/user/password/token/key)池化。
+/// 借出前用 PING 往返证明连接活着(死连接直接丢弃换新建);事务未了结的连接绝不归还
+/// (Close 即物理断开 —— 服务器对断连自动 ROLLBACK,残留事务不可能泄漏给下一个借出者)。
+/// 服务端 prepared 句柄缓存挂在物理连接上:同键复用即缓存有效,无需失效。
+/// </summary>
+internal static class ConnectionPool
+{
+    internal sealed class Slot
+    {
+        public readonly ConcurrentQueue<ProtocolConnection> Idle = new();
+        public readonly int MaxSize;
+
+        public Slot(int maxSize) => MaxSize = Math.Max(1, maxSize);
+    }
+
+    private static readonly ConcurrentDictionary<string, Slot> Pools = new();
+
+    /// <summary>池命中 / 未命中(新建) / 丢弃(死连接或超池上限) 计数,测试可断言。</summary>
+    internal static long Hits, Misses, Discarded;
+
+    internal static string KeyOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
+        string.Join('\u0001', p.Host, p.Port, p.User, p.Password, p.Token,
+            keyOverride ?? p.Key, p.MaxPoolSize);
+
+    internal static Slot SlotOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
+        Pools.GetOrAdd(KeyOf(p, keyOverride), _ => new Slot(p.MaxPoolSize));
+
+    internal static ProtocolConnection Rent(
+        Slot slot, DocsqlConnectionStringBuilder p, string? keyOverride)
+    {
+        while (slot.Idle.TryDequeue(out var proto))
+        {
+            try
+            {
+                // PING 在服务器上无需认证:一次往返即可证明 TCP 活着且帧通路完好。
+                var pong = proto.Send(new Frame(FrameType.ReqPing, 0, 0, Array.Empty<byte>()));
+                if (pong.Type == FrameType.RespPong)
+                {
+                    Interlocked.Increment(ref Hits);
+                    return proto;
+                }
+            }
+            catch
+            {
+                // 死连接(对端重启/网络断/超时)。
+            }
+            Interlocked.Increment(ref Discarded);
+            proto.Dispose();
+        }
+        Interlocked.Increment(ref Misses);
+        return DocsqlConnection.ConnectAndAuth(p, keyOverride);
+    }
+
+    internal static void Return(Slot? slot, ProtocolConnection proto)
+    {
+        if (slot is null || slot.Idle.Count >= slot.MaxSize)
+        {
+            Interlocked.Increment(ref Discarded);
+            proto.Dispose();
+            return;
+        }
+        slot.Idle.Enqueue(proto);
+    }
+
+    /// <summary>清空全部池(物理关闭所有空闲连接)。进程退出/测试隔离用。</summary>
+    public static void ClearAll()
+    {
+        foreach (var slot in Pools.Values)
+        {
+            while (slot.Idle.TryDequeue(out var proto))
+            {
+                proto.Dispose();
+            }
+        }
+        Pools.Clear();
+    }
+
+    public static void ClearSlot(string key)
+    {
+        if (Pools.TryRemove(key, out var slot))
+        {
+            while (slot.Idle.TryDequeue(out var proto))
+            {
+                proto.Dispose();
+            }
+        }
+    }
 }
 
 public sealed class DocsqlConnection : DbConnection
 {
     private ConnectionState _state = ConnectionState.Closed;
     private ProtocolConnection? _proto;
+    private ConnectionPool.Slot? _poolSlot;
+
+    /// <summary>事务打开期间为 true:此时 Close 物理断开(服务器断连自动回滚),连接绝不归还池。</summary>
+    internal bool InTransaction { get; set; }
 
     public DocsqlConnection() { }
 
@@ -191,11 +304,21 @@ public sealed class DocsqlConnection : DbConnection
         var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
         try
         {
-            _proto = ConnectAndAuth(p, KeyOverride);
+            if (p.Pooling)
+            {
+                var slot = ConnectionPool.SlotOf(p, KeyOverride);
+                _proto = ConnectionPool.Rent(slot, p, KeyOverride);
+                _poolSlot = slot;
+            }
+            else
+            {
+                _proto = ConnectAndAuth(p, KeyOverride);
+            }
         }
         catch
         {
             _proto = null;
+            _poolSlot = null;
             _state = ConnectionState.Broken;
             throw;
         }
@@ -204,10 +327,33 @@ public sealed class DocsqlConnection : DbConnection
 
     public override void Close()
     {
-        _proto?.Dispose();
-        _proto = null;
+        if (_proto is not null)
+        {
+            var proto = _proto;
+            _proto = null;
+            if (InTransaction)
+            {
+                // 事务未了结就 Close:物理断开(服务器断连自动 ROLLBACK)。
+                // 归还一个带着开放事务的连接,会把事务泄漏给下一个借出者。
+                Interlocked.Increment(ref ConnectionPool.Discarded);
+                proto.Dispose();
+            }
+            else
+            {
+                ConnectionPool.Return(_poolSlot, proto);
+            }
+        }
+        _poolSlot = null;
         _state = ConnectionState.Closed;
     }
+
+    /// <summary>清空与当前连接串对应的池(物理关闭空闲连接)。</summary>
+    public void ClearPool() =>
+        ConnectionPool.ClearSlot(ConnectionPool.KeyOf(
+            EndpointOverride is { } ep ? ep.ToBuilder() : Parsed, KeyOverride));
+
+    /// <summary>清空全部池(物理关闭所有空闲连接)。</summary>
+    public static void ClearAllPools() => ConnectionPool.ClearAll();
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
         new DocsqlTransaction(this, isolationLevel);
@@ -332,23 +478,41 @@ public sealed class DocsqlCommand : DbCommand
         {
             throw new InvalidOperationException("connection is not open");
         }
-        var sql = BindParameters();
-        return conn.Proto.Send(new Frame(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(sql)));
-    }
-
-    /// Substitute @name parameters (client-side v1; server-side binding is
-    /// tracked for the prepared-statement milestone). A single scanner pass
-    /// skips '...' string literals and matches whole identifiers, so
-    /// <c>@id</c> never rewrites <c>@id2</c>, literals containing
-    /// <c>@name</c> stay intact, and a parameter's own value can never be
-    /// rewritten by a later parameter.
-    private string BindParameters()
-    {
         if (Parameters.Count == 0)
         {
-            return CommandText;
+            return conn.Proto.Send(
+                new Frame(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(CommandText)));
         }
+        // 参数化语句走服务端绑定:占位符改写为 ?,模板注册 REQ_PREPARE(物理连接
+        // 内按句柄缓存),参数数组经 REQ_EXECUTE 执行 —— 值由服务器渲染为类型化
+        // 字面量(引号感知、字符串翻倍转义),任何取值都无法逃逸字面量;授权/审计
+        // 与 REQ_SQL 同路径。响应帧形状与 REQ_SQL 完全一致。
+        var (template, values) = RewriteParameters();
+        var (handle, _) = conn.Proto.GetOrPrepare(template);
+        var sb = new StringBuilder(values.Count * 8 + 32);
+        sb.Append("{\"handle\":").Append(handle).Append(",\"params\":[");
+        for (int i = 0; i < values.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+            sb.Append(JsonOf(values[i]));
+        }
+        sb.Append("]}");
+        return conn.Proto.Send(
+            new Frame(FrameType.ReqExecute, 0, 0, Encoding.UTF8.GetBytes(sb.ToString())));
+    }
+
+    /// Substitute @name parameters with `?` marks, returning the values in
+    /// marker order. A single scanner pass skips '...' string literals and
+    /// matches whole identifiers, so <c>@id</c> never rewrites <c>@id2</c>,
+    /// literals containing <c>@name</c> stay intact, and a repeated name
+    /// produces one marker per occurrence (duplicated value).
+    private (string Template, List<object?> Values) RewriteParameters()
+    {
         var sql = CommandText;
+        var values = new List<object?>(Parameters.Count);
         var sb = new StringBuilder(sql.Length);
         int i = 0;
         while (i < sql.Length)
@@ -389,7 +553,8 @@ public sealed class DocsqlCommand : DbCommand
                     var p = FindParameter(name);
                     if (p is not null)
                     {
-                        sb.Append(LiteralOf(p));
+                        sb.Append('?');
+                        values.Add(p.Value);
                         i = k;
                         continue;
                     }
@@ -398,34 +563,39 @@ public sealed class DocsqlCommand : DbCommand
             sb.Append(c);
             i++;
         }
-        return sb.ToString();
+        return (sb.ToString(), values);
     }
 
     private DocsqlParameter? FindParameter(string name) =>
         Parameters.Cast<DocsqlParameter>().FirstOrDefault(
             p => (p.ParameterName?.TrimStart('@') ?? "") == name);
 
-    private static string LiteralOf(DocsqlParameter p) => p.Value switch
+    /// <summary>参数值 → JSON(REQ_EXECUTE 的 params 数组元素)。字符串值在
+    /// 服务端转义绑定;DateTime 族沿用 culture-invariant 可排序文本形态。</summary>
+    private static string JsonOf(object? v) => v switch
     {
-        null or DBNull => "NULL",
-        // Unsigned integers render like their signed siblings; falling to
-        // the default case quoted them ('5') and silently matched nothing.
-        int or long or short or byte or uint or ulong or ushort or sbyte
-            => Convert.ToString(p.Value, System.Globalization.CultureInfo.InvariantCulture)!,
-        double d => d.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        float f => f.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        null or DBNull => "null",
+        bool b => b ? "true" : "false",
+        int or long or short or byte or sbyte
+            => JsonSerializer.Serialize(Convert.ToInt64(v, CultureInfo.InvariantCulture)),
+        uint or ushort => JsonSerializer.Serialize(Convert.ToInt64(v, CultureInfo.InvariantCulture)),
+        ulong u => JsonSerializer.Serialize(u),
+        double d => JsonSerializer.Serialize(d),
+        float f => JsonSerializer.Serialize((double)f),
         // Numeric literal: the engine stores decimals as f64 — big values
         // lose precision beyond ~15-16 significant digits (no decimal type).
-        decimal m => m.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        bool b => b ? "TRUE" : "FALSE",
-        char c => $"'{c.ToString().Replace("'", "''")}'",
-        // Date/time values must round-trip in a culture-invariant,
-        // lexicographically sortable text form (the engine stores TEXT):
-        // a culture-dependent ToString() sorts wrongly and cannot be parsed
-        // back by GetDateTime on machines with another culture.
-        DateTime dt => $"'{dt.ToString("O", System.Globalization.CultureInfo.InvariantCulture)}'",
-        DateTimeOffset dto => $"'{dto.ToString("O", System.Globalization.CultureInfo.InvariantCulture)}'",
-        TimeSpan ts => $"'{ts.ToString("c", System.Globalization.CultureInfo.InvariantCulture)}'",
+        decimal m => JsonSerializer.Serialize((double)m),
+        // Date/time values keep the culture-invariant, lexicographically
+        // sortable text form the engine stores (GetDateTime parses it back).
+        DateTime dt => JsonSerializer.Serialize(
+            dt.ToString("O", CultureInfo.InvariantCulture)),
+        DateTimeOffset dto => JsonSerializer.Serialize(
+            dto.ToString("O", CultureInfo.InvariantCulture)),
+        TimeSpan ts => JsonSerializer.Serialize(
+            ts.ToString("c", CultureInfo.InvariantCulture)),
+        string s => JsonSerializer.Serialize(s),
+        char c => JsonSerializer.Serialize(c.ToString()),
+        Guid g => JsonSerializer.Serialize(g.ToString()),
         // No BLOB storage in the engine; storing ToString() would corrupt
         // data silently — refuse loudly instead.
         byte[] => throw new NotSupportedException(
@@ -434,10 +604,8 @@ public sealed class DocsqlCommand : DbCommand
         // text and silently match nothing.
         Enum => throw new NotSupportedException(
             "enum parameters are not supported; convert to the underlying integer first"),
-        Guid g => $"'{g}'",
-        string s => $"'{s.Replace("'", "''")}'",
         _ => throw new NotSupportedException(
-            $"parameter type {p.Value.GetType().Name} is not supported"),
+            $"parameter type {v.GetType().Name} is not supported"),
     };
 
     private static string ErrorText(Frame f) => Encoding.UTF8.GetString(f.Payload);
@@ -445,7 +613,20 @@ public sealed class DocsqlCommand : DbCommand
     internal static int DecodeAffected(byte[] payload) =>
         payload.Length >= 8 ? BitConverter.ToInt32(payload, 0) : 0;
 
-    public override void Prepare() { }
+    /// <summary>预注册服务端 prepared statement(REQ_PREPARE,句柄按物理连接
+    /// 缓存):命令首次执行即省一次注册往返。无参数命令为 no-op(不走绑定路径)。</summary>
+    public override void Prepare()
+    {
+        if (Connection is not { State: ConnectionState.Open })
+        {
+            throw new InvalidOperationException("connection is not open");
+        }
+        if (Parameters.Count > 0)
+        {
+            var (template, _) = RewriteParameters();
+            _ = Connection.Proto.GetOrPrepare(template);
+        }
+    }
 
     protected override DbParameter CreateDbParameter() => new DocsqlParameter();
 }
@@ -663,6 +844,9 @@ public sealed class DocsqlTransaction : DbTransaction
         _conn = conn;
         IsolationLevel = iso;
         Run("BEGIN");
+        // 事务归属这条物理连接:InTransaction 期间 Close 把连接物理丢弃
+        // 而不是归还池(残留事务不可能泄漏给下一个借出者)。
+        conn.InTransaction = true;
     }
 
     public override IsolationLevel IsolationLevel { get; }
@@ -677,6 +861,7 @@ public sealed class DocsqlTransaction : DbTransaction
         }
         Run("COMMIT");
         _done = true;
+        _conn.InTransaction = false;
     }
 
     public override void Rollback()
@@ -687,6 +872,7 @@ public sealed class DocsqlTransaction : DbTransaction
         }
         Run("ROLLBACK");
         _done = true;
+        _conn.InTransaction = false;
     }
 
     // ADO.NET contract: disposing an unfinished transaction rolls it back —
@@ -705,6 +891,10 @@ public sealed class DocsqlTransaction : DbTransaction
             catch
             {
                 // Connection already broken; nothing to roll back.
+            }
+            finally
+            {
+                _conn.InTransaction = false;
             }
         }
         base.Dispose(disposing);
