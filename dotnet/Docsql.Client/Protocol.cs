@@ -138,6 +138,41 @@ public sealed class ProtocolConnection : IDisposable
         }
     }
 
+    private ProtocolConnection(TcpClient connected, byte[]? key)
+    {
+        _tcp = connected;
+        _stream = connected.GetStream();
+        _key = key;
+    }
+
+    /// <summary>异步建连(真异步,不占线程):超时与外部取消共用一个令牌。
+    /// 连接超时抛 <see cref="System.IO.IOException"/>,外部取消抛
+    /// OperationCanceledException —— 两者可据此区分。</summary>
+    public static async Task<ProtocolConnection> ConnectAsync(
+        string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000,
+        CancellationToken cancellationToken = default)
+    {
+        var tcp = new TcpClient();
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(connectTimeoutMs);
+            await tcp.ConnectAsync(host, port, cts.Token);
+            return new ProtocolConnection(tcp, key);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            tcp.Dispose();
+            throw new System.IO.IOException(
+                $"connect to {host}:{port} timed out after {connectTimeoutMs} ms");
+        }
+        catch
+        {
+            tcp.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>
     /// 取模板的 prepared 句柄(缓存命中不发帧);未缓存则 REQ_PREPARE 注册。
     /// 返回 (句柄, 是否命中缓存)。注册失败(语法错误等)直接抛出,不入缓存。
@@ -154,6 +189,30 @@ public sealed class ProtocolConnection : IDisposable
         }
         var resp = Send(new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)))
             .EnsureOk("prepare failed: ");
+        return FinishPrepare(resp, template);
+    }
+
+    /// <summary><see cref="GetOrPrepare"/> 的真异步形态。</summary>
+    internal async Task<(ulong Handle, bool Cached)> GetOrPrepareAsync(
+        string template, CancellationToken cancellationToken = default)
+    {
+        if (_prepared.TryGetValue(template, out var cached))
+        {
+            return (cached, true);
+        }
+        if (_prepared.Count >= PreparedCapacity)
+        {
+            ClearPrepared();
+        }
+        var resp = await SendAsync(
+                new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)), cancellationToken)
+            .ConfigureAwait(false);
+        resp.EnsureOk("prepare failed: ");
+        return FinishPrepare(resp, template);
+    }
+
+    private (ulong, bool) FinishPrepare(Frame resp, string template)
+    {
         if (resp.Type != FrameType.RespPrepared)
         {
             throw new DocsqlException($"unexpected response to PREPARE: {resp.Type}");
@@ -202,19 +261,43 @@ public sealed class ProtocolConnection : IDisposable
         return Receive();
     }
 
+    /// <summary><see cref="Send"/> 的真异步形态。取消只到语句边界:一帧发到
+    /// 一半作废会错位帧流(该连接只能弃用),语句级取消由服务端语句超时承担,
+    /// ct 在发送前检查。</summary>
+    public async Task<Frame> SendAsync(Frame request, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await WriteAsync(request).ConfigureAwait(false);
+        return await ReadFrameAsync().ConfigureAwait(false);
+    }
+
+    private Frame SealFrame(Frame request)
+    {
+        if (_key is null)
+        {
+            return request;
+        }
+        return request with
+        {
+            Flags = (ushort)(request.Flags | FlagEncrypted),
+            Payload = Seal(_key, request.Payload),
+        };
+    }
+
     /// <summary>仅发送一帧(订阅连接拆开用:响应帧与推送帧需分别接收)。</summary>
     public void Write(Frame request)
     {
-        if (_key is not null)
-        {
-            request = request with
-            {
-                Flags = (ushort)(request.Flags | FlagEncrypted),
-                Payload = Seal(_key, request.Payload),
-            };
-        }
-        _stream.Write(request.Encode());
+        var sealedFrame = SealFrame(request);
+        _stream.Write(sealedFrame.Encode());
         _stream.Flush();
+    }
+
+    /// <summary><see cref="Write"/> 的真异步形态。</summary>
+    public async Task WriteAsync(Frame request)
+    {
+        var sealedFrame = SealFrame(request);
+        await _stream.WriteAsync(sealedFrame.Encode()).ConfigureAwait(false);
+        await _stream.FlushAsync().ConfigureAwait(false);
     }
 
     /// <summary>仅接收一帧(已解密);阻塞直至一帧完整到达。</summary>
@@ -259,23 +342,44 @@ public sealed class ProtocolConnection : IDisposable
     private Frame ReadFrame()
     {
         ReadExact(_header);
-        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(_header.AsSpan(0, 4));
+        var (type, flags, topo, len) = ParseHeader(_header);
+        var payload = new byte[len];
+        ReadExact(payload);
+        return Assemble(flags, type, topo, payload);
+    }
+
+    /// <summary><see cref="ReadFrame"/> 的真异步形态。</summary>
+    private async Task<Frame> ReadFrameAsync()
+    {
+        await ReadExactAsync(_header).ConfigureAwait(false);
+        var (type, flags, topo, len) = ParseHeader(_header);
+        var payload = new byte[len];
+        await ReadExactAsync(payload).ConfigureAwait(false);
+        return Assemble(flags, type, topo, payload);
+    }
+
+    private (FrameType Type, ushort Flags, ulong TopologyVersion, int Len) ParseHeader(byte[] header)
+    {
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
         if (magic != 0x31515344)
         {
             throw new IOException("bad frame magic");
         }
-        var type = (FrameType)BinaryPrimitives.ReadUInt16LittleEndian(_header.AsSpan(6, 2));
-        var flags = BinaryPrimitives.ReadUInt16LittleEndian(_header.AsSpan(4, 2));
-        var topo = BinaryPrimitives.ReadUInt64LittleEndian(_header.AsSpan(8, 8));
-        int len = (int)BinaryPrimitives.ReadUInt32LittleEndian(_header.AsSpan(16, 4));
+        var type = (FrameType)BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(6, 2));
+        var flags = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(4, 2));
+        var topo = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(8, 8));
+        int len = (int)BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(16, 4));
         // Mirror the server's inbound cap: a corrupt or hostile length must
         // not drive a multi-GB allocation.
         if (len is < 0 or > 64 * 1024 * 1024)
         {
             throw new IOException($"frame length {len} out of range");
         }
-        var payload = new byte[len];
-        ReadExact(payload);
+        return (type, flags, topo, len);
+    }
+
+    private Frame Assemble(ushort flags, FrameType type, ulong topo, byte[] payload)
+    {
         if ((flags & FlagEncrypted) != 0)
         {
             if (_key is null)
@@ -291,6 +395,20 @@ public sealed class ProtocolConnection : IDisposable
         while (off < buf.Length)
         {
             int n = _stream.Read(buf, off, buf.Length - off);
+            if (n == 0)
+            {
+                throw new IOException("connection closed");
+            }
+            off += n;
+        }
+    }
+
+    private async Task ReadExactAsync(byte[] buf)
+    {
+        int off = 0;
+        while (off < buf.Length)
+        {
+            int n = await _stream.ReadAsync(buf.AsMemory(off, buf.Length - off)).ConfigureAwait(false);
             if (n == 0)
             {
                 throw new IOException("connection closed");

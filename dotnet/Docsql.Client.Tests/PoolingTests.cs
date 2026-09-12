@@ -127,17 +127,22 @@ public sealed class PoolingTests : IClassFixture<ServerFixture>
     }
 
     [Fact]
-    public void Max_pool_size_caps_idle_connections()
+    public void Max_pool_size_caps_active_connections()
     {
         ConnectionPool.ClearAll();
-        long discardedBefore = Interlocked.Read(ref ConnectionPool.Discarded);
+        var cs = $"host=127.0.0.1;port={_fx.Port};max pool size=1;connect timeout=1";
 
-        var a = OpenRaw($"host=127.0.0.1;port={_fx.Port};max pool size=1");
-        var b = OpenRaw($"host=127.0.0.1;port={_fx.Port};max pool size=1");
-        a.Close(); // 入池(idle=1)
-        b.Close(); // 池满:物理丢弃
-        Assert.True(Interlocked.Read(ref ConnectionPool.Discarded) > discardedBefore,
-            "over-capacity return must physically close");
+        var a = OpenRaw(cs);
+        // 唯一的物理连接在 a 手里:第二个 Open 必须等待池满超时(与 SqlClient
+        // 同语义),而不是悄悄新建超出上限。
+        using (var b = new DocsqlConnection(cs))
+        {
+            var ex = Assert.Throws<TimeoutException>(() => b.Open());
+            Assert.Contains("pool exhausted", ex.Message);
+        }
+        a.Close(); // 归还
+        using var c = OpenRaw(cs); // 立即可借出
+        Assert.Equal(1L, ExecScalar(c, "SELECT 1"));
     }
 
     [Fact]

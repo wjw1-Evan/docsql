@@ -32,11 +32,20 @@ await using var reader = await cmd.ExecuteReaderAsync();
 - `Close()` 归还物理连接而非断开;`Open()` 借出前 PING 验活,死连接自动丢弃重建
   (服务器重启后的客户端韧性由此免费获得);
 - 池键 = host/port/user/password/token/key/max pool size:不同身份绝不共享物理连接;
+- **池容量封顶"借出+空闲"总物理连接数**(与 SqlClient 同语义):池满时 `Open` 等待
+  `connect timeout` 秒(默认 15,亦即 TCP 建连超时)后抛超时错,绝不悄悄超限新建;
 - **事务安全**:事务未了结就 `Close()` 的连接被物理丢弃(服务器对断连自动 ROLLBACK),
   残留事务不可能泄漏给下一个借出者;
 - 池化连接的服务端 prepared 句柄缓存随物理连接有效,复用零成本;
-- 开关:`pooling=false`(直连模式);`max pool size=N`(池上限,默认 100,超限归还即关闭);
-- `ClearPool()` / `ClearAllPools()` 物理清空空闲连接。
+- 开关:`pooling=false`(直连模式);`max pool size=N`(池上限,默认 100);
+- `ClearPool()` / `ClearAllPools()` 物理清空空闲连接;
+- **真异步**:`OpenAsync`/`ExecuteReaderAsync`/`ExecuteNonQueryAsync`/`ExecuteScalarAsync`/
+  `CommitAsync`/`RollbackAsync`/保存点 `SaveAsync`/`RollbackAsync(name)`/`ReleaseAsync(name)`
+  全链路异步 IO(帧收发走 `NetworkStream` 异步,不占线程池线程);语句级取消由服务端
+  语句超时承担(帧中途取消会错位帧流,客户端不假装可取消);
+- **保存点 API**:`DocsqlTransaction.Save`/`Rollback(name)`/`Release(name)` 映射引擎
+  SAVEPOINT/ROLLBACK TO/RELEASE(`SupportsSavepoints=true`);注意引擎语义:ROLLBACK TO
+  会把命名保存点自身也丢弃(异于 SQLite/PG),回滚后勿再 Release 同名保存点。
 
 ## .NET EF Core(Docsql.EntityFrameworkCore)
 

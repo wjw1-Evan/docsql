@@ -15,8 +15,10 @@ while (await reader.ReadAsync()) { /* ... */ }
 ```
 
 - 命令面:完整 SQL(DDL/DML/JOIN/聚合/事务/SAVEPOINT/RETURNING)、`RETURNING` 子句、GUID/UUIDv7 自动主键
-- 事务:`BeginDbTransaction` 映射 BEGIN/COMMIT/ROLLBACK,支持 SAVEPOINT
+- 真 async:`OpenAsync`/`ExecuteReaderAsync`/`ExecuteNonQueryAsync`/`ExecuteScalarAsync`/`CommitAsync`/`SaveAsync` 全链路异步 IO(不占线程)
+- 事务:`BeginDbTransaction` 映射 BEGIN/COMMIT/ROLLBACK;`Save`/`Rollback(name)`/`Release(name)` 暴露保存点(引擎语义:ROLLBACK TO 会把命名保存点自身丢弃)
 - 认证:协议 token(`token=`)或数据库用户(`user=`/`password=`)二选一
+- 连接池(默认开启):`max pool size=N` 封顶"借出+空闲"总物理连接数(池满等待 `connect timeout` 秒后报错,与 SqlClient 同语义)、`ClearPool()`/`ClearAllPools()`
 - 持久化 pub/sub:`DocsqlConnection.Publish(...)` + `DocsqlSubscriber`(专用连接、断线按 id 续传)
 - 传输加密:服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM 帧加密
 

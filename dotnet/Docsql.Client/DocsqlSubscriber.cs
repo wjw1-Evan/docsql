@@ -69,7 +69,7 @@ public sealed class DocsqlSubscriber : IDisposable
     public DocsqlSubscriber(string connectionString)
     {
         var b = new DocsqlConnectionStringBuilder { ConnectionString = connectionString };
-        _proto = DocsqlConnection.ConnectAndAuth(b, null);
+        _proto = DocsqlConnection.ConnectAndAuth(b, null, b.ConnectTimeout * 1000);
         _reader = new Thread(ReadLoop) { IsBackground = true, Name = "docsql-subscriber" };
         _reader.Start();
     }
