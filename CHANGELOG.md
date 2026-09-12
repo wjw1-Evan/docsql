@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### Aspire 集成与 NuGet 首发(2026-09-12)
+
+#### 新增
+
+- **Aspire 扩展三件套**(`Docsql.Aspire.Hosting` / `Docsql.Aspire.Client` / EF 容器级注册):
+  AppHost 中 `AddDocsql` 以官方镜像编排 DocSQL 节点(随机 token、命名数据卷、TCP 健康检查、
+  连接串注入),`AddDocsqlCluster` 一次拉起对称集群(DOCSQL_PEERS/CLUSTER_TOKEN/数据卷),
+  `WithWebConsole` 附带 docsql-web 控制台伴生容器;消费侧 `AddDocsqlConnection` 注册连接与
+  健康检查;EF 新增 `AddDocsqlDbContext<T>(connectionName)` 按名取注入连接串;
+- **NuGet 发布流水线**:`nuget-publish.yml` 随 `v*` tag 将 Docsql.Client / Docsql.EntityFrameworkCore /
+  Docsql.Aspire.Client / Docsql.Aspire.Hosting 推送 GitHub Packages;
+- **示例**:`dotnet/samples/AspireSample/`(AppHost + Worker 参数化写读闭环,集群形态注释可切换)。
+
 ### 商用交付加固批次(2026-09-11)
 
 #### 新增

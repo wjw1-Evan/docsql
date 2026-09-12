@@ -214,6 +214,35 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 
 **兼容与过渡**:`DOCSQL_TOKEN` 恒为管理员身份(存量部署零变化);未配置 token 且从未创建用户的节点维持开放访问(开发模式);**一旦存在任一用户,新建的匿名连接即被拒绝**(判定取连接建立时刻——正在建号授权的会话不会被自己锁死)。用户/角色数据存于保留名内部表(`docsql_users` 等,复制但不可直接读写),明文密码只在执行节点出现,日志、复制流、备份里均为 PBKDF2 哈希形式。
 
+## .NET 与 Aspire(ADO.NET / EF Core / AppHost 编排)
+
+四个 NuGet 包发布在 GitHub Packages(先在 nuget.config 加源,见下),版本随 `v*` tag 发布:
+
+| 包 | 用途 |
+|---|---|
+| `Docsql.Client` | ADO.NET 提供程序(连接池/事务/pub-sub/传输加密) |
+| `Docsql.EntityFrameworkCore` | 原生 EF Core 提供程序(EnsureCreated/索引自动同步) |
+| `Docsql.Aspire.Hosting` | Aspire AppHost 编排:容器节点/对称集群/连接串注入/健康检查/伴生控制台 |
+| `Docsql.Aspire.Client` | Aspire 消费侧:`AddDocsqlConnection` + 连接健康检查 |
+
+```xml
+<!-- nuget.config:接入 GitHub Packages 源(需 GitHub PAT with read:packages) -->
+<source>https://nuget.pkg.github.com/wjw1-Evan/index.json</source>
+```
+
+AppHost 三行起步(完整示例见 `dotnet/samples/AspireSample/`):
+
+```csharp
+var docsql = builder.AddDocsql("docsql").WithDataVolume().WithWebConsole();
+builder.AddProject<Projects.MyApi>("myapi").WithReference(docsql).WaitFor(docsql);
+// 对称集群:builder.AddDocsqlCluster("docsql", nodeCount: 3)
+```
+
+消费侧 `builder.AddDocsqlConnection("docsql")` 注册连接与健康检查;EF 侧
+`services.AddDocsqlDbContext<TodoDb>("docsql")` 按名取注入的连接串。默认生成随机客户端
+token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEnvironment`
+可完整定制;镜像版本默认 `latest`,`WithImageTag` 钉版。
+
 ## 安全(对照等保 2.0 / GB/T 20273 数据库管理系统安全技术要求)
 
 面向国内数据库安全检测(等级保护第三级)的能力对照:

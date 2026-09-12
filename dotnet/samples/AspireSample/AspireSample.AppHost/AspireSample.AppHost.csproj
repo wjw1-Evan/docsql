@@ -1,0 +1,23 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.5.3">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsAspireHost>true</IsAspireHost>
+    <UserSecretsId>docsql-aspire-sample-7f4ab26e</UserSecretsId>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Docker" Version="13.5.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 本地集成包以编译引用接入;IsAspireProjectResource=false 防止它被当成编排资源。 -->
+    <ProjectReference Include="..\..\..\Docsql.Aspire.Hosting\Docsql.Aspire.Hosting.csproj" IsAspireProjectResource="false" />
+    <ProjectReference Include="..\AspireSample.Worker\AspireSample.Worker.csproj" />
+  </ItemGroup>
+
+</Project>

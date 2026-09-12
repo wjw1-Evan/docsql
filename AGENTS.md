@@ -12,7 +12,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 | `crates/docsql-server` | TCP 服务器、鉴权、复制、pub/sub、查询/同步日志、备份恢复 |
 | `crates/docsql-cli` | 嵌入式/远程 SQL shell |
 | `crates/docsql-web` | REST API + 内嵌单页控制台(`console.html` 经 `include_str!`) |
-| `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、两套 xUnit、Sample/EfSample |
+| `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/AspireSample(AppHost 示例) |
 | `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile;`run-tests.sh` 部署测试入口 |
 
 关键文件:`core/engine.rs`(SQL 执行器/约束/事务/写单元,最大文件)、`core/btree.rs`、`core/encode.rs`+`core/value.rs`、`core/guid.rs`、`core/useradmin.rs`+`core/kdf.rs`(数据库用户/角色 + PBKDF2)、`core/meta.rs`、`core/stmt.rs`、`core/proto.rs`、`server/lib.rs`(连接循环/全部 REQ_* 帧/join-repair,模块头注释权威)、`server/pubsub.rs`(锁顺序权威)、`server/querylog.rs`、`server/backup.rs`、`web/lib.rs`、`web/auth.rs`、`web/console.html`、`dotnet/Docsql.Client/AdoNet.cs`、`DocsqlSubscriber.cs`。基准:`crates/docsql-core/examples/bench*.rs`。
@@ -41,6 +41,7 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d   
 - compose 必须带 profile(不带 = 空操作);数据卷 external,`down -v` 不清数据;清数据唯一入口 `./deploy/reset-data.sh`;首次部署需先建卷(见 README;run-tests.sh 自动重建 dev 卷)。
 - 测试布局:Rust 单测在各模块内;e2e 在 `crates/docsql-server/tests/e2e.rs`(pub/sub、join/repair、备份恢复、故障转移)与 `crates/docsql-web/tests/e2e.rs`(真实 HTTP);.NET 为两个 xUnit 套件;部署测试 `deploy/single-test.sh` / `deploy/multinode-test.sh`。
 - CI `.github/workflows/docker-image.yml`(Rust 1.98.1 / .NET 10)执行同样门禁 + dotnet 测试 → 多架构镜像 → main 分支部署测试;CI 失败等同门禁失败。
+- NuGet 发布:`.github/workflows/nuget-publish.yml` 在 push `v*` tag(或手动)时 pack 四个 .NET 包并推 GitHub Packages(`dotnet/Docsql.sln` 含 Aspire 包与示例;Aspire 测试不起容器,CI 直接可跑)。
 
 ### Mimosa 安全门禁(本机 commit/push 钩子)
 

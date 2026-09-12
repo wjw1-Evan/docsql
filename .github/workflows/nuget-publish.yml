@@ -1,0 +1,41 @@
+name: nuget-packages
+
+# NuGet 包发布:推送 v* tag(或手动)时打包并推送四个 .NET 包到 GitHub Packages。
+# 前置:docker-image.yml 的测试门禁在 main 上已跑;本流水线只做 pack + push。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pack-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Pack
+        run: |
+          dotnet pack dotnet/Docsql.Client/Docsql.Client.csproj -c Release -o out
+          dotnet pack dotnet/Docsql.EntityFrameworkCore/Docsql.EntityFrameworkCore.csproj -c Release -o out
+          dotnet pack dotnet/Docsql.Aspire.Client/Docsql.Aspire.Client.csproj -c Release -o out
+          dotnet pack dotnet/Docsql.Aspire.Hosting/Docsql.Aspire.Hosting.csproj -c Release -o out
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget add source \
+            --username wjw1-Evan \
+            --password "${{ secrets.GITHUB_TOKEN }}" \
+            --store-password-in-clear-text \
+            --name github \
+            "https://nuget.pkg.github.com/wjw1-Evan/index.json"
+          for pkg in out/*.nupkg; do
+            dotnet nuget push "$pkg" --source github --skip-duplicate
+          done
