@@ -6,7 +6,7 @@
 
 | 边界 | 现状 | 影响 |
 |---|---|---|
-| 单写者引擎 | 全库一把引擎互斥,读写都过它;无 MVCC | 吞吐钉在单线程串行;大查询阻塞写入;**横向扩展靠集群分摊写入点,单节点内并发不加速** |
+| 单写者引擎 | 写路径全库互斥(有意设计,横向扩展靠集群分摊写入点);只读语句已 MVCC 快照化,**读不阻塞写、写不阻塞读** | 写吞吐仍是单线程串行;快照读依赖 WAL 保留窗口,极端写压下长读可响亮报「snapshot too old」 |
 | 单文档 ≤ 16MiB | 溢出页链已支持超页文档(旧 4KB 上限解除);仍无无限大文档 | 超过 16MiB 显式报错;无 BLOB 流式读取 |
 | 单列之外的索引能力 | 多列(复合)索引已支持(复合 UNIQUE 判重、前导列等值探测);无表达式/部分/JSON 路径索引 | JSON 点读中非前导列条件走全表扫描(JSON_EXTRACT 不走索引) |
 | 无精确 DECIMAL/TIMESTAMP 类型 | 值模型 Int/Float/Str/…;JSON 函数族已补文档点读 | 金额用 Float 有精度取舍;时间按整数毫秒/文本约定 |
@@ -28,10 +28,9 @@
 ## 路线(按商用优先级)
 
 1. **驱动扩展**:基于 REQ_PREPARE/REQ_EXECUTE 服务端绑定实现第二/第三语言驱动(JDBC/Python);
-2. **MVCC/读写并发** — 设计已定稿(`docs/design/003-mvcc-read-concurrency.md`):
-   阶段 A 读-读并发(`db: Mutex → RwLock` 分级 + pager 读取去借用化 + SELECT 执行链
-   `&self` 化),阶段 B 快照读(WAL 即版本链、commit LSN 可见性、与 write_unit 融合/
-   复制 apply 的兼容矩阵已给出);实现按阶段 A → B 推进,每阶段全量兼容回归;
+2. **MVCC/读写并发** — **阶段 A(读-读并发)与阶段 B(快照读,读不阻塞写)已落地**
+   (`docs/design/003-mvcc-read-concurrency.md`):server 读级微秒级建视图后锁外执行,
+   长查询不再卡写入;快照过旧(写流量把 WAL 推过硬阈值截断)时读取响亮报错可重试;
    附:DECIMAL/TIMESTAMP 类型、JSON 路径索引、VACUUM(溢出链孤儿页回收);
 3. **性能**:JOIN 优化(hash join)、EXPLAIN、统计信息;
 4. **数据安全**:TCP 协议层原生 TLS(控制台已原生支持;数据面走 AES-GCM 帧加密或 TLS 反代/加密卷)、

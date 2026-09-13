@@ -7,7 +7,7 @@
 use crate::btree::{BTree, BTreeError};
 use crate::encode;
 use crate::heap::Heap;
-use crate::pager::{Pager, PagerError, PAGE_SIZE};
+use crate::pager::{PageReader, Pager, PagerError, Snapshot, PAGE_SIZE};
 use crate::value::{Object, Value};
 use sqlparser::ast::{
     BinaryOperator, Expr as SqlExpr, LimitClause, ObjectName, ObjectNamePart, Query, SelectItem,
@@ -284,7 +284,7 @@ pub struct BatchError {
 type TableSnapshot = std::collections::BTreeMap<String, (TableMeta, Vec<Object>)>;
 
 #[derive(Debug, Clone, Default)]
-struct TableMeta {
+pub(crate) struct TableMeta {
     columns: Vec<String>,
     pages: Vec<u32>,
     primary_key: Option<String>,
@@ -480,9 +480,1249 @@ fn schema_hash(meta: &TableMeta) -> u64 {
     h.finish()
 }
 
+/// Owned catalog view for a guardless read (MVCC stage B): cloned under the
+/// server's brief read lock as `Arc` bumps, then held outside every database
+/// lock while the statement runs. Writers mutating a table's meta use
+/// `Arc::make_mut`, so the deep clone only happens while a detached reader
+/// actually holds the table's entry.
+#[derive(Clone, Default)]
+pub(crate) struct CatalogSnapshot(std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>);
+
+/// Execution context for the SELECT chain: everything a read needs — pager,
+/// catalog, deadline and optionally a snapshot — without borrowing the
+/// `Database` itself. Stage A runs it under the server's read lock
+/// (`snap: None`, current visibility); stage B runs it entirely outside the
+/// database locks (`snap: Some`, as-of visibility), so reads never block
+/// writes. The SELECT chain methods live on this type; the write path
+/// reaches them through `Database::read_cx` and the `_cx` shims.
+pub(crate) struct ReadCx<'a> {
+    pub(crate) pager: &'a Pager,
+    pub(crate) tables: &'a std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
+    pub(crate) deadline: &'a StmtDeadline,
+    pub(crate) snap: Option<&'a Snapshot>,
+}
+
+impl<'a> ReadCx<'a> {
+    /// Page reader for this context: current visibility without a snapshot,
+    /// as-of reconstruction with one.
+    pub(crate) fn reader(&self) -> PageReader<'a> {
+        match self.snap {
+            Some(snap) => PageReader::Snapshot(self.pager, snap),
+            None => PageReader::Current(self.pager),
+        }
+    }
+
+    /// Cloned meta for `name` — the same per-statement clone cost the read
+    /// path always paid (`get().cloned()`), now sourced from the view's
+    /// catalog snapshot.
+    pub(crate) fn table_meta(&self, name: &str) -> Option<TableMeta> {
+        self.tables.get(name).map(|a| a.as_ref().clone())
+    }
+}
+
+/// A guardless read view (MVCC stage B): the server builds one under a
+/// microsecond-scale read lock, then executes SELECTs with no database lock
+/// held — reads never block writes. Page reads go through the pager snapshot
+/// (as-of the commit head at creation); the catalog is the cloned snapshot.
+/// Dropping the view ends the pager snapshot.
+pub struct ReadView {
+    pager: std::sync::Arc<Pager>,
+    catalog: CatalogSnapshot,
+    deadline: std::sync::Arc<StmtDeadline>,
+    snap: Snapshot,
+}
+
+impl ReadView {
+    /// Arm the cooperative statement deadline. The view owns its deadline,
+    /// so concurrent readers never overwrite each other's arming.
+    pub fn set_statement_deadline(&self, deadline: Option<std::time::Instant>) {
+        self.deadline.set(deadline);
+    }
+
+    /// Execute a read-only statement as of this view's snapshot. Plain
+    /// SELECT only — the same refusals as [`Database::execute_read`].
+    pub fn execute(&self, sql: &str) -> Result<ExecOutcome> {
+        let parsed = Database::parse_classified(sql)?;
+        if parsed.is_write {
+            return err("read path refused a write statement");
+        }
+        if parsed.tx != TxControl::None {
+            return err("read path refused a transaction statement");
+        }
+        match parsed.stmt {
+            AnyStmt::Sql(stmt) => match &*stmt {
+                Statement::Query(q) if q.with.is_none() => {
+                    let q = q.clone();
+                    let cx = ReadCx {
+                        pager: &self.pager,
+                        tables: &self.catalog.0,
+                        deadline: &self.deadline,
+                        snap: Some(&self.snap),
+                    };
+                    cx.exec_query(*q)
+                }
+                Statement::Query(_) => err("read path: WITH queries must use the write path"),
+                _ => err("read path: statement is not a query"),
+            },
+            _ => err("read path: statement is not a query"),
+        }
+    }
+}
+
+impl Drop for ReadView {
+    fn drop(&mut self) {
+        self.pager.end_snapshot(self.snap);
+    }
+}
+
+impl<'a> ReadCx<'a> {
+    /// ORDER BY + LIMIT/OFFSET. Sort keys resolve in order of preference to
+    /// an output column name, an ordinal position (`ORDER BY 2`), or — when
+    /// the caller supplies the source docs — an arbitrary expression
+    /// evaluated per row.
+    fn apply_order_limit(
+        &self,
+        query: Query,
+        mut rows: Vec<Vec<Value>>,
+        columns: &[String],
+        docs: Option<Vec<Object>>,
+    ) -> Result<Vec<Vec<Value>>> {
+        if let Some(order_by) = &query.order_by {
+            let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
+                return err("unsupported ORDER BY");
+            };
+            // (column index, asc, nulls_first): appended hidden key columns
+            // start after the visible ones.
+            let mut keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
+            let mut extra_keys = 0usize;
+            for o in exprs {
+                let name = expr_name(&o.expr);
+                let idx = columns.iter().position(|c| c == &name).or_else(|| {
+                    // ORDER BY <ordinal>: 1-based output position.
+                    name.parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=columns.len()).contains(n))
+                        .map(|n| n - 1)
+                });
+                let idx = match idx {
+                    Some(i) => i,
+                    None => {
+                        let Some(ds) = &docs else {
+                            return err(format!("unknown ORDER BY key: {name}"));
+                        };
+                        if ds.len() != rows.len() {
+                            return err(format!("unknown ORDER BY key: {name}"));
+                        }
+                        // Evaluate the expression against each source doc and
+                        // append it as a hidden key column.
+                        for (row, doc) in rows.iter_mut().zip(ds) {
+                            row.push(eval_expr(&o.expr, doc)?);
+                        }
+                        let col = columns.len() + extra_keys;
+                        extra_keys += 1;
+                        col
+                    }
+                };
+                keys.push((idx, o.options.asc.unwrap_or(true), o.options.nulls_first));
+            }
+            rows.sort_by(|a, b| {
+                for (col, asc, nulls_first) in &keys {
+                    let ord = cmp_maybe_null(&a[*col], &b[*col], *nulls_first);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if *asc { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            if extra_keys > 0 {
+                for row in &mut rows {
+                    row.truncate(columns.len());
+                }
+            }
+        }
+        if let Some(lc) = &query.limit_clause {
+            rows = apply_limit_clause(lc, rows)?;
+        }
+        // Oracle 12c+/SQL-standard FETCH: `FETCH FIRST n ROWS ONLY` (and the
+        // NEXT form). WITH TIES requires the ORDER BY key's tie set — not
+        // supported, and per house rules it errors instead of silently
+        // returning a different row count.
+        if let Some(fetch) = &query.fetch {
+            if fetch.percent {
+                return err("FETCH … PERCENT is not supported");
+            }
+            if fetch.with_ties {
+                return err("FETCH … WITH TIES is not supported");
+            }
+            let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
+                Some(Value::Int(n)) if n >= 0 => n as usize,
+                Some(Value::Int(n)) => {
+                    return err(format!("FETCH quantity must be non-negative ({n})"))
+                }
+                Some(_) | None => return err("FETCH quantity must be an integer"),
+            };
+            rows.truncate(n);
+        }
+        Ok(rows)
+    }
+
+    /// Virtual information_schema tables from the catalog.
+    fn information_schema(&self, which: &str) -> Vec<Object> {
+        let mut out = Vec::new();
+        if which.ends_with("tables") {
+            for (name, meta) in self.tables {
+                out.push(Object::from([
+                    ("table_name".into(), Value::Str(name.clone())),
+                    ("pages".into(), Value::Int(meta.pages.len() as i64)),
+                ]));
+            }
+        } else {
+            for (name, meta) in self.tables {
+                for col in &meta.columns {
+                    out.push(Object::from([
+                        ("table_name".into(), Value::Str(name.clone())),
+                        ("column_name".into(), Value::Str(col.clone())),
+                        (
+                            "is_nullable".into(),
+                            Value::Str(
+                                if meta.not_null.contains(col) {
+                                    "NO"
+                                } else {
+                                    "YES"
+                                }
+                                .into(),
+                            ),
+                        ),
+                        (
+                            "data_type".into(),
+                            Value::Str(
+                                if meta.autoguid.as_deref() == Some(col.as_str()) {
+                                    "GUID"
+                                } else {
+                                    "ANY"
+                                }
+                                .into(),
+                            ),
+                        ),
+                    ]));
+                }
+            }
+        }
+        out
+    }
+
+    fn load_table_factor(
+        &self,
+        tf: &sqlparser::ast::TableFactor,
+        ctes: &Ctes,
+    ) -> Result<(String, Option<String>, Vec<Object>)> {
+        let sqlparser::ast::TableFactor::Table { name, alias, .. } = tf else {
+            // Derived table: FROM (SELECT ...) AS alias
+            if let sqlparser::ast::TableFactor::Derived {
+                subquery, alias, ..
+            } = tf
+            {
+                let ExecOutcome::Rows(r) = self.exec_query(subquery.as_ref().clone())? else {
+                    return err("derived table must be a SELECT");
+                };
+                let docs: Vec<Object> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| r.columns.iter().cloned().zip(row).collect())
+                    .collect();
+                let alias = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_default();
+                return Ok(("@derived".into(), Some(alias), docs));
+            }
+            return err("only simple tables in FROM");
+        };
+        let tname = obj_name(name);
+        let alias = alias.as_ref().map(|a| a.name.value.clone());
+        // Oracle DUAL: the one-row dummy table. Case-insensitive, works even
+        // when no user table named DUAL exists (it always shadows).
+        if tname.eq_ignore_ascii_case("DUAL") {
+            return Ok(("DUAL".into(), alias, vec![Object::new()]));
+        }
+        // WITH (...) names shadow real tables for this statement.
+        if let Some(docs) = ctes.get(&tname) {
+            return Ok((tname, alias, docs.clone()));
+        }
+        let qualified: String = name
+            .0
+            .iter()
+            .map(|p| match p {
+                ObjectNamePart::Identifier(i) => i.value.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        if qualified == "sqlite_master" || qualified == "sqlite_temporal_master" {
+            // SQLite-dialect compatibility view (EF Core probes it to learn
+            // which tables exist). Index rows let clients enumerate CREATE
+            // INDEX definitions for schema sync.
+            let mut docs: Vec<Object> = self
+                .tables
+                .keys()
+                .map(|n| {
+                    Object::from([
+                        ("type".into(), Value::Str("table".into())),
+                        ("name".into(), Value::Str(n.clone())),
+                        ("tbl_name".into(), Value::Str(n.clone())),
+                        ("sql".into(), Value::Str(String::new())),
+                    ])
+                })
+                .collect();
+            for (tbl, meta) in self.tables {
+                for d in &meta.index_defs {
+                    docs.push(Object::from([
+                        ("type".into(), Value::Str("index".into())),
+                        ("name".into(), Value::Str(d.name.clone())),
+                        ("tbl_name".into(), Value::Str(tbl.clone())),
+                        (
+                            "sql".into(),
+                            Value::Str(format!(
+                                "CREATE {}INDEX {iname} ON {tbl} ({col})",
+                                if d.unique { "UNIQUE " } else { "" },
+                                iname = d.name,
+                                col = d.columns.join(", ")
+                            )),
+                        ),
+                    ]));
+                }
+            }
+            return Ok(("sqlite_master".into(), alias, docs));
+        }
+        if qualified == "information_schema.tables" || qualified == "information_schema.columns" {
+            let docs = self.information_schema(&qualified);
+            return Ok(("information_schema".into(), alias, docs));
+        }
+        // Oracle data-dictionary compatibility views (case-insensitive):
+        // USER_* and ALL_* carry the same data — DocSQL has one global
+        // namespace, so every owner sees every user table.
+        let dq = qualified.to_ascii_uppercase();
+        if matches!(
+            dq.as_str(),
+            "ALL_TABLES"
+                | "USER_TABLES"
+                | "ALL_TAB_COLUMNS"
+                | "USER_TAB_COLUMNS"
+                | "ALL_INDEXES"
+                | "USER_INDEXES"
+        ) {
+            let owner = "DOCSQL";
+            let mut docs: Vec<Object> = Vec::new();
+            let user_tables: Vec<(&String, &std::sync::Arc<TableMeta>)> = self
+                .tables
+                .iter()
+                .filter(|(n, _)| !is_internal_table(n))
+                .collect();
+            match dq.as_str() {
+                "ALL_TABLES" | "USER_TABLES" => {
+                    for (n, meta) in &user_tables {
+                        docs.push(Object::from([
+                            ("owner".into(), Value::Str(owner.into())),
+                            ("table_name".into(), Value::Str((*n).clone())),
+                            ("num_rows".into(), Value::Null),
+                            ("blocks".into(), Value::Int(meta.pages.len() as i64)),
+                        ]));
+                    }
+                }
+                "ALL_TAB_COLUMNS" | "USER_TAB_COLUMNS" => {
+                    for (n, meta) in &user_tables {
+                        for (i, col) in meta.columns.iter().enumerate() {
+                            docs.push(Object::from([
+                                ("owner".into(), Value::Str(owner.into())),
+                                ("table_name".into(), Value::Str((*n).clone())),
+                                ("column_name".into(), Value::Str(col.clone())),
+                                ("data_type".into(), Value::Str("TEXT".into())),
+                                (
+                                    "nullable".into(),
+                                    Value::Str(
+                                        if meta.not_null.contains(col) {
+                                            "N"
+                                        } else {
+                                            "Y"
+                                        }
+                                        .into(),
+                                    ),
+                                ),
+                                ("column_id".into(), Value::Int(i as i64 + 1)),
+                            ]));
+                        }
+                    }
+                }
+                _ => {
+                    for (tbl, meta) in &user_tables {
+                        for d in &meta.index_defs {
+                            docs.push(Object::from([
+                                ("owner".into(), Value::Str(owner.into())),
+                                ("index_name".into(), Value::Str(d.name.clone())),
+                                ("table_name".into(), Value::Str((*tbl).clone())),
+                                (
+                                    "uniqueness".into(),
+                                    Value::Str(
+                                        if d.unique { "UNIQUE" } else { "NONUNIQUE" }.into(),
+                                    ),
+                                ),
+                            ]));
+                        }
+                    }
+                }
+            }
+            let view = match dq.as_str() {
+                v if v.starts_with("ALL_") => v.to_string(),
+                v => format!("USER_{}", &v[5..]),
+            };
+            return Ok((view, alias, docs));
+        }
+        let docs = self.table_docs(&tname)?;
+        Ok((tname, alias, docs))
+    }
+
+    fn agg_spec(&self, e: &SqlExpr, group_exprs: &[SqlExpr]) -> Result<AggSpec> {
+        // A projection item equal to a GROUP BY expression echoes its key.
+        for (i, g) in group_exprs.iter().enumerate() {
+            if format!("{g}") == format!("{e}") {
+                return Ok(AggSpec::GroupKey { idx: i });
+            }
+        }
+        if let SqlExpr::Identifier(i) = e {
+            // Bare column: allowed only if some group expr is that column.
+            for (i2, g) in group_exprs.iter().enumerate() {
+                if matches!(g, SqlExpr::Identifier(gi) if gi.value == i.value) {
+                    return Ok(AggSpec::GroupKey { idx: i2 });
+                }
+            }
+            return err(format!(
+                "column {} must appear in GROUP BY or an aggregate",
+                i.value
+            ));
+        }
+        if let SqlExpr::Function(f) = e {
+            if is_agg_fn(f) {
+                let (op, inner, distinct, sep) = agg_parts(f)?;
+                return Ok(AggSpec::Agg {
+                    op,
+                    arg: inner,
+                    distinct,
+                    sep,
+                });
+            }
+        }
+        // Composite expressions containing aggregate calls.
+        if contains_agg(e) {
+            check_group_refs(e, group_exprs)?;
+            return Ok(AggSpec::Composite { expr: e.clone() });
+        }
+        err(format!("unsupported aggregate projection: {e}"))
+    }
+
+    /// GROUP BY + aggregates (+ HAVING).
+    fn exec_grouped_select(
+        &self,
+        query: Query,
+        select: sqlparser::ast::Select,
+        rows: Vec<Object>,
+        group_exprs: Vec<SqlExpr>,
+    ) -> Result<ExecOutcome> {
+        // GROUP BY + aggregates (+ HAVING).
+        // Evaluate group keys per row. Groups hash by the encoded key —
+        // the same byte identity DISTINCT uses — instead of a linear scan
+        // per row (O(rows × groups) on large grouped queries).
+        let mut groups: Vec<(Vec<Value>, Vec<&Object>)> = Vec::new();
+        let mut group_index: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
+        for doc in &rows {
+            let key: Vec<Value> = group_exprs
+                .iter()
+                .map(|e| eval_expr(e, doc))
+                .collect::<Result<_>>()?;
+            let kb = row_key(&key);
+            match group_index.get(&kb) {
+                Some(&gi) => groups[gi].1.push(doc),
+                None => {
+                    group_index.insert(kb, groups.len());
+                    groups.push((key, vec![doc]));
+                }
+            }
+        }
+        // With no GROUP BY, aggregates run over one group even when empty.
+        if group_exprs.is_empty() && groups.is_empty() {
+            groups.push((vec![], vec![]));
+        }
+        // Projection must be aggregate functions or group exprs.
+        let mut columns = Vec::new();
+        let mut agg_specs = Vec::new(); // per column: AggSpec
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => {
+                    columns.push(expr_name(e));
+                    agg_specs.push(self.agg_spec(e, &group_exprs)?);
+                }
+                SelectItem::ExprWithAlias { expr, alias, .. } => {
+                    columns.push(alias.value.clone());
+                    agg_specs.push(self.agg_spec(expr, &group_exprs)?);
+                }
+                _ => return err("unsupported item in aggregate SELECT"),
+            }
+        }
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        for (key, docs) in &groups {
+            let mut row = Vec::with_capacity(agg_specs.len());
+            for spec in &agg_specs {
+                row.push(eval_agg(spec, docs, key, &group_exprs)?);
+            }
+            // HAVING: aggregates evaluate over the group's rows directly;
+            // everything else evaluates against the output columns, with
+            // GROUP BY expressions consulted before them so unprojected
+            // group keys resolve instead of reading as NULL.
+            if let Some(having) = &select.having {
+                let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
+                if !matches!(
+                    eval_group_expr(having, &doc, docs, &group_exprs)?,
+                    Value::Bool(true)
+                ) {
+                    continue;
+                }
+            }
+            out.push(row);
+        }
+        let out = self.apply_order_limit(query, out, &columns, None)?;
+        Ok(ExecOutcome::Rows(QueryResult { columns, rows: out }))
+    }
+
+    /// No aggregation: project expressions over rows.
+    fn exec_plain_select(
+        &self,
+        query: Query,
+        select: sqlparser::ast::Select,
+        rows: Vec<Object>,
+    ) -> Result<ExecOutcome> {
+        let mut want_star = false;
+        let mut project: Vec<(String, SqlExpr)> = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard(_) => want_star = true,
+                SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e.clone())),
+                SelectItem::ExprWithAlias { expr, alias, .. } => {
+                    project.push((alias.value.clone(), expr.clone()))
+                }
+                _ => return err("unsupported select item"),
+            }
+        }
+        let columns_out: Vec<String> = if want_star {
+            // SELECT *, expr: star fields first, then the explicit
+            // projections (SQLite semantics) — dropping the exprs silently
+            // returned fewer columns than the statement asked for. The
+            // ROWNUM pseudo-column (if injected) is not part of * — Oracle
+            // semantics.
+            let mut cols: Vec<String> = union_of_fields(&rows)
+                .into_iter()
+                .filter(|c| c != "ROWNUM")
+                .collect();
+            cols.extend(project.iter().map(|(n, _)| n.clone()));
+            cols
+        } else {
+            project.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        let mut docs = rows;
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        for doc in &docs {
+            if want_star {
+                let mut row: Vec<Value> = columns_out
+                    .iter()
+                    .map(|c| doc.get(c).cloned().unwrap_or(Value::Null))
+                    .collect();
+                // The trailing project.len() slots are the explicit exprs.
+                let base = columns_out.len() - project.len();
+                for (i, (_, e)) in project.iter().enumerate() {
+                    row[base + i] = eval_expr(e, doc)?;
+                }
+                out.push(row);
+            } else {
+                let mut row = Vec::with_capacity(project.len());
+                for (_, e) in &project {
+                    row.push(eval_expr(e, doc)?);
+                }
+                out.push(row);
+            }
+        }
+        // DISTINCT: drop duplicate projected rows; the first occurrence's
+        // source doc stays for ORDER BY evaluation. DISTINCT ON (...) is a
+        // different (unsupported) feature and must not pass silently.
+        match &select.distinct {
+            Some(sqlparser::ast::Distinct::On(cols)) => {
+                return err(format!(
+                    "DISTINCT ON is not supported: {}",
+                    cols.iter().map(expr_name).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            Some(sqlparser::ast::Distinct::Distinct) => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut kept_docs = Vec::with_capacity(docs.len());
+                let mut kept_rows = Vec::with_capacity(out.len());
+                for (doc, row) in docs.into_iter().zip(out) {
+                    let key = encode::encode_to_vec(&Value::Array(row.clone()))
+                        .map_err(SqlError::Encode)?;
+                    if seen.insert(key) {
+                        kept_docs.push(doc);
+                        kept_rows.push(row);
+                    }
+                }
+                docs = kept_docs;
+                out = kept_rows;
+            }
+            None | Some(sqlparser::ast::Distinct::All) => {}
+        }
+        out = self.apply_order_limit(query, out, &columns_out, Some(docs))?;
+        Ok(ExecOutcome::Rows(QueryResult {
+            columns: columns_out,
+            rows: out,
+        }))
+    }
+
+    /// Load a FROM list into merged rows: the base table plus its JOINs,
+    /// then comma-separated entries as cross joins. A lone base table keeps
+    /// unqualified field names; anything joined gets "alias.col" keys.
+    /// A solo real table with a probe-able WHERE skips the heap scan.
+    fn load_from(
+        &self,
+        from: &[sqlparser::ast::TableWithJoins],
+        selection: &Option<SqlExpr>,
+        ctes: &Ctes,
+    ) -> Result<Vec<Object>> {
+        use sqlparser::ast::{JoinConstraint, JoinOperator};
+        let base = &from[0];
+        // Index fast path: solo base table, WHERE narrows to an indexed
+        // column. Rows come straight from the B+ tree; the caller's residual
+        // WHERE filter still runs over them.
+        if base.joins.is_empty() && from.len() == 1 {
+            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &base.relation {
+                let tname = obj_name(name);
+                if self.tables.contains_key(&tname) && !ctes.contains_key(&tname) {
+                    let akey = alias.as_ref().map(|a| a.name.value.clone());
+                    if let Some(pairs) =
+                        self.index_probe(&tname, akey.as_deref(), selection, ctes)?
+                    {
+                        return Ok(pairs.into_iter().map(|(_, d)| d).collect());
+                    }
+                }
+            }
+        }
+        let (bname, balias, mut bdocs) = self.load_table_factor(&base.relation, ctes)?;
+        let bkey = balias.unwrap_or_else(|| bname.clone());
+        let solo = base.joins.is_empty() && from.len() == 1;
+        let mut rows: Vec<Object> = if solo {
+            bdocs
+        } else {
+            bdocs.drain(..).map(|d| qualify(&d, &bkey)).collect()
+        };
+        let mut all_joins: Vec<&sqlparser::ast::Join> = base.joins.iter().collect();
+        if !solo {
+            for twj in &from[1..] {
+                // comma-separated FROM entries: cross join their base tables
+                let (n, a, d) = self.load_table_factor(&twj.relation, ctes)?;
+                let k = a.unwrap_or(n);
+                rows = join_rows(rows, &d, &k, None, false, false, self.deadline)?;
+                all_joins.extend(twj.joins.iter());
+            }
+        }
+        for j in all_joins {
+            let (jname, jalias, jdocs) = self.load_table_factor(&j.relation, ctes)?;
+            let jkey = jalias.unwrap_or(jname);
+            let (left_join, right_join, on) = match &j.join_operator {
+                JoinOperator::Join(c)
+                | JoinOperator::Inner(c)
+                | JoinOperator::Left(c)
+                | JoinOperator::LeftOuter(c)
+                | JoinOperator::Right(c)
+                | JoinOperator::RightOuter(c)
+                | JoinOperator::FullOuter(c) => {
+                    let on = match c {
+                        JoinConstraint::On(e) => Some(e.clone()),
+                        JoinConstraint::Using(cols) => {
+                            // a USING b == ON left.b = right.b (unqualified lookups
+                            // are not supported; use alias-qualified names)
+                            let mut e = None;
+                            for c in cols {
+                                let col = obj_name(c);
+                                let eq = SqlExpr::BinaryOp {
+                                    left: Box::new(SqlExpr::Identifier(
+                                        sqlparser::ast::Ident::new(format!("{bkey}.{col}")),
+                                    )),
+                                    op: sqlparser::ast::BinaryOperator::Eq,
+                                    right: Box::new(SqlExpr::Identifier(
+                                        sqlparser::ast::Ident::new(format!("{jkey}.{col}")),
+                                    )),
+                                };
+                                e = Some(match e {
+                                    None => eq,
+                                    Some(prev) => SqlExpr::BinaryOp {
+                                        left: Box::new(prev),
+                                        op: sqlparser::ast::BinaryOperator::And,
+                                        right: Box::new(eq),
+                                    },
+                                });
+                            }
+                            e
+                        }
+                        _ => None,
+                    };
+                    let (mut left_join, mut right_join) = (false, false);
+                    match &j.join_operator {
+                        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => left_join = true,
+                        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => right_join = true,
+                        JoinOperator::FullOuter(_) => {
+                            left_join = true;
+                            right_join = true;
+                        }
+                        _ => {}
+                    }
+                    (left_join, right_join, on)
+                }
+                JoinOperator::CrossJoin(_) => (false, false, None),
+                _ => return err("unsupported join type"),
+            };
+            rows = join_rows(
+                rows,
+                &jdocs,
+                &jkey,
+                on.as_ref(),
+                left_join,
+                right_join,
+                self.deadline,
+            )?;
+        }
+        Ok(rows)
+    }
+
+    fn exec_select(
+        &self,
+        query: Query,
+        mut select: sqlparser::ast::Select,
+        ctes: &Ctes,
+    ) -> Result<ExecOutcome> {
+        // Resolve uncorrelated subqueries up front so the row-local
+        // expression evaluator never sees them.
+        if let Some(sel) = &mut select.selection {
+            self.subst_expr(sel)?;
+        }
+        for item in &mut select.projection {
+            self.subst_item(item)?;
+        }
+        if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &mut select.group_by {
+            for e in es {
+                self.subst_expr(e)?;
+            }
+        }
+        if let Some(having) = &mut select.having {
+            self.subst_expr(having)?;
+        }
+
+        if select.from.is_empty() {
+            // FROM-less SELECT: one row of constant expressions; WHERE
+            // filters that single row.
+            let mut project: Vec<(String, SqlExpr)> = Vec::new();
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e.clone())),
+                    SelectItem::ExprWithAlias { expr, alias, .. } => {
+                        project.push((alias.value.clone(), expr.clone()))
+                    }
+                    _ => return err("unsupported select item"),
+                }
+            }
+            let empty = Object::new();
+            let columns = project.iter().map(|(n, _)| n.clone()).collect();
+            if let Some(cond) = &select.selection {
+                if !matches!(eval_expr(cond, &empty)?, Value::Bool(true)) {
+                    return Ok(ExecOutcome::Rows(QueryResult {
+                        columns,
+                        rows: vec![],
+                    }));
+                }
+            }
+            let row = project
+                .iter()
+                .map(|(_, e)| eval_expr(e, &empty))
+                .collect::<Result<Vec<_>>>()?;
+            // FROM-less SELECT still honors LIMIT/OFFSET (`SELECT 1 LIMIT 0`
+            // must return zero rows, not one). ORDER BY over a single row
+            // cannot reorder anything.
+            let mut rows = vec![row];
+            if let Some(lc) = &query.limit_clause {
+                rows = apply_limit_clause(lc, rows)?;
+            }
+            return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
+        }
+        let mut rows = self.load_from(&select.from, &select.selection, ctes)?;
+
+        // Oracle ROWNUM pseudo-column: number each row right after it is
+        // retrieved (before WHERE and before ORDER BY — Oracle semantics).
+        // Injected only when the statement references it, and only for the
+        // non-aggregated path (aggregates + ROWNUM error on the missing
+        // column, which is the honest refusal).
+        let group_exprs: Vec<SqlExpr> = match &select.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
+            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
+        };
+        let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
+        let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
+        if rownum_wanted {
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.insert("ROWNUM".into(), Value::Int(i as i64 + 1));
+            }
+        }
+
+        // WHERE — consuming pass: matching docs move into the kept vec
+        // instead of being whole-document cloned (the filtered set is
+        // often the whole table).
+        if let Some(cond) = &select.selection {
+            let mut kept = Vec::with_capacity(rows.len());
+            for doc in rows.drain(..) {
+                self.deadline.check()?;
+                if matches!(eval_expr(cond, &doc)?, Value::Bool(true)) {
+                    kept.push(doc);
+                }
+            }
+            rows = kept;
+        }
+
+        // Aggregation path: aggregate functions in projection or GROUP BY.
+        if is_aggregate {
+            return self.exec_grouped_select(query, select, rows, group_exprs);
+        }
+        if select.having.is_some() {
+            // Silently dropping the filter would return unfiltered rows.
+            return err("HAVING requires GROUP BY or an aggregate");
+        }
+        self.exec_plain_select(query, select, rows)
+    }
+
+    /// Execute the query body (no WITH: it was materialized by the caller
+    /// into `ctes`).
+    fn exec_query_body(&self, query: Query, ctes: &Ctes) -> Result<ExecOutcome> {
+        let body = query.body.clone();
+        match *body {
+            SetExpr::Select(select) => self.exec_select(query.clone(), *select, ctes),
+            SetExpr::SetOperation {
+                left,
+                op,
+                set_quantifier,
+                right,
+            } => {
+                use sqlparser::ast::{SetOperator, SetQuantifier};
+                if !matches!(
+                    op,
+                    SetOperator::Union
+                        | SetOperator::Except
+                        | SetOperator::Minus
+                        | SetOperator::Intersect
+                ) {
+                    return err(format!("unsupported set operation: {op}"));
+                }
+                // Set operations combine whole result sets: strip per-arm
+                // ORDER BY/LIMIT so they apply to the combination only.
+                let bare = Query {
+                    order_by: None,
+                    limit_clause: None,
+                    ..query.clone()
+                };
+                let l = self.exec_query(Query {
+                    body: left,
+                    ..bare.clone()
+                })?;
+                let r = self.exec_query(Query {
+                    body: right,
+                    ..bare
+                })?;
+                let (ExecOutcome::Rows(mut lr), ExecOutcome::Rows(rr)) = (l, r) else {
+                    return err("set operations require SELECT on both sides");
+                };
+                // Column *counts* must match; names may differ (left wins).
+                if lr.columns.len() != rr.columns.len() {
+                    return err("set operation arms have different column counts");
+                }
+                let all = set_quantifier == SetQuantifier::All;
+                match op {
+                    SetOperator::Union => {
+                        lr.rows.extend(rr.rows);
+                        if !all {
+                            dedup_rows(&mut lr.rows);
+                        }
+                    }
+                    SetOperator::Intersect => {
+                        let mut counts = row_counts(&rr.rows);
+                        let mut out = Vec::new();
+                        for row in lr.rows {
+                            if consume_one(&mut counts, &row) {
+                                out.push(row);
+                            }
+                        }
+                        if !all {
+                            let mut out2 = out;
+                            dedup_rows(&mut out2);
+                            out = out2;
+                        }
+                        lr.rows = out;
+                    }
+                    // EXCEPT / MINUS share semantics.
+                    SetOperator::Except | SetOperator::Minus => {
+                        let mut counts = row_counts(&rr.rows);
+                        let mut out = Vec::new();
+                        for row in lr.rows {
+                            if consume_one(&mut counts, &row) {
+                                continue; // matched on the right: removed
+                            }
+                            out.push(row);
+                        }
+                        if !all {
+                            let mut out2 = out;
+                            dedup_rows(&mut out2);
+                            out = out2;
+                        }
+                        lr.rows = out;
+                    }
+                }
+                // ORDER BY / LIMIT now apply to the combined result.
+                let cols = lr.columns.clone();
+                let rows = self.apply_order_limit(query, lr.rows, &cols, None)?;
+                Ok(ExecOutcome::Rows(QueryResult {
+                    columns: cols,
+                    rows,
+                }))
+            }
+            other => err(format!("unsupported query body: {other}")),
+        }
+    }
+
+    fn exec_query(&self, query: Query) -> Result<ExecOutcome> {
+        // WITH <cte> AS (...), ...: materialize each CTE (they can reference
+        // earlier ones) into a statement-local map — owned by this call, so
+        // the whole SELECT execution chain can run on `&Database` (MVCC
+        // stage A concurrent readers).
+        let mut ctes: Ctes = Ctes::new();
+        if let Some(with) = &query.with {
+            if with.recursive {
+                return err("WITH RECURSIVE is not supported");
+            }
+            for cte in &with.cte_tables {
+                let name = cte.alias.name.value.clone();
+                let ExecOutcome::Rows(r) =
+                    self.exec_query_body(cte.query.as_ref().clone(), &ctes)?
+                else {
+                    return err("CTE body must be a SELECT");
+                };
+                let docs: Vec<Object> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| r.columns.iter().cloned().zip(row).collect())
+                    .collect();
+                ctes.insert(name, docs);
+            }
+        }
+        self.exec_query_body(query, &ctes)
+    }
+
+    /// Substitute subqueries inside a projection item.
+    fn subst_item(&self, item: &mut SelectItem) -> Result<()> {
+        match item {
+            SelectItem::UnnamedExpr(e) => self.subst_expr(e),
+            SelectItem::ExprWithAlias { expr, .. } => self.subst_expr(expr),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rewrite uncorrelated subqueries inside `e` into row-local
+    /// expressions (IN-lists / literals) before row iteration.
+    fn subst_expr(&self, e: &mut SqlExpr) -> Result<()> {
+        match e {
+            SqlExpr::Subquery(q) => {
+                let r = self.subquery_result(q)?;
+                let v = r
+                    .rows
+                    .first()
+                    .and_then(|row| row.first().cloned())
+                    .unwrap_or(Value::Null);
+                *e = value_to_literal(v)?;
+            }
+            SqlExpr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let r = self.subquery_result(subquery)?;
+                let list = r
+                    .rows
+                    .iter()
+                    .map(|row| value_to_literal(row.first().cloned().unwrap_or(Value::Null)))
+                    .collect::<Result<Vec<_>>>()?;
+                *e = SqlExpr::InList {
+                    expr: expr.clone(),
+                    list,
+                    negated: *negated,
+                };
+            }
+            SqlExpr::Exists { subquery, negated } => {
+                let r = self.subquery_result(subquery)?;
+                *e = value_to_literal(Value::Bool(!r.rows.is_empty() != *negated))?;
+            }
+            SqlExpr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => {
+                if let (sqlparser::ast::BinaryOperator::Eq, SqlExpr::Subquery(q)) =
+                    (compare_op, right.as_ref())
+                {
+                    let r = self.subquery_result(q)?;
+                    let list = r
+                        .rows
+                        .iter()
+                        .map(|row| value_to_literal(row.first().cloned().unwrap_or(Value::Null)))
+                        .collect::<Result<Vec<_>>>()?;
+                    *e = SqlExpr::InList {
+                        expr: left.clone(),
+                        list,
+                        negated: false,
+                    };
+                }
+                // Non-EQ ANY falls through and errors at evaluation time.
+            }
+            // Recurse into composite expressions.
+            SqlExpr::BinaryOp { left, right, .. } => {
+                self.subst_expr(left)?;
+                self.subst_expr(right)?;
+            }
+            SqlExpr::UnaryOp { expr, .. } => self.subst_expr(expr)?,
+            SqlExpr::Nested(inner) => self.subst_expr(inner)?,
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                self.subst_expr(expr)?;
+                self.subst_expr(low)?;
+                self.subst_expr(high)?;
+            }
+            SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+                self.subst_expr(expr)?;
+                self.subst_expr(pattern)?;
+            }
+            SqlExpr::InList { expr, list, .. } => {
+                self.subst_expr(expr)?;
+                for item in list {
+                    self.subst_expr(item)?;
+                }
+            }
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    self.subst_expr(op)?;
+                }
+                for w in conditions.iter_mut() {
+                    self.subst_expr(&mut w.condition)?;
+                    self.subst_expr(&mut w.result)?;
+                }
+                if let Some(el) = else_result {
+                    self.subst_expr(el)?;
+                }
+            }
+            SqlExpr::Cast { expr, .. } => self.subst_expr(expr)?,
+            SqlExpr::Function(f) => {
+                if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                    for a in &mut list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) = a
+                        {
+                            self.subst_expr(inner)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Run a subquery and return its rows (first column only matters for
+    /// IN/ANY lists, but scalar casts use the full first cell).
+    fn subquery_result(&self, q: &Query) -> Result<QueryResult> {
+        // Correlated references (`outer_table.column`) must error instead of
+        // falling into the inner query's schemaless column lookup, where a
+        // missing column reads as NULL and silently mis-filters (NOT IN ()
+        // over an empty list is vacuously true — that shape deletes rows).
+        let mut from_names = std::collections::BTreeSet::new();
+        collect_from_names(q, &mut from_names);
+        let mut hits = Vec::new();
+        if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
+            if let Some(sel_expr) = &sel.selection {
+                collect_correlated_refs(sel_expr, &from_names, self.tables, &mut hits);
+            }
+            if let Some(having) = &sel.having {
+                collect_correlated_refs(having, &from_names, self.tables, &mut hits);
+            }
+            for item in &sel.projection {
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        collect_correlated_refs(e, &from_names, self.tables, &mut hits);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(qualifier) = hits.first() {
+            return err(format!(
+                "correlated subqueries are not supported (reference to outer table {qualifier})"
+            ));
+        }
+        match self.exec_query(q.clone())? {
+            ExecOutcome::Rows(r) => Ok(r),
+            _ => err("subquery must be a SELECT"),
+        }
+    }
+
+    fn matches(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
+        self.deadline.check()?;
+        match selection {
+            None => Ok(true),
+            Some(e) => Ok(matches!(eval_expr(e, doc)?, Value::Bool(true))),
+        }
+    }
+
+    pub(crate) fn table_docs(&self, table: &str) -> Result<Vec<Object>> {
+        let Some(meta) = self.tables.get(table) else {
+            return err(format!("table {table} does not exist"));
+        };
+        let heap = meta.heap_of();
+        heap.scan(&self.reader()).map_err(Into::into)
+    }
+
+    fn index_probe(
+        &self,
+        table: &str,
+        alias: Option<&str>,
+        selection: &Option<SqlExpr>,
+        ctes: &Ctes,
+    ) -> Result<Option<Vec<(u64, Object)>>> {
+        let Some(cond) = selection else {
+            return Ok(None);
+        };
+        let Some(meta) = self.table_meta(table) else {
+            return Ok(None);
+        };
+        if meta.index_roots.is_empty() || !ctes.is_empty() {
+            return Ok(None);
+        }
+        let Some((col, plan)) = probe_plan(cond, &meta, table, alias) else {
+            return Ok(None);
+        };
+        let root = meta.index_roots[&col];
+        let heap = meta.heap_of();
+        let tx = self.pager.begin_tx(); // read-only use; aborted immediately
+        let tree = BTree::open(root);
+        let pairs = match plan {
+            ProbePlan::Eq(v) => {
+                // Bounded range + equal filter so non-unique trees return
+                // every duplicate match (get() would yield one entry).
+                // The hi bound lets the tree stop at the first key past v
+                // instead of walking the whole right side. For composite
+                // indexes v is the full Array key — element-wise cmp_values
+                // equality is exactly a key match.
+                let mut p = tree
+                    .range_bounded(&self.reader(), &tx, &v, Some((&v, true)))
+                    .map_err(|e| index_err(&col, e))?;
+                p.retain(|(k, _)| Value::cmp_values(k, &v) == Ordering::Equal);
+                p
+            }
+            ProbePlan::Prefix(prefix) => {
+                // Composite prefix probe: scan from the prefix (its rank
+                // makes Array(prefix) sort right before every key extending
+                // it) and keep keys that start with it element-wise.
+                let mut p = tree
+                    .range_bounded(&self.reader(), &tx, &prefix, None)
+                    .map_err(|e| index_err(&col, e))?;
+                if let Value::Array(pfx) = &prefix {
+                    p.retain(|(k, _)| match k {
+                        Value::Array(items) => {
+                            items.len() >= pfx.len()
+                                && items
+                                    .iter()
+                                    .zip(pfx.iter())
+                                    .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
+                        }
+                        _ => false,
+                    });
+                }
+                p
+            }
+            ProbePlan::Range { lo, hi } => {
+                let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
+                let mut pairs = match &lo {
+                    Some((v, true)) => tree
+                        .range_bounded(&self.reader(), &tx, v, hi_ref)
+                        .map_err(|e| index_err(&col, e))?,
+                    Some((v, false)) => {
+                        // strict lower bound: start at v, then drop the equal run
+                        let mut p = tree
+                            .range_bounded(&self.reader(), &tx, v, hi_ref)
+                            .map_err(|e| index_err(&col, e))?;
+                        p.retain(|(k, _)| Value::cmp_values(k, v) != std::cmp::Ordering::Equal);
+                        p
+                    }
+                    // No lower bound: full tree scan (rare: WHERE col < x).
+                    None => tree
+                        .scan(&self.reader(), &tx)
+                        .map_err(|e| index_err(&col, e))?,
+                };
+                if let Some((v, incl)) = &hi {
+                    pairs.retain(|(k, _)| {
+                        let o = Value::cmp_values(k, v);
+                        o == std::cmp::Ordering::Less || (*incl && o == std::cmp::Ordering::Equal)
+                    });
+                }
+                pairs
+            }
+        };
+        // Read-only tx: no staged pages, dropping it is the cleanup.
+        drop(tx);
+        let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
+        for (_, loc) in pairs {
+            if let Some(doc) = heap.doc_at(&self.reader(), loc)? {
+                out.push((loc, doc));
+            }
+        }
+        // Heap order (page, slot) — loc packing already sorts that way.
+        out.sort_by_key(|(loc, _)| *loc);
+        Ok(Some(out))
+    }
+
+    fn table_pairs(&self, table: &str) -> Result<Vec<(u64, Object)>> {
+        let Some(meta) = self.tables.get(table) else {
+            return err(format!("table {table} does not exist"));
+        };
+        let heap = meta.heap_of();
+        let mut out = Vec::new();
+        let rtx = self.pager.begin_tx();
+        for &pid in &heap.pages {
+            out.extend(heap.page_docs(&self.reader(), &rtx, pid)?);
+        }
+        // The read-only tx has no staged pages: dropping it is the cleanup.
+        Ok(out)
+    }
+}
+
 pub struct Database {
-    pager: Pager,
-    tables: std::collections::BTreeMap<String, TableMeta>,
+    pager: std::sync::Arc<Pager>,
+    tables: std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
     /// Async-commit mode (MongoDB-style journal interval): every statement
     /// commit skips the WAL fsync; a background flusher batches fsyncs.
     /// Trades bounded (ms) loss window on power failure for throughput.
@@ -757,7 +1997,7 @@ impl Database {
                             };
                             tables.insert(
                                 name.clone(),
-                                TableMeta {
+                                std::sync::Arc::new(TableMeta {
                                     columns,
                                     pages,
                                     primary_key,
@@ -773,7 +2013,7 @@ impl Database {
                                     foreign_keys,
                                     index_roots,
                                     overflow_free,
-                                },
+                                }),
                             );
                         }
                     }
@@ -781,7 +2021,7 @@ impl Database {
             }
         }
         Ok(Database {
-            pager,
+            pager: std::sync::Arc::new(pager),
             tables,
             async_commit: false,
             pending_sync: false,
@@ -822,14 +2062,14 @@ impl Database {
             .tables
             .get(tname)
             .map(|m| (m.pages.clone(), m.index_roots.clone()));
-        if let Some(m) = self.tables.get_mut(tname) {
+        if let Some(m) = self.catalog_mut(tname) {
             m.pages = pages;
             m.index_roots = roots;
             m.overflow_free = overflow_free;
         }
         if let Err(e) = self.save_catalog_into(tx) {
             if let Some((pages, index_roots)) = prev {
-                if let Some(m) = self.tables.get_mut(tname) {
+                if let Some(m) = self.catalog_mut(tname) {
                     m.pages = pages;
                     m.index_roots = index_roots;
                 }
@@ -1043,10 +2283,14 @@ impl Database {
         let names: Vec<String> = self.tables.keys().cloned().collect();
         let mut snap = std::collections::BTreeMap::new();
         for name in names {
-            let meta = self.tables.get(&name).cloned().unwrap_or_default();
+            let meta = self
+                .tables
+                .get(&name)
+                .map(|a| a.as_ref().clone())
+                .unwrap_or_default();
             // A read failure must surface: snapshotting an unreadable table
             // as empty would turn the next ROLLBACK into a permanent wipe.
-            let docs = self.table_docs(&name)?;
+            let docs = self.table_docs_cx(&name)?;
             snap.insert(name, (meta, docs));
         }
         Ok(snap)
@@ -1310,11 +2554,38 @@ impl Database {
         self.tx_snapshot.is_some()
     }
 
+    /// Build a guardless read view (MVCC stage B): clones the catalog as
+    /// `Arc` bumps and begins a pager snapshot at the current commit head.
+    /// The caller must hold *a* database lock while calling this; the view
+    /// is executed after the guard is released, so long SELECTs never block
+    /// writers. Dropping the view ends the snapshot.
+    pub fn read_view(&self) -> ReadView {
+        ReadView {
+            pager: self.pager.clone(),
+            catalog: CatalogSnapshot(self.tables.clone()),
+            deadline: std::sync::Arc::new(StmtDeadline::default()),
+            snap: self.pager.begin_snapshot(),
+        }
+    }
+
+    /// Borrowed read context under the current lock: current visibility,
+    /// no snapshot. Write paths and the census use this to share the SELECT
+    /// chain with the guardless stage-B views.
+    pub(crate) fn read_cx(&self) -> ReadCx<'_> {
+        ReadCx {
+            pager: &self.pager,
+            tables: &self.tables,
+            deadline: &self.stmt_deadline,
+            snap: None,
+        }
+    }
+
     /// Read-only execution path (MVCC stage A): plain SELECT only, callable
     /// on `&Database` under the server's read lock so read-only statements
     /// run concurrently. Writes, transaction control and WITH queries are
     /// refused — the server tiers them to the write lock (WITH
-    /// materialization is statement-local mutable state).
+    /// materialization is statement-local mutable state). Guardless reads
+    /// (stage B) go through [`Database::read_view`] instead.
     pub fn execute_read(&self, sql: &str) -> Result<ExecOutcome> {
         let parsed = Self::parse_classified(sql)?;
         if parsed.is_write {
@@ -1327,13 +2598,61 @@ impl Database {
             AnyStmt::Sql(stmt) => match &*stmt {
                 Statement::Query(q) if q.with.is_none() => {
                     let q = q.clone();
-                    self.exec_query(*q)
+                    let cx = self.read_cx();
+                    cx.exec_query(*q)
                 }
                 Statement::Query(_) => err("read path: WITH queries must use the write path"),
                 _ => err("read path: statement is not a query"),
             },
             _ => err("read path: statement is not a query"),
         }
+    }
+
+    // Write-path shims: run the shared SELECT-chain helpers under a borrowed
+    // context (current visibility — the write lock already excludes snapshot
+    // readers from mutating anything mid-statement).
+    /// Mutable catalog entry for the write path: `Arc::make_mut` deep-clones
+    /// the meta only while a detached stage-B reader still holds the previous
+    /// version (a concurrent long SELECT); single-writer idle runs mutate in
+    /// place exactly as before.
+    fn catalog_mut(&mut self, name: &str) -> Option<&mut TableMeta> {
+        match self.tables.get_mut(name) {
+            Some(a) => Some(std::sync::Arc::make_mut(a)),
+            None => None,
+        }
+    }
+
+    pub(crate) fn table_docs_cx(&self, table: &str) -> Result<Vec<Object>> {
+        self.read_cx().table_docs(table)
+    }
+    fn table_pairs_cx(&self, table: &str) -> Result<Vec<(u64, Object)>> {
+        self.read_cx().table_pairs(table)
+    }
+    fn subst_expr_cx(&self, e: &mut SqlExpr) -> Result<()> {
+        self.read_cx().subst_expr(e)
+    }
+    fn index_probe_cx(
+        &self,
+        table: &str,
+        alias: Option<&str>,
+        selection: &Option<SqlExpr>,
+        ctes: &Ctes,
+    ) -> Result<Option<Vec<(u64, Object)>>> {
+        self.read_cx().index_probe(table, alias, selection, ctes)
+    }
+    fn matches_cx(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
+        self.read_cx().matches(selection, doc)
+    }
+    fn load_from_cx(
+        &self,
+        from: &[sqlparser::ast::TableWithJoins],
+        selection: &Option<SqlExpr>,
+        ctes: &Ctes,
+    ) -> Result<Vec<Object>> {
+        self.read_cx().load_from(from, selection, ctes)
+    }
+    fn exec_query_cx(&self, query: Query) -> Result<ExecOutcome> {
+        self.read_cx().exec_query(query)
     }
 
     /// Execute exactly one SQL statement.
@@ -1521,7 +2840,7 @@ impl Database {
         if !self.tables.contains_key(table) {
             return Vec::new();
         }
-        self.table_docs(table)
+        self.table_docs_cx(table)
             .map(|d| union_of_fields(&d))
             .unwrap_or_default()
     }
@@ -1545,7 +2864,7 @@ impl Database {
         let mut out = Vec::with_capacity(names.len());
         for name in &names {
             let meta = self.tables.get(name).cloned().unwrap();
-            let docs = self.table_docs(name)?;
+            let docs = self.table_docs_cx(name)?;
             let mut rows_hash: u64 = 0;
             for doc in &docs {
                 let mut h = DefaultHasher::new();
@@ -1875,7 +3194,7 @@ impl Database {
         // the per-row FK check.
         let mut dml = String::new();
         for name in fk_dependency_order(&names, &self.tables) {
-            for doc in self.table_docs(&name)? {
+            for doc in self.table_docs_cx(&name)? {
                 let cols: Vec<String> = doc.keys().cloned().collect();
                 let vals = cols
                     .iter()
@@ -1953,7 +3272,7 @@ impl Database {
                                  cannot be dropped");
                         }
                         let mut found = false;
-                        for meta in self.tables.values_mut() {
+                        for meta in self.tables.values_mut().map(std::sync::Arc::make_mut) {
                             if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
                                 meta.indexes.remove(pos);
                                 found = true;
@@ -2096,7 +3415,7 @@ impl Database {
             Statement::ReleaseSavepoint { name } => self.release_savepoint(&name.value),
             Statement::CreateIndex(idx) => self.exec_create_index(idx),
             Statement::Merge(m) => self.exec_merge(m.clone()),
-            Statement::Query(q) => self.exec_query(*q),
+            Statement::Query(q) => self.exec_query_cx(*q),
             Statement::Truncate(tr) => {
                 // Empty the tables; shape (columns/constraints) is kept.
                 for target in &tr.table_names {
@@ -2105,7 +3424,11 @@ impl Database {
                         return err(format!("table {name} does not exist"));
                     }
                     if self.tables.contains_key(&name) {
-                        let mut meta = self.tables.get(&name).cloned().unwrap_or_default();
+                        let mut meta = self
+                            .tables
+                            .get(&name)
+                            .map(|a| a.as_ref().clone())
+                            .unwrap_or_default();
                         self.rewrite_table(&name, &mut meta, Vec::new())?;
                     }
                 }
@@ -2137,7 +3460,7 @@ impl Database {
         let mut tx = self.pager.begin_tx();
         let mut pairs: Vec<(u64, Object)> = Vec::with_capacity(docs.len());
         for doc in &docs {
-            let loc = heap.insert(&mut self.pager, &mut tx, doc)?;
+            let loc = heap.insert(&self.pager, &mut tx, doc)?;
             pairs.push((loc, doc.clone()));
         }
         let roots = self.build_trees(
@@ -2162,11 +3485,12 @@ impl Database {
         meta.pages = heap.pages;
         meta.index_roots = roots;
         self.autoinc_cache.remove(table);
-        self.tables.insert(table.to_string(), meta.clone());
+        self.tables
+            .insert(table.to_string(), std::sync::Arc::new(meta.clone()));
         if let Err(e) = self.save_catalog_into(&mut tx) {
             match prev_meta {
                 Some(old) => {
-                    *meta = old.clone();
+                    *meta = old.as_ref().clone();
                     self.tables.insert(table.to_string(), old);
                 }
                 None => {
@@ -2177,20 +3501,6 @@ impl Database {
         }
         self.commit_pager_tx(tx)?;
         Ok(())
-    }
-
-    fn table_pairs(&self, table: &str) -> Result<Vec<(u64, Object)>> {
-        let Some(meta) = self.tables.get(table) else {
-            return err(format!("table {table} does not exist"));
-        };
-        let heap = meta.heap_of();
-        let mut out = Vec::new();
-        let rtx = self.pager.begin_tx();
-        for &pid in &heap.pages {
-            out.extend(heap.page_docs(&self.pager, &rtx, pid)?);
-        }
-        // The read-only tx has no staged pages: dropping it is the cleanup.
-        Ok(out)
     }
 
     /// Build one B+ tree per (root_key, columns, unique) spec, populated
@@ -2213,11 +3523,10 @@ impl Database {
             .zip(unique_keys.iter())
             .map(|((k, c), u)| (k, c, *u))
         {
-            let mut tree =
-                BTree::create(&mut self.pager, tx).map_err(|e| index_err(root_key, e))?;
+            let mut tree = BTree::create(&self.pager, tx).map_err(|e| index_err(root_key, e))?;
             for (loc, doc) in pairs {
                 if let Some(v) = index_key_of(doc, cols) {
-                    tree.insert(&mut self.pager, tx, v, *loc, unique)
+                    tree.insert(&self.pager, tx, v, *loc, unique)
                         .map_err(|e| index_err(root_key, e))?;
                 }
             }
@@ -2238,7 +3547,7 @@ impl Database {
                 pages: meta.pages.clone(),
                 overflow_free: meta.overflow_free.clone(),
             }
-            .scan(&self.pager)?;
+            .scan(&PageReader::current(&self.pager))?;
             for d in &docs {
                 if let Some(Value::Int(i)) = d.get(col) {
                     max = max.max(*i);
@@ -2248,121 +3557,6 @@ impl Database {
         let next = max + 1;
         self.autoinc_cache.insert(table.to_string(), next);
         Ok(next)
-    }
-
-    fn index_probe(
-        &self,
-        table: &str,
-        alias: Option<&str>,
-        selection: &Option<SqlExpr>,
-        ctes: &Ctes,
-    ) -> Result<Option<Vec<(u64, Object)>>> {
-        let Some(cond) = selection else {
-            return Ok(None);
-        };
-        let Some(meta) = self.tables.get(table).cloned() else {
-            return Ok(None);
-        };
-        if meta.index_roots.is_empty() || !ctes.is_empty() {
-            return Ok(None);
-        }
-        let Some((col, plan)) = probe_plan(cond, &meta, table, alias) else {
-            return Ok(None);
-        };
-        let root = meta.index_roots[&col];
-        let heap = meta.heap_of();
-        let tx = self.pager.begin_tx(); // read-only use; aborted immediately
-        let tree = BTree::open(root);
-        let pairs = match plan {
-            ProbePlan::Eq(v) => {
-                // Bounded range + equal filter so non-unique trees return
-                // every duplicate match (get() would yield one entry).
-                // The hi bound lets the tree stop at the first key past v
-                // instead of walking the whole right side. For composite
-                // indexes v is the full Array key — element-wise cmp_values
-                // equality is exactly a key match.
-                let mut p = tree
-                    .range_bounded(&self.pager, &tx, &v, Some((&v, true)))
-                    .map_err(|e| index_err(&col, e))?;
-                p.retain(|(k, _)| Value::cmp_values(k, &v) == Ordering::Equal);
-                p
-            }
-            ProbePlan::Prefix(prefix) => {
-                // Composite prefix probe: scan from the prefix (its rank
-                // makes Array(prefix) sort right before every key extending
-                // it) and keep keys that start with it element-wise.
-                let mut p = tree
-                    .range_bounded(&self.pager, &tx, &prefix, None)
-                    .map_err(|e| index_err(&col, e))?;
-                if let Value::Array(pfx) = &prefix {
-                    p.retain(|(k, _)| match k {
-                        Value::Array(items) => {
-                            items.len() >= pfx.len()
-                                && items
-                                    .iter()
-                                    .zip(pfx.iter())
-                                    .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
-                        }
-                        _ => false,
-                    });
-                }
-                p
-            }
-            ProbePlan::Range { lo, hi } => {
-                let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
-                let mut pairs = match &lo {
-                    Some((v, true)) => tree
-                        .range_bounded(&self.pager, &tx, v, hi_ref)
-                        .map_err(|e| index_err(&col, e))?,
-                    Some((v, false)) => {
-                        // strict lower bound: start at v, then drop the equal run
-                        let mut p = tree
-                            .range_bounded(&self.pager, &tx, v, hi_ref)
-                            .map_err(|e| index_err(&col, e))?;
-                        p.retain(|(k, _)| Value::cmp_values(k, v) != std::cmp::Ordering::Equal);
-                        p
-                    }
-                    // No lower bound: full tree scan (rare: WHERE col < x).
-                    None => tree
-                        .scan(&self.pager, &tx)
-                        .map_err(|e| index_err(&col, e))?,
-                };
-                if let Some((v, incl)) = &hi {
-                    pairs.retain(|(k, _)| {
-                        let o = Value::cmp_values(k, v);
-                        o == std::cmp::Ordering::Less || (*incl && o == std::cmp::Ordering::Equal)
-                    });
-                }
-                pairs
-            }
-        };
-        // Read-only tx: no staged pages, dropping it is the cleanup.
-        drop(tx);
-        let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
-        for (_, loc) in pairs {
-            if let Some(doc) = heap.doc_at(&self.pager, loc)? {
-                out.push((loc, doc));
-            }
-        }
-        // Heap order (page, slot) — loc packing already sorts that way.
-        out.sort_by_key(|(loc, _)| *loc);
-        Ok(Some(out))
-    }
-
-    pub(crate) fn table_docs(&self, table: &str) -> Result<Vec<Object>> {
-        let Some(meta) = self.tables.get(table) else {
-            return err(format!("table {table} does not exist"));
-        };
-        let heap = meta.heap_of();
-        heap.scan(&self.pager).map_err(Into::into)
-    }
-
-    fn matches(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
-        self.stmt_deadline.check()?;
-        match selection {
-            None => Ok(true),
-            Some(e) => Ok(matches!(eval_expr(e, doc)?, Value::Bool(true))),
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2375,10 +3569,10 @@ impl Database {
         update_returning: Option<Vec<SelectItem>>,
     ) -> Result<ExecOutcome> {
         for a in &mut assignments {
-            self.subst_expr(&mut a.value)?;
+            self.subst_expr_cx(&mut a.value)?;
         }
         if let Some(sel) = &mut selection {
-            self.subst_expr(sel)?;
+            self.subst_expr_cx(sel)?;
         }
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = table.relation else {
             return err("only simple table names in UPDATE");
@@ -2388,13 +3582,17 @@ impl Database {
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
-        let mut meta = self.tables.get(&tname).cloned().unwrap_or_default();
+        let mut meta = self
+            .tables
+            .get(&tname)
+            .map(|a| a.as_ref().clone())
+            .unwrap_or_default();
 
         // Fast path: probe-able WHERE on an indexed column — update the
         // affected rows in place instead of rewriting the whole table.
         if from.is_none() {
             if let Some(matches) =
-                self.index_probe(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
+                self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
             {
                 return self.exec_update_fast(
                     tname,
@@ -2407,7 +3605,7 @@ impl Database {
             }
         }
 
-        let docs = self.table_docs(&tname)?;
+        let docs = self.table_docs_cx(&tname)?;
         let (out, changed_docs, old_changed, count) = match from {
             None => {
                 // Plain UPDATE: assignments and WHERE see only target columns.
@@ -2416,7 +3614,7 @@ impl Database {
                 let mut old_changed: Vec<Object> = Vec::new();
                 let mut count = 0u64;
                 for doc in docs {
-                    if self.matches(&selection, &doc)? {
+                    if self.matches_cx(&selection, &doc)? {
                         old_changed.push(doc.clone());
                         let new_vals = eval_assignments(&assignments, &doc)?;
                         let mut doc = doc;
@@ -2456,7 +3654,7 @@ impl Database {
                     joins: vec![],
                 }];
                 from_list.extend(extra);
-                let merged = self.load_from(&from_list, &None, &self.ctes)?;
+                let merged = self.load_from_cx(&from_list, &None, &self.ctes)?;
                 let prefix = format!("{tkey}.");
                 // First qualifying match per target content: every output
                 // row with that content receives that image — including
@@ -2472,7 +3670,7 @@ impl Database {
                     if updates.contains_key(&key) {
                         continue; // first qualifying match wins
                     }
-                    if !self.matches(&selection, m)? {
+                    if !self.matches_cx(&selection, m)? {
                         continue;
                     }
                     old_changed.push(tdoc.clone());
@@ -2526,7 +3724,7 @@ impl Database {
     ) -> Result<ExecOutcome> {
         let mut updates: Vec<(u64, Object, Object)> = Vec::new(); // (loc, old, new)
         for (loc, doc) in matches {
-            if !self.matches(selection, &doc)? {
+            if !self.matches_cx(selection, &doc)? {
                 continue; // probe col matched; some other conjunct did not
             }
             let mut doc = doc;
@@ -2566,7 +3764,7 @@ impl Database {
                 .chain(meta.unique.iter())
                 .any(|c| !meta.index_roots.contains_key(c));
         let all_docs: Option<Vec<Object>> = if legacy_check {
-            Some(self.table_docs(&tname)?)
+            Some(self.table_docs_cx(&tname)?)
         } else {
             None
         };
@@ -2583,7 +3781,7 @@ impl Database {
         // row's still-present old key.
         for (loc, old_doc, _) in &updates {
             if let Err(e) = reindex_remove(
-                &mut self.pager,
+                &self.pager,
                 &mut tx,
                 &meta,
                 &idx_cols,
@@ -2599,8 +3797,8 @@ impl Database {
         for i in 0..updates.len() {
             let (loc, _, new_doc) = updates[i].clone();
             let page = crate::heap::unpack_loc(loc).0;
-            let before = heap.page_docs(&self.pager, &tx, page)?;
-            let out = heap.replace(&mut self.pager, &mut tx, loc, &new_doc)?;
+            let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
+            let out = heap.replace(&self.pager, &mut tx, loc, &new_doc)?;
             // An in-page re-pack moved this page's survivors: pending locators
             // must follow, or a later update would target whatever document
             // now occupies the stale slot.
@@ -2620,7 +3818,7 @@ impl Database {
                     continue;
                 }
                 if let Err(e) = reindex_repoint(
-                    &mut self.pager,
+                    &self.pager,
                     &mut tx,
                     &meta,
                     &idx_cols,
@@ -2634,7 +3832,7 @@ impl Database {
                 }
             }
             if let Err(e) = reindex_insert(
-                &mut self.pager,
+                &self.pager,
                 &mut tx,
                 &meta,
                 &idx_cols,
@@ -2700,7 +3898,7 @@ impl Database {
         returning: Option<Vec<SelectItem>>,
     ) -> Result<ExecOutcome> {
         if let Some(sel) = &mut selection {
-            self.subst_expr(sel)?;
+            self.subst_expr_cx(sel)?;
         }
         let sqlparser::ast::FromTable::WithFromKeyword(tables) = from else {
             return err("unsupported DELETE form");
@@ -2717,28 +3915,32 @@ impl Database {
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
-        let mut meta = self.tables.get(&tname).cloned().unwrap_or_default();
+        let mut meta = self
+            .tables
+            .get(&tname)
+            .map(|a| a.as_ref().clone())
+            .unwrap_or_default();
         // Fast path: probe-able WHERE on an indexed column — remove the
         // matching rows in place (page re-pack) instead of rewriting the
         // whole table.
         if using.is_none() {
             if let Some(matches) =
-                self.index_probe(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
+                self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
             {
                 return self.exec_delete_fast(tname, meta, matches, &selection, &returning);
             }
         }
-        let docs = self.table_docs(&tname)?;
+        let docs = self.table_docs_cx(&tname)?;
         let (kept, removed) = if let Some(using) = using {
             // DELETE ... USING: qualify over the joined rows and mark the
             // target docs whose combination satisfies WHERE.
             let mut from_list = vec![tables[0].clone()];
             from_list.extend(using);
-            let merged = self.load_from(&from_list, &None, &self.ctes)?;
+            let merged = self.load_from_cx(&from_list, &None, &self.ctes)?;
             let prefix = format!("{tkey}.");
             let mut rm: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
             for m in &merged {
-                if !self.matches(&selection, m)? {
+                if !self.matches_cx(&selection, m)? {
                     continue;
                 }
                 let tdoc = target_doc_from_merged(m, &prefix);
@@ -2758,7 +3960,7 @@ impl Database {
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for doc in docs {
-                if self.matches(&selection, &doc)? {
+                if self.matches_cx(&selection, &doc)? {
                     removed.push(doc);
                 } else {
                     kept.push(doc);
@@ -2785,7 +3987,7 @@ impl Database {
     ) -> Result<ExecOutcome> {
         let mut targets: Vec<(u64, Object)> = Vec::new();
         for (loc, doc) in matches {
-            if self.matches(selection, &doc)? {
+            if self.matches_cx(selection, &doc)? {
                 targets.push((loc, doc));
             }
         }
@@ -2811,13 +4013,13 @@ impl Database {
             .collect();
         let mut before = Vec::new();
         for pid in affected {
-            before.extend(heap.page_docs(&self.pager, &tx, pid)?);
+            before.extend(heap.page_docs(&PageReader::current(&self.pager), &tx, pid)?);
         }
         let locs: Vec<u64> = targets.iter().map(|(l, _)| *l).collect();
-        let moves = heap.remove_many(&mut self.pager, &mut tx, &locs)?;
+        let moves = heap.remove_many(&self.pager, &mut tx, &locs)?;
         for (loc, doc) in &targets {
             reindex_remove(
-                &mut self.pager,
+                &self.pager,
                 &mut tx,
                 &meta,
                 &idx_cols,
@@ -2828,7 +4030,7 @@ impl Database {
         }
         for (old_l, new_l) in &moves {
             reindex_repoint(
-                &mut self.pager,
+                &self.pager,
                 &mut tx,
                 &meta,
                 &idx_cols,
@@ -2885,7 +4087,7 @@ impl Database {
             }
             return err(format!("index {iname} already exists"));
         }
-        let Some(mut meta) = self.tables.get_mut(&table).cloned() else {
+        let Some(mut meta) = self.tables.get(&table).map(|a| a.as_ref().clone()) else {
             return err(format!("table {table} does not exist"));
         };
         // Parse the indexed columns: plain identifiers only (expression
@@ -2913,14 +4115,14 @@ impl Database {
         // container — their tree enforces uniqueness itself (unique insert).
         let composite = cols.len() > 1;
         if idx.unique && !composite && !meta.unique.contains(&cols[0]) {
-            let docs = self.table_docs(&table)?;
+            let docs = self.table_docs_cx(&table)?;
             meta.unique.push(cols[0].clone());
             meta.check_unique(&docs)?;
         }
         // Build the B+ tree over the existing rows. Single-column trees are
         // non-unique at the tree level (duplicates allowed, lookups collect
         // every match); composite UNIQUE trees enforce duplicates on insert.
-        let pairs = self.table_pairs(&table)?;
+        let pairs = self.table_pairs_cx(&table)?;
         let mut tx = self.pager.begin_tx();
         let root_key = if composite {
             iname.clone()
@@ -2942,7 +4144,7 @@ impl Database {
             unique: idx.unique,
         });
         meta.indexes.push(iname);
-        self.tables.insert(table, meta);
+        self.tables.insert(table, std::sync::Arc::new(meta));
         self.save_catalog()?;
         Ok(ExecOutcome::Affected(0))
     }
@@ -2950,7 +4152,7 @@ impl Database {
     fn exec_alter(&mut self, alter: sqlparser::ast::AlterTable) -> Result<ExecOutcome> {
         use sqlparser::ast::AlterTableOperation as Op;
         let tname = obj_name(&alter.name);
-        let Some(mut meta) = self.tables.get(&tname).cloned() else {
+        let Some(mut meta) = self.tables.get(&tname).map(|a| a.as_ref().clone()) else {
             return err(format!("table {tname} does not exist"));
         };
         // rewrite_table persists the catalog in its own transaction; only
@@ -3006,7 +4208,7 @@ impl Database {
                     {
                         let e = parse_expr_text(&text)?;
                         let fill = eval_const(&e)?;
-                        let docs = self.table_docs(&tname)?;
+                        let docs = self.table_docs_cx(&tname)?;
                         let filled: Vec<Object> = docs
                             .into_iter()
                             .map(|mut d| {
@@ -3054,7 +4256,7 @@ impl Database {
                         meta.index_roots.retain(|k, _| !dead.contains(k));
                         meta.index_defs.retain(|d| !dead.contains(&d.name));
                     }
-                    let docs = self.table_docs(&tname)?;
+                    let docs = self.table_docs_cx(&tname)?;
                     let stripped: Vec<Object> = docs
                         .into_iter()
                         .map(|mut d| {
@@ -3160,7 +4362,7 @@ impl Database {
                         .iter()
                         .map(|c| rename_ident_in_text(c, old, new))
                         .collect();
-                    let docs = self.table_docs(&tname)?;
+                    let docs = self.table_docs_cx(&tname)?;
                     let renamed: Vec<Object> = docs
                         .into_iter()
                         .map(|mut d| {
@@ -3183,7 +4385,7 @@ impl Database {
                     if self.tables.contains_key(&new_name) {
                         return err(format!("table {new_name} already exists"));
                     }
-                    let docs = self.table_docs(&tname)?;
+                    let docs = self.table_docs_cx(&tname)?;
                     self.tables.remove(&tname);
                     self.rewrite_table(&new_name, &mut meta, docs)?;
                     return Ok(ExecOutcome::Affected(0));
@@ -3192,7 +4394,7 @@ impl Database {
             }
         }
         if !rewrote {
-            self.tables.insert(tname.clone(), meta);
+            self.tables.insert(tname.clone(), std::sync::Arc::new(meta));
             self.save_catalog()?;
         }
         Ok(ExecOutcome::Affected(0))
@@ -3208,7 +4410,7 @@ impl Database {
             if matches!(v, Value::Null) {
                 continue; // NULL passes (MATCH SIMPLE semantics)
             }
-            let ref_docs = self.table_docs(rtable)?;
+            let ref_docs = self.table_docs_cx(rtable)?;
             let found = ref_docs
                 .iter()
                 .any(|rd| rd.get(rcol).map(|rv| rv == v).unwrap_or(false));
@@ -3275,7 +4477,7 @@ impl Database {
             return Ok(());
         }
         for (child_table, child_col, rc) in &children {
-            let child_docs = self.table_docs(child_table)?;
+            let child_docs = self.table_docs_cx(child_table)?;
             let offender = child_docs.iter().any(|cd| {
                 cd.get(child_col)
                     .map(|cv| !matches!(cv, Value::Null) && lost.contains(&cv))
@@ -3289,169 +4491,6 @@ impl Database {
             }
         }
         Ok(())
-    }
-
-    /// Run a subquery and return its rows (first column only matters for
-    /// IN/ANY lists, but scalar casts use the full first cell).
-    fn subquery_result(&self, q: &Query) -> Result<QueryResult> {
-        // Correlated references (`outer_table.column`) must error instead of
-        // falling into the inner query's schemaless column lookup, where a
-        // missing column reads as NULL and silently mis-filters (NOT IN ()
-        // over an empty list is vacuously true — that shape deletes rows).
-        let mut from_names = std::collections::BTreeSet::new();
-        collect_from_names(q, &mut from_names);
-        let mut hits = Vec::new();
-        if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
-            if let Some(sel_expr) = &sel.selection {
-                collect_correlated_refs(sel_expr, &from_names, &self.tables, &mut hits);
-            }
-            if let Some(having) = &sel.having {
-                collect_correlated_refs(having, &from_names, &self.tables, &mut hits);
-            }
-            for item in &sel.projection {
-                match item {
-                    sqlparser::ast::SelectItem::UnnamedExpr(e)
-                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
-                        collect_correlated_refs(e, &from_names, &self.tables, &mut hits);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if let Some(qualifier) = hits.first() {
-            return err(format!(
-                "correlated subqueries are not supported (reference to outer table {qualifier})"
-            ));
-        }
-        match self.exec_query(q.clone())? {
-            ExecOutcome::Rows(r) => Ok(r),
-            _ => err("subquery must be a SELECT"),
-        }
-    }
-
-    /// Rewrite uncorrelated subqueries inside `e` into row-local
-    /// expressions (IN-lists / literals) before row iteration.
-    fn subst_expr(&self, e: &mut SqlExpr) -> Result<()> {
-        match e {
-            SqlExpr::Subquery(q) => {
-                let r = self.subquery_result(q)?;
-                let v = r
-                    .rows
-                    .first()
-                    .and_then(|row| row.first().cloned())
-                    .unwrap_or(Value::Null);
-                *e = value_to_literal(v)?;
-            }
-            SqlExpr::InSubquery {
-                expr,
-                subquery,
-                negated,
-            } => {
-                let r = self.subquery_result(subquery)?;
-                let list = r
-                    .rows
-                    .iter()
-                    .map(|row| value_to_literal(row.first().cloned().unwrap_or(Value::Null)))
-                    .collect::<Result<Vec<_>>>()?;
-                *e = SqlExpr::InList {
-                    expr: expr.clone(),
-                    list,
-                    negated: *negated,
-                };
-            }
-            SqlExpr::Exists { subquery, negated } => {
-                let r = self.subquery_result(subquery)?;
-                *e = value_to_literal(Value::Bool(!r.rows.is_empty() != *negated))?;
-            }
-            SqlExpr::AnyOp {
-                left,
-                compare_op,
-                right,
-                ..
-            } => {
-                if let (sqlparser::ast::BinaryOperator::Eq, SqlExpr::Subquery(q)) =
-                    (compare_op, right.as_ref())
-                {
-                    let r = self.subquery_result(q)?;
-                    let list = r
-                        .rows
-                        .iter()
-                        .map(|row| value_to_literal(row.first().cloned().unwrap_or(Value::Null)))
-                        .collect::<Result<Vec<_>>>()?;
-                    *e = SqlExpr::InList {
-                        expr: left.clone(),
-                        list,
-                        negated: false,
-                    };
-                }
-                // Non-EQ ANY falls through and errors at evaluation time.
-            }
-            // Recurse into composite expressions.
-            SqlExpr::BinaryOp { left, right, .. } => {
-                self.subst_expr(left)?;
-                self.subst_expr(right)?;
-            }
-            SqlExpr::UnaryOp { expr, .. } => self.subst_expr(expr)?,
-            SqlExpr::Nested(inner) => self.subst_expr(inner)?,
-            SqlExpr::Between {
-                expr, low, high, ..
-            } => {
-                self.subst_expr(expr)?;
-                self.subst_expr(low)?;
-                self.subst_expr(high)?;
-            }
-            SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
-                self.subst_expr(expr)?;
-                self.subst_expr(pattern)?;
-            }
-            SqlExpr::InList { expr, list, .. } => {
-                self.subst_expr(expr)?;
-                for item in list {
-                    self.subst_expr(item)?;
-                }
-            }
-            SqlExpr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                if let Some(op) = operand {
-                    self.subst_expr(op)?;
-                }
-                for w in conditions.iter_mut() {
-                    self.subst_expr(&mut w.condition)?;
-                    self.subst_expr(&mut w.result)?;
-                }
-                if let Some(el) = else_result {
-                    self.subst_expr(el)?;
-                }
-            }
-            SqlExpr::Cast { expr, .. } => self.subst_expr(expr)?,
-            SqlExpr::Function(f) => {
-                if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
-                    for a in &mut list.args {
-                        if let sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(inner),
-                        ) = a
-                        {
-                            self.subst_expr(inner)?;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Substitute subqueries inside a projection item.
-    fn subst_item(&self, item: &mut SelectItem) -> Result<()> {
-        match item {
-            SelectItem::UnnamedExpr(e) => self.subst_expr(e),
-            SelectItem::ExprWithAlias { expr, .. } => self.subst_expr(expr),
-            _ => Ok(()),
-        }
     }
 
     fn exec_create(&mut self, create: sqlparser::ast::CreateTable) -> Result<ExecOutcome> {
@@ -3471,7 +4510,7 @@ impl Database {
         // CREATE TABLE ... AS SELECT: shape and rows come from the query.
         // (`temporary` is accepted and treated as a regular table.)
         if let Some(q) = &create.query {
-            let ExecOutcome::Rows(r) = self.exec_query(q.as_ref().clone())? else {
+            let ExecOutcome::Rows(r) = self.exec_query_cx(q.as_ref().clone())? else {
                 return err("CREATE TABLE AS requires a SELECT");
             };
             let docs: Vec<Object> = r
@@ -3611,7 +4650,7 @@ impl Database {
             self.commit_pager_tx(tx)?;
             meta.index_roots = roots;
         }
-        self.tables.insert(name.clone(), meta);
+        self.tables.insert(name.clone(), std::sync::Arc::new(meta));
         self.save_catalog()?;
         Ok(ExecOutcome::Affected(0))
     }
@@ -3621,7 +4660,7 @@ impl Database {
             return err("unsupported INSERT target");
         };
         let table = obj_name(name);
-        let Some(meta) = self.tables.get(&table).cloned() else {
+        let Some(meta) = self.tables.get(&table).map(|a| a.as_ref().clone()) else {
             return err(format!("table {table} does not exist"));
         };
         let mut columns: Vec<String> = if insert.columns.is_empty() {
@@ -3649,7 +4688,7 @@ impl Database {
             // INSERT INTO t (cols...) SELECT ...: take the SELECT's rows;
             // when no column list is given the query's columns define them.
             SetExpr::Select(_) => {
-                let ExecOutcome::Rows(r) = self.exec_query(source.as_ref().clone())? else {
+                let ExecOutcome::Rows(r) = self.exec_query_cx(source.as_ref().clone())? else {
                     return err("INSERT source must be VALUES or SELECT");
                 };
                 if columns == meta.columns && insert.columns.is_empty() {
@@ -3841,7 +4880,7 @@ impl Database {
                         continue;
                     }
                     if let Some(loc) = BTree::open(roots[col])
-                        .get(&self.pager, &tx, v)
+                        .get(&PageReader::current(&self.pager), &tx, v)
                         .map_err(|e| index_err(col, e))?
                     {
                         displaced.push(loc);
@@ -3856,15 +4895,15 @@ impl Database {
                 .collect();
             let mut before = Vec::new();
             for pid in affected {
-                before.extend(heap.page_docs(&self.pager, &tx, pid)?);
+                before.extend(heap.page_docs(&PageReader::current(&self.pager), &tx, pid)?);
             }
-            let moves = heap.remove_many(&mut self.pager, &mut tx, &displaced)?;
+            let moves = heap.remove_many(&self.pager, &mut tx, &displaced)?;
             for loc in &displaced {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
                     continue;
                 };
                 reindex_remove(
-                    &mut self.pager,
+                    &self.pager,
                     &mut tx,
                     &meta,
                     &idx_cols,
@@ -3875,7 +4914,7 @@ impl Database {
             }
             for (old_l, new_l) in &moves {
                 reindex_repoint(
-                    &mut self.pager,
+                    &self.pager,
                     &mut tx,
                     &meta,
                     &idx_cols,
@@ -3900,7 +4939,7 @@ impl Database {
                         continue;
                     }
                     if BTree::open(roots[col])
-                        .get(&self.pager, &tx, v)
+                        .get(&PageReader::current(&self.pager), &tx, v)
                         .map_err(|e| index_err(col, e))?
                         .is_some()
                     {
@@ -3908,7 +4947,7 @@ impl Database {
                     }
                 }
             }
-            let loc = match heap.insert(&mut self.pager, &mut tx, &doc) {
+            let loc = match heap.insert(&self.pager, &mut tx, &doc) {
                 Ok(l) => l,
                 Err(e) => {
                     self.pager.abort_tx(tx)?;
@@ -3922,7 +4961,7 @@ impl Database {
                 }
                 let root = roots[col];
                 let mut tree = BTree::open(root);
-                if let Err(e) = tree.insert(&mut self.pager, &mut tx, v.clone(), loc, true) {
+                if let Err(e) = tree.insert(&self.pager, &mut tx, v.clone(), loc, true) {
                     insert_failed = Some(index_err(col, e));
                     break 'outer;
                 }
@@ -3943,7 +4982,7 @@ impl Database {
                 };
                 let root = roots[col.as_str()];
                 let mut tree = BTree::open(root);
-                tree.insert(&mut self.pager, &mut tx, v, loc, meta.root_key_unique(col))
+                tree.insert(&self.pager, &mut tx, v, loc, meta.root_key_unique(col))
                     .map_err(|e| index_err(col, e))?;
                 if tree.root != root {
                     roots.insert(col.clone(), tree.root);
@@ -3964,7 +5003,7 @@ impl Database {
                 pages: meta.pages.clone(),
                 overflow_free: meta.overflow_free.clone(),
             }
-            .scan(&self.pager))
+            .scan(&PageReader::current(&self.pager)))
             {
                 Ok(docs) => docs,
                 Err(e) => {
@@ -4010,349 +5049,6 @@ impl Database {
             return project_returning(ret, &new_docs);
         }
         Ok(ExecOutcome::Affected(count))
-    }
-
-    fn exec_query(&self, query: Query) -> Result<ExecOutcome> {
-        // WITH <cte> AS (...), ...: materialize each CTE (they can reference
-        // earlier ones) into a statement-local map — owned by this call, so
-        // the whole SELECT execution chain can run on `&Database` (MVCC
-        // stage A concurrent readers).
-        let mut ctes: Ctes = Ctes::new();
-        if let Some(with) = &query.with {
-            if with.recursive {
-                return err("WITH RECURSIVE is not supported");
-            }
-            for cte in &with.cte_tables {
-                let name = cte.alias.name.value.clone();
-                let ExecOutcome::Rows(r) =
-                    self.exec_query_body(cte.query.as_ref().clone(), &ctes)?
-                else {
-                    return err("CTE body must be a SELECT");
-                };
-                let docs: Vec<Object> = r
-                    .rows
-                    .into_iter()
-                    .map(|row| r.columns.iter().cloned().zip(row).collect())
-                    .collect();
-                ctes.insert(name, docs);
-            }
-        }
-        self.exec_query_body(query, &ctes)
-    }
-
-    /// Execute the query body (no WITH: it was materialized by the caller
-    /// into `ctes`).
-    fn exec_query_body(&self, query: Query, ctes: &Ctes) -> Result<ExecOutcome> {
-        let body = query.body.clone();
-        match *body {
-            SetExpr::Select(select) => self.exec_select(query.clone(), *select, ctes),
-            SetExpr::SetOperation {
-                left,
-                op,
-                set_quantifier,
-                right,
-            } => {
-                use sqlparser::ast::{SetOperator, SetQuantifier};
-                if !matches!(
-                    op,
-                    SetOperator::Union
-                        | SetOperator::Except
-                        | SetOperator::Minus
-                        | SetOperator::Intersect
-                ) {
-                    return err(format!("unsupported set operation: {op}"));
-                }
-                // Set operations combine whole result sets: strip per-arm
-                // ORDER BY/LIMIT so they apply to the combination only.
-                let bare = Query {
-                    order_by: None,
-                    limit_clause: None,
-                    ..query.clone()
-                };
-                let l = self.exec_query(Query {
-                    body: left,
-                    ..bare.clone()
-                })?;
-                let r = self.exec_query(Query {
-                    body: right,
-                    ..bare
-                })?;
-                let (ExecOutcome::Rows(mut lr), ExecOutcome::Rows(rr)) = (l, r) else {
-                    return err("set operations require SELECT on both sides");
-                };
-                // Column *counts* must match; names may differ (left wins).
-                if lr.columns.len() != rr.columns.len() {
-                    return err("set operation arms have different column counts");
-                }
-                let all = set_quantifier == SetQuantifier::All;
-                match op {
-                    SetOperator::Union => {
-                        lr.rows.extend(rr.rows);
-                        if !all {
-                            dedup_rows(&mut lr.rows);
-                        }
-                    }
-                    SetOperator::Intersect => {
-                        let mut counts = row_counts(&rr.rows);
-                        let mut out = Vec::new();
-                        for row in lr.rows {
-                            if consume_one(&mut counts, &row) {
-                                out.push(row);
-                            }
-                        }
-                        if !all {
-                            let mut out2 = out;
-                            dedup_rows(&mut out2);
-                            out = out2;
-                        }
-                        lr.rows = out;
-                    }
-                    // EXCEPT / MINUS share semantics.
-                    SetOperator::Except | SetOperator::Minus => {
-                        let mut counts = row_counts(&rr.rows);
-                        let mut out = Vec::new();
-                        for row in lr.rows {
-                            if consume_one(&mut counts, &row) {
-                                continue; // matched on the right: removed
-                            }
-                            out.push(row);
-                        }
-                        if !all {
-                            let mut out2 = out;
-                            dedup_rows(&mut out2);
-                            out = out2;
-                        }
-                        lr.rows = out;
-                    }
-                }
-                // ORDER BY / LIMIT now apply to the combined result.
-                let cols = lr.columns.clone();
-                let rows = self.apply_order_limit(query, lr.rows, &cols, None)?;
-                Ok(ExecOutcome::Rows(QueryResult {
-                    columns: cols,
-                    rows,
-                }))
-            }
-            other => err(format!("unsupported query body: {other}")),
-        }
-    }
-
-    fn exec_select(
-        &self,
-        query: Query,
-        mut select: sqlparser::ast::Select,
-        ctes: &Ctes,
-    ) -> Result<ExecOutcome> {
-        // Resolve uncorrelated subqueries up front so the row-local
-        // expression evaluator never sees them.
-        if let Some(sel) = &mut select.selection {
-            self.subst_expr(sel)?;
-        }
-        for item in &mut select.projection {
-            self.subst_item(item)?;
-        }
-        if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &mut select.group_by {
-            for e in es {
-                self.subst_expr(e)?;
-            }
-        }
-        if let Some(having) = &mut select.having {
-            self.subst_expr(having)?;
-        }
-
-        if select.from.is_empty() {
-            // FROM-less SELECT: one row of constant expressions; WHERE
-            // filters that single row.
-            let mut project: Vec<(String, SqlExpr)> = Vec::new();
-            for item in &select.projection {
-                match item {
-                    SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e.clone())),
-                    SelectItem::ExprWithAlias { expr, alias, .. } => {
-                        project.push((alias.value.clone(), expr.clone()))
-                    }
-                    _ => return err("unsupported select item"),
-                }
-            }
-            let empty = Object::new();
-            let columns = project.iter().map(|(n, _)| n.clone()).collect();
-            if let Some(cond) = &select.selection {
-                if !matches!(eval_expr(cond, &empty)?, Value::Bool(true)) {
-                    return Ok(ExecOutcome::Rows(QueryResult {
-                        columns,
-                        rows: vec![],
-                    }));
-                }
-            }
-            let row = project
-                .iter()
-                .map(|(_, e)| eval_expr(e, &empty))
-                .collect::<Result<Vec<_>>>()?;
-            // FROM-less SELECT still honors LIMIT/OFFSET (`SELECT 1 LIMIT 0`
-            // must return zero rows, not one). ORDER BY over a single row
-            // cannot reorder anything.
-            let mut rows = vec![row];
-            if let Some(lc) = &query.limit_clause {
-                rows = apply_limit_clause(lc, rows)?;
-            }
-            return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
-        }
-        let mut rows = self.load_from(&select.from, &select.selection, ctes)?;
-
-        // Oracle ROWNUM pseudo-column: number each row right after it is
-        // retrieved (before WHERE and before ORDER BY — Oracle semantics).
-        // Injected only when the statement references it, and only for the
-        // non-aggregated path (aggregates + ROWNUM error on the missing
-        // column, which is the honest refusal).
-        let group_exprs: Vec<SqlExpr> = match &select.group_by {
-            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
-            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
-        };
-        let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
-        let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
-        if rownum_wanted {
-            for (i, row) in rows.iter_mut().enumerate() {
-                row.insert("ROWNUM".into(), Value::Int(i as i64 + 1));
-            }
-        }
-
-        // WHERE — consuming pass: matching docs move into the kept vec
-        // instead of being whole-document cloned (the filtered set is
-        // often the whole table).
-        if let Some(cond) = &select.selection {
-            let mut kept = Vec::with_capacity(rows.len());
-            for doc in rows.drain(..) {
-                self.stmt_deadline.check()?;
-                if matches!(eval_expr(cond, &doc)?, Value::Bool(true)) {
-                    kept.push(doc);
-                }
-            }
-            rows = kept;
-        }
-
-        // Aggregation path: aggregate functions in projection or GROUP BY.
-        if is_aggregate {
-            return self.exec_grouped_select(query, select, rows, group_exprs);
-        }
-        if select.having.is_some() {
-            // Silently dropping the filter would return unfiltered rows.
-            return err("HAVING requires GROUP BY or an aggregate");
-        }
-        self.exec_plain_select(query, select, rows)
-    }
-
-    /// Load a FROM list into merged rows: the base table plus its JOINs,
-    /// then comma-separated entries as cross joins. A lone base table keeps
-    /// unqualified field names; anything joined gets "alias.col" keys.
-    /// A solo real table with a probe-able WHERE skips the heap scan.
-    fn load_from(
-        &self,
-        from: &[sqlparser::ast::TableWithJoins],
-        selection: &Option<SqlExpr>,
-        ctes: &Ctes,
-    ) -> Result<Vec<Object>> {
-        use sqlparser::ast::{JoinConstraint, JoinOperator};
-        let base = &from[0];
-        // Index fast path: solo base table, WHERE narrows to an indexed
-        // column. Rows come straight from the B+ tree; the caller's residual
-        // WHERE filter still runs over them.
-        if base.joins.is_empty() && from.len() == 1 {
-            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &base.relation {
-                let tname = obj_name(name);
-                if self.tables.contains_key(&tname) && !ctes.contains_key(&tname) {
-                    let akey = alias.as_ref().map(|a| a.name.value.clone());
-                    if let Some(pairs) =
-                        self.index_probe(&tname, akey.as_deref(), selection, ctes)?
-                    {
-                        return Ok(pairs.into_iter().map(|(_, d)| d).collect());
-                    }
-                }
-            }
-        }
-        let (bname, balias, mut bdocs) = self.load_table_factor(&base.relation, ctes)?;
-        let bkey = balias.unwrap_or_else(|| bname.clone());
-        let solo = base.joins.is_empty() && from.len() == 1;
-        let mut rows: Vec<Object> = if solo {
-            bdocs
-        } else {
-            bdocs.drain(..).map(|d| qualify(&d, &bkey)).collect()
-        };
-        let mut all_joins: Vec<&sqlparser::ast::Join> = base.joins.iter().collect();
-        if !solo {
-            for twj in &from[1..] {
-                // comma-separated FROM entries: cross join their base tables
-                let (n, a, d) = self.load_table_factor(&twj.relation, ctes)?;
-                let k = a.unwrap_or(n);
-                rows = join_rows(rows, &d, &k, None, false, false, &self.stmt_deadline)?;
-                all_joins.extend(twj.joins.iter());
-            }
-        }
-        for j in all_joins {
-            let (jname, jalias, jdocs) = self.load_table_factor(&j.relation, ctes)?;
-            let jkey = jalias.unwrap_or(jname);
-            let (left_join, right_join, on) = match &j.join_operator {
-                JoinOperator::Join(c)
-                | JoinOperator::Inner(c)
-                | JoinOperator::Left(c)
-                | JoinOperator::LeftOuter(c)
-                | JoinOperator::Right(c)
-                | JoinOperator::RightOuter(c)
-                | JoinOperator::FullOuter(c) => {
-                    let on = match c {
-                        JoinConstraint::On(e) => Some(e.clone()),
-                        JoinConstraint::Using(cols) => {
-                            // a USING b == ON left.b = right.b (unqualified lookups
-                            // are not supported; use alias-qualified names)
-                            let mut e = None;
-                            for c in cols {
-                                let col = obj_name(c);
-                                let eq = SqlExpr::BinaryOp {
-                                    left: Box::new(SqlExpr::Identifier(
-                                        sqlparser::ast::Ident::new(format!("{bkey}.{col}")),
-                                    )),
-                                    op: sqlparser::ast::BinaryOperator::Eq,
-                                    right: Box::new(SqlExpr::Identifier(
-                                        sqlparser::ast::Ident::new(format!("{jkey}.{col}")),
-                                    )),
-                                };
-                                e = Some(match e {
-                                    None => eq,
-                                    Some(prev) => SqlExpr::BinaryOp {
-                                        left: Box::new(prev),
-                                        op: sqlparser::ast::BinaryOperator::And,
-                                        right: Box::new(eq),
-                                    },
-                                });
-                            }
-                            e
-                        }
-                        _ => None,
-                    };
-                    let (mut left_join, mut right_join) = (false, false);
-                    match &j.join_operator {
-                        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => left_join = true,
-                        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => right_join = true,
-                        JoinOperator::FullOuter(_) => {
-                            left_join = true;
-                            right_join = true;
-                        }
-                        _ => {}
-                    }
-                    (left_join, right_join, on)
-                }
-                JoinOperator::CrossJoin(_) => (false, false, None),
-                _ => return err("unsupported join type"),
-            };
-            rows = join_rows(
-                rows,
-                &jdocs,
-                &jkey,
-                on.as_ref(),
-                left_join,
-                right_join,
-                &self.stmt_deadline,
-            )?;
-        }
-        Ok(rows)
     }
 
     /// MERGE INTO target USING source ON (cond) — Oracle/SQL-standard
@@ -4445,7 +5141,9 @@ impl Database {
         }
         // Source rows: plain table or derived subquery (no CTE access in
         // v1 — the MERGE statement is not a SELECT statement).
-        let (_, _, src_rows) = self.load_table_factor(&merge.source, &Ctes::new())?;
+        let (_, _, src_rows) = self
+            .read_cx()
+            .load_table_factor(&merge.source, &Ctes::new())?;
         let skey = match &merge.source {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => alias
                 .as_ref()
@@ -4461,7 +5159,7 @@ impl Database {
         {
             let rtx = self.pager.begin_tx();
             for &pid in &theap.pages {
-                tdocs.extend(theap.page_docs(&self.pager, &rtx, pid)?);
+                tdocs.extend(theap.page_docs(&PageReader::current(&self.pager), &rtx, pid)?);
             }
         }
 
@@ -4528,7 +5226,7 @@ impl Database {
         // not-yet-replaced row's still-present old key).
         for (loc, old_doc, _) in &updates {
             if let Err(e) = reindex_remove(
-                &mut self.pager,
+                &self.pager,
                 &mut tx,
                 &meta,
                 &idx_cols,
@@ -4544,8 +5242,8 @@ impl Database {
         for i in 0..updates.len() {
             let (loc, _, new_doc) = updates[i].clone();
             let page = crate::heap::unpack_loc(loc).0;
-            let before = heap.page_docs(&self.pager, &tx, page)?;
-            let out = heap.replace(&mut self.pager, &mut tx, loc, &new_doc)?;
+            let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
+            let out = heap.replace(&self.pager, &mut tx, loc, &new_doc)?;
             if !out.moved.is_empty() {
                 for pending in updates.iter_mut().skip(i + 1) {
                     if let Some((_, new_l)) = out.moved.iter().find(|(old, _)| *old == pending.0) {
@@ -4558,7 +5256,7 @@ impl Database {
                     continue;
                 }
                 if let Err(e) = reindex_repoint(
-                    &mut self.pager,
+                    &self.pager,
                     &mut tx,
                     &meta,
                     &idx_cols,
@@ -4572,7 +5270,7 @@ impl Database {
                 }
             }
             if let Err(e) = reindex_insert(
-                &mut self.pager,
+                &self.pager,
                 &mut tx,
                 &meta,
                 &idx_cols,
@@ -4600,9 +5298,9 @@ impl Database {
                     doc.insert(c.clone(), v);
                 }
                 self.check_fks(&meta, &doc)?;
-                let loc = heap.insert(&mut self.pager, &mut tx, &doc)?;
+                let loc = heap.insert(&self.pager, &mut tx, &doc)?;
                 reindex_insert(
-                    &mut self.pager,
+                    &self.pager,
                     &mut tx,
                     &meta,
                     &idx_cols,
@@ -4642,514 +5340,6 @@ impl Database {
             }
         }
         row
-    }
-
-    /// No aggregation: project expressions over rows.
-    fn exec_plain_select(
-        &self,
-        query: Query,
-        select: sqlparser::ast::Select,
-        rows: Vec<Object>,
-    ) -> Result<ExecOutcome> {
-        let mut want_star = false;
-        let mut project: Vec<(String, SqlExpr)> = Vec::new();
-        for item in &select.projection {
-            match item {
-                SelectItem::Wildcard(_) => want_star = true,
-                SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e.clone())),
-                SelectItem::ExprWithAlias { expr, alias, .. } => {
-                    project.push((alias.value.clone(), expr.clone()))
-                }
-                _ => return err("unsupported select item"),
-            }
-        }
-        let columns_out: Vec<String> = if want_star {
-            // SELECT *, expr: star fields first, then the explicit
-            // projections (SQLite semantics) — dropping the exprs silently
-            // returned fewer columns than the statement asked for. The
-            // ROWNUM pseudo-column (if injected) is not part of * — Oracle
-            // semantics.
-            let mut cols: Vec<String> = union_of_fields(&rows)
-                .into_iter()
-                .filter(|c| c != "ROWNUM")
-                .collect();
-            cols.extend(project.iter().map(|(n, _)| n.clone()));
-            cols
-        } else {
-            project.iter().map(|(n, _)| n.clone()).collect()
-        };
-
-        let mut docs = rows;
-        let mut out: Vec<Vec<Value>> = Vec::new();
-        for doc in &docs {
-            if want_star {
-                let mut row: Vec<Value> = columns_out
-                    .iter()
-                    .map(|c| doc.get(c).cloned().unwrap_or(Value::Null))
-                    .collect();
-                // The trailing project.len() slots are the explicit exprs.
-                let base = columns_out.len() - project.len();
-                for (i, (_, e)) in project.iter().enumerate() {
-                    row[base + i] = eval_expr(e, doc)?;
-                }
-                out.push(row);
-            } else {
-                let mut row = Vec::with_capacity(project.len());
-                for (_, e) in &project {
-                    row.push(eval_expr(e, doc)?);
-                }
-                out.push(row);
-            }
-        }
-        // DISTINCT: drop duplicate projected rows; the first occurrence's
-        // source doc stays for ORDER BY evaluation. DISTINCT ON (...) is a
-        // different (unsupported) feature and must not pass silently.
-        match &select.distinct {
-            Some(sqlparser::ast::Distinct::On(cols)) => {
-                return err(format!(
-                    "DISTINCT ON is not supported: {}",
-                    cols.iter().map(expr_name).collect::<Vec<_>>().join(", ")
-                ));
-            }
-            Some(sqlparser::ast::Distinct::Distinct) => {
-                let mut seen = std::collections::BTreeSet::new();
-                let mut kept_docs = Vec::with_capacity(docs.len());
-                let mut kept_rows = Vec::with_capacity(out.len());
-                for (doc, row) in docs.into_iter().zip(out) {
-                    let key = encode::encode_to_vec(&Value::Array(row.clone()))
-                        .map_err(SqlError::Encode)?;
-                    if seen.insert(key) {
-                        kept_docs.push(doc);
-                        kept_rows.push(row);
-                    }
-                }
-                docs = kept_docs;
-                out = kept_rows;
-            }
-            None | Some(sqlparser::ast::Distinct::All) => {}
-        }
-        out = self.apply_order_limit(query, out, &columns_out, Some(docs))?;
-        Ok(ExecOutcome::Rows(QueryResult {
-            columns: columns_out,
-            rows: out,
-        }))
-    }
-
-    /// GROUP BY + aggregates (+ HAVING).
-    fn exec_grouped_select(
-        &self,
-        query: Query,
-        select: sqlparser::ast::Select,
-        rows: Vec<Object>,
-        group_exprs: Vec<SqlExpr>,
-    ) -> Result<ExecOutcome> {
-        // GROUP BY + aggregates (+ HAVING).
-        // Evaluate group keys per row. Groups hash by the encoded key —
-        // the same byte identity DISTINCT uses — instead of a linear scan
-        // per row (O(rows × groups) on large grouped queries).
-        let mut groups: Vec<(Vec<Value>, Vec<&Object>)> = Vec::new();
-        let mut group_index: std::collections::HashMap<Vec<u8>, usize> =
-            std::collections::HashMap::new();
-        for doc in &rows {
-            let key: Vec<Value> = group_exprs
-                .iter()
-                .map(|e| eval_expr(e, doc))
-                .collect::<Result<_>>()?;
-            let kb = row_key(&key);
-            match group_index.get(&kb) {
-                Some(&gi) => groups[gi].1.push(doc),
-                None => {
-                    group_index.insert(kb, groups.len());
-                    groups.push((key, vec![doc]));
-                }
-            }
-        }
-        // With no GROUP BY, aggregates run over one group even when empty.
-        if group_exprs.is_empty() && groups.is_empty() {
-            groups.push((vec![], vec![]));
-        }
-        // Projection must be aggregate functions or group exprs.
-        let mut columns = Vec::new();
-        let mut agg_specs = Vec::new(); // per column: AggSpec
-        for item in &select.projection {
-            match item {
-                SelectItem::UnnamedExpr(e) => {
-                    columns.push(expr_name(e));
-                    agg_specs.push(self.agg_spec(e, &group_exprs)?);
-                }
-                SelectItem::ExprWithAlias { expr, alias, .. } => {
-                    columns.push(alias.value.clone());
-                    agg_specs.push(self.agg_spec(expr, &group_exprs)?);
-                }
-                _ => return err("unsupported item in aggregate SELECT"),
-            }
-        }
-        let mut out: Vec<Vec<Value>> = Vec::new();
-        for (key, docs) in &groups {
-            let mut row = Vec::with_capacity(agg_specs.len());
-            for spec in &agg_specs {
-                row.push(eval_agg(spec, docs, key, &group_exprs)?);
-            }
-            // HAVING: aggregates evaluate over the group's rows directly;
-            // everything else evaluates against the output columns, with
-            // GROUP BY expressions consulted before them so unprojected
-            // group keys resolve instead of reading as NULL.
-            if let Some(having) = &select.having {
-                let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
-                if !matches!(
-                    eval_group_expr(having, &doc, docs, &group_exprs)?,
-                    Value::Bool(true)
-                ) {
-                    continue;
-                }
-            }
-            out.push(row);
-        }
-        let out = self.apply_order_limit(query, out, &columns, None)?;
-        Ok(ExecOutcome::Rows(QueryResult { columns, rows: out }))
-    }
-
-    fn agg_spec(&self, e: &SqlExpr, group_exprs: &[SqlExpr]) -> Result<AggSpec> {
-        // A projection item equal to a GROUP BY expression echoes its key.
-        for (i, g) in group_exprs.iter().enumerate() {
-            if format!("{g}") == format!("{e}") {
-                return Ok(AggSpec::GroupKey { idx: i });
-            }
-        }
-        if let SqlExpr::Identifier(i) = e {
-            // Bare column: allowed only if some group expr is that column.
-            for (i2, g) in group_exprs.iter().enumerate() {
-                if matches!(g, SqlExpr::Identifier(gi) if gi.value == i.value) {
-                    return Ok(AggSpec::GroupKey { idx: i2 });
-                }
-            }
-            return err(format!(
-                "column {} must appear in GROUP BY or an aggregate",
-                i.value
-            ));
-        }
-        if let SqlExpr::Function(f) = e {
-            if is_agg_fn(f) {
-                let (op, inner, distinct, sep) = agg_parts(f)?;
-                return Ok(AggSpec::Agg {
-                    op,
-                    arg: inner,
-                    distinct,
-                    sep,
-                });
-            }
-        }
-        // Composite expressions containing aggregate calls.
-        if contains_agg(e) {
-            check_group_refs(e, group_exprs)?;
-            return Ok(AggSpec::Composite { expr: e.clone() });
-        }
-        err(format!("unsupported aggregate projection: {e}"))
-    }
-
-    fn load_table_factor(
-        &self,
-        tf: &sqlparser::ast::TableFactor,
-        ctes: &Ctes,
-    ) -> Result<(String, Option<String>, Vec<Object>)> {
-        let sqlparser::ast::TableFactor::Table { name, alias, .. } = tf else {
-            // Derived table: FROM (SELECT ...) AS alias
-            if let sqlparser::ast::TableFactor::Derived {
-                subquery, alias, ..
-            } = tf
-            {
-                let ExecOutcome::Rows(r) = self.exec_query(subquery.as_ref().clone())? else {
-                    return err("derived table must be a SELECT");
-                };
-                let docs: Vec<Object> = r
-                    .rows
-                    .into_iter()
-                    .map(|row| r.columns.iter().cloned().zip(row).collect())
-                    .collect();
-                let alias = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_default();
-                return Ok(("@derived".into(), Some(alias), docs));
-            }
-            return err("only simple tables in FROM");
-        };
-        let tname = obj_name(name);
-        let alias = alias.as_ref().map(|a| a.name.value.clone());
-        // Oracle DUAL: the one-row dummy table. Case-insensitive, works even
-        // when no user table named DUAL exists (it always shadows).
-        if tname.eq_ignore_ascii_case("DUAL") {
-            return Ok(("DUAL".into(), alias, vec![Object::new()]));
-        }
-        // WITH (...) names shadow real tables for this statement.
-        if let Some(docs) = ctes.get(&tname) {
-            return Ok((tname, alias, docs.clone()));
-        }
-        let qualified: String = name
-            .0
-            .iter()
-            .map(|p| match p {
-                ObjectNamePart::Identifier(i) => i.value.clone(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(".");
-        if qualified == "sqlite_master" || qualified == "sqlite_temporal_master" {
-            // SQLite-dialect compatibility view (EF Core probes it to learn
-            // which tables exist). Index rows let clients enumerate CREATE
-            // INDEX definitions for schema sync.
-            let mut docs: Vec<Object> = self
-                .tables
-                .keys()
-                .map(|n| {
-                    Object::from([
-                        ("type".into(), Value::Str("table".into())),
-                        ("name".into(), Value::Str(n.clone())),
-                        ("tbl_name".into(), Value::Str(n.clone())),
-                        ("sql".into(), Value::Str(String::new())),
-                    ])
-                })
-                .collect();
-            for (tbl, meta) in &self.tables {
-                for d in &meta.index_defs {
-                    docs.push(Object::from([
-                        ("type".into(), Value::Str("index".into())),
-                        ("name".into(), Value::Str(d.name.clone())),
-                        ("tbl_name".into(), Value::Str(tbl.clone())),
-                        (
-                            "sql".into(),
-                            Value::Str(format!(
-                                "CREATE {}INDEX {iname} ON {tbl} ({col})",
-                                if d.unique { "UNIQUE " } else { "" },
-                                iname = d.name,
-                                col = d.columns.join(", ")
-                            )),
-                        ),
-                    ]));
-                }
-            }
-            return Ok(("sqlite_master".into(), alias, docs));
-        }
-        if qualified == "information_schema.tables" || qualified == "information_schema.columns" {
-            let docs = self.information_schema(&qualified);
-            return Ok(("information_schema".into(), alias, docs));
-        }
-        // Oracle data-dictionary compatibility views (case-insensitive):
-        // USER_* and ALL_* carry the same data — DocSQL has one global
-        // namespace, so every owner sees every user table.
-        let dq = qualified.to_ascii_uppercase();
-        if matches!(
-            dq.as_str(),
-            "ALL_TABLES"
-                | "USER_TABLES"
-                | "ALL_TAB_COLUMNS"
-                | "USER_TAB_COLUMNS"
-                | "ALL_INDEXES"
-                | "USER_INDEXES"
-        ) {
-            let owner = "DOCSQL";
-            let mut docs: Vec<Object> = Vec::new();
-            let user_tables: Vec<(&String, &TableMeta)> = self
-                .tables
-                .iter()
-                .filter(|(n, _)| !is_internal_table(n))
-                .collect();
-            match dq.as_str() {
-                "ALL_TABLES" | "USER_TABLES" => {
-                    for (n, meta) in &user_tables {
-                        docs.push(Object::from([
-                            ("owner".into(), Value::Str(owner.into())),
-                            ("table_name".into(), Value::Str((*n).clone())),
-                            ("num_rows".into(), Value::Null),
-                            ("blocks".into(), Value::Int(meta.pages.len() as i64)),
-                        ]));
-                    }
-                }
-                "ALL_TAB_COLUMNS" | "USER_TAB_COLUMNS" => {
-                    for (n, meta) in &user_tables {
-                        for (i, col) in meta.columns.iter().enumerate() {
-                            docs.push(Object::from([
-                                ("owner".into(), Value::Str(owner.into())),
-                                ("table_name".into(), Value::Str((*n).clone())),
-                                ("column_name".into(), Value::Str(col.clone())),
-                                ("data_type".into(), Value::Str("TEXT".into())),
-                                (
-                                    "nullable".into(),
-                                    Value::Str(
-                                        if meta.not_null.contains(col) {
-                                            "N"
-                                        } else {
-                                            "Y"
-                                        }
-                                        .into(),
-                                    ),
-                                ),
-                                ("column_id".into(), Value::Int(i as i64 + 1)),
-                            ]));
-                        }
-                    }
-                }
-                _ => {
-                    for (tbl, meta) in &user_tables {
-                        for d in &meta.index_defs {
-                            docs.push(Object::from([
-                                ("owner".into(), Value::Str(owner.into())),
-                                ("index_name".into(), Value::Str(d.name.clone())),
-                                ("table_name".into(), Value::Str((*tbl).clone())),
-                                (
-                                    "uniqueness".into(),
-                                    Value::Str(
-                                        if d.unique { "UNIQUE" } else { "NONUNIQUE" }.into(),
-                                    ),
-                                ),
-                            ]));
-                        }
-                    }
-                }
-            }
-            let view = match dq.as_str() {
-                v if v.starts_with("ALL_") => v.to_string(),
-                v => format!("USER_{}", &v[5..]),
-            };
-            return Ok((view, alias, docs));
-        }
-        let docs = self.table_docs(&tname)?;
-        Ok((tname, alias, docs))
-    }
-
-    /// Virtual information_schema tables from the catalog.
-    fn information_schema(&self, which: &str) -> Vec<Object> {
-        let mut out = Vec::new();
-        if which.ends_with("tables") {
-            for (name, meta) in &self.tables {
-                out.push(Object::from([
-                    ("table_name".into(), Value::Str(name.clone())),
-                    ("pages".into(), Value::Int(meta.pages.len() as i64)),
-                ]));
-            }
-        } else {
-            for (name, meta) in &self.tables {
-                for col in &meta.columns {
-                    out.push(Object::from([
-                        ("table_name".into(), Value::Str(name.clone())),
-                        ("column_name".into(), Value::Str(col.clone())),
-                        (
-                            "is_nullable".into(),
-                            Value::Str(
-                                if meta.not_null.contains(col) {
-                                    "NO"
-                                } else {
-                                    "YES"
-                                }
-                                .into(),
-                            ),
-                        ),
-                        (
-                            "data_type".into(),
-                            Value::Str(
-                                if meta.autoguid.as_deref() == Some(col.as_str()) {
-                                    "GUID"
-                                } else {
-                                    "ANY"
-                                }
-                                .into(),
-                            ),
-                        ),
-                    ]));
-                }
-            }
-        }
-        out
-    }
-
-    /// ORDER BY + LIMIT/OFFSET. Sort keys resolve in order of preference to
-    /// an output column name, an ordinal position (`ORDER BY 2`), or — when
-    /// the caller supplies the source docs — an arbitrary expression
-    /// evaluated per row.
-    fn apply_order_limit(
-        &self,
-        query: Query,
-        mut rows: Vec<Vec<Value>>,
-        columns: &[String],
-        docs: Option<Vec<Object>>,
-    ) -> Result<Vec<Vec<Value>>> {
-        if let Some(order_by) = &query.order_by {
-            let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
-                return err("unsupported ORDER BY");
-            };
-            // (column index, asc, nulls_first): appended hidden key columns
-            // start after the visible ones.
-            let mut keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
-            let mut extra_keys = 0usize;
-            for o in exprs {
-                let name = expr_name(&o.expr);
-                let idx = columns.iter().position(|c| c == &name).or_else(|| {
-                    // ORDER BY <ordinal>: 1-based output position.
-                    name.parse::<usize>()
-                        .ok()
-                        .filter(|n| (1..=columns.len()).contains(n))
-                        .map(|n| n - 1)
-                });
-                let idx = match idx {
-                    Some(i) => i,
-                    None => {
-                        let Some(ds) = &docs else {
-                            return err(format!("unknown ORDER BY key: {name}"));
-                        };
-                        if ds.len() != rows.len() {
-                            return err(format!("unknown ORDER BY key: {name}"));
-                        }
-                        // Evaluate the expression against each source doc and
-                        // append it as a hidden key column.
-                        for (row, doc) in rows.iter_mut().zip(ds) {
-                            row.push(eval_expr(&o.expr, doc)?);
-                        }
-                        let col = columns.len() + extra_keys;
-                        extra_keys += 1;
-                        col
-                    }
-                };
-                keys.push((idx, o.options.asc.unwrap_or(true), o.options.nulls_first));
-            }
-            rows.sort_by(|a, b| {
-                for (col, asc, nulls_first) in &keys {
-                    let ord = cmp_maybe_null(&a[*col], &b[*col], *nulls_first);
-                    if ord != std::cmp::Ordering::Equal {
-                        return if *asc { ord } else { ord.reverse() };
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-            if extra_keys > 0 {
-                for row in &mut rows {
-                    row.truncate(columns.len());
-                }
-            }
-        }
-        if let Some(lc) = &query.limit_clause {
-            rows = apply_limit_clause(lc, rows)?;
-        }
-        // Oracle 12c+/SQL-standard FETCH: `FETCH FIRST n ROWS ONLY` (and the
-        // NEXT form). WITH TIES requires the ORDER BY key's tie set — not
-        // supported, and per house rules it errors instead of silently
-        // returning a different row count.
-        if let Some(fetch) = &query.fetch {
-            if fetch.percent {
-                return err("FETCH … PERCENT is not supported");
-            }
-            if fetch.with_ties {
-                return err("FETCH … WITH TIES is not supported");
-            }
-            let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
-                Some(Value::Int(n)) if n >= 0 => n as usize,
-                Some(Value::Int(n)) => {
-                    return err(format!("FETCH quantity must be non-negative ({n})"))
-                }
-                Some(_) | None => return err("FETCH quantity must be an integer"),
-            };
-            rows.truncate(n);
-        }
-        Ok(rows)
     }
 }
 
@@ -5979,7 +6169,7 @@ fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
 fn collect_correlated_refs(
     e: &SqlExpr,
     from_names: &std::collections::BTreeSet<String>,
-    catalog: &std::collections::BTreeMap<String, TableMeta>,
+    catalog: &std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
     hits: &mut Vec<String>,
 ) {
     match e {
@@ -6045,7 +6235,7 @@ fn collect_correlated_refs(
 /// order for its members (a true cycle needs deferred constraints).
 fn fk_dependency_order(
     names: &[String],
-    tables: &std::collections::BTreeMap<String, TableMeta>,
+    tables: &std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(names.len());
     let mut remaining: Vec<String> = names.to_vec();
@@ -7286,7 +7476,7 @@ fn mirror_op(op: &BinaryOperator) -> Option<BinaryOperator> {
 /// documents as they were before the mutation.
 #[allow(clippy::too_many_arguments)]
 fn reindex_repoint(
-    pager: &mut Pager,
+    pager: &Pager,
     tx: &mut crate::pager::Tx,
     meta: &TableMeta,
     root_keys: &[String],
@@ -7341,7 +7531,7 @@ fn index_key_of(doc: &Object, cols: &[String]) -> Option<Value> {
 /// Remove one document's entries from every index tree (`root_keys` names
 /// the trees; column sets resolve through `index_columns_of`).
 fn reindex_remove(
-    pager: &mut Pager,
+    pager: &Pager,
     tx: &mut crate::pager::Tx,
     meta: &TableMeta,
     root_keys: &[String],
@@ -7368,7 +7558,7 @@ fn reindex_remove(
 /// comes from the tree: `root_key_unique` trees (constraint columns and
 /// CREATE UNIQUE INDEX) reject duplicates at insert.
 fn reindex_insert(
-    pager: &mut Pager,
+    pager: &Pager,
     tx: &mut crate::pager::Tx,
     meta: &TableMeta,
     root_keys: &[String],
@@ -13770,5 +13960,91 @@ mod complex_query_tests {
             rows(&mut db, "SELECT v FROM t WHERE id = 1").rows,
             vec![vec![Value::Str("a".into())]]
         );
+    }
+}
+
+// ---- MVCC stage B: guardless snapshot reads ----
+
+#[cfg(test)]
+mod read_view_tests {
+    use crate::engine::{Database, ExecOutcome, ReadView};
+    use crate::value::Value;
+
+    fn count(db: &Database, sql: &str) -> i64 {
+        match db.execute_read(sql).unwrap() {
+            ExecOutcome::Rows(r) => r.rows[0][0].as_i64().unwrap(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    fn view_count(view: &ReadView, sql: &str) -> i64 {
+        match view.execute(sql).unwrap() {
+            ExecOutcome::Rows(r) => r.rows[0][0].as_i64().unwrap(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn read_view_is_repeatable_read_while_writes_commit() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        for i in 1..=3 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+
+        let view = db.read_view();
+        // Writes keep committing while the view is open — at the engine
+        // level nothing blocks them (the view holds no database lock).
+        for i in 4..=6 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+
+        // The view stays at its snapshot: repeatable read, no dirty data.
+        assert_eq!(view_count(&view, "SELECT COUNT(id) FROM t"), 3);
+        assert_eq!(view_count(&view, "SELECT COUNT(id) FROM t"), 3);
+        // Fresh views see the committed writes.
+        let view2 = db.read_view();
+        assert_eq!(view_count(&view2, "SELECT COUNT(id) FROM t"), 6);
+        // Ending the snapshot keeps the pager healthy.
+        drop(view);
+        assert_eq!(count(&db, "SELECT COUNT(id) FROM t"), 6);
+    }
+
+    #[test]
+    fn read_view_survives_index_updates_and_rewrites_underneath() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 1..=50 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let view = db.read_view();
+        // Post-snapshot: more inserts (root splits move the index root),
+        // an update and a delete — none of it may leak into the view.
+        for i in 51..=120 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        db.execute("UPDATE t SET v = 'changed' WHERE id = 7")
+            .unwrap();
+        db.execute("DELETE FROM t WHERE id = 9").unwrap();
+
+        assert_eq!(view_count(&view, "SELECT COUNT(id) FROM t"), 50);
+        match view.execute("SELECT v FROM t WHERE id = 7").unwrap() {
+            ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Str("v7".into())),
+            _ => panic!("expected rows"),
+        }
+        // PK probe over the as-of tree still finds row 9 (deleted only in
+        // the live tree) and misses 100 (inserted after the snapshot).
+        match view.execute("SELECT id FROM t WHERE id = 9").unwrap() {
+            ExecOutcome::Rows(r) => assert_eq!(r.rows.len(), 1),
+            _ => panic!("expected rows"),
+        }
+        match view.execute("SELECT id FROM t WHERE id = 100").unwrap() {
+            ExecOutcome::Rows(r) => assert_eq!(r.rows.len(), 0),
+            _ => panic!("expected rows"),
+        }
+        assert_eq!(count(&db, "SELECT COUNT(id) FROM t"), 119);
     }
 }

@@ -1,14 +1,17 @@
 # 设计说明:MVCC / 读写并发(分阶段路线)
 
 状态:**设计定稿;阶段 A 已全部落地**(pager 读取去借用化 + SELECT 执行链
-`&self` 化 + `ServerState.db: RwLock` 锁分级,读-读并发);**阶段 B 第一步
-(pager 层快照读机制)已落地**——pager 全方法 `&self` 化(WAL/pending/页数/
-页 LSN 内部锁),WAL 引入 checkpoint epoch,新增 `begin_snapshot`/
-`read_page_as_of`/`end_snapshot`(快照 = epoch + commit-head LSN;快速路径
-= 页 LSN ≤ 快照直接用当前版本,慢速路径 = 一次 WAL 扫描物化全部页的 as-of
-镜像并缓存;软截断给活跃快照让位,硬阈值流控优先、截断后旧快照响亮报
-`SnapshotTooOld`)。剩余工作:§3.2 的引擎侧 `ReadCx`(catalog 快照 + pager
-Arc 化)与服务器侧「微秒级短锁建视图、SELECT 全程锁外」改造。
+`&self` 化 + `ServerState.db: RwLock` 锁分级,读-读并发);**阶段 B 已全部
+落地**——pager 层:全方法 `&self` 化、WAL checkpoint epoch、
+`begin_snapshot`/`read_page_as_of`/`end_snapshot`(快速路径 = 页 LSN ≤ 快照
+直接用当前版本,慢速路径 = 一次 WAL 扫描物化全部页的 as-of 镜像并缓存;软截
+断给活跃快照让位,硬阈值流控优先、截断后旧快照响亮报 `SnapshotTooOld`)。
+引擎/服务器层:`Database::read_view()` 产出无锁 `ReadView`(catalog Arc 克隆
++ pager Arc + 独立语句超时 + 快照令牌,Drop 注销快照),SELECT 执行链整体
+迁移到 `ReadCx`(`PageReader` 双模读页),server 读级只持锁微秒级构建视图、
+语句全程锁外执行——**读不阻塞写**。实现与 §3 兼容矩阵一致:写单元融合的
+bookkeeping 在同一 commit LSN 原子可见(提交路径在 WAL 锁内完成读面应用);
+复制 apply/restore 恒走写路径;快照读受语句超时约束(视图自带 deadline)。
 本文是权威设计;任何并发/可见性相关改动先对照本文的兼容矩阵。
 
 ## 0. 现状(精确事实)

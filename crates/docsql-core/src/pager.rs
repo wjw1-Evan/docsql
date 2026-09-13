@@ -842,6 +842,37 @@ impl Pager {
     }
 }
 
+/// Page-read dispatch for the SELECT execution chain: `Current` serves the
+/// latest committed image (write-lock paths and MVCC stage-A readers),
+/// `Snapshot` reconstructs the image as of a snapshot (guardless stage-B
+/// reads — the read never sees anything committed after it began).
+pub enum PageReader<'a> {
+    Current(&'a Pager),
+    Snapshot(&'a Pager, &'a Snapshot),
+}
+
+impl<'a> PageReader<'a> {
+    pub fn current(pager: &'a Pager) -> Self {
+        Self::Current(pager)
+    }
+
+    /// Latest image of `id` visible to this reader: the transaction's own
+    /// staged version first (write transactions must see their own writes;
+    /// snapshot readers carry staged-less txs), then the pager — current or
+    /// as-of the snapshot.
+    pub fn page(&self, tx: Option<&Tx>, id: u32) -> Result<Vec<u8>> {
+        if let Some(tx) = tx {
+            if let Some(p) = tx.staged_page(id) {
+                return Ok(p.to_vec());
+            }
+        }
+        match self {
+            Self::Current(p) => p.read_page_shared(id),
+            Self::Snapshot(p, snap) => p.read_page_as_of(snap, id),
+        }
+    }
+}
+
 /// An in-flight page transaction.
 pub struct Tx {
     id: u64,

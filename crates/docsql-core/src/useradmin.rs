@@ -572,7 +572,7 @@ fn stored_password_form(password: &str) -> Result<String, String> {
 
 fn grant_row(db: &mut Database, role: &str, member: &str) -> Result<(), SqlError> {
     let exists = db
-        .table_docs(MEMBERS_TABLE)
+        .table_docs_cx(MEMBERS_TABLE)
         .unwrap_or_default()
         .iter()
         .any(|d| {
@@ -597,7 +597,7 @@ fn grant_priv_row(
     tbl: &str,
 ) -> Result<(), SqlError> {
     let exists = db
-        .table_docs(GRANTS_TABLE)
+        .table_docs_cx(GRANTS_TABLE)
         .unwrap_or_default()
         .iter()
         .any(|d| {
@@ -660,7 +660,7 @@ impl Database {
                 .map_err(|e| err_str(format!("user tables: {e}")))?;
         }
         let existing: std::collections::BTreeSet<String> = self
-            .table_docs(ROLES_TABLE)
+            .table_docs_cx(ROLES_TABLE)
             .unwrap_or_default()
             .iter()
             .filter_map(|d| d.get("name").and_then(|v| v.as_str().map(String::from)))
@@ -682,12 +682,12 @@ impl Database {
     /// tables only exist once the first user-management write created
     /// them — read paths must not conjure them into existence).
     fn user_rows(&mut self) -> Result<Vec<Object>, SqlError> {
-        Ok(self.table_docs(USERS_TABLE).unwrap_or_default())
+        Ok(self.table_docs_cx(USERS_TABLE).unwrap_or_default())
     }
 
     fn role_names(&mut self) -> Result<std::collections::BTreeSet<String>, SqlError> {
         Ok(self
-            .table_docs(ROLES_TABLE)
+            .table_docs_cx(ROLES_TABLE)
             .unwrap_or_default()
             .iter()
             .filter_map(|d| d.get("name").and_then(|v| v.as_str().map(String::from)))
@@ -833,7 +833,7 @@ impl Database {
                 self.set_resolved_sql(render(stmt, ""));
             }
             UserAdminStmt::RevokeRoles { roles, from } => {
-                let rows = self.table_docs(MEMBERS_TABLE).unwrap_or_default();
+                let rows = self.table_docs_cx(MEMBERS_TABLE).unwrap_or_default();
                 for r in roles {
                     for u in from {
                         let present = rows.iter().any(|d| {
@@ -883,7 +883,7 @@ impl Database {
                 tables,
                 from,
             } => {
-                let rows = self.table_docs(GRANTS_TABLE).unwrap_or_default();
+                let rows = self.table_docs_cx(GRANTS_TABLE).unwrap_or_default();
                 for g in from {
                     for t in tables {
                         for p in privileges {
@@ -973,7 +973,7 @@ impl UserGrants {
 pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants>, SqlError> {
     let name = name.to_lowercase();
     let users: std::collections::BTreeSet<String> = db
-        .table_docs(USERS_TABLE)
+        .table_docs_cx(USERS_TABLE)
         .unwrap_or_default()
         .iter()
         .filter_map(|d| d.get("name").and_then(|v| v.as_str().map(String::from)))
@@ -982,7 +982,7 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
         return Ok(None);
     }
     let mut roles: Vec<String> = db
-        .table_docs(MEMBERS_TABLE)
+        .table_docs_cx(MEMBERS_TABLE)
         .unwrap_or_default()
         .iter()
         .filter(|d| d.get("member").and_then(|v| v.as_str()) == Some(name.as_str()))
@@ -1004,7 +1004,7 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
             _ => {}
         }
     }
-    for d in db.table_docs(GRANTS_TABLE).unwrap_or_default() {
+    for d in db.table_docs_cx(GRANTS_TABLE).unwrap_or_default() {
         let (Some(grantee), Some(priv_name), Some(tbl)) = (
             d.get("grantee").and_then(|v| v.as_str()),
             d.get("priv").and_then(|v| v.as_str()),
@@ -1027,7 +1027,7 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
 /// state through the normal statement family). Sorted for determinism.
 pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> {
     let mut out = Vec::new();
-    for d in db.table_docs(USERS_TABLE).unwrap_or_default() {
+    for d in db.table_docs_cx(USERS_TABLE).unwrap_or_default() {
         let (Some(name), Some(pw)) = (
             d.get("name").and_then(|v| v.as_str()),
             d.get("pw").and_then(|v| v.as_str()),
@@ -1036,14 +1036,14 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
         };
         out.push(format!("CREATE USER {name} PASSWORD {}", lit(pw)));
     }
-    for d in db.table_docs(ROLES_TABLE).unwrap_or_default() {
+    for d in db.table_docs_cx(ROLES_TABLE).unwrap_or_default() {
         if let Some(name) = d.get("name").and_then(|v| v.as_str()) {
             if !BUILTIN_ROLES.contains(&name) {
                 out.push(format!("CREATE ROLE {name}"));
             }
         }
     }
-    for d in db.table_docs(MEMBERS_TABLE).unwrap_or_default() {
+    for d in db.table_docs_cx(MEMBERS_TABLE).unwrap_or_default() {
         let (Some(role), Some(member)) = (
             d.get("role").and_then(|v| v.as_str()),
             d.get("member").and_then(|v| v.as_str()),
@@ -1054,7 +1054,7 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
     }
     // Aggregate per (grantee, table) for deterministic, compact output.
     let mut grants: BTreeMap<(String, String), u8> = BTreeMap::new();
-    for d in db.table_docs(GRANTS_TABLE).unwrap_or_default() {
+    for d in db.table_docs_cx(GRANTS_TABLE).unwrap_or_default() {
         let (Some(grantee), Some(priv_name), Some(tbl)) = (
             d.get("grantee").and_then(|v| v.as_str()),
             d.get("priv").and_then(|v| v.as_str()),
@@ -1357,10 +1357,10 @@ mod tests {
         // duplicate GRANTs produce exactly one row each
         db.execute("GRANT SELECT ON t TO analyst").unwrap();
         db.execute("GRANT SELECT ON t TO analyst").unwrap();
-        assert_eq!(db.table_docs(GRANTS_TABLE).unwrap().len(), 1);
+        assert_eq!(db.table_docs_cx(GRANTS_TABLE).unwrap().len(), 1);
         db.execute("GRANT analyst TO alice").unwrap();
         db.execute("GRANT analyst TO alice").unwrap();
-        assert_eq!(db.table_docs(MEMBERS_TABLE).unwrap().len(), 1);
+        assert_eq!(db.table_docs_cx(MEMBERS_TABLE).unwrap().len(), 1);
         let g = resolve_grants(&mut db, "alice").unwrap().unwrap();
         assert!(g.may_select("t"));
         assert!(!g.may_dml("t", PRIV_INSERT));
@@ -1368,7 +1368,7 @@ mod tests {
         // canonical uppercase form; the match used to lowercase one side
         // and silently never fired)
         db.execute("REVOKE SELECT ON t FROM analyst").unwrap();
-        assert!(db.table_docs(GRANTS_TABLE).unwrap().is_empty());
+        assert!(db.table_docs_cx(GRANTS_TABLE).unwrap().is_empty());
         let g = resolve_grants(&mut db, "alice").unwrap().unwrap();
         assert!(!g.may_select("t"));
     }
@@ -1392,7 +1392,7 @@ mod tests {
         let g = resolve_grants(&mut db, "bob").unwrap().unwrap();
         assert!(!g.may_select("t"));
         assert!(!g.may_dml("t", PRIV_UPDATE));
-        assert!(db.table_docs(MEMBERS_TABLE).unwrap().is_empty());
+        assert!(db.table_docs_cx(MEMBERS_TABLE).unwrap().is_empty());
     }
 
     #[test]
@@ -1400,7 +1400,7 @@ mod tests {
         let mut db = Database::in_memory().unwrap();
         db.ensure_user_tables().unwrap();
         // built-ins seeded
-        let roles = db.table_docs(ROLES_TABLE).unwrap();
+        let roles = db.table_docs_cx(ROLES_TABLE).unwrap();
         let names: Vec<&str> = roles
             .iter()
             .filter_map(|d| d.get("name").and_then(|v| v.as_str()))

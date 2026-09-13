@@ -2,7 +2,7 @@
 //! the v1 protocol.
 
 use docsql_core::proto::{self, Frame};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -4377,4 +4377,72 @@ async fn concurrent_readers_never_observe_partial_writes() {
     for r in readers {
         r.await.unwrap();
     }
+}
+
+/// MVCC stage B (snapshot reads): a long-running SELECT holds no engine
+/// lock, so writes keep committing while it is in flight. The in-flight
+/// reader stays at its snapshot (never sees the concurrent writes), and a
+/// fresh SELECT sees all of them afterward.
+#[tokio::test]
+async fn long_read_does_not_block_writes() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE lr (id INT PRIMARY KEY, pad TEXT)")
+        .await;
+    let mut all = Vec::new();
+    for i in 0..350 {
+        all.push(format!("({i}, 'p{i}')"));
+    }
+    let f = c
+        .sql(&format!("INSERT INTO lr VALUES {}", all.join(", ")))
+        .await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+
+    // Long read on its own connection: a quadratic join over 350 rows
+    // (122,500 nested-loop pairs) runs well past the write burst below.
+    let read_addr = addr.clone();
+    let read = tokio::spawn(async move {
+        let mut r = Client::connect(&read_addr).await;
+        let t = Instant::now();
+        let f = r.sql("SELECT COUNT(*) FROM lr a, lr b").await;
+        assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+        let n: i64 = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["rows"][0][0]
+            .as_i64()
+            .unwrap();
+        (t.elapsed(), n)
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Write burst while the read is running: every write must complete
+    // promptly (they would queue behind the read under the stage-A
+    // lock-held read tier).
+    let mut w = Client::connect(&addr).await;
+    let t0 = Instant::now();
+    for i in 10_000..10_005 {
+        let f = w
+            .sql(&format!("INSERT INTO lr VALUES ({i}, 'late{i}')"))
+            .await;
+        assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    }
+    let write_elapsed = t0.elapsed();
+    assert!(
+        write_elapsed < Duration::from_secs(5),
+        "writes stalled {:?} behind an in-flight read",
+        write_elapsed
+    );
+
+    let (read_elapsed, seen) = read.await.unwrap();
+    assert!(
+        read_elapsed > write_elapsed,
+        "read ({read_elapsed:?}) finished before the writes ({write_elapsed:?}) — no overlap to test"
+    );
+    // The in-flight reader stayed at its snapshot: exactly the pre-write
+    // 350 × 350 pairs, none of the five late rows.
+    assert_eq!(seen, 350 * 350);
+    // A fresh read sees every committed row.
+    let f = c.sql("SELECT COUNT(id) FROM lr").await;
+    let n: i64 = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["rows"][0][0]
+        .as_i64()
+        .unwrap();
+    assert_eq!(n, 355);
 }

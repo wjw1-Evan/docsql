@@ -1742,18 +1742,24 @@ fn render_param(p: &Value) -> String {
     }
 }
 
-/// MVCC stage A read path: classified read-only SELECTs execute under the
-/// RwLock read tier — concurrent readers share the engine while writers keep
-/// the exclusive tier. Statement deadline and audit apply identically to the
-/// write path.
+/// MVCC stage B read path: classified read-only SELECTs run on a guardless
+/// [`docsql_core::engine::ReadView`] — the database lock is held only for the
+/// microseconds it takes to clone the catalog and take the pager snapshot,
+/// then the statement executes with no lock held, so reads never block
+/// writes (and vice versa). Statement deadline and audit apply identically
+/// to the write path; the view owns its deadline, so concurrent readers
+/// never clobber each other's arming.
 async fn execute_read_sql(
     state: &Arc<ServerState>,
     sql: &str,
     deadline: Option<std::time::Instant>,
 ) -> Frame {
-    let db = state.db.read().unwrap_or_else(|p| p.into_inner());
-    db.set_statement_deadline(deadline);
-    let resp = match db.execute_read(sql) {
+    let view = {
+        let db = state.db.read().unwrap_or_else(|p| p.into_inner());
+        db.read_view()
+    };
+    view.set_statement_deadline(deadline);
+    let resp = match view.execute(sql) {
         Ok(ExecOutcome::Rows(r)) => {
             let mut obj = docsql_core::value::Object::new();
             obj.insert(
@@ -1772,8 +1778,8 @@ async fn execute_read_sql(
         Ok(ExecOutcome::Affected(n)) => Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec()),
         Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
     };
-    db.set_statement_deadline(None);
-    drop(db);
+    view.set_statement_deadline(None);
+    drop(view); // ends the pager snapshot
     resp
 }
 
