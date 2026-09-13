@@ -77,6 +77,17 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 
 21. **堆溢出链(>4KB 文档)** — 超页文档主页槽存 `[0xFF][total:u32][chain_head:u32][内联前缀]`,其余沿 `0xFE` 链页(`next:u32`+`len:u16`+载荷);`0xFE/0xFF` 是 encode 永不产生的字节,读取端按槽首字节判别,**旧卷字节级兼容**;链页回收进 `TableMeta.overflow_free`(catalog 持久化)优先复用;硬上限 `MAX_DOC_SIZE`=16MiB。改 heap 相关代码:一切读槽走 `slot_document_bytes`(防环/截断校验),新存储布局禁止使用 encode tag 0..=7 的首字节。设计见 `docs/design/002-overflow-page-chains.md`。
 
+## 性能基准测试规范
+
+基准脚本在 `crates/docsql-core/examples/bench*.rs`:`bench`(综合:插入/点查/索引查/更新/删除/扫描)、`bench6`(逐条 fsync vs 异步组提交)、`bench_micro`(点查成本拆解)、`bench_write`(INSERT/UPDATE 成本拆解)、`bench_join`(hash join vs 嵌套循环对照)。统一 `cargo run -p docsql-core --example <name> --release` 采数,debug 只做冒烟不下结论;新增/修改 bench 脚本同样过提交门禁(`--all-targets` 含 examples)。动 pager/WAL/执行器/锁/分配路径后评估性能,按以下标准:
+
+1. **交替 A/B、成对比较,不信单轮** — 新旧二进制交替各跑 ≥3 轮,同项逐对比较;互有胜负 = 无可辨回归。禁止"改前跑一次、改后跑一次"下结论,更不许从单轮差异读趋势。
+2. **噪声带按主导成本分档** — fsync 主导指标(同步提交延迟/WAL 追加吞吐/checkpoint)受容器卷与宿主盘抖动支配,本机容器卷实测噪声 ±30%、单次 A/B 不可判,带内一律不算回归;CPU 主导指标(点查/B+树遍历/JSON 编解码/聚合)对噪声敏感得多,±10% 内归噪声,超出即复跑。结构性开销(引用计数/枚举分发/无竞争锁)预期亚微秒级,定性确认不影响 fsync 路径即可(2026-09-13 MVCC 阶段 B 实测:异步组提交 38.3→38.6µs/条持平)。
+3. **先量环境再量代码** — 采数前记录宿主 load average 与核数;并行会话可把负载推到 40+,与基线轮环境不可比则整轮作废。测试/e2e 里的时序比值断言同理去脆弱化:余量至少 4 倍(long_read 用例曾因宿主负载 44 把 `write_elapsed<5s` 断言拖崩,exit 101)。
+4. **同环境纵向可比,跨环境只比倍率** — 同机器/同容器/同卷/同数据量、预热后采数才可比绝对值;换机器、换卷类型、debug/release 混跑的数字无效。报告数字必须带环境(负载、profile、卷)。
+5. **吞吐与延迟尾部成对看** — 优化吞吐不以 p99/长尾恶化为默认代价(明示权衡除外);写路径同时看 µs/条 与 fsync 次数。
+6. **回归必须可解释才合并** — 判定回归前先复跑排除环境抖动;确认后定位到机制(锁竞争/分配热点/IO 放大),解释不了的开销不放行。
+
 ## 工作流约定
 
 - **修改完成后自动提交并推送源码,无需用户再下指令**:过完提交门禁与相关专项测试即 `git add` 本次改动 → `commit` → `push`(push 即触发 CI);只暂存本次改动涉及的文件,不要把工作区里其它在途修改一并提交。
