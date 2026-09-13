@@ -4390,7 +4390,7 @@ async fn long_read_does_not_block_writes() {
     c.sql("CREATE TABLE lr (id INT PRIMARY KEY, pad TEXT)")
         .await;
     let mut all = Vec::new();
-    for i in 0..350 {
+    for i in 0..700 {
         all.push(format!("({i}, 'p{i}')"));
     }
     let f = c
@@ -4398,8 +4398,10 @@ async fn long_read_does_not_block_writes() {
         .await;
     assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
 
-    // Long read on its own connection: a quadratic join over 350 rows
-    // (122,500 nested-loop pairs) runs well past the write burst below.
+    // Long read on its own connection: a quadratic join over 700 rows
+    // (490,000 nested-loop pairs) stays in flight well past the write burst
+    // below in BOTH debug and release profiles, so the overlap the test
+    // verifies is guaranteed to exist.
     let read_addr = addr.clone();
     let read = tokio::spawn(async move {
         let mut r = Client::connect(&read_addr).await;
@@ -4411,7 +4413,7 @@ async fn long_read_does_not_block_writes() {
             .unwrap();
         (t.elapsed(), n)
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Write burst while the read is running: every write must complete
     // promptly (they would queue behind the read under the stage-A
@@ -4437,12 +4439,12 @@ async fn long_read_does_not_block_writes() {
         "read ({read_elapsed:?}) finished before the writes ({write_elapsed:?}) — no overlap to test"
     );
     // The in-flight reader stayed at its snapshot: exactly the pre-write
-    // 350 × 350 pairs, none of the five late rows.
-    assert_eq!(seen, 350 * 350);
+    // 700 × 700 pairs, none of the five late rows.
+    assert_eq!(seen, 700 * 700);
     // A fresh read sees every committed row.
     let f = c.sql("SELECT COUNT(id) FROM lr").await;
     let n: i64 = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["rows"][0][0]
         .as_i64()
         .unwrap();
-    assert_eq!(n, 355);
+    assert_eq!(n, 705);
 }
