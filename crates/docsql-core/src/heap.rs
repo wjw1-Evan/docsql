@@ -195,11 +195,7 @@ fn slot_document_bytes(
         }
         hops += 1;
         let chain_page = load_page_owned(reader, tx, next)?;
-        if chain_page.first() != Some(&CHAIN_MARK) {
-            return Err(HeapError::Page(next, "overflow chain corrupt (bad marker)"));
-        }
-        let nxt = u32::from_le_bytes(chain_page[1..5].try_into().expect("4 bytes"));
-        let l = u16::from_le_bytes(chain_page[5..7].try_into().expect("2 bytes")) as usize;
+        let (nxt, l) = chain_header(&chain_page, next)?;
         if CHAIN_HEADER + l > chain_page.len() || out.len() + l > total {
             return Err(HeapError::Page(next, "overflow chain corrupt (bad length)"));
         }
@@ -215,6 +211,17 @@ fn slot_document_bytes(
     Ok(out)
 }
 
+/// Parse a chain page header: `(next_page, payload_len)`. Fails loudly on a
+/// missing `0xFE` marker so a corrupt chain page cannot be walked as data.
+fn chain_header(page: &[u8], pid: u32) -> Result<(u32, usize)> {
+    if page.first() != Some(&CHAIN_MARK) {
+        return Err(HeapError::Page(pid, "overflow chain corrupt (bad marker)"));
+    }
+    let next = u32::from_le_bytes(page[1..5].try_into().expect("4 bytes"));
+    let len = u16::from_le_bytes(page[5..7].try_into().expect("2 bytes")) as usize;
+    Ok((next, len))
+}
+
 /// Walk an overflow chain, zero every page and park the page ids in the
 /// table's free list (used by remove/replace of overflow documents).
 fn recycle_chain(pager: &Pager, tx: &mut Tx, head: u32, free: &mut Vec<u32>) -> Result<()> {
@@ -225,10 +232,7 @@ fn recycle_chain(pager: &Pager, tx: &mut Tx, head: u32, free: &mut Vec<u32>) -> 
             return Err(HeapError::Page(next, "overflow chain corrupt (cycle)"));
         }
         let page = load_page_owned(&PageReader::current(pager), Some(tx), next)?;
-        if page.first() != Some(&CHAIN_MARK) {
-            return Err(HeapError::Page(next, "overflow chain corrupt (bad marker)"));
-        }
-        let nxt = u32::from_le_bytes(page[1..5].try_into().expect("4 bytes"));
+        let (nxt, _) = chain_header(&page, next)?;
         pager.write_page(tx, next, 0, &vec![0u8; PAGE_SIZE])?;
         free.push(next);
         next = nxt;
@@ -375,22 +379,19 @@ impl Heap {
     /// pages only for the remainder.
     fn insert_overflow(&mut self, pager: &Pager, tx: &mut Tx, bytes: &[u8]) -> Result<u64> {
         // Main page: the last page when it can host the slot, else a fresh
-        // page (fresh pages give maximum inline capacity).
-        let use_last = match self.pages.last() {
+        // page (fresh pages give maximum inline capacity). Loaded once.
+        let last_free = match self.pages.last() {
             Some(&last) => {
                 let page = load_page_owned(&PageReader::current(pager), Some(tx), last)?;
                 validate_page(&page, last)?;
-                free_space(&page) >= SLOT_SIZE + OVERFLOW_SLOT_HEADER
+                Some(free_space(&page))
             }
-            None => false,
+            None => None,
         };
+        let slot_need = SLOT_SIZE + OVERFLOW_SLOT_HEADER;
+        let use_last = last_free.is_some_and(|fs| fs >= slot_need);
         let max_inline = if use_last {
-            let page = load_page_owned(
-                &PageReader::current(pager),
-                Some(tx),
-                *self.pages.last().unwrap(),
-            )?;
-            free_space(&page).saturating_sub(SLOT_SIZE + OVERFLOW_SLOT_HEADER)
+            last_free.unwrap() - slot_need
         } else {
             PAGE_SIZE - HEADER_FIXED - SLOT_SIZE - OVERFLOW_SLOT_HEADER
         };

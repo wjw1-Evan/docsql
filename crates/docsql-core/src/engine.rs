@@ -511,13 +511,6 @@ impl<'a> ReadCx<'a> {
             None => PageReader::Current(self.pager),
         }
     }
-
-    /// Cloned meta for `name` — the same per-statement clone cost the read
-    /// path always paid (`get().cloned()`), now sourced from the view's
-    /// catalog snapshot.
-    pub(crate) fn table_meta(&self, name: &str) -> Option<TableMeta> {
-        self.tables.get(name).map(|a| a.as_ref().clone())
-    }
 }
 
 /// A guardless read view (MVCC stage B): the server builds one under a
@@ -542,30 +535,14 @@ impl ReadView {
     /// Execute a read-only statement as of this view's snapshot. Plain
     /// SELECT only — the same refusals as [`Database::execute_read`].
     pub fn execute(&self, sql: &str) -> Result<ExecOutcome> {
-        let parsed = Database::parse_classified(sql)?;
-        if parsed.is_write {
-            return err("read path refused a write statement");
-        }
-        if parsed.tx != TxControl::None {
-            return err("read path refused a transaction statement");
-        }
-        match parsed.stmt {
-            AnyStmt::Sql(stmt) => match &*stmt {
-                Statement::Query(q) if q.with.is_none() => {
-                    let q = q.clone();
-                    let cx = ReadCx {
-                        pager: &self.pager,
-                        tables: &self.catalog.0,
-                        deadline: &self.deadline,
-                        snap: Some(&self.snap),
-                    };
-                    cx.exec_query(*q)
-                }
-                Statement::Query(_) => err("read path: WITH queries must use the write path"),
-                _ => err("read path: statement is not a query"),
-            },
-            _ => err("read path: statement is not a query"),
-        }
+        let q = Database::plain_read_query(&Database::parse_classified(sql)?)?;
+        let cx = ReadCx {
+            pager: &self.pager,
+            tables: &self.catalog.0,
+            deadline: &self.deadline,
+            snap: Some(&self.snap),
+        };
+        cx.exec_query(q)
     }
 }
 
@@ -1280,11 +1257,10 @@ impl<'a> ReadCx<'a> {
         // WHERE — consuming pass: matching docs move into the kept vec
         // instead of being whole-document cloned (the filtered set is
         // often the whole table).
-        if let Some(cond) = &select.selection {
+        if select.selection.is_some() {
             let mut kept = Vec::with_capacity(rows.len());
             for doc in rows.drain(..) {
-                self.deadline.check()?;
-                if matches!(eval_expr(cond, &doc)?, Value::Bool(true)) {
+                if self.matches(&select.selection, &doc)? {
                     kept.push(doc);
                 }
             }
@@ -1616,13 +1592,13 @@ impl<'a> ReadCx<'a> {
         let Some(cond) = selection else {
             return Ok(None);
         };
-        let Some(meta) = self.table_meta(table) else {
+        let Some(meta) = self.tables.get(table) else {
             return Ok(None);
         };
         if meta.index_roots.is_empty() || !ctes.is_empty() {
             return Ok(None);
         }
-        let Some((col, plan)) = probe_plan(cond, &meta, table, alias) else {
+        let Some((col, plan)) = probe_plan(cond, meta, table, alias) else {
             return Ok(None);
         };
         let root = meta.index_roots[&col];
@@ -1741,9 +1717,6 @@ pub struct Database {
     /// Session transaction snapshot: full table state at BEGIN. Rollback
     /// restores it; commit just discards it (durability is the WAL's job).
     tx_snapshot: Option<TableSnapshot>,
-    /// CTEs visible to the statement currently executing (WITH ...): the
-    /// body's rows, keyed by CTE name. Cleared per top-level statement.
-    ctes: std::collections::BTreeMap<String, Vec<Object>>,
     /// Cooperative deadline for the statement currently executing (see
     /// [`StmtDeadline`]); armed per client statement by the server, never
     /// set for replication apply / restore replay.
@@ -2028,7 +2001,6 @@ impl Database {
             write_unit: 0,
             savepoints: Vec::new(),
             tx_snapshot: None,
-            ctes: std::collections::BTreeMap::new(),
             stmt_deadline: StmtDeadline::default(),
             autoinc_cache: std::collections::HashMap::new(),
             resolved_sql: None,
@@ -2580,32 +2552,35 @@ impl Database {
         }
     }
 
-    /// Read-only execution path (MVCC stage A): plain SELECT only, callable
-    /// on `&Database` under the server's read lock so read-only statements
-    /// run concurrently. Writes, transaction control and WITH queries are
-    /// refused — the server tiers them to the write lock (WITH
-    /// materialization is statement-local mutable state). Guardless reads
-    /// (stage B) go through [`Database::read_view`] instead.
-    pub fn execute_read(&self, sql: &str) -> Result<ExecOutcome> {
-        let parsed = Self::parse_classified(sql)?;
+    /// The plain-SELECT gate shared by both read paths (stage A
+    /// [`Database::execute_read`] and stage B [`ReadView::execute`]):
+    /// writes, transaction control and WITH queries are refused — the
+    /// server tiers them to the write lock (WITH materialization is
+    /// statement-local mutable state). Returns the query to execute.
+    fn plain_read_query(parsed: &ParsedStatement) -> Result<Query> {
         if parsed.is_write {
             return err("read path refused a write statement");
         }
         if parsed.tx != TxControl::None {
             return err("read path refused a transaction statement");
         }
-        match parsed.stmt {
-            AnyStmt::Sql(stmt) => match &*stmt {
-                Statement::Query(q) if q.with.is_none() => {
-                    let q = q.clone();
-                    let cx = self.read_cx();
-                    cx.exec_query(*q)
-                }
+        match &parsed.stmt {
+            AnyStmt::Sql(stmt) => match &**stmt {
+                Statement::Query(q) if q.with.is_none() => Ok((**q).clone()),
                 Statement::Query(_) => err("read path: WITH queries must use the write path"),
                 _ => err("read path: statement is not a query"),
             },
             _ => err("read path: statement is not a query"),
         }
+    }
+
+    /// Read-only execution path (MVCC stage A): plain SELECT only, callable
+    /// on `&Database` under the server's read lock so read-only statements
+    /// run concurrently. Guardless reads (stage B) go through
+    /// [`Database::read_view`] instead.
+    pub fn execute_read(&self, sql: &str) -> Result<ExecOutcome> {
+        let q = Self::plain_read_query(&Self::parse_classified(sql)?)?;
+        self.exec_query_cx(q)
     }
 
     // Write-path shims: run the shared SELECT-chain helpers under a borrowed
@@ -2666,7 +2641,6 @@ impl Database {
     /// Execute an already-parsed statement — the parse-once path servers
     /// use after [`Database::parse_classified`] routed the request.
     pub fn execute_parsed(&mut self, parsed: ParsedStatement) -> Result<ExecOutcome> {
-        self.ctes.clear();
         self.resolved_sql = None;
         match parsed.stmt {
             AnyStmt::Sql(stmt) => self.exec_stmt(*stmt),
@@ -3244,7 +3218,7 @@ impl Database {
 
     /// Number of allocated pages.
     pub fn num_pages(&self) -> u32 {
-        self.pager.num_pages_now()
+        self.pager.num_pages()
     }
 
     /// Last WAL LSN known durable; nodes that received the same writes should
@@ -3271,42 +3245,58 @@ impl Database {
                             return err("index associated with UNIQUE or PRIMARY KEY constraint \
                                  cannot be dropped");
                         }
-                        let mut found = false;
-                        for meta in self.tables.values_mut().map(std::sync::Arc::make_mut) {
-                            if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
-                                meta.indexes.remove(pos);
-                                found = true;
-                                // The B+ tree itself stays in index_roots:
-                                // non-unique lookups still benefit from it.
-                                if let Some(dpos) = meta
-                                    .index_defs
-                                    .iter()
-                                    .position(|d| d.name == iname.as_str())
-                                {
-                                    let def = meta.index_defs.remove(dpos);
-                                    // Lift UNIQUE only when this index was
-                                    // the sole source: table-declared
-                                    // constraints and other unique indexes
-                                    // on the same column keep it enforced.
-                                    // Composite unique indexes never join
-                                    // meta.unique, so single-column lift
-                                    // rules cover everything here.
-                                    if def.unique
-                                        && def.columns.len() == 1
-                                        && !meta.constraint_unique.contains(&def.columns[0])
-                                        && meta.primary_key.as_deref()
-                                            != Some(def.columns[0].as_str())
-                                        && !meta.index_defs.iter().any(|d| {
-                                            d.columns.contains(&def.columns[0]) && d.unique
-                                        })
+                        // Index names are database-wide, so at most one table
+                        // owns the index. Locate it read-only first, then
+                        // write-clone just that entry (`catalog_mut` →
+                        // `Arc::make_mut`) — mapping make_mut over every
+                        // table would deep-clone the whole catalog whenever
+                        // any detached reader holds an old version.
+                        let owner = self
+                            .tables
+                            .iter()
+                            .find(|(_, m)| m.indexes.iter().any(|i| i == &iname))
+                            .map(|(t, _)| t.clone());
+                        match owner {
+                            Some(owner) => {
+                                let Some(meta) = self.catalog_mut(&owner) else {
+                                    return err(format!("table {owner} does not exist"));
+                                };
+                                if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
+                                    meta.indexes.remove(pos);
+                                    // The B+ tree itself stays in index_roots:
+                                    // non-unique lookups still benefit from it.
+                                    if let Some(dpos) = meta
+                                        .index_defs
+                                        .iter()
+                                        .position(|d| d.name == iname.as_str())
                                     {
-                                        meta.unique.retain(|c| c != &def.columns[0]);
+                                        let def = meta.index_defs.remove(dpos);
+                                        // Lift UNIQUE only when this index was
+                                        // the sole source: table-declared
+                                        // constraints and other unique indexes
+                                        // on the same column keep it enforced.
+                                        // Composite unique indexes never join
+                                        // meta.unique, so single-column lift
+                                        // rules cover everything here.
+                                        if def.unique
+                                            && def.columns.len() == 1
+                                            && !meta.constraint_unique.contains(&def.columns[0])
+                                            && meta.primary_key.as_deref()
+                                                != Some(def.columns[0].as_str())
+                                            && !meta.index_defs.iter().any(|d| {
+                                                d.columns.contains(&def.columns[0]) && d.unique
+                                            })
+                                        {
+                                            meta.unique.retain(|c| c != &def.columns[0]);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if !found && !if_exists {
-                            return err(format!("index {iname} does not exist"));
+                            None => {
+                                if !if_exists {
+                                    return err(format!("index {iname} does not exist"));
+                                }
+                            }
                         }
                     }
                     self.save_catalog()?;
@@ -3350,7 +3340,7 @@ impl Database {
                 // order on peers is identical).
                 for name in &dropping {
                     if !is_internal_table(name) {
-                        let lit_name = format!("'{}'", name.replace('\'', "''"));
+                        let lit_name = crate::stmt::sql_string_literal(name);
                         self.execute(&format!(
                             "DELETE FROM {} WHERE tbl = {}",
                             crate::useradmin::GRANTS_TABLE,
@@ -3592,7 +3582,7 @@ impl Database {
         // affected rows in place instead of rewriting the whole table.
         if from.is_none() {
             if let Some(matches) =
-                self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
+                self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &Ctes::new())?
             {
                 return self.exec_update_fast(
                     tname,
@@ -3654,7 +3644,7 @@ impl Database {
                     joins: vec![],
                 }];
                 from_list.extend(extra);
-                let merged = self.load_from_cx(&from_list, &None, &self.ctes)?;
+                let merged = self.load_from_cx(&from_list, &None, &Ctes::new())?;
                 let prefix = format!("{tkey}.");
                 // First qualifying match per target content: every output
                 // row with that content receives that image — including
@@ -3925,7 +3915,7 @@ impl Database {
         // whole table.
         if using.is_none() {
             if let Some(matches) =
-                self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &self.ctes)?
+                self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &Ctes::new())?
             {
                 return self.exec_delete_fast(tname, meta, matches, &selection, &returning);
             }
@@ -3936,7 +3926,7 @@ impl Database {
             // target docs whose combination satisfies WHERE.
             let mut from_list = vec![tables[0].clone()];
             from_list.extend(using);
-            let merged = self.load_from_cx(&from_list, &None, &self.ctes)?;
+            let merged = self.load_from_cx(&from_list, &None, &Ctes::new())?;
             let prefix = format!("{tkey}.");
             let mut rm: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
             for m in &merged {
@@ -4660,7 +4650,9 @@ impl Database {
             return err("unsupported INSERT target");
         };
         let table = obj_name(name);
-        let Some(meta) = self.tables.get(&table).map(|a| a.as_ref().clone()) else {
+        // Arc bump, not a meta deep clone: INSERT only ever reads the meta,
+        // and this is the hottest write path.
+        let Some(meta) = self.tables.get(&table).cloned() else {
             return err(format!("table {table} does not exist"));
         };
         let mut columns: Vec<String> = if insert.columns.is_empty() {
@@ -5154,14 +5146,7 @@ impl Database {
 
         // Target rows with locators (storage order — deterministic replay
         // on replication peers).
-        let theap = meta.heap_of();
-        let mut tdocs: Vec<(u64, Object)> = Vec::new();
-        {
-            let rtx = self.pager.begin_tx();
-            for &pid in &theap.pages {
-                tdocs.extend(theap.page_docs(&PageReader::current(&self.pager), &rtx, pid)?);
-            }
-        }
+        let tdocs = self.table_pairs_cx(&tname)?;
 
         // Pair every source row with its matching target row: ON evaluates
         // on the merged namespace (target columns first; source columns are
@@ -5637,10 +5622,6 @@ fn qualify(doc: &Object, alias: &str) -> Object {
         .collect()
 }
 
-/// Nested-loop join. ON is evaluated over the merged (qualified) row.
-/// LEFT/RIGHT joins null-extend the unmatched side; a RIGHT join also
-/// null-extends the left columns for unmatched right rows.
-#[allow(clippy::too_many_arguments)]
 /// Canonical join key for the hash-join path. Equality under
 /// [`Value::cmp_values`] implies equality here, which is the only contract
 /// the index needs: candidates re-evaluate the full ON, so the key may
@@ -5648,7 +5629,7 @@ fn qualify(doc: &Object, alias: &str) -> Object {
 /// same bits, mirroring `cmp_values`' cross-type numeric branch) but must
 /// never split a matching pair. NULL is a key like any other — `binop`'s `=`
 /// is `cmp_values`-based, so NULL = NULL joins.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Debug)]
 enum JoinKey {
     Null,
     Bool(bool),
@@ -5805,16 +5786,63 @@ fn column_refs(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
     Some(())
 }
 
+/// Which side of the join boundary an expression's column refs touch.
+enum Side {
+    Left,
+    Right,
+    /// Refs from both sides — never indexable, the conjunct stays residual.
+    Both,
+}
+
+/// One indexed equi condition: `left = right`, with the left expression
+/// evaluated against the left row and the right expression against the
+/// qualified right row. The ref lists are the exact keys a row must contain
+/// for that single-side evaluation to agree with merged-row evaluation:
+/// `eval_expr` falls back to suffix matching when the exact key is missing,
+/// which can bind `r.x` to `l.x` only on the merged row — so a missing key
+/// degrades that row to "probe everything" instead of keying it.
+struct EquiPair {
+    left: Box<SqlExpr>,
+    right: Box<SqlExpr>,
+    left_refs: Vec<String>,
+    right_refs: Vec<String>,
+}
+
 /// The equi-join plan for `on`: `left_expr = right_expr` pairs whose sides
 /// cleanly split across the join boundary. Only qualified references
 /// participate — unqualified names resolve through `lookup_col`'s suffix
 /// fallback and can silently bind to either side, so they stay in the
-/// residual (the join then falls back to the nested loop when nothing
-/// extractable remains). `None` = no usable equi predicate.
-fn equi_plan(right_key: &str, on: &SqlExpr) -> Option<Vec<(Box<SqlExpr>, Box<SqlExpr>)>> {
+/// residual. Same-side (`l.x = l.y`), mixed-side (`l.a = r.b + l.c`) and
+/// unmodelable conjuncts stay in the residual too; the plan is `None` only
+/// when nothing extractable remains.
+fn equi_plan(right_key: &str, on: &SqlExpr) -> Option<Vec<EquiPair>> {
     let mut conjuncts = Vec::new();
     and_conjuncts(on, &mut conjuncts);
     let jprefix = format!("{right_key}.");
+    let classify = |e: &SqlExpr| -> Option<(Vec<String>, Side)> {
+        let mut refs = Vec::new();
+        column_refs(e, &mut refs)?;
+        let (mut saw_left, mut saw_right) = (false, false);
+        for r in &refs {
+            if r.starts_with(&jprefix) {
+                saw_right = true;
+            } else if r.contains('.') {
+                saw_left = true;
+            } else {
+                // Unqualified refs are ambiguous under suffix resolution.
+                return None;
+            }
+        }
+        let side = match (saw_left, saw_right) {
+            (true, false) => Side::Left,
+            (false, true) => Side::Right,
+            // Literal-only keys evaluate identically on either side; treat
+            // them as left so `r.x = 5` pairs probe a constant.
+            (false, false) => Side::Left,
+            (true, true) => Side::Both,
+        };
+        Some((refs, side))
+    };
     let mut plan = Vec::new();
     for c in conjuncts {
         let SqlExpr::BinaryOp {
@@ -5825,36 +5853,30 @@ fn equi_plan(right_key: &str, on: &SqlExpr) -> Option<Vec<(Box<SqlExpr>, Box<Sql
         else {
             continue; // residual predicate: re-evaluated per candidate
         };
-        let classify = |e: &SqlExpr| -> Option<(Vec<String>, bool)> {
-            let mut refs = Vec::new();
-            column_refs(e, &mut refs)?;
-            // All-right / all-left / unmodelable — unqualified refs are
-            // ambiguous under suffix resolution and reject the conjunct.
-            let mut saw_right = false;
-            for r in &refs {
-                if r.starts_with(&jprefix) {
-                    saw_right = true;
-                } else if r.contains('.') {
-                    // left-side qualified ref
-                } else {
-                    return None;
-                }
-            }
-            Some((refs, saw_right))
+        let (l, r) = match (classify(left), classify(right)) {
+            (Some(l), Some(r)) => (l, r),
+            // Unmodelable conjunct stays in the residual; the remaining
+            // conjuncts still form a plan.
+            _ => continue,
         };
-        let (_lrefs, l_right) = classify(left)?;
-        let (rrefs, r_right) = classify(right)?;
-        if !r_right && rrefs.is_empty() {
-            continue; // right side references nothing: pure filter, residual
+        let (le, le_refs, re, re_refs) = match (l.1, r.1) {
+            (Side::Left, Side::Right) => (left, l.0, right, r.0),
+            (Side::Right, Side::Left) => (right, r.0, left, l.0),
+            // Same-side filters and side-mixing expressions.
+            _ => continue,
+        };
+        // SqlExpr has no PartialEq; identical printed forms are duplicates.
+        if plan.iter().any(|p: &EquiPair| {
+            p.left.to_string() == le.to_string() && p.right.to_string() == re.to_string()
+        }) {
+            continue; // duplicate conjunct adds no key component
         }
-        let pair = if !l_right {
-            (left.clone(), right.clone())
-        } else if !r_right {
-            (right.clone(), left.clone())
-        } else {
-            continue; // both sides touch the right table: ambiguous, residual
-        };
-        plan.push(pair);
+        plan.push(EquiPair {
+            left: le.clone(),
+            right: re.clone(),
+            left_refs: le_refs,
+            right_refs: re_refs,
+        });
     }
     if plan.is_empty() {
         None
@@ -5863,77 +5885,121 @@ fn equi_plan(right_key: &str, on: &SqlExpr) -> Option<Vec<(Box<SqlExpr>, Box<Sql
     }
 }
 
+/// Merged join row: `l` plus the right row's fields. `right` keys must
+/// already be qualified (`r.k`).
+fn merged_row(l: &Object, right: &Object) -> Object {
+    let mut merged = l.clone();
+    for (k, v) in right {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
+/// LEFT/INNER join's unmatched left row: the right side's columns padded
+/// with NULL. `right_sample` is any qualified right row (row schemas vary,
+/// the first row is the historical convention).
+fn null_extended_left(l: &Object, right_sample: Option<&Object>) -> Object {
+    let mut merged = l.clone();
+    if let Some(sample) = right_sample {
+        for k in sample.keys() {
+            merged.insert(k.clone(), Value::Null);
+        }
+    }
+    merged
+}
+
+/// RIGHT/FULL join's unmatched right row: the left side's columns padded
+/// with NULL. `right` keys must already be qualified.
+fn null_extended_right(left_fields: &[String], right: &Object) -> Object {
+    let mut merged = Object::new();
+    for k in left_fields {
+        merged.insert(k.clone(), Value::Null);
+    }
+    for (k, v) in right {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
 /// Equi-join over a canonical-key index: right rows are bucketed by their
 /// key, each left row probes its bucket, and every candidate still passes
 /// the full ON on the merged row (the index is a superset filter, the ON is
-/// the decider). Unmodelable key values (documents) degrade only their own
-/// row to "probe everything" instead of falling back for the whole join.
-/// Emission order matches the nested loop: left order, then right order
-/// within a left row.
-#[allow(clippy::too_many_arguments)]
+/// the decider). Rows whose key expressions do not resolve to exact keys
+/// (missing columns, which suffix fallback could rebind across the boundary
+/// on the merged row) or produce unmodelable values (documents) degrade
+/// only their own row to "probe everything" instead of falling back for the
+/// whole join. Emission order matches the nested loop: left order, then
+/// right order within a left row.
 fn hash_join(
     left: &[Object],
-    right: &[Object],
-    right_key: &str,
+    qright: &[Object],
     on: &SqlExpr,
-    plan: &[(Box<SqlExpr>, Box<SqlExpr>)],
+    plan: &[EquiPair],
     left_join: bool,
     right_join: bool,
     deadline: &StmtDeadline,
 ) -> Result<Vec<Object>> {
-    let qright: Vec<Object> = right.iter().map(|r| qualify(r, right_key)).collect();
-    let mut map: std::collections::BTreeMap<Vec<JoinKey>, Vec<usize>> =
-        std::collections::BTreeMap::new();
+    let mut map: std::collections::HashMap<Vec<JoinKey>, Vec<usize>> =
+        std::collections::HashMap::new();
     let mut always: Vec<usize> = Vec::new();
     for (i, qr) in qright.iter().enumerate() {
         deadline.check()?;
         let mut key = Vec::with_capacity(plan.len());
-        for (_, rex) in plan {
-            match join_key_of(&eval_expr(rex, qr)?) {
-                Some(k) => key.push(k),
-                None => {
-                    always.push(i);
-                    break;
+        let mut indexed = true;
+        for p in plan {
+            if p.right_refs.iter().all(|r| qr.get(r).is_some()) {
+                match join_key_of(&eval_expr(&p.right, qr)?) {
+                    Some(k) => key.push(k),
+                    None => indexed = false,
                 }
+            } else {
+                indexed = false;
+            }
+            if !indexed {
+                break;
             }
         }
-        if key.len() == plan.len() {
+        if indexed {
             map.entry(key).or_default().push(i);
+        } else {
+            always.push(i);
         }
     }
-    let mut right_matched = vec![false; right.len()];
+    let mut right_matched = vec![false; qright.len()];
     let mut out = Vec::new();
     for l in left {
         deadline.check()?;
         let mut lkey = Vec::with_capacity(plan.len());
         let mut unindexed = false;
-        for (lex, _) in plan {
-            match join_key_of(&eval_expr(lex, l)?) {
-                Some(k) => lkey.push(k),
-                None => {
-                    unindexed = true;
-                    break;
+        for p in plan {
+            if p.left_refs.iter().all(|r| l.get(r).is_some()) {
+                match join_key_of(&eval_expr(&p.left, l)?) {
+                    Some(k) => lkey.push(k),
+                    None => unindexed = true,
                 }
+            } else {
+                unindexed = true;
+            }
+            if unindexed {
+                break;
             }
         }
         let mut cands: Vec<usize> = Vec::new();
-        match (&unindexed, map.get(&lkey)) {
-            (true, _) => cands.extend(0..right.len()),
-            (false, Some(bucket)) => {
-                cands.extend_from_slice(bucket);
-                cands.extend_from_slice(&always);
-            }
-            (false, None) => cands.extend_from_slice(&always),
+        if unindexed {
+            cands.extend(0..qright.len());
+        } else if let Some(bucket) = map.get(&lkey) {
+            cands.extend_from_slice(bucket);
+            cands.extend_from_slice(&always);
+        } else {
+            cands.extend_from_slice(&always);
         }
         if !always.is_empty() && !unindexed {
             cands.sort_unstable(); // keep right-index emission order
         }
         let mut matched = false;
         for &ri in &cands {
-            let mut merged = l.clone();
-            for (k, v) in &qright[ri] {
-                merged.insert(k.clone(), v.clone());
-            }
+            deadline.check()?;
+            let merged = merged_row(l, &qright[ri]);
             if matches!(eval_expr(on, &merged)?, Value::Bool(true)) {
                 matched = true;
                 right_matched[ri] = true;
@@ -5941,33 +6007,22 @@ fn hash_join(
             }
         }
         if !matched && left_join {
-            let mut merged = l.clone();
-            if let Some(r) = right.first() {
-                for k in r.keys() {
-                    merged.insert(format!("{right_key}.{k}"), Value::Null);
-                }
-            }
-            out.push(merged);
+            out.push(null_extended_left(l, qright.first()));
         }
     }
     if right_join {
         let left_fields = union_of_fields(left);
         for (ri, r) in qright.iter().enumerate() {
             if !right_matched[ri] {
-                let mut merged = Object::new();
-                for k in &left_fields {
-                    merged.insert(k.clone(), Value::Null);
-                }
-                for (k, v) in r {
-                    merged.insert(k.clone(), v.clone());
-                }
-                out.push(merged);
+                out.push(null_extended_right(&left_fields, r));
             }
         }
     }
     Ok(out)
 }
 
+/// Nested-loop join and hash-join dispatcher. ON is evaluated over the
+/// merged (qualified) row; LEFT/RIGHT joins null-extend the unmatched side.
 fn join_rows(
     left: Vec<Object>,
     right: &[Object],
@@ -5977,29 +6032,28 @@ fn join_rows(
     right_join: bool,
     deadline: &StmtDeadline,
 ) -> Result<Vec<Object>> {
+    // Qualify the right rows once: both paths merge them into left rows as
+    // pre-qualified key-value pairs, so assembly stays byte-identical
+    // between the hash path and the nested loop.
+    let qright: Vec<Object> = right.iter().map(|r| qualify(r, right_key)).collect();
     // Equi-join fast path: an ON whose conjuncts split cleanly across the
     // join boundary (qualified `l.x = r.y` pairs) indexes the right side and
     // probes per left row instead of walking every pair. Everything else —
     // cross joins, non-equi predicates, unqualified/ambiguous ON — keeps the
-    // original nested loop below.
+    // nested loop below.
     if let Some(on) = on {
         if let Some(plan) = equi_plan(right_key, on) {
-            return hash_join(
-                &left, right, right_key, on, &plan, left_join, right_join, deadline,
-            );
+            return hash_join(&left, &qright, on, &plan, left_join, right_join, deadline);
         }
     }
-    let mut right_matched = vec![false; right.len()];
+    let mut right_matched = vec![false; qright.len()];
     let mut out = Vec::new();
     for l in &left {
         deadline.check()?;
         let mut matched = false;
-        for (ri, r) in right.iter().enumerate() {
+        for (ri, qr) in qright.iter().enumerate() {
             deadline.check()?;
-            let mut merged = l.clone();
-            for (k, v) in r {
-                merged.insert(format!("{right_key}.{k}"), v.clone());
-            }
+            let merged = merged_row(l, qr);
             let ok = match on {
                 None => true,
                 Some(e) => matches!(eval_expr(e, &merged)?, Value::Bool(true)),
@@ -6011,27 +6065,14 @@ fn join_rows(
             }
         }
         if !matched && left_join {
-            let mut merged = l.clone();
-            if let Some(r) = right.first() {
-                for k in r.keys() {
-                    merged.insert(format!("{right_key}.{k}"), Value::Null);
-                }
-            }
-            out.push(merged);
+            out.push(null_extended_left(l, qright.first()));
         }
     }
     if right_join {
         let left_fields = union_of_fields(&left);
-        for (ri, r) in right.iter().enumerate() {
+        for (ri, qr) in qright.iter().enumerate() {
             if !right_matched[ri] {
-                let mut merged = Object::new();
-                for k in &left_fields {
-                    merged.insert(k.clone(), Value::Null);
-                }
-                for (k, v) in r {
-                    merged.insert(format!("{right_key}.{k}"), v.clone());
-                }
-                out.push(merged);
+                out.push(null_extended_right(&left_fields, qr));
             }
         }
     }
@@ -6158,7 +6199,7 @@ fn value_literal(v: &Value) -> Result<String> {
             }
             Ok(format!("{f:?}"))
         }
-        Value::Str(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
+        Value::Str(s) => Ok(crate::stmt::sql_string_literal(s)),
         other => err(format!(
             "cannot render a {} value as a SQL literal \
              (replication and dump need scalar column values)",
@@ -6183,7 +6224,7 @@ fn default_expr_text(e: &SqlExpr) -> String {
 
 /// Double-quoted SQL identifier.
 fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::stmt::sql_quote_ident(name)
 }
 
 fn obj_name(name: &ObjectName) -> String {
@@ -7004,24 +7045,35 @@ fn now_ms_string() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}.{millis:03}Z")
 }
 
-/// Seconds-since-epoch → (y, m, d, h, mi, s), same civil algorithm as
-/// backup.rs's UTC stamping (Howard Hinnant's civil_from_days).
-fn civil_from_secs(secs: u64) -> (i64, i64, i64, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let h = (rem / 3600) as u32;
-    let mi = ((rem % 3600) / 60) as u32;
-    let se = (rem % 60) as u32;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 399 } / 400;
-    let doe = z - era * 400;
+/// Days since epoch → (y, m, d) — Howard Hinnant's `civil_from_days`.
+/// Shared with the server's backup UTC stamping; pinned by known-answer
+/// tests in both engine and backup suites.
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
+    let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (y, m, d, h, mi, se)
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Seconds since epoch → (y, m, d, h, mi, s).
+fn civil_from_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (y, mo, d) = civil_from_days(days);
+    (
+        y,
+        mo,
+        d,
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    )
 }
 
 /// True when the statement's projection or WHERE references the Oracle
@@ -9467,6 +9519,111 @@ mod tests {
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0], vec![Value::Int(1), Value::Int(1)]);
         assert_eq!(r.rows[1], vec![Value::Int(2), Value::Int(2)]);
+    }
+
+    #[test]
+    fn hash_join_same_side_conjunct_stays_residual() {
+        // `p.x = p.y` touches only the left side; it must stay a residual
+        // predicate, never become an indexed pair whose second expression is
+        // (wrongly) evaluated against the right row.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (x INT, y INT, id INT)");
+        run(&mut db, "CREATE TABLE q (id INT, v TEXT)");
+        run(&mut db, "INSERT INTO p VALUES (5, 5, 1), (5, 6, 2)");
+        run(&mut db, "INSERT INTO q VALUES (1, 'one')");
+        let r = rows(
+            &mut db,
+            "SELECT q.v FROM p JOIN q ON p.x = p.y AND p.id = q.id",
+        );
+        // Only the row with x = y and matching id joins.
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0], vec![Value::Str("one".into())]);
+    }
+
+    #[test]
+    fn hash_join_missing_column_degrades_per_row() {
+        // l2.foo does not exist as an exact key; on the merged row suffix
+        // resolution binds it to r2.foo, so the nested loop finds the match.
+        // The hash path must degrade the left row (not key it as NULL and
+        // lose the pair).
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE l2 (id INT)");
+        run(&mut db, "CREATE TABLE r2 (foo INT, bar INT)");
+        run(&mut db, "INSERT INTO l2 VALUES (1)");
+        run(&mut db, "INSERT INTO r2 VALUES (5, 5)");
+        let r = rows(&mut db, "SELECT l2.id FROM l2 JOIN r2 ON l2.foo = r2.bar");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0], vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn hash_join_unqualified_conjunct_keeps_other_pairs() {
+        // The unqualified `name` conjunct is residual, but the equi pair on
+        // ids still forms a plan; results must match the nested loop.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE x (id INT, name TEXT)");
+        run(&mut db, "CREATE TABLE y (id INT, name TEXT)");
+        run(&mut db, "INSERT INTO x VALUES (1, 'a')");
+        run(&mut db, "INSERT INTO y VALUES (1, 'a'), (1, 'b')");
+        let r = rows(
+            &mut db,
+            "SELECT y.name FROM x JOIN y ON x.id = y.id AND name = 'a'",
+        );
+        // Unqualified `name` resolves to the first suffix match on the
+        // merged row (x.name = 'a', constant across candidates): both
+        // id-matched pairs pass the residual.
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0], vec![Value::Str("a".into())]);
+        assert_eq!(r.rows[1], vec![Value::Str("b".into())]);
+    }
+
+    #[test]
+    fn hash_join_beyond_f64_int_keys_do_not_false_match() {
+        // 2^53 and 2^53+1 collapse to the same canonical key; the full ON
+        // (exact i64 comparison) must reject the pair — the superset filter
+        // may over-merge but never decides.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT)");
+        run(&mut db, "CREATE TABLE b (id INT)");
+        run(
+            &mut db,
+            "INSERT INTO a VALUES (9007199254740992), (9007199254740993)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO b VALUES (9007199254740992), (9007199254740993)",
+        );
+        let r = rows(&mut db, "SELECT a.id, b.id FROM a JOIN b ON a.id = b.id");
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn hash_join_deadline_fires() {
+        // The hash path's build/probe/candidate loops are the preemption
+        // points for an expired deadline, same contract as the nested loop.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE b (id INT)").unwrap();
+        // Enough rows to cross the deadline's 1024-call sampling batch; a
+        // small join finishes before the first clock sample by design.
+        let mut vals = String::from("INSERT INTO a VALUES (0)");
+        for i in 1..2000 {
+            vals.push_str(&format!(", ({i})"));
+        }
+        db.execute(&vals).unwrap();
+        db.execute("INSERT INTO b VALUES (0)").unwrap();
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        db.set_statement_deadline(Some(expired));
+        let e = db
+            .execute("SELECT COUNT(*) FROM a JOIN b ON a.id = b.id")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("statement timeout"),
+            "wrong error: {e}"
+        );
+        db.set_statement_deadline(None);
+        let n = rows(&mut db, "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id");
+        assert_eq!(n.rows[0], vec![Value::Int(1)]);
     }
 
     #[test]
@@ -14320,11 +14477,30 @@ mod complex_query_tests {
             q(&mut db, "SELECT TO_CHAR(123) || '!'"),
             Value::Str("123!".into())
         );
-        // SYSDATE: fixed-shape UTC timestamp text.
-        assert!(matches!(
-            q(&mut db, "SELECT SYSDATE()"),
-            Value::Str(s) if s.len() >= 19 && s.contains('T')
-        ));
+        // SYSDATE: fixed-shape UTC timestamp text with a sane year — the
+        // old civil math returned year ~740000 and a shape-only assert
+        // never noticed.
+        match q(&mut db, "SELECT SYSDATE()") {
+            Value::Str(s) => {
+                assert!(s.len() >= 19 && s.contains('T'), "shape: {s}");
+                let now_year = crate::now_ms() / 1000 / 86_400 / 366 + 1970;
+                let y: i64 = s.get(..4).and_then(|p| p.parse().ok()).unwrap_or(-1);
+                assert!(
+                    y.abs_diff(now_year as i64) <= 1,
+                    "SYSDATE year {y}, want ~{now_year}: {s}"
+                );
+            }
+            other => panic!("SYSDATE must be a string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn civil_from_secs_known_dates() {
+        // 2026-09-13T00:00:00Z and the epoch.
+        assert_eq!(civil_from_secs(1_789_257_600), (2026, 9, 13, 0, 0, 0));
+        assert_eq!(civil_from_secs(0), (1970, 1, 1, 0, 0, 0));
+        // 2000-02-29T23:59:59Z — leap day and second-of-day edge.
+        assert_eq!(civil_from_secs(951_868_799), (2000, 2, 29, 23, 59, 59));
     }
 
     #[test]

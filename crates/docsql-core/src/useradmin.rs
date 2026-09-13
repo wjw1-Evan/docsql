@@ -417,11 +417,11 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
 // ---- rendering (canonical + log-redacted) ----
 
 fn q(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::stmt::sql_quote_ident(name)
 }
 
 fn lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    crate::stmt::sql_string_literal(s)
 }
 
 fn priv_names(privs: &[TablePriv]) -> String {

@@ -5,6 +5,48 @@
 
 ## [Unreleased]
 
+### 全库审查修复与去重批次(2026-09-13)
+
+#### 修复
+
+- **等值 JOIN 丢行两处**:(1) 同侧等值合取(`ON l.x = l.y AND l.id = r.id`)曾被误纳入
+  哈希计划、第二表达式在右行上求值导致真匹配被丢弃——纯侧分类(Left/Right/Both)后同侧/混合侧
+  合取一律留在 residual;(2) 限定名列经 `lookup_col` 后缀回退可在合并行上跨表绑定
+  (`l.foo` 静默命中 `r.foo`),单侧求值与合并行求值分叉漏行——`EquiPair` 记录精确键清单,
+  行内键未精确命中只降级该行为全探针;
+- **MVCC 快照两处**:(1) checkpoint 截断后 `page_lsn` 残留旧 epoch 大 LSN,例行截断后的所有
+  新快照读"截断前最后写过"的页会被伪 `SnapshotTooOld` 打爆——截断在 WAL 锁内清表并发布
+  epoch;(2) 快路径 page_lsn 判定与取像两段加锁,提交者可插在中间使快照读到快照之后的页版本
+  ——seqlock 式双检(提交临界区池锁最后释放保证可检);
+- **`SYSDATE()` 日期完全错误**(一直如此):civil 历法换算的纪元除数写错,输出年份在
+  公元 74 万年(测试只断言了形状);收敛到与备份时间戳同一份 Hinnant 算法并加已知答案测试;
+- 哈希连接候选循环补 deadline 协作采样(超时粒度从"每左行"恢复到与嵌套循环同级的"每对");
+  hash 路径的行组装/补 NULL 逻辑与嵌套循环共享同一组助手,消除双路径手抄分叉。
+
+#### 优化
+
+- 快照慢路径(首次 as-of 读)的 WAL 全量扫描不再持 snaps/WAL 任一锁:独立只读句柄扫描、
+  扫后 WAL 锁内复验 epoch,后台化承诺(读不阻塞写)在物化期间同样成立;
+- 缓冲池冷未命中的磁盘 IO 移出池锁(此前一个冷读可卡住全部读者与提交路径);
+  嵌套循环右行统一预限定(原先每对 format! 一次);
+- INSERT 热路径表元数据改 Arc 引用(不再每语句整条深拷);DROP INDEX 定点写拷贝
+  (原先对全库每张表做 `Arc::make_mut`);MERGE 目标扫描复用 `table_pairs`
+  (原先手抄一遍带定位符扫描循环)。
+
+#### 重构
+
+- 密码学实现收敛:控制台账号门(~180 行 SHA-256/HMAC/PBKDF2 手写副本)与
+  `constant_time_eq` 三份实现统一到 core `kdf` 一份,已知答案测试保留于 core;
+- SQL 字面量/标识符转义(六处字符串、五处标识符手抄副本)统一为
+  `stmt::sql_string_literal`/`sql_quote_ident` 注入面单点;
+- `ReadView::execute` 与 `execute_read` 的纯 SELECT 门禁合并为
+  `plain_read_query` 单份;删除自 stage A 起恒空的 `Database::ctes` 死字段;
+- btree `range_from` = `range_bounded(None)` 特例化(删 40 行镜像递归);
+  heap 溢出链页头解析统一 `chain_header`,`insert_overflow` 不再双重加载尾页;
+  server 侧 `outcome_frame`(读写两级响应渲染)、`record_auth_failure`
+  (token/用户两路失败记账)、`hold_peer` 复用 `write_frame_on` 去重;
+  `file_bytes`/`now_ms` 包装收敛 core。
+
 ### 等值 JOIN hash join(2026-09-13)
 
 - **等值 JOIN 从嵌套循环改为哈希连接**:ON 中可跨连接边界切分的等值条件

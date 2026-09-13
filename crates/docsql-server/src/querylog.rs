@@ -130,10 +130,6 @@ impl QueryLog {
     }
 }
 
-fn now_ms() -> u64 {
-    docsql_core::now_ms()
-}
-
 /// Log one executed statement from its request/response frames.
 pub fn record(
     state: &Arc<ServerState>,
@@ -157,7 +153,7 @@ pub fn record(
     // trail; pre-hashed replays are left as-is.
     let redacted = docsql_core::useradmin::redact_sql(sql);
     state.query_log.push(LogEntry {
-        ts_ms: now_ms(),
+        ts_ms: docsql_core::now_ms(),
         peer: peer.to_string(),
         sql: redacted.chars().take(512).collect(),
         ms,
@@ -352,7 +348,7 @@ pub fn sync_event(
     detail: Option<String>,
 ) {
     log.push(SyncEntry {
-        ts_ms: now_ms(),
+        ts_ms: docsql_core::now_ms(),
         event: event.to_string(),
         target: target.to_string(),
         sql: sql.map(|s| s.chars().take(200).collect()),

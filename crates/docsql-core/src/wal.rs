@@ -254,10 +254,20 @@ impl Wal {
     /// Iterate all valid frames (recovery input), in LSN order. Continuity
     /// is seeded from the first frame (see `scan`).
     pub fn records(&self) -> Result<Vec<LogRecord>> {
+        // Through a fresh read-only handle: `self.file`'s cursor is owned by
+        // the append path, and this must stay callable while it appends.
+        Self::scan_file(&self.path)
+    }
+
+    /// Read and parse every valid frame from `path` via a fresh read-only
+    /// handle, holding no lock: safe while a writer appends (frames an
+    /// existing snapshot needs were fully written before that snapshot
+    /// began; a torn tail just stops the scan). A concurrent `checkpoint`
+    /// can invalidate what is read — callers must re-validate the epoch
+    /// under the append lock afterwards.
+    pub fn scan_file(path: &Path) -> Result<Vec<LogRecord>> {
         let mut buf = Vec::new();
-        let mut f = &self.file;
-        f.seek(SeekFrom::Start(0))?;
-        f.read_to_end(&mut buf)?;
+        File::open(path)?.read_to_end(&mut buf)?;
         let mut out = Vec::new();
         let mut pos = HEADER.len();
         let mut next: Option<u64> = None;

@@ -6,6 +6,19 @@
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+/// SQL string literal with `'` doubled — the single escaping rule this
+/// engine accepts. Every site that embeds a value into SQL text goes
+/// through here (or [`sql_quote_ident`]); drifting hand-rolled copies are
+/// how injection holes appear.
+pub fn sql_string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Double-quoted SQL identifier with `"` doubled.
+pub fn sql_quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// Quote/comment-aware split on top-level semicolons: string literals,
 /// quoted identifiers, `--` line comments and `/* */` block comments never
 /// split. Needed because user-management statements are hand-parsed and

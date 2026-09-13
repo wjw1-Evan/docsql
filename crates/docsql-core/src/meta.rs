@@ -18,10 +18,6 @@ fn int(n: u64) -> Value {
     Value::Int(n as i64)
 }
 
-fn file_bytes(p: &Path) -> u64 {
-    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
-
 /// The `/api/meta` payload: server identity, storage counters, totals, one
 /// entry per user table, and the engine-managed system tables (pub/sub
 /// backing store, catch-up journal/positions/identity) under
@@ -34,8 +30,8 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
     let mut total_rows = 0u64;
     for t in &catalog {
         let row_count = match db.execute(&format!(
-            "SELECT COUNT(*) FROM \"{}\"",
-            t.name.replace('"', "\"\"")
+            "SELECT COUNT(*) FROM {}",
+            crate::stmt::sql_quote_ident(&t.name)
         )) {
             Ok(ExecOutcome::Rows(r)) => {
                 r.rows.first().and_then(|row| row[0].as_i64()).unwrap_or(0) as u64
@@ -140,10 +136,10 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
             Value::Object(Object::from([
                 ("page_size".into(), int(db.page_size() as u64)),
                 ("num_pages".into(), int(db.num_pages() as u64)),
-                ("db_bytes".into(), int(file_bytes(db_path))),
+                ("db_bytes".into(), int(crate::file_bytes(db_path))),
                 (
                     "wal_bytes".into(),
-                    int(file_bytes(&crate::pager::wal_path_for(db_path))),
+                    int(crate::file_bytes(&crate::pager::wal_path_for(db_path))),
                 ),
             ])),
         ),

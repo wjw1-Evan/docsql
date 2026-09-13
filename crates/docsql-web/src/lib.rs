@@ -1029,11 +1029,11 @@ fn valid_user_ident(name: &str) -> bool {
 }
 
 fn sql_str_lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    docsql_core::stmt::sql_string_literal(s)
 }
 
 fn sql_ident_lit(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+    docsql_core::stmt::sql_quote_ident(s)
 }
 
 #[derive(serde::Deserialize)]

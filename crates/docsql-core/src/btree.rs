@@ -155,7 +155,7 @@ struct Ctx<'a> {
 impl BTree {
     /// Create a fresh tree (allocates a root leaf inside `tx`).
     pub fn create(pager: &Pager, tx: &mut Tx) -> Result<BTree> {
-        let next_page = pager.num_pages_now();
+        let next_page = pager.num_pages();
         let root = pager.allocate_page(tx)?;
         debug_assert_eq!(root, next_page);
         let mut page = vec![0u8; PAGE_SIZE];
@@ -481,50 +481,9 @@ impl BTree {
         tx: &Tx,
         key: &Value,
     ) -> Result<Vec<(Value, u64)>> {
-        let mut out = Vec::new();
-        Self::range_from_rec(reader, tx, self.root, key, &mut out)?;
-        Ok(out)
-    }
-
-    fn range_from_rec(
-        reader: &PageReader,
-        tx: &Tx,
-        id: u32,
-        key: &Value,
-        out: &mut Vec<(Value, u64)>,
-    ) -> Result<()> {
-        match Self::read_node(reader, tx, id)? {
-            Node::Leaf { cells } => {
-                out.extend(
-                    cells
-                        .into_iter()
-                        .filter(|(k, _)| Value::cmp_values(k, key) != Ordering::Less),
-                );
-            }
-            Node::Internal { leftmost, cells } => {
-                // Child i nominally covers [sep_i, sep_{i+1}) — but a split
-                // can leave keys EQUAL to a separator in the child left of
-                // it, so any child whose upper separator is >= key may hold
-                // matching entries; only upper < key is safely skippable.
-                let leftmost_upper_ge = match cells.first() {
-                    Some((k, _)) => Value::cmp_values(k, key) != Ordering::Less,
-                    None => true,
-                };
-                if leftmost_upper_ge {
-                    Self::range_from_rec(reader, tx, leftmost, key, out)?;
-                }
-                for (i, (_, child)) in cells.iter().enumerate() {
-                    let upper_ge = match cells.get(i + 1) {
-                        Some((k, _)) => Value::cmp_values(k, key) != Ordering::Less,
-                        None => true,
-                    };
-                    if upper_ge {
-                        Self::range_from_rec(reader, tx, *child, key, out)?;
-                    }
-                }
-            }
-        }
-        Ok(())
+        // The unbounded case of range_bounded (hi = None skips nothing by
+        // upper bound), so one walker serves both.
+        self.range_bounded(reader, tx, key, None)
     }
 
     /// Entries with key >= `lo`, optionally stopping early at `hi` —

@@ -23,17 +23,9 @@ pub fn parse_key_hex(s: &str) -> Result<TransportKey, String> {
 }
 
 /// Constant-time equality for secrets (AUTH tokens). The length check only
-/// leaks the length; byte comparison short-circuits nowhere.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+/// leaks the length; byte comparison short-circuits nowhere. Shared with
+/// the credential-hashing path in core's `kdf` module.
+pub use docsql_core::kdf::constant_time_eq;
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();

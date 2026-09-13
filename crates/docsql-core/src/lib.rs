@@ -27,3 +27,8 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// Current file size, 0 for missing paths (monitoring counters only).
+pub fn file_bytes(p: &std::path::Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}

@@ -53,7 +53,7 @@ pub fn ensure_table(db: &mut Database) -> Result<(), String> {
 
 /// SQL string literal (single quotes doubled).
 fn sql_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    docsql_core::stmt::sql_string_literal(s)
 }
 
 /// Append one message in the caller's engine write path; returns the

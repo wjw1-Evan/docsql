@@ -691,6 +691,40 @@ impl Conn {
 /// grants are read under the engine lock on either side of it. Failure
 /// accounting (per-source lockout + audit trail) mirrors token auth, and a
 /// missing user burns the same derivation so timing reveals nothing.
+/// Record one failed authentication from `source_ip`: bump the counter,
+/// prune idle sources, append the failure, and audit a lockout event when
+/// the threshold is hit. Shared by token and user/password auth so their
+/// lockout behavior cannot drift apart.
+async fn record_auth_failure(state: &Arc<ServerState>, source_ip: &str) {
+    state
+        .metrics
+        .auth_failures_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if state.auth_lock_threshold > 0 {
+        let mut failures = state.auth_failures.lock().await;
+        let now = std::time::Instant::now();
+        // Prune idle sources along the way: a scanner leaving one entry per
+        // IP would otherwise grow the map forever (entries are only
+        // otherwise dropped on that IP's success).
+        failures.retain(|_, list| {
+            list.retain(|t| now.duration_since(*t) < AUTH_LOCK_WINDOW);
+            !list.is_empty()
+        });
+        let list = failures.entry(source_ip.to_string()).or_default();
+        list.push(now);
+        if list.len() as u32 == state.auth_lock_threshold {
+            querylog::sync_event(
+                &state.sync_log,
+                "auth",
+                source_ip,
+                None,
+                false,
+                Some("lockout: repeated auth failures".into()),
+            );
+        }
+    }
+}
+
 async fn user_login_frame(
     state: &Arc<ServerState>,
     source_ip: &str,
@@ -739,30 +773,7 @@ async fn user_login_frame(
     .await
     .unwrap_or(false);
     if !ok {
-        state
-            .metrics
-            .auth_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if state.auth_lock_threshold > 0 {
-            let mut failures = state.auth_failures.lock().await;
-            let now = std::time::Instant::now();
-            failures.retain(|_, list| {
-                list.retain(|t| now.duration_since(*t) < AUTH_LOCK_WINDOW);
-                !list.is_empty()
-            });
-            let list = failures.entry(source_ip.to_string()).or_default();
-            list.push(now);
-            if list.len() as u32 == state.auth_lock_threshold {
-                querylog::sync_event(
-                    &state.sync_log,
-                    "auth",
-                    source_ip,
-                    None,
-                    false,
-                    Some("lockout: repeated auth failures".into()),
-                );
-            }
-        }
+        record_auth_failure(state, source_ip).await;
         querylog::sync_event(
             &state.sync_log,
             "auth",
@@ -1117,27 +1128,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             audit(true, "read token accepted", &state);
                             Some(Frame::new(proto::RESP_AFFECTED, b"ok(read-only)".to_vec()))
                         } else {
-                            state
-                                .metrics
-                                .auth_failures_total
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if state.auth_lock_threshold > 0 {
-                                let mut failures = state.auth_failures.lock().await;
-                                let now = std::time::Instant::now();
-                                // Prune idle sources along the way: a scanner
-                                // leaving one entry per IP would otherwise
-                                // grow the map forever (entries are only
-                                // otherwise dropped on that IP's success).
-                                failures.retain(|_, list| {
-                                    list.retain(|t| now.duration_since(*t) < AUTH_LOCK_WINDOW);
-                                    !list.is_empty()
-                                });
-                                let list = failures.entry(source_ip.to_string()).or_default();
-                                list.push(now);
-                                if list.len() as u32 == state.auth_lock_threshold {
-                                    audit(false, "lockout: repeated auth failures", &state);
-                                }
-                            }
+                            record_auth_failure(&state, source_ip).await;
                             Some(Frame::new(proto::RESP_ERROR, err_payload("bad token")))
                         }
                     }
@@ -1724,7 +1715,7 @@ fn render_param(p: &Value) -> String {
         }
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
-        Value::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Str(s) => docsql_core::stmt::sql_string_literal(s),
         Value::Bytes(b) => {
             let mut hex = String::with_capacity(b.len() * 2 + 3);
             hex.push_str("x'");
@@ -1735,10 +1726,7 @@ fn render_param(p: &Value) -> String {
             hex
         }
         // Nested documents/arrays travel as JSON text literals.
-        other => format!(
-            "'{}'",
-            docsql_core::json::to_string(other).replace('\'', "''")
-        ),
+        other => docsql_core::stmt::sql_string_literal(&docsql_core::json::to_string(other)),
     }
 }
 
@@ -1749,17 +1737,12 @@ fn render_param(p: &Value) -> String {
 /// writes (and vice versa). Statement deadline and audit apply identically
 /// to the write path; the view owns its deadline, so concurrent readers
 /// never clobber each other's arming.
-async fn execute_read_sql(
-    state: &Arc<ServerState>,
-    sql: &str,
-    deadline: Option<std::time::Instant>,
-) -> Frame {
-    let view = {
-        let db = state.db.read().unwrap_or_else(|p| p.into_inner());
-        db.read_view()
-    };
-    view.set_statement_deadline(deadline);
-    let resp = match view.execute(sql) {
+/// Render an engine outcome as the client-facing response frame: rows as a
+/// JSON object, affected counts as a LE u64, errors as RESP_ERROR. Shared by
+/// the write path and the guardless read tier so the wire shape cannot drift
+/// between them.
+fn outcome_frame<E: std::fmt::Display>(outcome: std::result::Result<ExecOutcome, E>) -> Frame {
+    match outcome {
         Ok(ExecOutcome::Rows(r)) => {
             let mut obj = docsql_core::value::Object::new();
             obj.insert(
@@ -1777,7 +1760,20 @@ async fn execute_read_sql(
         }
         Ok(ExecOutcome::Affected(n)) => Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec()),
         Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
+    }
+}
+
+async fn execute_read_sql(
+    state: &Arc<ServerState>,
+    sql: &str,
+    deadline: Option<std::time::Instant>,
+) -> Frame {
+    let view = {
+        let db = state.db.read().unwrap_or_else(|p| p.into_inner());
+        db.read_view()
     };
+    view.set_statement_deadline(deadline);
+    let resp = outcome_frame(view.execute(sql));
     view.set_statement_deadline(None);
     drop(view); // ends the pager snapshot
     resp
@@ -1816,8 +1812,8 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         user_tables += 1;
         // Same COUNT(*) census the web console's /api/meta performs.
         total_rows += match db.execute_read(&format!(
-            "SELECT COUNT(*) FROM \"{}\"",
-            t.name.replace('"', "\"\"")
+            "SELECT COUNT(*) FROM {}",
+            docsql_core::stmt::sql_quote_ident(&t.name)
         )) {
             Ok(ExecOutcome::Rows(r)) => {
                 r.rows.first().and_then(|row| row[0].as_i64()).unwrap_or(0) as u64
@@ -1853,7 +1849,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
 }
 
 fn file_bytes(p: &std::path::Path) -> u64 {
-    backup::file_bytes(p)
+    docsql_core::file_bytes(p)
 }
 
 fn wal_path(db: &std::path::Path) -> PathBuf {
@@ -2323,25 +2319,7 @@ async fn execute_sql_inner(
             _ => {}
         }
     }
-    match outcome {
-        Ok(ExecOutcome::Rows(r)) => {
-            let mut obj = docsql_core::value::Object::new();
-            obj.insert(
-                "columns".into(),
-                Value::Array(r.columns.into_iter().map(Value::Str).collect()),
-            );
-            obj.insert(
-                "rows".into(),
-                Value::Array(r.rows.into_iter().map(Value::Array).collect()),
-            );
-            Frame::new(
-                proto::RESP_ROWS,
-                docsql_core::json::to_string(&Value::Object(obj)).into_bytes(),
-            )
-        }
-        Ok(ExecOutcome::Affected(n)) => Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec()),
-        Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
-    }
+    outcome_frame(outcome)
 }
 
 /// Peer I/O budget: a partitioned or malicious peer must not wedge client
@@ -3168,22 +3146,10 @@ async fn hold_peer(
         advertise.as_bytes().to_vec(),
         state.transport_key.as_ref(),
     );
-    let bytes = match frame.encode() {
-        Ok(b) => b,
-        Err(e) => return Err(HoldFail::Unreachable(e.to_string())),
-    };
-    {
-        use tokio::io::AsyncWriteExt;
-        match tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(unreachable(e)),
-            Err(_) => return Err(HoldFail::Unreachable("hold write timed out".into())),
-        }
-        match tokio::time::timeout(IO_TIMEOUT, stream.flush()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(unreachable(e)),
-            Err(_) => return Err(HoldFail::Unreachable("hold flush timed out".into())),
-        }
+    // Encode/write failures on a connected peer mean the peer went away
+    // mid-hold — same classification as an unreachable target.
+    if let Err(e) = write_frame_on(&mut stream, &frame).await {
+        return Err(HoldFail::Unreachable(e.to_string()));
     }
     // The peer accepted the connection: if it now fails to answer in time
     // it is busy (alive, writes possibly in flight) — never "unreachable".
