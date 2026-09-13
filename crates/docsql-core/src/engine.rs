@@ -5641,6 +5641,333 @@ fn qualify(doc: &Object, alias: &str) -> Object {
 /// LEFT/RIGHT joins null-extend the unmatched side; a RIGHT join also
 /// null-extends the left columns for unmatched right rows.
 #[allow(clippy::too_many_arguments)]
+/// Canonical join key for the hash-join path. Equality under
+/// [`Value::cmp_values`] implies equality here, which is the only contract
+/// the index needs: candidates re-evaluate the full ON, so the key may
+/// over-merge (Int vs Int beyond f64's 2^53 exact range collapses to the
+/// same bits, mirroring `cmp_values`' cross-type numeric branch) but must
+/// never split a matching pair. NULL is a key like any other — `binop`'s `=`
+/// is `cmp_values`-based, so NULL = NULL joins.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+enum JoinKey {
+    Null,
+    Bool(bool),
+    /// f64 bit pattern, NaN collapsed to one payload and ±0.0 to +0.0 so
+    /// `cmp_values`-equal numerics hash equal.
+    Num(u64),
+    Str(String),
+    Bytes(Vec<u8>),
+    Array(Vec<JoinKey>),
+}
+
+fn join_key_of(v: &Value) -> Option<JoinKey> {
+    Some(match v {
+        Value::Null => JoinKey::Null,
+        Value::Bool(b) => JoinKey::Bool(*b),
+        Value::Int(i) => JoinKey::Num(num_key(*i as f64)),
+        Value::Float(f) => JoinKey::Num(num_key(*f)),
+        Value::Str(s) => JoinKey::Str(s.clone()),
+        Value::Bytes(b) => JoinKey::Bytes(b.clone()),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(join_key_of(it)?);
+            }
+            JoinKey::Array(out)
+        }
+        // Documents as join keys have no practical shape; the join falls
+        // back to the nested loop instead.
+        Value::Object(_) => return None,
+    })
+}
+
+fn num_key(f: f64) -> u64 {
+    if f.is_nan() {
+        f64::NAN.to_bits()
+    } else if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
+    }
+}
+
+/// Flatten `e` into its AND-conjuncts (parenthesized groups unwrapped).
+fn and_conjuncts<'e>(e: &'e SqlExpr, out: &mut Vec<&'e SqlExpr>) {
+    match e {
+        SqlExpr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
+            and_conjuncts(left, out);
+            and_conjuncts(right, out);
+        }
+        SqlExpr::Nested(inner) => and_conjuncts(inner, out),
+        other => out.push(other),
+    }
+}
+
+/// Column references inside `e`, as the dotted names the row-local evaluator
+/// resolves (`Identifier("a.id")` and `CompoundIdentifier[a, id]` both yield
+/// `"a.id"`). `None` = the tree contains something the collector does not
+/// model (subqueries, exotic nodes) — the caller then leaves the conjunct in
+/// the residual instead of indexing on it.
+fn column_refs(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        SqlExpr::Identifier(i) => out.push(i.value.clone()),
+        SqlExpr::CompoundIdentifier(parts) => {
+            out.push(
+                parts
+                    .iter()
+                    .map(|p| p.value.clone())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+        }
+        SqlExpr::Value(_) => {}
+        SqlExpr::UnaryOp { expr, .. } => column_refs(expr, out)?,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            column_refs(left, out)?;
+            column_refs(right, out)?;
+        }
+        SqlExpr::Nested(inner) => column_refs(inner, out)?,
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => column_refs(inner, out)?,
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            column_refs(expr, out)?;
+            column_refs(low, out)?;
+            column_refs(high, out)?;
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            column_refs(expr, out)?;
+            column_refs(pattern, out)?;
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            column_refs(expr, out)?;
+            for item in list {
+                column_refs(item, out)?;
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                column_refs(o, out)?;
+            }
+            for w in conditions {
+                column_refs(&w.condition, out)?;
+                column_refs(&w.result, out)?;
+            }
+            if let Some(r) = else_result {
+                column_refs(r, out)?;
+            }
+        }
+        SqlExpr::Cast { expr, .. } => column_refs(expr, out)?,
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            column_refs(expr, out)?;
+            if let Some(f) = substring_from {
+                column_refs(f, out)?;
+            }
+            if let Some(l) = substring_for {
+                column_refs(l, out)?;
+            }
+        }
+        SqlExpr::Function(f) => match &f.args {
+            FunctionArguments::List(list) => {
+                for a in &list.args {
+                    match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                            column_refs(inner, out)?
+                        }
+                        // `COUNT(*)` and friends reference no column; named or
+                        // wildcard argument shapes stay unmodeled.
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+                        _ => return None,
+                    }
+                }
+            }
+            FunctionArguments::None => {}
+            _ => return None,
+        },
+        // Subqueries and anything unmodeled keep the conjunct in the residual.
+        _ => return None,
+    }
+    Some(())
+}
+
+/// The equi-join plan for `on`: `left_expr = right_expr` pairs whose sides
+/// cleanly split across the join boundary. Only qualified references
+/// participate — unqualified names resolve through `lookup_col`'s suffix
+/// fallback and can silently bind to either side, so they stay in the
+/// residual (the join then falls back to the nested loop when nothing
+/// extractable remains). `None` = no usable equi predicate.
+fn equi_plan(right_key: &str, on: &SqlExpr) -> Option<Vec<(Box<SqlExpr>, Box<SqlExpr>)>> {
+    let mut conjuncts = Vec::new();
+    and_conjuncts(on, &mut conjuncts);
+    let jprefix = format!("{right_key}.");
+    let mut plan = Vec::new();
+    for c in conjuncts {
+        let SqlExpr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } = c
+        else {
+            continue; // residual predicate: re-evaluated per candidate
+        };
+        let classify = |e: &SqlExpr| -> Option<(Vec<String>, bool)> {
+            let mut refs = Vec::new();
+            column_refs(e, &mut refs)?;
+            // All-right / all-left / unmodelable — unqualified refs are
+            // ambiguous under suffix resolution and reject the conjunct.
+            let mut saw_right = false;
+            for r in &refs {
+                if r.starts_with(&jprefix) {
+                    saw_right = true;
+                } else if r.contains('.') {
+                    // left-side qualified ref
+                } else {
+                    return None;
+                }
+            }
+            Some((refs, saw_right))
+        };
+        let (_lrefs, l_right) = classify(left)?;
+        let (rrefs, r_right) = classify(right)?;
+        if !r_right && rrefs.is_empty() {
+            continue; // right side references nothing: pure filter, residual
+        }
+        let pair = if !l_right {
+            (left.clone(), right.clone())
+        } else if !r_right {
+            (right.clone(), left.clone())
+        } else {
+            continue; // both sides touch the right table: ambiguous, residual
+        };
+        plan.push(pair);
+    }
+    if plan.is_empty() {
+        None
+    } else {
+        Some(plan)
+    }
+}
+
+/// Equi-join over a canonical-key index: right rows are bucketed by their
+/// key, each left row probes its bucket, and every candidate still passes
+/// the full ON on the merged row (the index is a superset filter, the ON is
+/// the decider). Unmodelable key values (documents) degrade only their own
+/// row to "probe everything" instead of falling back for the whole join.
+/// Emission order matches the nested loop: left order, then right order
+/// within a left row.
+#[allow(clippy::too_many_arguments)]
+fn hash_join(
+    left: &[Object],
+    right: &[Object],
+    right_key: &str,
+    on: &SqlExpr,
+    plan: &[(Box<SqlExpr>, Box<SqlExpr>)],
+    left_join: bool,
+    right_join: bool,
+    deadline: &StmtDeadline,
+) -> Result<Vec<Object>> {
+    let qright: Vec<Object> = right.iter().map(|r| qualify(r, right_key)).collect();
+    let mut map: std::collections::BTreeMap<Vec<JoinKey>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut always: Vec<usize> = Vec::new();
+    for (i, qr) in qright.iter().enumerate() {
+        deadline.check()?;
+        let mut key = Vec::with_capacity(plan.len());
+        for (_, rex) in plan {
+            match join_key_of(&eval_expr(rex, qr)?) {
+                Some(k) => key.push(k),
+                None => {
+                    always.push(i);
+                    break;
+                }
+            }
+        }
+        if key.len() == plan.len() {
+            map.entry(key).or_default().push(i);
+        }
+    }
+    let mut right_matched = vec![false; right.len()];
+    let mut out = Vec::new();
+    for l in left {
+        deadline.check()?;
+        let mut lkey = Vec::with_capacity(plan.len());
+        let mut unindexed = false;
+        for (lex, _) in plan {
+            match join_key_of(&eval_expr(lex, l)?) {
+                Some(k) => lkey.push(k),
+                None => {
+                    unindexed = true;
+                    break;
+                }
+            }
+        }
+        let mut cands: Vec<usize> = Vec::new();
+        match (&unindexed, map.get(&lkey)) {
+            (true, _) => cands.extend(0..right.len()),
+            (false, Some(bucket)) => {
+                cands.extend_from_slice(bucket);
+                cands.extend_from_slice(&always);
+            }
+            (false, None) => cands.extend_from_slice(&always),
+        }
+        if !always.is_empty() && !unindexed {
+            cands.sort_unstable(); // keep right-index emission order
+        }
+        let mut matched = false;
+        for &ri in &cands {
+            let mut merged = l.clone();
+            for (k, v) in &qright[ri] {
+                merged.insert(k.clone(), v.clone());
+            }
+            if matches!(eval_expr(on, &merged)?, Value::Bool(true)) {
+                matched = true;
+                right_matched[ri] = true;
+                out.push(merged);
+            }
+        }
+        if !matched && left_join {
+            let mut merged = l.clone();
+            if let Some(r) = right.first() {
+                for k in r.keys() {
+                    merged.insert(format!("{right_key}.{k}"), Value::Null);
+                }
+            }
+            out.push(merged);
+        }
+    }
+    if right_join {
+        let left_fields = union_of_fields(left);
+        for (ri, r) in qright.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut merged = Object::new();
+                for k in &left_fields {
+                    merged.insert(k.clone(), Value::Null);
+                }
+                for (k, v) in r {
+                    merged.insert(k.clone(), v.clone());
+                }
+                out.push(merged);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn join_rows(
     left: Vec<Object>,
     right: &[Object],
@@ -5650,6 +5977,18 @@ fn join_rows(
     right_join: bool,
     deadline: &StmtDeadline,
 ) -> Result<Vec<Object>> {
+    // Equi-join fast path: an ON whose conjuncts split cleanly across the
+    // join boundary (qualified `l.x = r.y` pairs) indexes the right side and
+    // probes per left row instead of walking every pair. Everything else —
+    // cross joins, non-equi predicates, unqualified/ambiguous ON — keeps the
+    // original nested loop below.
+    if let Some(on) = on {
+        if let Some(plan) = equi_plan(right_key, on) {
+            return hash_join(
+                &left, right, right_key, on, &plan, left_join, right_join, deadline,
+            );
+        }
+    }
     let mut right_matched = vec![false; right.len()];
     let mut out = Vec::new();
     for l in &left {
@@ -9026,6 +9365,108 @@ mod tests {
         run(&mut db, "INSERT INTO y VALUES (3), (4), (5)");
         let r = rows(&mut db, "SELECT x.a, y.b FROM x CROSS JOIN y");
         assert_eq!(r.rows.len(), 6);
+    }
+
+    // ---- hash join path (equi_plan) semantics ----
+
+    #[test]
+    fn hash_join_null_equals_null_matches() {
+        // Engine semantics: `=` is cmp_values-based, so NULL = NULL joins.
+        // The canonical key must include NULL or this pair would be missed.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (k INT, tag TEXT)");
+        run(&mut db, "CREATE TABLE q (k INT, val TEXT)");
+        run(&mut db, "INSERT INTO p VALUES (NULL, 'pnull'), (1, 'p1')");
+        run(
+            &mut db,
+            "INSERT INTO q VALUES (NULL, 'qnull'), (1, 'q1'), (2, 'q2')",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT p.tag, q.val FROM p JOIN q ON p.k = q.k ORDER BY p.tag",
+        );
+        // NULL-NULL pair matches, plus the 1-1 pair; 2 never matches.
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Str("p1".into()), Value::Str("q1".into())]
+        );
+        assert_eq!(
+            r.rows[1],
+            vec![Value::Str("pnull".into()), Value::Str("qnull".into())]
+        );
+    }
+
+    #[test]
+    fn hash_join_mixed_equi_and_residual() {
+        // Equi conjunct indexes the candidates; the residual (x.v <> y.v)
+        // still decides per candidate on the merged row.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE x (id INT, v INT)");
+        run(&mut db, "CREATE TABLE y (id INT, w INT)");
+        run(&mut db, "INSERT INTO x VALUES (1, 10), (2, 20)");
+        run(&mut db, "INSERT INTO y VALUES (1, 99), (1, 10), (2, 5)");
+        let r = rows(
+            &mut db,
+            "SELECT x.id, y.w FROM x JOIN y ON x.id = y.id AND x.v <> y.w ORDER BY y.w",
+        );
+        // (1,10,1,10) is dropped by the residual; (1,10,1,99) and (2,20,2,5) stay.
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0], vec![Value::Int(2), Value::Int(5)]);
+        assert_eq!(r.rows[1], vec![Value::Int(1), Value::Int(99)]);
+    }
+
+    #[test]
+    fn hash_join_int_float_keys_join() {
+        // cmp_values compares Int(3) and Float(3.0) equal; the canonical key
+        // (f64 bits) must keep that pair in the same bucket.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE m (id INT, v TEXT)");
+        run(&mut db, "CREATE TABLE n (id FLOAT, w TEXT)");
+        run(&mut db, "INSERT INTO m VALUES (3, 'mint'), (4, 'mfour')");
+        run(
+            &mut db,
+            "INSERT INTO n VALUES (3.0, 'nthree'), (4.5, 'nhalf')",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT m.v, n.w FROM m JOIN n ON m.id = n.id ORDER BY m.v",
+        );
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Str("mint".into()), Value::Str("nthree".into())]
+        );
+    }
+
+    #[test]
+    fn hash_join_full_outer_and_unqualified_fallback() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE f (id INT, v TEXT)");
+        run(&mut db, "CREATE TABLE g (id INT, w TEXT)");
+        run(&mut db, "INSERT INTO f VALUES (1, 'f1'), (2, 'f2')");
+        run(&mut db, "INSERT INTO g VALUES (2, 'g2'), (3, 'g3')");
+        // FULL OUTER over an equi ON: matched row + one NULL-padded row per side.
+        let r = rows(
+            &mut db,
+            "SELECT f.id, g.id FROM f FULL OUTER JOIN g ON f.id = g.id ORDER BY f.id, g.id",
+        );
+        assert_eq!(r.rows.len(), 3);
+        // ORDER BY defaults NULLs first (smallest).
+        assert_eq!(r.rows[0], vec![Value::Null, Value::Int(3)]);
+        assert_eq!(r.rows[1], vec![Value::Int(1), Value::Null]);
+        assert_eq!(r.rows[2], vec![Value::Int(2), Value::Int(2)]);
+        // Unqualified ON references resolve via suffix matching and are
+        // ambiguous — the nested-loop fallback must keep them correct.
+        run(&mut db, "CREATE TABLE h (id INT, aid INT)");
+        run(&mut db, "INSERT INTO h VALUES (9, 1), (9, 2)");
+        let r = rows(
+            &mut db,
+            "SELECT f.id, h.aid FROM f JOIN h ON f.id = aid ORDER BY f.id",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0], vec![Value::Int(1), Value::Int(1)]);
+        assert_eq!(r.rows[1], vec![Value::Int(2), Value::Int(2)]);
     }
 
     #[test]

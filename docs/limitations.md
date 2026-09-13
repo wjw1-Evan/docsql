@@ -11,7 +11,7 @@
 | 单列之外的索引能力 | 多列(复合)索引已支持(复合 UNIQUE 判重、前导列等值探测);无表达式/部分/JSON 路径索引 | JSON 点读中非前导列条件走全表扫描(JSON_EXTRACT 不走索引) |
 | 无精确 DECIMAL/TIMESTAMP 类型 | 值模型 Int/Float/Str/…;JSON 函数族已补文档点读 | 金额用 Float 有精度取舍;时间按整数毫秒/文本约定 |
 | 集群修复无行级合并 | 重启反熵:增量追赶为主,超窗/分歧转快照采纳(多数派裁决) | 分歧中少数方独有写在快照采纳时被覆盖(文档化策略);修复由重启触发 |
-| 查询优化器原始 | 规则式索引探测(单表无 JOIN 时生效);JOIN 为嵌套循环 | 大表 JOIN/复杂查询成本高;无 EXPLAIN |
+| 查询优化器原始 | 规则式索引探测(单表无 JOIN 时生效);JOIN 等值条件走 hash join(键按 `cmp_values` 归一化,索引是超集、ON 逐候选终裁;等值 JOIN 千行级表毫秒级完成),非等值/无限定列/交叉连接仍嵌套循环 | 非等值 JOIN 成本高;无 EXPLAIN |
 | 备份为逻辑全量 | dump 快照 + keep-N + sha256 校验和 | 无增量备份/PITR;大库备份/恢复 O(数据) |
 
 ## 已具备的商用面
@@ -32,7 +32,7 @@
    (`docs/design/003-mvcc-read-concurrency.md`):server 读级微秒级建视图后锁外执行,
    长查询不再卡写入;快照过旧(写流量把 WAL 推过硬阈值截断)时读取响亮报错可重试;
    附:DECIMAL/TIMESTAMP 类型、JSON 路径索引、VACUUM(溢出链孤儿页回收);
-3. **性能**:JOIN 优化(hash join)、EXPLAIN、统计信息;
+3. **性能**:EXPLAIN、统计信息(JOIN 等值 hash join 已落地,`bench_join` 基准);
 4. **数据安全**:TCP 协议层原生 TLS(控制台已原生支持;数据面走 AES-GCM 帧加密或 TLS 反代/加密卷)、
    增量备份/PITR;
 5. **生态**:Kafka/CDC 连接器、视图与触发器、全文检索。
