@@ -586,7 +586,7 @@ impl Database {
         Ok(())
     }
     pub fn open(path: &std::path::Path) -> Result<Database> {
-        let mut pager = Pager::open(path)?;
+        let pager = Pager::open(path)?;
         // Reserve pages 0 (header) and 1 (catalog); allocate 1 if missing.
         while pager.num_pages() <= CATALOG_PAGE {
             let mut tx = pager.begin_tx();
@@ -9572,7 +9572,7 @@ mod tests {
         )]
         .into();
         {
-            let mut pager = crate::pager::Pager::open(&path).unwrap();
+            let pager = crate::pager::Pager::open(&path).unwrap();
             let mut tx = pager.begin_tx();
             while pager.num_pages() <= CATALOG_PAGE {
                 pager.allocate_page(&mut tx).unwrap();

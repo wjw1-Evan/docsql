@@ -33,16 +33,29 @@ pub enum WalError {
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
+/// CRC-32 (IEEE 802.3, reflected) over a 256-entry table: identical values
+/// to the original bitwise loop, ~8× faster. The bitwise version burned
+/// ~30k iterations per 4 KB page frame right on the commit path.
 fn crc32(data: &[u8]) -> u32 {
-    // Standard CRC-32 (IEEE 802.3, reflected), table computed on the fly
-    // would be slow; use a small constant-time loop over 8 bits per byte.
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
         }
+        t
+    });
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
 }
@@ -65,6 +78,13 @@ pub struct Wal {
     /// Highest commit LSN known durable (fsynced) — only [`Wal::sync`]
     /// advances it, so a deferred commit can lag but never lead durability.
     pub durable_lsn: u64,
+    /// In-memory log size (bytes, header included). Appends and checkpoints
+    /// are the only size changes, so `file_len` needs no `fstat` per commit.
+    appended: u64,
+    /// Checkpoint generation: LSNs restart at 1 after every checkpoint, so a
+    /// snapshot's LSN is only meaningful within its epoch (MVCC stage B).
+    /// Monotonic across checkpoints for the lifetime of the process.
+    epoch: u64,
 }
 
 impl Wal {
@@ -97,6 +117,7 @@ impl Wal {
         file.seek(SeekFrom::Start(0))?;
         file.read_to_end(&mut buf)?;
         let (durable, next) = Self::scan(&buf);
+        let appended = file.metadata()?.len();
         file.seek(SeekFrom::End(0))?;
         Ok(Wal {
             file,
@@ -104,6 +125,8 @@ impl Wal {
             next_lsn: next,
             last_commit_lsn: durable,
             durable_lsn: durable,
+            appended,
+            epoch: 0,
         })
     }
 
@@ -153,9 +176,23 @@ impl Wal {
         &self.path
     }
 
-    /// Current log size in bytes.
+    /// Checkpoint generation (bumped by [`Wal::checkpoint`]). A snapshot's
+    /// LSN is only comparable within its epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Highest appended Commit-frame LSN — the visible head for MVCC
+    /// snapshot reads (deferred commits included: their page images are
+    /// applied to the read surfaces before the append lock is released).
+    pub fn last_commit_lsn(&self) -> u64 {
+        self.last_commit_lsn
+    }
+
+    /// Current log size in bytes (in-memory counter: appends and
+    /// checkpoints are the only size changes after `open`).
     pub fn file_len(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.appended)
     }
 
     fn append(&mut self, kind: u8, txid: u64, payload: &[u8]) -> Result<u64> {
@@ -169,6 +206,7 @@ impl Wal {
         let crc = crc32(&frame[8..]);
         frame.extend_from_slice(&crc.to_le_bytes());
         self.file.write_all(&frame)?;
+        self.appended += frame.len() as u64;
         self.next_lsn += 1;
         Ok(lsn)
     }
@@ -246,6 +284,8 @@ impl Wal {
         self.durable_lsn = 0;
         self.last_commit_lsn = 0;
         self.next_lsn = 1;
+        self.appended = HEADER.len() as u64;
+        self.epoch += 1;
         Ok(())
     }
 }
@@ -297,6 +337,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("test.wal");
         (dir, p)
+    }
+
+    #[test]
+    fn crc32_known_answer() {
+        // Standard CRC-32 check value: pins the table-driven implementation
+        // to byte-identical output of the original bitwise loop (WAL frames
+        // written by older versions must keep verifying).
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]

@@ -1,10 +1,14 @@
 # 设计说明:MVCC / 读写并发(分阶段路线)
 
-状态:**设计定稿;阶段 A 第一步(pager 读取去借用化)已落地**——`read_page` 改为
-owned 返回,新增 `read_page_shared(&self)`(pool/file 走 Mutex,共享读者并发取页),
-heap/btree 的全部读方法已接受 `&Pager`;engine 的 `table_docs`/`table_pairs`/
-`index_probe`/`heap_of` 读路径同步去 `&mut`。下一步是 §2.2 的 SELECT 执行链
-`&self` 化(`exec_select` 的 CTE 写入状态参数化)与 §2.3 的服务器锁分级。
+状态:**设计定稿;阶段 A 已全部落地**(pager 读取去借用化 + SELECT 执行链
+`&self` 化 + `ServerState.db: RwLock` 锁分级,读-读并发);**阶段 B 第一步
+(pager 层快照读机制)已落地**——pager 全方法 `&self` 化(WAL/pending/页数/
+页 LSN 内部锁),WAL 引入 checkpoint epoch,新增 `begin_snapshot`/
+`read_page_as_of`/`end_snapshot`(快照 = epoch + commit-head LSN;快速路径
+= 页 LSN ≤ 快照直接用当前版本,慢速路径 = 一次 WAL 扫描物化全部页的 as-of
+镜像并缓存;软截断给活跃快照让位,硬阈值流控优先、截断后旧快照响亮报
+`SnapshotTooOld`)。剩余工作:§3.2 的引擎侧 `ReadCx`(catalog 快照 + pager
+Arc 化)与服务器侧「微秒级短锁建视图、SELECT 全程锁外」改造。
 本文是权威设计;任何并发/可见性相关改动先对照本文的兼容矩阵。
 
 ## 0. 现状(精确事实)

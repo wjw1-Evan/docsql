@@ -53,7 +53,7 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 
 ## 关键机制与红线(改代码前必读)
 
-1. **WAL/pager 顺序** — 一切落盘经 pager;先写 WAL 再应用页面;事务内的页面回写延迟到 WAL fsync 之后(防数据页领先日志)。动 pager 提交路径保持该顺序。
+1. **WAL/pager 顺序** — 一切落盘经 pager;先写 WAL 再应用页面;事务内的页面回写延迟到 WAL fsync 之后(防数据页领先日志)。动 pager 提交路径保持该顺序。checkpoint 已后台化(pager.rs:软阈值 8MB 请求后台线程 fsync 数据文件,硬阈值 64MB 写路径停等一次覆盖全日志的 fsync 后内联截断;ckpt 线程只 fsync 自有 dup 句柄,不碰 WAL/池/pending_writes),**WAL 截断仍必须发生在覆盖全日志的数据文件 fsync 之后**;页数增长经 `persisted_pages` 记账即时持久化进页头,否则 WAL 截断后重启丢页数(2026-09-13 修复的既有缺陷)。**pager 全方法 `&self`**(WAL/pending/页数/页 LSN 均内部锁;写串行仍由引擎写锁保证),供 MVCC 阶段 B 快照读共享:`begin_snapshot`/`read_page_as_of`/`end_snapshot` + WAL epoch(checkpoint 归零 LSN,快照按 epoch+LSN 定位);**软截断在有活跃快照时让位**(快照的 as-of 页历史只在 WAL),硬阈值流控优先、照常截断,被截断的快照在其后响亮报 `SnapshotTooOld`,绝不静默回退新版本页;提交路径在 WAL 锁内完成「append+commit+读面应用」(池/pending/页 LSN),快照 begin 读 commit head 与页面可见性由此原子。
 2. **编码 ≠ 排序** — `core/encode.rs` 只保证往返一致;排序统一走 `Value::cmp_values`(B+树/ORDER BY/DISTINCT)。新增值类型必须同时扩展编码与 `cmp_values`,否则索引序被破坏。DISTINCT/UNION 按编码字节判重:Int(3) 与 Float(3.0) 比较相等但不会互相去重。**复合索引的键 = `Value::Array` 按列序**(cmp_values 逐元素字典序,设计见 `docs/design/001-composite-indexes.md`):index_roots 键已泛化为 root_key(单列=列名,复合=索引名,旧卷零迁移),一切索引键构造/唯一判定必须走 `TableMeta::index_columns_of` + `index_key_of` + `root_key_unique`,勿回退按列名直取;复合 UNIQUE 的树级判重不进 meta.unique;OR REPLACE/IGNORE 的位移机制只认约束列,复合唯一冲突直接报错(明示语义)。
 3. **自动索引是派生展示** — PK/表声明 UNIQUE 的 B+ 树随建表创建(`index_roots`);`catalog()` 按 `primary_key`+`constraint_unique` 派生 `sqlite_autoindex_<表>_<n>`(不落 catalog,旧卷零迁移、各节点重算一致);`DROP INDEX`/`CREATE INDEX` 对该前缀显式报错;`sqlite_master` 不列自动索引(EF SchemaSync 只看 sqlite_master 且只回收 `IX_` 前缀)。
 4. **B+ 树边界** — 分裂按序列化字节驱动(超页即分裂);单键编码超半页(~2KB)报 KeyTooLarge;等键 run 可横跨分裂点,查找/删除靠 `candidate_children` 对名义区间覆盖该键的子树兜底——不要假设等键同叶。
