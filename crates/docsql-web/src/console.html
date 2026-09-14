@@ -78,9 +78,18 @@ button.danger { color:var(--err); }
   /* ---------- 主区域 ---------- */
   #main { flex: 1; display: flex; min-height: 0; }
   #explorer {
-    width: 268px; min-width: 180px; background: #fff; border-right: 1px solid var(--border);
+    width: 268px; min-width: 180px; background: #fff;
     display: flex; flex-direction: column; flex: none;
   }
+  /* ---------- 布局分隔条(拖动调整各块大小)---------- */
+  .splitter { flex: none; z-index: 20; touch-action: none; }
+  .splitter.v { width: 5px; cursor: col-resize; background: var(--chrome);
+                border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+  .splitter.h { height: 5px; cursor: row-resize; background: var(--chrome);
+                border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .splitter:hover, .splitter.drag { background: var(--accent); border-color: var(--accent-dk); }
+  body.resizing-x, body.resizing-x * { cursor: col-resize !important; }
+  body.resizing-y, body.resizing-y * { cursor: row-resize !important; }
   .panel-title {
     background: var(--chrome); border-bottom: 1px solid var(--border); padding: 5px 10px;
     font-weight: 600; color: var(--txt2); display: flex; align-items: center; gap: 6px;
@@ -136,8 +145,7 @@ button.danger { color:var(--err); }
 
   /* ---------- 查询编辑器 ---------- */
   .q-wrap { flex: 1; display: flex; flex-direction: column; min-height: 120px; }
-  .editor { flex: 1.2; display: flex; min-height: 90px; background: #fff; overflow: hidden;
-            border-bottom: 2px solid var(--border); }
+  .editor { flex: 1.2; display: flex; min-height: 90px; background: #fff; overflow: hidden; }
   .gutter {
     flex: none; width: 44px; background: var(--chrome); border-right: 1px solid var(--border2);
     overflow: hidden; text-align: right; padding: 6px 6px 6px 0;
@@ -332,6 +340,7 @@ button.danger { color:var(--err); }
     </div>
     <div id="tree"></div>
   </div>
+  <div class="splitter v" id="split-explorer" title="拖动调整对象资源管理器宽度,双击恢复默认"></div>
   <div id="docarea">
     <div id="tabstrip"></div>
     <div id="tabcontent"></div>
@@ -1160,6 +1169,116 @@ function dropIndex(tableName, indexName) {
   });
 }
 
+/* ================= 布局分隔条(拖动调整各块大小)================= */
+// 对象资源管理器(左栏)与查询编辑器/结果区之间的分隔条:按住拖动调整,
+// 双击恢复默认;尺寸保存在 localStorage,刷新/新标签页后沿用。编辑器与
+// 结果区用 flex 权重按比例分配高度,窗口缩放时保持用户设定的比例。
+const layout = {
+  EXPLORER_MIN: 180, EXPLORER_MAX: 720, EXPLORER_RESERVE: 320,
+  EDITOR_MIN: 90, RESULT_MIN: 60, EDITOR_DEFAULT: 1.2 / 2.2,
+  expW: 0,          // 0 = 使用 CSS 默认宽度(268px)
+  editorRatio: 0,   // 编辑器占 q-wrap 可用高度的比例;0 = 默认(1.2:1)
+  boot() {
+    this.expW = this._num('docsql.ui.explorerW');
+    this.editorRatio = this._ratio('docsql.ui.editorRatio') || this.EDITOR_DEFAULT;
+    this.applyExplorer();
+    this.bindExplorer();
+    this.bindEditor();
+    window.addEventListener('resize', () => this.onExplorerResize());
+  },
+  _num(key) { const v = parseFloat(localStorage.getItem(key)); return Number.isFinite(v) && v > 0 ? v : 0; },
+  _ratio(key) { const v = parseFloat(localStorage.getItem(key)); return Number.isFinite(v) ? Math.min(0.9, Math.max(0.1, v)) : 0; },
+
+  clampExplorer(w) {
+    const max = Math.max(this.EXPLORER_MIN, Math.min(this.EXPLORER_MAX, innerWidth - this.EXPLORER_RESERVE));
+    return Math.max(this.EXPLORER_MIN, Math.min(max, Math.round(w)));
+  },
+  applyExplorer() {
+    $('#explorer').style.width = this.expW > 0 ? this.clampExplorer(this.expW) + 'px' : '';
+  },
+  // 窗口变窄时按上限收缩(不覆盖保存值),恢复宽窗口后回到用户设定宽度。
+  onExplorerResize() { if (this.expW > 0) this.applyExplorer(); },
+  bindExplorer() {
+    const el = $('#split-explorer');
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      const startX = e.clientX;
+      const base = $('#explorer').getBoundingClientRect().width;
+      this._drag(el, e, 'resizing-x', (ev) => {
+        $('#explorer').style.width = this.clampExplorer(base + ev.clientX - startX) + 'px';
+      }, () => {
+        this.expW = this.clampExplorer($('#explorer').getBoundingClientRect().width);
+        localStorage.setItem('docsql.ui.explorerW', String(this.expW));
+      });
+    });
+    el.addEventListener('dblclick', () => {
+      this.expW = 0;
+      localStorage.removeItem('docsql.ui.explorerW');
+      this.applyExplorer();
+      ui.toast('对象资源管理器宽度已恢复默认');
+    });
+  },
+
+  // 用 flex 权重分配高度:权重之和 = 可用高度(px 等比例),拖动跟手,
+  // 窗口缩放时按同一比例重新分配;min-height 兜底防止拖没。
+  applyEditor(scope) {
+    const host = $('.ed-host', scope), res = $('.res-wrap', scope);
+    if (!host || !res) return;
+    const r = this.editorRatio || this.EDITOR_DEFAULT;
+    host.style.flex = `${r.toFixed(4)} 1 0px`;
+    res.style.flex = `${(1 - r).toFixed(4)} 1 0px`;
+  },
+  applyEditorAll() { tabs.byKind('query').forEach(t => this.applyEditor(t.el)); },
+  bindEditor() {
+    // 查询标签页动态创建:分隔条经事件委托统一绑定,不逐页挂载。
+    $('#tabcontent').addEventListener('pointerdown', (e) => {
+      const el = e.target.closest('.splitter.h');
+      if (!el || e.button !== 0) return;
+      const host = $('.ed-host', el.parentElement), res = $('.res-wrap', el.parentElement);
+      if (!host || !res) return;
+      const startY = e.clientY;
+      const baseE = host.getBoundingClientRect().height;
+      const total = baseE + res.getBoundingClientRect().height;
+      const apply = (y) => {
+        const h = Math.max(this.EDITOR_MIN, Math.min(total - this.RESULT_MIN, baseE + y - startY));
+        host.style.flex = `${h} 1 0px`;
+        res.style.flex = `${Math.max(1, total - h)} 1 0px`;
+        this.editorRatio = h / total;
+      };
+      this._drag(el, e, 'resizing-y', (ev) => apply(ev.clientY), () => {
+        localStorage.setItem('docsql.ui.editorRatio', this.editorRatio.toFixed(4));
+        this.applyEditorAll();
+      });
+    });
+    $('#tabcontent').addEventListener('dblclick', (e) => {
+      if (!e.target.closest('.splitter.h')) return;
+      this.editorRatio = this.EDITOR_DEFAULT;
+      localStorage.removeItem('docsql.ui.editorRatio');
+      this.applyEditorAll();
+      ui.toast('编辑器高度已恢复默认比例');
+    });
+  },
+
+  _drag(el, e, cls, move, done) {
+    el.setPointerCapture(e.pointerId);
+    el.classList.add('drag');
+    document.body.classList.add(cls);
+    const onMove = (ev) => move(ev);
+    const onUp = () => {
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      el.removeEventListener('pointercancel', onUp);
+      el.classList.remove('drag');
+      document.body.classList.remove(cls);
+      if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+      if (done) done();
+    };
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+  },
+};
+
 /* ================= 标签页管理 ================= */
 const tabs = {
   list: [], active: null, seq: 0,
@@ -1328,6 +1447,7 @@ function openQueryTab(title, sql, autoRun) {
         <span class="meta">F5 执行 · Ctrl+F5 分析 · 批量语句将依次执行并返回全部结果</span>
       </div>
       <div class="q-wrap"><div class="ed-host" style="flex:1.2;display:flex;min-height:90px;flex-direction:column"></div>
+      <div class="splitter h" title="拖动调整编辑器与结果区高度,双击恢复默认"></div>
       <div class="res-wrap">
         <div class="res-tabs">
           <div class="res-tab active" data-rt="results">结果</div>
@@ -1337,6 +1457,7 @@ function openQueryTab(title, sql, autoRun) {
         <div class="res-pane" data-rp="messages"><div class="msg-list"></div></div>
       </div></div>`;
     t.editor = makeEditor($('.ed-host', t.el), sql || '');
+    layout.applyEditor(t.el);
     t.msg = (text, cls) => { const d = document.createElement('div');
       if (cls) d.className = 'm-' + cls; d.textContent = text;
       $('[data-rp="messages"] .msg-list', t.el).appendChild(d);
@@ -2414,7 +2535,7 @@ $$('.menu-drop [data-act]').forEach(item => {
 /* ================= 启动 ================= */
 // 控制台账号门激活时,先完成 设置/登录(startApp 由 authGate 回调),
 // 否则直接进入。
-function startApp() { openDashboard(); explorer.refresh(); nodes.boot(); }
+function startApp() { layout.boot(); openDashboard(); explorer.refresh(); nodes.boot(); }
 explorer.bind();
 (async () => { if (await authGate.boot()) startApp(); })();
 $('#auth-ok').onclick = () => authGate.submit();

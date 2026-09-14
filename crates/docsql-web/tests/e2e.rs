@@ -290,7 +290,10 @@ async fn console_page_served_over_http() {
     assert!(html.contains("newIndexDialog")); // index management present
     assert!(html.contains("editIndexDialog"));
     assert!(html.contains("autoIndexScript")); // read-only constraint autoindexes
-                                               // The API surface is JSON-only: a bare GET on it is rejected.
+    assert!(html.contains("split-explorer")); // draggable explorer width splitter
+    assert!(html.contains("docsql.ui.editorRatio")); // draggable editor/results split
+
+    // The API surface is JSON-only: a bare GET on it is rejected.
     let res = http(&addr, "GET", "/api/sql", None, None).await;
     assert_eq!(res.status, 405);
 }
