@@ -4788,3 +4788,89 @@ async fn long_read_does_not_block_writes() {
         .unwrap();
     assert_eq!(n, 705);
 }
+
+/// Transport-encryption gate: with a pre-shared key configured, plaintext
+/// frames are refused, a frame sealed with the wrong key is refused, and a
+/// correctly sealed frame round-trips.
+#[tokio::test]
+async fn transport_key_requires_sealed_frames() {
+    use docsql_server::crypto::{self, FLAG_ENCRYPTED};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("enc.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let key: crypto::TransportKey = [0x42; 32];
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: Some(key),
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        statement_timeout_ms: 0,
+    }));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Plaintext frame on a keyed server: refused (response itself is sealed).
+    let mut c = Client::connect(&addr).await;
+    c.send(&Frame::new(
+        proto::REQ_SQL,
+        proto::encode_sql("SELECT 1").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert_ne!(f.flags & FLAG_ENCRYPTED, 0);
+    let msg = String::from_utf8(crypto::open(&key, &f.payload).unwrap()).unwrap();
+    assert!(msg.contains("transport encrypted"), "{msg}");
+
+    // Sealed with the wrong key: refused before touching the engine.
+    let mut c = Client::connect(&addr).await;
+    let bad: crypto::TransportKey = [0x41; 32];
+    c.send(&Frame {
+        frame_type: proto::REQ_SQL,
+        flags: FLAG_ENCRYPTED,
+        topology_version: 0,
+        payload: crypto::seal(&bad, &proto::encode_sql("SELECT 1").unwrap()),
+    })
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let msg = String::from_utf8(crypto::open(&key, &f.payload).unwrap()).unwrap();
+    assert!(msg.contains("decrypt failed"), "{msg}");
+
+    // Correctly sealed frame: normal SQL execution.
+    let mut c = Client::connect(&addr).await;
+    c.send(&Frame {
+        frame_type: proto::REQ_SQL,
+        flags: FLAG_ENCRYPTED,
+        topology_version: 0,
+        payload: crypto::seal(&key, &proto::encode_sql("SELECT 1").unwrap()),
+    })
+    .await;
+    let f = c.recv().await;
+    assert_ne!(f.flags & FLAG_ENCRYPTED, 0);
+    let plaintext = crypto::open(&key, &f.payload).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(v["columns"][0], "1");
+    assert_eq!(v["rows"][0][0], 1);
+}

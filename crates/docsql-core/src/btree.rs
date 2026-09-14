@@ -895,6 +895,32 @@ mod tests {
     }
 
     #[test]
+    fn deep_tree_splits_internal_nodes_and_keeps_every_key() {
+        let (_d, pager) = fresh("bt-deep.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&pager, &mut tx).unwrap();
+        // Long keys keep the fan-out low (~20 entries per page), so a couple
+        // of thousand inserts push the root past one page and exercise the
+        // internal split path, not just leaf splits.
+        let key = |i: i64| Value::Str(format!("key-{i:0>180}"));
+        for i in 0..2000i64 {
+            tree.insert(&pager, &mut tx, key(i), i as u64, true)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let reader = PageReader::current(&pager);
+        for i in (0..2000i64).step_by(37) {
+            assert_eq!(tree.get(&reader, &tx, &key(i)).unwrap(), Some(i as u64));
+        }
+        let all = tree.scan(&reader, &tx).unwrap();
+        assert_eq!(all.len(), 2000);
+        assert!(all
+            .windows(2)
+            .all(|w| Value::cmp_values(&w[0].0, &w[1].0) == std::cmp::Ordering::Less));
+    }
+
+    #[test]
     fn capped_scans_stop_at_max() {
         let (_d, pager) = fresh("bt10.db");
         let mut tx = pager.begin_tx();

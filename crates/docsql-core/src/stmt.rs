@@ -254,4 +254,36 @@ mod tests {
         let sql = "'' x";
         assert_eq!(sql_literal_end(sql, 0), (2, true));
     }
+
+    #[test]
+    fn literal_and_identifier_quoting_doubles_embedded_quotes() {
+        assert_eq!(sql_string_literal("O'Brien"), "'O''Brien'");
+        // A value that would otherwise close the literal stays data.
+        assert_eq!(
+            sql_string_literal("'; DROP TABLE t; --"),
+            "'''; DROP TABLE t; --'"
+        );
+        assert_eq!(sql_quote_ident(r#"we"ird"#), r#""we""ird""#);
+    }
+
+    #[test]
+    fn comments_never_split_statements() {
+        // `;` inside line and block comments stays inside its statement.
+        let v = split_statements("SELECT 1 -- one; two\n; SELECT 2").unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v[0].to_uppercase().contains("SELECT 1"));
+        assert!(v[1].to_uppercase().contains("SELECT 2"));
+        let v = split_statements("SELECT 1 /* a; b */; SELECT 2").unwrap();
+        assert_eq!(v.len(), 2);
+        // A single user-management statement (hand-parsed, not sqlparser
+        // grammar) passes through verbatim.
+        assert_eq!(
+            split_statements("CREATE USER u PASSWORD 'p'").unwrap(),
+            vec!["CREATE USER u PASSWORD 'p'"]
+        );
+        // Comment-only input parses to zero statements: explicit error, not
+        // an empty batch.
+        assert!(split_statements("/* only a comment */").is_err());
+        assert!(split_statements("/* a */; /* b */").is_err());
+    }
 }

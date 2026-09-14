@@ -470,4 +470,63 @@ mod tests {
         assert_eq!(parse_logs_limit(br#"{"limit": 999999}"#), LOGS_MAX_LIMIT);
         assert_eq!(parse_logs_limit(br#"{"limit": 0}"#), 1);
     }
+
+    fn log_with_sink(log_file: Option<String>) -> QueryLog {
+        QueryLog {
+            ring: Mutex::new(VecDeque::new()),
+            sink: Mutex::new(None),
+            sink_warned: std::sync::atomic::AtomicBool::new(false),
+            capacity: 10,
+            slow_ms: 1000.0,
+            log_file,
+        }
+    }
+
+    #[test]
+    fn jsonl_sink_appends_every_entry_and_keeps_the_handle_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let q = log_with_sink(Some(path.to_string_lossy().to_string()));
+        q.push(entry(7, "SELECT 1"));
+        q.push(entry(8, "SELECT 2"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // The lazy-open sink stays open across pushes: two appends, no truncate.
+        assert_eq!(lines.len(), 2);
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["ts_ms"], 7);
+        assert_eq!(v["peer"], "a");
+        assert_eq!(v["sql"], "SELECT 1");
+        assert_eq!(v["ms"], 1.0);
+        assert_eq!(v["affected"], 1);
+        assert_eq!(v["error"], serde_json::Value::Null);
+        assert_eq!(v["replicated"], false);
+        assert!(text.contains("SELECT 2"), "{text}");
+    }
+
+    #[test]
+    fn jsonl_sink_open_failure_keeps_the_ring_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory can never be opened as an append sink.
+        let q = log_with_sink(Some(dir.path().to_string_lossy().to_string()));
+        q.push(entry(1, "SELECT 1"));
+        q.push(entry(2, "SELECT 2"));
+        // A broken audit sink must not lose the in-memory trail, and the
+        // failure is latched so it is reported once, not per statement.
+        assert_eq!(q.snapshot().len(), 2);
+        assert!(q.sink_warned.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn word_tokens_skip_literals_comments_and_unterminated_blocks() {
+        let sql = "select 'a b -- not a comment' from /* drop table x */ t -- tail";
+        let toks = word_tokens(sql);
+        let words: Vec<&str> = toks.iter().map(|(s, e)| &sql[*s..*e]).collect();
+        assert_eq!(words, vec!["select", "from", "t"]);
+        // An unterminated block comment consumes the remainder safely.
+        let sql = "select /* never closed";
+        let toks = word_tokens(sql);
+        let words: Vec<&str> = toks.iter().map(|(s, e)| &sql[*s..*e]).collect();
+        assert_eq!(words, vec!["select"]);
+    }
 }

@@ -1294,4 +1294,20 @@ mod tests {
         );
         assert!(user.is_none());
     }
+
+    #[test]
+    fn print_push_renders_pubsub_payloads() {
+        // RESP_PUSH JSON bodies render message/pmessage lines; any other
+        // body falls back to raw text (smoke: must not panic).
+        print_push(&Frame::new(
+            proto::RESP_PUSH,
+            br#"{"kind":"message","channel":"news","id":7,"payload":"hi"}"#.to_vec(),
+        ));
+        print_push(&Frame::new(
+            proto::RESP_PUSH,
+            br#"{"kind":"pmessage","pattern":"n.*","channel":"news","id":8,"payload":"yo"}"#
+                .to_vec(),
+        ));
+        print_push(&Frame::new(proto::RESP_PUSH, b"plain".to_vec()));
+    }
 }

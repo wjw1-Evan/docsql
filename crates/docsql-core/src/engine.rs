@@ -13266,6 +13266,45 @@ mod tests {
     }
 
     #[test]
+    fn indexed_window_descending_probe_eq_and_composite_prefix() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, v INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_v ON t (v)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 2), (2, 2), (3, 1), (4, 3)",
+        );
+        // DESC window with an equality probe (Eq plan, reverse walk). Ties
+        // on the probe key have unspecified order, so compare as a set.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE v = 2 ORDER BY v DESC LIMIT 2",
+        );
+        let mut got: Vec<i64> = r.rows.iter().map(|row| row[0].as_i64().unwrap()).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+
+        run(
+            &mut db,
+            "CREATE TABLE c (id INT PRIMARY KEY NOT NULL, a INT NOT NULL, b INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_ab ON c (a, b)");
+        run(
+            &mut db,
+            "INSERT INTO c VALUES (1, 1, 2), (2, 2, 1), (3, 1, 1), (4, 1, 3), (5, 2, 2)",
+        );
+        // Composite equality prefix in descending order (Prefix plan, reverse).
+        let r = rows(
+            &mut db,
+            "SELECT id FROM c WHERE a = 1 ORDER BY a DESC, b DESC LIMIT 2",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(4)], vec![Value::Int(1)]]);
+    }
+
+    #[test]
     fn order_by_composite_index_walk_and_mixed_direction_fallback() {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -17271,6 +17310,37 @@ mod complex_query_tests {
         );
         // Non-query statements carry no read targets.
         assert_eq!(read("CREATE TABLE t (id INT)"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn stmt_write_targets_classification() {
+        // The server's system-table gate classifies on this: every mutating
+        // statement arm lists its target table (and any RENAME destination),
+        // never the tables it merely reads — so a literal mentioning a
+        // system table is not refused while a write aimed at one still is.
+        let parse = |sql: &str| {
+            let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+            stmts.swap_remove(0)
+        };
+        let write = |sql: &str| Database::stmt_write_targets(&parse(sql));
+
+        assert_eq!(write("INSERT INTO t VALUES (1)"), vec!["t"]);
+        assert_eq!(
+            write("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE"),
+            vec!["t"]
+        );
+        assert_eq!(write("UPDATE t SET a = 1"), vec!["t"]);
+        assert_eq!(write("DELETE FROM t WHERE a = 1"), vec!["t"]);
+        assert_eq!(write("CREATE TABLE t (a INT)"), vec!["t"]);
+        assert_eq!(write("CREATE VIEW v AS SELECT 1"), vec!["v"]);
+        assert_eq!(write("CREATE INDEX i ON t (a)"), vec!["t"]);
+        assert_eq!(write("DROP TABLE t"), vec!["t"]);
+        assert_eq!(write("ALTER TABLE t RENAME TO t2"), vec!["t", "t2"]);
+        assert_eq!(write("ALTER TABLE t ADD COLUMN c INT"), vec!["t"]);
+        assert_eq!(write("TRUNCATE TABLE t"), vec!["t"]);
+        // Reads and transaction control are not writes.
+        assert_eq!(write("SELECT * FROM t"), Vec::<String>::new());
+        assert_eq!(write("BEGIN"), Vec::<String>::new());
     }
 
     #[test]

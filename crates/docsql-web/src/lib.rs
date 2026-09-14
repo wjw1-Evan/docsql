@@ -2152,6 +2152,41 @@ mod tests {
         assert!(e["error"].as_str().unwrap().contains("未配置管理目标节点"));
     }
 
+    /// Login-lockout buckets follow X-Forwarded-For only when the deployment
+    /// opts into a trusted reverse proxy; otherwise the client-supplied
+    /// header is ignored, and a malformed/missing header always falls back
+    /// to the direct socket peer.
+    #[test]
+    fn lockout_key_trusts_forwarded_for_only_when_configured() {
+        let state = WebState {
+            upstream: Some("node-a:7600".into()),
+            token: None,
+            peers: vec!["node-a:7600".into()],
+            query_log: querylog::QueryLog::new(),
+            sync_log: querylog::SyncLog::new(1),
+            auth: None,
+            trust_proxy: false,
+            http_requests: Mutex::new(std::collections::HashMap::new()),
+        };
+        let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
+        let client: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", "203.0.113.9, 10.0.0.1".parse().unwrap());
+        // Without the flag the header is attacker-controlled: keep the peer.
+        assert_eq!(lockout_key(&state, &headers, peer), peer.ip());
+        // With the flag the first forwarded hop owns the bucket.
+        let trusted = WebState {
+            trust_proxy: true,
+            ..state
+        };
+        assert_eq!(lockout_key(&trusted, &headers, peer), client);
+        // Malformed first hop or missing header: no bucket confusion.
+        headers.insert("X-Forwarded-For", "not-an-ip, 10.0.0.1".parse().unwrap());
+        assert_eq!(lockout_key(&trusted, &headers, peer), peer.ip());
+        headers.remove("X-Forwarded-For");
+        assert_eq!(lockout_key(&trusted, &headers, peer), peer.ip());
+    }
+
     #[tokio::test]
     async fn cluster_endpoint_reports_default_node() {
         let state = Arc::new(WebState {

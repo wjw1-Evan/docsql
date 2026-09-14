@@ -381,9 +381,16 @@ public sealed class SqlSurfaceTests : IClassFixture<ServerFixture>
         Exec("INSERT OR IGNORE INTO up_t VALUES (1, 'z')");
         Assert.Equal("b", Scalar("SELECT v FROM up_t WHERE id = 1"));
         // ON CONFLICT DO NOTHING 同 OR IGNORE 语义。
-        Exec("INSERT INTO up_t VALUES (1, 'w') ON CONFLICT (id) DO NOTHING");
+        Exec("INSERT INTO up_t VALUES (1, 'w') ON CONFLICT DO NOTHING");
         Assert.Equal("b", Scalar("SELECT v FROM up_t WHERE id = 1"));
         Assert.Equal(1L, Long("SELECT COUNT(*) FROM up_t"));
+        // 目标列形式限定跳过的唯一约束:命中目标约束时跳过该行。
+        Exec("INSERT INTO up_t VALUES (1, 'w') ON CONFLICT (id) DO NOTHING");
+        Assert.Equal(1L, Long("SELECT COUNT(*) FROM up_t"));
+        // 目标列不匹配任何唯一约束时显式报错,不静默扩大范围。
+        var ex = Assert.Throws<DocsqlException>(
+            () => Exec("INSERT INTO up_t VALUES (2, 'x') ON CONFLICT (v) DO NOTHING"));
+        Assert.Contains("no unique constraint", ex.Message);
     }
 
     [Fact]
