@@ -8908,6 +8908,247 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reopen_roundtrips_constraints_and_overflow_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cattrip.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(
+                &mut db,
+                "CREATE TABLE parent (pid INT PRIMARY KEY, tag TEXT)",
+            );
+            run(
+                &mut db,
+                "CREATE TABLE child (id INT PRIMARY KEY AUTOINCREMENT, pid INT, \
+                 note TEXT DEFAULT ('n/a'), flag BOOL, \
+                 CHECK (id >= 0), FOREIGN KEY (pid) REFERENCES parent (pid))",
+            );
+            run(
+                &mut db,
+                "CREATE UNIQUE INDEX ux_child_pair ON child (note, flag)",
+            );
+            run(&mut db, "INSERT INTO parent VALUES (1, 'a')");
+            run(
+                &mut db,
+                "INSERT INTO child (pid, note, flag) VALUES (1, 'n1', true)",
+            );
+            // Overflow-chain document, then freed so overflow_free is non-empty.
+            let long = "x".repeat(20_000);
+            run(
+                &mut db,
+                &format!(
+                    "INSERT INTO child (pid, note, flag, blob) VALUES (1, 'long', false, '{long}')"
+                ),
+            );
+            run(&mut db, "DELETE FROM child WHERE flag = false");
+        }
+        let mut db = Database::open(&path).unwrap();
+        // The composite index is a pair, not per-column uniqueness: repeating
+        // row 1's note with a different flag is fine...
+        run(&mut db, "INSERT INTO parent VALUES (2, 'b')");
+        run(
+            &mut db,
+            "INSERT INTO child (pid, note, flag) VALUES (2, 'n1', false)",
+        );
+        assert!(
+            db.execute("INSERT INTO child (pid) VALUES (99)").is_err(),
+            "FK lost"
+        );
+        assert!(
+            db.execute("INSERT INTO child (id, pid) VALUES (-1, 2)")
+                .is_err(),
+            "CHECK lost"
+        );
+        // ...but the exact pair is a duplicate.
+        assert!(
+            db.execute("INSERT INTO child (pid, note, flag) VALUES (2, 'n1', false)")
+                .is_err(),
+            "composite UNIQUE lost"
+        );
+        // DEFAULT and AUTOINCREMENT survived reopen.
+        run(&mut db, "INSERT INTO child (pid, flag) VALUES (2, true)");
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT note, id FROM child WHERE flag = true AND pid = 2"
+            )
+            .rows[0],
+            vec![Value::Str("n/a".into()), Value::Int(3)]
+        );
+    }
+
+    #[test]
+    fn join_key_of_covers_every_value_kind() {
+        assert_eq!(join_key_of(&Value::Null), Some(JoinKey::Null));
+        assert_eq!(join_key_of(&Value::Bool(false)), Some(JoinKey::Bool(false)));
+        assert_eq!(
+            join_key_of(&Value::Int(7)),
+            Some(JoinKey::Num(num_key(7.0)))
+        );
+        assert_eq!(
+            join_key_of(&Value::Float(-0.5)),
+            Some(JoinKey::Num(num_key(-0.5)))
+        );
+        assert_eq!(
+            join_key_of(&Value::Str("k".into())),
+            Some(JoinKey::Str("k".into()))
+        );
+        assert_eq!(
+            join_key_of(&Value::Bytes(vec![1, 2])),
+            Some(JoinKey::Bytes(vec![1, 2]))
+        );
+        assert_eq!(
+            join_key_of(&Value::Array(vec![Value::Int(1), Value::Str("a".into())])),
+            Some(JoinKey::Array(vec![
+                JoinKey::Num(num_key(1.0)),
+                JoinKey::Str("a".into())
+            ]))
+        );
+        // A nested item that has no key (Object) degrades the whole array.
+        assert_eq!(
+            join_key_of(&Value::Array(vec![Value::Object(Object::new())])),
+            None
+        );
+        assert_eq!(join_key_of(&Value::Object(Object::new())), None);
+    }
+
+    fn parse_select_expr(sql: &str) -> SqlExpr {
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, &format!("SELECT {sql}")).unwrap();
+        let Statement::Query(q) = stmts.swap_remove(0) else {
+            panic!("not a query")
+        };
+        let SetExpr::Select(boxed) = *q.body else {
+            panic!("not a select")
+        };
+        let SelectItem::UnnamedExpr(e) = boxed.projection.first().unwrap() else {
+            panic!("not a bare expression")
+        };
+        e.clone()
+    }
+
+    #[test]
+    fn walk_expr_accepts_shapes_in_read_targets() {
+        // UPDATE-shaped statements route WHERE through walk_expr; every
+        // supported shape keeps the statement classifiable as a read-write.
+        let ok = |sql: &str| {
+            let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+            let stmt = stmts.swap_remove(0);
+            assert!(
+                Database::stmt_read_targets(&stmt).is_some(),
+                "read-target classifier rejected supported shape: {sql}"
+            );
+        };
+        ok("UPDATE t SET v = 1 WHERE CASE s WHEN 1 THEN v = 2 ELSE v = 3 END");
+        ok("UPDATE t SET v = 1 WHERE SUBSTRING(name FROM 1 FOR 2) = 'a'");
+        ok("UPDATE t SET v = 1 WHERE COALESCE(n, 0) < 5");
+        ok("UPDATE t SET v = 1 WHERE n BETWEEN 1 AND 3");
+        ok("UPDATE t SET v = 1 WHERE id IN (SELECT id FROM other)");
+        // Rare shapes (tuples/ANY/...) are denied fail-closed.
+        let mut out = Vec::new();
+        assert!(walk_expr(&parse_select_expr("(1, 2)"), &mut out).is_none());
+        // The parser never emits `Substring` under the generic dialect, so
+        // walk its from/for arms directly.
+        let sub = SqlExpr::Substring {
+            expr: Box::new(parse_select_expr("name")),
+            substring_from: Some(Box::new(parse_select_expr("2"))),
+            substring_for: Some(Box::new(parse_select_expr("4"))),
+            special: false,
+            shorthand: false,
+        };
+        let mut out = Vec::new();
+        assert!(walk_expr(&sub, &mut out).is_some());
+    }
+
+    #[test]
+    fn column_refs_covers_every_shape() {
+        let c = |sql: &str| {
+            let mut out = Vec::new();
+            assert!(
+                column_refs(&parse_select_expr(sql), &mut out).is_some(),
+                "column_refs rejected {sql}"
+            );
+            out
+        };
+        assert_eq!(
+            c("CASE id WHEN 1 THEN name ELSE other.v END"),
+            vec!["id".to_string(), "name".to_string(), "other.v".to_string()]
+        );
+        assert_eq!(
+            c("SUBSTRING(name FROM 2 FOR 4)"),
+            vec!["name".to_string()],
+            "integer substring bounds are literals, not column refs"
+        );
+        assert_eq!(c("COUNT(*)"), Vec::<String>::new());
+        assert_eq!(c("ABS(n)"), vec!["n".to_string()]);
+        assert_eq!(c("CAST(n AS TEXT)"), vec!["n".to_string()]);
+        // EXISTS / subqueries are unmodeled by the collector (stays residual).
+        let mut out = Vec::new();
+        assert!(
+            column_refs(&parse_select_expr("EXISTS (SELECT 1 FROM other)"), &mut out).is_none()
+        );
+    }
+
+    #[test]
+    fn group_by_qualified_group_column_in_composite() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 5)");
+        let r = rows(
+            &mut db,
+            "SELECT t.id + SUM(n) AS s FROM t GROUP BY t.id ORDER BY s",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(7)], vec![Value::Int(31)]]);
+        // The aggregate arm with a scalar wrapper (COALESCE(SUM..)) is a
+        // separate path; an empty group returns the scalar default.
+        let r = rows(
+            &mut db,
+            "SELECT COALESCE(SUM(n), 0) AS total FROM t WHERE id = 99",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+    }
+
+    #[test]
+    fn join_on_expr_covers_semi_anti_and_other_operators() {
+        use sqlparser::ast::{JoinConstraint as JC, JoinOperator as JO};
+        let on = parse_select_expr("a.id = b.id");
+        for op in [
+            JO::LeftSemi(JC::On(on.clone())),
+            JO::RightSemi(JC::On(on.clone())),
+            JO::LeftAnti(JC::On(on.clone())),
+            JO::RightAnti(JC::On(on.clone())),
+        ] {
+            assert!(join_on_expr(&op).is_some(), "missing ON for {op:?}");
+        }
+        // Non-outer operators and non-ON constraints carry no ON predicate.
+        assert!(join_on_expr(&JO::CrossJoin(JC::None)).is_none());
+        assert!(join_on_expr(&JO::Semi(JC::Natural)).is_none());
+        assert!(join_on_expr(&JO::Inner(JC::Using(vec![]))).is_none());
+    }
+
+    #[test]
+    fn explicit_id_update_resets_autoinc_watermark() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES ('a'), ('b')");
+        // The fast path sees the assignment to the autoinc column and drops
+        // the cached watermark; the next insert continues past the new max.
+        run(&mut db, "UPDATE t SET id = 50 WHERE id = 1");
+        run(&mut db, "INSERT INTO t (v) VALUES ('c')");
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(2)],
+                vec![Value::Int(50)],
+                vec![Value::Int(51)],
+            ]
+        );
+    }
+
+    #[test]
     fn primary_key_constraint_index_is_derived_and_protected() {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -11920,8 +12161,6 @@ mod tests {
         assert_eq!(vals, vec![-10.75, -2.5, 0.1, 0.2]);
     }
 
-    // 待办:堆单元格上限 4090 字节,超长值需要大对象溢出页支持;恢复前保持 ignore。
-    #[ignore = "heap cell size cap 4090 bytes; needs overflow pages for large values"]
     #[test]
     fn long_string_value_survives() {
         let mut db = Database::in_memory().unwrap();

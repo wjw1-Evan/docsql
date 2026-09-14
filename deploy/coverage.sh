@@ -2,7 +2,7 @@
 # Coverage gate: measures workspace line/function coverage via cargo-llvm-cov
 # and fails if either drops below the configured floor. It is a regression
 # guard, not a complete-coverage promise: thresholds sit below the current
-# measured baseline (lines ~91%, functions ~87%) so scope growth or dead-code
+# measured baseline (lines ~92%, functions ~88%) so scope growth or dead-code
 # removal doesn't trip it, while a real coverage regression fails the pipeline.
 #
 # Usage: ./deploy/coverage.sh                    # measure + enforce defaults

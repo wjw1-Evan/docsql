@@ -3965,6 +3965,15 @@ async fn users_roles_and_the_privilege_matrix() {
     // user/role tables are admin-only even for SELECT
     let f = ro.sql("SELECT name FROM docsql_users").await;
     assert_eq!(f.frame_type, proto::RESP_ERROR);
+    // Transaction control is not itself privileged (the statements inside
+    // are authorized individually), and allowlisted system tables stay
+    // readable without a grant.
+    let f = ro.sql("BEGIN").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let f = ro.sql("COMMIT").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let f = ro.sql("SELECT COUNT(*) FROM _pubsub_messages").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
 
     // readwrite: DML yes, DDL/user mgmt no, PUBLISH yes.
     let mut rw = Client::connect(&addr).await;
@@ -4000,6 +4009,11 @@ async fn users_roles_and_the_privilege_matrix() {
         .pubsub_cmd(r#"{"sub":"trim","channel":"ch","keep":1}"#)
         .await;
     assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+
+    // TRUNCATE is a delete-class DML statement for the readwrite role.
+    admin.sql("CREATE TABLE trunc_me (a INT)").await;
+    let f = rw.sql("TRUNCATE TABLE trunc_me").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
 
     // wrong password / unknown user are indistinguishable
     let mut bad = Client::connect(&addr).await;
@@ -4068,6 +4082,11 @@ async fn users_roles_and_the_privilege_matrix() {
     assert_eq!(f.frame_type, proto::RESP_ERROR, "old password must die");
     let f = user_login(&mut ro2, "robyn", &newpw).await;
     assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+
+    // A user holding the admin role passes authorization outright.
+    admin.sql("GRANT admin TO wally").await;
+    let f = rw.sql("CREATE TABLE admin_ok (a INT)").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
 }
 
 #[tokio::test]
@@ -4110,14 +4129,17 @@ async fn user_accounts_replicate_across_the_cluster() {
 
 #[tokio::test]
 async fn user_login_lockout_mirrors_token_auth() {
-    let (_dir, addr) = start_server(None).await;
+    // A low threshold keeps the test deterministic under coverage
+    // instrumentation: each wrong attempt runs a server-side PBKDF2 verify,
+    // and 10 of them under instrumentation can outlast the failure window.
+    let (_dir, addr) = start_server_sec(None, None, None, 0, 0, 3).await;
     let mut admin = Client::connect(&addr).await;
     let pw = ["lo", "ck", "me", "12"].concat();
     admin
         .sql(&format!("CREATE USER olga PASSWORD '{pw}'"))
         .await;
-    // start_server uses the default threshold (10): 10 failures lock out.
-    for _ in 0..10 {
+    // Three failures exhaust the threshold.
+    for _ in 0..3 {
         let mut c = Client::connect(&addr).await;
         let f = user_login(&mut c, "olga", "definitely-wrong").await;
         assert_eq!(f.frame_type, proto::RESP_ERROR);
@@ -4380,6 +4402,146 @@ async fn server_side_prepared_statements_bind_safely() {
     .await;
     let f = c.recv().await;
     assert!(payload_str(&f).contains("unknown statement handle"));
+
+    // Empty templates are refused up front; CLOSE on an unknown handle is an
+    // error, not a silent success.
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("empty statement"),
+        "{}",
+        payload_str(&f)
+    );
+    c.send(&Frame::new(
+        proto::REQ_CLOSE_STMT,
+        br#"{"handle":424242}"#.to_vec(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("unknown statement handle"),
+        "{}",
+        payload_str(&f)
+    );
+}
+
+/// Malformed pub/sub frames answer RESP_ERROR on a dedicated connection
+/// (bad JSON, missing fields, empty/oversize channel, unknown subcommand)
+/// instead of closing it or wedging a subscription.
+#[tokio::test]
+async fn pubsub_wire_errors_are_reported() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+
+    // PUBLISH: malformed JSON, missing fields, empty and oversize channel.
+    c.send(&Frame::new(proto::REQ_PUBLISH, b"{bad json".to_vec()))
+        .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("bad payload"),
+        "{}",
+        payload_str(&f)
+    );
+    c.send(&Frame::new(
+        proto::REQ_PUBLISH,
+        br#"{"channel":"c"}"#.to_vec(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    c.send(&Frame::new(
+        proto::REQ_PUBLISH,
+        br#"{"channel":"","payload":"p"}"#.to_vec(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let long = "c".repeat(300);
+    c.send(&Frame::new(
+        proto::REQ_PUBLISH,
+        format!(r#"{{"channel":"{long}","payload":"p"}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+
+    // SUBSCRIBE: malformed JSON, missing channel, oversize channel.
+    c.send(&Frame::new(proto::REQ_SUBSCRIBE, b"[".to_vec()))
+        .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("bad payload"),
+        "{}",
+        payload_str(&f)
+    );
+    c.send(&Frame::new(
+        proto::REQ_SUBSCRIBE,
+        br#"{"from":"latest"}"#.to_vec(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    c.send(&Frame::new(
+        proto::REQ_SUBSCRIBE,
+        format!(r#"{{"channel":"{long}","from":"latest"}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+
+    // REQ_PUBSUB: malformed JSON and an unknown subcommand.
+    c.send(&Frame::new(proto::REQ_PUBSUB, b"{".to_vec())).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    c.send(&Frame::new(
+        proto::REQ_PUBSUB,
+        br#"{"sub":"frobnicate"}"#.to_vec(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("unknown subcommand"),
+        "{}",
+        payload_str(&f)
+    );
+}
+
+/// Single-node wire behaviour for client-facing errors: malformed SQL comes
+/// back as RESP_ERROR, and RELEASE SAVEPOINT frees the mark without dropping
+/// buffered writes.
+#[tokio::test]
+async fn wire_errors_and_savepoint_release() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE sp (id INT)").await;
+
+    let f = c.sql("SELECT FROM WHERE").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+
+    c.sql("BEGIN").await;
+    c.sql("INSERT INTO sp VALUES (1)").await;
+    c.sql("SAVEPOINT a").await;
+    c.sql("INSERT INTO sp VALUES (2)").await;
+    let f = c.sql("RELEASE SAVEPOINT a").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    c.sql("INSERT INTO sp VALUES (3)").await;
+    let f = c.sql("COMMIT").await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let f = c.sql("SELECT id FROM sp ORDER BY id").await;
+    assert!(
+        payload_str(&f).contains("[[1],[2],[3]]"),
+        "{}",
+        payload_str(&f)
+    );
 }
 
 /// MVCC stage A (concurrent readers): many read-only SELECTs on separate
