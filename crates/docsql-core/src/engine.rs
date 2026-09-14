@@ -565,14 +565,15 @@ impl<'a> ReadCx<'a> {
         columns: &[String],
         docs: Option<Vec<Object>>,
     ) -> Result<Vec<Vec<Value>>> {
+        // (column index, asc, nulls_first); hidden key columns appended for
+        // ORDER BY expressions that are not output columns stay until the
+        // FETCH tie check has run.
+        let mut keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
+        let mut extra_keys = 0usize;
         if let Some(order_by) = &query.order_by {
             let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
                 return err("unsupported ORDER BY");
             };
-            // (column index, asc, nulls_first): appended hidden key columns
-            // start after the visible ones.
-            let mut keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
-            let mut extra_keys = 0usize;
             for o in exprs {
                 let name = expr_name(&o.expr);
                 let idx = columns.iter().position(|c| c == &name).or_else(|| {
@@ -612,25 +613,19 @@ impl<'a> ReadCx<'a> {
                 }
                 std::cmp::Ordering::Equal
             });
-            if extra_keys > 0 {
-                for row in &mut rows {
-                    row.truncate(columns.len());
-                }
-            }
         }
         if let Some(lc) = &query.limit_clause {
             rows = apply_limit_clause(lc, rows)?;
         }
         // Oracle 12c+/SQL-standard FETCH: `FETCH FIRST n ROWS ONLY` (and the
-        // NEXT form). WITH TIES requires the ORDER BY key's tie set — not
-        // supported, and per house rules it errors instead of silently
-        // returning a different row count.
+        // NEXT form). WITH TIES extends the window to the whole tie run of
+        // the last kept row, so it needs an ORDER BY to define the peers.
         if let Some(fetch) = &query.fetch {
             if fetch.percent {
                 return err("FETCH … PERCENT is not supported");
             }
-            if fetch.with_ties {
-                return err("FETCH … WITH TIES is not supported");
+            if fetch.with_ties && keys.is_empty() {
+                return err("FETCH … WITH TIES requires ORDER BY");
             }
             let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
                 Some(Value::Int(n)) if n >= 0 => n as usize,
@@ -639,7 +634,26 @@ impl<'a> ReadCx<'a> {
                 }
                 Some(_) | None => return err("FETCH quantity must be an integer"),
             };
-            rows.truncate(n);
+            if fetch.with_ties && n > 0 && n < rows.len() {
+                let last = &rows[n - 1];
+                let mut end = n;
+                while end < rows.len()
+                    && keys.iter().all(|(col, _, nulls_first)| {
+                        cmp_maybe_null(&last[*col], &rows[end][*col], *nulls_first)
+                            == Ordering::Equal
+                    })
+                {
+                    end += 1;
+                }
+                rows.truncate(end);
+            } else {
+                rows.truncate(n);
+            }
+        }
+        if extra_keys > 0 {
+            for row in &mut rows {
+                row.truncate(columns.len());
+            }
         }
         Ok(rows)
     }
@@ -694,19 +708,44 @@ impl<'a> ReadCx<'a> {
         tf: &sqlparser::ast::TableFactor,
         ctes: &Ctes,
     ) -> Result<(String, Option<String>, Vec<Object>)> {
-        let sqlparser::ast::TableFactor::Table { name, alias, .. } = tf else {
+        let sqlparser::ast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            version,
+            partitions,
+            sample,
+            ..
+        } = tf
+        else {
             // Derived table: FROM (SELECT ...) AS alias
             if let sqlparser::ast::TableFactor::Derived {
-                subquery, alias, ..
+                lateral,
+                subquery,
+                alias,
+                sample,
             } = tf
             {
+                if *lateral {
+                    return err("LATERAL derived tables are not supported");
+                }
+                if sample.is_some() {
+                    return err("TABLESAMPLE is not supported");
+                }
                 let ExecOutcome::Rows(r) = self.exec_query(subquery.as_ref().clone())? else {
                     return err("derived table must be a SELECT");
+                };
+                let alias_columns = match alias {
+                    Some(a) => table_alias_columns(&a.columns, r.columns.len())?,
+                    None => None,
                 };
                 let docs: Vec<Object> = r
                     .rows
                     .into_iter()
-                    .map(|row| r.columns.iter().cloned().zip(row).collect())
+                    .map(|row| match &alias_columns {
+                        Some(cols) => cols.iter().cloned().zip(row).collect(),
+                        None => r.columns.iter().cloned().zip(row).collect(),
+                    })
                     .collect();
                 let alias = alias
                     .as_ref()
@@ -714,8 +753,20 @@ impl<'a> ReadCx<'a> {
                     .unwrap_or_default();
                 return Ok(("@derived".into(), Some(alias), docs));
             }
-            return err("only simple tables in FROM");
+            return err("unsupported FROM item (expected a table, derived table or VALUES)");
         };
+        if args.is_some() {
+            return err("table functions in FROM are not supported");
+        }
+        if sample.is_some() {
+            return err("TABLESAMPLE is not supported");
+        }
+        if version.is_some() {
+            return err("table time travel (AS OF / FOR SYSTEM_TIME) is not supported");
+        }
+        if !partitions.is_empty() {
+            return err("partition selection (PARTITION (...)) is not supported");
+        }
         let tname = obj_name(name);
         let alias = alias.as_ref().map(|a| a.name.value.clone());
         // Oracle DUAL: the one-row dummy table. Case-insensitive, works even
@@ -879,13 +930,38 @@ impl<'a> ReadCx<'a> {
             ));
         }
         if let SqlExpr::Function(f) = e {
+            if f.name.to_string().eq_ignore_ascii_case("grouping") {
+                // GROUPING(expr): expression must be one of the grouping-set
+                // expressions (validated here, resolved per set at eval).
+                let arg = match &f.args {
+                    sqlparser::ast::FunctionArguments::List(list) if list.args.len() == 1 => {
+                        match &list.args[0] {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(inner),
+                            ) => inner.clone(),
+                            _ => return err("GROUPING argument must be a column expression"),
+                        }
+                    }
+                    _ => return err("GROUPING takes exactly one argument"),
+                };
+                for (i, g) in group_exprs.iter().enumerate() {
+                    let same = format!("{g}") == format!("{arg}")
+                        || matches!((g, &arg),
+                            (SqlExpr::Identifier(a), SqlExpr::Identifier(b)) if a.value == b.value);
+                    if same {
+                        return Ok(AggSpec::Grouping { idx: i });
+                    }
+                }
+                return err(format!("GROUPING argument {arg} must appear in GROUP BY"));
+            }
             if is_agg_fn(f) {
-                let (op, inner, distinct, sep) = agg_parts(f)?;
+                let (op, inner, distinct, sep, filter) = agg_parts(f)?;
                 return Ok(AggSpec::Agg {
                     op,
                     arg: inner,
                     distinct,
                     sep,
+                    filter,
                 });
             }
         }
@@ -898,37 +974,27 @@ impl<'a> ReadCx<'a> {
     }
 
     /// GROUP BY + aggregates (+ HAVING).
+    /// GROUP BY + aggregates (+ HAVING) over one or more grouping sets
+    /// (`GROUP BY` is one set; ROLLUP/CUBE/GROUPING SETS expand to several).
+    /// Rows of a set that omits an expression emit NULL for it; GROUPING()
+    /// distinguishes that from a NULL value.
     fn exec_grouped_select(
         &self,
         query: Query,
         select: sqlparser::ast::Select,
         rows: Vec<Object>,
-        group_exprs: Vec<SqlExpr>,
+        grouping_sets: Vec<Vec<SqlExpr>>,
     ) -> Result<ExecOutcome> {
-        // GROUP BY + aggregates (+ HAVING).
-        // Evaluate group keys per row. Groups hash by the encoded key —
-        // the same byte identity DISTINCT uses — instead of a linear scan
-        // per row (O(rows × groups) on large grouped queries).
-        let mut groups: Vec<(Vec<Value>, Vec<&Object>)> = Vec::new();
-        let mut group_index: std::collections::HashMap<Vec<u8>, usize> =
-            std::collections::HashMap::new();
-        for doc in &rows {
-            let key: Vec<Value> = group_exprs
-                .iter()
-                .map(|e| eval_expr(e, doc))
-                .collect::<Result<_>>()?;
-            let kb = row_key(&key);
-            match group_index.get(&kb) {
-                Some(&gi) => groups[gi].1.push(doc),
-                None => {
-                    group_index.insert(kb, groups.len());
-                    groups.push((key, vec![doc]));
+        // Union of every set expression, in first-appearance order:
+        // projection specs resolve against it, and each set resolves the
+        // subset it carries.
+        let mut all_exprs: Vec<SqlExpr> = Vec::new();
+        for set in &grouping_sets {
+            for e in set {
+                if !all_exprs.iter().any(|g| format!("{g}") == format!("{e}")) {
+                    all_exprs.push(e.clone());
                 }
             }
-        }
-        // With no GROUP BY, aggregates run over one group even when empty.
-        if group_exprs.is_empty() && groups.is_empty() {
-            groups.push((vec![], vec![]));
         }
         // Projection must be aggregate functions or group exprs.
         let mut columns = Vec::new();
@@ -937,35 +1003,58 @@ impl<'a> ReadCx<'a> {
             match item {
                 SelectItem::UnnamedExpr(e) => {
                     columns.push(expr_name(e));
-                    agg_specs.push(self.agg_spec(e, &group_exprs)?);
+                    agg_specs.push(self.agg_spec(e, &all_exprs)?);
                 }
                 SelectItem::ExprWithAlias { expr, alias, .. } => {
                     columns.push(alias.value.clone());
-                    agg_specs.push(self.agg_spec(expr, &group_exprs)?);
+                    agg_specs.push(self.agg_spec(expr, &all_exprs)?);
                 }
                 _ => return err("unsupported item in aggregate SELECT"),
             }
         }
         let mut out: Vec<Vec<Value>> = Vec::new();
-        for (key, docs) in &groups {
-            let mut row = Vec::with_capacity(agg_specs.len());
-            for spec in &agg_specs {
-                row.push(eval_agg(spec, docs, key, &group_exprs)?);
-            }
-            // HAVING: aggregates evaluate over the group's rows directly;
-            // everything else evaluates against the output columns, with
-            // GROUP BY expressions consulted before them so unprojected
-            // group keys resolve instead of reading as NULL.
-            if let Some(having) = &select.having {
-                let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
-                if !matches!(
-                    eval_group_expr(having, &doc, docs, &group_exprs)?,
-                    Value::Bool(true)
-                ) {
-                    continue;
+        for set in &grouping_sets {
+            // Group the rows by this set's expressions. Groups hash by the
+            // encoded key — the same byte identity DISTINCT uses — instead
+            // of a linear scan per row (O(rows × groups)).
+            let mut groups: Vec<(Vec<Value>, Vec<&Object>)> = Vec::new();
+            let mut group_index: std::collections::HashMap<Vec<u8>, usize> =
+                std::collections::HashMap::new();
+            for doc in &rows {
+                let key: Vec<Value> = set
+                    .iter()
+                    .map(|e| eval_expr(e, doc))
+                    .collect::<Result<_>>()?;
+                let kb = row_key(&key);
+                match group_index.get(&kb) {
+                    Some(&gi) => groups[gi].1.push(doc),
+                    None => {
+                        group_index.insert(kb, groups.len());
+                        groups.push((key, vec![doc]));
+                    }
                 }
             }
-            out.push(row);
+            // An empty set is one group over everything, even with no rows.
+            if set.is_empty() && groups.is_empty() {
+                groups.push((vec![], vec![]));
+            }
+            for (key, docs) in &groups {
+                let mut row = Vec::with_capacity(agg_specs.len());
+                for spec in &agg_specs {
+                    row.push(eval_grouped_spec(spec, &all_exprs, set, key, docs)?);
+                }
+                // HAVING: aggregates evaluate over the group's rows directly;
+                // everything else evaluates against the output columns, with
+                // this set's expressions consulted before them so group keys
+                // resolve and omitted ones read as NULL.
+                if let Some(having) = &select.having {
+                    let doc: Object = columns.iter().cloned().zip(row.iter().cloned()).collect();
+                    if !matches!(eval_group_expr(having, &doc, docs, set)?, Value::Bool(true)) {
+                        continue;
+                    }
+                }
+                out.push(row);
+            }
         }
         let out = self.apply_order_limit(query, out, &columns, None)?;
         Ok(ExecOutcome::Rows(QueryResult { columns, rows: out }))
@@ -1150,7 +1239,14 @@ impl<'a> ReadCx<'a> {
                             }
                             e
                         }
-                        _ => None,
+                        // NATURAL would need the common-column set; the
+                        // schemaless row shape has no schema to derive it at
+                        // plan time, so refuse instead of cross-joining.
+                        JoinConstraint::Natural => {
+                            return err("NATURAL JOIN is not supported (use ON/USING)")
+                        }
+                        // JOIN without ON: MySQL-style cross join.
+                        JoinConstraint::None => None,
                     };
                     let (mut left_join, mut right_join) = (false, false);
                     match &j.join_operator {
@@ -1186,6 +1282,7 @@ impl<'a> ReadCx<'a> {
         mut select: sqlparser::ast::Select,
         ctes: &Ctes,
     ) -> Result<ExecOutcome> {
+        reject_unsupported_select_clauses(&select)?;
         // Resolve uncorrelated subqueries up front so the row-local
         // expression evaluator never sees them.
         if let Some(sel) = &mut select.selection {
@@ -1248,6 +1345,7 @@ impl<'a> ReadCx<'a> {
             sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
             sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
         };
+        let grouping_sets = expand_grouping_sets(&group_exprs)?;
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
         let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
         let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
@@ -1310,7 +1408,7 @@ impl<'a> ReadCx<'a> {
 
         // Aggregation path: aggregate functions in projection or GROUP BY.
         if is_aggregate {
-            return self.exec_grouped_select(query, select, rows, group_exprs);
+            return self.exec_grouped_select(query, select, rows, grouping_sets);
         }
         if select.having.is_some() {
             // Silently dropping the filter would return unfiltered rows.
@@ -1322,6 +1420,7 @@ impl<'a> ReadCx<'a> {
     /// Execute the query body (no WITH: it was materialized by the caller
     /// into `ctes`).
     fn exec_query_body(&self, query: Query, ctes: &Ctes) -> Result<ExecOutcome> {
+        reject_unsupported_query_clauses(&query)?;
         let body = query.body.clone();
         match *body {
             SetExpr::Select(select) => self.exec_select(query.clone(), *select, ctes),
@@ -1412,6 +1511,31 @@ impl<'a> ReadCx<'a> {
                     rows,
                 }))
             }
+            SetExpr::Values(mut values) => {
+                // Row-value constructor (standard SQL): constant expressions,
+                // one row per parenthesized list, `column1..n` by default.
+                let width = values.rows.first().map_or(0, |r| r.content.len());
+                let columns: Vec<String> = (1..=width).map(|i| format!("column{i}")).collect();
+                let empty = Object::new();
+                let mut rows = Vec::with_capacity(values.rows.len());
+                for parens in values.rows.drain(..) {
+                    let mut exprs = parens.content;
+                    if exprs.len() != width {
+                        return err("VALUES rows must all have the same column count");
+                    }
+                    for e in &mut exprs {
+                        self.subst_expr(e)?;
+                    }
+                    rows.push(
+                        exprs
+                            .iter()
+                            .map(|e| eval_expr(e, &empty))
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                }
+                let rows = self.apply_order_limit(query, rows, &columns, None)?;
+                Ok(ExecOutcome::Rows(QueryResult { columns, rows }))
+            }
             other => err(format!("unsupported query body: {other}")),
         }
     }
@@ -1433,10 +1557,14 @@ impl<'a> ReadCx<'a> {
                 else {
                     return err("CTE body must be a SELECT");
                 };
+                let alias_columns = table_alias_columns(&cte.alias.columns, r.columns.len())?;
                 let docs: Vec<Object> = r
                     .rows
                     .into_iter()
-                    .map(|row| r.columns.iter().cloned().zip(row).collect())
+                    .map(|row| match &alias_columns {
+                        Some(cols) => cols.iter().cloned().zip(row).collect(),
+                        None => r.columns.iter().cloned().zip(row).collect(),
+                    })
                     .collect();
                 ctes.insert(name, docs);
             }
@@ -1493,9 +1621,13 @@ impl<'a> ReadCx<'a> {
                 right,
                 ..
             } => {
-                if let (sqlparser::ast::BinaryOperator::Eq, SqlExpr::Subquery(q)) =
-                    (compare_op, right.as_ref())
-                {
+                self.subst_expr(left)?;
+                let SqlExpr::Subquery(q) = right.as_ref() else {
+                    return err("ANY/ALL requires a subquery operand");
+                };
+                if *compare_op == sqlparser::ast::BinaryOperator::Eq {
+                    // `= ANY` is an IN list: cheaper than an OR chain and
+                    // the shape the planner already understands.
                     let r = self.subquery_result(q)?;
                     let list = r
                         .rows
@@ -1507,8 +1639,20 @@ impl<'a> ReadCx<'a> {
                         list,
                         negated: false,
                     };
+                } else {
+                    *e = self.quantified_chain(q, left, compare_op, true)?;
                 }
-                // Non-EQ ANY falls through and errors at evaluation time.
+            }
+            SqlExpr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => {
+                self.subst_expr(left)?;
+                let SqlExpr::Subquery(q) = right.as_ref() else {
+                    return err("ANY/ALL requires a subquery operand");
+                };
+                *e = self.quantified_chain(q, left, compare_op, false)?;
             }
             // Recurse into composite expressions.
             SqlExpr::BinaryOp { left, right, .. } => {
@@ -1523,6 +1667,17 @@ impl<'a> ReadCx<'a> {
                 self.subst_expr(expr)?;
                 self.subst_expr(low)?;
                 self.subst_expr(high)?;
+            }
+            SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+                self.subst_expr(l)?;
+                self.subst_expr(r)?;
+            }
+            SqlExpr::Rollup(groups) | SqlExpr::Cube(groups) | SqlExpr::GroupingSets(groups) => {
+                for g in groups {
+                    for e in g {
+                        self.subst_expr(e)?;
+                    }
+                }
             }
             SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
                 self.subst_expr(expr)?;
@@ -1563,10 +1718,52 @@ impl<'a> ReadCx<'a> {
                         }
                     }
                 }
+                if let Some(filter) = &mut f.filter {
+                    self.subst_expr(filter)?;
+                }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Rewrite `x op ANY|ALL (subquery)` into an OR/AND chain of literal
+    /// comparisons. DocSQL comparisons are two-valued (no UNKNOWN), so
+    /// boolean quantification over the chain is exact. Empty ANY → FALSE,
+    /// empty ALL → TRUE (SQL standard).
+    fn quantified_chain(
+        &self,
+        q: &Query,
+        left: &SqlExpr,
+        compare_op: &BinaryOperator,
+        any: bool,
+    ) -> Result<SqlExpr> {
+        let r = self.subquery_result(q)?;
+        let mut acc: Option<SqlExpr> = None;
+        for row in &r.rows {
+            let v = value_to_literal(row.first().cloned().unwrap_or(Value::Null))?;
+            let cmp = SqlExpr::BinaryOp {
+                left: Box::new(left.clone()),
+                op: compare_op.clone(),
+                right: Box::new(v),
+            };
+            acc = Some(match acc {
+                None => cmp,
+                Some(prev) => SqlExpr::BinaryOp {
+                    left: Box::new(prev),
+                    op: if any {
+                        BinaryOperator::Or
+                    } else {
+                        BinaryOperator::And
+                    },
+                    right: Box::new(cmp),
+                },
+            });
+        }
+        match acc {
+            Some(expr) => Ok(expr),
+            None => value_to_literal(Value::Bool(!any)),
+        }
     }
 
     /// Run a subquery and return its rows (first column only matters for
@@ -1803,6 +2000,7 @@ impl<'a> ReadCx<'a> {
             || select.projection.len() != 1
             || select.from.len() != 1
             || !select.from[0].joins.is_empty()
+            || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(e, _) if e.is_empty())
         {
             return Ok(None);
         }
@@ -5855,11 +6053,19 @@ enum AggSpec {
     GroupKey {
         idx: usize,
     },
+    /// `GROUPING(expr)`: 1 when the current grouping set omits `expr`, else
+    /// 0 (SQL:2016). `idx` indexes the union of all set expressions.
+    Grouping {
+        idx: usize,
+    },
     Agg {
         op: AggOp,
         arg: SqlExpr,
         distinct: bool,
         sep: Option<String>,
+        /// Aggregate FILTER (WHERE …): rows that do not evaluate true are
+        /// excluded before DISTINCT and aggregation.
+        filter: Option<SqlExpr>,
     },
     /// Aggregate arithmetic in the projection (`SUM(x) + 1`, `-COUNT(*)`,
     /// `COALESCE(SUM(x), 0)`): the whole expression evaluates over the
@@ -5873,7 +6079,10 @@ enum AggSpec {
 /// its operator, argument, DISTINCT flag and — for GROUP_CONCAT/STRING_AGG —
 /// the optional constant separator. `COUNT(*)` rewrites to a sentinel column
 /// so the executor counts rows instead of non-null values.
-fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool, Option<String>)> {
+#[allow(clippy::type_complexity)]
+fn agg_parts(
+    f: &sqlparser::ast::Function,
+) -> Result<(AggOp, SqlExpr, bool, Option<String>, Option<SqlExpr>)> {
     let fname = f.name.to_string().to_uppercase();
     // A window frame silently changes the result shape (one row per
     // partition); refusing is better than returning wrong numbers.
@@ -5934,7 +6143,10 @@ fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool, Opti
     } else {
         None
     };
-    Ok((op, arg, distinct, sep))
+    // FILTER (WHERE …) is an aggregate-row filter, applied before DISTINCT
+    // and the aggregate itself (SQL:2003).
+    let filter = f.filter.as_deref().cloned();
+    Ok((op, arg, distinct, sep, filter))
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value> {
@@ -5992,6 +6204,9 @@ fn eval_agg(
 ) -> Result<Value> {
     match spec {
         AggSpec::GroupKey { idx } => Ok(key.get(*idx).cloned().unwrap_or(Value::Null)),
+        // Resolved per grouping set by `eval_grouped_spec` before reaching
+        // the aggregate evaluator.
+        AggSpec::Grouping { .. } => err("GROUPING is only supported in the SELECT list"),
         AggSpec::Composite { expr } => {
             let empty = Object::new();
             eval_group_expr(expr, &empty, docs, group_exprs)
@@ -6001,9 +6216,24 @@ fn eval_agg(
             arg,
             distinct,
             sep,
+            filter,
         } => {
+            // FILTER applies first: only rows whose predicate is TRUE take
+            // part in DISTINCT and the aggregate.
+            let kept: Vec<&Object> = match filter {
+                Some(f) => {
+                    let mut kept = Vec::with_capacity(docs.len());
+                    for d in docs {
+                        if matches!(eval_expr(f, d)?, Value::Bool(true)) {
+                            kept.push(*d);
+                        }
+                    }
+                    kept
+                }
+                None => docs.to_vec(),
+            };
             let mut vals: Vec<Value> = Vec::new();
-            for d in docs {
+            for d in &kept {
                 let v = eval_expr(arg, d)?;
                 if !matches!(v, Value::Null) {
                     vals.push(v);
@@ -6019,7 +6249,7 @@ fn eval_agg(
                     // COUNT(*) is rewritten to a sentinel column that never
                     // exists, so count rows instead of non-null values.
                     if matches!(arg, SqlExpr::Identifier(i) if i.value == "__count__") {
-                        Value::Int(docs.len() as i64)
+                        Value::Int(kept.len() as i64)
                     } else {
                         Value::Int(vals.len() as i64)
                     }
@@ -6091,6 +6321,110 @@ fn eval_agg(
                         .join(sep.as_deref().unwrap_or(",")),
                 ),
             })
+        }
+    }
+}
+
+/// Expand GROUP BY into grouping sets. Plain expressions belong to every
+/// set; `ROLLUP(a, b)` contributes `(a,b), (a), ()`; `CUBE(a, b)` all
+/// subsets; `GROUPING SETS` its explicit list. Several super-grouping items
+/// combine as a cartesian product (SQL:2016).
+fn expand_grouping_sets(exprs: &[SqlExpr]) -> Result<Vec<Vec<SqlExpr>>> {
+    let mut sets: Vec<Vec<SqlExpr>> = vec![Vec::new()];
+    for e in exprs {
+        let alternatives: Vec<Vec<SqlExpr>> = match e {
+            SqlExpr::Rollup(groups) => (0..=groups.len())
+                .rev()
+                .map(|n| groups[..n].iter().flatten().cloned().collect())
+                .collect(),
+            SqlExpr::Cube(groups) => {
+                if groups.len() > 12 {
+                    return err("CUBE supports at most 12 elements");
+                }
+                (0..(1u32 << groups.len()))
+                    .map(|mask| {
+                        groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| mask & (1 << i) != 0)
+                            .flat_map(|(_, g)| g.iter().cloned())
+                            .collect()
+                    })
+                    .collect()
+            }
+            SqlExpr::GroupingSets(lists) => lists.clone(),
+            other => vec![vec![other.clone()]],
+        };
+        let mut next = Vec::with_capacity(sets.len() * alternatives.len());
+        for base in &sets {
+            for alt in &alternatives {
+                let mut combined = base.clone();
+                combined.extend(alt.iter().cloned());
+                next.push(combined);
+            }
+        }
+        sets = next;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for set in &sets {
+        for e in set {
+            if matches!(
+                e,
+                SqlExpr::Rollup(_) | SqlExpr::Cube(_) | SqlExpr::GroupingSets(_)
+            ) {
+                return err("nested grouping sets are not supported");
+            }
+            // Inside GROUPING SETS the parser turns ROLLUP/CUBE/GROUPING
+            // into function calls; they are still nested super-grouping.
+            if let SqlExpr::Function(f) = e {
+                let name = f.name.to_string().to_uppercase();
+                if name == "ROLLUP" || name == "CUBE" || name == "GROUPING" {
+                    return err("nested grouping sets are not supported");
+                }
+            }
+        }
+        // Duplicate sets would emit duplicate rows; the standard forbids them.
+        let key: Vec<String> = set.iter().map(|e| e.to_string()).collect();
+        if !seen.insert(key) {
+            return err("duplicate grouping set");
+        }
+    }
+    Ok(sets)
+}
+
+/// Position of `all_exprs[idx]` inside one grouping set, by expression text
+/// (the same identity `agg_spec` resolves group keys with).
+fn set_position(all_exprs: &[SqlExpr], set: &[SqlExpr], idx: usize) -> Option<usize> {
+    let target = &all_exprs[idx];
+    set.iter()
+        .position(|s| format!("{s}") == format!("{target}"))
+}
+
+/// Evaluate one projection spec for a group of one grouping set: keys that
+/// this set omits read as NULL, GROUPING() reports the omission, and the
+/// aggregates run over the group's rows.
+fn eval_grouped_spec(
+    spec: &AggSpec,
+    all_exprs: &[SqlExpr],
+    set: &[SqlExpr],
+    key: &[Value],
+    docs: &[&Object],
+) -> Result<Value> {
+    match spec {
+        AggSpec::GroupKey { idx } => Ok(set_position(all_exprs, set, *idx)
+            .and_then(|p| key.get(p).cloned())
+            .unwrap_or(Value::Null)),
+        AggSpec::Grouping { idx } => Ok(Value::Int(
+            if set_position(all_exprs, set, *idx).is_some() {
+                0
+            } else {
+                1
+            },
+        )),
+        AggSpec::Agg { .. } => eval_agg(spec, docs, key, set),
+        AggSpec::Composite { expr } => {
+            let empty = Object::new();
+            eval_group_expr(expr, &empty, docs, set)
         }
     }
 }
@@ -7293,6 +7627,16 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
         SqlExpr::IsNotNull(inner) => {
             Ok(Value::Bool(!matches!(eval_expr(inner, doc)?, Value::Null)))
         }
+        // NULL-safe comparison (SQL:2003): a comparison that is false or
+        // unknown is "distinct"; NULL matches only NULL.
+        SqlExpr::IsDistinctFrom(l, r) => {
+            let (lv, rv) = (eval_expr(l, doc)?, eval_expr(r, doc)?);
+            Ok(Value::Bool(!values_equal_null_safe(&lv, &rv)))
+        }
+        SqlExpr::IsNotDistinctFrom(l, r) => {
+            let (lv, rv) = (eval_expr(l, doc)?, eval_expr(r, doc)?);
+            Ok(Value::Bool(values_equal_null_safe(&lv, &rv)))
+        }
         SqlExpr::Between {
             expr,
             negated,
@@ -8319,6 +8663,115 @@ fn is_compat_view(name: &str) -> bool {
     )
 }
 
+/// Explicit alias column list (`AS t(a, b)` on a derived table or CTE):
+/// renamed positionally, with duplicate or wrong-width lists rejected.
+/// `None` means the producing query's own column names are kept.
+fn table_alias_columns(
+    alias_columns: &[sqlparser::ast::TableAliasColumnDef],
+    width: usize,
+) -> Result<Option<Vec<String>>> {
+    if alias_columns.is_empty() {
+        return Ok(None);
+    }
+    if alias_columns.len() != width {
+        return err(format!(
+            "alias declares {} columns but the table produces {width}",
+            alias_columns.len()
+        ));
+    }
+    let names: Vec<String> = alias_columns.iter().map(|c| c.name.value.clone()).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    if !names.iter().all(|n| seen.insert(n.clone())) {
+        return err("alias column names must be distinct");
+    }
+    Ok(Some(names))
+}
+
+/// Reject SELECT clause syntax the engine does not implement instead of
+/// silently ignoring it (a dropped clause changes results; house rule is
+/// loud refusal). Advisory hints (optimizer/index hints) are exempt —
+/// they affect planning, not results.
+fn reject_unsupported_select_clauses(select: &sqlparser::ast::Select) -> Result<()> {
+    if select.into.is_some() {
+        return err("SELECT INTO is not supported");
+    }
+    if select.top.is_some() {
+        return err("SELECT TOP is not supported (use LIMIT)");
+    }
+    if !select.lateral_views.is_empty() {
+        return err("LATERAL VIEW is not supported");
+    }
+    if select.prewhere.is_some() {
+        return err("PREWHERE is not supported");
+    }
+    if !select.connect_by.is_empty() {
+        return err("CONNECT BY is not supported");
+    }
+    if !select.cluster_by.is_empty() {
+        return err("CLUSTER BY is not supported");
+    }
+    if !select.distribute_by.is_empty() {
+        return err("DISTRIBUTE BY is not supported");
+    }
+    if !select.sort_by.is_empty() {
+        return err("SORT BY is not supported");
+    }
+    if !select.named_window.is_empty() {
+        return err("WINDOW clause is not supported");
+    }
+    if select.qualify.is_some() {
+        return err("QUALIFY is not supported");
+    }
+    if select.value_table_mode.is_some() {
+        return err("SELECT AS VALUE/STRUCT is not supported");
+    }
+    if select.exclude.is_some() {
+        return err("SELECT * EXCLUDE is not supported");
+    }
+    for item in &select.projection {
+        // `* EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE` parse into wildcard
+        // options; `exec_plain_select` expands the plain `*`, so anything
+        // else here would silently drop the modifier.
+        let opts = match item {
+            SelectItem::Wildcard(opts) | SelectItem::QualifiedWildcard(_, opts) => opts,
+            _ => continue,
+        };
+        if opts.opt_ilike.is_some()
+            || opts.opt_exclude.is_some()
+            || opts.opt_except.is_some()
+            || opts.opt_replace.is_some()
+            || opts.opt_rename.is_some()
+            || opts.opt_alias.is_some()
+        {
+            return err("SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE is not supported");
+        }
+    }
+    if select.select_modifiers.is_some() {
+        return err("SELECT modifiers are not supported");
+    }
+    Ok(())
+}
+
+/// Query-level clause guard; see [`reject_unsupported_select_clauses`].
+fn reject_unsupported_query_clauses(query: &Query) -> Result<()> {
+    if !query.locks.is_empty() {
+        return err("FOR UPDATE/FOR SHARE is not supported");
+    }
+    if query.for_clause.is_some() {
+        return err("FOR XML/FOR JSON is not supported");
+    }
+    if query.settings.is_some() {
+        return err("SETTINGS is not supported");
+    }
+    if query.format_clause.is_some() {
+        return err("FORMAT is not supported");
+    }
+    if !query.pipe_operators.is_empty() {
+        return err("pipe operators are not supported");
+    }
+    Ok(())
+}
+
 /// Inline a computed Value as a literal expression node (subquery
 /// substitution rewrites results into the row-local expression tree).
 fn value_to_literal(v: Value) -> Result<SqlExpr> {
@@ -8867,13 +9320,14 @@ fn eval_group_expr(
 ) -> Result<Value> {
     match e {
         SqlExpr::Function(f) if is_agg_fn(f) => {
-            let (op, arg, distinct, sep) = agg_parts(f)?;
+            let (op, arg, distinct, sep, filter) = agg_parts(f)?;
             eval_agg(
                 &AggSpec::Agg {
                     op,
                     arg,
                     distinct,
                     sep,
+                    filter,
                 },
                 docs,
                 &[],
@@ -9014,6 +9468,14 @@ fn binop(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         },
         other => return err(format!("unsupported operator: {other}")),
     })
+}
+
+/// NULL-safe equality for `IS [NOT] DISTINCT FROM` (SQL:2003). The engine's
+/// comparison is total — `NULL` is a sortable value, so `NULL` compares
+/// equal to `NULL` and unequal to everything else — which is exactly the
+/// DISTINCT FROM truth table.
+fn values_equal_null_safe(a: &Value, b: &Value) -> bool {
+    Value::cmp_values(a, b) == Ordering::Equal
 }
 
 fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
@@ -12094,6 +12556,333 @@ mod tests {
         }
     }
 
+    // ---- standard clause matrix ----
+
+    #[test]
+    fn grouping_sets_rollup_cube_and_grouping() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (g TEXT, h TEXT, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES ('a','x',1),('a','y',2),('b','x',3),('b','x',4)",
+        );
+        // ROLLUP(g): detail rows, subtotal (NULL g) and grand total.
+        let r = rows(
+            &mut db,
+            "SELECT g, SUM(v) FROM t GROUP BY ROLLUP(g) ORDER BY g",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Null, Value::Int(10)],
+                vec![Value::Str("a".into()), Value::Int(3)],
+                vec![Value::Str("b".into()), Value::Int(7)],
+            ]
+        );
+        // GROUPING distinguishes the subtotal NULL from a NULL key.
+        let r = rows(
+            &mut db,
+            "SELECT g, GROUPING(g) AS grp, SUM(v) FROM t GROUP BY ROLLUP(g) ORDER BY g",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Null, Value::Int(1), Value::Int(10)],
+                vec![Value::Str("a".into()), Value::Int(0), Value::Int(3)],
+                vec![Value::Str("b".into()), Value::Int(0), Value::Int(7)],
+            ]
+        );
+        // CUBE(g, h) expands to (g,h), (g), (h), (): 3 + 2 + 2 + 1 groups.
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM (SELECT g, h, SUM(v) FROM t GROUP BY CUBE(g, h)) AS c",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(8)]]);
+        // GROUPING SETS over explicit subsets.
+        let r = rows(
+            &mut db,
+            "SELECT g, h, SUM(v) FROM t GROUP BY GROUPING SETS ((g), (h)) ORDER BY g, h",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Null, Value::Str("x".into()), Value::Int(8)],
+                vec![Value::Null, Value::Str("y".into()), Value::Int(2)],
+                vec![Value::Str("a".into()), Value::Null, Value::Int(3)],
+                vec![Value::Str("b".into()), Value::Null, Value::Int(7)],
+            ]
+        );
+        // HAVING applies per set-group (aggregates over that group's rows).
+        let r = rows(
+            &mut db,
+            "SELECT g, SUM(v) FROM t GROUP BY ROLLUP(g) HAVING SUM(v) > 5 ORDER BY g",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Null, Value::Int(10)],
+                vec![Value::Str("b".into()), Value::Int(7)],
+            ]
+        );
+        // Duplicate and nested grouping sets are rejected.
+        let e = db
+            .execute("SELECT g FROM t GROUP BY GROUPING SETS ((g), (g))")
+            .unwrap_err();
+        assert!(e.to_string().contains("duplicate"), "{e}");
+        let e = db
+            .execute("SELECT g FROM t GROUP BY GROUPING SETS ((g), ROLLUP(g))")
+            .unwrap_err();
+        assert!(e.to_string().contains("nested"), "{e}");
+        // GROUPING() only accepts a grouping-set expression.
+        let e = db
+            .execute("SELECT GROUPING(v) FROM t GROUP BY g")
+            .unwrap_err();
+        assert!(e.to_string().contains("GROUPING"), "{e}");
+        // CUBE is bounded to keep the set explosion sane.
+        let e = db
+            .execute("SELECT COUNT(*) FROM t GROUP BY CUBE(a,b,c,d,e,f,g,h,i,j,k,l,m)")
+            .unwrap_err();
+        assert!(e.to_string().contains("CUBE"), "{e}");
+    }
+
+    #[test]
+    fn aggregate_filter_where() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (g TEXT, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES ('a',1),('a',2),('b',3),('b',4),('b',5)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FILTER (WHERE v > 2), SUM(v) FILTER (WHERE g = 'a') FROM t",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(3), Value::Int(3)]]);
+        // FILTER applies before DISTINCT and per group.
+        let r = rows(
+            &mut db,
+            "SELECT g, COUNT(DISTINCT v) FILTER (WHERE v > 1) FROM t GROUP BY g ORDER BY g",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("a".into()), Value::Int(1)],
+                vec![Value::Str("b".into()), Value::Int(3)],
+            ]
+        );
+        // Nothing passes the filter: COUNT is 0, SUM over no rows is NULL.
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FILTER (WHERE v > 99), SUM(v) FILTER (WHERE v > 99) FROM t",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(0), Value::Null]]);
+        // FILTER inside a composite aggregate expression.
+        let r = rows(
+            &mut db,
+            "SELECT COALESCE(SUM(v) FILTER (WHERE g = 'a'), 0) + 1 FROM t",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(4)]]);
+    }
+
+    #[test]
+    fn fetch_with_ties_extends_the_window() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (g TEXT, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES ('a',1),('a',2),('b',3),('b',4),('b',5)",
+        );
+        // One key, five rows of peers: the whole tie run comes back.
+        let r = rows(
+            &mut db,
+            "SELECT g FROM t ORDER BY g FETCH FIRST 1 ROWS WITH TIES",
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("a".into())], vec![Value::Str("a".into())]]
+        );
+        // Unique ORDER BY values: ties do not extend.
+        let r = rows(
+            &mut db,
+            "SELECT g FROM t ORDER BY v FETCH FIRST 2 ROWS WITH TIES",
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("a".into())], vec![Value::Str("a".into())]]
+        );
+        // Hidden ORDER BY keys (not projected) still define the peers.
+        let r = rows(
+            &mut db,
+            "SELECT g FROM t ORDER BY v DESC FETCH FIRST 1 ROWS WITH TIES",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("b".into())]]);
+    }
+
+    #[test]
+    fn values_rows_and_alias_columns() {
+        let mut db = Database::in_memory().unwrap();
+        // Top-level VALUES: default column names; ORDER BY/LIMIT apply.
+        let r = rows(&mut db, "VALUES (2, 'b'), (1, 'a') ORDER BY column1");
+        assert_eq!(r.columns, vec!["column1", "column2"]);
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Str("a".into())],
+                vec![Value::Int(2), Value::Str("b".into())],
+            ]
+        );
+        // Derived table with an explicit alias column list.
+        let r = rows(
+            &mut db,
+            "SELECT p.id, p.s FROM (VALUES (1,'x'),(2,'y')) AS p(id, s) WHERE p.id > 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2), Value::Str("y".into())]]);
+        // CTE alias columns rename positionally too.
+        let r = rows(
+            &mut db,
+            "WITH c(id, s) AS (VALUES (7, 'z')) SELECT c.id, c.s FROM c",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(7), Value::Str("z".into())]]);
+        // Alias width/duplicates are rejected instead of silently dropping.
+        let e = db
+            .execute("SELECT * FROM (VALUES (1, 2)) AS p(a)")
+            .unwrap_err();
+        assert!(e.to_string().contains("alias"), "{e}");
+        let e = db
+            .execute("SELECT * FROM (VALUES (1, 2)) AS p(a, a)")
+            .unwrap_err();
+        assert!(e.to_string().contains("distinct"), "{e}");
+        // Ragged VALUES rows are rejected.
+        let e = db.execute("VALUES (1), (2, 3)").unwrap_err();
+        assert!(e.to_string().contains("same column count"), "{e}");
+    }
+
+    #[test]
+    fn is_distinct_from_is_null_safe() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, b INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1,1),(1,2),(NULL,NULL),(NULL,1)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT a IS NOT DISTINCT FROM b AS same, a IS DISTINCT FROM b AS diff \
+             FROM t ORDER BY a IS NULL, a, b",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Bool(true), Value::Bool(false)],
+                vec![Value::Bool(false), Value::Bool(true)],
+                vec![Value::Bool(true), Value::Bool(false)],
+                vec![Value::Bool(false), Value::Bool(true)],
+            ]
+        );
+    }
+
+    #[test]
+    fn quantified_any_all_comparisons() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (v INT)");
+        run(&mut db, "INSERT INTO t VALUES (1),(2),(3),(4),(5)");
+        // Subquery yields {4, 5}: v > 4 or v > 5.
+        let r = rows(
+            &mut db,
+            "SELECT v FROM t WHERE v > ANY (SELECT v FROM t WHERE v > 3)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
+        let r = rows(
+            &mut db,
+            "SELECT v FROM t WHERE v <> ALL (SELECT v FROM t WHERE v > 3) ORDER BY v",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+            ]
+        );
+        // Empty subquery: ANY is false, ALL is vacuously true.
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM t WHERE v > ANY (SELECT v FROM t WHERE v > 99)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM t WHERE v > ALL (SELECT v FROM t WHERE v > 99)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
+        // SOME is a synonym for ANY (equality form goes through IN).
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM t WHERE v = SOME (SELECT v FROM t WHERE v > 4)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn unsupported_clauses_error_loudly() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (v INT)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let cases: &[(&str, &str)] = &[
+            ("SELECT * FROM t FOR UPDATE", "FOR UPDATE"),
+            ("SELECT * FROM t FOR SHARE", "FOR UPDATE"),
+            ("SELECT * INTO x FROM t", "SELECT INTO"),
+            ("SELECT TOP 1 * FROM t", "SELECT TOP"),
+            ("SELECT * FROM t TABLESAMPLE BERNOULLI (10)", "TABLESAMPLE"),
+            ("SELECT * FROM t NATURAL JOIN t AS u", "NATURAL JOIN"),
+            ("SELECT * FROM t, LATERAL (SELECT 1) AS l", "LATERAL"),
+            ("SELECT v FROM t WINDOW w AS (ORDER BY v)", "WINDOW"),
+            ("SELECT v FROM t QUALIFY v = 1", "QUALIFY"),
+            ("SELECT * FROM generate_series(1, 3)", "table functions"),
+            ("SELECT v FROM t GROUP BY v SETTINGS x = 1", "SETTINGS"),
+            ("SELECT * EXCLUDE (v) FROM t", "EXCLUDE"),
+            (
+                "SELECT v FROM t LATERAL VIEW explode(v) x AS y",
+                "LATERAL VIEW",
+            ),
+            ("SELECT v FROM t PREWHERE v = 1", "PREWHERE"),
+            (
+                "SELECT v FROM t START WITH v = 1 CONNECT BY PRIOR v = v",
+                "CONNECT BY",
+            ),
+            ("SELECT v FROM t CLUSTER BY v", "CLUSTER BY"),
+            ("SELECT v FROM t DISTRIBUTE BY v", "DISTRIBUTE BY"),
+            ("SELECT v FROM t SORT BY v", "SORT BY"),
+            ("SELECT v FROM t FOR XML AUTO", "FOR XML"),
+            ("SELECT v FROM t FORMAT JSONCompact", "FORMAT"),
+            ("SELECT v FROM t |> SELECT v", "pipe operators"),
+        ];
+        for (sql, want) in cases {
+            let e = db.execute(sql).unwrap_err();
+            assert!(
+                e.to_string().contains(want),
+                "sql={sql} error={e} want={want}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_star_fast_path_skips_grouped_queries() {
+        // Regression: the no-decode COUNT(*) shortcut must not swallow
+        // GROUP BY (it would count every row once instead of per group).
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (g TEXT)");
+        run(&mut db, "INSERT INTO t VALUES ('a'),('a'),('b')");
+        let r = rows(&mut db, "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("a".into()), Value::Int(2)],
+                vec![Value::Str("b".into()), Value::Int(1)],
+            ]
+        );
+    }
+
     #[test]
     fn order_by_indexed_key_with_where_on_same_index() {
         let mut db = Database::in_memory().unwrap();
@@ -14288,13 +15077,31 @@ mod tx_rollback_tests {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE sq (id INT)");
         run(&mut db, "INSERT INTO sq VALUES (1), (2)");
-        // 非相关 EXISTS 由 subst 阶段改写执行;ANY/ALL 走 eval 的拒绝分支
+        // 非相关 EXISTS 由 subst 阶段改写执行;ANY/ALL 同样在 subst 阶段
+        // 改写为比较链(空集 ANY=false / ALL=true)
         assert!(db
             .execute("SELECT id FROM sq WHERE EXISTS (SELECT 1 FROM sq)")
             .is_ok());
-        assert!(db
-            .execute("SELECT id FROM sq WHERE id > ANY (SELECT id FROM sq)")
-            .is_err());
+        let r = rows(
+            &mut db,
+            "SELECT id FROM sq WHERE id > ANY (SELECT id FROM sq) ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM sq WHERE id < ALL (SELECT id FROM sq)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM sq WHERE id < ANY (SELECT id FROM sq WHERE id > 99)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM sq WHERE id < ALL (SELECT id FROM sq WHERE id > 99)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
         // 真相关引用(内层引用未知别名)报错
         assert!(db
             .execute("SELECT id FROM sq WHERE id IN (SELECT id FROM nope WHERE id = sq.id)")
@@ -15972,8 +16779,15 @@ mod complex_query_tests {
             "SELECT n FROM r ORDER BY n FETCH FIRST 2 ROWS ONLY",
         );
         assert_eq!(r.rows, vec![vec![Value::Int(10)], vec![Value::Int(20)]]);
+        // WITH TIES returns the whole tie run; unique keys mean exactly n.
+        let r = rows(
+            &mut db,
+            "SELECT n FROM r ORDER BY n FETCH FIRST 2 ROWS WITH TIES",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(10)], vec![Value::Int(20)]]);
+        // Without ORDER BY there is no peer definition.
         let e = db
-            .execute("SELECT n FROM r ORDER BY n FETCH FIRST 1 ROWS WITH TIES")
+            .execute("SELECT n FROM r FETCH FIRST 1 ROWS WITH TIES")
             .unwrap_err();
         assert!(e.to_string().contains("WITH TIES"), "{e}");
     }

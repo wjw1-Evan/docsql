@@ -70,16 +70,38 @@ GROUP BY ... HAVING ...                                  -- HAVING 必须配 GRO
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]
 LIMIT n OFFSET m;
 FETCH FIRST n ROWS ONLY;                                -- Oracle 12c 分页
+FETCH FIRST n ROWS WITH TIES;                           -- 键相等行一并返回(需 ORDER BY)
 
 SELECT ... UNION [ALL] SELECT ...                       -- 集合运算
 SELECT ... INTERSECT [ALL] SELECT ...
 SELECT ... EXCEPT [ALL] SELECT ...                      -- / MINUS(同义)
 
 WITH cte AS (SELECT ...) SELECT * FROM cte;              -- 非递归 CTE;WITH RECURSIVE 报错
+WITH c(id, s) AS (VALUES (1, 'x')) SELECT * FROM c;      -- 别名列按位置改名
 SELECT 1 IN (SELECT ...), EXISTS (SELECT ...);           -- 标量/IN/EXISTS 子查询
+SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v(id, s);   -- 行值构造器(默认 column1..n)
 SELECT CASE WHEN n > 0 THEN 'p' ELSE 'n' END FROM t;     -- CASE
 SELECT 'A' ILIKE 'a';                                    -- 大小写不敏感 LIKE
 SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡尔积
+```
+
+标准 SQL 补充面(均已实现):
+
+```sql
+-- 分组扩展:ROLLUP / CUBE / GROUPING SETS + GROUPING() 区分汇总 NULL
+SELECT g, SUM(v), GROUPING(g) FROM t GROUP BY ROLLUP(g);
+SELECT g, h, SUM(v) FROM t GROUP BY GROUPING SETS ((g), (h));
+SELECT g, h, SUM(v) FROM t GROUP BY CUBE(g, h);
+
+-- 聚合 FILTER (WHERE …):先过滤行,再 DISTINCT/聚合
+SELECT COUNT(*) FILTER (WHERE v > 2), SUM(v) FILTER (WHERE g = 'a') FROM t;
+
+-- 量化比较(非相关子查询;空集 ANY=false / ALL=true);= 形式等价 IN
+SELECT v FROM t WHERE v > ANY (SELECT v FROM t WHERE v > 3);
+SELECT v FROM t WHERE v <> ALL (SELECT v FROM t);
+
+-- NULL 安全比较
+SELECT a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b FROM t;
 ```
 
 - `RETURNING` 支持 INSERT/UPDATE/DELETE;`INSERT … SELECT` 源为 SELECT 查询;
@@ -112,11 +134,15 @@ SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡
 
 以下语法在解析/执行层**显式报错**,不静默吞掉、不降级近似:
 
-- 窗口函数(`OVER`)、`DISTINCT ON`;
+- 窗口函数(`OVER`)、`WINDOW` 子句、`QUALIFY`;
+- `DISTINCT ON`、`SELECT TOP`、`SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE`;
+- `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、表时态(`AS OF`);
+- `FOR UPDATE` / `FOR SHARE`、`FOR XML` / `FOR JSON`、`SETTINGS`、`FORMAT`;
 - `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`(只支持 `DO NOTHING` / `DO REPLACE` / `OR REPLACE` / `OR IGNORE`);
-- **相关子查询**(子查询引用外层列);非相关标量/IN/EXISTS 子查询支持;
+- **相关子查询**(子查询引用外层列);非相关标量/IN/EXISTS/ANY/ALL 子查询支持;
 - `WITH RECURSIVE`(非递归 CTE 支持);
 - 无 `GROUP BY` 的 `HAVING`;
+- `FETCH … PERCENT`(WITH TIES 支持,需 ORDER BY);
 - 外键的 `ON DELETE` / `ON UPDATE` 动作(RESTRICT 式);
 - `CREATE VIEW` / `CREATE TRIGGER`;
 - 自定义 `TRIM` 字符集(单参数形式支持);
@@ -129,7 +155,7 @@ SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡
 - `FROM DUAL`:哑表(单行零列,大小写不敏感);
 - `ROWNUM` 伪列:行取出后、WHERE 与 ORDER BY **之前**编号;被 WHERE 过滤的行
   消耗编号(Oracle 语义);`SELECT *` 不含该列;
-- `FETCH FIRST n ROWS ONLY`(Oracle 12c/SQL 标准分页;`WITH TIES`/`PERCENT` 不支持,显式报错);
+- `FETCH FIRST n ROWS ONLY`(Oracle 12c/SQL 标准分页);`WITH TIES` 同样支持(需 ORDER BY),`PERCENT` 显式报错;
 - 数据字典兼容视图:`ALL_TABLES`/`USER_TABLES`/`ALL_TAB_COLUMNS`/`USER_TAB_COLUMNS`/
   `ALL_INDEXES`/`USER_INDEXES`(OWNER 恒为 `DOCSQL`;单全局命名空间,USER_* 与 ALL_* 同数据;
   系统内部表不出现)。

@@ -93,15 +93,21 @@ FROM t
 LEFT JOIN u ON t.id = u.t_id            -- INNER/LEFT/RIGHT/FULL/CROSS;USING(col)
 WHERE a BETWEEN 1 AND 9 AND b IN (1,2) AND c LIKE 'x%' ESCAPE '!'
 GROUP BY dept HAVING COUNT(*) > 1        -- HAVING 必须配 GROUP BY
+GROUP BY ROLLUP(dept), GROUPING SETS ((a), (b)), CUBE(a, b);   -- 分组扩展 + GROUPING()
+SELECT COUNT(*) FILTER (WHERE v > 2);    -- 聚合 FILTER
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]
 LIMIT n OFFSET m;
 FETCH FIRST n ROWS ONLY;                 -- Oracle 12c 分页
+FETCH FIRST n ROWS WITH TIES;            -- 键相等行一并返回(需 ORDER BY)
 
 SELECT ... UNION [ALL] SELECT ...        -- 集合运算
 SELECT ... INTERSECT [ALL] SELECT ...
 SELECT ... EXCEPT [ALL] SELECT ...       -- / MINUS
 WITH cte AS (SELECT ...) SELECT * FROM cte;              -- 非递归 CTE
 SELECT 1 IN (SELECT ...), EXISTS (SELECT ...);           -- 标量/IN/EXISTS 子查询
+SELECT v > ANY (SELECT ...), v <> ALL (SELECT ...);      -- 量化比较(非相关)
+SELECT a IS DISTINCT FROM b;                             -- NULL 安全比较
+SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(id, s);      -- 行值构造器
 SELECT CASE WHEN n > 0 THEN 'p' ELSE 'n' END FROM t;     -- CASE
 SELECT 'A' ILIKE 'a';                                    -- 大小写不敏感 LIKE
 SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉连接
@@ -111,8 +117,10 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 - 派生表(子查询作 FROM)、`SELECT *, expr`、`ROWNUM`、`DUAL` 支持;
 - **NULL / 软删语义**:`x != TRUE` 命中 NULL 与缺失字段(与 Mongo `$ne: true` 的软删过滤一致);
   单列 UNIQUE 允许多个 NULL,复合 UNIQUE 任一列 NULL 的行跳过整键(不判重);
-- 不支持:窗口函数(OVER)、`DISTINCT ON`、相关子查询、`WITH RECURSIVE`、无 GROUP BY 的
-  HAVING、`ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`(显式报错,不静默吞掉)。
+- 不支持(均显式报错,不静默吞掉):窗口函数(OVER)/`WINDOW`/`QUALIFY`、`DISTINCT ON`、
+  相关子查询、`WITH RECURSIVE`、无 GROUP BY 的 HAVING、`NATURAL JOIN`、`LATERAL`、
+  `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`/`SELECT TOP`、
+  `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`。
 
 ### 3.4 函数
 
