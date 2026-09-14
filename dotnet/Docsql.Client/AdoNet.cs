@@ -1376,4 +1376,14 @@ public sealed class DocsqlFactory : DbProviderFactory
 public sealed class DocsqlException : DbException
 {
     public DocsqlException(string message) : base(message) { }
+
+    /// <summary>服务端为唯一约束冲突返回的错误(UNIQUE constraint failed[: …])。
+    /// 幂等写入路径(webhook 重放等)可据此分支,等价于 Mongo 的 DuplicateKey 判定。</summary>
+    public bool IsUniqueViolation =>
+        Message.StartsWith("UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase)
+        || Message.Contains(": UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>服务端为语法/解析错误返回的消息前缀。</summary>
+    public bool IsSyntaxError =>
+        Message.StartsWith("parse error", StringComparison.OrdinalIgnoreCase);
 }

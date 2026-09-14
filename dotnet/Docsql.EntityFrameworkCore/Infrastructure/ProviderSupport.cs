@@ -77,11 +77,7 @@ public sealed class DocsqlAnnotationProvider(
 
 public sealed class DocsqlLoggingDefinitions : RelationalLoggingDefinitions;
 
-/// <summary>复用 EF 关系层通用约定集(表/列映射注解)。</summary>
-public sealed class DocsqlConventionSetBuilder(
-    ProviderConventionSetBuilderDependencies dependencies,
-    RelationalConventionSetBuilderDependencies relationalDependencies)
-    : RelationalConventionSetBuilder(dependencies, relationalDependencies);
+// DocsqlConventionSetBuilder 见 DocsqlJsonDictionaryConvention.cs(挂字典→JSON 文本约定)。
 
 /// <summary>字符串方法 LINQ 翻译(StartsWith/EndsWith/Contains → LIKE)。</summary>
 public sealed class DocsqlMethodCallTranslatorPlugin : IMethodCallTranslatorPlugin

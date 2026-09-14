@@ -7457,6 +7457,33 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Value::Bool(false),
             }
         }
+        // Array membership for EF's entity primitive-collection Contains:
+        // JSON_ARRAY_CONTAINS(json_text, needle) — NULL text/parse failure and
+        // non-array JSON are false (subquery-existence semantics).
+        "JSON_ARRAY_CONTAINS" => {
+            exact_arity(name, args, 2)?;
+            let (haystack, needle) = (arg(args, 0, name)?, arg(args, 1, name)?);
+            let items: &[Value] = match haystack {
+                Value::Null => return Ok(Value::Null),
+                Value::Array(items) => items,
+                Value::Str(s) => match crate::json::from_str(s) {
+                    Ok(Value::Array(items)) => {
+                        return Ok(Value::Bool(
+                            items
+                                .iter()
+                                .any(|it| Value::cmp_values(it, needle) == Ordering::Equal),
+                        ))
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                },
+                _ => return Ok(Value::Bool(false)),
+            };
+            Value::Bool(
+                items
+                    .iter()
+                    .any(|it| Value::cmp_values(it, needle) == Ordering::Equal),
+            )
+        }
         // ---- Oracle-style function family (compatibility surface) ----
         "NVL" => {
             exact_arity(name, args, 2)?;
@@ -15698,6 +15725,113 @@ mod complex_query_tests {
             rows(&mut db, "SELECT SUM(DISTINCT x) FROM g").rows[0][0].to_string(),
             "5.25"
         );
+    }
+
+    #[test]
+    fn json_array_contains_and_null_semantics() {
+        let mut db = Database::in_memory().unwrap();
+        // Membership over string/number/bool elements; strict JSON text input.
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('[\"a\",\"b\"]', 'a')").rows[0][0],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('[\"a\",\"b\"]', 'c')").rows[0][0],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('[1,2,3]', 2)").rows[0][0],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT JSON_ARRAY_CONTAINS('[1.5,true,null]', TRUE)"
+            )
+            .rows[0][0],
+            Value::Bool(true)
+        );
+        // Non-array / malformed JSON are false; NULL text stays NULL.
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('{\"a\":1}', 'a')").rows[0][0],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('not json', 'a')").rows[0][0],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS(NULL, 'a')").rows[0][0],
+            Value::Null
+        );
+        // EF translation shape: column-vs-column membership.
+        run(
+            &mut db,
+            "CREATE TABLE roles (id INT PRIMARY KEY, list TEXT, role TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO roles VALUES \
+             (1, '[\"admin\",\"user\"]', 'admin'), (2, '[\"user\"]', 'admin')",
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT COUNT(*) FROM roles WHERE JSON_ARRAY_CONTAINS(list, role)"
+            )
+            .rows[0][0],
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn null_semantics_for_soft_delete_and_single_column_unique() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE sd (id INT PRIMARY KEY, email TEXT UNIQUE, is_deleted BOOL)",
+        );
+        // Single-column UNIQUE allows multiple NULLs (Mongo missing-field parity).
+        run(
+            &mut db,
+            "INSERT INTO sd VALUES (1, NULL, NULL), (2, NULL, NULL)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO sd VALUES (3, 'a', TRUE), (4, 'b', NULL), (5, 'c', FALSE)",
+        );
+        run(&mut db, "INSERT INTO sd (id, email) VALUES (6, 'd')"); // is_deleted missing
+                                                                    // `IsDeleted != TRUE` matches NULL and missing fields — the Mongo
+                                                                    // soft-delete filter maps 1:1; `= FALSE` only matches explicit false.
+        let ids: Vec<Value> = rows(
+            &mut db,
+            "SELECT id FROM sd WHERE is_deleted != TRUE ORDER BY id",
+        )
+        .rows
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(4),
+                Value::Int(5),
+                Value::Int(6)
+            ]
+        );
+        let ids: Vec<Value> = rows(&mut db, "SELECT id FROM sd WHERE is_deleted = FALSE")
+            .rows
+            .iter()
+            .map(|r| r[0].clone())
+            .collect();
+        assert_eq!(ids, vec![Value::Int(5)]);
+        // A non-NULL duplicate still collides.
+        let e = db
+            .execute("INSERT INTO sd VALUES (7, 'a', NULL)")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
     }
 
     #[test]

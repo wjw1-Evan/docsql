@@ -215,7 +215,7 @@ builder.Services.AddDocsqlDbContext<AppDb>("docsql", (sp, o) => o.EnableSensitiv
 
 ```csharp
 var docsql = builder.AddDocsql("docsql")
-    .WithImageTag("v0.2.0")
+    .WithImageTag("v0.3.0")
     .WithEnvironment("DOCSQL_ASYNC_COMMIT", "1")          // 组提交(~2ms 丢失窗口)
     .WithEnvironment("DOCSQL_CATCHUP_WINDOW", "200000")   // 追赶日志保留
     .WithEnvironment("DOCSQL_BACKUP_INTERVAL_SECS", "3600")

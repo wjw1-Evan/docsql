@@ -99,7 +99,7 @@ INSERT INTO orders (id, note)
 | 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告(含运行时计数器:连接/语句/字节/认证失败,可直接喂 `/metrics`)、REQ_BACKUP 备份管理与手动触发、REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT 服务端参数化(占位符在服务端引号感知绑定,注入载荷无法逃逸字面量) |
 | 发布订阅 | 持久化 pub/sub(参考 Redis 命令面):PUBLISH/SUBSCRIBE/PSUBSCRIBE(glob `*` `?` `[...]`)/UNSUBSCRIBE/PUBSUB CHANNELS·NUMSUB·NUMPAT·TRIM;消息先经 WAL 落盘再推送,重启不丢;订阅可指定起点(`earliest` 全量回放 / `latest` 仅新消息 / 指定 id 续传),断线用最后收到的 id 重新订阅即补齐(at-least-once);集群内发布自动扇出到全部节点,各节点本地落盘并推送本地订阅者;`docsql_pubsub` 系统视图可查消息历史 |
 | Web | **DocSQL Studio**(SSMS 风格管理控制台,纯管理工具、自身不存数据,默认连接并管理指定节点):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/行内编辑与删除——按主键定位生成 UPDATE/DELETE,自增列只读、可勾选置 NULL;主键列缺失的表不提供行编辑)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、备份管理页(备份状态/文件列表/立即备份/一键恢复——恢复需输入完整文件名确认)、节点切换(默认管理节点 ↔ 任意 `DOCSQL_PEERS` 节点);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs /api/backup,其中数据端点 /api/sql /api/meta /api/stats /api/backup 可带 `node` 参数指定目标节点) |
-| EF Core | `UseDocsql(connectionString)`(独立原生提供程序,基于 Docsql ADO.NET,不依赖 SQLite):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引与模型复合索引(含唯一索引;模型增删索引均自动同步,免迁移);`decimal`→精确 `DECIMAL`(服务端 Sum/比较不丢精度)、`DateOnly`/`TimeOnly`、`byte[]`→`BLOB`、`List.Contains`→`IN` |
+| EF Core | `UseDocsql(connectionString)`(独立原生提供程序,基于 Docsql ADO.NET,不依赖 SQLite):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引与模型复合索引(含唯一索引;模型增删索引均自动同步,免迁移);`decimal`→精确 `DECIMAL`(服务端 Sum/比较不丢精度)、`DateOnly`/`TimeOnly`、`byte[]`→`BLOB`、`List.Contains`→`IN`;实体集合属性 `List<T>` 的 `Contains`→`JSON_ARRAY_CONTAINS`(权限/受众形态的服务端查询)、`Dictionary<string,object>`→JSON 文本 |
 | 集群 | 对等集群(`DOCSQL_PEERS`:任意节点可写,SQL 写入扇出至全部对等节点;节点之间用独立集群凭据互相认证)、主从复制(写转发)、只读副本、PROMOTE 故障转移 |
 
 ## 结构
@@ -205,7 +205,7 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 
 ## .NET 与 Aspire(ADO.NET / EF Core / AppHost 编排)
 
-四个 NuGet 包发布在 GitHub Packages(`net10.0`,版本随 `v*` tag 发布,当前 `0.2.0`):
+四个 NuGet 包发布在 GitHub Packages(`net10.0`,版本随 `v*` tag 发布,当前 `0.3.0`):
 
 | 包 | 用途 | 装到哪 |
 |---|---|---|

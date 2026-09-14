@@ -77,6 +77,13 @@ services.AddDbContext<AppDb>(o => o.UseDocsql(connectionString));
 - 原生提供程序(不依赖 SQLite);`EnsureCreated` + 惰性建表 + 模型/索引自动同步(免迁移);
 - 类型映射:`decimal` → `DECIMAL`(参数经 `$dec` 文本标记精确绑定,服务端十进制聚合/比较;`HasPrecision` 进入列类型与 CAST 字面量)、`byte[]` → `BLOB`(参数经 `$bytes` 标记,响应按 `{"$bytes":[…]}` 解码;单值 ≤16MiB 文档上限)、`DateOnly`/`TimeOnly` → 可排序 ISO 文本、`DateTime`/`DateTimeOffset`/`TimeSpan`/`Guid` 沿用文本;未映射的 CLR 类型在模型构建期显式报错;
 - 模型复合索引(`HasIndex(e => new { … })`)按列序创建;`List.Contains` 翻译为 `IN (…)`;字符串 `StartsWith/EndsWith/Contains` 翻译为 `LIKE`;引擎不支持的语法在翻译期显式失败;
+- **实体集合属性**(`List<string>`/`List<int>` 等,JSON 数组列)的 `Contains` 翻译为服务端
+  `JSON_ARRAY_CONTAINS(list, item)`——常量元素、跨实体列(`t.RoleIds.Contains(p.Id)` 权限形态)、
+  取反与数值集合均可;成员查询不回落客户端求值;
+- `Dictionary<string, object>` 属性约定映射为 JSON 文本标量(读写、整体变更跟踪);字典内部
+  成员不参与 SQL 翻译(在 WHERE 里按键过滤仍在客户端侧不可用,请提取为独立列);
+- 异常分类:`DocsqlException.IsUniqueViolation`(唯一约束冲突,幂等写入/重复键语义)与
+  `IsSyntaxError`(解析错误),不需要匹配错误文本;
 - `Database.Migrate()` 显式报错(Migrations 不支持)。
 
 ## Aspire 集成(Docsql.Aspire.Hosting / Docsql.Aspire.Client)

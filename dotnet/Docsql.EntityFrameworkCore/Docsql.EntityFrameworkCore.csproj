@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <!-- NuGet packaging surface (dotnet pack) -->
     <PackageId>Docsql.EntityFrameworkCore</PackageId>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <Authors>DocSQL Contributors</Authors>
     <Description>Entity Framework Core provider for DocSQL (native, on Docsql.Client): EnsureCreated, lazy table creation, model/index auto-sync. Migrations are intentionally unsupported.</Description>
     <PackageTags>docsql;database;efcore;entity-framework-core;provider</PackageTags>

@@ -313,6 +313,38 @@ public sealed class ClientSurfaceTests : IClassFixture<ServerFixture>
         }
     }
 
+    [Fact]
+    public void Duplicate_key_surfaces_as_unique_violation()
+    {
+        // 幂等写入路径(webhook 重放)按异常类型分支:唯一冲突可识别。
+        using var conn = Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS csurf_uniq (id INT PRIMARY KEY)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "DELETE FROM csurf_uniq";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "INSERT INTO csurf_uniq VALUES (1)";
+            Assert.Equal(1, cmd.ExecuteNonQuery());
+            cmd.CommandText = "INSERT INTO csurf_uniq VALUES (1)";
+            var dup = Assert.Throws<DocsqlException>(() => cmd.ExecuteNonQuery());
+            Assert.True(dup.IsUniqueViolation, dup.Message);
+            Assert.False(dup.IsSyntaxError, dup.Message);
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT * FROM csurf_missing_table";
+            var other = Assert.Throws<DocsqlException>(() => cmd.ExecuteNonQuery());
+            Assert.False(other.IsUniqueViolation, other.Message);
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELEC 1";
+            var syntax = Assert.Throws<DocsqlException>(() => cmd.ExecuteNonQuery());
+            Assert.True(syntax.IsSyntaxError, syntax.Message);
+        }
+    }
+
     private object? ScalarWithParam(string sql, object value)
     {
         using var conn = Open();

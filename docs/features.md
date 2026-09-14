@@ -109,6 +109,8 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 
 - 等值 JOIN 自动走 **hash join**(键按数值/编码归一化,索引只做超集、ON 逐候选终裁);
 - 派生表(子查询作 FROM)、`SELECT *, expr`、`ROWNUM`、`DUAL` 支持;
+- **NULL / 软删语义**:`x != TRUE` 命中 NULL 与缺失字段(与 Mongo `$ne: true` 的软删过滤一致);
+  单列 UNIQUE 允许多个 NULL,复合 UNIQUE 任一列 NULL 的行跳过整键(不判重);
 - 不支持:窗口函数(OVER)、`DISTINCT ON`、相关子查询、`WITH RECURSIVE`、无 GROUP BY 的
   HAVING、`ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`(显式报错,不静默吞掉)。
 
@@ -122,6 +124,7 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 | 空值/条件 | `COALESCE` `IFNULL` `NULLIF` `NVL` `NVL2` `DECODE` |
 | 类型/自省 | `TYPEOF` `CAST(expr AS INT/REAL/DECIMAL/TEXT/BOOL/BLOB/...)` |
 | JSON 点读 | `JSON_EXTRACT(doc,'$.a.b[0]')` `JSON_TYPE` `JSON_VALID`(坏文本/缺路径返回 NULL) |
+| JSON 数组 | `JSON_ARRAY_CONTAINS(json_text, value)` 数组成员判定(EF 实体集合 `Contains` 的翻译目标;非数组/坏 JSON → false,NULL 文本 → NULL) |
 | Oracle 兼容 | `INSTR` `LPAD/RPAD` `GREATEST/LEAST` `TO_NUMBER`(非整数文本产 DECIMAL) `TO_CHAR` `SYSDATE()` |
 
 ### 3.5 事务
@@ -261,7 +264,7 @@ REST API(`X-Docsql-Token` 认证):
 | 入口 | 能力 |
 |---|---|
 | ADO.NET(`Docsql.Client`) | 连接池(默认开启,池键含身份)、事务 + SAVEPOINT、全链路异步、`RETURNING`、服务端参数绑定(`@name`)、`Publish`/`DocsqlSubscriber`、`DOCSQL_KEY` 透传 |
-| EF Core(`Docsql.EntityFrameworkCore`) | 原生提供程序(不依赖 SQLite):EnsureCreated + 惰性建表 + 模型/索引(含复合)自动同步、LINQ/Include、`decimal`→DECIMAL、`byte[]`→BLOB、`DateOnly/TimeOnly`、`List.Contains`→IN、字符串方法→LIKE;`Database.Migrate()` 显式报错 |
+| EF Core(`Docsql.EntityFrameworkCore`) | 原生提供程序(不依赖 SQLite):EnsureCreated + 惰性建表 + 模型/索引(含复合)自动同步、LINQ/Include、`decimal`→DECIMAL、`byte[]`→BLOB、`DateOnly/TimeOnly`、`List.Contains`→IN、字符串方法→LIKE;**实体集合属性 `List<T>`(JSON 数组)的 `Contains` 翻译为 `JSON_ARRAY_CONTAINS`(常量/跨列/取反/数值元素)**;`Dictionary<string,object>` 映射为 JSON 文本(读写与变更跟踪,成员不参与 SQL 翻译);`Database.Migrate()` 显式报错 |
 | Aspire | `AddDocsql` / `AddDocsqlCluster` / `WithWebConsole` / `WithDataVolume` + 消费侧 `AddDocsqlConnection` / `AddDocsqlDbContext`;见 [Aspire 指南](aspire.md) |
 | CLI(`docsql-cli`) | 嵌入式(直接开数据文件)与远程 shell;`--csv`/`--json` 导出;`-f script.sql` 批量(快速失败);内联 pub/sub 命令;`--user` 登录(密码走环境/提示) |
 | 线协议(自研驱动) | v1 二进制一句话一帧;`REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT` 服务端绑定;复制帧、`REQ_STATUS`、`REQ_BACKUP`、订阅帧;参数支持 `$dec`/`$bytes` 精确标记;帧定义见 `core/proto.rs` 模块头 |

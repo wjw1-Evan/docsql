@@ -74,7 +74,15 @@ jobs:
           --configfile dotnet/samples/AspireSample/nuget.config
       - name: Build Aspire sample against published packages
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        run: dotnet build dotnet/samples/AspireSample/AspireSample.AppHost/AspireSample.AppHost.csproj
+        run: |
+          # On a v* tag push the sample's package version is published by the
+          # nuget-publish workflow in parallel; retry the restore briefly.
+          for i in 1 2 3 4 5 6; do
+            dotnet restore dotnet/samples/AspireSample/AspireSample.AppHost/AspireSample.AppHost.csproj && break
+            echo "restore not ready yet (attempt $i); retrying in 30s"
+            sleep 30
+          done
+          dotnet build dotnet/samples/AspireSample/AspireSample.AppHost/AspireSample.AppHost.csproj --no-restore
 
   coverage:
     name: coverage gate

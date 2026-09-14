@@ -56,6 +56,9 @@ public sealed class DocsqlOptionsExtension : RelationalOptionsExtension
         // 依赖它写入模型。
         services.Replace(ServiceDescriptor.Scoped<IProviderConventionSetBuilder, DocsqlConventionSetBuilder>());
         services.Replace(ServiceDescriptor.Scoped<IQuerySqlGeneratorFactory, DocsqlQuerySqlGeneratorFactory>());
+        // 实体集合属性 Contains(JSON 数组)翻译:默认关系层不支持,换本提供程序实现。
+        services.Replace(ServiceDescriptor.Scoped<IRelationalSqlTranslatingExpressionVisitorFactory,
+            DocsqlSqlTranslatingExpressionVisitorFactory>());
     }
 
     public override DbContextOptionsExtensionInfo Info => new ExtensionInfo(this);

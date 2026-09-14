@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-14
+
+### 实体集合查询 + 字典映射 + 异常分类(2026-09-14)
+
+#### 新增
+
+- **实体集合属性的服务端查询**:`List<string>`/`List<int>` 等集合属性(JSON 数组列)的
+  `Contains` 由 EF 提供程序翻译为引擎新函数 `JSON_ARRAY_CONTAINS(json_text, value)`
+  (成员判定;非数组/坏 JSON → false,NULL 文本 → NULL)。覆盖常量元素、跨实体列形态
+  (`t.RoleIds.Contains(p.Id)` 权限查询)、取反、数值集合与空集合;不回落客户端求值。
+- **`Dictionary<string, object>` 映射**:提供程序约定(实体/属性加入时)把字典映射为
+  JSON 文本标量——此前模型校验直接失败("shared-type entity type"导航)。读取把 JSON
+  反序列化为原生 CLR 值(整数保持 long),`ValueComparer` 以键排序的规范 JSON 做
+  相等/哈希/快照,原地改写可被变更跟踪捕获;字典成员不参与 SQL 翻译(需要键过滤时提取独立列)。
+- **异常分类**:`DocsqlException.IsUniqueViolation`(唯一约束冲突)与 `IsSyntaxError`
+  (解析错误)——幂等写入(webhook 重放)可按属性分支,不必解析错误文本。
+
+#### 文档
+
+- `docs/features.md` / `docs/drivers.md` / README / EF 包 README 同步集合翻译、字典映射、
+  异常分类与 NULL/软删语义说明(`x != TRUE` 命中 NULL/缺字段;单列 UNIQUE 允许多个 NULL)。
+
 ### Aspire 示例改用发布包 + 文档整理(2026-09-14)
 
 #### 变更
