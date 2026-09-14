@@ -21,6 +21,7 @@
 use crate::encode;
 use crate::pager::{PageReader, Pager, PagerError, Tx, PAGE_SIZE};
 use crate::value::{Object, Value};
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 const SLOT_SIZE: usize = 4;
@@ -166,18 +167,19 @@ fn load_page_owned(reader: &PageReader, tx: Option<&Tx>, id: u32) -> Result<Vec<
 /// Assemble one slot's document bytes: a plain slot's content is the
 /// encoded document itself; an overflow slot (`0xFF` first byte) carries
 /// `[mark][total:u32][chain_head:u32][inline prefix]` and the rest is
-/// assembled along the chain page list.
-fn slot_document_bytes(
+/// assembled along the chain page list. Plain slots borrow the page; only
+/// overflow documents copy.
+fn slot_document_bytes<'a>(
     reader: &PageReader,
     tx: Option<&Tx>,
     page_id: u32,
-    page: &[u8],
+    page: &'a [u8],
     off: usize,
     len: usize,
-) -> Result<Vec<u8>> {
+) -> Result<Cow<'a, [u8]>> {
     let content = &page[off..off + len];
     if content.first() != Some(&OVERFLOW_MARK) {
-        return Ok(content.to_vec());
+        return Ok(Cow::Borrowed(content));
     }
     if content.len() < OVERFLOW_SLOT_HEADER {
         return Err(HeapError::Page(page_id, "overflow slot truncated"));
@@ -208,7 +210,7 @@ fn slot_document_bytes(
             "overflow chain corrupt (short read)",
         ));
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 /// Parse a chain page header: `(next_page, payload_len)`. Fails loudly on a
@@ -292,6 +294,54 @@ impl Heap {
             }
         }
         Ok(out)
+    }
+
+    /// Number of live document slots, without decoding any document.
+    /// Documents are always object-rooted (`insert` takes `&Object`) and
+    /// tombstones are zero-length slots, so counting non-empty slots is
+    /// exact. Used by the COUNT(*) fast path.
+    pub fn live_count(&self, reader: &PageReader) -> Result<u64> {
+        let mut n = 0u64;
+        for &pid in &self.pages {
+            let page = reader.page(None, pid)?;
+            validate_page(&page, pid)?;
+            for i in 0..count_of(&page) {
+                if slot(&page, i).1 != 0 {
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// Visit every live document's raw encoded bytes in insertion order,
+    /// passing its locator. Plain slots borrow the page; overflow documents
+    /// assemble their chain first. Generic over the visitor's error type so
+    /// the engine can propagate its own errors (`E: From<HeapError>`).
+    pub fn for_each_doc<E>(
+        &self,
+        reader: &PageReader,
+        mut visit: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<HeapError>,
+    {
+        for &pid in &self.pages {
+            let page = reader
+                .page(None, pid)
+                .map_err(|e| E::from(HeapError::from(e)))?;
+            validate_page(&page, pid).map_err(E::from)?;
+            for i in 0..count_of(&page) {
+                let (off, len) = slot(&page, i);
+                if len == 0 {
+                    continue; // tombstone
+                }
+                let bytes =
+                    slot_document_bytes(reader, None, pid, &page, off, len).map_err(E::from)?;
+                visit(pack_loc(pid, i), &bytes)?;
+            }
+        }
+        Ok(())
     }
 
     /// Live (locator, document) pairs of one page, in slot order. Staged

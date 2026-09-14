@@ -1252,6 +1252,14 @@ impl<'a> ReadCx<'a> {
         let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
         let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
 
+        // `SELECT COUNT(*) FROM t` without WHERE/GROUP BY: count live heap
+        // slots instead of decoding every document.
+        if is_aggregate {
+            if let Some(out) = self.try_count_star(&query, &select, ctes)? {
+                return Ok(out);
+            }
+        }
+
         // ORDER BY <index key> + LIMIT: index-ordered window, skipping the
         // full heap scan and sort. Already filtered and windowed; the WHERE
         // pass below would be a no-op, so it is skipped too.
@@ -1269,7 +1277,13 @@ impl<'a> ReadCx<'a> {
                     pre_windowed = true;
                     rows
                 }
-                None => self.load_from(&select.from, &select.selection, ctes)?,
+                None => match self.unindexed_order_window(&select, &query, ctes)? {
+                    Some(rows) => {
+                        pre_windowed = true;
+                        rows
+                    }
+                    None => self.load_from(&select.from, &select.selection, ctes)?,
+                },
             }
         } else {
             self.load_from(&select.from, &select.selection, ctes)?
@@ -1767,6 +1781,249 @@ impl<'a> ReadCx<'a> {
             }
         };
         Ok(pairs)
+    }
+
+    /// `SELECT COUNT(*) FROM t` with no WHERE/GROUP BY/window: count the
+    /// heap's live slots without decoding documents. `None` sends anything
+    /// more complex down the generic aggregate path.
+    fn try_count_star(
+        &self,
+        query: &Query,
+        select: &sqlparser::ast::Select,
+        ctes: &Ctes,
+    ) -> Result<Option<ExecOutcome>> {
+        if !ctes.is_empty()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || select.top.is_some()
+            || !matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All))
+            || query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || query.fetch.is_some()
+            || select.projection.len() != 1
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return Ok(None);
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return Ok(None);
+        };
+        let Some(meta) = self.real_table_meta(name) else {
+            return Ok(None);
+        };
+        let (column, expr) = match &select.projection[0] {
+            SelectItem::UnnamedExpr(e) => (expr_name(e), e),
+            SelectItem::ExprWithAlias { expr, alias, .. } => (alias.value.clone(), expr),
+            _ => return Ok(None),
+        };
+        let SqlExpr::Function(f) = expr else {
+            return Ok(None);
+        };
+        if !f.name.to_string().eq_ignore_ascii_case("count")
+            || f.filter.is_some()
+            || f.over.is_some()
+        {
+            return Ok(None);
+        }
+        use sqlparser::ast::{DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments};
+        let is_star = match &f.args {
+            FunctionArguments::List(list) => {
+                !matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+                    && list.args.len() == 1
+                    && matches!(
+                        list.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    )
+            }
+            _ => false,
+        };
+        if !is_star {
+            return Ok(None);
+        }
+        let count = meta.heap_of().live_count(&self.reader())?;
+        Ok(Some(ExecOutcome::Rows(QueryResult {
+            columns: vec![column],
+            rows: vec![vec![Value::Int(count as i64)]],
+        })))
+    }
+
+    /// A FROM relation that resolves to a real heap table: single-part name,
+    /// present in the catalog, and not a compatibility view that shadows
+    /// user tables of the same name in `load_table_factor`.
+    fn real_table_meta(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+    ) -> Option<&std::sync::Arc<TableMeta>> {
+        if name.0.len() != 1 {
+            return None;
+        }
+        let tname = obj_name(name);
+        if is_compat_view(&tname) {
+            return None;
+        }
+        self.tables.get(&tname)
+    }
+
+    /// Unindexed `ORDER BY <fields> LIMIT/OFFSET`: extract only the sort
+    /// fields from each document's encoded bytes (no full decode), keep the
+    /// best `skip+take` rows in a bounded heap, then materialize just those
+    /// documents. `None` (generic decode + sort) unless every ORDER BY key
+    /// is a bare top-level field, there is no WHERE, and the window is
+    /// bounded. Ties keep scan order, matching the stable generic sort.
+    fn unindexed_order_window(
+        &self,
+        select: &sqlparser::ast::Select,
+        query: &Query,
+        ctes: &Ctes,
+    ) -> Result<Option<Vec<Object>>> {
+        if !ctes.is_empty()
+            || select.selection.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return Ok(None);
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return Ok(None);
+        };
+        let Some(meta) = self.real_table_meta(name) else {
+            return Ok(None);
+        };
+        let Some(order_by) = &query.order_by else {
+            return Ok(None);
+        };
+        let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Ok(None);
+        };
+        if exprs.is_empty() {
+            return Ok(None);
+        }
+        let Some((skip, take)) = constant_limit_window(query) else {
+            return Ok(None);
+        };
+        if take == usize::MAX {
+            return Ok(None); // unbounded: every row is materialized anyway
+        }
+        if take == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Resolve every ORDER BY key to a source field, mirroring
+        // `apply_order_limit`: an output-column name wins over the raw
+        // expression, and a bare column ref (possibly qualified, with the
+        // bare name as fallback) is the only extractable shape.
+        let mut project: Vec<(String, &SqlExpr)> = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e)),
+                SelectItem::ExprWithAlias { expr, alias, .. } => {
+                    project.push((alias.value.clone(), expr))
+                }
+                _ => return Ok(None), // wildcard / unsupported item
+            }
+        }
+        let mut keys: Vec<(Vec<String>, bool, Option<bool>)> = Vec::new();
+        for o in exprs {
+            let name = expr_name(&o.expr);
+            let src = match project.iter().find(|(c, _)| *c == name) {
+                Some((_, e)) => *e,
+                None => {
+                    if name.parse::<usize>().is_ok() {
+                        return Ok(None); // ordinal position: generic path
+                    }
+                    &o.expr
+                }
+            };
+            let fields = match src {
+                SqlExpr::Identifier(i) => vec![i.value.clone()],
+                SqlExpr::CompoundIdentifier(parts) => {
+                    let mut fields: Vec<String> = parts.iter().map(|p| p.value.clone()).collect();
+                    if let Some(last) = fields.last().cloned() {
+                        fields.push(last);
+                    }
+                    fields
+                }
+                _ => return Ok(None),
+            };
+            keys.push((fields, o.options.asc.unwrap_or(true), o.options.nulls_first));
+        }
+        let dirs: Vec<(bool, Option<bool>)> = keys.iter().map(|(_, asc, nf)| (*asc, *nf)).collect();
+        let cap = skip.saturating_add(take);
+        let heap = meta.heap_of();
+        let reader = self.reader();
+        let mut top: std::collections::BinaryHeap<OrderKeyed> =
+            std::collections::BinaryHeap::with_capacity(cap.min(64));
+        let mut seq = 0u64;
+        heap.for_each_doc::<SqlError>(&reader, |loc, bytes| {
+            // Extract the first key; when the window is full, reject before
+            // decoding the remaining keys (the common case).
+            let mut first = Value::Null;
+            for field in &keys[0].0 {
+                if let Some(v) = encode::extract_field(bytes, field)? {
+                    first = v;
+                    break;
+                }
+            }
+            if top.len() >= cap {
+                let worst = top.peek().expect("cap > 0");
+                let ord = cmp_maybe_null(&first, &worst.keys[0], dirs[0].1);
+                let worse = if dirs[0].0 {
+                    ord == Ordering::Greater
+                } else {
+                    ord == Ordering::Less
+                };
+                if worse {
+                    seq += 1;
+                    return Ok(());
+                }
+            }
+            let mut key_vals = Vec::with_capacity(keys.len());
+            key_vals.push(first);
+            for (fields, _, _) in keys.iter().skip(1) {
+                let mut v = Value::Null;
+                for field in fields {
+                    if let Some(found) = encode::extract_field(bytes, field)? {
+                        v = found;
+                        break;
+                    }
+                }
+                key_vals.push(v);
+            }
+            let entry = OrderKeyed {
+                keys: key_vals,
+                loc,
+                seq,
+                dirs: &dirs,
+            };
+            seq += 1;
+            if top.len() < cap {
+                top.push(entry);
+            } else if top.peek().is_some_and(|worst| entry < *worst) {
+                top.pop();
+                top.push(entry);
+            }
+            Ok(())
+        })?;
+        // Only the window needs ordering: partition the skipped prefix off
+        // in O(cap) and sort just the suffix (at most `take` rows — the
+        // heap holds at most `skip+take`), so deep OFFSET no longer sorts
+        // the whole candidate set.
+        let mut entries = top.into_vec();
+        if skip < entries.len() {
+            entries.select_nth_unstable(skip);
+            let mut window = entries.split_off(skip);
+            window.sort();
+            entries = window;
+        } else {
+            entries.clear();
+        }
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            if let Some(doc) = heap.doc_at(&reader, e.loc)? {
+                out.push(doc);
+            }
+        }
+        Ok(Some(out))
     }
 
     /// `ORDER BY <index key> LIMIT/OFFSET` window: walk one B+ tree in key
@@ -8001,6 +8258,67 @@ fn cmp_maybe_null(a: &Value, b: &Value, nulls_first: Option<bool>) -> Ordering {
     }
 }
 
+/// One candidate row of the unindexed ORDER BY top-K heap: extracted sort
+/// keys, heap locator, scan sequence (stable tie-break) and the shared
+/// per-key directions. The ordering is the row's `ORDER BY` position, so
+/// "better" compares less: `BinaryHeap` keeps the worst window entry on top
+/// and `into_sorted_vec` yields best first.
+struct OrderKeyed<'a> {
+    keys: Vec<Value>,
+    loc: u64,
+    seq: u64,
+    dirs: &'a [(bool, Option<bool>)],
+}
+
+impl PartialEq for OrderKeyed<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for OrderKeyed<'_> {}
+
+impl PartialOrd for OrderKeyed<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderKeyed<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (i, (asc, nulls_first)) in self.dirs.iter().enumerate() {
+            let ord = cmp_maybe_null(&self.keys[i], &other.keys[i], *nulls_first);
+            if ord != Ordering::Equal {
+                return if *asc { ord } else { ord.reverse() };
+            }
+        }
+        self.seq.cmp(&other.seq)
+    }
+}
+
+/// True for names that `load_table_factor` resolves to a virtual
+/// compatibility view instead of a real heap. Fast paths must not look
+/// their rows up in `tables`; keep this list in sync with that resolver.
+fn is_compat_view(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("DUAL")
+        || name == "sqlite_master"
+        || name == "sqlite_temporal_master"
+        || name == "information_schema.tables"
+        || name == "information_schema.columns"
+    {
+        return true;
+    }
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "ALL_TABLES"
+            | "USER_TABLES"
+            | "ALL_TAB_COLUMNS"
+            | "USER_TAB_COLUMNS"
+            | "ALL_INDEXES"
+            | "USER_INDEXES"
+    )
+}
+
 /// Inline a computed Value as a literal expression node (subquery
 /// substitution rewrites results into the row-local expression tree).
 fn value_to_literal(v: Value) -> Result<SqlExpr> {
@@ -11648,6 +11966,132 @@ mod tests {
         );
         let r = rows(&mut db, "SELECT note FROM t ORDER BY n DESC LIMIT 1");
         assert_eq!(r.rows, vec![vec![Value::Str("two".into())]]);
+    }
+
+    #[test]
+    fn count_star_fast_path_matches_generic_aggregate() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+        let count_fast = rows(&mut db, "SELECT COUNT(*) FROM t");
+        let count_slow = rows(&mut db, "SELECT COUNT(*) FROM t WHERE 1 = 1");
+        assert_eq!(count_fast.columns, count_slow.columns);
+        assert_eq!(count_fast.rows, vec![vec![Value::Int(3)]]);
+        let alias_fast = rows(&mut db, "SELECT COUNT(*) AS n FROM t");
+        let alias_slow = rows(&mut db, "SELECT COUNT(*) AS n FROM t WHERE 1 = 1");
+        assert_eq!(alias_fast.columns, alias_slow.columns);
+        assert_eq!(alias_fast.rows, vec![vec![Value::Int(3)]]);
+        // COUNT(col) counts non-null values and stays on the generic path.
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(v) FROM t").rows,
+            vec![vec![Value::Int(3)]]
+        );
+        // Liveness: updates and deletes must not leave tombstones counted.
+        run(&mut db, "UPDATE t SET v = 'a' WHERE id = 2");
+        run(&mut db, "DELETE FROM t WHERE id = 1");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows,
+            vec![vec![Value::Int(2)]]
+        );
+        run(&mut db, "INSERT INTO t VALUES (4, NULL)");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows,
+            vec![vec![Value::Int(3)]]
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(v) FROM t").rows,
+            vec![vec![Value::Int(2)]]
+        );
+        run(&mut db, "DELETE FROM t");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows,
+            vec![vec![Value::Int(0)]]
+        );
+        // LIMIT / WHERE keep the generic path but the same answer.
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t LIMIT 1").rows,
+            vec![vec![Value::Int(0)]]
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t WHERE 1 = 1").rows,
+            vec![vec![Value::Int(0)]]
+        );
+    }
+
+    #[test]
+    fn unindexed_order_window_matches_generic_sort() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, name TEXT, v INT)",
+        );
+        // Duplicates, NULLs, mixed directions and a missing field: the
+        // schemaless sort semantics and the stable tie order must match the
+        // generic full decode + sort path.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 'b', 10), (2, NULL, 5), (3, 'a', 7), (4, 'b', 9), \
+             (5, NULL, 5), (6, 'c', 3)",
+        );
+        run(&mut db, "INSERT INTO t (id) VALUES (7)");
+        let pairs = [
+            (
+                "SELECT id FROM t ORDER BY name LIMIT 3 OFFSET 1",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY name LIMIT 3 OFFSET 1",
+            ),
+            (
+                "SELECT id FROM t ORDER BY name DESC LIMIT 2",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY name DESC LIMIT 2",
+            ),
+            (
+                "SELECT id FROM t ORDER BY name NULLS LAST LIMIT 2",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY name NULLS LAST LIMIT 2",
+            ),
+            (
+                "SELECT id FROM t ORDER BY v DESC, name ASC LIMIT 4",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY v DESC, name ASC LIMIT 4",
+            ),
+            (
+                "SELECT id FROM t ORDER BY v LIMIT 3 OFFSET 2",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY v LIMIT 3 OFFSET 2",
+            ),
+            (
+                "SELECT id, name FROM t ORDER BY name LIMIT 20",
+                "SELECT id, name FROM t WHERE 1 = 1 ORDER BY name LIMIT 20",
+            ),
+            (
+                "SELECT id FROM t ORDER BY name LIMIT 2 OFFSET 99",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY name LIMIT 2 OFFSET 99",
+            ),
+            (
+                "SELECT v AS k FROM t ORDER BY k LIMIT 2",
+                "SELECT v AS k FROM t WHERE 1 = 1 ORDER BY k LIMIT 2",
+            ),
+            // Output alias shadows a source field: the key is the projected
+            // expression, not the field with the same name.
+            (
+                "SELECT v AS name FROM t ORDER BY name LIMIT 2",
+                "SELECT v AS name FROM t WHERE 1 = 1 ORDER BY name LIMIT 2",
+            ),
+            (
+                "SELECT id FROM t AS x ORDER BY x.name LIMIT 2",
+                "SELECT id FROM t AS x WHERE 1 = 1 ORDER BY x.name LIMIT 2",
+            ),
+            (
+                "SELECT id FROM t ORDER BY t.name LIMIT 2",
+                "SELECT id FROM t WHERE 1 = 1 ORDER BY t.name LIMIT 2",
+            ),
+        ];
+        for (fast, generic) in pairs {
+            assert_eq!(
+                rows(&mut db, fast).rows,
+                rows(&mut db, generic).rows,
+                "fast={fast} generic={generic}"
+            );
+        }
     }
 
     #[test]

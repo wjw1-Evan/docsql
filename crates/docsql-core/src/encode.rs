@@ -98,6 +98,54 @@ impl<'a> Decoder<'a> {
         self.value_at(0)
     }
 
+    /// Advance past one encoded value without materializing it.
+    fn skip_value(&mut self) -> Result<(), EncodeError> {
+        self.skip_at(0)
+    }
+
+    fn skip_at(&mut self, depth: usize) -> Result<(), EncodeError> {
+        if depth > MAX_DEPTH {
+            return Err(EncodeError::TooDeep);
+        }
+        match self.u8()? {
+            0 => Ok(()),
+            1 => {
+                self.u8()?;
+                Ok(())
+            }
+            2 | 3 => {
+                self.take(8)?;
+                Ok(())
+            }
+            8 => {
+                self.take(16)?;
+                Ok(())
+            }
+            4 | 5 => {
+                let len = self.u32()? as usize;
+                self.take(len)?;
+                Ok(())
+            }
+            6 => {
+                let len = self.u32()? as usize;
+                for _ in 0..len {
+                    self.skip_at(depth + 1)?;
+                }
+                Ok(())
+            }
+            7 => {
+                let len = self.u32()? as usize;
+                for _ in 0..len {
+                    let klen = self.u32()? as usize;
+                    self.take(klen)?;
+                    self.skip_at(depth + 1)?;
+                }
+                Ok(())
+            }
+            t => Err(EncodeError::UnknownTag(t)),
+        }
+    }
+
     fn value_at(&mut self, depth: usize) -> Result<Value, EncodeError> {
         if depth > MAX_DEPTH {
             return Err(EncodeError::TooDeep);
@@ -219,6 +267,27 @@ pub fn decode_prefix(buf: &[u8]) -> Result<(Value, usize), EncodeError> {
     Ok((v, d.pos))
 }
 
+/// One top-level object field, without materializing the rest of the
+/// document: entries are walked in order, every other value is skipped by
+/// its encoded size. `None` when the root is not an object or the field is
+/// absent (the caller maps that to SQL NULL, like `eval_expr` does).
+/// Used by the unindexed ORDER BY window to sort on raw heap bytes.
+pub fn extract_field(buf: &[u8], field: &str) -> Result<Option<Value>, EncodeError> {
+    let mut d = Decoder::new(buf);
+    if d.u8()? != 7 {
+        return Ok(None);
+    }
+    let len = d.u32()? as usize;
+    for _ in 0..len {
+        let key = d.string()?;
+        if key == field {
+            return Ok(Some(d.value()?));
+        }
+        d.skip_value()?;
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +376,61 @@ mod tests {
         let (v, n) = decode_prefix(&buf).unwrap();
         assert_eq!(v, Value::Str("abcd".into()));
         assert_eq!(n, buf.len() - 3);
+    }
+
+    #[test]
+    fn extract_field_matches_decode_without_materializing() {
+        let obj = Object::from([
+            ("a".into(), Value::Int(1)),
+            ("name".into(), Value::Str("bob".into())),
+            (
+                "nested".into(),
+                Value::Object(Object::from([("name".into(), Value::Int(9))])),
+            ),
+            (
+                "arr".into(),
+                Value::Array(vec![Value::Null, Value::Str("x".into())]),
+            ),
+            ("dec".into(), Value::Decimal("1.50".parse().unwrap())),
+            ("bin".into(), Value::Bytes(vec![0, 255])),
+        ]);
+        let enc = encode_to_vec(&Value::Object(obj.clone())).unwrap();
+        assert_eq!(
+            extract_field(&enc, "name").unwrap(),
+            Some(Value::Str("bob".into()))
+        );
+        assert_eq!(extract_field(&enc, "a").unwrap(), Some(Value::Int(1)));
+        assert_eq!(extract_field(&enc, "dec").unwrap(), obj.get("dec").cloned());
+        assert_eq!(
+            extract_field(&enc, "bin").unwrap(),
+            Some(Value::Bytes(vec![0, 255]))
+        );
+        assert_eq!(
+            extract_field(&enc, "nested").unwrap(),
+            obj.get("nested").cloned()
+        );
+        assert_eq!(extract_field(&enc, "missing").unwrap(), None);
+        // Non-object roots have no fields.
+        assert_eq!(
+            extract_field(&encode_to_vec(&Value::Array(vec![])).unwrap(), "x").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_field_truncated_never_panics() {
+        let doc = Value::Object(Object::from([
+            (
+                "a".into(),
+                Value::Array(vec![Value::Int(1), Value::Object(Object::new())]),
+            ),
+            ("b".into(), Value::Str("tail".into())),
+        ]));
+        let enc = encode_to_vec(&doc).unwrap();
+        for cut in 0..enc.len() {
+            let _ = extract_field(&enc[..cut], "b");
+            let _ = extract_field(&enc[..cut], "a");
+        }
     }
 
     #[test]
