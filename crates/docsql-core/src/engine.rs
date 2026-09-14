@@ -1625,14 +1625,14 @@ impl<'a> ReadCx<'a> {
         if meta.index_roots.is_empty() || !ctes.is_empty() {
             return Ok(None);
         }
-        let Some((col, plan)) = probe_plan(cond, meta, table, alias) else {
+        let Some((col, plan, _)) = probe_plan(cond, meta, table, alias) else {
             return Ok(None);
         };
         let root = meta.index_roots[&col];
         let heap = meta.heap_of();
         let tx = self.pager.begin_tx(); // read-only handle: nothing staged, dropping it is the cleanup
         let tree = BTree::open(root);
-        let pairs = self.probe_pairs(&col, &tree, &tx, &plan)?;
+        let pairs = self.probe_pairs(&col, &tree, &tx, &plan, None)?;
         // Read-only tx: no staged pages, dropping it is the cleanup.
         drop(tx);
         let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
@@ -1646,13 +1646,17 @@ impl<'a> ReadCx<'a> {
         Ok(Some(out))
     }
 
-    /// Index entries selected by `plan`, in key order.
+    /// Index entries selected by `plan`, in key order. `max` caps the walk to
+    /// the first `max` entries; pass it only when every entry the plan can
+    /// return is a result (exact probes), since a non-unique run must not
+    /// spend the cap on entries a filter would drop.
     fn probe_pairs(
         &self,
         col: &str,
         tree: &BTree,
         tx: &crate::pager::Tx,
         plan: &ProbePlan,
+        max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let reader = self.reader();
         let pairs = match plan {
@@ -1664,7 +1668,7 @@ impl<'a> ReadCx<'a> {
                 // indexes v is the full Array key — element-wise cmp_values
                 // equality is exactly a key match.
                 let mut p = tree
-                    .range_bounded(&reader, tx, v, Some((v, true)))
+                    .range_bounded_limited(&reader, tx, v, Some((v, true)), max)
                     .map_err(|e| index_err(col, e))?;
                 p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
                 p
@@ -1672,7 +1676,9 @@ impl<'a> ReadCx<'a> {
             ProbePlan::Prefix(prefix) => {
                 // Composite prefix probe: scan from the prefix (its rank
                 // makes Array(prefix) sort right before every key extending
-                // it) and keep keys that start with it element-wise.
+                // it) and keep keys that start with it element-wise. `max` is
+                // ignored: beyond-prefix keys would otherwise spend the cap
+                // that the retain then drops.
                 let mut p = tree
                     .range_bounded(&reader, tx, prefix, None)
                     .map_err(|e| index_err(col, e))?;
@@ -1694,18 +1700,18 @@ impl<'a> ReadCx<'a> {
                 let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
                 let mut pairs = match &lo {
                     Some((v, true)) => tree
-                        .range_bounded(&reader, tx, v, hi_ref)
+                        .range_bounded_limited(&reader, tx, v, hi_ref, max)
                         .map_err(|e| index_err(col, e))?,
-                    Some((v, false)) => {
-                        // strict lower bound: start at v, then drop the equal run
-                        let mut p = tree
-                            .range_bounded(&reader, tx, v, hi_ref)
-                            .map_err(|e| index_err(col, e))?;
-                        p.retain(|(k, _)| Value::cmp_values(k, v) != std::cmp::Ordering::Equal);
-                        p
-                    }
-                    // No lower bound: full tree scan (rare: WHERE col < x).
-                    None => tree.scan(&reader, tx).map_err(|e| index_err(col, e))?,
+                    // Strict lower bound: the walk drops the equal run itself
+                    // so the cap counts kept entries only.
+                    Some((v, false)) => tree
+                        .range_bounded_excl_limited(&reader, tx, v, hi_ref, max)
+                        .map_err(|e| index_err(col, e))?,
+                    // No lower bound: in-range keys are a prefix of the scan,
+                    // so a cap collects them all (or exactly `max` of them).
+                    None => tree
+                        .scan_limited(&reader, tx, max)
+                        .map_err(|e| index_err(col, e))?,
                 };
                 if let Some((v, incl)) = &hi {
                     pairs.retain(|(k, _)| {
@@ -1719,13 +1725,60 @@ impl<'a> ReadCx<'a> {
         Ok(pairs)
     }
 
+    /// [`Database::probe_pairs`] walking in descending key order — the
+    /// `ORDER BY … DESC` window. Same `max` caveats; a prefix scan ignores
+    /// it.
+    fn probe_pairs_rev(
+        &self,
+        col: &str,
+        tree: &BTree,
+        tx: &crate::pager::Tx,
+        plan: &ProbePlan,
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let reader = self.reader();
+        let pairs = match plan {
+            ProbePlan::Eq(v) => tree
+                .range_bounded_rev_limited(&reader, tx, Some((v, true)), Some((v, true)), max)
+                .map_err(|e| index_err(col, e))?,
+            ProbePlan::Prefix(prefix) => {
+                let mut p = tree
+                    .range_bounded_rev_limited(&reader, tx, Some((prefix, true)), None, None)
+                    .map_err(|e| index_err(col, e))?;
+                if let Value::Array(pfx) = prefix {
+                    p.retain(|(k, _)| match k {
+                        Value::Array(items) => {
+                            items.len() >= pfx.len()
+                                && items
+                                    .iter()
+                                    .zip(pfx.iter())
+                                    .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
+                        }
+                        _ => false,
+                    });
+                }
+                p
+            }
+            ProbePlan::Range { lo, hi } => {
+                let lo_ref = lo.as_ref().map(|(v, incl)| (v, *incl));
+                let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
+                tree.range_bounded_rev_limited(&reader, tx, lo_ref, hi_ref, max)
+                    .map_err(|e| index_err(col, e))?
+            }
+        };
+        Ok(pairs)
+    }
+
     /// `ORDER BY <index key> LIMIT/OFFSET` window: walk one B+ tree in key
-    /// order and load only the documents in the requested window — no full
-    /// heap scan, no sort. `None` (generic path) unless the plan is exact:
-    /// solo real table, ORDER BY the tree's columns in order with a single
-    /// direction, all key columns declared NOT NULL (trees omit NULL keys),
-    /// a constant LIMIT, and a WHERE that either is absent or probes the
-    /// same tree (residual conjuncts still filter while walking).
+    /// order (forward for ASC, reverse for DESC) and load only the documents
+    /// in the requested window — no full heap scan, no sort. `None` (generic
+    /// path) unless the plan applies: solo real table, ORDER BY the tree's
+    /// columns in order with a single direction, all key columns declared
+    /// NOT NULL (trees omit NULL keys), a constant LIMIT/OFFSET, and a WHERE
+    /// that either is absent or probes the same tree (residual conjuncts
+    /// still filter while walking). An exact probe (one that subsumes the
+    /// whole WHERE) lets the walk stop at the window's end and count OFFSET
+    /// rows without reading them.
     fn ordered_index_window(
         &self,
         from: &[sqlparser::ast::TableWithJoins],
@@ -1762,10 +1815,10 @@ impl<'a> ReadCx<'a> {
         if take == 0 {
             return Ok(Some(Vec::new()));
         }
-        let plan = match selection {
-            None => None,
+        let (plan, exact) = match selection {
+            None => (None, true),
             Some(cond) => match probe_plan(cond, meta, &tname, akey.as_deref()) {
-                Some((plan_root, plan)) if plan_root == root_key => Some(plan),
+                Some((plan_root, plan, exact)) if plan_root == root_key => (Some(plan), exact),
                 _ => return Ok(None),
             },
         };
@@ -1773,31 +1826,39 @@ impl<'a> ReadCx<'a> {
         let root = meta.index_roots[&root_key];
         let tree = BTree::open(root);
         let tx = self.pager.begin_tx();
-        // With no WHERE the walk stops collecting keys at the window's end.
-        // (Residual filters make the needed key count unknowable up front.)
-        let cap = (selection.is_none() && asc).then(|| skip.saturating_add(take));
+        // An exact walk yields exactly the window rows in the ORDER BY
+        // direction, so it can stop collecting keys at the window's end;
+        // residual filters need the whole candidate range first.
+        let cap = exact.then(|| skip.saturating_add(take));
         let pairs = match &plan {
-            None => tree
+            None if asc => tree
                 .scan_limited(&self.reader(), &tx, cap)
                 .map_err(|e| index_err(&root_key, e))?,
-            Some(plan) => self.probe_pairs(&root_key, &tree, &tx, plan)?,
+            None => tree
+                .scan_limited_rev(&self.reader(), &tx, cap)
+                .map_err(|e| index_err(&root_key, e))?,
+            Some(plan) if asc => self.probe_pairs(&root_key, &tree, &tx, plan, cap)?,
+            Some(plan) => self.probe_pairs_rev(&root_key, &tree, &tx, plan, cap)?,
         };
         drop(tx);
 
         let heap = meta.heap_of();
         let reader = self.reader();
-        let locs: Vec<u64> = if asc {
-            pairs.iter().map(|(_, loc)| *loc).collect()
-        } else {
-            pairs.iter().rev().map(|(_, loc)| *loc).collect()
-        };
+        // Both walkers already yield pairs in the ORDER BY direction.
+        let locs: Vec<u64> = pairs.iter().map(|(_, loc)| *loc).collect();
         let mut out = Vec::new();
         let mut skipped = 0usize;
         for loc in locs {
+            // Exact walks return rows straight from the window: OFFSET rows
+            // need only be counted, never decoded.
+            if exact && skipped < skip {
+                skipped += 1;
+                continue;
+            }
             let Some(doc) = heap.doc_at(&reader, loc)? else {
                 continue;
             };
-            if selection.is_some() && !self.matches(selection, &doc)? {
+            if !exact && !self.matches(selection, &doc)? {
                 continue;
             }
             if skipped < skip {
@@ -7210,26 +7271,45 @@ fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
     pi == p.len()
 }
 
-/// `(skip, take)` when LIMIT/OFFSET are non-negative integer constants.
-/// `None` means the window cannot be bounded ahead of time (no LIMIT,
-/// negative or expression bounds, FETCH …) — the generic path decides.
+/// `(skip, take)` when LIMIT/OFFSET are integer constants. `None` means the
+/// window cannot be bounded ahead of time (no LIMIT clause, FETCH, or a
+/// non-integer bound) — the generic path decides. Negative bounds follow
+/// SQLite semantics (LIMIT -1 = no limit, OFFSET -1 = skip nothing), so a
+/// pure `LIMIT -1 OFFSET n` skip still uses the index-ordered window with an
+/// unbounded take.
 fn constant_limit_window(query: &Query) -> Option<(usize, usize)> {
     if query.fetch.is_some() {
         return None;
     }
-    fn count(e: &SqlExpr) -> Option<usize> {
-        match eval_const(e).ok()?.as_i64() {
-            Some(n) if n >= 0 => Some(n as usize),
-            _ => None,
+    fn bound(e: &SqlExpr) -> Option<i64> {
+        eval_const(e).ok()?.as_i64()
+    }
+    fn take(n: i64) -> usize {
+        if n < 0 {
+            usize::MAX
+        } else {
+            n as usize
+        }
+    }
+    fn skip(n: i64) -> usize {
+        if n < 0 {
+            0
+        } else {
+            n as usize
         }
     }
     match query.limit_clause.as_ref()? {
         LimitClause::LimitOffset { limit, offset, .. } => {
-            let take = count(limit.as_ref()?)?;
-            let skip = offset.as_ref().map_or(Some(0), |o| count(&o.value))?;
-            Some((skip, take))
+            let limit = bound(limit.as_ref()?)?;
+            let offset = match offset {
+                Some(o) => bound(&o.value)?,
+                None => 0,
+            };
+            Some((skip(offset), take(limit)))
         }
-        LimitClause::OffsetCommaLimit { offset, limit } => Some((count(offset)?, count(limit)?)),
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            Some((skip(bound(offset)?), take(bound(limit)?)))
+        }
     }
 }
 
@@ -8058,16 +8138,22 @@ fn resolve_indexed_col(
 }
 
 /// Choose an index plan from a WHERE expression: an equality conjunct on an
-/// indexed column wins; otherwise range bounds on one indexed column.
+/// indexed column wins; otherwise range bounds on one indexed column. The
+/// bool is true when the plan subsumes the whole condition — every conjunct
+/// is implied by the probe, so callers may trust the entry count and stop a
+/// window walk at the requested end (no residual re-filter).
 fn probe_plan(
     cond: &SqlExpr,
     meta: &TableMeta,
     table: &str,
     alias: Option<&str>,
-) -> Option<(String, ProbePlan)> {
+) -> Option<(String, ProbePlan, bool)> {
     let mut conjuncts = Vec::new();
     flatten_and(cond, &mut conjuncts);
     let empty = Object::new();
+    // A conjunct the plan cannot consume: its filter still has to run after
+    // the probe, so the plan is inexact.
+    let mut opaque = false;
     // All equality conjuncts: composite prefixes need every leading column's
     // value, not just the first one seen.
     let mut eq_map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
@@ -8075,6 +8161,7 @@ fn probe_plan(
     let mut range: Option<(String, Vec<(BinaryOperator, Value)>)> = None;
     for c in conjuncts {
         let SqlExpr::BinaryOp { left, op, right } = c else {
+            opaque = true;
             continue;
         };
         // col OP lit, or lit OP col (mirrored)
@@ -8085,18 +8172,26 @@ fn probe_plan(
             (l, SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)) => {
                 (right.as_ref(), op.clone(), l, true)
             }
-            _ => continue,
+            _ => {
+                opaque = true;
+                continue;
+            }
         };
         let name = match col_ref {
             SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(col_ref),
-            _ => continue,
+            _ => {
+                opaque = true;
+                continue;
+            }
         };
         // The literal side must be a constant (subqueries were substituted
         // away; column refs make this conjunct unusable).
         let Ok(v) = eval_expr(lit, &empty) else {
+            opaque = true;
             continue;
         };
         if matches!(v, Value::Null) {
+            opaque = true;
             continue;
         }
         let op = if mirror { mirror_op(&op)? } else { op };
@@ -8115,17 +8210,30 @@ fn probe_plan(
             }
             Gt | GtEq | Lt | LtEq => {
                 let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+                    opaque = true;
                     continue;
                 };
                 match &mut range {
                     Some((c2, bounds)) if *c2 == col => bounds.push((op, v)),
                     None => range = Some((col, vec![(op, v)])),
-                    _ => {}
+                    _ => opaque = true,
                 }
             }
-            _ => {}
+            _ => opaque = true,
         }
     }
+    // Equality coverage: every equality conjunct must name one of the probed
+    // leading index columns, and do so distinctly (a bare/qualified duplicate
+    // of the same column is not proof that both values were consumed).
+    let covered = |cols: &[String], map: &std::collections::BTreeMap<String, Value>| -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        map.keys().all(|k| {
+            let Some(name) = unqualified_col(k, table, alias) else {
+                return false;
+            };
+            cols.contains(&name) && seen.insert(name)
+        })
+    };
     // Composite-index probe: longest equality prefix over the index columns
     // wins. Full-column equality is an exact key (Eq of the Array); a
     // partial prefix becomes a Prefix scan with a prefix retain. Non-leading
@@ -8156,17 +8264,25 @@ fn probe_plan(
             }
         }
         if let Some((root_key, prefix)) = best {
-            let n = meta.index_columns_of(&root_key).len();
-            let plan = if prefix.len() == n {
+            let cols = meta.index_columns_of(&root_key);
+            let prefix_len = prefix.len();
+            let plan = if prefix_len == cols.len() {
                 ProbePlan::Eq(Value::Array(prefix))
             } else {
                 ProbePlan::Prefix(Value::Array(prefix))
             };
-            return Some((root_key, plan));
+            let exact = !opaque && range.is_none() && covered(&cols[..prefix_len], &eq_map);
+            return Some((root_key, plan, exact));
         }
     }
     if let Some((col, v)) = eq {
-        return Some((col, ProbePlan::Eq(v)));
+        let exact = !opaque
+            && range.is_none()
+            && eq_map.len() == 1
+            && eq_map.iter().all(|(k, ev)| {
+                unqualified_col(k, table, alias).as_deref() == Some(&col) && *ev == v
+            });
+        return Some((col, ProbePlan::Eq(v), exact));
     }
     let (col, bounds) = range?;
     let mut lo: Option<(Value, bool)> = None;
@@ -8214,7 +8330,8 @@ fn probe_plan(
     if lo.is_none() && hi.is_none() {
         return None;
     }
-    Some((col, ProbePlan::Range { lo, hi }))
+    let exact = !opaque && eq_map.is_empty();
+    Some((col, ProbePlan::Range { lo, hi }, exact))
 }
 
 /// Mirror a comparison operator for `lit OP col` conjuncts.
@@ -11570,6 +11687,168 @@ mod tests {
         assert_eq!(r.rows, vec![vec![Value::Int(4)]]);
         let r = rows(&mut db, "SELECT id FROM t WHERE id = 3 ORDER BY id LIMIT 2");
         assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn indexed_window_caps_exact_probes_and_counts_offset_unread() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, v INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_t_v ON t (v)");
+        for i in 0..200i64 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i}, {})", i / 2));
+        }
+        // Exact range probe: the walk stops at the window's end.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id > 150 ORDER BY id LIMIT 5",
+        );
+        assert_eq!(
+            r.rows,
+            (151..=155).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+        );
+        // Tightest bound wins; the subsumed conjunct keeps the probe exact.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id > 150 AND id > 100 ORDER BY id LIMIT 2",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(151)], vec![Value::Int(152)]]);
+        // A residual conjunct disables the cap: matches past the first
+        // window stay visible.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id > 150 AND id % 10 = 0 ORDER BY id LIMIT 3",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(160)],
+                vec![Value::Int(170)],
+                vec![Value::Int(180)]
+            ]
+        );
+        // OFFSET inside an exact range counts positions without decoding.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id >= 10 ORDER BY id LIMIT 2 OFFSET 3",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(13)], vec![Value::Int(14)]]);
+        // Numeric equality with a differently-typed literal stays a result
+        // even though the exact probe replaces the row filter.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE v = 50.0 ORDER BY v LIMIT 5",
+        );
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn indexed_window_descending_walks_and_pure_skip() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, v TEXT)",
+        );
+        for i in 0..100i64 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
+        }
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id DESC LIMIT 3");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(99)],
+                vec![Value::Int(98)],
+                vec![Value::Int(97)]
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t ORDER BY id DESC LIMIT 2 OFFSET 5",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(94)], vec![Value::Int(93)]]);
+        // Keyset in descending order: the reverse range walk.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id < 50 ORDER BY id DESC LIMIT 3",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(49)],
+                vec![Value::Int(48)],
+                vec![Value::Int(47)]
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id < 50 ORDER BY id DESC LIMIT 2 OFFSET 3",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(46)], vec![Value::Int(45)]]);
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id > 90 ORDER BY id DESC LIMIT 2 OFFSET 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(98)], vec![Value::Int(97)]]);
+        // `LIMIT -1` (pure skip) keeps index order both ways.
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id LIMIT -1 OFFSET 97");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(97)],
+                vec![Value::Int(98)],
+                vec![Value::Int(99)]
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t ORDER BY id DESC LIMIT -1 OFFSET 97",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(2)],
+                vec![Value::Int(1)],
+                vec![Value::Int(0)]
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_window_composite_exact_and_residual() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v TEXT)",
+        );
+        run(&mut db, "CREATE INDEX ix_ab ON t (a, b)");
+        for i in 0..100i64 {
+            run(
+                &mut db,
+                &format!("INSERT INTO t VALUES ({}, {}, 'x{i}')", i / 10, i % 10),
+            );
+        }
+        // Exact prefix probe: only the window's rows are decoded.
+        let r = rows(
+            &mut db,
+            "SELECT b FROM t WHERE a = 5 ORDER BY a, b LIMIT 3 OFFSET 2",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+                vec![Value::Int(4)]
+            ]
+        );
+        // Residual conjunct on a non-leading column: candidates all scanned,
+        // filter applied before OFFSET counts.
+        let r = rows(
+            &mut db,
+            "SELECT b FROM t WHERE a = 5 AND b >= 5 ORDER BY a, b LIMIT 2",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(5)], vec![Value::Int(6)]]);
     }
 
     #[test]

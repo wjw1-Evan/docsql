@@ -455,6 +455,51 @@ impl BTree {
         Ok(())
     }
 
+    /// Reverse (descending key) scan capped at `max` entries — the
+    /// `ORDER BY … DESC LIMIT` mirror of [`BTree::scan_limited`].
+    pub fn scan_limited_rev(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let mut out = Vec::new();
+        Self::scan_rev_rec(reader, tx, self.root, max, &mut out)?;
+        Ok(out)
+    }
+
+    fn scan_rev_rec(
+        reader: &PageReader,
+        tx: &Tx,
+        id: u32,
+        max: Option<usize>,
+        out: &mut Vec<(Value, u64)>,
+    ) -> Result<()> {
+        if max.is_some_and(|m| out.len() >= m) {
+            return Ok(());
+        }
+        match Self::read_node(reader, tx, id)? {
+            Node::Leaf { cells } => {
+                for cell in cells.into_iter().rev() {
+                    out.push(cell);
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
+                    }
+                }
+            }
+            Node::Internal { leftmost, cells } => {
+                for (_, child) in cells.iter().rev() {
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
+                    }
+                    Self::scan_rev_rec(reader, tx, *child, max, out)?;
+                }
+                Self::scan_rev_rec(reader, tx, leftmost, max, out)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Remove a key. Returns whether it was present.
     pub fn delete(&mut self, pager: &Pager, tx: &mut Tx, key: &Value) -> Result<bool> {
         Self::delete_rec(pager, tx, self.root, key, &|cells: &mut Vec<(
@@ -568,7 +613,23 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_bounded_rec(reader, tx, self.root, lo, hi, max, &mut out)?;
+        Self::range_bounded_rec(reader, tx, self.root, lo, true, hi, max, &mut out)?;
+        Ok(out)
+    }
+
+    /// `range_bounded_limited` with a strict lower bound: entries equal to
+    /// `lo` are dropped during the walk, so a cap counts only kept entries
+    /// (a `retain` afterwards would let an equal-key run exhaust the cap).
+    pub fn range_bounded_excl_limited(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        lo: &Value,
+        hi: Option<(&Value, bool)>,
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let mut out = Vec::new();
+        Self::range_bounded_rec(reader, tx, self.root, lo, false, hi, max, &mut out)?;
         Ok(out)
     }
 
@@ -581,11 +642,24 @@ impl BTree {
         }
     }
 
+    /// True when `k` fails an optional lower bound `(value, inclusive)`.
+    /// Works for values as well as subtree upper bounds: a bound `u` below
+    /// `lo` means every key `<= u` fails it too.
+    fn below_lo(k: &Value, lo: Option<(&Value, bool)>) -> bool {
+        match lo {
+            None => false,
+            Some((l, true)) => Value::cmp_values(k, l) == Ordering::Less,
+            Some((l, false)) => Value::cmp_values(k, l) != Ordering::Greater,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn range_bounded_rec(
         reader: &PageReader,
         tx: &Tx,
         id: u32,
         lo: &Value,
+        lo_incl: bool,
         hi: Option<(&Value, bool)>,
         max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
@@ -599,11 +673,13 @@ impl BTree {
                     if Self::beyond_hi(&k, hi) {
                         break; // cells are in key order; the rest is beyond too
                     }
-                    if Value::cmp_values(&k, lo) != Ordering::Less {
-                        out.push((k, v));
-                        if max.is_some_and(|m| out.len() >= m) {
-                            break;
-                        }
+                    let o = Value::cmp_values(&k, lo);
+                    if o == Ordering::Less || (o == Ordering::Equal && !lo_incl) {
+                        continue;
+                    }
+                    out.push((k, v));
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
                     }
                 }
             }
@@ -613,19 +689,13 @@ impl BTree {
                 // child is skipped only when its own keys are guaranteed
                 // beyond hi (lower separator > hi, or == hi when exclusive):
                 // every key of the child is >= its lower separator.
-                let skip_by_hi = |sep: &Value| -> bool {
-                    match hi {
-                        None => false,
-                        Some((h, true)) => Value::cmp_values(sep, h) == Ordering::Greater,
-                        Some((h, false)) => Value::cmp_values(sep, h) != Ordering::Less,
-                    }
-                };
+                let skip_by_hi = |sep: &Value| -> bool { Self::beyond_hi(sep, hi) };
                 let leftmost_upper_ge = match cells.first() {
                     Some((k, _)) => Value::cmp_values(k, lo) != Ordering::Less,
                     None => true,
                 };
                 if leftmost_upper_ge {
-                    Self::range_bounded_rec(reader, tx, leftmost, lo, hi, max, out)?;
+                    Self::range_bounded_rec(reader, tx, leftmost, lo, lo_incl, hi, max, out)?;
                 }
                 for (i, (sep, child)) in cells.iter().enumerate() {
                     if max.is_some_and(|m| out.len() >= m) {
@@ -639,9 +709,84 @@ impl BTree {
                         None => true,
                     };
                     if upper_ge {
-                        Self::range_bounded_rec(reader, tx, *child, lo, hi, max, out)?;
+                        Self::range_bounded_rec(reader, tx, *child, lo, lo_incl, hi, max, out)?;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Entries with key >(=) `lo` and <(=) `hi`, largest first, capped at
+    /// `max` — the descending mirror of [`BTree::range_bounded_limited`]
+    /// used by `ORDER BY … DESC LIMIT` windows. The walk starts at the
+    /// child that can still hold `hi` and moves left, so it costs
+    /// O(log n + collected) rather than materializing the range.
+    pub fn range_bounded_rev_limited(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let mut out = Vec::new();
+        Self::range_rev_rec(reader, tx, self.root, lo, hi, max, &mut out)?;
+        Ok(out)
+    }
+
+    fn range_rev_rec(
+        reader: &PageReader,
+        tx: &Tx,
+        id: u32,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+        max: Option<usize>,
+        out: &mut Vec<(Value, u64)>,
+    ) -> Result<()> {
+        if max.is_some_and(|m| out.len() >= m) {
+            return Ok(());
+        }
+        match Self::read_node(reader, tx, id)? {
+            Node::Leaf { cells } => {
+                for (k, v) in cells.into_iter().rev() {
+                    if Self::beyond_hi(&k, hi) {
+                        continue; // above the upper bound; keep walking down
+                    }
+                    if Self::below_lo(&k, lo) {
+                        break; // cells are in key order; the rest is below too
+                    }
+                    out.push((k, v));
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
+                    }
+                }
+            }
+            Node::Internal { leftmost, cells } => {
+                // Children right of the last separator at or below `hi` hold
+                // only keys beyond it and are skipped whole; the walk starts
+                // there and moves left. A child whose upper separator already
+                // fails `lo` ends the walk (everything further left fails too).
+                if let Some(b) = cells.iter().rposition(|(sep, _)| !Self::beyond_hi(sep, hi)) {
+                    for i in (0..=b).rev() {
+                        if max.is_some_and(|m| out.len() >= m) {
+                            return Ok(());
+                        }
+                        let upper = cells.get(i + 1).map(|(k, _)| k);
+                        if upper.is_some_and(|u| Self::below_lo(u, lo)) {
+                            return Ok(());
+                        }
+                        Self::range_rev_rec(reader, tx, cells[i].1, lo, hi, max, out)?;
+                    }
+                }
+                if max.is_some_and(|m| out.len() >= m) {
+                    return Ok(());
+                }
+                let upper = cells.first().map(|(k, _)| k);
+                if upper.is_some_and(|u| Self::below_lo(u, lo)) {
+                    return Ok(());
+                }
+                Self::range_rev_rec(reader, tx, leftmost, lo, hi, max, out)?;
             }
         }
         Ok(())
@@ -770,6 +915,116 @@ mod tests {
                 .unwrap(),
             full[100..105]
         );
+        // The exclusive walk drops the equal keys itself, so the cap still
+        // yields five kept entries (a post-scan retain would waste it).
+        assert_eq!(
+            tree.range_bounded_excl_limited(&reader, &tx, &Value::Int(100), None, Some(5))
+                .unwrap(),
+            full[101..106]
+        );
+        // Descending mirrors.
+        let mut rev = full.clone();
+        rev.reverse();
+        assert_eq!(
+            tree.scan_limited_rev(&reader, &tx, Some(7)).unwrap(),
+            rev[..7]
+        );
+        assert_eq!(tree.scan_limited_rev(&reader, &tx, None).unwrap(), rev);
+        assert_eq!(
+            tree.range_bounded_rev_limited(
+                &reader,
+                &tx,
+                Some((&Value::Int(100), true)),
+                Some((&Value::Int(104), true)),
+                Some(5)
+            )
+            .unwrap(),
+            rev[195..200]
+        );
+        assert_eq!(
+            tree.range_bounded_rev_limited(
+                &reader,
+                &tx,
+                Some((&Value::Int(100), false)),
+                Some((&Value::Int(104), false)),
+                Some(3)
+            )
+            .unwrap(),
+            rev[196..199]
+        );
+    }
+
+    #[test]
+    fn bounded_reverse_walk_matches_filtered_scan() {
+        let (_d, pager) = fresh("bt12.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&pager, &mut tx).unwrap();
+        // Non-unique keys: every key has three entries, so equal-key runs
+        // straddle splits.
+        for i in 0..200i64 {
+            for r in 0..3u64 {
+                tree.insert(
+                    &pager,
+                    &mut tx,
+                    Value::Int(i / 3),
+                    (i as u64) * 10 + r,
+                    false,
+                )
+                .unwrap();
+            }
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let reader = PageReader::current(&pager);
+        let full = tree.scan(&reader, &tx).unwrap();
+        let check_rev =
+            |lo: Option<(&Value, bool)>, hi: Option<(&Value, bool)>, max: Option<usize>| {
+                let mut want: Vec<(Value, u64)> = full
+                    .iter()
+                    .filter(|(k, _)| !BTree::below_lo(k, lo) && !BTree::beyond_hi(k, hi))
+                    .cloned()
+                    .collect();
+                want.reverse();
+                if let Some(m) = max {
+                    want.truncate(m);
+                }
+                let got = tree
+                    .range_bounded_rev_limited(&reader, &tx, lo, hi, max)
+                    .unwrap();
+                assert_eq!(got, want, "rev lo={lo:?} hi={hi:?} max={max:?}");
+            };
+        let v10 = Value::Int(10);
+        let v33 = Value::Int(33);
+        let v50 = Value::Int(50);
+        for max in [None, Some(0), Some(1), Some(7), Some(10_000)] {
+            check_rev(None, None, max);
+            check_rev(Some((&v10, true)), None, max);
+            check_rev(Some((&v10, false)), None, max);
+            check_rev(None, Some((&v50, true)), max);
+            check_rev(None, Some((&v50, false)), max);
+            check_rev(Some((&v10, false)), Some((&v50, true)), max);
+            check_rev(Some((&v10, true)), Some((&v50, false)), max);
+            check_rev(Some((&v33, true)), Some((&v33, true)), max);
+            check_rev(Some((&v33, false)), Some((&v33, false)), max);
+        }
+        // Forward exclusive walk with a cap keeps the same entry set.
+        for max in [None, Some(1), Some(7)] {
+            let mut want: Vec<(Value, u64)> = full
+                .iter()
+                .filter(|(k, _)| {
+                    !BTree::below_lo(k, Some((&v10, false)))
+                        && !BTree::beyond_hi(k, Some((&v50, true)))
+                })
+                .cloned()
+                .collect();
+            if let Some(m) = max {
+                want.truncate(m);
+            }
+            let got = tree
+                .range_bounded_excl_limited(&reader, &tx, &v10, Some((&v50, true)), max)
+                .unwrap();
+            assert_eq!(got, want, "fwd max={max:?}");
+        }
     }
 
     #[test]
