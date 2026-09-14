@@ -4,8 +4,8 @@
 //! The console is still storage-free as a *database tool*: the only state is
 //! one credential file (path from `DOCSQL_WEB_AUTH_FILE`) holding a salted
 //! PBKDF2-HMAC-SHA256 hash of the console account, plus in-memory sessions.
-//! With the env unset the console behaves exactly as before (token header
-//! gate only).
+//! With the env unset the console API is open (node connections always use
+//! the process's `DOCSQL_TOKEN`, never a browser-supplied value).
 //!
 //! The hash construction (SHA-256 / HMAC / PBKDF2, with known-answer tests)
 //! lives in `docsql-core`'s `kdf` module and is shared with the database

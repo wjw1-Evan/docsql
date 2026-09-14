@@ -73,7 +73,6 @@ button.danger { color:var(--err); }
   }
   #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
   #toolbar .spacer { flex: 1; }
-  #token { width: 150px; }
   .tb-ico { display: inline-flex; vertical-align: -3px; margin-right: 4px; }
 
   /* ---------- 主区域 ---------- */
@@ -294,8 +293,6 @@ button.danger { color:var(--err); }
 
 <div id="toolbar">
   <span title="连接状态" id="conn-dot" style="font-weight:700;color:#e81123">●</span>
-  <input id="token" type="text" placeholder="令牌 X-Docsql-Token" title="服务器开启认证时填写令牌">
-  <button id="btn-connect">连接</button>
   <div class="sep"></div>
   <span style="color:var(--txt2)">节点</span>
   <select id="nodesel" style="display:none;max-width:190px" title="切换管理的节点:默认节点(控制台启动时指定的管理目标)或 DOCSQL_PEERS 集群节点。控制台不存数据,所有操作以数据库客户端身份连接所选节点执行,认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
@@ -389,12 +386,14 @@ const ICONS = {
 $$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
 
 /* ================= API 层 ================= */
+// 浏览器不持有节点凭据:控制台与节点通信一律使用 Web 进程环境变量
+// DOCSQL_TOKEN(docker-compose 下发,与节点同值)。控制台自身的访问门是
+// 账号门(会话 Cookie);未启用账号门时 API 开放。
 const api = {
-  token: localStorage.getItem('docsql.token') || '',
   // 当前管理的节点('' = 默认节点,即控制台启动时指定的管理目标;
   // 否则为 DOCSQL_PEERS 中的地址)。
   node: localStorage.getItem('docsql.node') || '',
-  headers() { const h = {'Content-Type': 'application/json'}; if (this.token) h['X-Docsql-Token'] = this.token; return h; },
+  headers() { return {'Content-Type': 'application/json'}; },
   async get(path) {
     if (this.node) path += (path.includes('?') ? '&' : '?') + 'node=' + encodeURIComponent(this.node);
     return this._do(fetch(path, {headers: this.headers()}));
@@ -408,9 +407,9 @@ const api = {
     const r = await p;
     if (r.status === 401) {
       ui.connState('unauth');
-      // 账号门激活时会话过期/未登录:弹回登录遮罩而不是仅提示令牌。
+      // 账号门激活时会话过期/未登录:弹回登录遮罩。
       if (authGate.active) authGate.show('login');
-      throw new Error(authGate.active ? '会话已过期,请重新登录' : '未授权:请在工具栏填写正确的令牌');
+      throw new Error(authGate.active ? '会话已过期,请重新登录' : '未授权:请求被拒绝');
     }
     let body;
     try { body = await r.json(); }
@@ -430,7 +429,7 @@ const api = {
 /* ================= 控制台账号(首次使用设置 + 登录 + 修改) ================= */
 // 服务端启用 DOCSQL_WEB_AUTH_FILE 时:第一次使用强制创建账号,之后每次
 // 进入需登录(会话 Cookie,HttpOnly)。账号与密码哈希(PBKDF2)保存在控制台
-// 凭据文件中;off 模式维持原有令牌行为。
+// 凭据文件中;off 模式 API 开放(节点认证仍由服务端 DOCSQL_TOKEN 负责)。
 const authGate = {
   active: false,
   mode: 'off',
@@ -440,8 +439,6 @@ const authGate = {
     try { st = await fetch('/api/auth/status').then(r => r.json()); } catch { return true; }
     this.active = st.mode && st.mode !== 'off';
     if (!this.active) return true;
-    $('#token').style.display = 'none';
-    $('#btn-connect').style.display = 'none';
     $('[data-act="logout"]').style.display = '';
     $('[data-act="account"]').style.display = '';
     if (st.mode === 'login') {
@@ -534,7 +531,7 @@ const ui = {
     if (state === 'ok') { dot.textContent = '●'; dot.style.color = '#107c10';
       bar.textContent = '已连接 ' + location.host; sb.className = ''; }
     else if (state === 'unauth') { dot.textContent = '●'; dot.style.color = '#e81123';
-      bar.textContent = '未授权(令牌错误)'; sb.className = 'err'; }
+      bar.textContent = '未授权'; sb.className = 'err'; }
     else { dot.textContent = '●'; dot.style.color = '#e81123'; bar.textContent = '未连接'; sb.className = ''; }
   },
   status(text, cls) {
@@ -1676,7 +1673,7 @@ const usersPage = {
       `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
     html += `<h3 style="margin:10px 0 6px">用户</h3>`;
     if (!users.length) {
-      html += `<div class="k" style="color:var(--txt3)">尚无数据库用户:节点处于开放模式(或仅 token 认证)。创建第一个用户后,新的匿名连接将被拒绝 —— 建议先为节点配置 DOCSQL_TOKEN。</div>`;
+      html += `<div class="k" style="color:var(--txt3)">尚无数据库用户:节点处于开放模式(或仅 token 认证)。创建第一个用户后,新的匿名连接将被拒绝 —— 建议先为节点与 Web 服务配置一致的 DOCSQL_TOKEN。</div>`;
     } else {
       html += `<table class="grid"><thead><tr><th>用户名</th><th>角色</th><th>表级权限</th><th style="width:290px">操作</th></tr></thead><tbody>`;
       for (const u of users) {
@@ -2382,18 +2379,6 @@ $('#btn-refresh').onclick = () => explorer.refresh();
 $('#exp-newtable').onclick = () => newTableDialog();
 $('#exp-collapse').onclick = () => { explorer.expanded.clear(); explorer.render(); };
 
-$('#btn-connect').onclick = async () => {
-  api.token = $('#token').value.trim();
-  localStorage.setItem('docsql.token', api.token);
-  try {
-    await api.get('/api/meta');
-    ui.toast('连接成功');
-    nodes.boot(); // 认证通过后再取一次节点列表(填充切换器)
-    explorer.refresh();
-  } catch (e) { ui.toast(e.message, true); }
-};
-$('#token').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-connect').click(); });
-
 /* 菜单栏 */
 $$('[data-menu] > span').forEach(sp => {
   sp.onclick = (e) => { e.stopPropagation();
@@ -2430,7 +2415,6 @@ $$('.menu-drop [data-act]').forEach(item => {
 // 控制台账号门激活时,先完成 设置/登录(startApp 由 authGate 回调),
 // 否则直接进入。
 function startApp() { openDashboard(); explorer.refresh(); nodes.boot(); }
-$('#token').value = api.token;
 explorer.bind();
 (async () => { if (await authGate.boot()) startApp(); })();
 $('#auth-ok').onclick = () => authGate.submit();

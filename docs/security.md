@@ -50,7 +50,9 @@ readonly=SELECT;自定义角色=授予的表级 DML。读目标按 AST 分类 fa
   默认端口仅映射 127.0.0.1;Web 控制台生产部署置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`);
 - 静态:TDE 未内置(部署于加密卷之上);备份为明文 SQL + sha256 sidecar(防损坏/篡改,不保密——保护备份卷);
 - Web 控制台:首次使用强制设置账号(盐化 PBKDF2 存储,HttpOnly 会话 Cookie),
-  改密码踢掉其它全部在线会话;`node` 参数受 `DOCSQL_PEERS` 白名单约束(SSRF 防护)。
+  改密码踢掉其它全部在线会话;浏览器不持有节点令牌(控制台以服务端 `DOCSQL_TOKEN`
+  连接节点,该 token 也可作程序化 API 旁路);
+  `node` 参数受 `DOCSQL_PEERS` 白名单约束(SSRF 防护)。
 
 ## 审计
 

@@ -240,10 +240,11 @@ SAVEPOINT sp; ... ROLLBACK TO sp; ... RELEASE sp;
   (直接授予与角色携带分开展示);
 - **控制台账号**:首次强制设置用户名/密码(≥8 位),PBKDF2 凭据文件 + HttpOnly 会话 Cookie,
   连续输错锁定;「文件 → 修改账号…」需当前密码确认,改密后其它会话全部退出;
-  `DOCSQL_TOKEN` 作程序化旁路,设空 `DOCSQL_WEB_AUTH_FILE` 关闭门禁;
+  浏览器不持有节点令牌(连节点用服务端 `DOCSQL_TOKEN`,与 docker-compose 下发值同源),
+  `DOCSQL_TOKEN` 作程序化 API 旁路;未启用 `DOCSQL_WEB_AUTH_FILE` 时 API 开放;
 - **节点切换**:工具栏下拉切换管理目标;未配置 peers 时显示单机模式。
 
-REST API(`X-Docsql-Token` 认证):
+REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;未启用账号门时开放):
 
   | 方法 | 路径 | 说明 |
   |---|---|---|

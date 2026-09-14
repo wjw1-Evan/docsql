@@ -82,8 +82,9 @@ INSERT INTO orders (id, note)
   列编辑网格建表/改表(含 GUID 时序主键;失败语句明确提示);
 - **监控与管理页**:仪表盘、集群状态(在线/只读/行数/LSN 收敛,5s 刷新)、日志页(数据审计 +
   同步事件,多条件过滤)、备份管理(立即备份/一键恢复)、用户与角色(建号授权/表级权限);
-- **控制台账号门**:首次强制设置用户名/密码,HttpOnly 会话,改密踢出其它会话;
-  `DOCSQL_TOKEN` 可作 API 旁路(详见[安全指南](docs/security.md));
+- **控制台账号门**:首次强制设置用户名/密码,HttpOnly 会话,改密踢出其它会话;浏览器不再需要
+  填写令牌 —— 控制台连节点使用服务端环境变量 `DOCSQL_TOKEN`(与节点同值),该 token 同时可作
+  程序化 API 旁路(详见[安全指南](docs/security.md));
 - **零存储**:控制台不落任何数据,默认管理启动指定的节点,可在 `DOCSQL_PEERS` 白名单内切换节点。
 
 完整功能清单与 REST API 表见[功能总览 · Web 控制台](docs/features.md#9-web-控制台docsql-studio)。
@@ -155,7 +156,7 @@ cd deploy && for v in a b c d single; do docker volume create docsql-dev-data-$v
 
 **备份与恢复**:每节点默认每日自动备份(保留 7 份,备份文件带 sha256 校验和,恢复前强校验),写数据卷 `backups/`;控制台备份页 / `POST /api/backup` 可手动触发与一键恢复。恢复为整库脚本经正常写路径重放并扇出全网,完成后自动比对摘要验证收敛。完整语义(覆盖范围、恢复期间写排队、跨节点互斥、AUTOINCREMENT、归档)见[运维手册 · 备份与恢复](docs/operations.md#备份与恢复)。
 
-**本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。客户端 token 用 `DOCSQL_DEV_TOKEN` 配置(同时下发给所有节点与 Web 控制台,控制台以它认证节点;**从控制台创建数据库用户之前必须配置**——节点一旦存在用户,匿名的控制台连接会被拒绝,部署测试脚本会自动将其置空)。
+**本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。客户端 token 用 `DOCSQL_DEV_TOKEN` 配置(同时下发给所有节点与 Web 控制台,控制台以它认证节点,浏览器端无需填写令牌;**从控制台创建数据库用户之前必须配置**——节点一旦存在用户,匿名的控制台连接会被拒绝,部署测试脚本会自动将其置空)。
 
 **生产**(`deploy/docker-compose.prod.yml`,项目名 `docsql-prod`):拉取 CI 发布的 GHCR 镜像(不本地构建),端口 +1000(18600-18604/18700/18710,与开发栈互不冲突),数据卷沿用历史命名 `docsql-data-*`(真实数据在此),断线自动重启,日志轮转,Web 控制台可配 token:
 
@@ -295,7 +296,8 @@ token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEn
 监控、环境变量、备份恢复、扩容与部署运维的完整手册见[运维手册](docs/operations.md)。要点:
 
 - **存活探针**:`GET /healthz` 无门禁回答控制台进程自身状态(不触碰数据库节点,setup 前同样可用);
-- **Prometheus 指标**:`GET /metrics`(抓取认证与其它 API 一致,`X-Docsql-Token`)——逐节点并行抓取
+- **Prometheus 指标**:`GET /metrics`(账号门激活时抓取需会话 Cookie 或 `X-Docsql-Token` 旁路,
+  未启用账号门时开放)——逐节点并行抓取
   REQ_STATUS,输出 `docsql_node_up`/`docsql_sql_statements_total`/`docsql_connections_active`/
   `docsql_network_bytes_total`/`docsql_auth_failures_total`/存储与期刊收敛等指标族(节点标签 `node`),
   另有控制台自身 `docsql_web_http_requests_total`;

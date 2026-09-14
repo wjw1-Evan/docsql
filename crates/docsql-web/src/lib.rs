@@ -36,7 +36,9 @@
 //! guard); node connections authenticate with the server's own
 //! DOCSQL_TOKEN, never with a browser-supplied value.
 //!
-//! Auth v1: requests must send `X-Docsql-Token` when the server token is set.
+//! Auth v1: the console account gate (`DOCSQL_WEB_AUTH_FILE`; absent =
+//! open API) protects the browser surface, while node connections always
+//! authenticate with the process's own `DOCSQL_TOKEN`.
 
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -61,6 +63,10 @@ pub struct WebState {
     /// land. A client connection target, not local storage — the console
     /// holds no database of its own.
     pub upstream: Option<String>,
+    /// Node-facing admin credential (`DOCSQL_TOKEN`, compose/env): every
+    /// node connection authenticates with it, and with the account gate
+    /// active it doubles as the programmatic API bypass. Never read from a
+    /// browser-supplied value.
     pub token: Option<String>,
     /// Cluster nodes to monitor and switch between (DOCSQL_PEERS).
     pub peers: Vec<String>,
@@ -352,9 +358,10 @@ async fn healthz() -> impl IntoResponse {
 /// Prometheus scrape endpoint (`text/plain; version=0.0.4`). Per-node
 /// gauges/counters come from each configured node's REQ_STATUS report (the
 /// same JSON that feeds /api/stats and /api/cluster); the console's own
-/// HTTP counters ride along with the `docsql_web_` prefix. Behind the same
-/// gate as the other API endpoints — a scraper authenticates with the
-/// server token (`X-Docsql-Token`), exactly like a programmatic API client.
+/// HTTP counters ride along with the `docsql_web_` prefix. Behind the
+/// console account gate when one is configured — a scraper authenticates
+/// with a session cookie or the `X-Docsql-Token` bypass, exactly like a
+/// programmatic API client; without the account file the endpoint is open.
 async fn api_metrics(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -586,35 +593,33 @@ fn fmt_f64(f: f64) -> String {
     }
 }
 
-/// The API gate. Legacy behavior: `X-Docsql-Token` must match the server
-/// token when one is configured, nothing otherwise. With the console
-/// account active, a valid session cookie passes; the token keeps working
-/// as the programmatic bypass. Until the account is set up AND no token
-/// is configured, data endpoints answer 401 — the anonymous window used
-/// to keep them reachable pre-setup, which left the most destructive
-/// endpoint (whole-database restore) open to anyone who could reach the
-/// port until somebody happened to complete setup. Setup itself and the
-/// auth endpoints need no gate; everything else waits for credentials.
+/// The console's own API gate — the account gate, nothing else. With
+/// `DOCSQL_WEB_AUTH_FILE` configured, a valid session cookie passes; a
+/// request carrying the process's `DOCSQL_TOKEN` also passes (the
+/// programmatic bypass scripts/CI use — the browser UI has no token input
+/// and never sends one). Without the account file the API is open (legacy
+/// mode): node connections still authenticate with the process's own
+/// `DOCSQL_TOKEN`, the same compose/env value the nodes require. Until
+/// the account is set up, data endpoints answer 401 — the anonymous
+/// window used to keep them reachable pre-setup, which left the most
+/// destructive endpoint (whole-database restore) open to anyone who could
+/// reach the port until somebody happened to complete setup. Setup itself
+/// and the auth endpoints need no gate; everything else waits for
+/// credentials.
 fn check_auth(state: &WebState, headers: &HeaderMap) -> Option<StatusCode> {
-    let token = headers.get("X-Docsql-Token").and_then(|v| v.to_str().ok());
-    let token_ok = match &state.token {
-        None => true,
-        // Constant-time compare: a plain == short-circuits on the first
-        // differing byte and leaks a (noisy but real) timing oracle.
-        Some(expect) => token.is_some_and(|t| constant_time_eq(t.as_bytes(), expect.as_bytes())),
-    };
     let Some(auth) = &state.auth else {
-        return if token_ok {
-            None
-        } else {
-            Some(StatusCode::UNAUTHORIZED)
-        };
+        return None;
     };
     if session_from(headers).is_some_and(|t| auth.sessions.verify(&t)) {
         return None;
     }
-    if token_ok && state.token.is_some() {
-        return None;
+    if let Some(expect) = &state.token {
+        let token = headers.get("X-Docsql-Token").and_then(|v| v.to_str().ok());
+        // Constant-time compare: a plain == short-circuits on the first
+        // differing byte and leaks a (noisy but real) timing oracle.
+        if token.is_some_and(|t| constant_time_eq(t.as_bytes(), expect.as_bytes())) {
+            return None;
+        }
     }
     Some(StatusCode::UNAUTHORIZED)
 }
@@ -2081,6 +2086,11 @@ mod tests {
         // No embedded engine: the selector's fallback is the default managed
         // node, never a local database.
         assert!(!html.contains("内嵌引擎"));
+        // The browser carries no node credential: no token input and no
+        // X-Docsql-Token header — node auth uses the process DOCSQL_TOKEN.
+        assert!(!html.contains("X-Docsql-Token"));
+        assert!(!html.contains("id=\"token\""));
+        assert!(!html.contains("docsql.token"));
     }
 
     #[test]

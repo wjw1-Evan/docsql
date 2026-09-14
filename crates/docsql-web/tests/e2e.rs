@@ -399,9 +399,12 @@ async fn parse_endpoint_validates_without_executing() {
 }
 
 #[tokio::test]
-async fn token_gates_api_surface_but_not_console_page() {
+async fn console_api_is_open_without_account_gate() {
+    // No account file: the console page and its API need no browser
+    // credential. The web process authenticates to the node with its own
+    // DOCSQL_TOKEN (the compose/env value shared with the nodes), so an
+    // anonymous request still lands on a token-protected node.
     let (_dir, addr, _node) = start_stack(Some("sekrit"), Vec::new()).await;
-    // The console page must load without a token (the UI collects it).
     assert_eq!(http(&addr, "GET", "/", None, None).await.status, 200);
 
     for (method, path, body) in [
@@ -412,12 +415,11 @@ async fn token_gates_api_surface_but_not_console_page() {
         ("GET", "/api/cluster", None),
     ] {
         let res = http(&addr, method, path, None, body).await;
-        assert_eq!(res.status, 401, "{path} without token");
-        let res = http(&addr, method, path, Some("wrong"), body).await;
-        assert_eq!(res.status, 401, "{path} wrong token");
-        let res = http(&addr, method, path, Some("sekrit"), body).await;
-        assert_eq!(res.status, 200, "{path} correct token");
+        assert_eq!(res.status, 200, "{path} without any browser token");
     }
+    // Node-side auth came from the process token, not the browser.
+    let r = sql(&addr, None, "CREATE TABLE open_api (id INT)").await;
+    assert!(r.get("error").is_none(), "{r}");
 }
 
 #[tokio::test]
@@ -743,15 +745,10 @@ async fn cluster_page_probes_live_and_dead_nodes() {
     assert!(nodes[1]["status"].is_null());
 }
 
-/// /api/logs: token-gated; serves the console's own statement audit as the
+/// /api/logs: serves the console's own statement audit as the
 /// local section and fetches each peer's REQ_LOGS report over the wire.
 #[tokio::test]
 async fn logs_endpoint_serves_local_and_node_reports() {
-    // Token gate first.
-    let daddr = start_web(Some("sekrit"), Vec::new(), None).await;
-    let res = http(&daddr, "GET", "/api/logs", None, None).await;
-    assert_eq!(res.status, 401);
-
     // A real node behind the same token + a dead address.
     let node_dir = tempfile::tempdir().unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -986,11 +983,6 @@ async fn node_selection_routes_sql_meta_stats() {
         .json();
     assert_eq!(r["kind"], "error", "{r}");
     assert!(r["message"].as_str().unwrap().contains("不可达"), "{r}");
-
-    // The console token gate applies before any node connection.
-    let body = serde_json::to_string(&json!({"sql": "SELECT 1", "node": node_addr})).unwrap();
-    let res = http(&addr, "POST", "/api/sql", None, Some(&body)).await;
-    assert_eq!(res.status, 401);
 }
 
 /// No managed node configured: data endpoints report the configuration gap
@@ -1169,6 +1161,14 @@ async fn console_account_token_bypass() {
             .status,
         200
     );
+    // /metrics rides the same gate: anonymous 401, bypass token 200.
+    assert_eq!(http(&addr, "GET", "/metrics", None, None).await.status, 401);
+    assert_eq!(
+        http(&addr, "GET", "/metrics", Some("node-secret"), None)
+            .await
+            .status,
+        200
+    );
     let r = http(
         &addr,
         "POST",
@@ -1244,16 +1244,11 @@ async fn console_account_persists_across_restart() {
     );
 }
 
-/// /api/backup: token-gated; GET lists the managed node's backup state
+/// /api/backup: GET lists the managed node's backup state
 /// (REQ_BACKUP over the wire) and POST triggers one backup, whose file then
 /// shows up in the next poll. `?node=` targets an explicit whitelisted peer.
 #[tokio::test]
 async fn backup_endpoint_lists_and_triggers() {
-    // Token gate first.
-    let daddr = start_web(Some("sekrit"), Vec::new(), None).await;
-    let res = http(&daddr, "GET", "/api/backup", None, None).await;
-    assert_eq!(res.status, 401);
-
     // Real node as default managed target AND whitelisted peer; some data.
     let node_dir = tempfile::tempdir().unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2531,22 +2526,17 @@ async fn healthz_is_gate_free_liveness() {
     assert_eq!(res.json()["ok"], true);
 }
 
-/// /metrics sits behind the same API gate as every other endpoint, serves
-/// Prometheus text scraped from the managed node's REQ_STATUS (now carrying
-/// the runtime counters), and counts the console's own HTTP surface with
-/// scanner-proof path bucketing.
+/// /metrics sits behind the console account gate when one is configured,
+/// serves Prometheus text scraped from the managed node's REQ_STATUS (now
+/// carrying the runtime counters), and counts the console's own HTTP surface
+/// with scanner-proof path bucketing.
 #[tokio::test]
-async fn metrics_endpoint_gates_formats_and_scrapes_nodes() {
+async fn metrics_endpoint_formats_and_scrapes_nodes() {
     let (_dir, addr, node) = start_stack(Some("sekrit"), Vec::new()).await;
 
-    // Gate: no token / wrong token are refused like any API call.
-    assert_eq!(http(&addr, "GET", "/metrics", None, None).await.status, 401);
-    assert_eq!(
-        http(&addr, "GET", "/metrics", Some("wrong"), None)
-            .await
-            .status,
-        401
-    );
+    // No account gate: scrapes need no browser credential, and the node
+    // scrape itself authenticates with the process's DOCSQL_TOKEN.
+    assert_eq!(http(&addr, "GET", "/metrics", None, None).await.status, 200);
 
     // One statement on the node first, so the SQL counter has work to show.
     sql(

@@ -98,7 +98,7 @@ docker compose --profile cluster --profile join up -d node-d
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DOCSQL_TOKEN` | 无 | 客户端凭据(恒为管理员身份);≥8 位且非单字符重复,违者拒绝启动 |
+| `DOCSQL_TOKEN` | 无 | 客户端凭据(恒为管理员身份);Web 控制台以它连接节点(与节点同值),并作为账号门的 API 旁路;≥8 位且非单字符重复,违者拒绝启动 |
 | `DOCSQL_READ_TOKEN` | 无 | 只读客户端凭据(可查不可写) |
 | `DOCSQL_CLUSTER_TOKEN` | 无 | 节点间凭据(复制帧仅接受节点身份) |
 | `DOCSQL_KEY` | 无 | 64 位 hex → AES-256-GCM 帧加密(客户端与节点间同用) |
@@ -129,7 +129,7 @@ docker compose --profile cluster --profile join up -d node-d
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DOCSQL_UPSTREAM` | 无 | 默认管理节点(启动参数 > 此变量 > `DOCSQL_PEERS` 首条) |
-| `DOCSQL_WEB_AUTH_FILE` | 无 | 控制台账号门凭据文件;空/未设 = 关闭,已设 = 首次强制 setup |
+| `DOCSQL_WEB_AUTH_FILE` | 无 | 控制台账号门凭据文件;空/未设 = 关闭(API 开放,浏览器无令牌输入),已设 = 首次强制 setup |
 | `DOCSQL_WEB_COOKIE_SECURE` | 0 | HTTPS 反代下置 1(会话 Cookie Secure) |
 | `DOCSQL_WEB_TRUST_PROXY` | 0 | 1 = 按 `X-Forwarded-For` 分桶(登录锁定/审计) |
 | `DOCSQL_WEB_TLS_CERT` / `_KEY` | 无 | PEM 证书/私钥路径,同时设置即以 HTTPS 服务(只设其一拒绝启动) |
@@ -139,7 +139,7 @@ docker compose --profile cluster --profile join up -d node-d
 ## 监控
 
 - `GET /healthz` — 无门禁存活探针,只反映控制台进程自身;
-- `GET /metrics` — Prometheus 文本,抓取认证与其它 API 一致(带 `X-Docsql-Token`):
+- `GET /metrics` — Prometheus 文本,账号门激活时抓取认证与其它 API 一致(会话 Cookie 或 `X-Docsql-Token` 旁路),未启用账号门时开放:
 
   ```yaml
   scrape_configs:
