@@ -426,7 +426,18 @@ impl BTree {
 
     /// Remove a key. Returns whether it was present.
     pub fn delete(&mut self, pager: &Pager, tx: &mut Tx, key: &Value) -> Result<bool> {
-        Self::delete_rec(pager, tx, self.root, key)
+        Self::delete_rec(pager, tx, self.root, key, &|cells: &mut Vec<(
+            Value,
+            u64,
+        )>| {
+            match cells.binary_search_by(|(k, _)| Value::cmp_values(k, key)) {
+                Ok(i) => {
+                    cells.remove(i);
+                    true
+                }
+                Err(_) => false,
+            }
+        })
     }
 
     /// Remove the exact `(key, locator)` pair. Needed for non-unique trees
@@ -439,32 +450,47 @@ impl BTree {
         key: &Value,
         loc: u64,
     ) -> Result<bool> {
-        Self::delete_entry_rec(pager, tx, self.root, key, loc)
+        Self::delete_rec(pager, tx, self.root, key, &|cells: &mut Vec<(
+            Value,
+            u64,
+        )>| {
+            // binary_search lands on *an* equal key; equal keys may not be
+            // contiguous after interleaved updates, so scan the whole leaf.
+            for i in 0..cells.len() {
+                if Value::cmp_values(&cells[i].0, key) == Ordering::Equal && cells[i].1 == loc {
+                    cells.remove(i);
+                    return true;
+                }
+            }
+            false
+        })
     }
 
-    fn delete_entry_rec(
+    /// Shared recursion for the two delete shapes: the internal walk (via
+    /// `candidate_children`, since equal-key runs can straddle a split) is
+    /// identical, only the leaf matcher differs.
+    fn delete_rec<F>(
         pager: &Pager,
         tx: &mut Tx,
         id: u32,
         key: &Value,
-        loc: u64,
-    ) -> Result<bool> {
+        leaf_match: &F,
+    ) -> Result<bool>
+    where
+        F: Fn(&mut Vec<(Value, u64)>) -> bool,
+    {
         match Self::read_node(&PageReader::current(pager), tx, id)? {
             Node::Leaf { mut cells } => {
-                // binary_search lands on *an* equal key; equal keys may not be
-                // contiguous after interleaved updates, so scan the whole leaf.
-                for i in 0..cells.len() {
-                    if Value::cmp_values(&cells[i].0, key) == Ordering::Equal && cells[i].1 == loc {
-                        cells.remove(i);
-                        Self::write_node(pager, tx, id, &Node::Leaf { cells })?;
-                        return Ok(true);
-                    }
+                if leaf_match(&mut cells) {
+                    Self::write_node(pager, tx, id, &Node::Leaf { cells })?;
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(false)
             }
             Node::Internal { leftmost, cells } => {
                 for child in candidate_children(&cells, leftmost, key) {
-                    if Self::delete_entry_rec(pager, tx, child, key, loc)? {
+                    if Self::delete_rec(pager, tx, child, key, leaf_match)? {
                         return Ok(true);
                     }
                 }
@@ -566,29 +592,6 @@ impl BTree {
             }
         }
         Ok(())
-    }
-
-    fn delete_rec(pager: &Pager, tx: &mut Tx, id: u32, key: &Value) -> Result<bool> {
-        match Self::read_node(&PageReader::current(pager), tx, id)? {
-            Node::Leaf { mut cells } => {
-                match cells.binary_search_by(|(k, _)| Value::cmp_values(k, key)) {
-                    Ok(i) => {
-                        cells.remove(i);
-                        Self::write_node(pager, tx, id, &Node::Leaf { cells })?;
-                        Ok(true)
-                    }
-                    Err(_) => Ok(false),
-                }
-            }
-            Node::Internal { leftmost, cells } => {
-                for child in candidate_children(&cells, leftmost, key) {
-                    if Self::delete_rec(pager, tx, child, key)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-        }
     }
 }
 

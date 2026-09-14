@@ -96,6 +96,10 @@ impl Wal {
             .create(true)
             .truncate(false) // never clobber an existing log
             .open(path)?;
+        // Read the log once: the torn-tail truncation below keeps exactly the
+        // bytes scanned here, so the durable/next scan reuses this buffer
+        // instead of re-reading the file (up to tens of MB at the hard limit).
+        let mut preloaded: Option<Vec<u8>> = None;
         if exists && file.metadata()?.len() > 0 {
             // Validate header and truncate any torn tail so appends start clean.
             let mut buf = Vec::new();
@@ -106,6 +110,8 @@ impl Wal {
             }
             let good_end = Self::scan_end(&buf);
             file.set_len(good_end as u64)?;
+            buf.truncate(good_end);
+            preloaded = Some(buf);
         }
         file.seek(SeekFrom::Start(0))?;
         if file.metadata()?.len() == 0 {
@@ -113,9 +119,15 @@ impl Wal {
             file.sync_all()?;
         }
         // Compute durable_lsn and next_lsn from the clean prefix.
-        let mut buf = Vec::new();
-        file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut buf)?;
+        let buf = match preloaded {
+            Some(buf) => buf,
+            None => {
+                let mut buf = Vec::new();
+                file.seek(SeekFrom::Start(0))?;
+                file.read_to_end(&mut buf)?;
+                buf
+            }
+        };
         let (durable, next) = Self::scan(&buf);
         let appended = file.metadata()?.len();
         file.seek(SeekFrom::End(0))?;
@@ -130,12 +142,13 @@ impl Wal {
         })
     }
 
-    /// Returns (durable_commit_lsn, next_lsn) over all valid frames.
-    /// LSN continuity is checked *within* the log: the first frame's LSN is
-    /// adopted as the seed, because `checkpoint` truncates the log while
-    /// `next_lsn` keeps counting up (post-checkpoint frames never restart at 1
-    /// in files written by older versions).
-    fn scan(buf: &[u8]) -> (u64, u64) {
+    /// One walk of the valid frame prefix: `(end_offset, durable_commit_lsn,
+    /// next_lsn)`. LSN continuity is checked *within* the log: the first
+    /// frame's LSN is adopted as the seed, because `checkpoint` truncates the
+    /// log while `next_lsn` keeps counting up (post-checkpoint frames never
+    /// restart at 1 in files written by older versions). `durable` counts
+    /// commit frames whose begin was seen (a torn tail drops the rest).
+    fn scan_prefix(buf: &[u8]) -> (usize, u64, u64) {
         let mut pos = HEADER.len();
         let mut next: Option<u64> = None;
         let mut open: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -156,20 +169,18 @@ impl Wal {
             next = Some(rec.lsn + 1);
             pos += adv;
         }
-        (durable, next.unwrap_or(1))
+        (pos, durable, next.unwrap_or(1))
     }
 
+    /// Returns (durable_commit_lsn, next_lsn) over all valid frames.
+    fn scan(buf: &[u8]) -> (u64, u64) {
+        let (_, durable, next) = Self::scan_prefix(buf);
+        (durable, next)
+    }
+
+    /// End offset of the valid frame prefix (torn-tail truncation point).
     fn scan_end(buf: &[u8]) -> usize {
-        let mut pos = HEADER.len();
-        let mut next: Option<u64> = None;
-        while pos < buf.len() {
-            let Some((rec, adv)) = parse_frame(&buf[pos..], next).unwrap_or(None) else {
-                break;
-            };
-            next = Some(rec.lsn + 1);
-            pos += adv;
-        }
-        pos
+        Self::scan_prefix(buf).0
     }
 
     pub fn path(&self) -> &Path {

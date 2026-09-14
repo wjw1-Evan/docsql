@@ -178,20 +178,9 @@ pub fn try_rewrite_pubsub_view(sql: &str) -> Option<String> {
         // 'docsql_pubsub' must survive the rewrite untouched ('' escapes
         // included).
         if lb[i] == b'\'' {
-            let start = i;
-            i += 1;
-            while i < sql.len() {
-                if lb[i] == b'\'' {
-                    if lb.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push_str(sql.get(start..i).unwrap_or(""));
+            let (end, _) = docsql_core::stmt::sql_literal_end(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
             continue;
         }
         if i + needle.len() <= lb.len() && &lb[i..i + needle.len()] == needle {

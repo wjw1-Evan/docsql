@@ -173,18 +173,8 @@ fn word_tokens(lower: &str) -> Vec<(usize, usize)> {
     while i < b.len() {
         let c = b[i];
         if c == b'\'' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\'' {
-                    if b.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+            let (end, _) = docsql_core::stmt::sql_literal_end(lower, i);
+            i = end;
         } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;

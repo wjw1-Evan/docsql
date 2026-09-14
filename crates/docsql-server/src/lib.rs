@@ -1656,31 +1656,24 @@ fn json_param_to_value(p: &serde_json::Value) -> Value {
 /// `''` escape) is data, not a placeholder. String params escape single
 /// quotes by doubling, so a value can never terminate the literal early:
 /// that closes the injection surface client-side binding leaves open.
+/// Replace `?` placeholders with typed literals, quoting-aware: strings use
+/// the shared literal escaper, so bound values can only ever be data. The
+/// count is checked in both directions (too few / too many parameters).
 fn bind_params(sql: &str, params: &[Value]) -> Result<String, String> {
     let mut out = String::with_capacity(sql.len() + 16 * params.len());
-    let mut in_quote = false;
     let mut next = 0usize;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_quote {
-            out.push(c);
-            if c == '\'' {
-                // '' inside a literal is an escaped quote, not the end.
-                if chars.peek() == Some(&'\'') {
-                    out.push('\'');
-                    chars.next();
-                } else {
-                    in_quote = false;
-                }
+    let mut i = 0usize;
+    let bytes = sql.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            // Literals are copied verbatim: a `?` inside one is data, not a
+            // placeholder.
+            b'\'' => {
+                let (end, _) = docsql_core::stmt::sql_literal_end(sql, i);
+                out.push_str(&sql[i..end]);
+                i = end;
             }
-            continue;
-        }
-        match c {
-            '\'' => {
-                in_quote = true;
-                out.push(c);
-            }
-            '?' => {
+            b'?' => {
                 let Some(p) = params.get(next) else {
                     return Err(format!(
                         "statement has more ? placeholders than the {} parameter(s) supplied",
@@ -1689,8 +1682,14 @@ fn bind_params(sql: &str, params: &[Value]) -> Result<String, String> {
                 };
                 next += 1;
                 out.push_str(&render_param(p));
+                i += 1;
             }
-            _ => out.push(c),
+            _ => {
+                // Advance by one CHARACTER (multibyte safety).
+                let ch_len = sql[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                out.push_str(&sql[i..i + ch_len]);
+                i += ch_len;
+            }
         }
     }
     if next < params.len() {
@@ -3909,34 +3908,23 @@ const REPAIR_ROUNDS: usize = 20;
 async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
     for round in 0..REPAIR_ROUNDS {
         // Probe every peer for digests + journal info, concurrently.
-        let mut probes = Vec::new();
-        for peer in &peers {
-            let st = state.clone();
-            let target = peer.clone();
-            probes.push(tokio::spawn(async move {
-                let digests = probe_peer_digests(&st, &target).await;
-                let info = probe_peer_info(&st, &target).await;
-                (target, digests, info)
-            }));
-        }
         let mut reports: Vec<(String, Vec<TableDigest>)> = Vec::new();
         let mut infos: Vec<(String, PeerInfo)> = Vec::new();
-        for probe in probes {
-            match probe.await {
-                Ok((peer, Ok(digests), Ok(info))) => {
+        for (peer, digests, info) in probe_all_peer_reports(&state, &peers).await {
+            match (digests, info) {
+                (Ok(digests), Ok(info)) => {
                     reports.push((peer.clone(), digests));
                     infos.push((peer, info));
                 }
-                Ok((peer, Ok(digests), Err(e))) => {
+                (Ok(digests), Err(e)) => {
                     // Digests arrived, journal info did not: this peer can
                     // still serve a snapshot, never incremental catch-up.
                     eprintln!("repair: journal probe of {peer} failed: {e}");
                     reports.push((peer, digests));
                 }
-                Ok((peer, Err(e), _)) => {
+                (Err(e), _) => {
                     eprintln!("repair: digest probe of {peer} failed: {e}");
                 }
-                Err(e) => eprintln!("repair: probe task failed: {e}"),
             }
         }
         if reports.is_empty() {
@@ -3994,21 +3982,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                         drain_sync_queue(&state, false).await;
                         // Fresh digest check: the mesh kept writing while
                         // the backlog replayed.
-                        let mut fresh_probes = Vec::new();
-                        for peer in &peers {
-                            let st = state.clone();
-                            let target = peer.clone();
-                            fresh_probes.push(tokio::spawn(async move {
-                                let d = probe_peer_digests(&st, &target).await;
-                                (target, d)
-                            }));
-                        }
-                        let mut fresh: Vec<(String, Vec<TableDigest>)> = Vec::new();
-                        for probe in fresh_probes {
-                            if let Ok((peer, Ok(d))) = probe.await {
-                                fresh.push((peer, d));
-                            }
-                        }
+                        let fresh = probe_all_digests(&state, &peers).await;
                         let fresh_local = {
                             let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                             db.digests()
@@ -4404,25 +4378,14 @@ async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
     let Ok(local) = local else {
         return;
     };
-    let mut probes = Vec::new();
-    for peer in &peers {
-        let st = state.clone();
-        let target = peer.clone();
-        probes.push(tokio::spawn(async move {
-            let digests = probe_peer_digests(&st, &target).await;
-            (target, digests)
-        }));
-    }
     let mut reachable = 0usize;
     let mut agreeing = 0usize;
-    for probe in probes {
-        if let Ok((peer, Ok(d))) = probe.await {
-            reachable += 1;
-            if d == local {
-                agreeing += 1;
-            } else {
-                eprintln!("join verify: state differs from {peer}");
-            }
+    for (peer, d) in probe_all_digests(state, &peers).await {
+        reachable += 1;
+        if d == local {
+            agreeing += 1;
+        } else {
+            eprintln!("join verify: state differs from {peer}");
         }
     }
     if reachable > 0 && agreeing == 0 {
@@ -4471,6 +4434,65 @@ pub(crate) async fn probe_peer_digests(
     }
     serde_json::from_slice(&resp.payload)
         .map_err(|e| std::io::Error::other(format!("bad digest payload: {e}")))
+}
+
+/// Concurrently probe every peer for its table digests. Unreachable peers
+/// are logged and dropped ("unknown", never "divergent"); the returned
+/// order matches `peers`.
+async fn probe_all_digests(
+    state: &Arc<ServerState>,
+    peers: &[String],
+) -> Vec<(String, Vec<TableDigest>)> {
+    let mut probes = Vec::new();
+    for peer in peers {
+        let st = state.clone();
+        let target = peer.clone();
+        probes.push(tokio::spawn(async move {
+            let d = probe_peer_digests(&st, &target).await;
+            (target, d)
+        }));
+    }
+    let mut out = Vec::new();
+    for probe in probes {
+        match probe.await {
+            Ok((peer, Ok(d))) => out.push((peer, d)),
+            Ok((peer, Err(e))) => eprintln!("repair: digest probe of {peer} failed: {e}"),
+            Err(e) => eprintln!("repair: probe task failed: {e}"),
+        }
+    }
+    out
+}
+
+/// Concurrently probe every peer for digests + journal info, keeping the
+/// two results separate so a peer that answered digests but not status is
+/// still usable for snapshot repair. Task-level failures are logged and
+/// dropped; peer-level errors ride in the tuples for the caller's framing.
+async fn probe_all_peer_reports(
+    state: &Arc<ServerState>,
+    peers: &[String],
+) -> Vec<(
+    String,
+    std::io::Result<Vec<TableDigest>>,
+    std::io::Result<PeerInfo>,
+)> {
+    let mut probes = Vec::new();
+    for peer in peers {
+        let st = state.clone();
+        let target = peer.clone();
+        probes.push(tokio::spawn(async move {
+            let digests = probe_peer_digests(&st, &target).await;
+            let info = probe_peer_info(&st, &target).await;
+            (target, digests, info)
+        }));
+    }
+    let mut out = Vec::new();
+    for probe in probes {
+        match probe.await {
+            Ok(report) => out.push(report),
+            Err(e) => eprintln!("repair: probe task failed: {e}"),
+        }
+    }
+    out
 }
 
 /// What one peer reported about itself over REQ_STATUS: its user-table

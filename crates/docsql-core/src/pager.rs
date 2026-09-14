@@ -262,6 +262,16 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The 16-byte data-file header (`magic | page_size | num_pages`), shared by
+/// the initial open and every later page-count persistence.
+fn encode_header(num_pages: u32) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[..8].copy_from_slice(MAGIC);
+    header[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    header[12..16].copy_from_slice(&num_pages.to_le_bytes());
+    header
+}
+
 impl Pager {
     /// Open (creating if needed) a database at `path` with WAL at `path.wal`,
     /// running crash recovery first.
@@ -276,11 +286,7 @@ impl Pager {
             .open(path)?;
 
         let num_pages = if file.metadata()?.len() == 0 {
-            let mut header = vec![0u8; HEADER_LEN];
-            header[..8].copy_from_slice(MAGIC);
-            header[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-            header[12..16].copy_from_slice(&1u32.to_le_bytes()); // page 0 only
-            file.write_all_at(&header, 0)?;
+            file.write_all_at(&encode_header(1), 0)?; // page 0 only
             file.sync_all()?;
             1
         } else {
@@ -394,12 +400,8 @@ impl Pager {
     }
 
     fn persist_header(&self) -> Result<()> {
-        let mut header = [0u8; HEADER_LEN];
-        header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        header[12..16].copy_from_slice(&self.num_pages().to_le_bytes());
         let file = lock(&self.file);
-        file.write_all_at(&header, 0)?;
+        file.write_all_at(&encode_header(self.num_pages()), 0)?;
         self.persisted_pages
             .store(self.num_pages(), Ordering::Relaxed);
         Ok(())

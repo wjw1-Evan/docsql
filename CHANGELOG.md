@@ -5,6 +5,38 @@
 
 ## [Unreleased]
 
+### 审查去重续批(2026-09-13)
+
+#### 修复
+
+- **查询日志在非 ASCII 语句上 panic**:`redact_sql`(每条被记录语句都会跑)用
+  `to_lowercase()` 副本的字节下标去索引原文,而 Unicode 大小写映射会改变字节长度
+  (如 U+212A KELVIN SIGN 三字节 → `k` 一字节),下标越界直接 panic 并中断该连接。
+  改为在原文上做 ASCII 大小写不敏感匹配,并复用共享的字面量扫描助手(该 panic
+  有回归测试钉住:修复前 exit 101)。
+
+#### 重构
+
+- **SQL 字符串字面量扫描收敛单点**:占位符绑定(`bind_params`)、`docsql_pubsub`
+  视图重写、`redact_sql`、查询日志词法四处手写的「跳过 '' 转义字面量」循环统一走
+  `stmt::sql_literal_end`(新增,带边界测试:转义、闭合引号在末字节、未终止到 EOF);
+  `bind_params` 由字符状态机改为字节游标(语义逐字节等价,注入面单点)。
+- 用户/角色执行侧:GRANT/REVOKE/加角色/撤角色四处镜像分支收敛为
+  `rows_have`/`insert_row`/`delete_rows` 三个助手(存在性判定与存储行的规范大写
+  形式保持原样);GRANT/REVOKE 解析的 TO/FROM 方向分支合并。
+- btree 删除:按整键删与按 `(键, 定位符)` 删共享同一递归走子(内部节点走法原本
+  逐行重复,等键跨分裂的 `candidate_children` 兜底语义不变)。
+- server 侧对等探测:repair_sync 的轮首/追赶后复验与 join 收敛复验三处
+  spawn+collect 收敛为 `probe_all_digests`/`probe_all_peer_reports` 两个助手
+  (「摘要到、状态未到」仍可快照修复的降级判定保留)。
+- web 控制台探测:状态/日志两个 probe 的连接与请求-响应骨架收敛为
+  `connect_probe_stream`/`request_on_probe_stream`(可达性分类的 bool 语义逐处保留)。
+- hash join 候选集由每左行排序改为对两个已升序的桶做线性归并(右行输出顺序不变),
+  补文档键值降级(always 桶)的回归测试。
+- WAL 启动只整读一遍(撕尾截断后的干净前缀直接复用,原来重读第二遍;硬阈值下最大
+  省约 60MB 启动 IO);三段 frame 走查(撕尾定位/durable 扫描)收敛为一个
+  `scan_prefix`;pager 页头编码(初始建库与页数持久化两处)收敛 `encode_header`。
+
 ### 全库审查修复与去重批次(2026-09-13)
 
 #### 修复

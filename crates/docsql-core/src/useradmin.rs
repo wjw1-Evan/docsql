@@ -379,38 +379,32 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
             }
         }
         let tables = c.name_list()?;
-        if is_grant {
-            c.kw("TO")?;
-            let to = c.name_list()?;
-            c.expect_end()?;
-            Ok(UserAdminStmt::GrantTable {
+        c.kw(if is_grant { "TO" } else { "FROM" })?;
+        let names = c.name_list()?;
+        c.expect_end()?;
+        Ok(if is_grant {
+            UserAdminStmt::GrantTable {
                 privileges,
                 tables,
-                to,
-            })
+                to: names,
+            }
         } else {
-            c.kw("FROM")?;
-            let from = c.name_list()?;
-            c.expect_end()?;
-            Ok(UserAdminStmt::RevokeTable {
+            UserAdminStmt::RevokeTable {
                 privileges,
                 tables,
-                from,
-            })
-        }
+                from: names,
+            }
+        })
     } else {
         let roles = c.name_list()?;
-        if is_grant {
-            c.kw("TO")?;
-            let to = c.name_list()?;
-            c.expect_end()?;
-            Ok(UserAdminStmt::GrantRoles { roles, to })
+        c.kw(if is_grant { "TO" } else { "FROM" })?;
+        let names = c.name_list()?;
+        c.expect_end()?;
+        Ok(if is_grant {
+            UserAdminStmt::GrantRoles { roles, to: names }
         } else {
-            c.kw("FROM")?;
-            let from = c.name_list()?;
-            c.expect_end()?;
-            Ok(UserAdminStmt::RevokeRoles { roles, from })
-        }
+            UserAdminStmt::RevokeRoles { roles, from: names }
+        })
     }
 }
 
@@ -478,38 +472,43 @@ pub fn render(stmt: &UserAdminStmt, password: &str) -> String {
 /// hashed forms (`$pbkdf2…`) are left in place — they replicate in that
 /// form anyway.
 pub fn redact_sql(sql: &str) -> String {
-    let lower = sql.to_lowercase();
+    /// ASCII-case-insensitive `starts_with` at a byte offset.
+    fn starts_with_ci(b: &[u8], at: usize, pat: &str) -> bool {
+        let p = pat.as_bytes();
+        b.len() >= at + p.len()
+            && b[at..at + p.len()]
+                .iter()
+                .zip(p)
+                .all(|(x, y)| x.eq_ignore_ascii_case(y))
+    }
+
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if lower[i..].starts_with("password")
-            && (i == 0 || lower[..i].ends_with(|c: char| c.is_whitespace()))
+        // Compared on the original bytes: a full-Unicode `to_lowercase`
+        // copy can change byte length (KELVIN SIGN → "k"), so its indices
+        // cannot address this text — the previous version panicked on such
+        // input.
+        if starts_with_ci(bytes, i, "PASSWORD")
+            && (i == 0
+                || sql[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace))
         {
             let mut j = i + "password".len();
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
             if bytes.get(j) == Some(&b'\'') {
-                // scan to the closing quote (respecting '' escapes)
-                let mut k = j + 1;
-                while k < bytes.len() {
-                    if bytes[k] == b'\'' {
-                        if bytes.get(k + 1) == Some(&b'\'') {
-                            k += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    k += 1;
-                }
-                // An unterminated literal (k == len) still hides the tail:
-                // the query log must never carry a password's characters.
-                let closed = k < bytes.len();
-                let value = &sql[j + 1..if closed { k } else { bytes.len() }];
+                let (end, closed) = crate::stmt::sql_literal_end(sql, j);
+                // An unterminated literal still hides the tail: the query
+                // log must never carry a password's characters.
+                let value = &sql[j + 1..if closed { end - 1 } else { bytes.len() }];
                 if !value.starts_with(kdf::HASH_PREFIX) {
                     out.push_str("PASSWORD '***'");
-                    i = if closed { k + 1 } else { bytes.len() };
+                    i = end;
                     continue;
                 }
             }
@@ -570,24 +569,53 @@ fn stored_password_form(password: &str) -> Result<String, String> {
     Ok(kdf::hash_password(password, &salt))
 }
 
-fn grant_row(db: &mut Database, role: &str, member: &str) -> Result<(), SqlError> {
-    let exists = db
-        .table_docs_cx(MEMBERS_TABLE)
-        .unwrap_or_default()
-        .iter()
-        .any(|d| {
-            d.get("role").and_then(|v| v.as_str()) == Some(role)
-                && d.get("member").and_then(|v| v.as_str()) == Some(member)
-        });
-    if !exists {
-        db.execute(&format!(
-            "INSERT INTO {} (role, member) VALUES ({}, {})",
-            q(MEMBERS_TABLE),
-            lit(role),
-            lit(member)
-        ))?;
+/// True when one of `rows` carries every given column/value pair (the
+/// user/role storage tables keep all values as text).
+fn rows_have(rows: &[Object], cols: &[(&str, &str)]) -> bool {
+    rows.iter().any(|d| {
+        cols.iter()
+            .all(|(c, v)| d.get(*c).and_then(|x| x.as_str()) == Some(*v))
+    })
+}
+
+/// Rows of `table` (empty when it does not exist yet — the user tables are
+/// created lazily).
+fn table_rows(db: &mut Database, table: &str) -> Vec<Object> {
+    db.table_docs_cx(table).unwrap_or_default()
+}
+
+/// INSERT one row unless an identical one is already present (grant
+/// statements replay idempotently).
+fn insert_row(db: &mut Database, table: &str, cols: &[(&str, &str)]) -> Result<(), SqlError> {
+    if rows_have(&table_rows(db, table), cols) {
+        return Ok(());
     }
+    let names = cols.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", ");
+    let values = cols
+        .iter()
+        .map(|(_, v)| lit(v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    db.execute(&format!(
+        "INSERT INTO {} ({names}) VALUES ({values})",
+        q(table)
+    ))?;
     Ok(())
+}
+
+/// DELETE every row of `table` matching all given column/value pairs.
+fn delete_rows(db: &mut Database, table: &str, cols: &[(&str, &str)]) -> Result<(), SqlError> {
+    let cond = cols
+        .iter()
+        .map(|(c, v)| format!("{c} = {}", lit(v)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    db.execute(&format!("DELETE FROM {} WHERE {cond}", q(table)))?;
+    Ok(())
+}
+
+fn grant_row(db: &mut Database, role: &str, member: &str) -> Result<(), SqlError> {
+    insert_row(db, MEMBERS_TABLE, &[("role", role), ("member", member)])
 }
 
 fn grant_priv_row(
@@ -596,25 +624,11 @@ fn grant_priv_row(
     priv_: &TablePriv,
     tbl: &str,
 ) -> Result<(), SqlError> {
-    let exists = db
-        .table_docs_cx(GRANTS_TABLE)
-        .unwrap_or_default()
-        .iter()
-        .any(|d| {
-            d.get("grantee").and_then(|v| v.as_str()) == Some(grantee)
-                && d.get("priv").and_then(|v| v.as_str()) == Some(priv_.name())
-                && d.get("tbl").and_then(|v| v.as_str()) == Some(tbl)
-        });
-    if !exists {
-        db.execute(&format!(
-            "INSERT INTO {} (grantee, priv, tbl) VALUES ({}, {}, {})",
-            q(GRANTS_TABLE),
-            lit(grantee),
-            lit(priv_.name()),
-            lit(tbl)
-        ))?;
-    }
-    Ok(())
+    insert_row(
+        db,
+        GRANTS_TABLE,
+        &[("grantee", grantee), ("priv", priv_.name()), ("tbl", tbl)],
+    )
 }
 
 impl Database {
@@ -756,21 +770,9 @@ impl Database {
                 if self.stored_pw(name)?.is_none() {
                     return Err(err_str(format!("user {name} does not exist")));
                 }
-                self.execute(&format!(
-                    "DELETE FROM {} WHERE name = {}",
-                    q(USERS_TABLE),
-                    lit(name)
-                ))?;
-                self.execute(&format!(
-                    "DELETE FROM {} WHERE member = {}",
-                    q(MEMBERS_TABLE),
-                    lit(name)
-                ))?;
-                self.execute(&format!(
-                    "DELETE FROM {} WHERE grantee = {}",
-                    q(GRANTS_TABLE),
-                    lit(name)
-                ))?;
+                delete_rows(self, USERS_TABLE, &[("name", name)])?;
+                delete_rows(self, MEMBERS_TABLE, &[("member", name)])?;
+                delete_rows(self, GRANTS_TABLE, &[("grantee", name)])?;
                 self.set_resolved_sql(render(stmt, ""));
             }
             UserAdminStmt::CreateRole { name } => {
@@ -793,21 +795,9 @@ impl Database {
                 if !self.role_names()?.contains(name) {
                     return Err(err_str(format!("role {name} does not exist")));
                 }
-                self.execute(&format!(
-                    "DELETE FROM {} WHERE name = {}",
-                    q(ROLES_TABLE),
-                    lit(name)
-                ))?;
-                self.execute(&format!(
-                    "DELETE FROM {} WHERE role = {}",
-                    q(MEMBERS_TABLE),
-                    lit(name)
-                ))?;
-                self.execute(&format!(
-                    "DELETE FROM {} WHERE grantee = {}",
-                    q(GRANTS_TABLE),
-                    lit(name)
-                ))?;
+                delete_rows(self, ROLES_TABLE, &[("name", name)])?;
+                delete_rows(self, MEMBERS_TABLE, &[("role", name)])?;
+                delete_rows(self, GRANTS_TABLE, &[("grantee", name)])?;
                 self.set_resolved_sql(render(stmt, ""));
             }
             UserAdminStmt::GrantRoles { roles, to } => {
@@ -833,20 +823,11 @@ impl Database {
                 self.set_resolved_sql(render(stmt, ""));
             }
             UserAdminStmt::RevokeRoles { roles, from } => {
-                let rows = self.table_docs_cx(MEMBERS_TABLE).unwrap_or_default();
+                let rows = table_rows(self, MEMBERS_TABLE);
                 for r in roles {
                     for u in from {
-                        let present = rows.iter().any(|d| {
-                            d.get("role").and_then(|v| v.as_str()) == Some(r.as_str())
-                                && d.get("member").and_then(|v| v.as_str()) == Some(u.as_str())
-                        });
-                        if present {
-                            self.execute(&format!(
-                                "DELETE FROM {} WHERE role = {} AND member = {}",
-                                q(MEMBERS_TABLE),
-                                lit(r),
-                                lit(u)
-                            ))?;
+                        if rows_have(&rows, &[("role", r), ("member", u)]) {
+                            delete_rows(self, MEMBERS_TABLE, &[("role", r), ("member", u)])?;
                         }
                     }
                 }
@@ -883,25 +864,19 @@ impl Database {
                 tables,
                 from,
             } => {
-                let rows = self.table_docs_cx(GRANTS_TABLE).unwrap_or_default();
+                let rows = table_rows(self, GRANTS_TABLE);
                 for g in from {
                     for t in tables {
                         for p in privileges {
                             // Stored rows carry the canonical uppercase
                             // name() form (written by the grant path).
-                            let present = rows.iter().any(|d| {
-                                d.get("grantee").and_then(|v| v.as_str()) == Some(g.as_str())
-                                    && d.get("priv").and_then(|v| v.as_str()) == Some(p.name())
-                                    && d.get("tbl").and_then(|v| v.as_str()) == Some(t.as_str())
-                            });
-                            if present {
-                                self.execute(&format!(
-                                    "DELETE FROM {} WHERE grantee = {} AND priv = {} AND tbl = {}",
-                                    q(GRANTS_TABLE),
-                                    lit(g),
-                                    lit(p.name()),
-                                    lit(t)
-                                ))?;
+                            let cond = [
+                                ("grantee", g.as_str()),
+                                ("priv", p.name()),
+                                ("tbl", t.as_str()),
+                            ];
+                            if rows_have(&rows, &cond) {
+                                delete_rows(self, GRANTS_TABLE, &cond)?;
                             }
                         }
                     }
@@ -1261,6 +1236,24 @@ mod tests {
         // "MYPASSWORD" is not the keyword (no whitespace before it)
         let keep = format!("UPDATE t SET note = 'mypassword {pw}' WHERE id = 1");
         assert_eq!(redact_sql(&keep), keep);
+    }
+
+    #[test]
+    fn redact_sql_survives_unicode_whose_lowercase_changes_byte_length() {
+        // U+212A KELVIN SIGN is three bytes; its lowercase is one. Indexing
+        // the original text with offsets from a `to_lowercase()` copy
+        // panicked here (the query log runs this on every statement).
+        let sql = "SELECT '\u{212A}' AS k, x FROM t";
+        assert_eq!(redact_sql(sql), sql);
+        // Case-insensitive keyword matching still works.
+        let pw = test_pw();
+        assert_eq!(
+            redact_sql(&format!("create user a PaSsWoRd '{pw}'")),
+            "create user a PASSWORD '***'"
+        );
+        // Multibyte whitespace before the keyword keeps the boundary check.
+        let sql = format!("CREATE USER a\u{00A0}PASSWORD '{pw}'");
+        assert_eq!(redact_sql(&sql), "CREATE USER a\u{00A0}PASSWORD '***'");
     }
 
     #[test]

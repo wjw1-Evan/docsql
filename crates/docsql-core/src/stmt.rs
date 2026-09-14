@@ -19,6 +19,30 @@ pub fn sql_quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Byte offset just past the SQL string literal whose opening quote sits at
+/// `open` (`sql.as_bytes()[open] == b'\''`), plus whether the closing quote
+/// was found. `''` inside the literal is an escaped quote, never the end.
+/// An unterminated literal runs to the end of the input — callers that must
+/// not leak a tail (password redaction) rely on that, and callers that must
+/// not mis-read data (placeholder binding, view rewriting) must not treat
+/// the literal's contents as SQL.
+pub fn sql_literal_end(sql: &str, open: usize) -> (usize, bool) {
+    let b = sql.as_bytes();
+    debug_assert_eq!(b.get(open), Some(&b'\''), "not a literal start");
+    let mut i = open + 1;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return (i + 1, true);
+        }
+        i += 1;
+    }
+    (b.len(), false)
+}
+
 /// Quote/comment-aware split on top-level semicolons: string literals,
 /// quoted identifiers, `--` line comments and `/* */` block comments never
 /// split. Needed because user-management statements are hand-parsed and
@@ -209,5 +233,25 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    #[test]
+    fn sql_literal_end_covers_escapes_and_unterminated_tails() {
+        let sql = "'ab' tail";
+        assert_eq!(sql_literal_end(sql, 0), (4, true));
+        // '' is an escaped quote, not the end.
+        let sql = "'a''b' tail";
+        assert_eq!(sql_literal_end(sql, 0), (6, true));
+        // Closing quote as the last byte.
+        let sql = "'ab'";
+        assert_eq!(sql_literal_end(sql, 0), (4, true));
+        // Unterminated: runs to the end (the trailing '' is an escaped quote).
+        let sql = "'ab";
+        assert_eq!(sql_literal_end(sql, 0), (3, false));
+        let sql = "'ab''";
+        assert_eq!(sql_literal_end(sql, 0), (5, false));
+        // Empty literal.
+        let sql = "'' x";
+        assert_eq!(sql_literal_end(sql, 0), (2, true));
     }
 }

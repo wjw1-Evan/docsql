@@ -1433,6 +1433,33 @@ async fn auth_on_stream(
     Ok(())
 }
 
+/// Connect to a managed node within the probe budget. The error's bool is
+/// the reachability classification (`false`: the connection itself failed).
+async fn connect_probe_stream(addr: &str) -> Result<TcpStream, (bool, String)> {
+    tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|e| (false, e.to_string()))?
+        .map_err(|e| (false, e.to_string()))
+}
+
+/// One request/response exchange on an open probe connection. I/O failures
+/// mean the node died mid-exchange; `reachable` is the classification the
+/// caller wants for that case (the unauthenticated PING leg counts it as
+/// unreachable, the authenticated legs as reachable).
+async fn request_on_probe_stream(
+    stream: &mut TcpStream,
+    frame: Frame,
+    cap: usize,
+    reachable: bool,
+) -> Result<Frame, (bool, String)> {
+    write_frame(stream, &frame)
+        .await
+        .map_err(|e| (reachable, e.to_string()))?;
+    read_response_frame(stream, cap)
+        .await
+        .map_err(|e| (reachable, e.to_string()))
+}
+
 /// Probe one cluster node: REQ_PING for liveness + latency, then (after AUTH
 /// when a token is configured) REQ_STATUS for the full report. The probe
 /// never writes to the node. Transport-encrypted nodes reject plaintext
@@ -1462,18 +1489,16 @@ async fn probe_node_inner(
     addr: &str,
     token: Option<&str>,
 ) -> Result<(f64, serde_json::Value), (bool, String)> {
-    let mut stream = tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|e| (false, e.to_string()))?
-        .map_err(|e| (false, e.to_string()))?;
+    let mut stream = connect_probe_stream(addr).await?;
     // Liveness: PING needs no authenticated session.
     let started = Instant::now();
-    write_frame(&mut stream, &Frame::new(proto::REQ_PING, vec![]))
-        .await
-        .map_err(|e| (false, e.to_string()))?;
-    let pong = read_response_frame(&mut stream, PROBE_RECV_CAP)
-        .await
-        .map_err(|e| (false, e.to_string()))?;
+    let pong = request_on_probe_stream(
+        &mut stream,
+        Frame::new(proto::REQ_PING, vec![]),
+        PROBE_RECV_CAP,
+        false,
+    )
+    .await?;
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     if pong.frame_type != proto::RESP_PONG {
         return Err((
@@ -1484,12 +1509,13 @@ async fn probe_node_inner(
     if let Err((reachable, message)) = auth_on_stream(&mut stream, token, PROBE_RECV_CAP).await {
         return Err((reachable, message));
     }
-    write_frame(&mut stream, &Frame::new(proto::REQ_STATUS, vec![]))
-        .await
-        .map_err(|e| (true, e.to_string()))?;
-    let resp = read_response_frame(&mut stream, PROBE_RECV_CAP)
-        .await
-        .map_err(|e| (true, e.to_string()))?;
+    let resp = request_on_probe_stream(
+        &mut stream,
+        Frame::new(proto::REQ_STATUS, vec![]),
+        PROBE_RECV_CAP,
+        true,
+    )
+    .await?;
     if resp.frame_type != proto::RESP_STATUS {
         return Err((
             true,
@@ -1566,20 +1592,18 @@ async fn fetch_node_logs_inner(
     token: Option<&str>,
     limit: usize,
 ) -> Result<serde_json::Value, (bool, String)> {
-    let mut stream = tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|e| (false, e.to_string()))?
-        .map_err(|e| (false, e.to_string()))?;
+    let mut stream = connect_probe_stream(addr).await?;
     if let Err((reachable, message)) = auth_on_stream(&mut stream, token, LOGS_RECV_CAP).await {
         return Err((reachable, message));
     }
     let body = serde_json::to_vec(&serde_json::json!({"limit": limit})).unwrap_or_default();
-    write_frame(&mut stream, &Frame::new(proto::REQ_LOGS, body))
-        .await
-        .map_err(|e| (true, e.to_string()))?;
-    let resp = read_response_frame(&mut stream, LOGS_RECV_CAP)
-        .await
-        .map_err(|e| (true, e.to_string()))?;
+    let resp = request_on_probe_stream(
+        &mut stream,
+        Frame::new(proto::REQ_LOGS, body),
+        LOGS_RECV_CAP,
+        true,
+    )
+    .await?;
     if resp.frame_type != proto::RESP_LOGS {
         return Err((
             true,

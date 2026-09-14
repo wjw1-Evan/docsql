@@ -1603,7 +1603,7 @@ impl<'a> ReadCx<'a> {
         };
         let root = meta.index_roots[&col];
         let heap = meta.heap_of();
-        let tx = self.pager.begin_tx(); // read-only use; aborted immediately
+        let tx = self.pager.begin_tx(); // read-only handle: nothing staged, dropping it is the cleanup
         let tree = BTree::open(root);
         let pairs = match plan {
             ProbePlan::Eq(v) => {
@@ -2578,6 +2578,11 @@ impl Database {
     /// on `&Database` under the server's read lock so read-only statements
     /// run concurrently. Guardless reads (stage B) go through
     /// [`Database::read_view`] instead.
+    ///
+    /// No statement deadline here: this path shares the engine-global slot
+    /// the write path arms (a concurrent arming would be overwritten), so
+    /// stage-A reads are not preemptible. Stage-B views carry their own
+    /// deadline (see `ReadView::set_statement_deadline`).
     pub fn execute_read(&self, sql: &str) -> Result<ExecOutcome> {
         let q = Self::plain_read_query(&Self::parse_classified(sql)?)?;
         self.exec_query_cx(q)
@@ -5987,14 +5992,25 @@ fn hash_join(
         let mut cands: Vec<usize> = Vec::new();
         if unindexed {
             cands.extend(0..qright.len());
-        } else if let Some(bucket) = map.get(&lkey) {
-            cands.extend_from_slice(bucket);
-            cands.extend_from_slice(&always);
         } else {
-            cands.extend_from_slice(&always);
-        }
-        if !always.is_empty() && !unindexed {
-            cands.sort_unstable(); // keep right-index emission order
+            // The bucket and `always` are each ascending (built in right-row
+            // order) and disjoint, so a linear merge restores overall right
+            // order in O(k) instead of sorting per left row.
+            let empty: &[usize] = &[];
+            let bucket = map.get(&lkey).map(Vec::as_slice).unwrap_or(empty);
+            cands.reserve(bucket.len() + always.len());
+            let (mut bi, mut ai) = (0usize, 0usize);
+            while bi < bucket.len() || ai < always.len() {
+                let take_bucket =
+                    ai >= always.len() || (bi < bucket.len() && bucket[bi] < always[ai]);
+                if take_bucket {
+                    cands.push(bucket[bi]);
+                    bi += 1;
+                } else {
+                    cands.push(always[ai]);
+                    ai += 1;
+                }
+            }
         }
         let mut matched = false;
         for &ri in &cands {
@@ -9575,6 +9591,37 @@ mod tests {
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0], vec![Value::Str("a".into())]);
         assert_eq!(r.rows[1], vec![Value::Str("b".into())]);
+    }
+
+    #[test]
+    fn hash_join_document_key_values_degrade_to_full_probe() {
+        // Documents have no canonical join key. A doc-valued right row must
+        // stay probe-able by every left row (the `always` bucket) and a
+        // doc-valued left row must probe every right row — dropping either
+        // would lose matches the ON accepts (documents compare structurally,
+        // and equal documents are `=`).
+        let doc = Value::Object(Object::from([("a".to_string(), Value::Int(1))]));
+        let left_row = |k: Value| Object::from([("l.k".to_string(), k)]);
+        let right_row = |k: Value| Object::from([("k".to_string(), k)]);
+
+        let on = parse_expr_text("l.k = r.k").unwrap();
+        let deadline = StmtDeadline::default();
+        let out = join_rows(
+            vec![left_row(doc.clone()), left_row(Value::Int(9))],
+            &[right_row(doc.clone()), right_row(Value::Int(9))],
+            "r",
+            Some(&on),
+            false,
+            false,
+            &deadline,
+        )
+        .unwrap();
+        // doc ↔ doc (always bucket + unindexed probe) and 9 ↔ 9 by key; the
+        // always row comes first in right-row order.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["l.k"], doc);
+        assert_eq!(out[0]["r.k"], doc);
+        assert_eq!(out[1]["l.k"], Value::Int(9));
     }
 
     #[test]
