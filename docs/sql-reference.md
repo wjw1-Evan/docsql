@@ -97,7 +97,7 @@ DocSQL 文档模型不强制 schema：**列声明类型仅作文档与自省用�
 CAST(expr AS type)
 ```
 
-支持的目标类型：`INT`、`CHAR`/`TEXT`/`STRING`、`BOOL`、`REAL`/`DOUBLE`/`FLOAT`、`DECIMAL`/`NUMERIC`、`BLOB`/`BYTES`/`BINARY`（文本按 UTF-8 字节入库）。DECIMAL 的规范写法是 `CAST('123.45' AS DECIMAL)`；`DECIMAL(p,s)` 声明不做存储截断。
+支持的目标类型：`INT`、`CHAR`/`TEXT`/`STRING`、`BOOL`、`BIT`（T-SQL，映射 BOOL）、`REAL`/`DOUBLE`/`FLOAT`、`DECIMAL`/`NUMERIC`、`BLOB`/`BYTES`/`BINARY`（文本按 UTF-8 字节入库）。DECIMAL 的规范写法是 `CAST('123.45' AS DECIMAL)`；`DECIMAL(p,s)` 声明不做存储截断。其他目标类型（如 `DATE`/`DATETIME`/`NVARCHAR`）按**声明类型**处理，值保持不变（时间统一按文本约定）。
 
 ### 时间值
 
@@ -682,6 +682,7 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 |---|---|
 | `COUNT(*)` | 行数（无 WHERE/GROUP BY/ORDER/LIMIT 时走免解码计数） |
 | `COUNT(expr)` | 非 NULL 值个数 |
+| `COUNT_BIG` | T-SQL 兼容，语义同 `COUNT` |
 | `SUM` / `AVG` / `MIN` / `MAX` | 数值求和/均值/最小/最大；`SUM` 空集为 NULL |
 | `GROUP_CONCAT` / `STRING_AGG` | 文本拼接，可选分隔符 `STRING_AGG(v, ',')` |
 | `GROUPING(expr)` | 该表达式是否不在当前分组集合（1/0），仅 SELECT 列表可用 |
@@ -694,7 +695,7 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 |---|---|---|
 | 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`、`CONCAT(a, b, ...)` | 位置按字符计；TRIM 仅单参形式 |
 | 数值 | `ABS`、`ROUND(x [, digits])` | ROUND 对 DECIMAL 精确四舍五入（半离零），FLOAT 保持浮点 |
-| 空值/条件 | `COALESCE`/`IFNULL`、`NULLIF` | |
+| 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF` | |
 | 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`blob`/`array`/`object` |
 | JSON | `JSON_EXTRACT(doc, '$.a.b[0]')`、`JSON_TYPE(doc, path)`、`JSON_VALID(text)`、`JSON_ARRAY_CONTAINS(json_text, needle)` | 坏文本/缺路径返回 NULL（不中断扫描）；`JSON_ARRAY_CONTAINS` 非数组为 FALSE |
 | Oracle 兼容 | `NVL(a,b)`、`NVL2(a,b,c)`、`DECODE(expr, s1, r1, ..., [default])`、`INSTR(str, sub)`、`LPAD/RPAD(str, len [, pad])`、`GREATEST/LEAST(...)`、`TO_NUMBER(text)`、`TO_CHAR(v)`、`SYSDATE()` | `DECODE` 用全序匹配（`NULL = NULL` 命中）；`TO_NUMBER` 解析失败显式报错；`TO_CHAR` 不支持格式掩码 |
@@ -775,9 +776,24 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 
 `FROM DUAL`、`ROWNUM`、`FETCH FIRST/NEXT n ROWS ONLY`、`MINUS`、`NVL/NVL2/DECODE/INSTR/LPAD/RPAD/GREATEST/LEAST/TO_NUMBER/TO_CHAR/SYSDATE`、`ALL_*`/`USER_*` 字典视图、`MERGE` 与 `DECODE` 的 `NULL = NULL` 匹配语义。
 
-### SQL Server / EF 兼容面
+### T-SQL（SQL Server）兼容面
 
-`information_schema`、`sqlite_master`（EF schema 同步探测）、`x != TRUE` 命中 NULL/缺失字段（软删过滤）、`JSON_ARRAY_CONTAINS`（实体原始集合 Contains）、`SELECT TOP` 与 `FOR XML/JSON` 明确报错（不静默）。
+**已支持**：`COUNT_BIG`、`ISNULL`、`LEN`、`CAST(... AS BIT)`、`INFORMATION_SCHEMA.*`（大小写不敏感）、`sqlite_master`（大小写不敏感）、`UPDATE ... FROM`、`DELETE ... USING`、`MERGE`（受限）、`ORDER BY (SELECT 1)`（EF Core Skip/Take 形状）、`x != TRUE` 命中 NULL/缺失字段（软删过滤）、`JSON_ARRAY_CONTAINS`（实体原始集合 Contains）；`BIT`/`DATETIME2`/`NVARCHAR(MAX)` 等类型名按声明类型接受（值模型不变）。
+
+**显式报错**（不静默、不降级）：
+
+| 类别 | 语法 |
+|---|---|
+| SELECT | `TOP [n]`、`INTO`、`FOR XML/JSON`、`OPTION (...)`、`FOR SYSTEM_TIME` |
+| 运算符/变量 | `@@ROWCOUNT`/`@@VERSION` 等 `@@` 系统变量、`@param` 变量与 `SELECT @x = 1` 赋值、`N'...'` 字面量、`[bracket]` 标识符、`'a' + 'b'` 字符串加法（用 `\|\|`） |
+| FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`CROSS/OUTER APPLY`、`PIVOT`/`UNPIVOT`、表函数、`TABLESAMPLE` |
+| DML | `OUTPUT INSERTED/DELETED...`（用 `RETURNING`）、`MERGE ... OUTPUT`、`MERGE WHEN MATCHED THEN DELETE`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` 多表删除（用 `DELETE ... USING`） |
+| DDL | `#temp`/`##temp` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
+| 目录 | `sys.*`/`sysobjects`（报错并指向 `information_schema`/`sqlite_master`） |
+| 语句/过程 | `USE`、`SET`、`DECLARE`、`PRINT`、`EXEC`、`WAITFOR`、`IF`、`TRY/CATCH`、`DENY`、`CREATE PROCEDURE/TRIGGER/VIEW/SCHEMA/SEQUENCE` |
+| 函数 | `GETDATE`、`NEWID`、`DATEPART`、`DATEDIFF`、`CONVERT`/`TRY_CONVERT`、`IIF`、`CHARINDEX`、`REPLACE`、`LEFT`/`RIGHT`、`STRING_SPLIT`、`SERVERPROPERTY`、`OBJECT_ID`、`DB_NAME`、`HOST_NAME`、`SUSER_SNAME`、`SCOPE_IDENTITY` 等（均返回 `unknown function`） |
+
+窗口函数（`OVER`）、递归 CTE、`CROSS APPLY` 等结构性缺口见[不支持的语法](#不支持的语法)。
 
 ## 不支持的语法
 
@@ -793,6 +809,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
 | DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE VIEW`、`CREATE TRIGGER`、`ALTER TABLE` 的改约束/改类型 |
+| T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、`@` 变量/参数、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`N'...'`、`[方括号]` 标识符、`'a' + 'b'`（用 `\|\|`）、`CROSS/OUTER APPLY`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |
 

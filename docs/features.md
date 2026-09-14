@@ -120,7 +120,10 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 - 不支持(均显式报错,不静默吞掉):窗口函数(OVER)/`WINDOW`/`QUALIFY`、`DISTINCT ON`、
   相关子查询、`WITH RECURSIVE`、无 GROUP BY 的 HAVING、`NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`/`SELECT TOP`、
-  `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`。
+  `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`;
+  T-SQL 专有形式(变量 `@p`/`@@ROWCOUNT`、`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、
+  `IDENTITY(1,1)`、`CROSS/OUTER APPLY`、`sys.*`、`N'…'`、`[方括号]` 标识符)同样报错,
+  兼容别名 `COUNT_BIG`/`ISNULL`/`CAST(... AS BIT)` 与 `INFORMATION_SCHEMA`(大小写不敏感)已支持。
 
 ### 3.4 函数
 

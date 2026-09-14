@@ -712,10 +712,13 @@ impl<'a> ReadCx<'a> {
             name,
             alias,
             args,
+            with_hints,
             version,
+            with_ordinality,
             partitions,
+            json_path,
             sample,
-            ..
+            index_hints,
         } = tf
         else {
             // Derived table: FROM (SELECT ...) AS alias
@@ -756,7 +759,7 @@ impl<'a> ReadCx<'a> {
             return err("unsupported FROM item (expected a table, derived table or VALUES)");
         };
         if args.is_some() {
-            return err("table functions in FROM are not supported");
+            return err("table functions or FROM hints are not supported");
         }
         if sample.is_some() {
             return err("TABLESAMPLE is not supported");
@@ -766,6 +769,25 @@ impl<'a> ReadCx<'a> {
         }
         if !partitions.is_empty() {
             return err("partition selection (PARTITION (...)) is not supported");
+        }
+        if !with_hints.is_empty() {
+            // MSSQL `WITH (NOLOCK)` and friends: reads are snapshot-isolated
+            // here; silently accepting locking hints would misstate them.
+            return err("table hints (WITH (...)) are not supported");
+        }
+        if !index_hints.is_empty() {
+            return err("index hints are not supported");
+        }
+        if *with_ordinality {
+            return err("WITH ORDINALITY is not supported");
+        }
+        if json_path.is_some() {
+            return err("JSON path table sources are not supported");
+        }
+        if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+            // Renaming a base table's columns is not implemented; ignoring
+            // the list would silently keep the original names.
+            return err("column aliases on a table alias are not supported");
         }
         let tname = obj_name(name);
         let alias = alias.as_ref().map(|a| a.name.value.clone());
@@ -787,7 +809,18 @@ impl<'a> ReadCx<'a> {
             })
             .collect::<Vec<_>>()
             .join(".");
-        if qualified == "sqlite_master" || qualified == "sqlite_temporal_master" {
+        // SQL Server-style catalog names: explicit guidance instead of the
+        // confusing "table <last part> does not exist".
+        let qualified_lower = qualified.to_ascii_lowercase();
+        if qualified_lower.starts_with("sys.") || qualified_lower == "sysobjects" {
+            return err(
+                "SQL Server catalog views (sys.*/sysobjects) are not supported \
+                 (use information_schema or sqlite_master)",
+            );
+        }
+        if qualified.eq_ignore_ascii_case("sqlite_master")
+            || qualified.eq_ignore_ascii_case("sqlite_temporal_master")
+        {
             // SQLite-dialect compatibility view (EF Core probes it to learn
             // which tables exist). Index rows let clients enumerate CREATE
             // INDEX definitions for schema sync.
@@ -823,8 +856,10 @@ impl<'a> ReadCx<'a> {
             }
             return Ok(("sqlite_master".into(), alias, docs));
         }
-        if qualified == "information_schema.tables" || qualified == "information_schema.columns" {
-            let docs = self.information_schema(&qualified);
+        if qualified.eq_ignore_ascii_case("information_schema.tables")
+            || qualified.eq_ignore_ascii_case("information_schema.columns")
+        {
+            let docs = self.information_schema(&qualified_lower);
             return Ok(("information_schema".into(), alias, docs));
         }
         // Oracle data-dictionary compatibility views (case-insensitive):
@@ -1278,7 +1313,7 @@ impl<'a> ReadCx<'a> {
 
     fn exec_select(
         &self,
-        query: Query,
+        mut query: Query,
         mut select: sqlparser::ast::Select,
         ctes: &Ctes,
     ) -> Result<ExecOutcome> {
@@ -1287,6 +1322,15 @@ impl<'a> ReadCx<'a> {
         // expression evaluator never sees them.
         if let Some(sel) = &mut select.selection {
             self.subst_expr(sel)?;
+        }
+        // ORDER BY expressions too: EF Core emits `ORDER BY (SELECT 1)` for
+        // Skip/Take without an explicit ordering key.
+        if let Some(ob) = &mut query.order_by {
+            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut ob.kind {
+                for o in exprs.iter_mut() {
+                    self.subst_expr(&mut o.expr)?;
+                }
+            }
         }
         for item in &mut select.projection {
             self.subst_item(item)?;
@@ -4019,21 +4063,47 @@ impl Database {
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Insert(insert) => self.exec_insert(insert),
-            Statement::Update(sqlparser::ast::Update {
-                table,
-                assignments,
-                from,
-                selection,
-                returning,
-                ..
-            }) => self.exec_update(table, assignments, from, selection, returning),
-            Statement::Delete(sqlparser::ast::Delete {
-                from,
-                using,
-                selection,
-                returning,
-                ..
-            }) => self.exec_delete(from, using, selection, returning),
+            Statement::Update(update) => {
+                if update.output.is_some() {
+                    return err("OUTPUT is not supported (use RETURNING)");
+                }
+                if update.or.is_some() {
+                    return err("UPDATE OR ... is not supported");
+                }
+                if !update.order_by.is_empty() || update.limit.is_some() {
+                    return err("UPDATE ... ORDER BY/LIMIT is not supported");
+                }
+                let sqlparser::ast::Update {
+                    table,
+                    assignments,
+                    from,
+                    selection,
+                    returning,
+                    ..
+                } = update;
+                self.exec_update(table, assignments, from, selection, returning)
+            }
+            Statement::Delete(delete) => {
+                if delete.output.is_some() {
+                    return err("OUTPUT is not supported (use RETURNING)");
+                }
+                if !delete.order_by.is_empty() || delete.limit.is_some() {
+                    return err("DELETE ... ORDER BY/LIMIT is not supported");
+                }
+                if !delete.tables.is_empty() {
+                    return err(
+                        "DELETE target lists are not supported (use DELETE FROM ... USING ...)",
+                    );
+                }
+                let sqlparser::ast::Delete {
+                    from,
+                    using,
+                    selection,
+                    returning,
+                    ..
+                } = delete;
+                self.exec_delete(from, using, selection, returning)
+            }
             Statement::AlterTable(alter) => self.exec_alter(alter),
             Statement::StartTransaction { .. } => {
                 if self.tx_snapshot.is_some() {
@@ -4067,7 +4137,12 @@ impl Database {
             Statement::Savepoint { name } => self.savepoint(&name.value),
             Statement::ReleaseSavepoint { name } => self.release_savepoint(&name.value),
             Statement::CreateIndex(idx) => self.exec_create_index(idx),
-            Statement::Merge(m) => self.exec_merge(m.clone()),
+            Statement::Merge(m) => {
+                if m.output.is_some() {
+                    return err("MERGE OUTPUT is not supported (use RETURNING on the statements)");
+                }
+                self.exec_merge(m.clone())
+            }
             Statement::Query(q) => self.exec_query_cx(*q),
             Statement::Truncate(tr) => {
                 // Empty the tables; shape (columns/constraints) is kept.
@@ -4717,6 +4792,27 @@ impl Database {
     }
 
     fn exec_create_index(&mut self, idx: sqlparser::ast::CreateIndex) -> Result<ExecOutcome> {
+        // Clause-level guard: every index option the engine cannot honor must
+        // be refused, not dropped (a filtered/INCLUDE index silently becomes
+        // a different index).
+        if !idx.include.is_empty() {
+            return err("CREATE INDEX INCLUDE is not supported");
+        }
+        if idx.predicate.is_some() {
+            return err("partial indexes (CREATE INDEX ... WHERE) are not supported");
+        }
+        if idx.using.is_some() {
+            return err("index types (USING ...) are not supported");
+        }
+        if idx.nulls_distinct.is_some() {
+            return err("NULLS [NOT] DISTINCT is not supported");
+        }
+        if idx.concurrently {
+            return err("CREATE INDEX CONCURRENTLY is not supported");
+        }
+        if !idx.with.is_empty() || !idx.index_options.is_empty() {
+            return err("index storage options are not supported");
+        }
         let table = obj_name(&idx.table_name);
         let iname = idx
             .name
@@ -5149,6 +5245,11 @@ impl Database {
     fn exec_create(&mut self, create: sqlparser::ast::CreateTable) -> Result<ExecOutcome> {
         use sqlparser::ast::ColumnOption as CO;
         let name = obj_name(&create.name);
+        if name.starts_with('#') {
+            // T-SQL temp tables are session-scoped; making them persistent
+            // global tables would silently change their lifetime/visibility.
+            return err("temp tables (#name/##name) are not supported");
+        }
         if crate::useradmin::is_user_table(&name) && !self.internal_ddl {
             return err(format!(
                 "table name {name} is reserved for the user/role subsystem"
@@ -5323,6 +5424,9 @@ impl Database {
     }
 
     fn exec_insert(&mut self, insert: sqlparser::ast::Insert) -> Result<ExecOutcome> {
+        if insert.output.is_some() {
+            return err("OUTPUT is not supported (use RETURNING)");
+        }
         let TableObject::TableName(name) = &insert.table else {
             return err("unsupported INSERT target");
         };
@@ -5806,7 +5910,8 @@ impl Database {
                         return err("duplicate WHEN MATCHED clause");
                     }
                     let MergeAction::Update(upd) = &cl.action else {
-                        return err("WHEN MATCHED THEN INSERT is not supported");
+                        return err("WHEN MATCHED supports only UPDATE \
+                             (DELETE/other actions are not supported)");
                     };
                     if upd.update_predicate.is_some() || upd.delete_predicate.is_some() {
                         return err("MERGE UPDATE WHERE/DELETE WHERE is not supported");
@@ -6182,7 +6287,8 @@ fn agg_parts(
         return err(format!("unsupported aggregate arguments: {fname}"));
     };
     let op = match fname.as_str() {
-        "COUNT" => AggOp::Count,
+        // COUNT_BIG is T-SQL's COUNT returning bigint; same semantics here.
+        "COUNT" | "COUNT_BIG" => AggOp::Count,
         "SUM" => AggOp::Sum,
         "AVG" => AggOp::Avg,
         "MIN" => AggOp::Min,
@@ -7030,7 +7136,7 @@ fn is_agg_fn(f: &sqlparser::ast::Function) -> bool {
     !f.over.is_some()
         && matches!(
             f.name.to_string().to_uppercase().as_str(),
-            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
+            "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
         )
 }
 
@@ -7693,7 +7799,27 @@ fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
 /// Evaluate an expression against a document row.
 pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
     match e {
+        // T-SQL variables/parameters (`@p`, `@@ROWCOUNT`) read a document
+        // field by that name today, i.e. silently NULL unless the document
+        // happens to carry it. Bare (unquoted) forms are almost always a
+        // variable: refuse and point at binding/quoted field access.
+        SqlExpr::Identifier(i) if i.quote_style.is_none() && i.value.starts_with('@') => err(
+            format!(
+                "variables/parameters ({0}) are not supported; bind the value or quote the field name (\"{0}\")",
+                i.value
+            ),
+        ),
         SqlExpr::Identifier(i) => lookup_col(doc, &i.value),
+        SqlExpr::CompoundIdentifier(parts)
+            if parts
+                .first()
+                .is_some_and(|p| p.quote_style.is_none() && p.value.starts_with('@')) =>
+        {
+            err(format!(
+                "variables/parameters ({}) are not supported; bind the value or quote the field name",
+                parts.first().map(|p| p.value.as_str()).unwrap_or("@")
+            ))
+        }
         SqlExpr::CompoundIdentifier(parts) => {
             let full = parts
                 .iter()
@@ -8174,6 +8300,15 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
     let t = type_name.to_uppercase();
     Ok(match v {
         Value::Null => Value::Null,
+        // T-SQL BIT is the boolean-ish column type.
+        v if t == "BIT" => match v {
+            Value::Bool(_) => v,
+            Value::Int(i) => Value::Bool(i != 0),
+            Value::Float(f) => Value::Bool(f != 0.0),
+            Value::Decimal(d) => Value::Bool(!d.is_zero()),
+            Value::Str(s) => Value::Bool(s == "1" || s.eq_ignore_ascii_case("true")),
+            other => other,
+        },
         v if t.contains("INT") => match v {
             Value::Int(_) => v,
             Value::Float(f) => Value::Int(f as i64),
@@ -8312,7 +8447,7 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Float((x * m).round() / m)
             }
         }
-        "COALESCE" | "IFNULL" => {
+        "COALESCE" | "IFNULL" | "ISNULL" => {
             if args.is_empty() {
                 return err(format!("function {name} requires at least 1 argument"));
             }
@@ -8752,10 +8887,10 @@ impl Ord for OrderKeyed<'_> {
 /// their rows up in `tables`; keep this list in sync with that resolver.
 fn is_compat_view(name: &str) -> bool {
     if name.eq_ignore_ascii_case("DUAL")
-        || name == "sqlite_master"
-        || name == "sqlite_temporal_master"
-        || name == "information_schema.tables"
-        || name == "information_schema.columns"
+        || name.eq_ignore_ascii_case("sqlite_master")
+        || name.eq_ignore_ascii_case("sqlite_temporal_master")
+        || name.eq_ignore_ascii_case("information_schema.tables")
+        || name.eq_ignore_ascii_case("information_schema.columns")
     {
         return true;
     }
@@ -13030,6 +13165,68 @@ mod tests {
             rows(&mut db, "SELECT COUNT(*) FROM ok").rows,
             vec![vec![Value::Int(1)]]
         );
+    }
+
+    #[test]
+    fn tsql_aliases_and_silent_forms() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT, b INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10, 20), (2, 30, NULL)");
+        // T-SQL aliases that map exactly onto existing behavior.
+        let r = rows(&mut db, "SELECT COUNT_BIG(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        let r = rows(&mut db, "SELECT ISNULL(b, -1) FROM t ORDER BY id");
+        assert_eq!(r.rows, vec![vec![Value::Int(20)], vec![Value::Int(-1)]]);
+        // T-SQL BIT target maps to BOOL.
+        let r = rows(&mut db, "SELECT CAST(1 AS BIT), CAST(0 AS BIT)");
+        assert_eq!(r.rows, vec![vec![Value::Bool(true), Value::Bool(false)]]);
+        // EF Core's Skip/Take-without-order shape now substitutes the
+        // subquery instead of failing the correlated check.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t ORDER BY (SELECT 1) LIMIT 1 OFFSET 1",
+        );
+        assert_eq!(r.rows.len(), 1);
+        // Uppercase catalog view names resolve like their lowercase forms.
+        let r = rows(&mut db, "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS");
+        assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
+        // Forms that used to be silently ignored now refuse loudly.
+        for (sql, want) in [
+            ("SELECT @@ROWCOUNT", "variables/parameters"),
+            ("SELECT @@VERSION", "variables/parameters"),
+            ("SELECT @x = 1", "variables/parameters"),
+            ("SELECT * FROM t WITH (NOLOCK)", "table hints"),
+            ("SELECT * FROM t AS x (a, b)", "column aliases"),
+            ("SELECT * FROM t OPTION (RECOMPILE)", "column aliases"),
+            ("SELECT * FROM t (NOLOCK)", "table functions or FROM hints"),
+            ("INSERT INTO t VALUES (3, 1, 1) OUTPUT INSERTED.*", "OUTPUT"),
+            (
+                "UPDATE t SET v = 1 OUTPUT INSERTED.* WHERE id = 1",
+                "OUTPUT",
+            ),
+            ("DELETE FROM t OUTPUT DELETED.* WHERE id = 2", "OUTPUT"),
+            (
+                "MERGE INTO t USING t AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = s.v OUTPUT $action",
+                "MERGE OUTPUT",
+            ),
+            ("CREATE TABLE #temp (a INT)", "temp tables"),
+            ("CREATE INDEX ix_i ON t (v) INCLUDE (b)", "INCLUDE"),
+            ("CREATE INDEX ix_w ON t (v) WHERE v > 0", "partial indexes"),
+            ("SELECT * FROM sys.tables", "catalog views"),
+            ("SELECT * FROM sysobjects", "catalog views"),
+        ] {
+            let e = db.execute(sql).unwrap_err();
+            assert!(
+                e.to_string().contains(want),
+                "sql={sql} error={e} want={want}"
+            );
+        }
+        // MERGE DELETE is refused with an accurate message.
+        let e = db
+            .execute("MERGE INTO t USING t AS s ON t.id = s.id WHEN MATCHED THEN DELETE")
+            .unwrap_err();
+        assert!(e.to_string().contains("UPDATE"), "{e}");
     }
 
     #[test]
