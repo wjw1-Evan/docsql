@@ -84,6 +84,8 @@ services.AddDbContext<AppDb>(o => o.UseDocsql(connectionString));
   成员不参与 SQL 翻译(在 WHERE 里按键过滤仍在客户端侧不可用,请提取为独立列);
 - 异常分类:`DocsqlException.IsUniqueViolation`(唯一约束冲突,幂等写入/重复键语义)与
   `IsSyntaxError`(解析错误),不需要匹配错误文本;
+- 导航 `Any`/关系层的相关 EXISTS 子查询(引用外层行的子查询)会被引擎显式拒绝:迁移应用时
+  对导航条件、集合成员查询逐条审计,必要时改写为显式 JOIN + 引擎支持的形态;
 - `Database.Migrate()` 显式报错(Migrations 不支持)。
 
 ## Aspire 集成(Docsql.Aspire.Hosting / Docsql.Aspire.Client)
