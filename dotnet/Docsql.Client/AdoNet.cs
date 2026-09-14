@@ -615,14 +615,25 @@ public sealed class DocsqlCommand : DbCommand
         {
             return null;
         }
-        var v = reader.GetValue(0);
-        if (v is double or float or decimal)
+        return NarrowScalar(reader.GetValue(0));
+    }
+
+    /// <summary>标量窄化:整数值返回 long,小数保留原类型。
+    /// decimal 用自身比较判断整数性——先转 double 会让 17 位大数因精度丢失去整,
+    /// 静默截断金额;double/float 仍按各自的精确整数性处理(3.5、AVG 结果保持浮点)。</summary>
+    private static object? NarrowScalar(object? v)
+    {
+        if (v is decimal m)
         {
-            // Only narrow to long when the value is an exact integer;
-            // fractional doubles (3.5, AVG results) must keep their type.
-            // Comparing two roundings of the same value — the previous
-            // check — was always true and rounded 3.5 to 4.
-            var d = Convert.ToDouble(v);
+            if (m == decimal.Truncate(m) && m >= long.MinValue && m <= long.MaxValue)
+            {
+                return (long)m;
+            }
+            return v;
+        }
+        if (v is double or float)
+        {
+            var d = Convert.ToDouble(v, CultureInfo.InvariantCulture);
             if (Math.Floor(d) == d)
             {
                 try
@@ -742,27 +753,7 @@ public sealed class DocsqlCommand : DbCommand
         {
             return null;
         }
-        var v = reader.GetValue(0);
-        if (v is double or float or decimal)
-        {
-            // Only narrow to long when the value is an exact integer;
-            // fractional doubles (3.5, AVG results) must keep their type.
-            // Comparing two roundings of the same value — the previous
-            // check — was always true and rounded 3.5 to 4.
-            var d = Convert.ToDouble(v);
-            if (Math.Floor(d) == d)
-            {
-                try
-                {
-                    return Convert.ToInt64(d);
-                }
-                catch (OverflowException)
-                {
-                    // out-of-range doubles (1e300, SUM overflow) return as-is
-                }
-            }
-        }
-        return v;
+        return NarrowScalar(reader.GetValue(0));
     }
 
     /// Substitute @name parameters with `?` marks, returning the values in

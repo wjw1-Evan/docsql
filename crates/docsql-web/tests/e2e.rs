@@ -339,6 +339,45 @@ async fn sql_roundtrip_over_http() {
 }
 
 #[tokio::test]
+async fn typed_scalars_surface_dec_and_bytes_markers_over_http() {
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
+    // DECIMAL/BLOB responses carry the exact wire markers to JSON clients.
+    let r = sql(
+        &addr,
+        None,
+        "SELECT CAST('1.25' AS DECIMAL) AS d, x'00ff' AS b, \
+         TYPEOF(CAST('1.5' AS DECIMAL)) AS t",
+    )
+    .await;
+    assert_eq!(r["kind"], "rows", "{r}");
+    assert_eq!(r["rows"][0][0], json!({"$dec": "1.25"}));
+    assert_eq!(r["rows"][0][1], json!({"$bytes": [0, 255]}));
+    assert_eq!(r["rows"][0][2], "decimal");
+
+    // Stored decimals keep exact sums through the REST path.
+    assert_eq!(
+        sql(
+            &addr,
+            None,
+            "CREATE TABLE w (id INT PRIMARY KEY, m DECIMAL(18,4))"
+        )
+        .await["kind"],
+        "affected"
+    );
+    assert_eq!(
+        sql(
+            &addr,
+            None,
+            "INSERT INTO w VALUES (1, CAST('0.10' AS DECIMAL)), (2, CAST('0.20' AS DECIMAL))"
+        )
+        .await["kind"],
+        "affected"
+    );
+    let r = sql(&addr, None, "SELECT SUM(m) FROM w").await;
+    assert_eq!(r["rows"][0][0], json!({"$dec": "0.30"}));
+}
+
+#[tokio::test]
 async fn parse_endpoint_validates_without_executing() {
     let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     let ok = serde_json::to_string(&json!({"sql": "CREATE TABLE p (id INT)"})).unwrap();

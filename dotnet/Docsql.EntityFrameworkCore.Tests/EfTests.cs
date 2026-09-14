@@ -351,6 +351,77 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
     }
 
     [Fact]
+    public void Decimal_update_aggregate_nullable_and_contains_roundtrip()
+    {
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE IF EXISTS Ledgers";
+            cmd.ExecuteNonQuery();
+        }
+        using (var db = new LedgerDb(Cs))
+        {
+            db.Ledgers.Add(new Ledger { Amount = 10.05m, Extra = null });
+            db.Ledgers.Add(new Ledger { Amount = 10.10m, Extra = 0.01m });
+            db.SaveChanges();
+
+            // UPDATE 走参数化 $dec,精确回写。
+            var row = db.Ledgers.Single(l => l.Amount == 10.05m);
+            row.Amount = 10.50m;
+            db.SaveChanges();
+            Assert.Equal(10.50m, db.Ledgers.Single(l => l.Extra == null).Amount);
+
+            // Min/Max/Average/OrderBy 全部服务端十进制语义。
+            Assert.Equal(10.10m, db.Ledgers.Min(l => l.Amount));
+            Assert.Equal(10.50m, db.Ledgers.Max(l => l.Amount));
+            Assert.Equal(10.30m, db.Ledgers.Average(l => l.Amount));
+            var ordered = db.Ledgers.OrderBy(l => l.Amount).Select(l => l.Amount).ToList();
+            Assert.Equal(new[] { 10.10m, 10.50m }, ordered);
+
+            // 集合 Contains → IN,元素为 decimal 参数。
+            var wanted = new[] { 10.10m, 99.99m };
+            Assert.Single(db.Ledgers.Where(l => wanted.Contains(l.Amount)).ToList());
+            // 可空 decimal:NULL 行与有值行各自精确。
+            Assert.Equal(0.01m, db.Ledgers.Single(l => l.Extra != null).Extra);
+        }
+    }
+
+    [Fact]
+    public void Composite_unique_index_is_enforced()
+    {
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE IF EXISTS Zones";
+            cmd.ExecuteNonQuery();
+        }
+        using (var db = new UniqueZoneDb(Cs))
+        {
+            db.Zones.Add(new Zone { Sku = "A", Area = 1 });
+            db.SaveChanges();
+            // 复合唯一:同一 (Sku, Area) 组合被引擎拒绝。
+            var dup = new Zone { Sku = "A", Area = 1 };
+            db.Zones.Add(dup);
+            Assert.ThrowsAny<Exception>(() => db.SaveChanges());
+            // 失败实体仍是 Added:先退跟踪再加合法组合(EF 失败后不自动清理)。
+            db.Entry(dup).State = EntityState.Detached;
+            db.Zones.Add(new Zone { Sku = "A", Area = 2 });
+            db.SaveChanges();
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'IX_Zones_Sku_Area'";
+            var ddl = Assert.IsType<string>(cmd.ExecuteScalar());
+            Assert.Contains("UNIQUE", ddl);
+            Assert.Contains("Sku", ddl);
+            Assert.Contains("Area", ddl);
+        }
+    }
+
+    [Fact]
     public void DateOnly_and_TimeOnly_roundtrip_and_compare_server_side()
     {
         using var conn = new DocsqlConnection(Cs);
@@ -372,6 +443,18 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
             var row = db.Schedules.Single(s => s.Day == new DateOnly(2024, 3, 15));
             Assert.Equal(new DateOnly(2024, 3, 15), row.Day);
             Assert.Equal(new TimeOnly(13, 45, 30, 250), row.At);
+            // 可空 DateOnly/TimeOnly 的 NULL 与有值各自往返
+            Assert.Null(row.EndDay);
+            Assert.Null(row.EndAt);
+            row.EndDay = new DateOnly(2024, 4, 1);
+            row.EndAt = new TimeOnly(9, 0);
+            db.SaveChanges();
+            Assert.Equal(
+                new DateOnly(2024, 4, 1),
+                db.Schedules.Single(s => s.Id == row.Id).EndDay);
+            Assert.Equal(
+                new TimeOnly(9, 0),
+                db.Schedules.Single(s => s.Id == row.Id).EndAt);
             // 范围比较在服务端按可排序 ISO 文本执行
             Assert.Single(db.Schedules.Where(s => s.Day >= new DateOnly(2024, 3, 1)).ToList());
             Assert.Empty(db.Schedules.Where(s => s.Day < new DateOnly(2024, 1, 1)).ToList());
@@ -390,13 +473,23 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
         }
         using (var db = new AssetDb(Cs))
         {
+            var big = new byte[64 * 1024 + 7];
+            new Random(3).NextBytes(big);
             db.Assets.Add(new Asset { Name = "logo", Data = new byte[] { 1, 2, 255 } });
             db.Assets.Add(new Asset { Name = "empty", Data = Array.Empty<byte>() });
+            db.Assets.Add(new Asset { Name = "big", Data = big });
             db.SaveChanges();
 
             var row = db.Assets.Single(a => a.Name == "logo");
             Assert.Equal(new byte[] { 1, 2, 255 }, row.Data);
             Assert.Empty(db.Assets.Single(a => a.Name == "empty").Data);
+            Assert.Equal(big, db.Assets.Single(a => a.Name == "big").Data);
+
+            // UPDATE 二进制列走 $bytes 参数,精确回写。
+            row.Data = new byte[] { 9, 8, 7 };
+            db.SaveChanges();
+            Assert.Equal(
+                new byte[] { 9, 8, 7 }, db.Assets.Single(a => a.Name == "logo").Data);
         }
     }
 
@@ -482,6 +575,7 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
     {
         public int Id { get; set; }
         public decimal Amount { get; set; }
+        public decimal? Extra { get; set; }
     }
 
     public class LedgerDb : DbContext
@@ -494,11 +588,30 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
         protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
     }
 
+    public class Zone
+    {
+        public int Id { get; set; }
+        public string Sku { get; set; } = "";
+        public int Area { get; set; }
+    }
+
+    public class UniqueZoneDb : DbContext
+    {
+        private readonly string _cs;
+        public UniqueZoneDb(string cs) => _cs = cs;
+        public DbSet<Zone> Zones => Set<Zone>();
+        protected override void OnModelCreating(ModelBuilder b) =>
+            b.Entity<Zone>().HasIndex(z => new { z.Sku, z.Area }).IsUnique();
+        protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
+    }
+
     public class Schedule
     {
         public int Id { get; set; }
         public DateOnly Day { get; set; }
         public TimeOnly At { get; set; }
+        public DateOnly? EndDay { get; set; }
+        public TimeOnly? EndAt { get; set; }
     }
 
     public class ScheduleDb : DbContext

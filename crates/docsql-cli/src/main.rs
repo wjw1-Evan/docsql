@@ -874,6 +874,25 @@ mod tests {
     }
 
     #[test]
+    fn render_typed_scalars_in_table_and_json() {
+        let r = QueryResult {
+            columns: vec!["m".into(), "b".into()],
+            rows: vec![vec![
+                Value::Decimal("1234.50".parse().unwrap()),
+                Value::Bytes(vec![0xde, 0xad]),
+            ]],
+        };
+        // 表格:十进制精确文本、BLOB 十六进制文本。
+        let out = render_rows(&r);
+        assert!(out.contains("1234.50"), "{out}");
+        assert!(out.contains("x'dead'"), "{out}");
+        // JSON 导出保持无损标记。
+        let json = render_json(&r);
+        assert!(json.contains(r#""m":{"$dec":"1234.50"}"#), "{json}");
+        assert!(json.contains(r#""b":{"$bytes":[222,173]}"#), "{json}");
+    }
+
+    #[test]
     fn pubsub_command_parsing() {
         match parse_pubsub_command("subscribe news earliest;") {
             Some(PubsubCmd::Subscribe {

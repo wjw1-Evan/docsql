@@ -246,6 +246,19 @@ mod tests {
     }
 
     #[test]
+    fn decimal_scale_is_part_of_the_encoding() {
+        // Same numeric value, different scale: distinct byte keys (DISTINCT/
+        // GROUP BY semantics documented in value.rs), text preserved.
+        let a = encode_to_vec(&Value::Decimal("1.5".parse().unwrap())).unwrap();
+        let b = encode_to_vec(&Value::Decimal("1.50".parse().unwrap())).unwrap();
+        assert_ne!(a, b);
+        match decode(&b).unwrap() {
+            Value::Decimal(d) => assert_eq!(d.to_string(), "1.50"),
+            other => panic!("expected decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn roundtrip_nested() {
         let doc = Value::Object(Object::from([
             ("_id".into(), Value::Int(1)),

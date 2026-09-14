@@ -4840,14 +4840,33 @@ mod security_tests {
         );
         let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":[0,255]}"#).unwrap();
         assert_eq!(json_param_to_value(&p), Value::Bytes(vec![0, 255]));
+        let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":[]}"#).unwrap();
+        assert_eq!(json_param_to_value(&p), Value::Bytes(vec![]));
         // Malformed markers degrade to text instead of corrupting data.
         let p: serde_json::Value = serde_json::from_str(r#"{"$dec":"nope"}"#).unwrap();
         assert!(matches!(json_param_to_value(&p), Value::Str(_)));
         let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":[256]}"#).unwrap();
         assert!(matches!(json_param_to_value(&p), Value::Str(_)));
+        let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":"not-an-array"}"#).unwrap();
+        assert!(matches!(json_param_to_value(&p), Value::Str(_)));
         // Ordinary objects stay text (render_param quotes them).
         let p: serde_json::Value = serde_json::from_str(r#"{"k":1}"#).unwrap();
         assert_eq!(json_param_to_value(&p), Value::Str(r#"{"k":1}"#.into()));
+    }
+
+    #[test]
+    fn marker_payloads_cannot_escape_the_binding_literal() {
+        // A hostile "$dec" payload that fails decimal parsing must fall back
+        // to a quoted text literal, never raw SQL.
+        let p: serde_json::Value =
+            serde_json::from_str(r#"{"$dec":"1'; DROP TABLE t; --"}"#).unwrap();
+        let v = json_param_to_value(&p);
+        assert!(matches!(v, Value::Str(_)));
+        let rendered = bind_params("SELECT ?", &[v]).unwrap();
+        assert_eq!(rendered, r#"SELECT '{"$dec":"1''; DROP TABLE t; --"}'"#);
+        // Nested arrays in "$bytes" are rejected (integer elements only).
+        let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":[[]]}"#).unwrap();
+        assert!(matches!(json_param_to_value(&p), Value::Str(_)));
     }
 
     #[test]

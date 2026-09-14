@@ -4431,6 +4431,135 @@ async fn server_side_prepared_statements_bind_safely() {
     );
 }
 
+/// Typed wire scalars end to end: `$dec`/`$bytes` params bind into DECIMAL/
+/// BLOB engine values, and RESP_ROWS carries the exact markers back.
+#[tokio::test]
+async fn typed_scalar_params_and_markers_roundtrip_over_the_wire() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE typed (id INT PRIMARY KEY, m DECIMAL(28,10), b BLOB)")
+        .await;
+
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("INSERT INTO typed VALUES (?, ?, ?)").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_PREPARED, "{}", payload_str(&f));
+    let h = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["handle"]
+        .as_u64()
+        .unwrap();
+
+    // Exact 28-digit decimal + byte blob through the marker payloads.
+    let params = r#"[1, {"$dec":"12345678901234567.8901234567"}, {"$bytes":[0,255,16]}]"#;
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":{params}}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+
+    let f = c.sql("SELECT m, b FROM typed").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    let body: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+    assert_eq!(
+        body["rows"][0][0],
+        serde_json::json!({"$dec": "12345678901234567.8901234567"}),
+        "{body}"
+    );
+    assert_eq!(
+        body["rows"][0][1],
+        serde_json::json!({"$bytes": [0, 255, 16]}),
+        "{body}"
+    );
+    let f = c.sql("SELECT SUM(m) FROM typed").await;
+    let body: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+    assert_eq!(
+        body["rows"][0][0],
+        serde_json::json!({"$dec": "12345678901234567.8901234567"}),
+        "{body}"
+    );
+
+    // Exact decimal comparison over the bound parameter, not a float match.
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("SELECT id FROM typed WHERE m = ?").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    let h = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["handle"]
+        .as_u64()
+        .unwrap();
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":[{{"$dec":"12345678901234567.8901234567"}}]}}"#)
+            .into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains(r#""rows":[[1]]"#),
+        "{}",
+        payload_str(&f)
+    );
+    // A float-inexact decimal (0.1 + 0.2) still matches its exact sum.
+    c.sql(
+        "INSERT INTO typed VALUES (2, CAST('0.10' AS DECIMAL), x''), \
+         (3, CAST('0.20' AS DECIMAL), x'')",
+    )
+    .await;
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("SELECT id FROM typed WHERE m + ? = CAST('0.30' AS DECIMAL)").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    let h = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["handle"]
+        .as_u64()
+        .unwrap();
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":[{{"$dec":"0.20"}}]}}"#).into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains(r#""rows":[[2]]"#),
+        "{}",
+        payload_str(&f)
+    );
+
+    // Malformed markers fall back to text (escaped literal), never raw SQL.
+    c.send(&Frame::new(
+        proto::REQ_PREPARE,
+        proto::encode_sql("SELECT id FROM typed WHERE m = ?").unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    let h = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["handle"]
+        .as_u64()
+        .unwrap();
+    c.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        format!(r#"{{"handle":{h},"params":[{{"$dec":"1.0'; DROP TABLE typed; --"}}]}}"#)
+            .into_bytes(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains(r#""rows":[]"#),
+        "{}",
+        payload_str(&f)
+    );
+    let f = c.sql("SELECT COUNT(*) FROM typed").await;
+    assert!(payload_str(&f).contains('3'), "{}", payload_str(&f));
+}
+
 /// Malformed pub/sub frames answer RESP_ERROR on a dedicated connection
 /// (bad JSON, missing fields, empty/oversize channel, unknown subcommand)
 /// instead of closing it or wedging a subscription.

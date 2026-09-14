@@ -229,6 +229,88 @@ public sealed class ClientSurfaceTests : IClassFixture<ServerFixture>
             Assert.Equal(new DateOnly(2024, 3, 15), r.GetFieldValue<DateOnly>(0));
             Assert.Equal(new TimeOnly(13, 45, 30, 250), r.GetFieldValue<TimeOnly>(1));
         }
+        using (var cmd = conn.CreateCommand())
+        {
+            // 标量路径同样是 decimal,不再窄化成 double。
+            cmd.CommandText = "SELECT @m";
+            ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("m", 10.55m);
+            var scalar = cmd.ExecuteScalar();
+            Assert.IsType<decimal>(scalar);
+            Assert.Equal(10.55m, (decimal)scalar!);
+        }
+    }
+
+    [Fact]
+    public void Typed_columns_roundtrip_and_sum_stays_exact_on_the_server()
+    {
+        using var conn = Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText =
+                "CREATE TABLE IF NOT EXISTS csurf_typed (id INT, m DECIMAL(28,10), b BLOB, d TEXT, t TEXT)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "DELETE FROM csurf_typed";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "INSERT INTO csurf_typed VALUES (@id, @m, @b, @d, @t)";
+            var p = (DocsqlParameterCollection)cmd.Parameters;
+            p.AddWithValue("id", 1);
+            p.AddWithValue("m", 12345678901234567.8901234567m);
+            p.AddWithValue("b", new byte[] { 0, 1, 254, 255 });
+            p.AddWithValue("d", new DateOnly(2025, 12, 31));
+            p.AddWithValue("t", new TimeOnly(23, 59, 59, 999));
+            Assert.Equal(1, cmd.ExecuteNonQuery());
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT m, b, d, t FROM csurf_typed WHERE id = 1";
+            using var r = cmd.ExecuteReader();
+            Assert.True(r.Read());
+            Assert.Equal(12345678901234567.8901234567m, r.GetDecimal(0));
+            Assert.Equal(new byte[] { 0, 1, 254, 255 }, r.GetFieldValue<byte[]>(1));
+            Assert.Equal(new DateOnly(2025, 12, 31), r.GetFieldValue<DateOnly>(2));
+            Assert.Equal(new TimeOnly(23, 59, 59, 999), r.GetFieldValue<TimeOnly>(3));
+            // GetBytes 契约:空缓冲返回总长,偏移复制按字节切片。
+            Assert.Equal(4L, r.GetBytes(1, 0, null, 0, 0));
+            var buf = new byte[2];
+            Assert.Equal(2L, r.GetBytes(1, 1, buf, 0, 2));
+            Assert.Equal(new byte[] { 1, 254 }, buf);
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            // 服务端 SUM 走十进制语义:响应 $dec 标记原样解码;
+            // 17 位大数不得被 ExecuteScalar 误窄化为 long(回归)。
+            cmd.CommandText = "SELECT SUM(m) FROM csurf_typed";
+            var scalar = cmd.ExecuteScalar();
+            Assert.IsType<decimal>(scalar);
+            Assert.Equal(12345678901234567.8901234567m, (decimal)scalar!);
+        }
+    }
+
+    [Fact]
+    public void Large_blob_roundtrips()
+    {
+        var data = new byte[200_000];
+        new Random(7).NextBytes(data);
+        using var conn = Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS csurf_blob (id INT, b BLOB)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "DELETE FROM csurf_blob";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "INSERT INTO csurf_blob VALUES (1, @b)";
+            ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("b", data);
+            Assert.Equal(1, cmd.ExecuteNonQuery());
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT b FROM csurf_blob WHERE id = 1";
+            var read = (byte[])cmd.ExecuteScalar()!;
+            Assert.Equal(data, read);
+        }
     }
 
     private object? ScalarWithParam(string sql, object value)

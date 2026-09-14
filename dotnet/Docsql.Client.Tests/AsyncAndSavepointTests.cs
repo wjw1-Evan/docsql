@@ -74,6 +74,38 @@ public sealed class AsyncClientTests : IClassFixture<ServerFixture>
     }
 
     [Fact]
+    public async Task Async_scalar_keeps_large_decimals_exact()
+    {
+        // 回归:decimal 窄化不得先转 double(17 位大数会被误判为整数截断)。
+        using var conn = new DocsqlConnection($"host=127.0.0.1;port={_fx.Port}");
+        await conn.OpenAsync();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        cmd.CommandText = "SELECT @m";
+        cmd.Parameters.AddWithValue("m", 12345678901234567.8901234567m);
+        var v = await cmd.ExecuteScalarAsync();
+        Assert.IsType<decimal>(v);
+        Assert.Equal(12345678901234567.8901234567m, (decimal)v!);
+    }
+
+    [Fact]
+    public async Task Async_reader_decodes_typed_markers()
+    {
+        // 异步读取路径($dec/$bytes 标记 + GetFieldValueAsync 默认桥接)。
+        using var conn = new DocsqlConnection($"host=127.0.0.1;port={_fx.Port}");
+        await conn.OpenAsync();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        cmd.CommandText = "SELECT @m, @b, @d";
+        cmd.Parameters.AddWithValue("m", 0.30m);
+        cmd.Parameters.AddWithValue("b", new byte[] { 7, 8 });
+        cmd.Parameters.AddWithValue("d", new DateOnly(2024, 2, 29));
+        using var r = await cmd.ExecuteReaderAsync();
+        Assert.True(await r.ReadAsync());
+        Assert.Equal(0.30m, await r.GetFieldValueAsync<decimal>(0));
+        Assert.Equal(new byte[] { 7, 8 }, await r.GetFieldValueAsync<byte[]>(1));
+        Assert.Equal(new DateOnly(2024, 2, 29), await r.GetFieldValueAsync<DateOnly>(2));
+    }
+
+    [Fact]
     public async Task Async_transaction_commit_and_rollback()
     {
         using var conn = new DocsqlConnection($"host=127.0.0.1;port={_fx.Port}");

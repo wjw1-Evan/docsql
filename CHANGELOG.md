@@ -36,6 +36,23 @@
 - `docs/limitations.md`、`sql-reference.md`、`drivers.md` 与 README 能力表同步(DECIMAL/
   BLOB 从"已知边界/路线"移入已具备;`INSERT … SELECT` 本已支持,文档补记)。
 
+#### 修复
+
+- `ADO.NET ExecuteScalar` 对 decimal 先转 double 再判断整数性,17 位大数(
+  如 `SUM(金额)`)会因精度丢失被误判为整数并静默截断为 long;改为 decimal 自身
+  精确判断整数性(同步/异步两路径),`double`/`float` 行为不变。
+
+#### 测试
+
+- 补齐 DECIMAL/BLOB 全链路测试:精确 CAST 矩阵与一元负号(常量/行/聚合三条求值路径)、
+  除零/取模/溢出语义、MIN/MAX/AVG/SUM(DISTINCT)、GROUP BY 编码判重与 scale 别名、
+  UNIQUE/复合索引/UPDATE 索引位移、跨列 JOIN、INSERT … SELECT 与 auto-GUID 回写重放、
+  JSON_TYPE/TO_CHAR 文本、x'hex' 畸形拒绝;服务端 REQ_EXECUTE `$dec`/`$bytes` 线协议
+  往返与注入回退;Web `/api/sql` 标记透出;CLI 表格/JSON 渲染;客户端表级往返、
+  GetBytes 偏移契约、200KB BLOB、异步标记解码;EF 更新/聚合/可空 decimal/Contains、
+  复合唯一索引、64KB BLOB 与 DateOnly/TimeOnly 可空往返。workspace 567 用例,
+  覆盖率 92.2%/88.2%。
+
 ## [0.2.0] - 2026-09-14
 
 ### 发布与文档:0.2.0(NuGet 四包 + Aspire 安装使用)(2026-09-14)

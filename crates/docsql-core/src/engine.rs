@@ -6720,6 +6720,7 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
                     Ok(Value::Int(i.wrapping_neg()))
                 }
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
                 _ => err("unsupported unary operand"),
             }
         }
@@ -6828,6 +6829,7 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                     None => Ok(Value::Float(-(i as f64))),
                 },
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
                 _ => err("unsupported unary operand"),
@@ -8267,6 +8269,7 @@ fn eval_group_expr(
                     None => Ok(Value::Float(-(i as f64))),
                 },
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
                 _ => err("unsupported unary operand"),
@@ -15410,6 +15413,388 @@ mod complex_query_tests {
             Value::Int(2)
         );
         assert!(db.execute("SELECT x'abc'").is_err());
+    }
+
+    #[test]
+    fn decimal_cast_unary_edges_and_text() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE parts (id INT PRIMARY KEY, amount DECIMAL(18,4), neg DECIMAL(18,4))",
+        );
+        // eval_const path: unary minus on a decimal CAST in VALUES.
+        run(
+            &mut db,
+            "INSERT INTO parts VALUES (1, CAST('1.25' AS DECIMAL), -CAST('2.50' AS DECIMAL))",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT amount, neg FROM parts").rows[0],
+            vec![
+                Value::Decimal("1.25".parse().unwrap()),
+                Value::Decimal("-2.50".parse().unwrap())
+            ]
+        );
+        // eval_expr path: unary over a column.
+        assert_eq!(
+            rows(&mut db, "SELECT -amount FROM parts WHERE id = 1").rows[0][0],
+            Value::Decimal("-1.25".parse().unwrap())
+        );
+        // eval_group_expr path: unary over an aggregate.
+        assert_eq!(
+            rows(&mut db, "SELECT -SUM(amount) FROM parts").rows[0][0],
+            Value::Decimal("-1.25".parse().unwrap())
+        );
+        // CAST matrix: int/float/text sources, precision spec, chains, bool.
+        assert_eq!(
+            rows(&mut db, "SELECT CAST(1 AS DECIMAL) + CAST('2' AS DECIMAL)").rows[0][0],
+            Value::Decimal("3".parse().unwrap())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT CAST(3.5 AS DECIMAL)").rows[0][0],
+            Value::Decimal("3.5".parse().unwrap())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT CAST('  1.5  ' AS DECIMAL(10,2))").rows[0][0],
+            Value::Decimal("1.5".parse().unwrap())
+        );
+        // Truncation toward zero, text round-trip, bool coercion.
+        assert_eq!(
+            rows(&mut db, "SELECT CAST(CAST('1.9' AS DECIMAL) AS INT)").rows[0][0],
+            Value::Int(1)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT CAST(CAST('-1.9' AS DECIMAL) AS INT)").rows[0][0],
+            Value::Int(-1)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT CAST(CAST('1.50' AS DECIMAL) AS TEXT)").rows[0][0],
+            Value::Str("1.50".into())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT CAST(CAST('0' AS DECIMAL) AS BOOL)").rows[0][0],
+            Value::Bool(false)
+        );
+        // Text forms keep the exact scale through CONCAT / ||.
+        assert_eq!(
+            rows(&mut db, "SELECT CONCAT(CAST('1.50' AS DECIMAL), '!')").rows[0][0],
+            Value::Str("1.50!".into())
+        );
+        // Invalid text errors loudly instead of degrading to Float/garbage.
+        let e = db.execute("SELECT CAST('bad' AS DECIMAL)").unwrap_err();
+        assert!(e.to_string().contains("cannot CAST"), "{e}");
+    }
+
+    #[test]
+    fn decimal_divide_modulo_overflow_and_aggregate_edges() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE d (id INT PRIMARY KEY, x DECIMAL(28,4))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO d VALUES \
+             (1, CAST('7.5' AS DECIMAL)), (2, CAST('2' AS DECIMAL)), (3, NULL)",
+        );
+        // Division / modulo by zero yield NULL (Int/Float parity).
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT CAST('1.5' AS DECIMAL) / CAST('0' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Null
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT CAST('1.5' AS DECIMAL) % CAST('0' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Null
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT CAST('7.5' AS DECIMAL) % CAST('2' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Decimal("1.5".parse().unwrap())
+        );
+        // Overflow is checked, never a panic.
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT CAST('79228162514264337593543950335' AS DECIMAL) + CAST('1' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Null
+        );
+        // MIN/MAX/AVG over decimals, NULLs skipped.
+        assert_eq!(
+            rows(&mut db, "SELECT MIN(x), MAX(x), AVG(x) FROM d").rows[0],
+            vec![
+                Value::Decimal("2".parse().unwrap()),
+                Value::Decimal("7.5".parse().unwrap()),
+                Value::Decimal("4.75".parse().unwrap()),
+            ]
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT ABS(CAST('-3.25' AS DECIMAL))").rows[0][0],
+            Value::Decimal("3.25".parse().unwrap())
+        );
+        // Mixed Int * Decimal multiplies exactly; SUM promotes to decimal.
+        run(
+            &mut db,
+            "CREATE TABLE mix (id INT PRIMARY KEY, n INT, m DECIMAL(10,2))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO mix VALUES \
+             (1, 1, CAST('0.10' AS DECIMAL)), (2, 2, CAST('0.20' AS DECIMAL))",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT SUM(n * m) FROM mix").rows[0][0],
+            Value::Decimal("0.50".parse().unwrap())
+        );
+        // Overflow inside AVG reports loudly instead of dropping money.
+        run(&mut db, "CREATE TABLE big (v DECIMAL(28,4))");
+        run(
+            &mut db,
+            "INSERT INTO big VALUES \
+             (CAST('79228162514264337593543950335' AS DECIMAL)), \
+             (CAST('79228162514264337593543950335' AS DECIMAL))",
+        );
+        let e = db.execute("SELECT AVG(v) FROM big").unwrap_err();
+        assert!(e.to_string().contains("overflow"), "{e}");
+    }
+
+    #[test]
+    fn decimal_storage_constraints_indexes_updates_and_joins() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE m (id INT PRIMARY KEY, amount DECIMAL(12,2) UNIQUE NOT NULL, tag TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO m VALUES (1, CAST('1.00' AS DECIMAL), 'x')",
+        );
+        // UNIQUE compares numerically: a different scale is still a duplicate.
+        let e = db
+            .execute("INSERT INTO m VALUES (2, CAST('1.0' AS DECIMAL), 'y')")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+        // UPDATE fast path with the unique tree, then probe on the new key.
+        run(
+            &mut db,
+            "UPDATE m SET amount = amount + CAST('0.01' AS DECIMAL) WHERE id = 1",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT amount FROM m").rows[0][0],
+            Value::Decimal("1.01".parse().unwrap())
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT tag FROM m WHERE amount = CAST('1.01' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Str("x".into())
+        );
+        // Composite index with a decimal leading column: point + range probes.
+        run(
+            &mut db,
+            "CREATE TABLE ci (id INT PRIMARY KEY, a DECIMAL(10,2), b TEXT)",
+        );
+        run(&mut db, "CREATE INDEX ci_ab ON ci (a, b)");
+        run(
+            &mut db,
+            "INSERT INTO ci VALUES \
+             (1, CAST('1.00' AS DECIMAL), 'x'), \
+             (2, CAST('2.00' AS DECIMAL), 'x'), \
+             (3, CAST('2.50' AS DECIMAL), 'y')",
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT id FROM ci WHERE a = CAST('2.00' AS DECIMAL) AND b = 'x'"
+            )
+            .rows[0][0],
+            Value::Int(2)
+        );
+        let ids: Vec<Value> = rows(
+            &mut db,
+            "SELECT id FROM ci WHERE a > CAST('1.00' AS DECIMAL) ORDER BY id",
+        )
+        .rows
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+        assert_eq!(ids, vec![Value::Int(2), Value::Int(3)]);
+        // Equality join across decimal columns matches numerically equal keys.
+        run(
+            &mut db,
+            "CREATE TABLE j1 (id INT PRIMARY KEY, k DECIMAL(10,2))",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE j2 (id INT PRIMARY KEY, k DECIMAL(10,2))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO j1 VALUES (1, CAST('1.50' AS DECIMAL)), (2, CAST('9.99' AS DECIMAL))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO j2 VALUES (1, CAST('1.5' AS DECIMAL)), (2, CAST('2.00' AS DECIMAL))",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT j1.id FROM j1 JOIN j2 ON j1.k = j2.k").rows[0][0],
+            Value::Int(1)
+        );
+        // JSON_TYPE sees the wire marker as an exact number.
+        assert_eq!(
+            rows(&mut db, "SELECT JSON_TYPE('{\"$dec\":\"1.5\"}')").rows[0][0],
+            Value::Str("real".into())
+        );
+    }
+
+    #[test]
+    fn decimal_group_by_and_distinct_semantics() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE g (id INT PRIMARY KEY, x DECIMAL(10,2))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO g VALUES \
+             (1, CAST('1.50' AS DECIMAL)), (2, CAST('1.50' AS DECIMAL)), \
+             (3, CAST('2.25' AS DECIMAL)), (4, CAST('1.5' AS DECIMAL)), (5, NULL)",
+        );
+        // Grouping is byte-keyed (encode), exactly like Int/Float: identical
+        // text collapses, a different scale is a separate group. Scale is
+        // invisible to `PartialEq` and the two equal-valued groups tie under
+        // cmp_values, so key the assertion by rendered text without order.
+        let groups = rows(&mut db, "SELECT x, COUNT(*) FROM g GROUP BY x");
+        let by_text: std::collections::BTreeMap<String, Value> = groups
+            .rows
+            .iter()
+            .map(|r| (r[0].to_string(), r[1].clone()))
+            .collect();
+        assert_eq!(groups.rows.len(), 4);
+        assert_eq!(by_text.get("null"), Some(&Value::Int(1)));
+        assert_eq!(by_text.get("1.5"), Some(&Value::Int(1)));
+        assert_eq!(by_text.get("1.50"), Some(&Value::Int(2)));
+        assert_eq!(by_text.get("2.25"), Some(&Value::Int(1)));
+        // COUNT DISTINCT follows the same byte-keyed rule (NULL excluded).
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(DISTINCT x) FROM g").rows[0][0],
+            Value::Int(3)
+        );
+        // SUM DISTINCT keeps the first occurrence of each byte-keyed group.
+        assert_eq!(
+            rows(&mut db, "SELECT SUM(DISTINCT x) FROM g").rows[0][0].to_string(),
+            "5.25"
+        );
+    }
+
+    #[test]
+    fn blob_storage_ordering_unique_and_updates() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE b (id INT PRIMARY KEY, raw BLOB UNIQUE)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO b VALUES (1, x'0102'), (2, x''), (3, NULL)",
+        );
+        // NULL < empty blob < blob; ORDER BY uses cmp_values.
+        let ids: Vec<Value> = rows(&mut db, "SELECT id FROM b ORDER BY raw")
+            .rows
+            .iter()
+            .map(|r| r[0].clone())
+            .collect();
+        assert_eq!(ids, vec![Value::Int(3), Value::Int(2), Value::Int(1)]);
+        // UNIQUE is byte-exact.
+        let e = db.execute("INSERT INTO b VALUES (4, x'0102')").unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+        // UPDATE moves the index entry; probes find the new key only.
+        run(&mut db, "UPDATE b SET raw = x'03' WHERE id = 1");
+        assert_eq!(
+            rows(&mut db, "SELECT raw FROM b WHERE raw = x'03'").rows[0][0],
+            Value::Bytes(vec![3])
+        );
+        assert!(rows(&mut db, "SELECT id FROM b WHERE raw = x'0102'")
+            .rows
+            .is_empty());
+        // Malformed hex is rejected (odd digits / non-hex characters).
+        assert!(db.execute("SELECT x'abc'").is_err());
+        assert!(db.execute("SELECT x'zz'").is_err());
+    }
+
+    #[test]
+    fn insert_select_and_guid_rewrite_carry_decimal_and_blob_exactly() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE src (id INT PRIMARY KEY, m DECIMAL(20,5), b BLOB)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO src VALUES \
+             (1, CAST('0.10000' AS DECIMAL), x'01'), (2, CAST('-2.50000' AS DECIMAL), NULL)",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE dst (id INT PRIMARY KEY, m DECIMAL(20,5), b BLOB)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO dst SELECT id, m, b FROM src WHERE id >= 1",
+        );
+        let a = rows(&mut db, "SELECT id, m, b FROM src ORDER BY id");
+        let b = rows(&mut db, "SELECT id, m, b FROM dst ORDER BY id");
+        assert_eq!(a, b);
+        run(
+            &mut db,
+            "CREATE TABLE dst2 (id INT PRIMARY KEY, m DECIMAL(20,5), b BLOB)",
+        );
+        run(&mut db, "INSERT INTO dst2 SELECT * FROM src");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM dst2").rows[0][0],
+            Value::Int(2)
+        );
+
+        // auto-GUID resolved rewrite renders exact literals so a peer re-runs
+        // neither random ids nor lossy float text.
+        run(
+            &mut db,
+            "CREATE TABLE g (id GUID PRIMARY KEY AUTOINCREMENT, m DECIMAL(28,10), b BLOB)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO g (m, b) VALUES \
+             (CAST('12345678901234567.8901234567' AS DECIMAL), x'deadbeef')",
+        );
+        let resolved = db.take_resolved_sql().expect("resolved rewrite");
+        assert!(
+            resolved.contains("CAST('12345678901234567.8901234567' AS DECIMAL)"),
+            "{resolved}"
+        );
+        assert!(resolved.contains("x'deadbeef'"), "{resolved}");
+        let mut peer = Database::in_memory().unwrap();
+        run(
+            &mut peer,
+            "CREATE TABLE g (id GUID PRIMARY KEY AUTOINCREMENT, m DECIMAL(28,10), b BLOB)",
+        );
+        peer.execute(&resolved).unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT id, m, b FROM g"),
+            rows(&mut peer, "SELECT id, m, b FROM g")
+        );
     }
 }
 
