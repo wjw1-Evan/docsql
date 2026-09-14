@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### EF schema 同步摊销(2026-09-14)
+
+#### 变更
+
+- **惰性建表改「先校验后同步」**:新上下文(EF 每个 DbContext 一条新连接)先做两条
+  一次性校验查询——`information_schema.columns`(表×声明列)与 `sqlite_master`
+  (命名索引及其 DDL)——模型要求的表/列/索引齐备即跳过整场 `SyncModel`;此前每条
+  连接都全量同步(119 实体规模 = 数百次建表/列探测往返)。校验覆盖缺表、缺列、缺索引、
+  unique 漂移(同名非 UNIQUE)与模型已移除的 `IX_` 索引(回收面),任一命中才回落全量
+  同步;外部 DDL(裸连接删表/删列/删索引)在下一个上下文即被校验发现并恢复,语义与
+  逐连接全量同步一致。新增 `SchemaSyncAccounting.FullSyncCount(connectionString)`
+  观测口径(内部,供测试断言)与 `SchemaVerifyTests` 三条回归(重复上下文零全量同步/
+  缺列回填/缺索引重建)。
+
 ### 部署测试不再清空开发数据(2026-09-14)
 
 #### 变更
