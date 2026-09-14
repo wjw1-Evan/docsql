@@ -292,6 +292,8 @@ async fn console_page_served_over_http() {
     assert!(html.contains("autoIndexScript")); // read-only constraint autoindexes
     assert!(html.contains("split-explorer")); // draggable explorer width splitter
     assert!(html.contains("docsql.ui.editorRatio")); // draggable editor/results split
+    assert!(html.contains("aboutDialog")); // redesigned About dialog
+    assert!(html.contains("复制诊断信息"));
 
     // The API surface is JSON-only: a bare GET on it is rejected.
     let res = http(&addr, "GET", "/api/sql", None, None).await;

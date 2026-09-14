@@ -264,6 +264,26 @@ button.danger { color:var(--err); }
     width: 100%; min-height: 190px; resize: vertical;
     font: 12.5px/1.55 var(--mono); white-space: pre; tab-size: 2;
   }
+  /* 关于 DocSQL Studio */
+  .about-dialog .body { gap: 13px; }
+  .about-hero { display: flex; align-items: center; gap: 12px; }
+  .about-logo { width: 46px; height: 46px; flex: none; border-radius: 8px;
+                background: linear-gradient(160deg, #eaf4fd, #d6e9fa); border: 1px solid #bcd9f2;
+                display: flex; align-items: center; justify-content: center; }
+  .about-logo svg { width: 30px; height: 30px; }
+  .about-name { font-size: 17px; font-weight: 600; }
+  .about-ver { color: var(--txt3); margin-top: 1px; }
+  .about-desc { margin: 0; color: var(--txt2); line-height: 1.75; }
+  .about-sec-title { font-weight: 600; color: var(--txt2); margin-bottom: 6px; }
+  .about .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .about .chip { border: 1px solid var(--border2); background: var(--chrome2); color: var(--txt2);
+                 border-radius: 9px; padding: 1px 9px; }
+  .about-info { border-top: 1px solid var(--border2); padding-top: 11px; }
+  .about .kv { display: flex; gap: 8px; padding: 1.5px 0; }
+  .about .kv .k { flex: none; width: 64px; color: var(--txt3); }
+  .about .kv .v { color: var(--txt); -webkit-user-select: text; user-select: text;
+                  word-break: break-all; line-height: 1.6; }
+  .about .kv .v a { color: var(--accent-dk); }
   #toasts { position: fixed; right: 14px; bottom: 34px; z-index: 700; display: flex;
             flex-direction: column; gap: 6px; }
   .toast { background: #323130; color: #fff; border-radius: 4px; padding: 8px 14px; max-width: 380px;
@@ -371,6 +391,8 @@ const fmtBytes = (n) => { if (!n) return '0 B'; const u = ['B','KB','MB','GB']; 
   while (n >= 1024 && i < u.length-1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
 const fmtDur = (ms) => { const s = Math.floor(ms/1000), d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   return d ? `${d}天${h}时${m}分` : h ? `${h}时${m}分` : m ? `${m}分${s%60}秒` : `${s}秒`; };
+// 控制台自身版本(与数据库节点版本无关;展示于仪表盘与「关于」)。
+const CONSOLE_VERSION = '1.0';
 
 /* ================= 图标(内联 SVG)================= */
 const SVG = (inner, vb) => `<svg width="16" height="16" viewBox="${vb||'0 0 16 16'}" fill="none" xmlns="http://www.w3.org/2000/svg">${inner}</svg>`;
@@ -531,6 +553,72 @@ function accountDialog() {
     } catch (e) { err('请求失败:' + e.message); }
   };
   ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
+}
+
+/* ================= 关于 DocSQL Studio ================= */
+// 产品简介 + 主要能力 + 实时连接/版本信息(取自对象资源管理器缓存与
+// 节点选择器,不发额外请求)。「复制诊断信息」把版本、目标节点、浏览器
+// 写入剪贴板,便于反馈问题时附上环境信息。
+function aboutDialog() {
+  const m = explorer.meta;
+  const target = api.node
+    ? `节点 ${esc(api.node)}`
+    : (nodes.default ? `默认节点(${esc(nodes.default)})` : '默认节点(未配置)');
+  const targetPlain = api.node
+    ? `节点 ${api.node}`
+    : (nodes.default ? `默认节点(${nodes.default})` : '默认节点(未配置)');
+  const server = m
+    ? `DocSQL v${esc(m.server.version)} · ${esc(m.totals.tables)} 表 · ${esc(m.totals.rows)} 行`
+    : '<span class="null">未知(对象资源管理器尚未刷新)</span>';
+  const serverPlain = m
+    ? `DocSQL v${m.server.version} · ${m.totals.tables} 表 · ${m.totals.rows} 行`
+    : '未知';
+  const caps = ['对象资源管理器', '查询工作台', '数据网格', '表结构编辑', 'JSON 插入',
+    '仪表盘', '集群状态', '日志', '备份恢复', '用户与角色'];
+  const logo = SVG(`<ellipse cx="8" cy="4" rx="6" ry="2.3" stroke="#0072c6" stroke-width="1.2"/>
+    <path d="M2 4v8c0 1.27 2.7 2.3 6 2.3s6-1.03 6-2.3V4" stroke="#0072c6" stroke-width="1.2"/>
+    <path d="M2 8c0 1.27 2.7 2.3 6 2.3S14 9.27 14 8" stroke="#0072c6" stroke-width="1.2"/>`);
+  const ov = showModal(`<div class="dialog about-dialog" style="min-width:470px;max-width:560px">
+    <h3>关于 DocSQL Studio</h3>
+    <div class="body about">
+      <div class="about-hero">
+        <div class="about-logo">${logo}</div>
+        <div>
+          <div class="about-name">DocSQL Studio</div>
+          <div class="about-ver">文档数据库管理控制台 v${CONSOLE_VERSION} · SSMS 风格</div>
+        </div>
+      </div>
+      <p class="about-desc">DocSQL 是 Rust 原生文档数据库:JSON 文档整体存储、完整 SQL、对称集群复制
+        与持久化发布订阅。本控制台是纯管理工具、自身零存储 —— 全部操作以数据库客户端身份连接管理节点执行。</p>
+      <div>
+        <div class="about-sec-title">主要能力</div>
+        <div class="chips">${caps.map(c => `<span class="chip">${c}</span>`).join('')}</div>
+      </div>
+      <div class="about-info">
+        <div class="about-sec-title">连接与版本</div>
+        <div class="kv"><span class="k">管理目标</span><span class="v">${target}</span></div>
+        <div class="kv"><span class="k">服务端</span><span class="v">${server}</span></div>
+        <div class="kv"><span class="k">控制台</span><span class="v">v${CONSOLE_VERSION} · 零存储 ·
+          <a href="https://github.com/wjw1-Evan/docsql" target="_blank" rel="noopener">项目主页</a></span></div>
+      </div>
+    </div>
+    <div class="foot">
+      <button data-copy>复制诊断信息</button>
+      <button class="primary" data-cancel>确定</button>
+    </div></div>`, 'button[data-cancel]');
+  $('[data-copy]', ov).onclick = () => {
+    const text = [
+      `DocSQL Studio v${CONSOLE_VERSION}`,
+      `管理目标: ${targetPlain}`,
+      `服务端: ${serverPlain}`,
+      `页面: ${location.href}`,
+      `浏览器: ${navigator.userAgent}`,
+    ].join('\n');
+    if (!navigator.clipboard || !navigator.clipboard.writeText) { ui.toast('复制失败:浏览器不支持剪贴板', true); return; }
+    navigator.clipboard.writeText(text)
+      .then(() => ui.toast('诊断信息已复制到剪贴板'))
+      .catch(e => ui.toast('复制失败:' + e.message, true));
+  };
 }
 
 /* ================= UI 反馈 ================= */
@@ -1611,7 +1699,7 @@ function openDashboard() {
       // 统计对象随节点选择器切换:默认管理节点或其它集群节点。
       $('.sub', t.el).textContent = api.node
         ? `统计对象为节点 ${api.node}(写在该节点上执行并按其集群配置扇出)`
-        : `统计对象为默认管理节点${nodes.default ? ` ${nodes.default}` : ''}(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v1.0`;
+        : `统计对象为默认管理节点${nodes.default ? ` ${nodes.default}` : ''}(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v${CONSOLE_VERSION}`;
       try {
         const m = await api.get('/api/meta');
         if (m && m.error) {
@@ -2526,9 +2614,7 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'backup') openBackupTab();
     else if (act === 'account') accountDialog();
     else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST'}).finally(() => location.reload());
-    else if (act === 'about') dialog('关于 DocSQL Studio', [
-      {name:'a', label: '产品', value: 'DocSQL Studio — 文档数据库管理控制台(SSMS 风格) v1.0'},
-    ], '确定', async () => {});
+    else if (act === 'about') aboutDialog();
   };
 });
 
