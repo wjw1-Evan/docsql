@@ -7,8 +7,10 @@
 #   docker compose --profile single --profile cluster up -d   # both at once
 #
 # Tear down with the same profile flags: docker compose --profile ... down
-# (down -v also works). Data lives in EXTERNAL volumes (fixed docsql-dev-data-*
-# names) that compose never removes — rebuilding/redeploying keeps data.
+# (down -v also works). Data lives in EXTERNAL volumes (default
+# docsql-dev-data-* names; DOCSQL_DEV_DATA_PREFIX overrides the prefix, which
+# run-tests.sh uses for its throwaway test volumes) that compose never
+# removes — rebuilding/redeploying keeps data.
 # Wipe data only via ./reset-data.sh (or explicit docker volume rm).
 # Set DOCSQL_DEV_IMAGE_TAG to run against an existing image instead of
 # building — deliberately NOT DOCSQL_IMAGE_TAG, which belongs to the prod
@@ -234,9 +236,10 @@ services:
 # External data volumes: created once (`docker volume create docsql-dev-data-*`
 # or any `docker compose up` precondition), they survive `down -v` and
 # container recreation — releases never lose data. Dev volumes are namespaced
-# docsql-dev-data-* and are fully separate from prod's docsql-data-*, so both
-# stacks can run at the same time. ./reset-data.sh removes them;
-# run-tests.sh recreates them per run.
+# docsql-dev-data-* (DOCSQL_DEV_DATA_PREFIX overrides the prefix) and are
+# fully separate from prod's docsql-data-*, so both stacks can run at the same
+# time. ./reset-data.sh removes them; run-tests.sh never touches them (it runs
+# on its own docsql-dev-testdata-* volumes).
 volumes:
   # Console account files (username/password hash): compose-managed named
   # volumes, so the first-use setup survives redeploys and `down` (only
@@ -245,19 +248,19 @@ volumes:
   web-auth-single:
   peer-a-data:
     external: true
-    name: docsql-dev-data-a
+    name: "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-a"
   peer-b-data:
     external: true
-    name: docsql-dev-data-b
+    name: "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-b"
   peer-c-data:
     external: true
-    name: docsql-dev-data-c
+    name: "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-c"
   peer-d-data:
     external: true
-    name: docsql-dev-data-d
+    name: "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-d"
   single-data:
     external: true
-    name: docsql-dev-data-single
+    name: "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-single"
 
 networks:
   docsql:

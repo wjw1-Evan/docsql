@@ -147,7 +147,7 @@ docker compose --profile single --profile cluster down    # 全部停止(数据�
 
 **扩容与修复**:集群扩容只需起一个指向现有节点的全新节点(compose `join` profile,先建卷 `docsql-dev-data-d` / `docsql-prod-data-d`),自动拉取全量历史并注册扇出;节点离线错过的写在**重启时自动增量补齐**(超出日志窗口或仍有分歧时转多数派快照采纳)。步骤、动态注册注意事项与边界见[运维手册 · 扩容](docs/operations.md#扩容新数据节点自动同步)与[离线补齐](docs/operations.md#离线补齐与重启反熵)。
 
-**数据持久化**:每个节点的数据放在 external 卷(生产 `docsql-data-a/b/c/single` + `docsql-prod-data-d`;开发 `docsql-dev-data-*`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
+**数据持久化**:每个节点的数据放在 external 卷(生产 `docsql-data-a/b/c/single` + `docsql-prod-data-d`;开发 `docsql-dev-data-*`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;部署测试跑在一次性卷(`docsql-dev-testdata-*`)上,同样不动开发数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
 
 ```bash
 cd deploy && for v in a b c single; do docker volume create docsql-data-$v; done && docker volume create docsql-prod-data-d  # 生产

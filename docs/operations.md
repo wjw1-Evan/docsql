@@ -173,5 +173,6 @@ docsql connect <addr> [token]       远程模式(--user 走用户登录,密码�
   help;                             内联帮助(远程模式含 pub/sub 命令面)
 ```
 
-部署测试(`./deploy/run-tests.sh`)会自动重建开发卷并同时验证两个 profile;接口细节见
-[客户端与驱动](drivers.md#clidocsql-cli)。
+部署测试(`./deploy/run-tests.sh`)在一次性卷(`docsql-dev-testdata-*`)上同时验证两个
+profile,不触碰开发数据卷(`docsql-dev-data-*`)与控制台账号卷,结束后恢复运行前的
+stack;接口细节见[客户端与驱动](drivers.md#clidocsql-cli)。

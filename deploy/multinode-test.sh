@@ -356,8 +356,8 @@ wait_row_d() {
 }
 ( cd "$(dirname "$0")" && docker compose --profile cluster --profile join stop node-d >/dev/null 2>&1 || true
   docker compose --profile cluster --profile join rm -f node-d >/dev/null 2>&1 || true
-  docker volume rm -f docsql-dev-data-d >/dev/null 2>&1 || true
-  docker volume create docsql-dev-data-d >/dev/null
+  docker volume rm -f "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-d" >/dev/null 2>&1 || true
+  docker volume create "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-d" >/dev/null
   DOCSQL_DEV_IMAGE_TAG="${DOCSQL_DEV_IMAGE_TAG:-local}" docker compose --profile cluster --profile join up -d node-d >/dev/null )
 ok_d=""
 for _ in $(seq 1 60); do

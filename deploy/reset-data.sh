@@ -16,6 +16,7 @@ docker compose -f docker-compose.prod.yml --profile single --profile cluster --p
 for v in docsql-data-a docsql-data-b docsql-data-c docsql-data-d docsql-data-web docsql-data-single docsql-data-web-single \
          docsql-prod-data-d \
          docsql-dev-data-a docsql-dev-data-b docsql-dev-data-c docsql-dev-data-d docsql-dev-data-single \
+         docsql-dev-testdata-a docsql-dev-testdata-b docsql-dev-testdata-c docsql-dev-testdata-d docsql-dev-testdata-single \
          docsql-dev_web-auth docsql-dev_web-auth-single \
          docsql-prod_web-auth docsql-prod_web-auth-single; do
   docker volume rm -f "$v" >/dev/null 2>&1 || true

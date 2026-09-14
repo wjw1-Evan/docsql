@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+### 部署测试不再清空开发数据(2026-09-14)
+
+#### 变更
+
+- `./deploy/run-tests.sh` 改为在一次性卷 `docsql-dev-testdata-*` 上运行(single/cluster
+  两套 34+81 项断言仍从干净状态开始),不再删除开发数据卷 `docsql-dev-data-*` 与控制台
+  账号卷;测试前停止、测试后自动恢复运行前的 dev stack(`down` 不再带 `-v`)。
+  清数据仍只通过 `./deploy/reset-data.sh`;compose 新增 `DOCSQL_DEV_DATA_PREFIX`
+  覆盖外置卷前缀(默认 `docsql-dev-data`,测试栈用 `docsql-dev-testdata`)。
+
 ### Web 控制台移除浏览器令牌输入(2026-09-14)
 
 #### 变更
