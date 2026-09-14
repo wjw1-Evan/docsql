@@ -345,31 +345,37 @@ impl Pager {
 
     /// Crash recovery: replay after-images of committed transactions, in LSN
     /// order, then checkpoint the WAL. Uncommitted transactions are dropped.
+    ///
+    /// Both passes **stream** the log (`Wal::frames`): a log can be far
+    /// larger than memory (a killed multi-GB transaction appends tens of MB
+    /// per attempt, and a crash loop re-appends before any truncation), and
+    /// materializing it used to OOM the node before recovery could truncate
+    /// — wedging the process in a restart loop. Pass 2 writes each
+    /// after-image straight through in LSN order: a later frame for the same
+    /// page overwrites an earlier one, so last-write-wins holds without
+    /// holding any page images in memory.
     fn recover(&self) -> Result<()> {
-        let records = lock(&self.wal).records()?;
+        let wal_path = wal_path_for(&self.path);
         let mut committed = std::collections::HashSet::new();
-        for r in &records {
-            if r.kind == KIND_COMMIT {
-                committed.insert(r.txid);
+        for rec in Wal::frames(&wal_path)? {
+            let rec = rec?;
+            if rec.kind == KIND_COMMIT {
+                committed.insert(rec.txid);
             }
         }
-        let mut replayed: HashMap<u32, Vec<u8>> = HashMap::new();
-        for r in &records {
-            if r.kind != KIND_WRITE || !committed.contains(&r.txid) {
+        let mut applied = false;
+        for rec in Wal::frames(&wal_path)? {
+            let rec = rec?;
+            if rec.kind != KIND_WRITE || !committed.contains(&rec.txid) {
                 continue;
             }
-            let Some(page) = decode_page_image(&r.payload)? else {
+            let Some((page, data)) = decode_page_image(&rec.payload)? else {
                 continue;
             };
-            replayed.insert(page.0, page.1);
-            if page.0 >= self.num_pages() {
-                self.num_pages.store(page.0 + 1, Ordering::Relaxed);
-            }
+            self.write_file_page(page, &data)?;
+            applied = true;
         }
-        if !replayed.is_empty() {
-            for (id, data) in &replayed {
-                self.write_file_page(*id, data)?;
-            }
+        if applied {
             self.persist_header()?;
             lock(&self.file).sync_all()?;
         }
@@ -746,11 +752,15 @@ impl Pager {
     }
 
     /// Abort: staged writes never reach disk, nothing to undo (WAL never
-    /// got a commit record), so this only bookkeeps.
+    /// got a commit record), so this only bookkeeps. It still runs the
+    /// WAL bound: a ruled-out transaction leaves dead frames in the log
+    /// (a failed snapshot adoption appends tens of MB), and nothing else
+    /// would shrink it until the next successful commit.
     pub fn abort_tx(&self, tx: Tx) -> Result<()> {
         if !tx.staged.is_empty() {
             self.ckpt.appends.fetch_add(1, Ordering::Relaxed);
             lock(&self.wal).abort(tx.id)?;
+            self.maybe_checkpoint()?;
         }
         Ok(())
     }
@@ -846,18 +856,22 @@ impl Pager {
         {
             return Ok(());
         }
-        // Fresh read-only handle (`Wal::scan_file`): concurrent appends are
-        // fine — every frame this snapshot needs was fully written before it
-        // began, and a torn tail only stops the scan early.
-        let records = Wal::scan_file(&wal_path_for(&self.path))?;
+        // Fresh read-only handle, streamed twice (`Wal::frames`) for the
+        // same reason recovery streams: the log may not fit in memory.
+        // Concurrent appends are fine — every frame this snapshot needs was
+        // fully written before it began, and a torn tail only stops the scan
+        // early.
+        let wal_path = wal_path_for(&self.path);
         let mut committed: HashMap<u64, u64> = HashMap::new();
-        for r in &records {
+        for rec in Wal::frames(&wal_path)? {
+            let r = rec?;
             if r.kind == KIND_COMMIT && r.lsn <= snap.lsn {
                 committed.insert(r.txid, r.lsn);
             }
         }
         let mut cache: HashMap<u32, Vec<u8>> = HashMap::new();
-        for r in &records {
+        for rec in Wal::frames(&wal_path)? {
+            let r = rec?;
             if r.kind != KIND_WRITE {
                 continue;
             }
@@ -1079,6 +1093,71 @@ mod tests {
         let pager = Pager::open(&path).unwrap();
         let page = pager.read_page(1).unwrap().to_vec();
         assert_eq!(&page[..11], b"wal-rescued");
+    }
+
+    #[test]
+    fn recover_streams_uncommitted_wal_and_truncates() {
+        // 被杀死的大事务(如中途崩溃的快照采纳):帧已进 WAL、没有 COMMIT。
+        // 恢复必须流式处理(不物化整个日志)、丢弃这些帧并在结束时截断 WAL。
+        let (_dir, path) = tmp_db("h.db");
+        let (p, wal_len) = {
+            let pager = Pager::open(&path).unwrap();
+            let mut tx = pager.begin_tx();
+            let p = pager.allocate_page(&mut tx).unwrap();
+            pager.write_page(&mut tx, p, 0, b"keeper").unwrap();
+            pager.commit_tx(tx).unwrap();
+            {
+                let mut wal = lock(&pager.wal);
+                wal.begin(999).unwrap();
+                let mut payload = Vec::with_capacity(4 + PAGE_SIZE);
+                for i in 0..2000u32 {
+                    payload.clear();
+                    payload.extend_from_slice(&(p + 1 + i).to_le_bytes());
+                    payload.extend_from_slice(&[7u8; PAGE_SIZE]);
+                    wal.log_write(999, &payload).unwrap();
+                }
+            }
+            (p, std::fs::metadata(wal_path_for(&path)).unwrap().len())
+        };
+        assert!(wal_len > 8_000_000, "dead log is multi-MB: {wal_len}");
+
+        let pager = Pager::open(&path).unwrap();
+        assert_eq!(&pager.read_page(p).unwrap()[..6], b"keeper");
+        assert!(
+            pager.read_page(p + 1).is_err(),
+            "abandoned transaction must not surface"
+        );
+        assert_eq!(
+            std::fs::metadata(wal_path_for(&path)).unwrap().len(),
+            8,
+            "recovery truncates the dead WAL"
+        );
+    }
+
+    #[test]
+    fn recovery_applies_last_image_in_lsn_order() {
+        // 直接落文件(不做 last-image 聚合)时,同一页的多版本必须按 LSN
+        // 顺序覆盖:最后提交的版本胜出。
+        let (_dir, path) = tmp_db("i.db");
+        let p = {
+            let pager = Pager::open(&path).unwrap();
+            let mut tx = pager.begin_tx();
+            let p = pager.allocate_page(&mut tx).unwrap();
+            pager.write_page(&mut tx, p, 0, b"v1").unwrap();
+            pager.commit_tx(tx).unwrap();
+            let mut tx = pager.begin_tx();
+            pager.write_page(&mut tx, p, 0, b"v2").unwrap();
+            pager.commit_tx(tx).unwrap();
+            p
+        };
+        // 模拟数据页丢失:只留头页,WAL 里的两个版本都要重放。
+        {
+            let fh = OpenOptions::new().write(true).open(&path).unwrap();
+            fh.set_len(PAGE_SIZE as u64).unwrap();
+            fh.sync_all().unwrap();
+        }
+        let pager = Pager::open(&path).unwrap();
+        assert_eq!(&pager.read_page(p).unwrap()[..2], b"v2");
     }
 
     #[test]

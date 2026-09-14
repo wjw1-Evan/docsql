@@ -23,6 +23,11 @@ pub const KIND_ABORT: u8 = 4;
 
 const HEADER: &[u8; 8] = b"DOCSWAL1";
 
+/// Largest payload a valid frame may carry. The pager logs one page image
+/// per write frame (4 + 4096 bytes); anything beyond this is a corrupt
+/// length field, treated as a torn tail instead of an allocation request.
+const MAX_FRAME_PAYLOAD: usize = 1 << 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
     #[error("io error: {0}")]
@@ -96,91 +101,64 @@ impl Wal {
             .create(true)
             .truncate(false) // never clobber an existing log
             .open(path)?;
-        // Read the log once: the torn-tail truncation below keeps exactly the
-        // bytes scanned here, so the durable/next scan reuses this buffer
-        // instead of re-reading the file (up to tens of MB at the hard limit).
-        let mut preloaded: Option<Vec<u8>> = None;
-        if exists && file.metadata()?.len() > 0 {
-            // Validate header and truncate any torn tail so appends start clean.
-            let mut buf = Vec::new();
-            file.seek(SeekFrom::Start(0))?;
-            file.read_to_end(&mut buf)?;
-            if buf.len() < HEADER.len() || &buf[..HEADER.len()] != HEADER {
-                return Err(WalError::Corrupt(0, "bad header"));
-            }
-            let good_end = Self::scan_end(&buf);
-            file.set_len(good_end as u64)?;
-            buf.truncate(good_end);
-            preloaded = Some(buf);
-        }
-        file.seek(SeekFrom::Start(0))?;
-        if file.metadata()?.len() == 0 {
+        if !exists || file.metadata()?.len() == 0 {
             file.write_all(HEADER)?;
             file.sync_all()?;
+            return Ok(Wal {
+                file,
+                path: path.to_path_buf(),
+                next_lsn: 1,
+                last_commit_lsn: 0,
+                durable_lsn: 0,
+                appended: HEADER.len() as u64,
+                epoch: 0,
+            });
         }
-        // Compute durable_lsn and next_lsn from the clean prefix.
-        let buf = match preloaded {
-            Some(buf) => buf,
-            None => {
-                let mut buf = Vec::new();
-                file.seek(SeekFrom::Start(0))?;
-                file.read_to_end(&mut buf)?;
-                buf
+        // Validate the header, then stream the valid prefix: the log can be
+        // arbitrarily large (a killed multi-GB transaction), so the scan
+        // must not materialize it — one frame at a time, truncating at the
+        // first torn/corrupt frame exactly like the old in-memory walk did.
+        let len = file.metadata()?.len();
+        if len < HEADER.len() as u64 {
+            return Err(WalError::Corrupt(0, "bad header"));
+        }
+        let mut header = [0u8; HEADER.len()];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header)?;
+        if &header != HEADER {
+            return Err(WalError::Corrupt(0, "bad header"));
+        }
+        let mut next_lsn = 1u64;
+        let mut durable = 0u64;
+        let mut good_end = HEADER.len() as u64;
+        let mut open_tx: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut reader = FrameReader::open(path)?;
+        while let Some(rec) = reader.next() {
+            // A gap is a corrupt tail to the opener (it truncates there);
+            // replay callers get the same error from `FrameReader`.
+            let Ok(rec) = rec else { break };
+            good_end = reader.valid_end();
+            match rec.kind {
+                KIND_BEGIN => {
+                    open_tx.insert(rec.txid);
+                }
+                KIND_COMMIT if open_tx.remove(&rec.txid) => durable = rec.lsn,
+                _ => {}
             }
-        };
-        let (durable, next) = Self::scan(&buf);
-        let appended = file.metadata()?.len();
+            next_lsn = rec.lsn + 1;
+        }
+        drop(reader);
+        file.set_len(good_end)?;
         file.seek(SeekFrom::End(0))?;
         Ok(Wal {
             file,
             path: path.to_path_buf(),
-            next_lsn: next,
+            next_lsn,
             last_commit_lsn: durable,
             durable_lsn: durable,
-            appended,
+            appended: good_end,
             epoch: 0,
         })
-    }
-
-    /// One walk of the valid frame prefix: `(end_offset, durable_commit_lsn,
-    /// next_lsn)`. LSN continuity is checked *within* the log: the first
-    /// frame's LSN is adopted as the seed, because `checkpoint` truncates the
-    /// log while `next_lsn` keeps counting up (post-checkpoint frames never
-    /// restart at 1 in files written by older versions). `durable` counts
-    /// commit frames whose begin was seen (a torn tail drops the rest).
-    fn scan_prefix(buf: &[u8]) -> (usize, u64, u64) {
-        let mut pos = HEADER.len();
-        let mut next: Option<u64> = None;
-        let mut open: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut durable = 0u64;
-        while pos < buf.len() {
-            let Some((rec, adv)) = parse_frame(&buf[pos..], next).unwrap_or(None) else {
-                break;
-            };
-            match rec.kind {
-                KIND_BEGIN => {
-                    open.insert(rec.txid);
-                }
-                KIND_COMMIT if open.remove(&rec.txid) => {
-                    durable = rec.lsn;
-                }
-                _ => {}
-            }
-            next = Some(rec.lsn + 1);
-            pos += adv;
-        }
-        (pos, durable, next.unwrap_or(1))
-    }
-
-    /// Returns (durable_commit_lsn, next_lsn) over all valid frames.
-    fn scan(buf: &[u8]) -> (u64, u64) {
-        let (_, durable, next) = Self::scan_prefix(buf);
-        (durable, next)
-    }
-
-    /// End offset of the valid frame prefix (torn-tail truncation point).
-    fn scan_end(buf: &[u8]) -> usize {
-        Self::scan_prefix(buf).0
     }
 
     pub fn path(&self) -> &Path {
@@ -263,11 +241,21 @@ impl Wal {
     }
 
     /// Iterate all valid frames (recovery input), in LSN order. Continuity
-    /// is seeded from the first frame (see `scan`).
+    /// is seeded from the first frame (via [`FrameReader`]).
     pub fn records(&self) -> Result<Vec<LogRecord>> {
         // Through a fresh read-only handle: `self.file`'s cursor is owned by
         // the append path, and this must stay callable while it appends.
         Self::scan_file(&self.path)
+    }
+
+    /// Streaming frame source over `path` via a fresh read-only handle,
+    /// holding no lock: safe while a writer appends. Callers that process
+    /// records one at a time (recovery, snapshot materialization) must use
+    /// this instead of [`Wal::scan_file`] — the log can outgrow memory (a
+    /// killed multi-GB transaction), and collecting every frame first then
+    /// OOMs before any replay/truncation can happen.
+    pub fn frames(path: &Path) -> Result<FrameReader> {
+        FrameReader::open(path)
     }
 
     /// Read and parse every valid frame from `path` via a fresh read-only
@@ -275,20 +263,11 @@ impl Wal {
     /// existing snapshot needs were fully written before that snapshot
     /// began; a torn tail just stops the scan). A concurrent `checkpoint`
     /// can invalidate what is read — callers must re-validate the epoch
-    /// under the append lock afterwards.
+    /// under the append lock afterwards. Materializing callers only.
     pub fn scan_file(path: &Path) -> Result<Vec<LogRecord>> {
-        let mut buf = Vec::new();
-        File::open(path)?.read_to_end(&mut buf)?;
         let mut out = Vec::new();
-        let mut pos = HEADER.len();
-        let mut next: Option<u64> = None;
-        while pos < buf.len() {
-            let Some((rec, adv)) = parse_frame(&buf[pos..], next)? else {
-                break;
-            };
-            next = Some(rec.lsn + 1);
-            pos += adv;
-            out.push(rec);
+        for rec in Self::frames(path)? {
+            out.push(rec?);
         }
         Ok(out)
     }
@@ -308,6 +287,87 @@ impl Wal {
         self.appended = HEADER.len() as u64;
         self.epoch += 1;
         Ok(())
+    }
+}
+
+/// Streaming frame reader (see [`Wal::frames`]): parses one frame at a
+/// time off a buffered read-only handle, so a log of any size costs one
+/// frame of memory instead of a copy of the file. Yields records in LSN
+/// order with the exact `scan_file` torn-write rule: a corrupt/torn tail
+/// (short frame, bad CRC, absurd length) stops iteration silently; an LSN
+/// gap is a hard error — `Wal::open` stops there and truncates, replay
+/// callers propagate it.
+pub struct FrameReader {
+    reader: io::BufReader<File>,
+    next: Option<u64>,
+    pos: u64,
+    done: bool,
+}
+
+impl FrameReader {
+    pub fn open(path: &Path) -> Result<FrameReader> {
+        let mut reader = io::BufReader::with_capacity(64 * 1024, File::open(path)?);
+        reader.seek(SeekFrom::Start(HEADER.len() as u64))?;
+        Ok(FrameReader {
+            reader,
+            next: None,
+            pos: HEADER.len() as u64,
+            done: false,
+        })
+    }
+
+    /// End offset of the last yielded frame — the torn-tail truncation
+    /// point after iteration stops.
+    pub fn valid_end(&self) -> u64 {
+        self.pos
+    }
+
+    fn read_frame(&mut self) -> Result<Option<(LogRecord, usize)>> {
+        // Frame layout: lsn:u64 | kind:u8 | txid:u64 | len:u32 | payload | crc:u32.
+        const HEAD_LEN: usize = 8 + 1 + 8 + 4;
+        let mut head = [0u8; HEAD_LEN];
+        match self.reader.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_le_bytes(head[17..21].try_into().unwrap()) as usize;
+        if len > MAX_FRAME_PAYLOAD {
+            return Ok(None); // corrupt length: torn tail, not an allocation
+        }
+        let mut frame = vec![0u8; HEAD_LEN + len + 4];
+        frame[..HEAD_LEN].copy_from_slice(&head);
+        match self.reader.read_exact(&mut frame[HEAD_LEN..]) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        parse_frame(&frame, self.next)
+    }
+}
+
+impl Iterator for FrameReader {
+    type Item = Result<LogRecord>;
+
+    fn next(&mut self) -> Option<Result<LogRecord>> {
+        if self.done {
+            return None;
+        }
+        match self.read_frame() {
+            Ok(Some((rec, adv))) => {
+                self.pos += adv as u64;
+                self.next = Some(rec.lsn + 1);
+                Some(Ok(rec))
+            }
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -446,6 +506,109 @@ mod tests {
     }
 
     #[test]
+    fn frame_reader_streams_what_scan_file_collects() {
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.log_write(1, b"one").unwrap();
+            w.commit(1).unwrap();
+            w.begin(2).unwrap();
+            w.log_write(2, b"two").unwrap();
+            w.abort(2).unwrap();
+        }
+        let scanned = Wal::scan_file(&path).unwrap();
+        let streamed: Vec<LogRecord> = Wal::frames(&path).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(streamed.len(), scanned.len());
+        for (a, b) in streamed.iter().zip(scanned.iter()) {
+            assert_eq!((a.lsn, a.kind, a.txid), (b.lsn, b.kind, b.txid));
+            assert_eq!(a.payload, b.payload);
+        }
+        // 全部帧有效:valid_end 落在文末。
+        let mut reader = Wal::frames(&path).unwrap();
+        while reader.next().is_some() {}
+        assert_eq!(reader.valid_end(), std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn frame_reader_stops_at_torn_tail() {
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.commit(1).unwrap();
+        }
+        let good = std::fs::metadata(&path).unwrap().len();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[9, 9, 9]).unwrap(); // half a frame header
+        }
+        let mut reader = Wal::frames(&path).unwrap();
+        assert_eq!(reader.by_ref().filter(|r| r.is_ok()).count(), 2);
+        assert_eq!(
+            reader.valid_end(),
+            good,
+            "torn tail excluded from the prefix"
+        );
+        // 打开时按前缀截断,后续 append 不受影响。
+        let w = Wal::open(&path).unwrap();
+        assert_eq!(w.durable_lsn, 2);
+    }
+
+    #[test]
+    fn frame_reader_reports_lsn_gap_and_open_truncates_at_it() {
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.log_write(1, b"one").unwrap();
+            w.commit(1).unwrap();
+        }
+        // begin(25B) + write(28B) + commit(25B) + 8B 头 = 86;把 COMMIT 的
+        // lsn 改掉制造断号(lsn 不在 CRC 覆盖范围内,校验仍通过)。
+        let mut data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 86);
+        let gap_at = 8 + 25 + 28;
+        let lsn = u64::from_le_bytes(data[gap_at..gap_at + 8].try_into().unwrap());
+        data[gap_at..gap_at + 8].copy_from_slice(&(lsn + 10).to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = Wal::frames(&path).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().kind, KIND_BEGIN);
+        assert_eq!(reader.next().unwrap().unwrap().kind, KIND_WRITE);
+        assert!(matches!(
+            reader.next(),
+            Some(Err(WalError::Corrupt(_, "lsn gap")))
+        ));
+        // 打开器把断号处当尾部截断,只保留前缀。
+        let w = Wal::open(&path).unwrap();
+        assert_eq!(w.durable_lsn, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 + 25 + 28);
+    }
+
+    #[test]
+    fn frame_reader_rejects_absurd_length_as_torn_tail() {
+        // 长度字段损坏成巨大值时按撕裂尾处理,绝不据此分配内存。
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.commit(1).unwrap();
+        }
+        let good = std::fs::metadata(&path).unwrap().len();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            let mut head = vec![0u8; 21];
+            head[0] = 7; // lsn
+            head[8] = KIND_WRITE;
+            head[17..21].copy_from_slice(&(u32::MAX / 2).to_le_bytes());
+            f.write_all(&head).unwrap();
+        }
+        let mut reader = Wal::frames(&path).unwrap();
+        assert_eq!(reader.by_ref().filter(|r| r.is_ok()).count(), 2);
+        assert_eq!(reader.valid_end(), good);
+    }
+    #[test]
     fn checkpoint_clears_log() {
         let (_dir, path) = wal_dir();
         let mut w = Wal::open(&path).unwrap();
@@ -499,9 +662,11 @@ mod tests {
         // Simulate a fresh open tearing the tail: reopen scans with the first
         // frame's LSN as the continuity seed, so nothing is discarded.
         let w = Wal::open(&path).unwrap();
-        let (durable, _next) = Wal::scan(&std::fs::read(&path).unwrap());
-        assert_eq!(w.durable_lsn, durable);
-        assert!(durable > 0);
+        let recs = w.records().unwrap();
+        assert_eq!(recs.len(), 3);
+        assert!(recs.iter().any(|r| r.payload == b"page-image"));
+        assert_eq!(w.durable_lsn, w.last_commit_lsn());
+        assert_eq!(w.durable_lsn, recs.last().unwrap().lsn);
     }
 
     #[test]
