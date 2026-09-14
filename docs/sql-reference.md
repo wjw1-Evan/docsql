@@ -30,10 +30,14 @@ CREATE TABLE [IF NOT EXISTS] t (
     uid     GUID AUTOINCREMENT,           -- UUID/UNIQUEIDENTIFIER/UUIDV7 别名:自动 UUIDv7
     ref     INT REFERENCES other(id)      -- 外键(RESTRICT 式;不支持 ON DELETE/UPDATE 动作)
 );
+CREATE TABLE dst AS SELECT ...;                           -- CTAS
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON t (col);          -- 单列索引
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON t (a, b);         -- 多列(复合)索引
 DROP INDEX idx;
-ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'v';            -- 不支持 PK/UNIQUE/自增;不支持 DROP COLUMN 主键
+ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'v';            -- 带 DEFAULT 回填存量行;NOT NULL 必须带 DEFAULT
+ALTER TABLE t RENAME COLUMN a TO b;
+ALTER TABLE t DROP COLUMN c;                            -- 主键列不可删;不支持在线改约束
+TRUNCATE TABLE [IF EXISTS] t;                           -- 清空数据,保留表结构与索引
 DROP TABLE [IF EXISTS] t;
 ```
 
@@ -41,28 +45,46 @@ DROP TABLE [IF EXISTS] t;
 - **多列(复合)索引**:键为按列序的复合值,`WHERE a = 1 AND b = 2` 形态走索引点查,
   前导列等值可用前缀探测;非前导列单独条件不走该索引(仍正确,全表扫描);
   复合 UNIQUE 的唯一性按**完整键组合**判定,任一列 NULL 的行跳过整键(不判重);
+- `CREATE VIEW` / `CREATE TRIGGER` 不支持(显式报错);
 - auto-GUID 表不支持 `INSERT ... SELECT`(随机值无法跨节点收敛;用 VALUES);
-- ADD COLUMN 带 DEFAULT 时自动回填存量行。
+- ADD COLUMN 带 DEFAULT 时自动回填存量行;`ADD COLUMN` 不支持 PK/UNIQUE/FK/自增。
 
 ## DML 与查询
 
 ```sql
 INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y') RETURNING id;
+INSERT INTO t (a, b) SELECT a, b FROM src;              -- INSERT … SELECT
 INSERT INTO t (...) ON CONFLICT DO NOTHING;             -- 或 DO REPLACE;不支持 DO UPDATE
+INSERT OR REPLACE INTO t ...;                           -- 或 OR IGNORE
 UPDATE t SET a = a + 1 WHERE b = 'x' RETURNING *;
-DELETE FROM t WHERE a = 1;
+DELETE FROM t WHERE a = 1 RETURNING id;
+
+MERGE INTO stock USING feed ON stock.sku = feed.sku
+WHEN MATCHED THEN UPDATE SET qty = feed.qty
+WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (feed.sku, feed.qty);
 
 SELECT [DISTINCT] * , expr
 FROM t LEFT JOIN u ON t.id = u.t_id                     -- INNER/LEFT/RIGHT/FULL/CROSS;USING(col)
-WHERE ...
+WHERE a BETWEEN 1 AND 9 AND b IN (1,2) AND c LIKE 'x%' ESCAPE '!'
 GROUP BY ... HAVING ...                                  -- HAVING 必须配 GROUP BY
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]
 LIMIT n OFFSET m;
+FETCH FIRST n ROWS ONLY;                                -- Oracle 12c 分页
+
+SELECT ... UNION [ALL] SELECT ...                       -- 集合运算
+SELECT ... INTERSECT [ALL] SELECT ...
+SELECT ... EXCEPT [ALL] SELECT ...                      -- / MINUS(同义)
 
 WITH cte AS (SELECT ...) SELECT * FROM cte;              -- 非递归 CTE;WITH RECURSIVE 报错
 SELECT 1 IN (SELECT ...), EXISTS (SELECT ...);           -- 标量/IN/EXISTS 子查询
+SELECT CASE WHEN n > 0 THEN 'p' ELSE 'n' END FROM t;     -- CASE
+SELECT 'A' ILIKE 'a';                                    -- 大小写不敏感 LIKE
 SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡尔积
 ```
+
+- `RETURNING` 支持 INSERT/UPDATE/DELETE;`INSERT … SELECT` 源为 SELECT 查询;
+- 集合运算按列数对齐(列名取左);`EXCEPT ALL` 保留左多重集语义;
+- 等值 JOIN 自动走 hash join(索引只做超集过滤,ON 逐候选终裁)。
 
 ## 函数
 
@@ -86,7 +108,21 @@ SELECT a FROM t1, t2 WHERE ...;                          -- 逗号 FROM = 笛卡
   SYSDATE()                            -- 当前 UTC 时间戳文本(固定形状)
   ```
 
-不支持:窗口函数(OVER)、DISTINCT ON、ON CONFLICT DO UPDATE、相关子查询、自定义 TRIM 字符集、递归 CTE。
+## 不支持
+
+以下语法在解析/执行层**显式报错**,不静默吞掉、不降级近似:
+
+- 窗口函数(`OVER`)、`DISTINCT ON`;
+- `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`(只支持 `DO NOTHING` / `DO REPLACE` / `OR REPLACE` / `OR IGNORE`);
+- **相关子查询**(子查询引用外层列);非相关标量/IN/EXISTS 子查询支持;
+- `WITH RECURSIVE`(非递归 CTE 支持);
+- 无 `GROUP BY` 的 `HAVING`;
+- 外键的 `ON DELETE` / `ON UPDATE` 动作(RESTRICT 式);
+- `CREATE VIEW` / `CREATE TRIGGER`;
+- 自定义 `TRIM` 字符集(单参数形式支持);
+- 表达式索引、部分索引、JSON 路径索引。
+
+`PRAGMA` 是有意接受并忽略的兼容垫片(兼容 ORM/驱动的探测语句),不产生任何效果。
 
 ## Oracle 兼容面
 

@@ -86,6 +86,8 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 
 ## 能力总览
 
+> 每项能力的完整说明、SQL 示例与细节链接见 [文档 · 功能总览](docs/features.md);用户手册索引见 [docs/](docs/README.md)。
+
 | 领域 | 支持 |
 |---|---|
 | 存储 | JSON 文档整体存储(无强制 schema)、WAL 崩溃恢复、手写分页器与 B+ 树 |
@@ -105,6 +107,8 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | docsql-cli | 嵌入式 + 远程 shell |
 | docsql-web | Web 管理控制台(SSMS 风格 UI + REST API;纯管理工具,自身不存数据,所有数据操作连接指定节点执行) |
 | dotnet/ | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Docsql.Aspire.Hosting / Docsql.Aspire.Client(AppHost 编排与消费侧);示例:Docsql.Sample(ADO.NET 数据操作实例,连已运行节点)、Docsql.EfSample(EF Core 端到端)、samples/AspireSample(AppHost + Worker 编排示例) |
+
+全部用户文档索引见 [docs/](docs/README.md)。
 
 ## 测试
 
@@ -266,6 +270,8 @@ token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEn
 可完整定制;镜像版本默认 `latest`,`WithImageTag` 钉版。API 速览见
 [Docsql.Aspire.Hosting](dotnet/Docsql.Aspire.Hosting/README.md) /
 [Docsql.Aspire.Client](dotnet/Docsql.Aspire.Client/README.md) 包 README。
+
+> 完整使用手册(集群/控制台/凭据管理/消费侧/发布与排障)见 [Aspire 集成指南](docs/aspire.md)。
 
 ## 安全(对照等保 2.0 / GB/T 20273 数据库管理系统安全技术要求)
 

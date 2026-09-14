@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 文档完善:Aspire 使用手册 + 功能总览(2026-09-14)
+
+#### 文档
+
+- 新增 `docs/aspire.md`(Aspire 集成指南):安装与包源、单节点/对称集群编排、
+  Web 控制台行为、token/凭据管理与自锁风险、消费侧连接注册(ADO.NET/EF/健康检查)、
+  运行期配置与镜像钉版、本地开发工作流、发布部署路径对比、故障排查、Hosting API 速览;
+- 新增 `docs/features.md`(功能总览):数据库全部能力的完整清单——运行形态、数据模型与
+  类型、SQL(DDL/DML/查询/函数/事务/MVCC)、索引、发布订阅、复制与集群、备份恢复、
+  安全、Web 控制台与 REST API、客户端/CLI/线协议、可观测性、部署与边界摘要;
+- `docs/sql-reference.md` 补齐交集/差集(INTERSECT/EXCEPT/MINUS)、`TRUNCATE TABLE`、
+  `CASE`/`ILIKE`、`ALTER TABLE RENAME/DROP COLUMN`、`FETCH FIRST`,并新增独立
+  「不支持」章节(含 `CREATE VIEW`/`TRIGGER`、外键动作、表达式/部分索引等);
+- README、`docs/README.md` 与两个 Aspire 包 README 增加新文档入口与索引。
+
 ### 精确数值与二进制类型 + EF 映射补齐(2026-09-14)
 
 #### 新增

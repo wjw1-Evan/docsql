@@ -23,6 +23,9 @@ dotnet add package Docsql.Aspire.Client
 本地 `aspire start`(或 `dotnet run --project <AppHost>`)拉起节点;`aspire publish`
 输出部署产物(配 `AddDockerComposeEnvironment` 即 docker-compose)。
 
+> 完整使用手册(单节点/集群/控制台/凭据管理/消费侧/发布与排障)见
+> [Aspire 集成指南](https://github.com/wjw1-Evan/docsql/blob/main/docs/aspire.md)。
+
 ## 快速开始
 
 AppHost 项目(`<Project Sdk="Aspire.AppHost.Sdk/13.5.3">`):

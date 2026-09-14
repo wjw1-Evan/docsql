@@ -4,7 +4,9 @@
 
 | 文档 | 内容 |
 |---|---|
+| [功能总览](features.md) | DocSQL 全部能力的完整清单与索引入口(存储/类型/SQL/索引/事务/发布订阅/复制/备份/安全/控制台/驱动/可观测性) |
 | [SQL 参考](sql-reference.md) | 支持的 DDL/DML/查询语法、函数清单(含 JSON 函数族)、事务与约束、不支持面 |
+| [Aspire 集成指南](aspire.md) | AppHost 编排(Docsql.Aspire.Hosting)、消费侧注册(Docsql.Aspire.Client)、集群/控制台/凭据/发布与排障 |
 | [运维手册](operations.md) | 部署拓扑、环境变量参考、备份/恢复与校验和、监控(/metrics /healthz)、优雅停机、语句超时 |
 | [安全指南](security.md) | 认证模型(三凭据 + 数据库用户/角色)、登录锁定、传输加密、SQL 注入防护、等级保护对照 |
 | [客户端与驱动](drivers.md) | .NET ADO.NET / EF Core / Aspire 集成(GitHub Packages 安装)、CLI、线协议 prepared statements(驱动作者) |

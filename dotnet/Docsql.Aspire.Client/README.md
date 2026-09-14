@@ -4,6 +4,9 @@ DocSQL 的 Aspire client 集成:从 `ConnectionStrings:{name}`(由
 [Docsql.Aspire.Hosting](https://github.com/wjw1-Evan/docsql) 经 `WithReference` 注入)注册
 `DocsqlConnection`,并按需注册连接健康检查。
 
+> 完整使用手册(集群/控制台/凭据/消费侧/发布与排障)见
+> [Aspire 集成指南](https://github.com/wjw1-Evan/docsql/blob/main/docs/aspire.md)。
+
 ## 安装
 
 包发布在 GitHub Packages(`net10.0`),源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`,
