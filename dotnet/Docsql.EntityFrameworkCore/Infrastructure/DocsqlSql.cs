@@ -31,7 +31,7 @@ public sealed class DocsqlQuerySqlGenerator(
         {
             if (selectExpression.Limit is null)
             {
-                Sql.AppendLine().Append("LIMIT 18446744073709551615");
+                Sql.AppendLine().Append("LIMIT -1");
             }
             Sql.AppendLine().Append("OFFSET ");
             Visit(selectExpression.Offset);
