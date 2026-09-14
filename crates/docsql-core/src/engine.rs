@@ -1342,7 +1342,18 @@ impl<'a> ReadCx<'a> {
         // non-aggregated path (aggregates + ROWNUM error on the missing
         // column, which is the honest refusal).
         let group_exprs: Vec<SqlExpr> = match &select.group_by {
-            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
+            sqlparser::ast::GroupByExpr::Expressions(e, modifiers) => {
+                // MySQL `WITH ROLLUP` / ClickHouse `WITH TOTALS` modifiers
+                // would be silently dropped; the standard spellings are
+                // GROUP BY ROLLUP(...) / CUBE(...) / GROUPING SETS.
+                if !modifiers.is_empty() {
+                    return err(
+                        "GROUP BY modifiers (WITH ROLLUP/CUBE/TOTALS) are not supported \
+                         (use GROUP BY ROLLUP(...)/CUBE(...))",
+                    );
+                }
+                e.clone()
+            }
             sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
         };
         let grouping_sets = expand_grouping_sets(&group_exprs)?;
@@ -5236,6 +5247,14 @@ impl Database {
             use sqlparser::ast::TableConstraint as TC;
             match c {
                 TC::Unique(u) => {
+                    // A multi-column constraint would need a composite unique
+                    // tree; declaring it as per-column uniques silently
+                    // changes the semantics (any single column becomes
+                    // unique), so refuse and point at the supported form.
+                    if u.columns.len() != 1 {
+                        return err("composite UNIQUE table constraints are not supported \
+                             (use CREATE UNIQUE INDEX)");
+                    }
                     for ic in &u.columns {
                         let col = expr_name(&ic.column.expr);
                         if !meta.unique.contains(&col) {
@@ -5245,6 +5264,12 @@ impl Database {
                     }
                 }
                 TC::PrimaryKey(pk) => {
+                    // DocSQL has single-column primary keys; a composite key
+                    // must not silently degrade to its first column.
+                    if pk.columns.len() != 1 {
+                        return err("composite PRIMARY KEY is not supported \
+                             (declare a single-column PRIMARY KEY or use CREATE UNIQUE INDEX)");
+                    }
                     if let Some(ic) = pk.columns.first() {
                         meta.primary_key = Some(expr_name(&ic.column.expr));
                     }
@@ -5514,6 +5539,25 @@ impl Database {
         // the roots map per row.
         let idx_cols: Vec<String> = roots.keys().cloned().collect();
 
+        // ON CONFLICT [target]: the target names one unique constraint whose
+        // conflicts are skipped; without it every unique constraint takes
+        // part (SQLite/PG semantics). An unresolvable target errors instead
+        // of silently widening the scope.
+        let conflict_scope: Option<String> = match &insert.on {
+            Some(sqlparser::ast::OnInsert::OnConflict(c)) => match &c.conflict_target {
+                None => None,
+                Some(sqlparser::ast::ConflictTarget::Columns(cols)) => {
+                    let cols: Vec<String> = cols.iter().map(|i| i.value.clone()).collect();
+                    Some(resolve_conflict_columns(&meta, &cols)?)
+                }
+                Some(sqlparser::ast::ConflictTarget::OnConstraint(name)) => {
+                    let iname = obj_name(name);
+                    Some(resolve_conflict_constraint(&meta, &iname)?)
+                }
+            },
+            _ => None,
+        };
+
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
         if replace && !indexed.is_empty() {
@@ -5577,17 +5621,37 @@ impl Database {
         let mut insert_failed: Option<SqlError> = None;
         'outer: for doc in new_docs.into_iter() {
             if do_nothing {
-                for col in &indexed {
-                    let Some(v) = doc.get(col) else { continue };
-                    if matches!(v, Value::Null) {
-                        continue;
+                match &conflict_scope {
+                    // Untargeted: any unique constraint can skip the row.
+                    None => {
+                        for col in &indexed {
+                            let Some(v) = doc.get(col) else { continue };
+                            if matches!(v, Value::Null) {
+                                continue;
+                            }
+                            if BTree::open(roots[col])
+                                .get(&PageReader::current(&self.pager), &tx, v)
+                                .map_err(|e| index_err(col, e))?
+                                .is_some()
+                            {
+                                continue 'outer; // conflict: skip this row
+                            }
+                        }
                     }
-                    if BTree::open(roots[col])
-                        .get(&PageReader::current(&self.pager), &tx, v)
-                        .map_err(|e| index_err(col, e))?
-                        .is_some()
-                    {
-                        continue 'outer; // conflict: skip this row
+                    // Targeted: only this constraint's conflicts are skipped;
+                    // a conflict on any other unique constraint still errors
+                    // (the insert below enforces it).
+                    Some(root) => {
+                        let cols = meta.index_columns_of(root);
+                        if let Some(key) = index_key_of(&doc, &cols) {
+                            if BTree::open(roots[root])
+                                .get(&PageReader::current(&self.pager), &tx, &key)
+                                .map_err(|e| index_err(root, e))?
+                                .is_some()
+                            {
+                                continue 'outer;
+                            }
+                        }
                     }
                 }
             }
@@ -6147,6 +6211,49 @@ fn agg_parts(
     // and the aggregate itself (SQL:2003).
     let filter = f.filter.as_deref().cloned();
     Ok((op, arg, distinct, sep, filter))
+}
+
+/// Root key of the unique constraint an `ON CONFLICT (cols)` target names:
+/// a single-column spelling resolves through the constraint containers, a
+/// multi-column one must match a UNIQUE index (column sets compare
+/// order-insensitively, as in PostgreSQL).
+fn resolve_conflict_columns(meta: &TableMeta, cols: &[String]) -> Result<String> {
+    if cols.len() == 1 {
+        let col = &cols[0];
+        let constraint =
+            meta.primary_key.as_deref() == Some(col.as_str()) || meta.unique.contains(col);
+        if constraint && meta.index_roots.contains_key(col) {
+            return Ok(col.clone());
+        }
+    }
+    if let Some(def) = meta.index_defs.iter().find(|d| {
+        d.unique && d.columns.len() == cols.len() && cols.iter().all(|c| d.columns.contains(c))
+    }) {
+        return Ok(if def.columns.len() == 1 {
+            def.columns[0].clone()
+        } else {
+            def.name.clone()
+        });
+    }
+    err(format!(
+        "there is no unique constraint matching the ON CONFLICT target ({})",
+        cols.join(", ")
+    ))
+}
+
+/// Root key of the unique index `ON CONFLICT ON CONSTRAINT name` names.
+fn resolve_conflict_constraint(meta: &TableMeta, name: &str) -> Result<String> {
+    let Some(def) = meta.index_defs.iter().find(|d| d.name == name) else {
+        return err(format!("constraint {name} does not exist"));
+    };
+    if !def.unique {
+        return err(format!("constraint {name} is not unique"));
+    }
+    Ok(if def.columns.len() == 1 {
+        def.columns[0].clone()
+    } else {
+        def.name.clone()
+    })
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value> {
@@ -12840,6 +12947,10 @@ mod tests {
             ("SELECT v FROM t QUALIFY v = 1", "QUALIFY"),
             ("SELECT * FROM generate_series(1, 3)", "table functions"),
             ("SELECT v FROM t GROUP BY v SETTINGS x = 1", "SETTINGS"),
+            (
+                "SELECT v FROM t GROUP BY v WITH ROLLUP",
+                "GROUP BY modifiers",
+            ),
             ("SELECT * EXCLUDE (v) FROM t", "EXCLUDE"),
             (
                 "SELECT v FROM t LATERAL VIEW explode(v) x AS y",
@@ -12881,6 +12992,76 @@ mod tests {
                 vec![Value::Str("b".into()), Value::Int(1)],
             ]
         );
+    }
+
+    #[test]
+    fn unsupported_constraint_and_conflict_forms_error() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, b INT)");
+        for (sql, want) in [
+            (
+                "CREATE TABLE c1 (a INT, b INT, PRIMARY KEY (a, b))",
+                "composite PRIMARY KEY",
+            ),
+            (
+                "CREATE TABLE c2 (a INT, b INT, UNIQUE (a, b))",
+                "composite UNIQUE",
+            ),
+            (
+                "INSERT INTO t VALUES (1, 1) ON CONFLICT (a) DO NOTHING",
+                "no unique constraint",
+            ),
+            (
+                "INSERT INTO t VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET b = 1",
+                "DO UPDATE",
+            ),
+        ] {
+            let e = db.execute(sql).unwrap_err();
+            assert!(e.to_string().contains(want), "sql={sql} error={e}");
+        }
+        // The single-column spellings keep working, including DO NOTHING.
+        run(&mut db, "CREATE TABLE ok (a INT PRIMARY KEY, b INT UNIQUE)");
+        run(&mut db, "INSERT INTO ok VALUES (1, 1)");
+        run(
+            &mut db,
+            "INSERT INTO ok VALUES (1, 2) ON CONFLICT DO NOTHING",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM ok").rows,
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_target_scopes_the_skip() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        // Target matches the PK: a conflicting id is skipped.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO NOTHING",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows,
+            vec![vec![Value::Int(1)]]
+        );
+        // A conflict on a non-target unique constraint still errors.
+        let e = db
+            .execute("INSERT INTO t VALUES (2, 'a') ON CONFLICT (id) DO NOTHING")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("unique") || e.to_string().contains("UNIQUE"),
+            "{e}"
+        );
+        // A target that names no unique constraint errors.
+        let e = db
+            .execute("INSERT INTO t VALUES (3, 'c') ON CONFLICT (v, id) DO NOTHING")
+            .unwrap_err();
+        assert!(e.to_string().contains("no unique constraint"), "{e}");
     }
 
     #[test]
