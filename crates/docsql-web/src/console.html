@@ -188,7 +188,11 @@ button.danger { color:var(--err); }
   .grid tr.sel td { background: var(--tree-sel); }
   .grid td:hover { background: var(--grid-hover); }
   .grid .null { color: #b0b0b0; font-style: italic; }
+  .grid th.rowact, .grid td.rowact { width: 1%; white-space: nowrap; text-align: right; }
+  .grid td.rowact button { margin-left: 5px; }
   .grid-label { font-weight: 600; color: var(--txt2); padding: 6px 10px 2px; }
+  .tag { font-size: 10px; color: #6a4fa3; border: 1px solid #ddd0ee; background: #f4effc;
+         border-radius: 3px; padding: 0 4px; margin-left: 4px; vertical-align: 1px; }
 
   /* ---------- 仪表盘 ---------- */
   .dash { overflow: auto; padding: 16px; }
@@ -888,6 +892,129 @@ function insertDocDialog(tableName, meta, after) {
   };
 }
 
+/* ---------- 行级编辑/删除(按主键定位;无主键表不出此入口)---------- */
+// 主键列名清单:meta.keys(引擎声明顺序)优先,列标志兜底。
+function tableKeys(meta) {
+  if (!meta || !meta.columns) return [];
+  if (Array.isArray(meta.keys) && meta.keys.length) return meta.keys.slice();
+  return meta.columns.filter(c => c.primary_key).map(c => c.name);
+}
+// WHERE 定位子句;NULL 主键值用 IS NULL(否则永不匹配)。任一定位列缺失返回 null。
+function rowWhere(tableName, keys, cols, row) {
+  const parts = [];
+  for (const n of keys) {
+    const i = cols.indexOf(n);
+    if (i < 0) return null;
+    const v = row[i];
+    parts.push(`"${qident(n)}" ${v === null ? 'IS NULL' : '= ' + sqlLiteral(v)}`);
+  }
+  return parts.join(' AND ');
+}
+// 行单元格控件:布尔→select,数值→number,其余→text;NULL 由独立复选框表达。
+function rowFieldCell(name, value, readonly) {
+  if (readonly)
+    return `<input type="text" value="${esc(value === null ? '' : value)}" disabled title="自增列不可在线修改">`;
+  if (value === true || value === false)
+    return `<select data-v="1" data-type="bool">
+      <option value="true"${value === true ? ' selected' : ''}>true</option>
+      <option value="false"${value === false ? ' selected' : ''}>false</option></select>`;
+  if (typeof value === 'number')
+    return `<input type="number" step="any" data-v="1" data-type="num" value="${esc(value)}">`;
+  return `<input type="text" data-v="1" data-type="str" value="${esc(value === null ? '' : value)}"
+    placeholder="${value === null ? '(NULL)' : ''}">`;
+}
+
+async function editRowDialog(tableName, meta, cols, row, after) {
+  const keys = tableKeys(meta);
+  const where = rowWhere(tableName, keys, cols, row);
+  if (!where) { ui.toast('无法定位该行:主键列不在查询结果中', true); return; }
+  const mcol = (n) => (meta && meta.columns ? meta.columns.find(c => c.name === n) : null);
+  const trs = cols.map((n, i) => {
+    const mc = mcol(n);
+    const ro = !!mc && mc.autoinc;
+    const badge = (mc && mc.primary_key ? ' <span class="tag">PK</span>' : '') + (ro ? ' <span class="tag">自增</span>' : '');
+    return `<tr data-field-col="${i}"><td class="lbl">${esc(n)}${badge}</td>
+      <td>${rowFieldCell(n, row[i], ro)}</td>
+      <td style="text-align:center"><input type="checkbox" data-null="1"${row[i] === null ? ' checked' : ''}${ro ? ' disabled title="自增列不可修改"' : ''} title="值为 NULL"></td></tr>`;
+  }).join('');
+  const ov = showModal(`<div class="dialog" style="min-width:560px;max-width:660px"><h3>编辑行 — ${esc(tableName)}</h3><div class="body">
+    <table class="colgrid"><thead><tr><th style="width:34%">列</th><th>值</th><th style="width:12%">NULL</th></tr></thead>
+      <tbody>${trs}</tbody></table>
+    <div class="hint">按主键定位该行并执行 UPDATE(集群按写路径扇出)。勾选 NULL 的值保存为 NULL;自增列只读。</div>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`,
+    'input[data-v="1"],select[data-v="1"]');
+  $$('[data-null]', ov).forEach(chk => {
+    const sync = () => {
+      const inp = $('input[data-v="1"],select[data-v="1"]', chk.closest('tr'));
+      if (inp) inp.disabled = chk.checked;
+    };
+    chk.onchange = sync;
+    sync();
+  });
+  $('[data-ok]', ov).onclick = async () => {
+    const err = (m) => { $('[data-err]', ov).textContent = m; };
+    const setParts = [];
+    for (let i = 0; i < cols.length; i++) {
+      const n = cols[i];
+      const mc = mcol(n);
+      if (mc && mc.autoinc) continue;
+      const tr = $(`tr[data-field-col="${i}"]`, ov);
+      const nullCk = $('[data-null]', tr);
+      const isNull = nullCk.checked;
+      let v;
+      if (!isNull) {
+        const ctrl = $('[data-v="1"]', tr);
+        if (ctrl.dataset.type === 'bool') v = ctrl.value === 'true';
+        else if (ctrl.dataset.type === 'num') {
+          const t = ctrl.value.trim();
+          if (t === '') return err(`列 ${n}:需要数值(或勾选 NULL)`);
+          const num = Number(t);
+          if (!Number.isFinite(num)) return err(`列 ${n}:不是有效数值`);
+          v = num;
+        }
+        else v = ctrl.value;
+      }
+      setParts.push(`"${qident(n)}" = ${isNull ? 'NULL' : sqlLiteral(v)}`);
+    }
+    if (!setParts.length) return err('没有可修改的列');
+    const sql = `UPDATE "${qident(tableName)}" SET ${setParts.join(', ')} WHERE ${where}`;
+    ui.status(`正在更新 ${tableName}…`, 'busy');
+    let r;
+    try { r = await api.post('/api/sql', {sql}); }
+    catch (e) { ui.status('更新失败', 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status('更新失败', 'err'); return err(r.message); }
+    ui.toast('已更新该行');
+    closeModal();
+    if (after) after();
+  };
+  ov.onkeydown = (e) => {
+    if (e.key === 'Enter' && e.target.matches('input[type=text],input[type=number]')) $('[data-ok]', ov).click();
+  };
+}
+
+function deleteRowDialog(tableName, meta, cols, row, after) {
+  const where = rowWhere(tableName, tableKeys(meta), cols, row);
+  if (!where) { ui.toast('无法定位该行:主键列不在查询结果中', true); return; }
+  const sql = `DELETE FROM "${qident(tableName)}" WHERE ${where}`;
+  const ov = showModal(`<div class="dialog"><h3>删除行</h3><div class="body">
+    <div class="hint">执行并沿集群写路径扇出,不可撤销:</div>
+    <pre style="white-space:pre-wrap;word-break:break-all;margin:6px 0;font-family:var(--mono);font-size:12px;color:var(--txt2);background:var(--bg);border:1px solid var(--border);padding:8px;border-radius:3px">${esc(sql)}</pre>
+    <div class="err-line" data-err></div></div>
+    <div class="foot"><button data-cancel>取消</button><button class="primary danger" data-ok>删除该行</button></div></div>`);
+  $('[data-ok]', ov).onclick = async () => {
+    const err = (m) => { $('[data-err]', ov).textContent = m; };
+    ui.status('正在删除…', 'busy');
+    let r;
+    try { r = await api.post('/api/sql', {sql}); }
+    catch (e) { ui.status('删除失败', 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status('删除失败', 'err'); return err(r.message); }
+    ui.toast('已删除该行');
+    closeModal();
+    if (after) after();
+  };
+}
+
 /* ---------- 索引管理(引擎仅支持单列;修改 = 按新定义重建)---------- */
 const indexCreateSql = (t, name, col, uniq) =>
   `CREATE ${uniq ? 'UNIQUE ' : ''}INDEX "${qident(name)}" ON "${qident(t)}" ("${qident(col)}")`;
@@ -1141,11 +1268,16 @@ function renderGrid(container, cols, rows, opts) {
         return state.asc ? c : -c;
       });
     }
+    const btns = opts.btns; // (row, ri) => [{label, title, cls, act}] per-row actions, or falsy
     const head = `<th class="rownum">#</th>` + cols.map((c, i) =>
-      `<th data-ci="${i}" title="${esc(c)}">${esc(c)}${state.sortCol === i ? `<span class="sort-ind">${state.asc ? '▲' : '▼'}</span>` : ''}</th>`).join('');
+      `<th data-ci="${i}" title="${esc(c)}">${esc(c)}${state.sortCol === i ? `<span class="sort-ind">${state.asc ? '▲' : '▼'}</span>` : ''}</th>`).join('') +
+      (btns ? '<th class="rowact"></th>' : '');
     const body = data.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
       `<td class="rownum">${ri + 1}</td>` +
-      row.map(v => `<td title="${v === null ? 'NULL' : esc(v)}">${v === null ? '<span class="null">NULL</span>' : esc(v)}</td>`).join('') + '</tr>').join('');
+      row.map(v => `<td title="${v === null ? 'NULL' : esc(v)}">${v === null ? '<span class="null">NULL</span>' : esc(v)}</td>`).join('') +
+      (btns ? `<td class="rowact">${(btns(row, ri) || []).map((b, i) =>
+        `<button data-bt="${ri}:${i}"${b.cls ? ` class="${b.cls}"` : ''}${b.title ? ` title="${esc(b.title)}"` : ''}>${b.label}</button>`).join('')}</td>` : '') +
+      '</tr>').join('');
     wrap.innerHTML = `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
     $$('th[data-ci]', wrap).forEach(th => th.onclick = () => {
       const i = +th.dataset.ci;
@@ -1156,6 +1288,14 @@ function renderGrid(container, cols, rows, opts) {
     if (opts.onRowClick) $$('tr[data-ri]', wrap).forEach(tr => {
       tr.onclick = () => { $$('tr', wrap).forEach(x => x.classList.remove('sel')); tr.classList.add('sel');
         opts.onRowClick(data[+tr.dataset.ri]); };
+    });
+    if (btns) $$('button[data-bt]', wrap).forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const [ri, i] = btn.dataset.bt.split(':').map(Number);
+        const b = (btns(data[ri], ri) || [])[i];
+        if (b) b.act();
+      };
     });
   };
   draw();
@@ -1294,8 +1434,14 @@ function openDataTab(tableName, meta) {
         const r = await api.post('/api/sql', {sql: `SELECT * FROM "${qident(tableName)}" ORDER BY 1 LIMIT ${t.limit} OFFSET ${t.offset}`});
         t.host.innerHTML = '';
         if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; return; }
-        const pk = meta && meta.keys && meta.keys[0];
-        renderGrid(t.host, r.columns, r.rows, pk ? {onRowClick: row => { t.selected = row; }} : {});
+        const keys = tableKeys(meta);
+        renderGrid(t.host, r.columns, r.rows, keys.length ? {
+          onRowClick: row => { t.selected = row; },
+          btns: row => [
+            {label: '编辑', title: '编辑此行(按主键 UPDATE)', act: () => editRowDialog(tableName, meta, r.columns, row, t.load)},
+            {label: '删除', cls: 'danger', title: '删除此行(按主键)', act: () => deleteRowDialog(tableName, meta, r.columns, row, t.load)},
+          ],
+        } : {});
         range();
         ui.status(`${tableName}:共 ${t.total} 行`);
         $('[data-do="prev"]', t.el).disabled = t.offset <= 0;
