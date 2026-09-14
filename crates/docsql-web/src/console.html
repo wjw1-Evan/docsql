@@ -843,13 +843,29 @@ function editTableDialog(tableName, meta, after) {
 
 /* ---------- 插入文档(JSON → INSERT;对象单行,数组批量)---------- */
 // JSON 值 → SQL 字面量:嵌套对象/数组以 JSON 文本字符串存储(DocSQL 文档式存储支持声明外字段)。
+// 服务端精确标量标记:`$dec` → CAST(... AS DECIMAL),`$bytes` → x'..'。
 function sqlLiteral(v) {
   if (v === null) return 'NULL';
   const t = typeof v;
   if (t === 'number') return Number.isFinite(v) ? String(v) : 'NULL';
   if (t === 'boolean') return v ? 'TRUE' : 'FALSE';
   if (t === 'string') return "'" + v.replace(/'/g, "''") + "'";
+  if (t === 'object') {
+    if (typeof v.$dec === 'string') return "CAST('" + v.$dec.replace(/'/g, "''") + "' AS DECIMAL)";
+    if (Array.isArray(v.$bytes)) return "x'" + v.$bytes.map(b => Number(b).toString(16).padStart(2, '0')).join('') + "'";
+  }
   return "'" + JSON.stringify(v).replace(/'/g, "''") + "'";
+}
+
+// 网格单元格显示:DECIMAL/BLOB 标记以数值文本 / 十六进制文本呈现,其余对象走 JSON。
+function fmtCell(v) {
+  if (v === null || v === undefined) return 'NULL';
+  if (typeof v === 'object') {
+    if (typeof v.$dec === 'string') return v.$dec;
+    if (Array.isArray(v.$bytes)) return "x'" + v.$bytes.map(b => Number(b).toString(16).padStart(2, '0')).join('') + "'";
+    return JSON.stringify(v);
+  }
+  return String(v);
 }
 
 function insertDocDialog(tableName, meta, after) {
@@ -913,14 +929,14 @@ function rowWhere(tableName, keys, cols, row) {
 // 行单元格控件:布尔→select,数值→number,其余→text;NULL 由独立复选框表达。
 function rowFieldCell(name, value, readonly) {
   if (readonly)
-    return `<input type="text" value="${esc(value === null ? '' : value)}" disabled title="自增列不可在线修改">`;
+    return `<input type="text" value="${esc(value === null ? '' : fmtCell(value))}" disabled title="自增列不可在线修改">`;
   if (value === true || value === false)
     return `<select data-v="1" data-type="bool">
       <option value="true"${value === true ? ' selected' : ''}>true</option>
       <option value="false"${value === false ? ' selected' : ''}>false</option></select>`;
   if (typeof value === 'number')
     return `<input type="number" step="any" data-v="1" data-type="num" value="${esc(value)}">`;
-  return `<input type="text" data-v="1" data-type="str" value="${esc(value === null ? '' : value)}"
+  return `<input type="text" data-v="1" data-type="str" value="${esc(value === null ? '' : fmtCell(value))}"
     placeholder="${value === null ? '(NULL)' : ''}">`;
 }
 
@@ -1274,7 +1290,7 @@ function renderGrid(container, cols, rows, opts) {
       (btns ? '<th class="rowact"></th>' : '');
     const body = data.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
       `<td class="rownum">${ri + 1}</td>` +
-      row.map(v => `<td title="${v === null ? 'NULL' : esc(v)}">${v === null ? '<span class="null">NULL</span>' : esc(v)}</td>`).join('') +
+      row.map(v => `<td title="${v === null ? 'NULL' : esc(fmtCell(v))}">${v === null ? '<span class="null">NULL</span>' : esc(fmtCell(v))}</td>`).join('') +
       (btns ? `<td class="rowact">${(btns(row, ri) || []).map((b, i) =>
         `<button data-bt="${ri}:${i}"${b.cls ? ` class="${b.cls}"` : ''}${b.title ? ` title="${esc(b.title)}"` : ''}>${b.label}</button>`).join('')}</td>` : '') +
       '</tr>').join('');

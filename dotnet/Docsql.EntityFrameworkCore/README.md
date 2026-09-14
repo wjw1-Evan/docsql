@@ -23,7 +23,8 @@ class AppDb(DbContextOptions<AppDb> options) : DbContext(options)
 ```
 
 - `EnsureCreated` / 惰性自动建表:模型缺表缺列启动即补(免迁移)
-- 模型与索引自动同步:`[Index]` 特性索引(含唯一索引)随模型增删自动创建/回收
+- 模型与索引自动同步:`[Index]` 特性索引(含唯一索引)与复合索引随模型增删自动创建/回收
+- 类型映射:`decimal` → 精确 `DECIMAL`(`HasPrecision` 生效;服务端 `Sum`/比较不丢精度)、`DateOnly`/`TimeOnly`、`byte[]` → `BLOB`(单值 ≤16MiB);`List.Contains` 翻译为 `IN (…)`,字符串 `StartsWith/EndsWith/Contains` 翻译为 `LIKE`
 - CRUD / LINQ / `Include` / 原生 `FromSql` 全支持
 - `Database.Migrate()` 显式报错:DocSQL 不支持 EF Migrations,请使用 EnsureCreated(显式报错并指引,绝不静默)
 

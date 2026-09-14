@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub use rust_decimal::Decimal;
+
 /// Field ordering in objects is deterministic (BTreeMap) so encodings are
 /// stable across processes and replays.
 pub type Object = BTreeMap<String, Value>;
@@ -16,6 +18,9 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// Exact decimal (SQL DECIMAL/NUMERIC). Compared numerically against
+    /// Int/Float; arithmetic stays exact while no Float is involved.
+    Decimal(Decimal),
     Str(String),
     Bytes(Vec<u8>),
     Array(Vec<Value>),
@@ -29,6 +34,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
             Value::Float(_) => "float",
+            Value::Decimal(_) => "decimal",
             Value::Str(_) => "string",
             Value::Bytes(_) => "bytes",
             Value::Array(_) => "array",
@@ -50,6 +56,13 @@ impl Value {
         }
     }
 
+    pub fn as_decimal(&self) -> Option<Decimal> {
+        match self {
+            Value::Decimal(d) => Some(*d),
+            _ => None,
+        }
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
@@ -58,14 +71,14 @@ impl Value {
     }
 
     /// Total ordering used by indexes and ORDER BY. Null < Bool < numbers
-    /// (int/float compared numerically) < Str < Bytes < Array < Object.
+    /// (int/float/decimal compared numerically) < Str < Bytes < Array < Object.
     pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         fn rank(v: &Value) -> u8 {
             match v {
                 Value::Null => 0,
                 Value::Bool(_) => 1,
-                Value::Int(_) | Value::Float(_) => 2,
+                Value::Int(_) | Value::Float(_) | Value::Decimal(_) => 2,
                 Value::Str(_) => 3,
                 Value::Bytes(_) => 4,
                 Value::Array(_) => 5,
@@ -80,6 +93,11 @@ impl Value {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
+            (Value::Decimal(x), Value::Int(y)) => x.cmp(&Decimal::from(*y)),
+            (Value::Int(x), Value::Decimal(y)) => Decimal::from(*x).cmp(y),
+            (Value::Decimal(x), Value::Float(y)) => cmp_decimal_f64(x, *y),
+            (Value::Float(x), Value::Decimal(y)) => cmp_decimal_f64(y, *x).reverse(),
             (Value::Float(_), Value::Float(_))
             | (Value::Int(_), Value::Float(_))
             | (Value::Float(_), Value::Int(_)) => {
@@ -132,6 +150,20 @@ impl Value {
     }
 }
 
+/// Decimal ↔ f64 order: NaN ranks above everything (matching the Float/Float
+/// rule), ±infinity sits beyond the finite decimal range.
+fn cmp_decimal_f64(d: &Decimal, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return Ordering::Less; // d < NaN
+    }
+    match Decimal::from_f64_retain(f) {
+        Some(fd) => d.cmp(&fd),
+        None if f > 0.0 => Ordering::Less, // d < +inf
+        None => Ordering::Greater,         // d > -inf
+    }
+}
+
 fn num_as_f64(v: &Value) -> f64 {
     match v {
         Value::Int(i) => *i as f64,
@@ -147,6 +179,7 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int(i) => write!(f, "{i}"),
             Value::Float(x) => write!(f, "{x}"),
+            Value::Decimal(d) => write!(f, "{d}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Bytes(b) => write!(
                 f,
@@ -191,6 +224,30 @@ mod tests {
             Greater
         );
         assert_eq!(Value::cmp_values(&Value::Int(3), &Value::Float(3.0)), Equal);
+        // Decimal participates in the numeric rank and compares exactly.
+        assert_eq!(
+            Value::cmp_values(&Value::Int(3), &Value::Decimal(Decimal::new(30, 1))),
+            Equal
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::new(15, 1)), &Value::Float(1.5)),
+            Equal
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::new(2, 0)), &Value::Float(1.5)),
+            Greater
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::new(2, 0)), &Value::Float(f64::NAN)),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Decimal(Decimal::new(2, 0)),
+                &Value::Float(f64::INFINITY)
+            ),
+            Less
+        );
         assert_eq!(
             Value::cmp_values(&Value::Str("a".into()), &Value::Str("b".into())),
             Less
@@ -213,20 +270,24 @@ mod tests {
     #[test]
     fn accessors_and_type_names() {
         let s = Value::Str("hi".into());
+        let dec = Decimal::new(12345, 2);
         assert_eq!(s.as_str(), Some("hi"));
         assert_eq!(Value::Int(7).as_i64(), Some(7));
         assert_eq!(Value::Bool(true).as_bool(), Some(true));
+        assert_eq!(Value::Decimal(dec).as_decimal(), Some(dec));
         // wrong-type accessors yield None
         assert_eq!(s.as_i64(), None);
         assert_eq!(s.as_bool(), None);
         assert_eq!(Value::Int(1).as_str(), None);
         assert_eq!(Value::Bool(false).as_i64(), None);
         assert_eq!(Value::Null.as_bool(), None);
+        assert_eq!(Value::Int(1).as_decimal(), None);
         for (v, name) in [
             (&Value::Null, "null"),
             (&Value::Bool(false), "bool"),
             (&Value::Int(0), "int"),
             (&Value::Float(0.0), "float"),
+            (&Value::Decimal(dec), "decimal"),
             (&s, "string"),
             (&Value::Bytes(vec![]), "bytes"),
             (&Value::Array(vec![]), "array"),
@@ -242,6 +303,7 @@ mod tests {
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Int(-5).to_string(), "-5");
         assert_eq!(Value::Float(1.5).to_string(), "1.5");
+        assert_eq!(Value::Decimal(Decimal::new(12345, 2)).to_string(), "123.45");
         assert_eq!(Value::Str("s".into()).to_string(), "s");
         assert_eq!(
             Value::Bytes(vec![0xde, 0xad, 0x01]).to_string(),

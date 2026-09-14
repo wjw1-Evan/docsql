@@ -89,11 +89,11 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | 领域 | 支持 |
 |---|---|
 | 存储 | JSON 文档整体存储(无强制 schema)、WAL 崩溃恢复、手写分页器与 B+ 树 |
-| SQL | CREATE/ALTER/DROP TABLE+INDEX、INSERT(多行/RETURNING)、UPDATE/DELETE(RETURNING)、SELECT(WHERE/ORDER/LIMIT/OFFSET/GROUP BY+HAVING/COUNT/SUM/AVG/MIN/MAX/JOIN:INNER/LEFT/CROSS/USING/子查询派生表/UNION(ALL)/IN)、事务 BEGIN/COMMIT/ROLLBACK、PRIMARY KEY/UNIQUE/NOT NULL/AUTOINCREMENT、GUID 主键(UUIDv7 时序有序自动生成)、JSON 函数(JSON_EXTRACT/JSON_TYPE/JSON_VALID:文档点读路径 `$.a.b[0]`)、**多列(复合)索引**(`CREATE INDEX … ON t (a, b)`,复合 UNIQUE 判重;前导列等值探测)、**Oracle 兼容**(DUAL 哑表、ROWNUM 伪列、FETCH FIRST n ROWS ONLY、NVL/NVL2/DECODE/INSTR/LPAD/RPAD/GREATEST/LEAST/TO_NUMBER/TO_CHAR/SYSDATE()、ALL_/USER_ 数据字典视图)、information_schema、sqlite_master 兼容视图、PRAGMA 兼容 |
+| SQL | CREATE/ALTER/DROP TABLE+INDEX、INSERT(多行/RETURNING/INSERT…SELECT)、UPDATE/DELETE(RETURNING)、SELECT(WHERE/ORDER/LIMIT/OFFSET/GROUP BY+HAVING/COUNT/SUM/AVG/MIN/MAX/JOIN:INNER/LEFT/CROSS/USING/子查询派生表/UNION(ALL)/IN)、事务 BEGIN/COMMIT/ROLLBACK、PRIMARY KEY/UNIQUE/NOT NULL/AUTOINCREMENT、GUID 主键(UUIDv7 时序有序自动生成)、**精确 DECIMAL**(`CAST('123.45' AS DECIMAL)`,算术/聚合/比较按十进制语义且 28~29 位有效数字)、**BLOB**(`x'hex'` 字面量)、JSON 函数(JSON_EXTRACT/JSON_TYPE/JSON_VALID:文档点读路径 `$.a.b[0]`)、**多列(复合)索引**(`CREATE INDEX … ON t (a, b)`,复合 UNIQUE 判重;前导列等值探测)、**Oracle 兼容**(DUAL 哑表、ROWNUM 伪列、FETCH FIRST n ROWS ONLY、NVL/NVL2/DECODE/INSTR/LPAD/RPAD/GREATEST/LEAST/TO_NUMBER/TO_CHAR/SYSDATE()、ALL_/USER_ 数据字典视图)、information_schema、sqlite_master 兼容视图、PRAGMA 兼容 |
 | 网络 | 自定义二进制协议 v1(预留拓扑版本/重定向字段)、REQ_AUTH token 认证、节点间集群认证(DOCSQL_CLUSTER_TOKEN:复制帧仅接受集群身份,客户端凭据无法伪造节点流量)、REQ_PROMOTE 故障转移提升、REQ_STATUS 节点状态报告(含运行时计数器:连接/语句/字节/认证失败,可直接喂 `/metrics`)、REQ_BACKUP 备份管理与手动触发、REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT 服务端参数化(占位符在服务端引号感知绑定,注入载荷无法逃逸字面量) |
 | 发布订阅 | 持久化 pub/sub(参考 Redis 命令面):PUBLISH/SUBSCRIBE/PSUBSCRIBE(glob `*` `?` `[...]`)/UNSUBSCRIBE/PUBSUB CHANNELS·NUMSUB·NUMPAT·TRIM;消息先经 WAL 落盘再推送,重启不丢;订阅可指定起点(`earliest` 全量回放 / `latest` 仅新消息 / 指定 id 续传),断线用最后收到的 id 重新订阅即补齐(at-least-once);集群内发布自动扇出到全部节点,各节点本地落盘并推送本地订阅者;`docsql_pubsub` 系统视图可查消息历史 |
 | Web | **DocSQL Studio**(SSMS 风格管理控制台,纯管理工具、自身不存数据,默认连接并管理指定节点):对象资源管理器(表/列/索引/键 + 系统视图)、多标签查询编辑器(SQL 高亮/F5 执行/Ctrl+F5 分析/批量多结果集)、数据网格(排序/分页/行内编辑与删除——按主键定位生成 UPDATE/DELETE,自增列只读、可勾选置 NULL;主键列缺失的表不提供行编辑)、新建表 / 插入文档(参考 mongo-express:列编辑网格建表——类型含 GUID 时序主键、JSON 文档插入,支持批量与表外字段)、服务器仪表盘、集群状态页、日志页(数据/同步/错误,含各节点来源)、备份管理页(备份状态/文件列表/立即备份/一键恢复——恢复需输入完整文件名确认)、节点切换(默认管理节点 ↔ 任意 `DOCSQL_PEERS` 节点);REST API(/api/sql /api/parse /api/meta /api/stats /api/cluster /api/logs /api/backup,其中数据端点 /api/sql /api/meta /api/stats /api/backup 可带 `node` 参数指定目标节点) |
-| EF Core | `UseDocsql(connectionString)`(独立原生提供程序,基于 Docsql ADO.NET,不依赖 SQLite):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引(含唯一索引;模型增删索引均自动同步,免迁移) |
+| EF Core | `UseDocsql(connectionString)`(独立原生提供程序,基于 Docsql ADO.NET,不依赖 SQLite):EnsureCreated/CRUD/LINQ/Include/`[Index]` 特性索引与模型复合索引(含唯一索引;模型增删索引均自动同步,免迁移);`decimal`→精确 `DECIMAL`(服务端 Sum/比较不丢精度)、`DateOnly`/`TimeOnly`、`byte[]`→`BLOB`、`List.Contains`→`IN` |
 | 集群 | 对等集群(`DOCSQL_PEERS`:任意节点可写,SQL 写入扇出至全部对等节点;节点之间用独立集群凭据互相认证)、主从复制(写转发)、只读副本、PROMOTE 故障转移 |
 
 ## 结构
@@ -110,7 +110,7 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
 - Docker:compose 双 profile 部署测试全绿——多节点 81 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
-- .NET:xUnit(ADO.NET Client 90 项 + EF Core 24 项 + Aspire 集成 12 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型与长语句契约/资源模型快照与 DI 注册)
+- .NET:xUnit(ADO.NET Client 91 项 + EF Core 28 项 + Aspire 集成 12 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型(含 DECIMAL/BLOB/DateOnly/TimeOnly)与长语句契约/复合索引/资源模型快照与 DI 注册)
 - CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(81 + 34 项)
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)

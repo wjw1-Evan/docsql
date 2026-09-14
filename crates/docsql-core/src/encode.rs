@@ -4,16 +4,17 @@
 //! ```text
 //! value := tag payload
 //! tag   := 0 null | 1 bool | 2 int | 3 float | 4 str | 5 bytes
-//!       | 6 array | 7 object
+//!       | 6 array | 7 object | 8 decimal
 //! str   := len:u32 bytes:utf8
 //! bytes := len:u32 bytes
 //! array := len:u32 value*
 //! object:= len:u32 (str_key value)*
+//! decimal := 16 bytes (rust_decimal serialized form)
 //! ```
 //! Trailing garbage after one value is rejected by `decode` to catch
 //! corruption early; `decode_prefix` allows framed streams.
 
-use crate::value::{Object, Value};
+use crate::value::{Decimal, Object, Value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -130,6 +131,12 @@ impl<'a> Decoder<'a> {
                 }
                 Value::Object(obj)
             }
+            8 => {
+                let b = self.take(16)?;
+                let mut raw = [0u8; 16];
+                raw.copy_from_slice(b);
+                Value::Decimal(Decimal::deserialize(raw))
+            }
             t => return Err(EncodeError::UnknownTag(t)),
         })
     }
@@ -154,6 +161,10 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         Value::Float(f) => {
             out.push(3);
             out.extend_from_slice(&f.to_le_bytes());
+        }
+        Value::Decimal(d) => {
+            out.push(8);
+            out.extend_from_slice(&d.serialize());
         }
         Value::Str(s) => {
             out.push(4);
@@ -226,6 +237,10 @@ mod tests {
         roundtrip(Value::Int(i64::MAX));
         roundtrip(Value::Float(3.25));
         roundtrip(Value::Float(-0.0));
+        roundtrip(Value::Decimal(
+            "12345678901234567890.123456".parse().unwrap(),
+        ));
+        roundtrip(Value::Decimal(Decimal::new(-1, 28)));
         roundtrip(Value::Str("hello 世界 🎉".into()));
         roundtrip(Value::Bytes(vec![0, 1, 255, 128]));
     }

@@ -47,6 +47,13 @@ fn write_value(out: &mut String, v: &Value) {
                 out.push_str("null"); // JSON has no NaN/Inf
             }
         }
+        Value::Decimal(d) => {
+            // JSON numbers are IEEE doubles on the consuming side; a marker
+            // object keeps the exact decimal text (like `$bytes` below).
+            out.push_str("{\"$dec\":\"");
+            let _ = write!(out, "{d}");
+            out.push_str("\"}");
+        }
         Value::Str(s) => write_json_string(out, s),
         Value::Bytes(b) => {
             // Encode as {"$bytes": [ints]} — non-standard but lossless.
@@ -108,6 +115,30 @@ fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
     out.push_str(&escape_str(s));
     out.push('"');
+}
+
+/// Wire markers decode back to their exact scalar types: `{"$dec":"..."}` is
+/// the lossless DECIMAL carrier and `{"$bytes":[...]}` the BLOB carrier.
+/// Shapes that do not qualify stay plain objects.
+fn decode_marker(obj: Object) -> Value {
+    if obj.len() == 1 {
+        if let Some(Value::Str(s)) = obj.get("$dec") {
+            if let Ok(d) = s.parse::<crate::value::Decimal>() {
+                return Value::Decimal(d);
+            }
+        }
+        if let Some(Value::Array(items)) = obj.get("$bytes") {
+            let mut bytes = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    Value::Int(i) if (0..=255).contains(i) => bytes.push(*i as u8),
+                    _ => return Value::Object(obj),
+                }
+            }
+            return Value::Bytes(bytes);
+        }
+    }
+    Value::Object(obj)
 }
 
 pub fn from_str(s: &str) -> Result<Value> {
@@ -207,7 +238,7 @@ impl<'a> Parser<'a> {
                         _ => return Err(JsonError::Unexpected('}', self.pos)),
                     }
                 }
-                Ok(Value::Object(obj))
+                Ok(decode_marker(obj))
             }
             Some(b'-' | b'0'..=b'9') => self.number(),
             other => Err(JsonError::Unexpected(
@@ -351,6 +382,7 @@ mod tests {
             Value::Bool(true),
             Value::Int(-42),
             Value::Float(3.5),
+            Value::Decimal("3.14159265358979323846".parse().unwrap()),
             Value::Str("hello 世界 🎉 \"quoted\" \\".into()),
         ] {
             let s = to_string(&v);
@@ -431,9 +463,29 @@ mod tests {
         let v = Value::Bytes(vec![0, 1, 255]);
         let s = to_string(&v);
         assert_eq!(s, r#"{"$bytes":[0,1,255]}"#);
-        // Parsing yields the generic object form (bytes is a write-side encoding).
-        assert!(matches!(from_str(&s), Ok(Value::Object(_))));
+        // The marker round-trips back to the exact byte string.
+        assert_eq!(from_str(&s).unwrap(), v);
         assert_eq!(to_string(&Value::Bytes(vec![])), r#"{"$bytes":[]}"#);
+        // Out-of-range elements fall back to a plain object.
+        assert!(matches!(
+            from_str(r#"{"$bytes":[256]}"#),
+            Ok(Value::Object(_))
+        ));
+    }
+
+    #[test]
+    fn decimals_serialize_as_exact_marker() {
+        let v = Value::Decimal("0.10000000000000000555".parse().unwrap());
+        assert_eq!(to_string(&v), r#"{"$dec":"0.10000000000000000555"}"#);
+        assert_eq!(from_str(&to_string(&v)).unwrap(), v);
+        let v = Value::Decimal("12345678901234567890.12".parse().unwrap());
+        assert_eq!(to_string(&v), r#"{"$dec":"12345678901234567890.12"}"#);
+        assert_eq!(from_str(&to_string(&v)).unwrap(), v);
+        // Non-decimal text stays an object.
+        assert!(matches!(
+            from_str(r#"{"$dec":"nope"}"#),
+            Ok(Value::Object(_))
+        ));
     }
 
     #[test]

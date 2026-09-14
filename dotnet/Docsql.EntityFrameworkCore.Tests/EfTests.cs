@@ -294,7 +294,7 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
     }
 
     [Fact]
-    public void Composite_index_is_skipped_without_breaking_the_context()
+    public void Composite_index_is_created_with_all_columns()
     {
         using var conn = new DocsqlConnection(Cs);
         conn.Open();
@@ -305,11 +305,98 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
         }
         using (var db = new WidgetDb(Cs))
         {
-            // 复合索引引擎暂不支持:同步按尽力而为跳过,读写不受影响
             db.Widgets.Add(new Widget { Sku = "A", Zone = 1 });
             db.Widgets.Add(new Widget { Sku = "B", Zone = 1 });
             db.SaveChanges();
             Assert.Equal(2, db.Widgets.Count(w => w.Zone == 1));
+        }
+
+        // 复合索引按列序创建,引擎以 (Sku, Zone) 复合键维护 B+ 树。
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'IX_Widgets_Sku_Zone'";
+            var ddl = Assert.IsType<string>(cmd.ExecuteScalar());
+            Assert.Contains("Sku", ddl);
+            Assert.Contains("Zone", ddl);
+        }
+    }
+
+    [Fact]
+    public void Decimal_aggregate_and_comparison_stay_exact_on_the_server()
+    {
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE IF EXISTS Ledgers";
+            cmd.ExecuteNonQuery();
+        }
+        using (var db = new LedgerDb(Cs))
+        {
+            db.Ledgers.Add(new Ledger { Amount = 0.1m });
+            db.Ledgers.Add(new Ledger { Amount = 0.2m });
+            db.Ledgers.Add(new Ledger { Amount = 12345678901234567.89m });
+            db.SaveChanges();
+
+            // 服务端 SUM 按十进制精确求和:double 路径会得到 ...68.190000000000
+            Assert.Equal(12345678901234568.19m, db.Ledgers.Sum(l => l.Amount));
+            // 参数化比较走 $dec → CAST(... AS DECIMAL),不经过 IEEE double
+            Assert.Single(db.Ledgers.Where(l => l.Amount == 0.1m).ToList());
+            Assert.Equal(2, db.Ledgers.Count(l => l.Amount > 0.05m && l.Amount < 1m));
+            // 单行读取精确
+            var big = db.Ledgers.Single(l => l.Amount > 1000m);
+            Assert.Equal(12345678901234567.89m, big.Amount);
+        }
+    }
+
+    [Fact]
+    public void DateOnly_and_TimeOnly_roundtrip_and_compare_server_side()
+    {
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE IF EXISTS Schedules";
+            cmd.ExecuteNonQuery();
+        }
+        using (var db = new ScheduleDb(Cs))
+        {
+            db.Schedules.Add(new Schedule
+            {
+                Day = new DateOnly(2024, 3, 15),
+                At = new TimeOnly(13, 45, 30, 250),
+            });
+            db.SaveChanges();
+
+            var row = db.Schedules.Single(s => s.Day == new DateOnly(2024, 3, 15));
+            Assert.Equal(new DateOnly(2024, 3, 15), row.Day);
+            Assert.Equal(new TimeOnly(13, 45, 30, 250), row.At);
+            // 范围比较在服务端按可排序 ISO 文本执行
+            Assert.Single(db.Schedules.Where(s => s.Day >= new DateOnly(2024, 3, 1)).ToList());
+            Assert.Empty(db.Schedules.Where(s => s.Day < new DateOnly(2024, 1, 1)).ToList());
+        }
+    }
+
+    [Fact]
+    public void Byte_array_maps_to_blob_and_roundtrips()
+    {
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE IF EXISTS Assets";
+            cmd.ExecuteNonQuery();
+        }
+        using (var db = new AssetDb(Cs))
+        {
+            db.Assets.Add(new Asset { Name = "logo", Data = new byte[] { 1, 2, 255 } });
+            db.Assets.Add(new Asset { Name = "empty", Data = Array.Empty<byte>() });
+            db.SaveChanges();
+
+            var row = db.Assets.Single(a => a.Name == "logo");
+            Assert.Equal(new byte[] { 1, 2, 255 }, row.Data);
+            Assert.Empty(db.Assets.Single(a => a.Name == "empty").Data);
         }
     }
 
@@ -346,6 +433,34 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
         }
     }
 
+    [Fact]
+    public void Contains_on_a_local_collection_translates_to_IN()
+    {
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "DROP TABLE IF EXISTS Counters";
+            cmd.ExecuteNonQuery();
+        }
+        using (var db = new CounterDb(Cs))
+        {
+            db.Counters.Add(new Counter { Label = "a" });
+            db.Counters.Add(new Counter { Label = "b" });
+            db.Counters.Add(new Counter { Label = "c" });
+            db.SaveChanges();
+
+            // 权限/菜单等服务的集合查询翻译:List.Contains → IN (...)。
+            var wanted = new[] { "a", "c" };
+            var hits = db.Counters
+                .Where(c => wanted.Contains(c.Label))
+                .OrderBy(c => c.Label)
+                .Select(c => c.Label)
+                .ToList();
+            Assert.Equal(new[] { "a", "c" }, hits);
+        }
+    }
+
     public class Widget
     {
         public int Id { get; set; }
@@ -360,6 +475,52 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
         public DbSet<Widget> Widgets => Set<Widget>();
         protected override void OnModelCreating(ModelBuilder b) =>
             b.Entity<Widget>().HasIndex(w => new { w.Sku, w.Zone });
+        protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
+    }
+
+    public class Ledger
+    {
+        public int Id { get; set; }
+        public decimal Amount { get; set; }
+    }
+
+    public class LedgerDb : DbContext
+    {
+        private readonly string _cs;
+        public LedgerDb(string cs) => _cs = cs;
+        public DbSet<Ledger> Ledgers => Set<Ledger>();
+        protected override void OnModelCreating(ModelBuilder b) =>
+            b.Entity<Ledger>().Property(l => l.Amount).HasPrecision(28, 10);
+        protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
+    }
+
+    public class Schedule
+    {
+        public int Id { get; set; }
+        public DateOnly Day { get; set; }
+        public TimeOnly At { get; set; }
+    }
+
+    public class ScheduleDb : DbContext
+    {
+        private readonly string _cs;
+        public ScheduleDb(string cs) => _cs = cs;
+        public DbSet<Schedule> Schedules => Set<Schedule>();
+        protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
+    }
+
+    public class Asset
+    {
+        public int Id { get; set; }
+        public string Name { get; set; } = "";
+        public byte[] Data { get; set; } = Array.Empty<byte>();
+    }
+
+    public class AssetDb : DbContext
+    {
+        private readonly string _cs;
+        public AssetDb(string cs) => _cs = cs;
+        public DbSet<Asset> Assets => Set<Asset>();
         protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
     }
 

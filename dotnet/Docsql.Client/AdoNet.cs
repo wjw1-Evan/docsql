@@ -832,7 +832,9 @@ public sealed class DocsqlCommand : DbCommand
             p => (p.ParameterName?.TrimStart('@') ?? "") == name);
 
     /// <summary>参数值 → JSON(REQ_EXECUTE 的 params 数组元素)。字符串值在
-    /// 服务端转义绑定;DateTime 族沿用 culture-invariant 可排序文本形态。</summary>
+    /// 服务端转义绑定;DateTime 族沿用 culture-invariant 可排序文本形态。
+    /// decimal 与 byte[] 用带类型标记的对象载荷($dec/$bytes),精确值不经过
+    /// IEEE double,服务端解码为引擎原生 DECIMAL/BLOB 值。</summary>
     private static string JsonOf(object? v) => v switch
     {
         null or DBNull => "null",
@@ -843,9 +845,8 @@ public sealed class DocsqlCommand : DbCommand
         ulong u => JsonSerializer.Serialize(u),
         double d => JsonSerializer.Serialize(d),
         float f => JsonSerializer.Serialize((double)f),
-        // Numeric literal: the engine stores decimals as f64 — big values
-        // lose precision beyond ~15-16 significant digits (no decimal type).
-        decimal m => JsonSerializer.Serialize((double)m),
+        // 精确小数文本走 $dec 标记,服务端渲染 CAST(... AS DECIMAL)。
+        decimal m => "{\"$dec\":\"" + m.ToString(CultureInfo.InvariantCulture) + "\"}",
         // Date/time values keep the culture-invariant, lexicographically
         // sortable text form the engine stores (GetDateTime parses it back).
         DateTime dt => JsonSerializer.Serialize(
@@ -854,13 +855,15 @@ public sealed class DocsqlCommand : DbCommand
             dto.ToString("O", CultureInfo.InvariantCulture)),
         TimeSpan ts => JsonSerializer.Serialize(
             ts.ToString("c", CultureInfo.InvariantCulture)),
+        DateOnly d => JsonSerializer.Serialize(
+            d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
+        TimeOnly t => JsonSerializer.Serialize(
+            t.ToString("HH:mm:ss.fffffff", CultureInfo.InvariantCulture)),
         string s => JsonSerializer.Serialize(s),
         char c => JsonSerializer.Serialize(c.ToString()),
         Guid g => JsonSerializer.Serialize(g.ToString()),
-        // No BLOB storage in the engine; storing ToString() would corrupt
-        // data silently — refuse loudly instead.
-        byte[] => throw new NotSupportedException(
-            "byte[] parameters are not supported (no BLOB storage); serialize to TEXT/Base64"),
+        // BLOB:整数数组的 $bytes 标记,服务端解码后渲染 x'..' 十六进制字面量。
+        byte[] b => BytesJson(b),
         // Enums have no wire form; their ToString() name would be quoted as
         // text and silently match nothing.
         Enum => throw new NotSupportedException(
@@ -868,6 +871,22 @@ public sealed class DocsqlCommand : DbCommand
         _ => throw new NotSupportedException(
             $"parameter type {v.GetType().Name} is not supported"),
     };
+
+    private static string BytesJson(byte[] b)
+    {
+        var sb = new StringBuilder(b.Length * 4 + 12);
+        sb.Append("{\"$bytes\":[");
+        for (int i = 0; i < b.Length; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+            sb.Append(b[i]);
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
 
     private static string ErrorText(Frame f) => Encoding.UTF8.GetString(f.Payload);
 
@@ -1016,8 +1035,29 @@ public sealed class DocsqlDataReader : DbDataReader
         JsonValueKind.True => true,
         JsonValueKind.False => false,
         JsonValueKind.Null => null,
+        // Typed markers from the server: exact DECIMAL / BLOB scalars.
+        JsonValueKind.Object => MarkerToValue(e),
         _ => e.GetRawText(),
     };
+
+    private static object? MarkerToValue(JsonElement e)
+    {
+        if (e.TryGetProperty("$dec", out var dec) && dec.ValueKind == JsonValueKind.String)
+        {
+            return decimal.Parse(dec.GetString()!, CultureInfo.InvariantCulture);
+        }
+        if (e.TryGetProperty("$bytes", out var bytes) && bytes.ValueKind == JsonValueKind.Array)
+        {
+            var b = new byte[bytes.GetArrayLength()];
+            int i = 0;
+            foreach (var x in bytes.EnumerateArray())
+            {
+                b[i++] = x.GetByte();
+            }
+            return b;
+        }
+        return e.GetRawText();
+    }
 
     public override int FieldCount => _columns.Count;
     public override bool HasRows => _rows.Count > 0;
@@ -1053,6 +1093,56 @@ public sealed class DocsqlDataReader : DbDataReader
     public override double GetDouble(int ordinal) => Convert.ToDouble(CurrentRow[ordinal]);
     public override string GetString(int ordinal) => Convert.ToString(CurrentRow[ordinal])!;
     public override bool GetBoolean(int ordinal) => Convert.ToBoolean(CurrentRow[ordinal]);
+
+    /// <summary>EF 提供程序按类型映射读取;泛型读取覆盖 DECIMAL/BLOB/DATE/TIME 文本。</summary>
+    public override T GetFieldValue<T>(int ordinal)
+    {
+        var v = CurrentRow[ordinal];
+        if (v is T typed)
+        {
+            return typed;
+        }
+        if (v is null)
+        {
+            throw new InvalidCastException(
+                $"column {_columns[ordinal]} is NULL; check IsDBNull before GetFieldValue");
+        }
+        var t = typeof(T);
+        if (t == typeof(byte[]))
+        {
+            var bytes = v switch
+            {
+                byte[] b => b,
+                string s => Convert.FromBase64String(s),
+                _ => throw new InvalidCastException(
+                    $"column {_columns[ordinal]} is not a BLOB value"),
+            };
+            return (T)(object)bytes;
+        }
+        if (t == typeof(DateOnly))
+        {
+            return (T)(object)DateOnly.Parse(
+                Convert.ToString(v, CultureInfo.InvariantCulture)!, CultureInfo.InvariantCulture);
+        }
+        if (t == typeof(TimeOnly))
+        {
+            return (T)(object)TimeOnly.Parse(
+                Convert.ToString(v, CultureInfo.InvariantCulture)!, CultureInfo.InvariantCulture);
+        }
+        if (t == typeof(decimal))
+        {
+            return (T)(object)Convert.ToDecimal(v, CultureInfo.InvariantCulture);
+        }
+        if (t == typeof(DateTime))
+        {
+            return (T)(object)Convert.ToDateTime(v, CultureInfo.InvariantCulture);
+        }
+        if (t == typeof(Guid))
+        {
+            return (T)(object)Guid.Parse(Convert.ToString(v, CultureInfo.InvariantCulture)!);
+        }
+        return (T)Convert.ChangeType(v, t, CultureInfo.InvariantCulture);
+    }
 
     public override int GetValues(object[] values)
     {
@@ -1100,10 +1190,32 @@ public sealed class DocsqlDataReader : DbDataReader
     public override byte GetByte(int ordinal) => Convert.ToByte(CurrentRow[ordinal]);
     public override Guid GetGuid(int ordinal) => Guid.Parse(GetString(ordinal));
     public override float GetFloat(int ordinal) => Convert.ToSingle(CurrentRow[ordinal]);
-    public override decimal GetDecimal(int ordinal) => Convert.ToDecimal(CurrentRow[ordinal]);
+    public override decimal GetDecimal(int ordinal) =>
+        Convert.ToDecimal(CurrentRow[ordinal], CultureInfo.InvariantCulture);
     public override DateTime GetDateTime(int ordinal) =>
         Convert.ToDateTime(CurrentRow[ordinal], CultureInfo.InvariantCulture);
-    public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length) => 0;
+    public override long GetBytes(
+        int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
+    {
+        var v = CurrentRow[ordinal];
+        var bytes = v switch
+        {
+            byte[] b => b,
+            string s => Convert.FromBase64String(s),
+            _ => throw new InvalidCastException($"column {_columns[ordinal]} is not a BLOB value"),
+        };
+        if (buffer is null)
+        {
+            return bytes.Length;
+        }
+        if (dataOffset < 0 || dataOffset > bytes.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(dataOffset));
+        }
+        int n = (int)Math.Min(length, bytes.Length - dataOffset);
+        Array.Copy(bytes, dataOffset, buffer, bufferOffset, n);
+        return n;
+    }
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length) => 0;
     public override bool NextResult() => false;
 

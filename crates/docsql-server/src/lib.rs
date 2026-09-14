@@ -1636,7 +1636,9 @@ pub fn check_token_strength(name: &str, token: &str) -> Result<(), String> {
 }
 
 /// Wire param (JSON) → engine value. Nested objects/arrays keep their JSON
-/// text shape — render_param quotes them as text literals.
+/// text shape — render_param quotes them as text literals. The `$dec` and
+/// `$bytes` marker objects (emitted by the .NET client) decode back to the
+/// exact scalar types; unknown objects remain text.
 fn json_param_to_value(p: &serde_json::Value) -> Value {
     match p {
         serde_json::Value::Null => Value::Null,
@@ -1646,6 +1648,24 @@ fn json_param_to_value(p: &serde_json::Value) -> Value {
             .map(Value::Int)
             .unwrap_or_else(|| Value::Float(n.as_f64().unwrap_or(0.0))),
         serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Object(o) => {
+            if let Some(serde_json::Value::String(s)) = o.get("$dec") {
+                if let Ok(d) = s.parse::<docsql_core::value::Decimal>() {
+                    return Value::Decimal(d);
+                }
+            }
+            if let Some(serde_json::Value::Array(a)) = o.get("$bytes") {
+                let mut bytes = Vec::with_capacity(a.len());
+                for v in a {
+                    let Some(b) = v.as_u64().filter(|b| *b <= 0xff) else {
+                        return Value::Str(p.to_string());
+                    };
+                    bytes.push(b as u8);
+                }
+                return Value::Bytes(bytes);
+            }
+            Value::Str(p.to_string())
+        }
         other => Value::Str(other.to_string()),
     }
 }
@@ -1714,6 +1734,14 @@ fn render_param(p: &Value) -> String {
         }
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Decimal(d) => {
+            // Exactness survives the text round-trip: an unquoted number
+            // would re-parse as Float on the engine side.
+            format!(
+                "CAST({} AS DECIMAL)",
+                docsql_core::stmt::sql_string_literal(&d.to_string())
+            )
+        }
         Value::Str(s) => docsql_core::stmt::sql_string_literal(s),
         Value::Bytes(b) => {
             let mut hex = String::with_capacity(b.len() * 2 + 3);
@@ -4787,9 +4815,39 @@ mod security_tests {
             .unwrap(),
             "INSERT INTO b VALUES (x'dead')"
         );
+        // Decimals render as exact CAST text, never a lossy float.
+        assert_eq!(
+            bind_params(
+                "INSERT INTO m VALUES (?)",
+                &[Value::Decimal("1234567890.123456789".parse().unwrap())]
+            )
+            .unwrap(),
+            "INSERT INTO m VALUES (CAST('1234567890.123456789' AS DECIMAL))"
+        );
         // Arity mismatches are errors, never partial binds.
         assert!(bind_params("SELECT ?", &[]).is_err());
         assert!(bind_params("SELECT 1", &[Value::Int(1)]).is_err());
+    }
+
+    #[test]
+    fn json_params_decode_dec_and_bytes_markers() {
+        // The .NET client's typed markers decode to exact engine values.
+        let p: serde_json::Value =
+            serde_json::from_str(r#"{"$dec":"0.10000000000000000001"}"#).unwrap();
+        assert_eq!(
+            json_param_to_value(&p),
+            Value::Decimal("0.10000000000000000001".parse().unwrap())
+        );
+        let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":[0,255]}"#).unwrap();
+        assert_eq!(json_param_to_value(&p), Value::Bytes(vec![0, 255]));
+        // Malformed markers degrade to text instead of corrupting data.
+        let p: serde_json::Value = serde_json::from_str(r#"{"$dec":"nope"}"#).unwrap();
+        assert!(matches!(json_param_to_value(&p), Value::Str(_)));
+        let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":[256]}"#).unwrap();
+        assert!(matches!(json_param_to_value(&p), Value::Str(_)));
+        // Ordinary objects stay text (render_param quotes them).
+        let p: serde_json::Value = serde_json::from_str(r#"{"k":1}"#).unwrap();
+        assert_eq!(json_param_to_value(&p), Value::Str(r#"{"k":1}"#.into()));
     }
 
     #[test]

@@ -5,6 +5,37 @@
 
 ## [Unreleased]
 
+### 精确数值与二进制类型 + EF 映射补齐(2026-09-14)
+
+#### 新增
+
+- **DECIMAL 精确十进制类型**:值模型新增 `Value::Decimal`(rust_decimal,28~29 位有效
+  数字),编码 tag 8、`cmp_values` 与 Int/Float 数值互比、ORDER BY/索引/复合键全链路支持;
+  `CAST('123.45' AS DECIMAL)` 与 `TO_NUMBER` 非整数文本产出 DECIMAL,算术/`SUM`/`AVG`/
+  `ROUND`/`ABS` 按十进制精确执行(混合运算中 Decimal 优先于 Float);`value_literal` 渲染为
+  `CAST('…' AS DECIMAL)`,dump/备份/复制重放精度不丢;JSON 线协议用 `{"$dec":"…"}` 标记
+  精确传输(解析回 Decimal)。EF Core `decimal` 映射从 TEXT 改为 `DECIMAL`
+  (`HasPrecision` 进入列类型与 CAST 字面量),参数经 `$dec` 标记、服务端十进制聚合与比较,
+  86 个金额/面积字段这类场景不再有 Float 精度取舍。
+- **BLOB 二进制值**:`x'hex'` 字面量解析为 `Value::Bytes`(此前仅内部值、SQL 层不可达),
+  `CAST(text AS BLOB)`、`LENGTH`、`value_literal`/dump/复制全链路;JSON 线协议用
+  `{"$bytes":[…]}` 标记。EF Core `byte[]` 映射从"故意不映射"改为 `BLOB`
+  (DocsqlDataReader 新增 `GetFieldValue<T>`/`GetBytes` 按类型读取),客户端 `byte[]` 参数从
+  显式拒绝改为精确往返(单值 ≤16MiB 文档上限,无流式分块)。
+- **EF Core `DateOnly`/`TimeOnly` 映射**(可排序 ISO 文本,参数与读取双向),补齐
+  `Common_clr_types_roundtrip` 之外的 30 个 `DateOnly` 属性场景;
+- **EF Core 模型复合索引**:`HasIndex(e => new { … })` 从"尽力而为跳过"改为按列序创建
+  (引擎复合索引 B+ 树);`List.Contains` 翻译为 `IN (…)`(新增回归测试);
+- Web 控制台查询网格/行编辑识别 `$dec`/`$bytes` 标记:精确显示十进制文本、BLOB 十六进制,
+  行内编辑保存走 `CAST(… AS DECIMAL)`/`x'…'` 而非 JSON 文本。
+
+#### 变更
+
+- 客户端 `decimal` 参数不再降级为 IEEE double(此前 >15~16 位有效数字丢精度),`byte[]`
+  参数不再抛 `NotSupportedException`;
+- `docs/limitations.md`、`sql-reference.md`、`drivers.md` 与 README 能力表同步(DECIMAL/
+  BLOB 从"已知边界/路线"移入已具备;`INSERT … SELECT` 本已支持,文档补记)。
+
 ## [0.2.0] - 2026-09-14
 
 ### 发布与文档:0.2.0(NuGet 四包 + Aspire 安装使用)(2026-09-14)

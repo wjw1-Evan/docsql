@@ -16,3 +16,5 @@ license = "MIT OR Apache-2.0"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
+rust_decimal = "1"
+num-traits = "0.2"

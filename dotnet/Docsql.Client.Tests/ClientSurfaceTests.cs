@@ -1,5 +1,5 @@
 // 客户端 ADO.NET 面契约测试:事务 Dispose 回滚、查询/非查询互斥、空结果
-// 标量、参数 CLR 类型字面量化与往返、byte[] 拒绝、长语句不截断、
+// 标量、参数 CLR 类型字面量化与往返(DECIMAL/BLOB/DATE/TIME)、长语句不截断、
 // SchemaTable、DbProviderFactory 与连接串解析。复用 AdoNetTests 的
 // 无凭据 ServerFixture,每个用例独立表名。
 
@@ -187,14 +187,57 @@ public sealed class ClientSurfaceTests : IClassFixture<ServerFixture>
     }
 
     [Fact]
-    public void Byte_array_parameters_are_rejected_loudly()
+    public void Byte_array_parameters_roundtrip_as_blob()
     {
-        // 引擎无 BLOB 存储:静默 ToString 会写坏数据,必须显式拒绝
+        // 引擎 Value::Bytes + $bytes/$hex 绑定:byte[] 精确往返。
         using var conn = Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT @b";
-        ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("b", new byte[] { 1, 2 });
-        Assert.Throws<NotSupportedException>(() => cmd.ExecuteScalar());
+        ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("b", new byte[] { 1, 2, 255 });
+        using var r = cmd.ExecuteReader();
+        Assert.True(r.Read());
+        Assert.Equal(new byte[] { 1, 2, 255 }, Assert.IsType<byte[]>(r.GetValue(0)));
+        Assert.Equal(new byte[] { 1, 2, 255 }, r.GetFieldValue<byte[]>(0));
+        // 空 BLOB 与 NULL 区分得当
+        var empty = (byte[])ScalarWithParam("SELECT @b", new byte[0])!;
+        Assert.Empty(empty);
+    }
+
+    [Fact]
+    public void Decimal_and_dateonly_timeonly_parameters_roundtrip_exactly()
+    {
+        using var conn = Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            // 17 位有效数字:double 路径必然丢精度,decimal 路径必须精确
+            cmd.CommandText = "SELECT @m";
+            ((DocsqlParameterCollection)cmd.Parameters).AddWithValue(
+                "m", 12345678901234567.89m);
+            using var r = cmd.ExecuteReader();
+            Assert.True(r.Read());
+            Assert.Equal(12345678901234567.89m, r.GetDecimal(0));
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT @d, @t";
+            ((DocsqlParameterCollection)cmd.Parameters).AddWithValue(
+                "d", new DateOnly(2024, 3, 15));
+            ((DocsqlParameterCollection)cmd.Parameters).AddWithValue(
+                "t", new TimeOnly(13, 45, 30, 250));
+            using var r = cmd.ExecuteReader();
+            Assert.True(r.Read());
+            Assert.Equal(new DateOnly(2024, 3, 15), r.GetFieldValue<DateOnly>(0));
+            Assert.Equal(new TimeOnly(13, 45, 30, 250), r.GetFieldValue<TimeOnly>(1));
+        }
+    }
+
+    private object? ScalarWithParam(string sql, object value)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        ((DocsqlParameterCollection)cmd.Parameters).AddWithValue("b", value);
+        return cmd.ExecuteScalar();
     }
 
     [Fact]

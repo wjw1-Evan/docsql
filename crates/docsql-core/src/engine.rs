@@ -8,7 +8,8 @@ use crate::btree::{BTree, BTreeError};
 use crate::encode;
 use crate::heap::Heap;
 use crate::pager::{PageReader, Pager, PagerError, Snapshot, PAGE_SIZE};
-use crate::value::{Object, Value};
+use crate::value::{Decimal, Object, Value};
+use num_traits::ToPrimitive;
 use sqlparser::ast::{
     BinaryOperator, Expr as SqlExpr, LimitClause, ObjectName, ObjectNamePart, Query, SelectItem,
     SetExpr, Statement, TableObject,
@@ -5489,6 +5490,12 @@ fn agg_parts(f: &sqlparser::ast::Function) -> Result<(AggOp, SqlExpr, bool, Opti
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value> {
+    // Decimal poisons the sum toward exactness: Int/Float operands convert
+    // losslessly (a Float contributes its exact binary value).
+    if matches!(a, Value::Decimal(_)) || matches!(b, Value::Decimal(_)) {
+        let (x, y) = (as_decimal(&a)?, as_decimal(&b)?);
+        return Ok(x.checked_add(y).map(Value::Decimal).unwrap_or(Value::Null));
+    }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_add(y))),
         (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 + y)),
@@ -5583,6 +5590,19 @@ fn eval_agg(
                 AggOp::Avg => {
                     if vals.is_empty() {
                         Value::Null
+                    } else if vals.iter().any(|v| matches!(v, Value::Decimal(_))) {
+                        // Exact averaging when any input is decimal: sum first
+                        // (exact), then divide once.
+                        let mut acc = Decimal::ZERO;
+                        for v in &vals {
+                            acc = acc
+                                .checked_add(as_decimal(v)?)
+                                .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                        }
+                        match acc.checked_div(Decimal::from(vals.len() as i64)) {
+                            Some(d) => Value::Decimal(d),
+                            None => Value::Null,
+                        }
                     } else {
                         let n = vals.len() as f64;
                         let mut acc = 0.0f64;
@@ -5659,6 +5679,10 @@ fn join_key_of(v: &Value) -> Option<JoinKey> {
         Value::Bool(b) => JoinKey::Bool(*b),
         Value::Int(i) => JoinKey::Num(num_key(*i as f64)),
         Value::Float(f) => JoinKey::Num(num_key(*f)),
+        // Decimal hashes through its nearest f64: over-merging only in the
+        // ultra-wide-integer range, mirroring Int/Float (cmp_values then
+        // terminates candidates exactly).
+        Value::Decimal(d) => JoinKey::Num(num_key(d.to_f64()?)),
         Value::Str(s) => JoinKey::Str(s.clone()),
         Value::Bytes(b) => JoinKey::Bytes(b.clone()),
         Value::Array(items) => {
@@ -6222,6 +6246,21 @@ fn value_literal(v: &Value) -> Result<String> {
             }
             Ok(format!("{f:?}"))
         }
+        // Exact text form wrapped in a CAST: bare decimal text would re-parse
+        // as Float on replay and silently lose precision.
+        Value::Decimal(d) => Ok(format!(
+            "CAST({} AS DECIMAL)",
+            crate::stmt::sql_string_literal(&d.to_string())
+        )),
+        Value::Bytes(b) => {
+            let mut hex = String::with_capacity(b.len() * 2 + 3);
+            hex.push_str("x'");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex.push('\'');
+            Ok(hex)
+        }
         Value::Str(s) => Ok(crate::stmt::sql_string_literal(s)),
         other => err(format!(
             "cannot render a {} value as a SQL literal \
@@ -6690,6 +6729,11 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
             binop(l, op, r)
         }
         SqlExpr::Nested(e) => eval_const(e),
+        // CAST of a constant (bound decimal/blob parameters render as
+        // CAST/hex literals; resolved INSERT replay re-evaluates them).
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => cast_value(eval_const(expr)?, &data_type.to_string()),
         SqlExpr::Identifier(i) => err(format!("column {} not allowed here", i.value)),
         other => err(format!("unsupported expression: {other}")),
     }
@@ -6716,6 +6760,25 @@ fn sql_value(v: &sqlparser::ast::Value) -> Result<Value> {
         V::SingleQuotedString(s) | V::DoubleQuotedString(s) => Value::Str(s.clone()),
         V::Boolean(b) => Value::Bool(*b),
         V::Null => Value::Null,
+        // x'deadbeef' — the canonical BLOB literal (params, dumps, replays).
+        V::HexStringLiteral(s) => {
+            let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            if !cleaned.len().is_multiple_of(2) {
+                return err(format!("hex literal has an odd digit count: x'{s}'"));
+            }
+            let mut bytes = Vec::with_capacity(cleaned.len() / 2);
+            let chars: Vec<char> = cleaned.chars().collect();
+            for pair in chars.chunks(2) {
+                let hi = pair[0]
+                    .to_digit(16)
+                    .ok_or_else(|| SqlError::Message(format!("bad hex digit: {s}")))?;
+                let lo = pair[1]
+                    .to_digit(16)
+                    .ok_or_else(|| SqlError::Message(format!("bad hex digit: {s}")))?;
+                bytes.push(((hi << 4) | lo) as u8);
+            }
+            Value::Bytes(bytes)
+        }
         other => return err(format!("unsupported literal: {other}")),
     };
     Ok(out)
@@ -7156,6 +7219,7 @@ fn value_to_text(v: &Value) -> String {
                 format!("{f:.1}")
             }
         }
+        Value::Decimal(d) => d.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Null => String::new(),
         other => format!("{other:?}"),
@@ -7170,6 +7234,7 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
         v if t.contains("INT") => match v {
             Value::Int(_) => v,
             Value::Float(f) => Value::Int(f as i64),
+            Value::Decimal(d) => Value::Int(d.trunc().to_i64().unwrap_or(0)),
             Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
             Value::Str(s) => Value::Int(
                 s.trim()
@@ -7184,17 +7249,42 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
         v if t.contains("BOOL") => match v {
             Value::Bool(_) => v,
             Value::Int(i) => Value::Bool(i != 0),
+            Value::Decimal(d) => Value::Bool(!d.is_zero()),
             Value::Str(s) => Value::Bool(s == "true"),
+            other => other,
+        },
+        // Exact DECIMAL/NUMERIC: text and integer sources convert losslessly;
+        // a Float source only promises its exact binary value.
+        v if t.contains("DECIMAL") || t.contains("NUMERIC") => match v {
+            Value::Decimal(_) => v,
+            Value::Int(i) => Value::Decimal(Decimal::from(i)),
+            Value::Float(f) => Value::Decimal(
+                Decimal::from_f64_retain(f)
+                    .ok_or_else(|| SqlError::Message(format!("cannot CAST {f} AS {type_name}")))?,
+            ),
+            Value::Str(s) => Value::Decimal(
+                s.trim()
+                    .parse::<Decimal>()
+                    .map_err(|_| SqlError::Message(format!("cannot CAST '{s}' AS {type_name}")))?,
+            ),
             other => other,
         },
         v if t.contains("REAL") || t.contains("DOUBLE") || t.contains("FLOAT") => match v {
             Value::Float(_) => v,
             Value::Int(i) => Value::Float(i as f64),
+            Value::Decimal(d) => Value::Float(d.to_f64().unwrap_or(f64::NAN)),
             Value::Str(s) => Value::Float(
                 s.trim()
                     .parse::<f64>()
                     .map_err(|_| SqlError::Message(format!("cannot CAST '{s}' AS {type_name}")))?,
             ),
+            other => other,
+        },
+        // BLOB: bytes pass through; text keeps its UTF-8 bytes (SQLite-style
+        // CAST semantics that drivers rely on for `CAST(@p AS BLOB)`).
+        v if t.contains("BLOB") || t.contains("BYTES") || t.contains("BINARY") => match v {
+            Value::Bytes(_) => v,
+            Value::Str(s) => Value::Bytes(s.into_bytes()),
             other => other,
         },
         // Unknown type: pass through unchanged (types are documentation here).
@@ -7242,6 +7332,7 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             match arg(args, 0, name)? {
                 Value::Int(i) => Value::Int(i.abs()),
                 Value::Float(f) => Value::Float(f.abs()),
+                Value::Decimal(d) => Value::Decimal(d.abs()),
                 Value::Null => Value::Null,
                 other => return err(format!("ABS of non-numeric: {other:?}")),
             }
@@ -7255,6 +7346,17 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             }
             if null_prop(arg(args, 0, name)?) {
                 Value::Null
+            } else if let Value::Decimal(d) = arg(args, 0, name)? {
+                // Exact rounding: half away from zero (SQL Server semantics),
+                // digits clamped to the decimal scale range.
+                let digits = match args.get(1) {
+                    Some(Value::Int(d)) => (*d).clamp(0, 28) as u32,
+                    _ => 0,
+                };
+                Value::Decimal(d.round_dp_with_strategy(
+                    digits,
+                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                ))
             } else {
                 let x = as_f64(arg(args, 0, name)?)?;
                 let digits = match args.get(1) {
@@ -7337,6 +7439,7 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                     Value::Bool(_) => "bool",
                     Value::Int(_) => "integer",
                     Value::Float(_) => "float",
+                    Value::Decimal(_) => "decimal",
                     Value::Str(_) => "text",
                     Value::Bytes(_) => "blob",
                     Value::Array(_) => "array",
@@ -7480,14 +7583,15 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         "TO_NUMBER" => {
             exact_arity(name, args, 1)?;
             match arg(args, 0, name)?.clone() {
-                Value::Int(_) | Value::Float(_) => args[0].clone(),
+                Value::Int(_) | Value::Float(_) | Value::Decimal(_) => args[0].clone(),
                 Value::Str(s) => {
                     let t = s.trim();
                     if let Ok(i) = t.parse::<i64>() {
                         Value::Int(i)
                     } else {
-                        match t.parse::<f64>() {
-                            Ok(f) => Value::Float(f),
+                        // Oracle NUMBER 是精确数值:非整数文本进 DECIMAL 而非 f64
+                        match t.parse::<Decimal>() {
+                            Ok(d) => Value::Decimal(d),
                             Err(_) => {
                                 return err(format!("TO_NUMBER: invalid number {s:?}"));
                             }
@@ -7511,6 +7615,7 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             }
             match arg(args, 0, name)? {
                 Value::Str(s) => Value::Str(s.clone()),
+                Value::Decimal(d) => Value::Str(d.to_string()),
                 other => Value::Str(crate::json::to_string(other).trim_matches('"').to_string()),
             }
         }
@@ -7602,6 +7707,7 @@ fn json_type_name(v: &Value) -> &'static str {
         Value::Bool(_) => "boolean",
         Value::Int(_) => "integer",
         Value::Float(_) => "real",
+        Value::Decimal(_) => "real",
         Value::Str(_) => "text",
         Value::Bytes(_) => "blob",
         Value::Array(_) => "array",
@@ -8240,6 +8346,23 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
+    // Decimal wins over Float in mixed arithmetic: exactness survives
+    // `amount * 1.5` while Int stays promoted losslessly.
+    if matches!(l, Value::Decimal(_)) || matches!(r, Value::Decimal(_)) {
+        let a = as_decimal(&l)?;
+        let b = as_decimal(&r)?;
+        let out = match op {
+            Plus => a.checked_add(b),
+            Minus => a.checked_sub(b),
+            Multiply => a.checked_mul(b),
+            Divide => a.checked_div(b),
+            Modulo => a.checked_rem(b),
+            _ => return err("not an arithmetic operator"),
+        };
+        // Overflow yields NULL (SQLite-style) rather than a panic; division
+        // by zero is None from checked_div/checked_rem.
+        return Ok(out.map(Value::Decimal).unwrap_or(Value::Null));
+    }
     let float_mode = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
     if float_mode {
         let a = as_f64(&l)?;
@@ -8256,24 +8379,29 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         });
     }
     match (&l, &r) {
-        (Value::Int(a), Value::Int(b)) => Ok(match op {
-            Plus => Value::Int(a.wrapping_add(*b)),
-            Minus => Value::Int(a.wrapping_sub(*b)),
-            Multiply => Value::Int(a.wrapping_mul(*b)),
-            Divide if *b == 0 => Value::Null,
-            // i64::MIN / -1 overflows (SIGFPE on some ISAs) — treat like
-            // division by zero and yield NULL instead of crashing.
-            Divide => match a.checked_div(*b) {
-                Some(q) => Value::Int(q),
-                None => Value::Null,
-            },
-            Modulo if *b == 0 => Value::Null,
-            Modulo => match a.checked_rem(*b) {
-                Some(m) => Value::Int(m),
-                None => Value::Null,
-            },
-            _ => return err("not an arithmetic operator"),
-        }),
+        (Value::Int(a), Value::Int(b)) => {
+            // Copy out so the inherent i64 checked_* methods win over the
+            // num-traits impls imported for Decimal.
+            let (a, b) = (*a, *b);
+            Ok(match op {
+                Plus => Value::Int(a.wrapping_add(b)),
+                Minus => Value::Int(a.wrapping_sub(b)),
+                Multiply => Value::Int(a.wrapping_mul(b)),
+                Divide if b == 0 => Value::Null,
+                // i64::MIN / -1 overflows (SIGFPE on some ISAs) — treat like
+                // division by zero and yield NULL instead of crashing.
+                Divide => match a.checked_div(b) {
+                    Some(q) => Value::Int(q),
+                    None => Value::Null,
+                },
+                Modulo if b == 0 => Value::Null,
+                Modulo => match a.checked_rem(b) {
+                    Some(m) => Value::Int(m),
+                    None => Value::Null,
+                },
+                _ => return err("not an arithmetic operator"),
+            })
+        }
         _ => err(format!("non-numeric operands: {l:?} {op} {r:?}")),
     }
 }
@@ -8282,6 +8410,19 @@ fn as_f64(v: &Value) -> Result<f64> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
+        Value::Decimal(d) => Ok(d.to_f64().unwrap_or(f64::NAN)),
+        other => err(format!("non-numeric operand: {other:?}")),
+    }
+}
+
+/// Exact numeric view of Int/Float/Decimal operands (the decimal arithmetic
+/// path). A Float contributes its exact binary value.
+fn as_decimal(v: &Value) -> Result<Decimal> {
+    match v {
+        Value::Decimal(d) => Ok(*d),
+        Value::Int(i) => Ok(Decimal::from(*i)),
+        Value::Float(f) => Decimal::from_f64_retain(*f)
+            .ok_or_else(|| SqlError::Message(format!("non-finite float in arithmetic: {f}"))),
         other => err(format!("non-numeric operand: {other:?}")),
     }
 }
@@ -13241,6 +13382,30 @@ mod tx_rollback_tests {
     }
 
     #[test]
+    fn dump_script_roundtrips_decimal_and_blob_values() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE money (id INT PRIMARY KEY, amount DECIMAL(28,10), raw BLOB)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO money VALUES \
+             (1, CAST('0.10000000000000000001' AS DECIMAL), x'deadbeef'), \
+             (2, CAST('-123456789012345678.1234567890' AS DECIMAL), x''), \
+             (3, NULL, NULL)",
+        );
+        let script = db.dump_script().unwrap();
+        let mut restored = apply_dump(&script);
+        let before = rows(&mut db, "SELECT amount, raw FROM money ORDER BY id");
+        let after = rows(&mut restored, "SELECT amount, raw FROM money ORDER BY id");
+        assert_eq!(before, after);
+        // The dump carries exact CAST literals, not lossy float text.
+        assert!(script.contains("CAST('0.10000000000000000001' AS DECIMAL)"));
+        assert!(script.contains("x'deadbeef'"));
+    }
+
+    #[test]
     fn dump_script_roundtrips_schema_constraints_and_data() {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -14836,6 +15001,15 @@ mod complex_query_tests {
         assert_eq!(q(&mut db, "SELECT GREATEST(1, NULL)"), Value::Null);
         // Conversions.
         assert_eq!(q(&mut db, "SELECT TO_NUMBER('42') + 1"), Value::Int(43));
+        // Oracle NUMBER semantics: non-integer text parses to exact DECIMAL.
+        assert_eq!(
+            q(&mut db, "SELECT TO_NUMBER('0.1') + TO_NUMBER('0.2')"),
+            Value::Decimal("0.3".parse().unwrap())
+        );
+        assert_eq!(
+            q(&mut db, "SELECT TO_CHAR(TO_NUMBER('1234.50'))"),
+            Value::Str("1234.50".into())
+        );
         assert!(matches!(
             db.execute("SELECT TO_NUMBER('not-a-number')"),
             Err(SqlError::Message(m)) if m.contains("invalid number")
@@ -15110,16 +15284,132 @@ mod complex_query_tests {
             value_literal(&Value::Str("it's \"quoted\"".into())).unwrap(),
             "'it''s \"quoted\"'"
         );
+        // DECIMAL renders as an exact CAST of its text form (a bare number
+        // would re-parse as Float and lose precision on replay).
+        assert_eq!(
+            value_literal(&Value::Decimal("1234.56".parse().unwrap())).unwrap(),
+            "CAST('1234.56' AS DECIMAL)"
+        );
+        // BLOB renders as a hex literal.
+        assert_eq!(
+            value_literal(&Value::Bytes(vec![0xde, 0xad])).unwrap(),
+            "x'dead'"
+        );
         for bad in [
             Value::Float(f64::NAN),
             Value::Float(f64::INFINITY),
             Value::Float(f64::NEG_INFINITY),
             Value::Array(vec![Value::Int(1)]),
-            Value::Bytes(vec![1, 2]),
         ] {
             let e = value_literal(&bad).unwrap_err();
             assert!(e.to_string().contains("cannot render"), "{bad:?}: {e}");
         }
+    }
+
+    #[test]
+    fn decimal_exact_arithmetic_aggregates_and_indexes() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE bills (id INT PRIMARY KEY, amount DECIMAL(18,2), label TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO bills VALUES \
+             (1, CAST('0.10' AS DECIMAL), 'a'), \
+             (2, CAST('0.20' AS DECIMAL), 'b'), \
+             (3, CAST('0.30' AS DECIMAL), 'c'), \
+             (4, CAST('12345678901234567.89' AS DECIMAL), 'd')",
+        );
+        // 0.1 + 0.2 stays exactly 0.6 — f64 would drift at the 17th digit.
+        assert_eq!(
+            rows(&mut db, "SELECT SUM(amount) FROM bills WHERE id <= 3").rows[0][0].to_string(),
+            "0.60"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT SUM(amount) FROM bills").rows[0][0].to_string(),
+            "12345678901234568.49"
+        );
+        // Exact equality and range probes (f64 cannot represent the big row).
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT id FROM bills WHERE amount = CAST('0.30' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Int(3)
+        );
+        let ids: Vec<Value> = rows(
+            &mut db,
+            "SELECT id FROM bills WHERE amount > CAST('0.20' AS DECIMAL) ORDER BY id",
+        )
+        .rows
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+        assert_eq!(ids, vec![Value::Int(3), Value::Int(4)]);
+        // Arithmetic keeps decimal exactness; ROUND is half-away-from-zero.
+        assert_eq!(
+            rows(&mut db, "SELECT amount * 2 FROM bills WHERE id = 4").rows[0][0].to_string(),
+            "24691357802469135.78"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT ROUND(CAST('2.345' AS DECIMAL), 2)").rows[0][0].to_string(),
+            "2.35"
+        );
+        // AVG over decimals divides once at the end, exactly.
+        assert_eq!(
+            rows(&mut db, "SELECT AVG(amount) FROM bills WHERE id <= 3").rows[0][0],
+            Value::Decimal("0.2".parse().unwrap())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT TYPEOF(CAST('1.5' AS DECIMAL))").rows[0][0],
+            Value::Str("decimal".into())
+        );
+        // Decimal keys flow through cmp_values for indexes and ORDER BY.
+        run(&mut db, "CREATE INDEX ix_bills_amount ON bills (amount)");
+        run(
+            &mut db,
+            "INSERT INTO bills VALUES (5, CAST('-1.5' AS DECIMAL), 'e')",
+        );
+        let ordered: Vec<String> = rows(&mut db, "SELECT label FROM bills ORDER BY amount")
+            .rows
+            .iter()
+            .map(|r| r[0].to_string())
+            .collect();
+        assert_eq!(ordered, vec!["e", "a", "b", "c", "d"]);
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT label FROM bills WHERE amount = CAST('-1.5' AS DECIMAL)"
+            )
+            .rows[0][0],
+            Value::Str("e".into())
+        );
+    }
+
+    #[test]
+    fn blob_hex_literals_and_cast_roundtrip() {
+        let mut db = Database::in_memory().unwrap();
+        // x'..' literals parse to bytes; CAST(text AS BLOB) keeps UTF-8 bytes.
+        assert_eq!(
+            rows(&mut db, "SELECT x'deadbeef'").rows[0][0],
+            Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT CAST('abc' AS BLOB)").rows[0][0],
+            Value::Bytes(b"abc".to_vec())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT TYPEOF(x'00')").rows[0][0],
+            Value::Str("blob".into())
+        );
+        // Length counts bytes; a hex literal with odd digits is rejected.
+        assert_eq!(
+            rows(&mut db, "SELECT LENGTH(x'0102')").rows[0][0],
+            Value::Int(2)
+        );
+        assert!(db.execute("SELECT x'abc'").is_err());
     }
 }
 

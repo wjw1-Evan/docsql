@@ -98,13 +98,11 @@ internal static partial class SchemaSync
 
     /// <summary>
     /// 模型索引双向同步(免迁移,与列同步配套):
-    /// - 模型新增的索引(含 [Index] 特性与外键惯例索引)自动创建,
+    /// - 模型新增的索引(含 [Index] 特性、外键惯例索引与复合索引)自动创建,
     ///   IF NOT EXISTS 保证幂等;唯一索引由引擎强制执行重复检查;
     /// - 模型里删掉的索引自动 DROP。为避免误删用户手工建的索引,
     ///   只回收 EF 惯例命名(IX_ 前缀)且不在当前模型中的索引。
-    /// 引擎目前只支持单列索引:多列索引按"尽力而为"跳过创建,但它们的
-    /// 名字必须计入 wanted —— 否则回收循环会把模型仍声明的多列 IX_
-    /// 索引(手工/旧版本建的)当垃圾 DROP 掉。
+    /// 复合索引按列序创建(引擎以列序构造复合键)。
     /// </summary>
     public static void SyncIndexes(DbConnection conn, IEntityType entity)
     {
@@ -117,10 +115,15 @@ internal static partial class SchemaSync
             var iname = index.GetDatabaseName();
             if (iname is null) continue;
             wanted.Add(iname);
-            if (index.Properties.Count != 1) continue;
-            var column = index.Properties[0]
-                .GetColumnName(StoreObjectIdentifier.Table(table, entity.GetSchema()));
-            if (column is null) continue;
+            var columns = new List<string>();
+            foreach (var p in index.Properties)
+            {
+                var column = p.GetColumnName(StoreObjectIdentifier.Table(table, entity.GetSchema()));
+                if (column is null) break;
+                columns.Add(column);
+            }
+            if (columns.Count == 0 || columns.Count != index.Properties.Count) continue;
+            var columnList = string.Join(", ", columns.Select(Quote));
 
             try
             {
@@ -137,7 +140,7 @@ internal static partial class SchemaSync
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText =
                     $"CREATE {(index.IsUnique ? "UNIQUE " : "")}INDEX IF NOT EXISTS " +
-                    $"{Quote(iname)} ON {Quote(table)} ({Quote(column)})";
+                    $"{Quote(iname)} ON {Quote(table)} ({columnList})";
                 cmd.ExecuteNonQuery();
             }
             catch (Exception ex) when (IsIgnorableDdlError(ex))

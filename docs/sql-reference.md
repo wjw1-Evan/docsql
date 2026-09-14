@@ -12,11 +12,12 @@ DocSQL 的 SQL 面:完整 DDL/DML、JOIN、聚合、事务与约束。所有未�
 | BOOL | TRUE/FALSE |
 | INT | 64 位整数 |
 | FLOAT | 64 位双精度 |
+| DECIMAL | 精确十进制(rust_decimal,28~29 位有效数字);存精确文本,算术/聚合/比较按十进制语义,**混合运算中优先于 Float** |
 | TEXT | 字符串(JSON 文档也按文本存储) |
 | BLOB | 二进制,字面量 `x'hex'` |
 | ARRAY / OBJECT | 表达式层内部使用;SQL 层 JSON 字面量以文本入库 |
 
-`CAST` 支持:`INT`、`CHAR/TEXT/STRING`、`BOOL`、`REAL/DOUBLE/FLOAT`。没有 DECIMAL/TIMESTAMP 精确类型(见[已知边界](limitations.md))。
+`CAST` 支持:`INT`、`CHAR/TEXT/STRING`、`BOOL`、`REAL/DOUBLE/FLOAT`、`DECIMAL/NUMERIC`、`BLOB/BYTES/BINARY`(文本按其 UTF-8 字节入库)。没有 TIMESTAMP 精确类型(时间按 ISO-8601 文本/整数毫秒约定,见[已知边界](limitations.md))。DECIMAL 的规范写法是 `CAST('123.45' AS DECIMAL)`;`DECIMAL(p,s)` 声明仅作文档/自省用途,不做存储截断。
 
 ## DDL
 

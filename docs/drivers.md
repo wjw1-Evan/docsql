@@ -75,6 +75,8 @@ services.AddDbContext<AppDb>(o => o.UseDocsql(connectionString));
 ```
 
 - 原生提供程序(不依赖 SQLite);`EnsureCreated` + 惰性建表 + 模型/索引自动同步(免迁移);
+- 类型映射:`decimal` → `DECIMAL`(参数经 `$dec` 文本标记精确绑定,服务端十进制聚合/比较;`HasPrecision` 进入列类型与 CAST 字面量)、`byte[]` → `BLOB`(参数经 `$bytes` 标记,响应按 `{"$bytes":[…]}` 解码;单值 ≤16MiB 文档上限)、`DateOnly`/`TimeOnly` → 可排序 ISO 文本、`DateTime`/`DateTimeOffset`/`TimeSpan`/`Guid` 沿用文本;未映射的 CLR 类型在模型构建期显式报错;
+- 模型复合索引(`HasIndex(e => new { … })`)按列序创建;`List.Contains` 翻译为 `IN (…)`;字符串 `StartsWith/EndsWith/Contains` 翻译为 `LIKE`;引擎不支持的语法在翻译期显式失败;
 - `Database.Migrate()` 显式报错(Migrations 不支持)。
 
 ## Aspire 集成(Docsql.Aspire.Hosting / Docsql.Aspire.Client)
@@ -139,6 +141,6 @@ v1 二进制协议(`core/proto.rs`),一句一帧。服务端 prepared statements
 
 - 参数按位置绑定,服务端渲染类型化字面量(引号感知;字符串值翻倍转义)——驱动无需自行转义;
 - 句柄按连接隔离,连接断开即失效;
-- 参数类型:JSON `null/bool/number/string`(嵌套对象/数组按 JSON 文本绑定,二进制走 hex 字面量);
+- 参数类型:JSON `null/bool/number/string`(嵌套对象/数组按 JSON 文本绑定);精确标量用标记对象:`$dec`(十进制文本 → `CAST(… AS DECIMAL)`)、`$bytes`(整数数组 → `x'…'` hex 字面量);响应中 DECIMAL 为 `{"$dec":"…"}`、BLOB 为 `{"$bytes":[…]}`;
 - 授权、`DOCSQL_STATEMENT_TIMEOUT_MS`、审计与 REQ_SQL 完全同路径;
 - 订阅帧、REQ_STATUS(含 `metrics` 运行时计数器)等其余帧见 `core/proto.rs` 模块头注释(权威)。

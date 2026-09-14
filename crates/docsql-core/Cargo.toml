@@ -9,6 +9,8 @@ description = "DocSQL embedded core: document storage engine + SQL execution"
 thiserror.workspace = true
 serde.workspace = true
 tempfile.workspace = true
+rust_decimal.workspace = true
+num-traits.workspace = true
 sqlparser = "0.62"
 
 

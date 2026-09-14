@@ -8,7 +8,7 @@
 | [运维手册](operations.md) | 部署拓扑、环境变量参考、备份/恢复与校验和、监控(/metrics /healthz)、优雅停机、语句超时 |
 | [安全指南](security.md) | 认证模型(三凭据 + 数据库用户/角色)、登录锁定、传输加密、SQL 注入防护、等级保护对照 |
 | [客户端与驱动](drivers.md) | .NET ADO.NET / EF Core / Aspire 集成(GitHub Packages 安装)、CLI、线协议 prepared statements(驱动作者) |
-| [已知边界与定位](limitations.md) | 当前架构边界(单写者、单文档 16MiB、无 DECIMAL 等)、商用化现状与路线 |
+| [已知边界与定位](limitations.md) | 当前架构边界(单写者、单文档 16MiB、无 TIMESTAMP 精确类型等)、商用化现状与路线 |
 
 ## 五分钟速览
 
