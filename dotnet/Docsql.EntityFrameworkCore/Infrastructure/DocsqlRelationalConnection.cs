@@ -13,8 +13,15 @@ public sealed class DocsqlRelationalConnection(
 {
     protected override DbConnection CreateDbConnection()
     {
-        var cs = Dependencies.ContextOptions.FindExtension<DocsqlOptionsExtension>()?.ConnectionString;
-        return new DocsqlConnection(cs ?? "host=127.0.0.1;port=7600");
+        var extension = Dependencies.ContextOptions.FindExtension<DocsqlOptionsExtension>();
+        // 连接实例(UseDocsql(DocsqlConnection))优先;否则每次新建连接,
+        // 连接串取运行期工厂(若有)或静态值。
+        if (extension?.Connection is { } connection)
+        {
+            return connection;
+        }
+        return new DocsqlConnection(
+            extension?.ResolveConnectionString() ?? "host=127.0.0.1;port=7600");
     }
 
     protected override bool SupportsAmbientTransactions => false;

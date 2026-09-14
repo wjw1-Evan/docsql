@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### EF 运行期连接串工厂(2026-09-14)
+
+#### 新增
+
+- **`UseDocsql(Func<string> connectionStringFactory)`**:每次创建物理连接时调用工厂,
+  连接信息不参与模型/服务提供程序缓存键(扩展哈希恒为 0)——同一宿主内不同上下文可连
+  不同节点而模型只建一次;测试夹具按用例路由到独立节点的机制基于此。
+- 修复 `UseDocsql(DocsqlConnection)` 连接实例被忽略的缺陷(此前 `CreateDbConnection`
+  只读连接串,实例落入默认 `127.0.0.1:7600`)。
+- 新增 `ConnectionFactoryTests`(双节点路由互不可见)回归。
+
 ### EF schema 同步摊销(2026-09-14)
 
 #### 变更

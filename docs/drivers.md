@@ -72,9 +72,14 @@ dotnet add package Docsql.EntityFrameworkCore
 ```csharp
 services.AddDbContext<AppDb>(o => o.UseDocsql(connectionString));
 // 容器级(Aspire/宿主集成):services.AddDocsqlDbContext<AppDb>("docsql") 按名取注入的连接串
+// 运行期连接串工厂(每次创建物理连接时调用;连接信息不进模型缓存键):
+// services.AddDbContext<AppDb>(o => o.UseDocsql(() => Route.CurrentConnectionString));
 ```
 
 - 原生提供程序(不依赖 SQLite);`EnsureCreated` + 惰性建表 + 模型/索引自动同步(免迁移);
+- `UseDocsql` 三种入参:`string`(静态连接串)、`DocsqlConnection`(固定连接实例)、
+  `Func<string>`(**运行期连接串工厂**——测试夹具把每个用例路由到独立节点、读写入口切换
+  等场景;同一进程模型只建一次,连接按上下文解析);
 - 类型映射:`decimal` → `DECIMAL`(参数经 `$dec` 文本标记精确绑定,服务端十进制聚合/比较;`HasPrecision` 进入列类型与 CAST 字面量)、`byte[]` → `BLOB`(参数经 `$bytes` 标记,响应按 `{"$bytes":[…]}` 解码;单值 ≤16MiB 文档上限)、`DateOnly`/`TimeOnly` → 可排序 ISO 文本、`DateTime`/`DateTimeOffset`/`TimeSpan`/`Guid` 沿用文本;未映射的 CLR 类型在模型构建期显式报错;
 - 模型复合索引(`HasIndex(e => new { … })`)按列序创建;`List.Contains` 翻译为 `IN (…)`;字符串 `StartsWith/EndsWith/Contains` 翻译为 `LIKE`;引擎不支持的语法在翻译期显式失败;
 - **实体集合属性**(`List<string>`/`List<int>` 等,JSON 数组列)的 `Contains` 翻译为服务端

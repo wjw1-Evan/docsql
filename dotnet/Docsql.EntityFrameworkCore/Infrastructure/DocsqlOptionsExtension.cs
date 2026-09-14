@@ -25,6 +25,7 @@ public sealed class DocsqlOptionsExtension : RelationalOptionsExtension
 {
     private string? _connectionString;
     private DbConnection? _connection;
+    private Func<string>? _connectionStringFactory;
 
     public DocsqlOptionsExtension() { }
 
@@ -32,16 +33,31 @@ public sealed class DocsqlOptionsExtension : RelationalOptionsExtension
     {
         _connectionString = copy._connectionString;
         _connection = copy._connection;
+        _connectionStringFactory = copy._connectionStringFactory;
     }
 
     public override string? ConnectionString => _connectionString;
     public override DbConnection? Connection => _connection;
+
+    /// <summary>运行期连接串工厂(见 UseDocsql(Func&lt;string&gt;))。</summary>
+    public Func<string>? ConnectionStringFactory => _connectionStringFactory;
 
     public override DocsqlOptionsExtension WithConnectionString(string? cs)
         => new(this) { _connectionString = cs };
 
     public override DocsqlOptionsExtension WithConnection(DbConnection? conn)
         => new(this) { _connection = conn };
+
+    /// <summary>
+    /// 每次创建物理连接时调用的连接串工厂。连接信息不参与 EF 模型/服务提供程序
+    /// 缓存键(本扩展哈希恒为 0),同一宿主可让不同上下文连不同节点而模型只建一次。
+    /// </summary>
+    public DocsqlOptionsExtension WithConnectionStringFactory(Func<string> factory)
+        => new(this) { _connectionStringFactory = factory };
+
+    /// <summary>解析当前应使用的连接信息:工厂(运行期)优先于静态连接串。</summary>
+    internal string? ResolveConnectionString()
+        => _connectionStringFactory?.Invoke() ?? _connectionString;
 
     protected override RelationalOptionsExtension Clone() => new DocsqlOptionsExtension(this);
 
