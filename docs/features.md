@@ -72,7 +72,7 @@ DROP INDEX idx;
 ```sql
 INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y') RETURNING id;
 INSERT INTO t (a, b) SELECT a, b FROM src;                 -- INSERT … SELECT
-INSERT INTO t (...) ON CONFLICT DO NOTHING;                -- 或 DO REPLACE
+INSERT INTO t (...) ON CONFLICT DO NOTHING;                -- 目标列/ON CONSTRAINT 限定作用域
 INSERT OR REPLACE INTO t ...;  INSERT OR IGNORE INTO t ...;
 UPDATE t SET a = a + 1 WHERE b = 'x' RETURNING *;
 DELETE FROM t WHERE a = 1 RETURNING id;
