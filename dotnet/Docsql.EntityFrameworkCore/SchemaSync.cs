@@ -33,9 +33,11 @@ internal static partial class SchemaSync
             if (column is null) continue;
             var type = p.GetColumnType() ?? "TEXT";
             modelColumns.Add((column, type));
-            // 单列值生成主键:整数自增,其余 NOT NULL 照常声明。
+            // 单列值生成主键:整数自增;非空模型照常声明 NOT NULL
+            // (引擎的索引按序扫描要求键列 NOT NULL——索引树不存 NULL 键)。
             if (pk is { Properties.Count: 1 } && pk.Properties[0] == p && p.IsPrimaryKey())
-                cols.Add($"{Quote(column)} {type} PRIMARY KEY AUTOINCREMENT");
+                cols.Add(
+                    $"{Quote(column)} {type}{(p.IsNullable ? "" : " NOT NULL")} PRIMARY KEY AUTOINCREMENT");
             else
                 cols.Add($"{Quote(column)} {type}{(p.IsNullable ? "" : " NOT NULL")}");
         }

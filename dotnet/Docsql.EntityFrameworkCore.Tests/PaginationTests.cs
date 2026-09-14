@@ -115,4 +115,29 @@ public sealed class PaginationTests : IClassFixture<EfServerFixture>
             db.Items.Where(p => p.Bucket == 1).OrderBy(p => p.Rank)
                 .Skip(4).Take(2).Select(p => p.Rank).ToList());
     }
+
+    [Fact]
+    public void Ef_created_key_is_not_null_and_pages_by_id()
+    {
+        Clean();
+        Seed(23);
+
+        using var conn = new DocsqlConnection(Cs);
+        conn.Open();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT is_nullable FROM information_schema.columns " +
+                "WHERE table_name = 'PagedItems' AND column_name = 'Id'";
+            Assert.Equal("NO", cmd.ExecuteScalar());
+        }
+
+        using var db = new PagedItemDb(Cs);
+        Assert.Equal(
+            new[] { 21, 22, 23 },
+            db.Items.OrderBy(p => p.Id).Skip(20).Take(10).Select(p => p.Id).ToList());
+        Assert.Equal(
+            new[] { 23, 22, 21 },
+            db.Items.OrderByDescending(p => p.Id).Take(3).Select(p => p.Id).ToList());
+    }
 }

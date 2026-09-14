@@ -38,7 +38,7 @@ public sealed class LargePagerFixture : IDisposable
         {
             cmd.Transaction = tx;
             cmd.CommandText =
-                "CREATE TABLE PageRows (Id INT PRIMARY KEY, Rank INT, Name TEXT, Bucket INT, Payload TEXT)";
+                "CREATE TABLE PageRows (Id INT PRIMARY KEY NOT NULL, Rank INT, Name TEXT, Bucket INT NOT NULL, Payload TEXT)";
             cmd.ExecuteNonQuery();
         }
         const int batch = 500;
@@ -85,9 +85,10 @@ public sealed class LargePaginationTests : IClassFixture<LargePagerFixture>
         var seen = new List<int>(LargePagerFixture.Total);
         for (var page = 0; page * pageSize < LargePagerFixture.Total; page++)
         {
-            var got = db.Rows.OrderBy(r => r.Rank)
+            // PK 索引序窗口:每页只走索引 + 装载窗口内的文档。
+            var got = db.Rows.OrderBy(r => r.Id)
                 .Skip(page * pageSize).Take(pageSize)
-                .Select(r => r.Rank).ToList();
+                .Select(r => r.Id).ToList();
             Assert.Equal(pageSize, got.Count);
             Assert.Equal(baseline.GetRange(page * pageSize, pageSize), got);
             seen.AddRange(got);
@@ -102,17 +103,26 @@ public sealed class LargePaginationTests : IClassFixture<LargePagerFixture>
         using var db = NewDb();
         Assert.Equal(
             Enumerable.Range(47_501, 1_000),
-            db.Rows.OrderBy(r => r.Rank).Skip(47_500).Take(1_000).Select(r => r.Rank).ToList());
+            db.Rows.OrderBy(r => r.Id).Skip(47_500).Take(1_000).Select(r => r.Id).ToList());
 
         Assert.Equal(
             Enumerable.Range(LargePagerFixture.Total - 9, 10),
-            db.Rows.OrderBy(r => r.Rank)
-                .Skip(LargePagerFixture.Total - 10).Select(r => r.Rank).ToList());
+            db.Rows.OrderBy(r => r.Id)
+                .Skip(LargePagerFixture.Total - 10).Select(r => r.Id).ToList());
 
-        Assert.Empty(db.Rows.OrderBy(r => r.Rank).Skip(LargePagerFixture.Total).ToList());
-        Assert.Empty(db.Rows.OrderBy(r => r.Rank)
+        Assert.Empty(db.Rows.OrderBy(r => r.Id).Skip(LargePagerFixture.Total).ToList());
+        Assert.Empty(db.Rows.OrderBy(r => r.Id)
             .Skip(LargePagerFixture.Total + 10_000).Take(100).ToList());
 
+        Assert.Equal(
+            Enumerable.Range(36_656, 1_000).Reverse(),
+            db.Rows.OrderByDescending(r => r.Id)
+                .Skip(12_345).Take(1_000).Select(r => r.Id).ToList());
+
+        // 无索引键(Rank)仍走通用扫描+排序路径,结果一致。
+        Assert.Equal(
+            Enumerable.Range(47_501, 1_000),
+            db.Rows.OrderBy(r => r.Rank).Skip(47_500).Take(1_000).Select(r => r.Rank).ToList());
         Assert.Equal(
             Enumerable.Range(36_656, 1_000).Reverse(),
             db.Rows.OrderByDescending(r => r.Rank)

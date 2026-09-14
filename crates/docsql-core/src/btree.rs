@@ -405,19 +405,50 @@ impl BTree {
 
     /// In-order scan of all (key, val) pairs.
     pub fn scan(&self, reader: &PageReader, tx: &Tx) -> Result<Vec<(Value, u64)>> {
+        self.scan_limited(reader, tx, None)
+    }
+
+    /// In-order scan capped at `max` entries (`None` = unlimited). Callers
+    /// that only need an ORDER BY … LIMIT prefix stop walking the tree as
+    /// soon as the window is filled.
+    pub fn scan_limited(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
         // Leaves are not chained in v0; walk the tree recursively.
         let mut out = Vec::new();
-        Self::scan_rec(reader, tx, self.root, &mut out)?;
+        Self::scan_rec(reader, tx, self.root, max, &mut out)?;
         Ok(out)
     }
 
-    fn scan_rec(reader: &PageReader, tx: &Tx, id: u32, out: &mut Vec<(Value, u64)>) -> Result<()> {
+    fn scan_rec(
+        reader: &PageReader,
+        tx: &Tx,
+        id: u32,
+        max: Option<usize>,
+        out: &mut Vec<(Value, u64)>,
+    ) -> Result<()> {
+        if max.is_some_and(|m| out.len() >= m) {
+            return Ok(());
+        }
         match Self::read_node(reader, tx, id)? {
-            Node::Leaf { cells } => out.extend(cells),
+            Node::Leaf { cells } => {
+                for cell in cells {
+                    out.push(cell);
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
+                    }
+                }
+            }
             Node::Internal { leftmost, cells } => {
-                Self::scan_rec(reader, tx, leftmost, out)?;
+                Self::scan_rec(reader, tx, leftmost, max, out)?;
                 for (_, child) in cells {
-                    Self::scan_rec(reader, tx, child, out)?;
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
+                    }
+                    Self::scan_rec(reader, tx, child, max, out)?;
                 }
             }
         }
@@ -524,8 +555,20 @@ impl BTree {
         lo: &Value,
         hi: Option<(&Value, bool)>,
     ) -> Result<Vec<(Value, u64)>> {
+        self.range_bounded_limited(reader, tx, lo, hi, None)
+    }
+
+    /// `range_bounded` with an entry cap (see [`BTree::scan_limited`]).
+    pub fn range_bounded_limited(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        lo: &Value,
+        hi: Option<(&Value, bool)>,
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_bounded_rec(reader, tx, self.root, lo, hi, &mut out)?;
+        Self::range_bounded_rec(reader, tx, self.root, lo, hi, max, &mut out)?;
         Ok(out)
     }
 
@@ -544,8 +587,12 @@ impl BTree {
         id: u32,
         lo: &Value,
         hi: Option<(&Value, bool)>,
+        max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
     ) -> Result<()> {
+        if max.is_some_and(|m| out.len() >= m) {
+            return Ok(());
+        }
         match Self::read_node(reader, tx, id)? {
             Node::Leaf { cells } => {
                 for (k, v) in cells {
@@ -554,6 +601,9 @@ impl BTree {
                     }
                     if Value::cmp_values(&k, lo) != Ordering::Less {
                         out.push((k, v));
+                        if max.is_some_and(|m| out.len() >= m) {
+                            break;
+                        }
                     }
                 }
             }
@@ -575,9 +625,12 @@ impl BTree {
                     None => true,
                 };
                 if leftmost_upper_ge {
-                    Self::range_bounded_rec(reader, tx, leftmost, lo, hi, out)?;
+                    Self::range_bounded_rec(reader, tx, leftmost, lo, hi, max, out)?;
                 }
                 for (i, (sep, child)) in cells.iter().enumerate() {
+                    if max.is_some_and(|m| out.len() >= m) {
+                        break;
+                    }
                     if skip_by_hi(sep) {
                         continue;
                     }
@@ -586,7 +639,7 @@ impl BTree {
                         None => true,
                     };
                     if upper_ge {
-                        Self::range_bounded_rec(reader, tx, *child, lo, hi, out)?;
+                        Self::range_bounded_rec(reader, tx, *child, lo, hi, max, out)?;
                     }
                 }
             }
@@ -694,6 +747,29 @@ mod tests {
             .range_from(&PageReader::current(&pager), &tx, &Value::Int(5))
             .unwrap();
         assert_eq!(from_5.len(), 500 - 5 * 50);
+    }
+
+    #[test]
+    fn capped_scans_stop_at_max() {
+        let (_d, pager) = fresh("bt10.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&pager, &mut tx).unwrap();
+        for i in 0..300i64 {
+            tree.insert(&pager, &mut tx, Value::Int(i), i as u64, true)
+                .unwrap();
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let reader = PageReader::current(&pager);
+        let full = tree.scan(&reader, &tx).unwrap();
+        assert_eq!(tree.scan_limited(&reader, &tx, Some(7)).unwrap(), full[..7]);
+        assert!(tree.scan_limited(&reader, &tx, Some(0)).unwrap().is_empty());
+        assert_eq!(tree.scan_limited(&reader, &tx, None).unwrap(), full);
+        assert_eq!(
+            tree.range_bounded_limited(&reader, &tx, &Value::Int(100), None, Some(5))
+                .unwrap(),
+            full[100..105]
+        );
     }
 
     #[test]

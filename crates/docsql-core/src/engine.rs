@@ -977,6 +977,7 @@ impl<'a> ReadCx<'a> {
         query: Query,
         select: sqlparser::ast::Select,
         rows: Vec<Object>,
+        pre_windowed: bool,
     ) -> Result<ExecOutcome> {
         let mut want_star = false;
         let mut project: Vec<(String, SqlExpr)> = Vec::new();
@@ -1055,7 +1056,9 @@ impl<'a> ReadCx<'a> {
             }
             None | Some(sqlparser::ast::Distinct::All) => {}
         }
-        out = self.apply_order_limit(query, out, &columns_out, Some(docs))?;
+        if !pre_windowed {
+            out = self.apply_order_limit(query, out, &columns_out, Some(docs))?;
+        }
         Ok(ExecOutcome::Rows(QueryResult {
             columns: columns_out,
             rows: out,
@@ -1236,8 +1239,6 @@ impl<'a> ReadCx<'a> {
             }
             return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
         }
-        let mut rows = self.load_from(&select.from, &select.selection, ctes)?;
-
         // Oracle ROWNUM pseudo-column: number each row right after it is
         // retrieved (before WHERE and before ORDER BY — Oracle semantics).
         // Injected only when the statement references it, and only for the
@@ -1249,6 +1250,31 @@ impl<'a> ReadCx<'a> {
         };
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
         let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
+        let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
+
+        // ORDER BY <index key> + LIMIT: index-ordered window, skipping the
+        // full heap scan and sort. Already filtered and windowed; the WHERE
+        // pass below would be a no-op, so it is skipped too.
+        let mut pre_windowed = false;
+        let mut rows = if !is_aggregate && !rownum_wanted && select.having.is_none() && distinct_all
+        {
+            match self.ordered_index_window(
+                &select.from,
+                &select.selection,
+                &query.order_by,
+                &query,
+                ctes,
+            )? {
+                Some(rows) => {
+                    pre_windowed = true;
+                    rows
+                }
+                None => self.load_from(&select.from, &select.selection, ctes)?,
+            }
+        } else {
+            self.load_from(&select.from, &select.selection, ctes)?
+        };
+
         if rownum_wanted {
             for (i, row) in rows.iter_mut().enumerate() {
                 row.insert("ROWNUM".into(), Value::Int(i as i64 + 1));
@@ -1258,7 +1284,7 @@ impl<'a> ReadCx<'a> {
         // WHERE — consuming pass: matching docs move into the kept vec
         // instead of being whole-document cloned (the filtered set is
         // often the whole table).
-        if select.selection.is_some() {
+        if !pre_windowed && select.selection.is_some() {
             let mut kept = Vec::with_capacity(rows.len());
             for doc in rows.drain(..) {
                 if self.matches(&select.selection, &doc)? {
@@ -1276,7 +1302,7 @@ impl<'a> ReadCx<'a> {
             // Silently dropping the filter would return unfiltered rows.
             return err("HAVING requires GROUP BY or an aggregate");
         }
-        self.exec_plain_select(query, select, rows)
+        self.exec_plain_select(query, select, rows, pre_windowed)
     }
 
     /// Execute the query body (no WITH: it was materialized by the caller
@@ -1606,6 +1632,29 @@ impl<'a> ReadCx<'a> {
         let heap = meta.heap_of();
         let tx = self.pager.begin_tx(); // read-only handle: nothing staged, dropping it is the cleanup
         let tree = BTree::open(root);
+        let pairs = self.probe_pairs(&col, &tree, &tx, &plan)?;
+        // Read-only tx: no staged pages, dropping it is the cleanup.
+        drop(tx);
+        let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
+        for (_, loc) in pairs {
+            if let Some(doc) = heap.doc_at(&self.reader(), loc)? {
+                out.push((loc, doc));
+            }
+        }
+        // Heap order (page, slot) — loc packing already sorts that way.
+        out.sort_by_key(|(loc, _)| *loc);
+        Ok(Some(out))
+    }
+
+    /// Index entries selected by `plan`, in key order.
+    fn probe_pairs(
+        &self,
+        col: &str,
+        tree: &BTree,
+        tx: &crate::pager::Tx,
+        plan: &ProbePlan,
+    ) -> Result<Vec<(Value, u64)>> {
+        let reader = self.reader();
         let pairs = match plan {
             ProbePlan::Eq(v) => {
                 // Bounded range + equal filter so non-unique trees return
@@ -1615,9 +1664,9 @@ impl<'a> ReadCx<'a> {
                 // indexes v is the full Array key — element-wise cmp_values
                 // equality is exactly a key match.
                 let mut p = tree
-                    .range_bounded(&self.reader(), &tx, &v, Some((&v, true)))
-                    .map_err(|e| index_err(&col, e))?;
-                p.retain(|(k, _)| Value::cmp_values(k, &v) == Ordering::Equal);
+                    .range_bounded(&reader, tx, v, Some((v, true)))
+                    .map_err(|e| index_err(col, e))?;
+                p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
                 p
             }
             ProbePlan::Prefix(prefix) => {
@@ -1625,9 +1674,9 @@ impl<'a> ReadCx<'a> {
                 // makes Array(prefix) sort right before every key extending
                 // it) and keep keys that start with it element-wise.
                 let mut p = tree
-                    .range_bounded(&self.reader(), &tx, &prefix, None)
-                    .map_err(|e| index_err(&col, e))?;
-                if let Value::Array(pfx) = &prefix {
+                    .range_bounded(&reader, tx, prefix, None)
+                    .map_err(|e| index_err(col, e))?;
+                if let Value::Array(pfx) = prefix {
                     p.retain(|(k, _)| match k {
                         Value::Array(items) => {
                             items.len() >= pfx.len()
@@ -1645,20 +1694,18 @@ impl<'a> ReadCx<'a> {
                 let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
                 let mut pairs = match &lo {
                     Some((v, true)) => tree
-                        .range_bounded(&self.reader(), &tx, v, hi_ref)
-                        .map_err(|e| index_err(&col, e))?,
+                        .range_bounded(&reader, tx, v, hi_ref)
+                        .map_err(|e| index_err(col, e))?,
                     Some((v, false)) => {
                         // strict lower bound: start at v, then drop the equal run
                         let mut p = tree
-                            .range_bounded(&self.reader(), &tx, v, hi_ref)
-                            .map_err(|e| index_err(&col, e))?;
+                            .range_bounded(&reader, tx, v, hi_ref)
+                            .map_err(|e| index_err(col, e))?;
                         p.retain(|(k, _)| Value::cmp_values(k, v) != std::cmp::Ordering::Equal);
                         p
                     }
                     // No lower bound: full tree scan (rare: WHERE col < x).
-                    None => tree
-                        .scan(&self.reader(), &tx)
-                        .map_err(|e| index_err(&col, e))?,
+                    None => tree.scan(&reader, tx).map_err(|e| index_err(col, e))?,
                 };
                 if let Some((v, incl)) = &hi {
                     pairs.retain(|(k, _)| {
@@ -1669,16 +1716,99 @@ impl<'a> ReadCx<'a> {
                 pairs
             }
         };
-        // Read-only tx: no staged pages, dropping it is the cleanup.
+        Ok(pairs)
+    }
+
+    /// `ORDER BY <index key> LIMIT/OFFSET` window: walk one B+ tree in key
+    /// order and load only the documents in the requested window — no full
+    /// heap scan, no sort. `None` (generic path) unless the plan is exact:
+    /// solo real table, ORDER BY the tree's columns in order with a single
+    /// direction, all key columns declared NOT NULL (trees omit NULL keys),
+    /// a constant LIMIT, and a WHERE that either is absent or probes the
+    /// same tree (residual conjuncts still filter while walking).
+    fn ordered_index_window(
+        &self,
+        from: &[sqlparser::ast::TableWithJoins],
+        selection: &Option<SqlExpr>,
+        order_by: &Option<sqlparser::ast::OrderBy>,
+        query: &Query,
+        ctes: &Ctes,
+    ) -> Result<Option<Vec<Object>>> {
+        if !ctes.is_empty() || from.len() != 1 {
+            return Ok(None);
+        }
+        let base = &from[0];
+        if !base.joins.is_empty() {
+            return Ok(None);
+        }
+        let sqlparser::ast::TableFactor::Table { name, alias, .. } = &base.relation else {
+            return Ok(None);
+        };
+        let tname = obj_name(name);
+        let Some(meta) = self.tables.get(&tname) else {
+            return Ok(None);
+        };
+        let Some(order_by) = order_by else {
+            return Ok(None);
+        };
+        let akey = alias.as_ref().map(|a| a.name.value.clone());
+        let Some((root_key, asc)) = order_walk_index(meta, &tname, akey.as_deref(), order_by)
+        else {
+            return Ok(None);
+        };
+        let Some((skip, take)) = constant_limit_window(query) else {
+            return Ok(None);
+        };
+        if take == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let plan = match selection {
+            None => None,
+            Some(cond) => match probe_plan(cond, meta, &tname, akey.as_deref()) {
+                Some((plan_root, plan)) if plan_root == root_key => Some(plan),
+                _ => return Ok(None),
+            },
+        };
+
+        let root = meta.index_roots[&root_key];
+        let tree = BTree::open(root);
+        let tx = self.pager.begin_tx();
+        // With no WHERE the walk stops collecting keys at the window's end.
+        // (Residual filters make the needed key count unknowable up front.)
+        let cap = (selection.is_none() && asc).then(|| skip.saturating_add(take));
+        let pairs = match &plan {
+            None => tree
+                .scan_limited(&self.reader(), &tx, cap)
+                .map_err(|e| index_err(&root_key, e))?,
+            Some(plan) => self.probe_pairs(&root_key, &tree, &tx, plan)?,
+        };
         drop(tx);
-        let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
-        for (_, loc) in pairs {
-            if let Some(doc) = heap.doc_at(&self.reader(), loc)? {
-                out.push((loc, doc));
+
+        let heap = meta.heap_of();
+        let reader = self.reader();
+        let locs: Vec<u64> = if asc {
+            pairs.iter().map(|(_, loc)| *loc).collect()
+        } else {
+            pairs.iter().rev().map(|(_, loc)| *loc).collect()
+        };
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        for loc in locs {
+            let Some(doc) = heap.doc_at(&reader, loc)? else {
+                continue;
+            };
+            if selection.is_some() && !self.matches(selection, &doc)? {
+                continue;
+            }
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+            out.push(doc);
+            if out.len() >= take {
+                break;
             }
         }
-        // Heap order (page, slot) — loc packing already sorts that way.
-        out.sort_by_key(|(loc, _)| *loc);
         Ok(Some(out))
     }
 
@@ -7080,6 +7210,29 @@ fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
     pi == p.len()
 }
 
+/// `(skip, take)` when LIMIT/OFFSET are non-negative integer constants.
+/// `None` means the window cannot be bounded ahead of time (no LIMIT,
+/// negative or expression bounds, FETCH …) — the generic path decides.
+fn constant_limit_window(query: &Query) -> Option<(usize, usize)> {
+    if query.fetch.is_some() {
+        return None;
+    }
+    fn count(e: &SqlExpr) -> Option<usize> {
+        match eval_const(e).ok()?.as_i64() {
+            Some(n) if n >= 0 => Some(n as usize),
+            _ => None,
+        }
+    }
+    match query.limit_clause.as_ref()? {
+        LimitClause::LimitOffset { limit, offset, .. } => {
+            let take = count(limit.as_ref()?)?;
+            let skip = offset.as_ref().map_or(Some(0), |o| count(&o.value))?;
+            Some((skip, take))
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => Some((count(offset)?, count(limit)?)),
+    }
+}
+
 /// LIMIT/OFFSET windowing shared by the FROM-less and general SELECT paths.
 /// A negative limit or offset means "no limit"/"skip nothing" (SQLite);
 /// non-integer values are an error, not a silently unlimited query.
@@ -7819,6 +7972,63 @@ fn flatten_and<'a>(e: &'a SqlExpr, out: &mut Vec<&'a SqlExpr>) {
     } else {
         out.push(e);
     }
+}
+
+/// Resolve a column reference (bare, table- or alias-qualified) to its bare
+/// column name when it names a column of this table.
+fn unqualified_col(ident: &str, table: &str, alias: Option<&str>) -> Option<String> {
+    if let Some(c) = ident.strip_prefix(&format!("{table}.")) {
+        return Some(c.to_string());
+    }
+    if let Some(a) = alias {
+        if let Some(c) = ident.strip_prefix(&format!("{a}.")) {
+            return Some(c.to_string());
+        }
+    }
+    if !ident.contains('.') {
+        return Some(ident.to_string());
+    }
+    None
+}
+
+/// Match ORDER BY to one of the table's B+ trees: every key resolves to the
+/// tree's columns in order, all one direction, default NULL placement
+/// (NULLS FIRST/LAST is a different order — the sort path handles it). The
+/// trees omit NULL keys (`index_key_of`), so every key column must be
+/// declared NOT NULL or rows would silently go missing from the walk.
+fn order_walk_index(
+    meta: &TableMeta,
+    table: &str,
+    alias: Option<&str>,
+    order_by: &sqlparser::ast::OrderBy,
+) -> Option<(String, bool)> {
+    let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return None;
+    };
+    if exprs.is_empty() {
+        return None;
+    }
+    let mut cols = Vec::with_capacity(exprs.len());
+    let mut asc = true;
+    for (i, o) in exprs.iter().enumerate() {
+        if o.options.nulls_first.is_some() {
+            return None;
+        }
+        let col = unqualified_col(&expr_name(&o.expr), table, alias)?;
+        let this_asc = o.options.asc.unwrap_or(true);
+        if i == 0 {
+            asc = this_asc;
+        } else if asc != this_asc {
+            return None;
+        }
+        cols.push(col);
+    }
+    if cols.iter().any(|c| !meta.not_null.contains(c)) {
+        return None;
+    }
+    meta.index_roots
+        .keys()
+        .find_map(|root| (meta.index_columns_of(root) == cols).then(|| (root.clone(), asc)))
 }
 
 /// Resolve a column reference (bare or table/alias-qualified) to an indexed
@@ -11261,6 +11471,138 @@ mod tests {
                 vec![Value::Str("a".into()), Value::Int(1)],
                 vec![Value::Str("b".into()), Value::Int(2)],
             ]
+        );
+    }
+
+    #[test]
+    fn order_by_indexed_not_null_key_limit_windows() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, v TEXT)",
+        );
+        for i in 1..=20 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'v{i}')"));
+        }
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10");
+        assert_eq!(
+            r.rows,
+            (11..=15).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+        );
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id DESC LIMIT 3");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(20)],
+                vec![Value::Int(19)],
+                vec![Value::Int(18)]
+            ]
+        );
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id LIMIT 0 OFFSET 5");
+        assert!(r.rows.is_empty());
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 18");
+        assert_eq!(r.rows, vec![vec![Value::Int(19)], vec![Value::Int(20)]]);
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 50");
+        assert!(r.rows.is_empty());
+        // ORDER BY key need not be in the projection.
+        let r = rows(&mut db, "SELECT id * 2 AS dbl FROM t ORDER BY id LIMIT 2");
+        assert_eq!(r.columns, vec!["dbl"]);
+        assert_eq!(r.rows, vec![vec![Value::Int(2)], vec![Value::Int(4)]]);
+    }
+
+    #[test]
+    fn order_by_nullable_indexed_column_keeps_null_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (n INT, note TEXT)");
+        run(&mut db, "CREATE INDEX ix_n ON t (n)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (NULL, 'null'), (1, 'one'), (2, 'two')",
+        );
+        // Trees omit NULL keys: the walk must stay off for nullable columns,
+        // or these rows would silently disappear.
+        let r = rows(&mut db, "SELECT note FROM t ORDER BY n LIMIT 2");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("null".into())],
+                vec![Value::Str("one".into())]
+            ]
+        );
+        let r = rows(&mut db, "SELECT note FROM t ORDER BY n DESC LIMIT 1");
+        assert_eq!(r.rows, vec![vec![Value::Str("two".into())]]);
+    }
+
+    #[test]
+    fn order_by_indexed_key_with_where_on_same_index() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, v TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a'), (6, 'b')",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id >= 2 AND id <= 9 ORDER BY id LIMIT 3 OFFSET 1",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(3)],
+                vec![Value::Int(4)],
+                vec![Value::Int(5)]
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id >= 4 AND id <= 9 ORDER BY id LIMIT 3 OFFSET 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(5)], vec![Value::Int(6)]]);
+        // The probe bounds the walk; the residual filter still runs before
+        // OFFSET counts.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id >= 1 AND v = 'b' ORDER BY id LIMIT 1 OFFSET 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(4)]]);
+        let r = rows(&mut db, "SELECT id FROM t WHERE id = 3 ORDER BY id LIMIT 2");
+        assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn order_by_composite_index_walk_and_mixed_direction_fallback() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v TEXT)",
+        );
+        run(&mut db, "CREATE INDEX ix_ab ON t (a, b)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z'), (2, 2, 'w')",
+        );
+        let r = rows(&mut db, "SELECT v FROM t ORDER BY a, b LIMIT 3 OFFSET 1");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("y".into())],
+                vec![Value::Str("z".into())],
+                vec![Value::Str("w".into())]
+            ]
+        );
+        let r = rows(&mut db, "SELECT v FROM t ORDER BY a DESC, b DESC LIMIT 2");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("w".into())], vec![Value::Str("z".into())]]
+        );
+        // Mixed directions cannot follow one tree order: generic sort path.
+        let r = rows(&mut db, "SELECT v FROM t ORDER BY a ASC, b DESC LIMIT 2");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("y".into())], vec![Value::Str("x".into())]]
         );
     }
 
