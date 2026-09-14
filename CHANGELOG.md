@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-14
+
+### 发布与文档:0.2.0(NuGet 四包 + Aspire 安装使用)(2026-09-14)
+
+#### 变更
+
+- **.NET 包版本 0.1.0 → 0.2.0**:Docsql.Client / Docsql.EntityFrameworkCore /
+  Docsql.Aspire.Hosting / Docsql.Aspire.Client 统一升版,随 `v0.2.0` tag 推 GitHub Packages;
+- **文档补齐 Aspire 安装与使用**:README「.NET 与 Aspire」与 `docs/drivers.md`(新增安装节与
+  Aspire 集成节)、`docs/README.md`(Aspire 快速开始)、四个包 README 全部写明 GitHub Packages
+  源配置(nuget.config + PAT `read:packages`)、`dotnet add package` 命令、包到项目的对应关系、
+  AppHost/消费侧最小示例与 `aspire start` / `aspire publish` 用法;`docs/limitations.md`
+  生态行与 README 结构/测试行同步(含客户端与 Aspire 示例项目)。
+
 ### 审查去重续批(2026-09-13)
 
 #### 修复

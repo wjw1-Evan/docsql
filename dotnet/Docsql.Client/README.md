@@ -2,6 +2,16 @@
 
 ADO.NET data provider for [DocSQL](https://github.com/wjw1-Evan/docsql) — a Rust-native JSON document database with full SQL.
 
+## 安装
+
+包发布在 GitHub Packages(`net10.0`);先把源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`
+配到 `nuget.config`(读取需 GitHub PAT,权限 `read:packages`;配置见
+[仓库 README](https://github.com/wjw1-Evan/docsql#net-与-aspireadonet--ef-core--apphost-编排)),然后:
+
+```bash
+dotnet add package Docsql.Client
+```
+
 ```csharp
 await using var conn = new DocsqlConnection("host=127.0.0.1;port=7600;token=YOUR-TOKEN");
 // 或数据库用户登录: "host=...;port=...;user=analyst;password=..."

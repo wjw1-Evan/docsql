@@ -1,6 +1,16 @@
 # Docsql.EntityFrameworkCore
 
-Entity Framework Core provider for [DocSQL](https://github.com/wjw1-Evan/docsql) — 原生提供程序,基于 [Docsql.Client](https://www.nuget.org/packages/Docsql.Client),不依赖 SQLite。
+Entity Framework Core provider for [DocSQL](https://github.com/wjw1-Evan/docsql) — 原生提供程序,基于 [Docsql.Client](https://github.com/wjw1-Evan/docsql/pkgs/nuget/Docsql.Client),不依赖 SQLite。
+
+## 安装
+
+包发布在 GitHub Packages(`net10.0`);先把源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`
+配到 `nuget.config`(读取需 GitHub PAT,权限 `read:packages`;配置见
+[仓库 README](https://github.com/wjw1-Evan/docsql#net-与-aspireadonet--ef-core--apphost-编排)),然后:
+
+```bash
+dotnet add package Docsql.EntityFrameworkCore
+```
 
 ```csharp
 services.AddDbContext<AppDb>(o =>

@@ -20,6 +20,8 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
 ```
 
 > 私有仓库的 GHCR 镜像包默认不可匿名拉取,先 `docker login ghcr.io`。镜像 tag 可用环境变量覆盖:生产用 `DOCSQL_IMAGE_TAG`,本地开发用 `DOCSQL_DEV_IMAGE_TAG`(两者互不影响)。
+>
+> .NET / Aspire 项目无需手写 compose:`dotnet add package Docsql.Aspire.Hosting` 后在 AppHost 里三行编排 DocSQL 容器节点(见下文「.NET 与 Aspire」)。
 
 ## 发布订阅(pub/sub,持久化)
 
@@ -102,13 +104,13 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 | docsql-server | TCP 服务器、认证、复制、持久化发布订阅(pub/sub) |
 | docsql-cli | 嵌入式 + 远程 shell |
 | docsql-web | Web 管理控制台(SSMS 风格 UI + REST API;纯管理工具,自身不存数据,所有数据操作连接指定节点执行) |
-| dotnet/ | Docsql.Client(ADO.NET)与 Docsql.EntityFrameworkCore;示例:Docsql.Sample(ADO.NET 数据操作实例,连已运行节点)、Docsql.EfSample(EF Core 端到端) |
+| dotnet/ | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Docsql.Aspire.Hosting / Docsql.Aspire.Client(AppHost 编排与消费侧);示例:Docsql.Sample(ADO.NET 数据操作实例,连已运行节点)、Docsql.EfSample(EF Core 端到端)、samples/AspireSample(AppHost + Worker 编排示例) |
 
 ## 测试
 
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
 - Docker:compose 双 profile 部署测试全绿——多节点 81 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
-- .NET:xUnit(ADO.NET Client 62 项 + EF Core 22 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型与长语句契约)
+- .NET:xUnit(ADO.NET Client 90 项 + EF Core 24 项 + Aspire 集成 12 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型与长语句契约/资源模型快照与 DI 注册)
 - CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(81 + 34 项)
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)
@@ -216,21 +218,39 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 
 ## .NET 与 Aspire(ADO.NET / EF Core / AppHost 编排)
 
-四个 NuGet 包发布在 GitHub Packages(先在 nuget.config 加源,见下),版本随 `v*` tag 发布:
+四个 NuGet 包发布在 GitHub Packages(`net10.0`,版本随 `v*` tag 发布,当前 `0.2.0`):
 
-| 包 | 用途 |
-|---|---|
-| `Docsql.Client` | ADO.NET 提供程序(连接池/事务/pub-sub/传输加密) |
-| `Docsql.EntityFrameworkCore` | 原生 EF Core 提供程序(EnsureCreated/索引自动同步) |
-| `Docsql.Aspire.Hosting` | Aspire AppHost 编排:容器节点/对称集群/连接串注入/健康检查/伴生控制台 |
-| `Docsql.Aspire.Client` | Aspire 消费侧:`AddDocsqlConnection` + 连接健康检查 |
+| 包 | 用途 | 装到哪 |
+|---|---|---|
+| `Docsql.Client` | ADO.NET 提供程序(连接池/事务/pub-sub/传输加密) | 数据访问项目 |
+| `Docsql.EntityFrameworkCore` | 原生 EF Core 提供程序(EnsureCreated/索引自动同步) | EF 项目 |
+| `Docsql.Aspire.Hosting` | Aspire AppHost 编排:容器节点/对称集群/连接串注入/健康检查/伴生控制台 | AppHost 项目 |
+| `Docsql.Aspire.Client` | Aspire 消费侧:`AddDocsqlConnection` + 连接健康检查 | 消费项目(Worker/ASP.NET Core) |
+
+**安装**:先把 GitHub Packages 源配到 `nuget.config`(读取需要 GitHub PAT,权限 `read:packages`):
 
 ```xml
-<!-- nuget.config:接入 GitHub Packages 源(需 GitHub PAT with read:packages) -->
-<source>https://nuget.pkg.github.com/wjw1-Evan/index.json</source>
+<configuration>
+  <packageSources>
+    <add key="github" value="https://nuget.pkg.github.com/wjw1-Evan/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <github>
+      <add key="Username" value="<GitHub 用户名>" />
+      <add key="ClearTextPassword" value="<PAT,read:packages>" />
+    </github>
+  </packageSourceCredentials>
+</configuration>
 ```
 
-AppHost 三行起步(完整示例见 `dotnet/samples/AspireSample/`):
+```bash
+dotnet add package Docsql.Client                # ADO.NET(连接池/事务/pub-sub)
+dotnet add package Docsql.EntityFrameworkCore   # EF Core 提供程序
+dotnet add package Docsql.Aspire.Hosting        # AppHost 项目
+dotnet add package Docsql.Aspire.Client         # 消费项目(Worker/API)
+```
+
+**AppHost 三步起步**(完整示例见 `dotnet/samples/AspireSample/`):
 
 ```csharp
 var docsql = builder.AddDocsql("docsql").WithDataVolume().WithWebConsole();
@@ -238,10 +258,14 @@ builder.AddProject<Projects.MyApi>("myapi").WithReference(docsql).WaitFor(docsql
 // 对称集群:builder.AddDocsqlCluster("docsql", nodeCount: 3)
 ```
 
+`aspire start`(或 `dotnet run --project <AppHost>`)即按编排拉起容器节点并打开 dashboard;
+示例 AppHost 配 `AddDockerComposeEnvironment`,`aspire publish` 输出 docker-compose 部署产物。
 消费侧 `builder.AddDocsqlConnection("docsql")` 注册连接与健康检查;EF 侧
 `services.AddDocsqlDbContext<TodoDb>("docsql")` 按名取注入的连接串。默认生成随机客户端
 token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEnvironment`
-可完整定制;镜像版本默认 `latest`,`WithImageTag` 钉版。
+可完整定制;镜像版本默认 `latest`,`WithImageTag` 钉版。API 速览见
+[Docsql.Aspire.Hosting](dotnet/Docsql.Aspire.Hosting/README.md) /
+[Docsql.Aspire.Client](dotnet/Docsql.Aspire.Client/README.md) 包 README。
 
 ## 安全(对照等保 2.0 / GB/T 20273 数据库管理系统安全技术要求)
 

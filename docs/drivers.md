@@ -1,6 +1,22 @@
 # 客户端与驱动
 
+## 安装(四个 NuGet 包,GitHub Packages)
+
+包发布在 GitHub Packages 源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`(读取需 GitHub
+PAT,权限 `read:packages`;`nuget.config` 源配置见 [README](../README.md#net-与-aspireadonet--ef-core--apphost-编排)):
+
+```bash
+dotnet add package Docsql.Client                # .NET ADO.NET
+dotnet add package Docsql.EntityFrameworkCore   # EF Core 提供程序
+dotnet add package Docsql.Aspire.Hosting        # Aspire AppHost 编排
+dotnet add package Docsql.Aspire.Client         # Aspire 消费侧
+```
+
 ## .NET ADO.NET(Docsql.Client)
+
+```bash
+dotnet add package Docsql.Client
+```
 
 ```csharp
 await using var conn = new DocsqlConnection("host=127.0.0.1;port=7600;token=YOUR-TOKEN");
@@ -49,13 +65,56 @@ await using var reader = await cmd.ExecuteReaderAsync();
 
 ## .NET EF Core(Docsql.EntityFrameworkCore)
 
+```bash
+dotnet add package Docsql.EntityFrameworkCore
+```
+
 ```csharp
 services.AddDbContext<AppDb>(o => o.UseDocsql(connectionString));
+// 容器级(Aspire/宿主集成):services.AddDocsqlDbContext<AppDb>("docsql") 按名取注入的连接串
 ```
 
 - 原生提供程序(不依赖 SQLite);`EnsureCreated` + 惰性建表 + 模型/索引自动同步(免迁移);
-- `Database.Migrate()` 显式报错(Migrations 不支持);
-- 两包均带 NuGet 元数据,`dotnet pack` 可出包(`Docsql.Client` / `Docsql.EntityFrameworkCore`)。
+- `Database.Migrate()` 显式报错(Migrations 不支持)。
+
+## Aspire 集成(Docsql.Aspire.Hosting / Docsql.Aspire.Client)
+
+在 AppHost 中以容器方式编排 DocSQL 节点(单节点或对称集群),连接串自动注入消费项目。
+
+```bash
+dotnet add package Docsql.Aspire.Hosting   # AppHost 项目(需 Aspire AppHost SDK)
+dotnet add package Docsql.Aspire.Client    # 消费项目(Worker/ASP.NET Core)
+```
+
+AppHost:
+
+```csharp
+using Docsql.Aspire.Hosting;
+
+var docsql = builder.AddDocsql("docsql")
+    .WithDataVolume()      // 命名卷持久化 /data
+    .WithWebConsole();     // 伴生 docsql-web 控制台容器(账号门默认开启)
+
+builder.AddProject<Projects.MyApi>("myapi")
+    .WithReference(docsql) // 注入 ConnectionStrings__docsql
+    .WaitFor(docsql);      // 等待 TCP 健康检查通过
+```
+
+消费侧:
+
+```csharp
+builder.AddDocsqlConnection("docsql");       // 注册 transient DocsqlConnection + 健康检查
+// EF 项目:builder.Services.AddDocsqlDbContext<AppDb>("docsql") 按名取注入的连接串
+```
+
+- 对称集群:`builder.AddDocsqlCluster("docsql", nodeCount: 3)`(token / cluster token / peers /
+  数据卷一次到位,`cluster.Primary` 为连接入口);
+- 镜像默认 `latest`,`WithImageTag(...)` 钉版;`WithToken` / `WithClusterToken` / `WithPeers` /
+  `WithEnvironment(...)` 可定制;完整 API 速览见包 README
+  ([Hosting](../dotnet/Docsql.Aspire.Hosting/README.md)、[Client](../dotnet/Docsql.Aspire.Client/README.md));
+- 本地:`aspire start`(或 `dotnet run --project <AppHost>`)拉起节点 + dashboard;部署出口:
+  `aspire publish`(示例配 `AddDockerComposeEnvironment` 输出 docker-compose)。完整示例见
+  `dotnet/samples/AspireSample/`。
 
 ## CLI(docsql-cli)
 

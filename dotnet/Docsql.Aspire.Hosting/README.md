@@ -6,6 +6,23 @@ DocSQL 的 Aspire hosting 集成:在 AppHost 中以容器方式编排 DocSQL 数
 镜像为官方多架构 `ghcr.io/wjw1-evan/docsql`(amd64/arm64);容器内协议端口固定 7600,
 控制台固定 7700,数据目录挂载点为 `/data`。
 
+## 安装
+
+包发布在 GitHub Packages(`net10.0`),源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`,
+读取需要 GitHub PAT(权限 `read:packages`;`nuget.config` 源配置见
+[仓库 README](https://github.com/wjw1-Evan/docsql#net-与-aspireadonet--ef-core--apphost-编排)):
+
+```bash
+# AppHost 项目:
+dotnet add package Docsql.Aspire.Hosting
+# 消费项目(Worker/ASP.NET Core):
+dotnet add package Docsql.Aspire.Client
+```
+
+需要 .NET Aspire 13.5+(AppHost 项目为 `<Project Sdk="Aspire.AppHost.Sdk/13.5.3">`)。
+本地 `aspire start`(或 `dotnet run --project <AppHost>`)拉起节点;`aspire publish`
+输出部署产物(配 `AddDockerComposeEnvironment` 即 docker-compose)。
+
 ## 快速开始
 
 AppHost 项目(`<Project Sdk="Aspire.AppHost.Sdk/13.5.3">`):

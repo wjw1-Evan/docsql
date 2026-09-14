@@ -22,7 +22,7 @@
 - 数据完整性:WAL 先日志后数据、备份 sha256 校验和、恢复后跨节点摘要收敛验证、集群反熵自愈;
 - 安全:三凭据 + 数据库用户/角色(即时撤销)、登录锁定、**服务端参数化绑定(驱动默认路径)**、
   **Web 控制台原生 TLS(rustls)**、等保三级能力对照;
-- 生态:.NET ADO.NET(连接池默认开启 + 服务端绑定)+ EF Core(NuGet 可打包)、
+- 生态:.NET ADO.NET(连接池默认开启 + 服务端绑定)+ EF Core + Aspire 编排集成(NuGet/GitHub Packages 发布)、
   CLI(csv/json/脚本)、Web 控制台、单语言驱动之外的服务端 prepared statements 线协议(第二语言驱动的基础)。
 
 ## 路线(按商用优先级)

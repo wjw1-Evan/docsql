@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <!-- NuGet packaging surface (dotnet pack) -->
     <PackageId>Docsql.Aspire.Client</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>DocSQL Contributors</Authors>
     <Description>Aspire client integration for DocSQL: registers DocsqlConnection from the connection string injected by the Aspire hosting integration, with a health check.</Description>
     <PackageTags>docsql;database;aspire;client;document;sql</PackageTags>
