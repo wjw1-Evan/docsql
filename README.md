@@ -206,7 +206,7 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 
 ## .NET 与 Aspire(ADO.NET / EF Core / AppHost 编排)
 
-四个 NuGet 包发布在 GitHub Packages(`net10.0`,版本随 `v*` tag 发布,当前 `0.3.0`):
+四个 NuGet 包发布在 GitHub Packages(`net10.0`,版本随 `v*` tag 发布,当前 `0.4.0`):
 
 | 包 | 用途 | 装到哪 |
 |---|---|---|

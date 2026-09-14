@@ -9,7 +9,7 @@
 | `AspireSample.Worker` | `AddDocsqlConnection("docsql")` 注册连接,`INSERT ... RETURNING` + 参数化 `SELECT` 验证往返 |
 
 包版本在 [`Directory.Build.props`](Directory.Build.props) 的 `DocsqlPackageVersion`(当前
-`0.3.0`)统一钉住;升级包版本时改这一处即可。
+`0.4.0`)统一钉住;升级包版本时改这一处即可。
 
 ## 1. 配置包源(GitHub Packages)
 

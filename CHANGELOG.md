@@ -5,6 +5,61 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-14
+
+### 分页与计数性能批次(2026-09-14)
+
+#### 优化
+
+- **`ORDER BY <索引键> + 常量 LIMIT/OFFSET` 走索引序窗口**:按树序只装载窗口内
+  文档,不再全表扫描 + 全量排序(50 万行实测首屏/浅页 ~30x,深 OFFSET ~40x,
+  keyset 双向 ~50x);WHERE 能探测同一棵树时按窗口截断树遍历(OFFSET 行只计数
+  不解码),残余条件回退候选边扫边过滤;DESC 走反向遍历,严格下界在遍历内丢弃
+  等值 run;
+- **无索引 `ORDER BY` + 有界 LIMIT 走键提取 top-K 窗口**:只从编码字节提取排序
+  字段、不物化整文档(50 万行 `ORDER BY name` 320→41ms,深 OFFSET 366→98ms);
+- **`SELECT COUNT(*)` 免解码活槽计数**(50 万行 387→1.5ms);
+- 新增 `bench_page` 分页基准(默认 50 万行,可传行数)。
+
+### 标准 SQL 子句补齐与 T-SQL 兼容审计(2026-09-14)
+
+#### 新增
+
+- **标准查询子句**:`GROUP BY ROLLUP(...)`/`CUBE(...)`/`GROUPING SETS` + `GROUPING()`;
+  聚合 `FILTER (WHERE ...)`;`FETCH FIRST n ROWS WITH TIES`;`FROM (VALUES ...) AS t(cols)`
+  (含 CTE 别名列);`IS [NOT] DISTINCT FROM`;量化比较 `> ANY`/`<> ALL`(非相关子查询,
+  改写为比较链);
+- **T-SQL 兼容垫片**:`COUNT_BIG`/`ISNULL`/`CAST(... AS BIT)`;`INFORMATION_SCHEMA`
+  大小写不敏感;`ORDER BY (SELECT 1)` 子查询替换(EF Core `Skip`/`Take` 形态)。
+
+#### 变更
+
+- **子句级静默忽略全部改显式报错**:NATURAL JOIN(曾按 CROSS JOIN)、LATERAL/
+  `FOR UPDATE`·`FOR SHARE`/`SELECT INTO`·`SELECT TOP`/`TABLESAMPLE`/`WINDOW`·`QUALIFY`、
+  ClickHouse/Hive 专有子句、`* EXCLUDE/REPLACE`、T-SQL 变量 `@p`/`@@VAR`(曾静默 NULL)、
+  `OUTPUT`、表提示 `WITH(...)`、`#` 临时表(曾建持久表)、索引 `INCLUDE`/`WHERE`/`USING`/
+  存储选项(曾丢子句)、`UPDATE`·`DELETE` 的 `ORDER BY`/`LIMIT`、基表别名列、`sys.*`
+  提示——均显式报错,不再静默降级;`PRAGMA` 仍是有意接受并忽略的兼容垫片。
+
+### SQL 参考文档重写与三处静默降级修正(2026-09-14)
+
+#### 变更
+
+- `docs/sql-reference.md` 按 MSDN(T-SQL)风格重写:约定/数据类型/运算符/逐语句
+  语法·参数·备注·示例/系统视图/兼容性矩阵;README 能力表同步 SQL 面、JOIN 列表与
+  .NET 用例数;
+- 表级复合 `PRIMARY KEY`/`UNIQUE`(曾按单列声明)与 `GROUP BY ... WITH ROLLUP`
+  修饰符(曾被丢弃)改为显式报错;
+- `ON CONFLICT (cols)`/`ON CONSTRAINT name` 实现**定向冲突**语义:只跳过目标唯一
+  约束的冲突,命中其他唯一约束仍报错;目标不匹配任何唯一约束时显式报错。
+
+#### 测试
+
+- 新增深 B+ 树内部节点分裂、JSONL 审计落盘与写失败告警、X-Forwarded-For 可信
+  代理锁定键、DESC 索引窗口 Eq/复合前缀探针、加密传输门禁(明文/错钥拒绝)、
+  语句切分注释与转义、语句写目标分类等回归;workspace 604 用例,覆盖率 92.9%/88.6%
+  (行/函数)。
+
 ### EF 运行期连接串工厂(2026-09-14)
 
 #### 新增
