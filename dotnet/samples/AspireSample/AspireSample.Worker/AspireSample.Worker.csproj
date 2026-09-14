@@ -9,7 +9,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\Docsql.Aspire.Client\Docsql.Aspire.Client.csproj" />
+    <!-- 与真实用户一致:引用 GitHub Packages 发布的官方包(源配置见 ../nuget.config)。 -->
+    <PackageReference Include="Docsql.Aspire.Client" Version="$(DocsqlPackageVersion)" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
   </ItemGroup>
 

@@ -41,9 +41,11 @@ dotnet add package Docsql.Client                # ADO.NET(被 Client 集成引�
 dotnet add package Docsql.EntityFrameworkCore   # 含 AddDocsqlDbContext<T>
 ```
 
-> 本地开发本仓库时,AppHost 可以直接 `<ProjectReference>` 引入 Hosting 项目,但必须加
-> `IsAspireProjectResource="false"`,否则它会被当成编排资源(示例见
-> `dotnet/samples/AspireSample/AspireSample.AppHost/AspireSample.AppHost.csproj`)。
+> 示例工程 [`dotnet/samples/AspireSample/`](../dotnet/samples/AspireSample/) 与真实用户一致,
+> 直接引用 **GitHub Packages 已发布包**(版本由示例的 `Directory.Build.props` 的
+> `DocsqlPackageVersion` 统一钉住),并刻意不在 `Docsql.sln` 内——主解决方案的自测不依赖私有包。
+> 本地构建示例前先按[示例 README](../dotnet/samples/AspireSample/README.md#1-配置包源github-packages)
+> 配置包源凭据;CI 用 `GITHUB_TOKEN` 认证后单独构建它。
 
 ## 2. 五分钟起步(单节点 + 控制台)
 

@@ -15,8 +15,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- 本地集成包以编译引用接入;IsAspireProjectResource=false 防止它被当成编排资源。 -->
-    <ProjectReference Include="..\..\..\Docsql.Aspire.Hosting\Docsql.Aspire.Hosting.csproj" IsAspireProjectResource="false" />
+    <!-- 与真实用户一致:引用 GitHub Packages 发布的官方包(源配置见 ../nuget.config)。 -->
+    <PackageReference Include="Docsql.Aspire.Hosting" Version="$(DocsqlPackageVersion)" />
     <ProjectReference Include="..\AspireSample.Worker\AspireSample.Worker.csproj" />
   </ItemGroup>
 

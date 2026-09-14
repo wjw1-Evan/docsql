@@ -23,6 +23,19 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
 >
 > .NET / Aspire 项目无需手写 compose:`dotnet add package Docsql.Aspire.Hosting` 后在 AppHost 里三行编排 DocSQL 容器节点(见下文「.NET 与 Aspire」)。
 
+## 文档导航
+
+| 我想… | 看这里 |
+|---|---|
+| 了解数据库全部能力 | [功能总览](docs/features.md) |
+| 查 SQL 语法与函数 | [SQL 参考](docs/sql-reference.md) |
+| 用 Aspire 编排(单节点/集群/控制台) | [Aspire 集成指南](docs/aspire.md) |
+| 用 .NET ADO.NET / EF Core / CLI / 写驱动 | [客户端与驱动](docs/drivers.md) |
+| 部署、扩容、备份恢复、环境变量、监控 | [运维手册](docs/operations.md) |
+| 配用户/角色/审计/加密(等保对照) | [安全指南](docs/security.md) |
+| 确认架构边界与不支持项 | [已知边界](docs/limitations.md) |
+| 参与开发(构建/测试/门禁) | [贡献指南](CONTRIBUTING.md) · [AGENTS](AGENTS.md) |
+
 ## 发布订阅(pub/sub,持久化)
 
 参考 Redis 命令面,但消息**先落盘再推送**(WAL 持久化,重启不丢;即使 `DOCSQL_ASYNC_COMMIT=1`,PUBLISH 也在推送前强制 fsync,契约不受组提交影响)。CLI 内联命令:
@@ -61,28 +74,19 @@ INSERT INTO orders (id, note)
 - 存储为规范小写 UUID 文本(36 字符);`information_schema.columns.data_type` 对该列显示 `GUID`
 - 边界:auto-GUID 表不支持 `INSERT ... SELECT`(显式报错;请用 VALUES 并按需显式给 id)
 
-## 开发(构建与测试,非运行方式)
-
-```bash
-cargo build --workspace
-cargo test --workspace          # Rust 全量测试(开发门禁;本地 Docker 构建亦内置)
-cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二进制)
-./deploy/run-tests.sh           # 本地构建镜像 + 部署测试(多节点 81 项 + 单节点 34 项)
-```
-
 ## DocSQL Studio(Web 管理控制台)
 
-参考 SQL Server Management Studio 的交互重新设计:
+- **对象资源管理器**:表/列(声明列与实测列区分)/索引/键/系统视图/系统表,双击打开数据网格;
+- **查询工作台**:多标签、SQL 高亮、F5 执行 / Ctrl+F5 分析 / 执行所选、批量多结果集、表头排序;
+- **数据网格与写入面**:行内编辑/删除(按主键定位,可置 NULL)、JSON 批量插入(允许表外字段)、
+  列编辑网格建表/改表(含 GUID 时序主键;失败语句明确提示);
+- **监控与管理页**:仪表盘、集群状态(在线/只读/行数/LSN 收敛,5s 刷新)、日志页(数据审计 +
+  同步事件,多条件过滤)、备份管理(立即备份/一键恢复)、用户与角色(建号授权/表级权限);
+- **控制台账号门**:首次强制设置用户名/密码,HttpOnly 会话,改密踢出其它会话;
+  `DOCSQL_TOKEN` 可作 API 旁路(详见[安全指南](docs/security.md));
+- **零存储**:控制台不落任何数据,默认管理启动指定的节点,可在 `DOCSQL_PEERS` 白名单内切换节点。
 
-- **对象资源管理器**(左栏树):服务器 → 表(列含 PK/UQ/NN/AI 徽章、索引、键)→ 每表可双击打开数据网格;**系统表**分支(引擎内部存储:`_cluster_log`/`_cluster_pos`/`_cluster_id`/`_pubsub_messages`,带行数,双击以只读查询查看——这些表拒绝一切写入/DDL);系统视图(`information_schema.*`、`sqlite_master`)。列节点区分**声明列**(建表/ALTER 定义,约束面)与**实测列**(数据中顶层字段并集):schemaless 写入带出表结构之外的字段时,列文件夹计数显示「声明 N / 实测 M」,仅见于数据的字段带「数据」徽章——声明列不随数据自动改写,`SELECT *` 按实测字段投影
-- **查询工作台**(多标签文档):SQL 语法高亮 + 行号编辑器,F5 执行 / Ctrl+F5 仅语法分析 / 执行所选;多语句批次依次执行并逐结果集呈现(网格 + "(N 行受影响)" 消息页 + 总耗时);表头点击排序
-- **右键任务**:新建查询、选择前 1000 行、查看数据、编辑行/删除行(按主键定位,主键列缺失的表无此入口)、编辑表、插入文档、编写 CREATE/DROP 脚本、删除表
-- **新建表 / 编辑表 / 插入文档**(参考 mongo-express 的写入面):对象资源管理器「＋表」按钮 / 右键 / 「文件 → 新建表…」打开列编辑网格(列名/类型/默认值/PK/NOT NULL/自增,PK 自动联动 NOT NULL;类型含 GUID——勾自增即建时序有序 UUIDv7 主键,INSERT 省略该列即可;默认值按 SQL 字面量填写,字符串带引号,INSERT 省略该列时自动填入)一键 CREATE TABLE;已有表右键「编辑表…」(数据页工具栏同入口)复用同一网格——已有列可改名/删除(主键列除外,类型、约束与默认值锁定为只读,SQL 层不支持在线改约束),新增列选类型并可带默认值与 NOT NULL(带默认值时自动回填存量行;ADD COLUMN 不支持 PK/UNIQUE/自增),保存时按「重命名 → 删除 → 新增」生成 ALTER 批次执行,失败语句与已生效前缀明确提示;数据网格「插入文档…」或表右键打开 JSON 编辑域——对象插入一行、数组批量插入,允许表结构之外的字段(文档式存储),嵌套对象/数组以 JSON 文本存储
-- **仪表盘**:表/行数/页与文件占用/运行时长一览
-- **集群状态**:按 `DOCSQL_PEERS` 只读探测各节点(PING 延迟 + REQ_STATUS 状态报告),展示在线/离线/只读、表与行数收敛、存储占用、LSN 收敛指标;5 秒自动刷新;未配置 peers 时显示单机模式
-- **日志**(视图 → 日志,或服务器右键):全部日志一览——**数据日志**为各处执行的 SQL 语句审计(控制台提交的语句 + 各集群节点,含耗时/影响行数/错误;来自对等节点扇出的语句带「复制」徽章),**同步日志**为集群同步事件(写扇出 publish/trim 扇出/PROMOTE/节点加入,逐目标记录成功与失败原因);条目按时间倒序合并,支持类别(全部/数据/同步/仅错误)、来源(控制台/各节点)、关键词过滤与 5 秒自动刷新;节点离线时显示离线清单
-- **控制台账号(首次使用设置用户名密码)**:web 控制台启用账号门(`DOCSQL_WEB_AUTH_FILE`,compose 部署默认开启)后,第一次打开页面强制**设置用户名与密码**(密码至少 8 位,拒绝单一字符重复),之后每次进入需登录;凭据以盐化 PBKDF2-HMAC-SHA256 哈希存于控制台凭据文件(数据仍全部在数据库节点,控制台依旧零数据存储),登录会话为 HttpOnly Cookie,连续输错触发锁定;「文件 → 修改账号…」可更改用户名与密码(需输入当前密码确认;修改密码后其它已登录会话全部退出,当前浏览器会话保持);「文件 → 退出登录」结束会话。携带 `DOCSQL_TOKEN` 的 API 调用不受登录门影响(脚本/程序化访问照旧);设空 `DOCSQL_WEB_AUTH_FILE` 可整体关闭该门禁
-- **节点切换**(工具栏「节点」下拉框):控制台是纯管理工具,**自身不存任何数据**——默认连接并管理启动时指定的节点(如 `node-a:7600`),配置了 `DOCSQL_PEERS` 时可一键切换到其它集群节点——查询、对象资源管理器、数据网格、建表/插入文档、仪表盘全部以数据库客户端身份连接所选节点执行(二进制协议直连,认证用服务端配置的 `DOCSQL_TOKEN`);在该节点上的写入按其集群配置正常扇出;切换仅允许 `DOCSQL_PEERS` 中配置的地址,节点离线时操作返回明确错误
+完整功能清单与 REST API 表见[功能总览 · Web 控制台](docs/features.md#9-web-控制台docsql-studio)。
 
 ## 能力总览
 
@@ -115,7 +119,9 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 - Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(亦在本地 Docker 构建内作为门禁执行)
 - Docker:compose 双 profile 部署测试全绿——多节点 81 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
 - .NET:xUnit(ADO.NET Client 95 项 + EF Core 30 项 + Aspire 集成 12 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型(含 DECIMAL/BLOB/DateOnly/TimeOnly)与长语句契约/复合索引/资源模型快照与 DI 注册)
-- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test` 全过 → 构建镜像 → main 分支另跑同一套部署测试(81 + 34 项)
+- CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test`(含按 GitHub Packages 发布包构建 Aspire 示例)全过 → 构建镜像 → main 分支另跑同一套部署测试(81 + 34 项)
+
+本地开发(构建、门禁、本地集群、覆盖率)命令见[贡献指南](CONTRIBUTING.md),机制约束与红线见 [AGENTS.md](AGENTS.md)。
 
 ## Docker 部署(单节点 / 多节点;本地开发与生产两个 compose 文件)
 
@@ -125,11 +131,11 @@ cd dotnet && dotnet test        # .NET 测试(需先 cargo build 出 server 二�
 |---|---|---|---|
 | `single` | node-single(独立单节点,无复制)+ 独立 web 控制台 | 17600 / 17710 | 18600 / 18710 |
 | `cluster` | node-a + node-b + node-c 对等集群(任意节点可读写,SQL 写入自动扇出至 `DOCSQL_PEERS`)+ web 控制台(集群状态页监控三节点) | 17601-17603 / 17700 | 18601-18603 / 18700 |
-| `join` | node-d(向运行中的集群加入第四数据节点:全新节点启动即自动拉取全量历史数据并注册进扇出网格;见下文"扩容") | 17604 | 18604 |
+| `join` | node-d(向运行中的集群加入第四数据节点:全新节点启动即自动拉取全量历史数据并注册进扇出网格;步骤见[运维手册](docs/operations.md#扩容新数据节点自动同步)) | 17604 | 18604 |
 
 两个 profile 端口不冲突,可同时运行(便于对比验证);命令均需带 profile 参数:
 
-> **架构说明(控制台无本地存储)**:DocSQL Studio 是纯管理工具——web 容器不挂数据卷、不内嵌数据库,启动参数即**默认管理节点**(`docsql-web node-a:7600 …`,或 `DOCSQL_UPSTREAM` / 首个 `DOCSQL_PEERS` 条目),所有数据操作都以客户端身份连接该节点执行,写入落在集群数据卷并正常扇出。界面里的「节点」下拉框只切换管理目标,不存在独立的控制台数据库。从旧版本升级:web 容器会自动重建(不再挂 `docsql-data-web*` 卷),旧内嵌引擎卷成为遗留数据,可用 `./deploy/reset-data.sh` 一并清除。
+> **架构说明(控制台无本地存储)**:控制台是纯管理工具——web 容器不挂数据卷、不内嵌数据库,启动参数即**默认管理节点**(`DOCSQL_UPSTREAM` / 首个 `DOCSQL_PEERS` 条目),数据操作全部转发到该节点执行;界面「节点」下拉框只切换管理目标。从旧版本升级:web 容器自动重建(不再挂旧内嵌引擎卷),遗留卷可用 `./deploy/reset-data.sh` 清除。
 
 ```bash
 cd deploy
@@ -138,37 +144,16 @@ docker compose --profile cluster up -d    # 三节点对等集群部署
 docker compose --profile single --profile cluster down    # 全部停止(数据保留)
 ```
 
-**扩容(新数据节点自动同步)**:集群已有数据时,起一个指向现有节点的全新节点即可——它会自动拉取全量历史(schema、约束、索引、数据、GUID 值),注册进各节点的扇出列表,随后与其它节点互相同步写入。compose 用 `join` profile:
+**扩容与修复**:集群扩容只需起一个指向现有节点的全新节点(compose `join` profile,先建卷 `docsql-dev-data-d` / `docsql-prod-data-d`),自动拉取全量历史并注册扇出;节点离线错过的写在**重启时自动增量补齐**(超出日志窗口或仍有分歧时转多数派快照采纳)。步骤、动态注册注意事项与边界见[运维手册 · 扩容](docs/operations.md#扩容新数据节点自动同步)与[离线补齐](docs/operations.md#离线补齐与重启反熵)。
 
-```bash
-cd deploy && docker volume create docsql-dev-data-d    # 一次性建卷(开发;生产 join 用 docsql-prod-data-d)
-docker compose --profile cluster --profile join up -d node-d
-```
-
-新节点需要两个环境变量:`DOCSQL_PEERS`(现有节点地址表)与 `DOCSQL_ADVERTISE`(其它节点回连自己的地址)。注意:动态注册保存在原节点内存中,原节点重启后会丢失——要把 node-d 变成长期成员,请把它写进各节点的 `DOCSQL_PEERS` 并重建(数据保留,且不会重复同步)。
-
-**离线自动补齐(重启反熵修复,缺多少补多少)**:节点离线/分区期间,其它节点的写不会实时补发;但离线节点**重启时会自动修复**——每个节点把本地提交的写按序记入复制日志,重入节点对比各节点表数据摘要,发现分歧即按自己记录的位点从各原点**增量拉取缺失的操作**(只读对端日志,全程不冻结集群、不重传已有数据),补齐后复验摘要,全网恢复一致。离线太久、超出日志保留窗口(`DOCSQL_CATCHUP_WINDOW`,默认 10 万条)或增量后仍有分歧时,自动回退为整体快照采纳(与 MongoDB「oplog 窗口内增量、过期全量重同步」同型)。两点边界:没有行级合并,分歧中**少数方/数据较少一方独有**的写会被参考方快照覆盖(多数方在线节点上的数据为准);修复由重启触发,仅网络分区而各节点未重启时不自动收敛(任一分歧节点重启即收敛)。
-
-**数据持久化**:每个节点的数据放在 external 卷(生产 `docsql-data-a/b/c/single` + join 节点 `docsql-prod-data-d`;开发 `docsql-dev-data-a/b/c/d/single`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
+**数据持久化**:每个节点的数据放在 external 卷(生产 `docsql-data-a/b/c/single` + `docsql-prod-data-d`;开发 `docsql-dev-data-*`),发布换镜像、重建容器乃至 `down -v` 都**不会**删数据;彻底清数据唯一入口是 `./deploy/reset-data.sh`。首次部署前先建卷(一次性):
 
 ```bash
 cd deploy && for v in a b c single; do docker volume create docsql-data-$v; done && docker volume create docsql-prod-data-d  # 生产
 cd deploy && for v in a b c d single; do docker volume create docsql-dev-data-$v; done                                       # 开发
 ```
 
-**自动备份**:每个节点默认**每日一次**自动生成备份——整库的逻辑 SQL 快照(全部表的 DROP/CREATE/INSERT 脚本,不含系统表),写在节点数据卷的 `backups/` 子目录(容器内 `/data/backups`),随卷持久、发布/重建容器不丢。间隔与保留由 `DOCSQL_BACKUP_INTERVAL_SECS`(秒,默认 86400,0=关闭;节点重启后若无备份或最新备份已超一个间隔则立即出一份新备份,频繁重启不会把保留窗口挤成近同快照)与 `DOCSQL_BACKUP_KEEP`(保留份数,默认 7,超出删最旧)控制。备份在写路径静止时取快照,是整库一致点;集群为每节点独立备份(任一节点的备份都可恢复整库)。备份状态在 `REQ_STATUS` 的 `backup` 字段与 Web 控制台「备份管理」页可见,页面上可随时手动触发一次;每次备份成败也写入同步日志(控制台日志页可见)。
-
-**恢复**:内置两条路,语义相同——备份文件是完整 SQL 脚本(以一条多表 `DROP TABLE IF EXISTS` 开头,重放即整库还原、幂等),由节点逐条语句经正常写路径重放,**每条语句扇出到集群全网,整体收敛到备份时点**:
-
-- **Web 控制台**:「备份管理」页每行「恢复」按钮,输入完整备份文件名确认即触发(对话框标明目标节点;API 调用同样要求 `confirm` 字段逐字重复文件名);恢复进行中显示进度,完成后回显结果并标注**集群收敛是否已验证**。
-- **API/手工**:`POST /api/backup/restore {"file": "backup-….sql", "confirm": "backup-….sql"}`;或把备份文件重放进节点(容器内文件经 docker exec 管道):
-
-```bash
-bk=$(docker exec docsql-prod-single ls /data/backups | grep -E '^backup-.*\.sql$' | sort | tail -1)
-docker exec docsql-prod-single cat "/data/backups/$bk" | docker exec -i docsql-prod-single docsql-cli connect 127.0.0.1:7600
-```
-
-恢复语义与注意事项:恢复**覆盖备份中包含的所有表**(整表替换);备份之后新建的表不受影响,如需完全对齐请先手动删除;**恢复重放期间发起节点持写路径**——本地新写在恢复期间排队(超过 30 秒报错),恢复完成后照常落库、不会回滚;重放期间其它节点错过扇入的写由发起节点在恢复完成后自动增量补拉,并逐一比对全网摘要,`converged=false` 时按提示让仍分歧的节点重启一次即自动修复;AUTOINCREMENT 计数器按恢复后现存最大值 +1 续推;恢复在所选节点发起即可,重放经扇出传播全网(全网同时只允许一个恢复:发起节点会探测各 peer,他节点恢复进行中即拒绝);只读连接/只读副本拒绝恢复。要把备份带到主机侧归档,`docker cp docsql-prod-single:/data/backups .` 即可。
+**备份与恢复**:每节点默认每日自动备份(保留 7 份,备份文件带 sha256 校验和,恢复前强校验),写数据卷 `backups/`;控制台备份页 / `POST /api/backup` 可手动触发与一键恢复。恢复为整库脚本经正常写路径重放并扇出全网,完成后自动比对摘要验证收敛。完整语义(覆盖范围、恢复期间写排队、跨节点互斥、AUTOINCREMENT、归档)见[运维手册 · 备份与恢复](docs/operations.md#备份与恢复)。
 
 **本地开发**(`deploy/docker-compose.yml`,项目名 `docsql-dev`):从源码构建镜像(构建期内置全量 cargo test 门禁),tag `:local`,数据卷 `docsql-dev-data-*`。上面的命令加 `--build` 即触发构建;镜像 tag 用 `DOCSQL_DEV_IMAGE_TAG` 覆盖。客户端 token 用 `DOCSQL_DEV_TOKEN` 配置(同时下发给所有节点与 Web 控制台,控制台以它认证节点;**从控制台创建数据库用户之前必须配置**——节点一旦存在用户,匿名的控制台连接会被拒绝,部署测试脚本会自动将其置空)。
 
@@ -181,9 +166,7 @@ docker compose -f docker-compose.prod.yml --profile single up -d    # 生产单�
 docker compose -f docker-compose.prod.yml --profile cluster up -d   # 生产三节点集群
 ```
 
-> 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)与客户端 token 变量(`DOCSQL_DEV_TOKEN` / `DOCSQL_TOKEN`)互不相同,两套拓扑可同时运行、互不共享数据。
-
-部署测试(`./deploy/run-tests.sh`,同时拉起两个 profile):多节点 81 项(任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测 + 节点切换/跨节点 pub/sub/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写、事务回滚、容器重启后数据持久、GUID 主键生成与重启续用、与集群的数据隔离、Web 控制台、pub/sub、自动备份与恢复演练)。
+> 本地开发与生产完全分离:项目名(`docsql-dev` / `docsql-prod`)、端口(1760x+1770x / 1860x+1870x)、数据卷(`docsql-dev-data-*` / `docsql-data-*`)、镜像 tag 变量(`DOCSQL_DEV_IMAGE_TAG` / `DOCSQL_IMAGE_TAG`)与客户端 token 变量(`DOCSQL_DEV_TOKEN` / `DOCSQL_TOKEN`)互不相同,两套拓扑可同时运行、互不共享数据。环境变量完整清单见[运维手册](docs/operations.md#环境变量运维相关)。
 
 > 注:镜像基于 mcr.microsoft.com/azurelinux(本环境 docker.io 不可达)。
 
@@ -216,9 +199,9 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 - ADO.NET 连接串:`host=...;port=...;user=analyst;password=...`(与 `token=` 二选一,同时给出时用户登录优先);EF Core `UseDocsql("...")` 同一连接串。
 - CLI:`docsql-cli connect 127.0.0.1:7600 --user analyst`(密码从 `DOCSQL_PASSWORD` 或交互提示读取,不走命令行参数)。
 
-**Web 控制台管理**:「视图 → 用户与角色」页面可视化完成上述全部操作 —— 用户列表(角色徽标/表级权限/改密码/删除)、角色管理(内置角色说明/自定义角色/成员授予与移除)、以及按表勾选 SELECT/INSERT/UPDATE/DELETE 的表级权限编辑器(用户的直接授予与其角色携带的权限分开展示)。页面数据来自控制台的管理员连接;**节点启用用户后,务必为 Web 服务与节点配置一致的 `DOCSQL_TOKEN`(生产栈,经 `.env`;开发栈为 `DOCSQL_DEV_TOKEN`)**,否则控制台的匿名连接会被节点拒绝(页面会给出相应提示)。
+**Web 控制台管理**:「视图 → 用户与角色」页可完成上述全部操作(用户列表/角色管理/按表勾选表级权限)。**节点启用用户后,务必为控制台与节点配置一致的 `DOCSQL_TOKEN`(开发栈为 `DOCSQL_DEV_TOKEN`)**,否则控制台的匿名连接会被拒绝;详见[安全指南 · 数据库用户与角色](docs/security.md#数据库用户与角色)与[功能总览 · 控制台](docs/features.md#9-web-控制台docsql-studio)。
 
-**兼容与过渡**:`DOCSQL_TOKEN` 恒为管理员身份(存量部署零变化);未配置 token 且从未创建用户的节点维持开放访问(开发模式);**一旦存在任一用户,新建的匿名连接即被拒绝**(判定取连接建立时刻——正在建号授权的会话不会被自己锁死)。用户/角色数据存于保留名内部表(`docsql_users` 等,复制但不可直接读写),明文密码只在执行节点出现,日志、复制流、备份里均为 PBKDF2 哈希形式。
+**兼容与过渡**:`DOCSQL_TOKEN` 恒为管理员身份(存量部署零变化);未配置 token 且从未创建用户的节点维持开放访问(开发模式);**一旦存在任一用户,新建的匿名连接即被拒绝**(判定取连接建立时刻——正在建号授权的会话不会被自己锁死)。用户/角色数据存于保留名内部表(复制但不可直接读写),明文密码只在执行节点出现,日志、复制流、备份里均为 PBKDF2 哈希形式。
 
 ## .NET 与 Aspire(ADO.NET / EF Core / AppHost 编排)
 
@@ -309,6 +292,8 @@ token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEn
 
 ## 运维与监控
 
+监控、环境变量、备份恢复、扩容与部署运维的完整手册见[运维手册](docs/operations.md)。要点:
+
 - **存活探针**:`GET /healthz` 无门禁回答控制台进程自身状态(不触碰数据库节点,setup 前同样可用);
 - **Prometheus 指标**:`GET /metrics`(抓取认证与其它 API 一致,`X-Docsql-Token`)——逐节点并行抓取
   REQ_STATUS,输出 `docsql_node_up`/`docsql_sql_statements_total`/`docsql_connections_active`/
@@ -326,3 +311,5 @@ token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEn
 - 事务为单连接快照隔离;多连接并发由服务器互斥串行化(单写者引擎)
 - auto-GUID 主键列不支持 `INSERT ... SELECT`(对等节点重放 SELECT 时无法收敛随机生成值;请用 VALUES 并按需显式给 id)
 - EF Core 为独立原生提供程序(不依赖 SQLite);`Database.Migrate()` 不支持(显式报错并指引改用 `EnsureCreated`),模型/索引同步由 EnsureCreated 自动完成
+
+完整边界清单与不在支持面的 SQL 语法见[已知边界](docs/limitations.md)与 [SQL 参考 · 不支持](docs/sql-reference.md#不支持)。

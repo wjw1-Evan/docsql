@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### Aspire 示例改用发布包 + 文档整理(2026-09-14)
+
+#### 变更
+
+- `dotnet/samples/AspireSample/` 与真实用户对齐:改为引用 **GitHub Packages 已发布包**
+  (`Docsql.Aspire.Hosting` / `Docsql.Aspire.Client`,版本集中在示例的
+  `Directory.Build.props`),并移出 `Docsql.sln`——主解决方案的自测不再依赖私有包;
+  CI 在 dotnet job 用 `GITHUB_TOKEN` 认证后单独构建该示例(fork PR 跳过)。示例新增 README
+  (包源凭据配置、`aspire start`、集群切换、发布产物)。
+- 文档整理:README 新增「文档导航」并压缩为导航友好形态(Studio/部署/备份恢复/用户角色
+  细节下沉到 docs,开发命令改由 CONTRIBUTING 承接);`docs/README.md` 改为按任务分类的
+  索引;`docs/operations.md` 补齐数据持久化、扩容、离线补齐、备份恢复语义、环境变量
+  (新增 Web 控制台变量表)与 CLI;`docs/features.md` 补全 Web 控制台细节与 REST API。
+
 ### 文档完善:Aspire 使用手册 + 功能总览(2026-09-14)
 
 #### 文档

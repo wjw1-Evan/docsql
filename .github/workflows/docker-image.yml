@@ -45,6 +45,11 @@ jobs:
   dotnet:
     name: dotnet test
     runs-on: ubuntu-latest
+    # The Aspire sample consumes the four Docsql packages from GitHub
+    # Packages: read access lets CI restore them with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
@@ -56,6 +61,20 @@ jobs:
           dotnet-version: "10.0.x"
       - run: dotnet test
         working-directory: dotnet
+      # Aspire sample is intentionally outside Docsql.sln (real users consume
+      # the published packages); still compile it here so API drift is caught.
+      # Fork PRs cannot read the repo's private packages — skip there.
+      - name: Authenticate GitHub Packages for the sample
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: >
+          dotnet nuget update source github
+          --username "${{ github.actor }}"
+          --password "${{ secrets.GITHUB_TOKEN }}"
+          --store-password-in-clear-text
+          --configfile dotnet/samples/AspireSample/nuget.config
+      - name: Build Aspire sample against published packages
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: dotnet build dotnet/samples/AspireSample/AspireSample.AppHost/AspireSample.AppHost.csproj
 
   coverage:
     name: coverage gate

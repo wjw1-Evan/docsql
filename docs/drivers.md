@@ -116,7 +116,8 @@ builder.AddDocsqlConnection("docsql");       // 注册 transient DocsqlConnectio
   ([Hosting](../dotnet/Docsql.Aspire.Hosting/README.md)、[Client](../dotnet/Docsql.Aspire.Client/README.md));
 - 本地:`aspire start`(或 `dotnet run --project <AppHost>`)拉起节点 + dashboard;部署出口:
   `aspire publish`(示例配 `AddDockerComposeEnvironment` 输出 docker-compose)。完整示例见
-  `dotnet/samples/AspireSample/`。
+  `dotnet/samples/AspireSample/`(直接引用 GitHub Packages 发布包,含消费侧 Worker);
+  使用手册见 [Aspire 集成指南](aspire.md)。
 
 ## CLI(docsql-cli)
 
