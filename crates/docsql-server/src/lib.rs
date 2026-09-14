@@ -3120,9 +3120,23 @@ pub(crate) const SYNC_HOLD_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub(crate) const SYNC_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 /// One whole REQ_SYNC attempt (connect + quiesce + dump stream).
 pub(crate) const SYNC_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-/// Dump chunks are reassembled by the joiner, so the split can be plain
-/// byte slices; the bound just keeps frames well under the 64 MB cap.
+/// Dump chunks are reassembled by the joiner, so the split only has to fall
+/// on a UTF-8 char boundary; the bound keeps frames well under the 64 MB cap.
 pub(crate) const SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// End offset of one dump chunk: `start + budget` clamped to the script
+/// length, then advanced (at most 3 bytes) to the next char boundary. A raw
+/// byte offset can land inside a multi-byte char (the dump carries user SQL
+/// text, CJK included) and `&str[start..end]` would panic. Chunks are
+/// reassembled by the joiner, so a chunk overshooting the budget by a few
+/// bytes is harmless.
+fn dump_chunk_end(script: &str, start: usize, budget: usize) -> usize {
+    let mut end = (start + budget).min(script.len());
+    while end < script.len() && !script.is_char_boundary(end) {
+        end += 1;
+    }
+    end
+}
 /// Fresh-node bootstrap retries before giving up (peers may still be
 /// coming up during a full cluster start). Fast, short rounds: a
 /// simultaneously started cluster settles in the first round or two, and
@@ -3387,9 +3401,8 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
     };
     let mut start = 0usize;
     while start < script.len() {
-        let end = (start + SYNC_CHUNK_BYTES).min(script.len());
+        let end = dump_chunk_end(&script, start, SYNC_CHUNK_BYTES);
         let chunk = &script[start..end];
-        // `script` is a String, so chunks are already valid UTF-8.
         let payload = match proto::encode_sql(chunk).map_err(|e| e.to_string()) {
             Ok(p) => p,
             Err(e) => {
@@ -4880,5 +4893,31 @@ mod security_tests {
         assert!(e.contains("too weak"), "{e}");
         // Exactly at the floor passes.
         assert!(check_token_strength("DOCSQL_TOKEN", "12345678").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::dump_chunk_end;
+
+    #[test]
+    fn dump_chunk_end_never_splits_multibyte_chars() {
+        // 「通」占字节 3..6:预算 4 落在它的中间字节上,必须推进到 6。
+        let s = format!("xxx通{}", "y".repeat(10));
+        assert_eq!(dump_chunk_end(&s, 0, 4), 6);
+        assert_eq!(&s[..6], "xxx通");
+        // 边界恰在字符起点时不动;超过文末截到长度。
+        assert_eq!(dump_chunk_end(&s, 0, 2), 2);
+        assert_eq!(dump_chunk_end(&s, 0, 3), 3);
+        assert_eq!(dump_chunk_end(&s, 0, usize::MAX), s.len());
+        // 按小预算连续切分:覆盖全文,每段都是有效 UTF-8。
+        let mut out = String::new();
+        let mut start = 0;
+        while start < s.len() {
+            let end = dump_chunk_end(&s, start, 4);
+            out.push_str(&s[start..end]);
+            start = end;
+        }
+        assert_eq!(out, s);
     }
 }
