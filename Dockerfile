@@ -25,6 +25,12 @@ RUN cargo build --release -p docsql-server -p docsql-cli -p docsql-web
 # the image, and a mount point the image lacks is created root-owned — the
 # unprivileged process could never write there (os error 13).
 FROM mcr.microsoft.com/azurelinux/base/core:3.0
+# glibc keeps freed memory in per-thread arenas (default cap = 8 × cores). The
+# join/repair snapshot replay churns hundreds of thousands of short-lived
+# allocations across threads; with 32 arenas a 500k-statement bootstrap grew
+# past 6 GB and the container was OOM-killed, while capping arenas keeps the
+# same replay at ~300 MB.
+ENV MALLOC_ARENA_MAX=2
 RUN tdnf install -y ca-certificates libstdc++ && tdnf clean all
 COPY --from=builder /build/target/release/docsql-server /usr/local/bin/docsql-server
 COPY --from=builder /build/target/release/docsql-cli /usr/local/bin/docsql-cli
