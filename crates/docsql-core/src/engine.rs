@@ -5138,15 +5138,22 @@ impl Database {
         }
         // Source rows: plain table or derived subquery (no CTE access in
         // v1 — the MERGE statement is not a SELECT statement).
-        let (_, _, src_rows) = self
+        let (_, src_alias, src_rows) = self
             .read_cx()
             .load_table_factor(&merge.source, &Ctes::new())?;
+        // Source-column qualifier: the alias for a plain table (falling back
+        // to its name), the derived-table alias when given, else `source`.
+        // Losing the derived alias here would make `feed.col` resolve to the
+        // target's bare column via fallback and every source row would match
+        // the same target row (spurious "multiple source rows matched").
         let skey = match &merge.source {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| obj_name(name)),
-            _ => "source".to_string(),
+            _ => src_alias
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| "source".to_string()),
         };
 
         // Target rows with locators (storage order — deterministic replay
@@ -11772,6 +11779,80 @@ mod tests {
     }
 
     #[test]
+    fn fk_parent_delete_and_key_update_enforced() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE parent (id INT PRIMARY KEY, name TEXT)",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+        );
+        run(&mut db, "INSERT INTO parent VALUES (1, 'a'), (2, 'b')");
+        run(&mut db, "INSERT INTO child VALUES (10, 1)");
+        // Deleting an unreferenced parent passes.
+        run(&mut db, "DELETE FROM parent WHERE id = 2");
+        // Deleting a referenced parent is refused loudly and transactionally.
+        let e = db.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
+        assert!(
+            e.to_string().contains("child.pid references parent.id"),
+            "{e}"
+        );
+        // A child table with no rows cannot block anything.
+        run(
+            &mut db,
+            "CREATE TABLE orphan (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+        );
+        run(&mut db, "DELETE FROM child WHERE id = 10");
+        run(&mut db, "DELETE FROM parent WHERE id = 1");
+        run(&mut db, "INSERT INTO parent VALUES (1, 'a')");
+        run(&mut db, "INSERT INTO orphan VALUES (20, 1)");
+        // Key updates follow the same rule (the old key disappears).
+        let e = db
+            .execute("UPDATE parent SET id = 3 WHERE id = 1")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("orphan.pid references parent.id"),
+            "update must fail like a delete, got: {e}"
+        );
+        // A non-key update keeps the parent key (matches replacement_docs)
+        // and passes; NULL children neither block nor count.
+        run(&mut db, "INSERT INTO orphan VALUES (21, NULL)");
+        run(&mut db, "UPDATE parent SET name = 'z' WHERE id = 1");
+        // Removing the referencing rows first unblocks the parent delete.
+        run(&mut db, "DELETE FROM orphan WHERE id IN (20, 21)");
+        run(&mut db, "DELETE FROM parent WHERE id = 1");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM parent").rows[0][0],
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn fk_parent_delete_multiple_children_references() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE parent (id INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "CREATE TABLE a (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE b (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+        );
+        run(&mut db, "INSERT INTO parent VALUES (1)");
+        run(&mut db, "INSERT INTO a VALUES (10, 1)");
+        run(&mut db, "INSERT INTO b VALUES (20, 1)");
+        let e = db.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
+        // The first offending child in catalog order is named.
+        assert!(e.to_string().contains("references parent.id"), "{e}");
+        run(&mut db, "DELETE FROM a WHERE id = 10");
+        let e = db.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
+        assert!(e.to_string().contains("b.pid references parent.id"), "{e}");
+    }
+
+    #[test]
     fn table_level_unique_and_pk_constraints() {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -14624,6 +14705,182 @@ mod complex_query_tests {
             rows(&mut db, "SELECT v FROM t WHERE id = 1").rows,
             vec![vec![Value::Str("a".into())]]
         );
+    }
+
+    #[test]
+    fn merge_using_derived_subquery() {
+        // A derived-subquery USING source (no backing table) exercises the
+        // subquery load path in exec_merge and the merge read-target
+        // classification (the USING side is a read, not the target).
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute(
+            "MERGE INTO t USING (SELECT 1 AS id, 'x' AS v UNION ALL SELECT 2, 'y') feed \
+             ON t.id = feed.id \
+             WHEN MATCHED THEN UPDATE SET v = feed.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (feed.id, feed.v)",
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&mut db, "SELECT id, v FROM t ORDER BY id").rows,
+            vec![
+                vec![Value::Int(1), Value::Str("x".into())],
+                vec![Value::Int(2), Value::Str("y".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn stmt_read_targets_classification() {
+        // Authorization taxonomy: SELECT walks the whole query graph; the
+        // read side of INSERT .. SELECT, UPDATE .. FROM, DELETE .. USING and
+        // MERGE USING resolve to the source tables (never the write target);
+        // unrecognized statements classify as no reads (their write target
+        // classification gates them instead).
+        let parse = |sql: &str| {
+            let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+            stmts.swap_remove(0)
+        };
+        let read = |sql: &str| Database::stmt_read_targets(&parse(sql)).unwrap_or_default();
+
+        assert_eq!(
+            read("SELECT a.id FROM a JOIN b ON a.id = b.id"),
+            vec!["a", "b"]
+        );
+        // Nested derived tables contribute their inside names.
+        assert_eq!(read("SELECT * FROM (SELECT * FROM s) AS x"), vec!["s"]);
+        assert_eq!(read("INSERT INTO t SELECT * FROM s"), vec!["s"]);
+        assert_eq!(
+            read("UPDATE t SET v = s.v FROM s WHERE t.id = s.id"),
+            vec!["s"]
+        );
+        assert_eq!(read("DELETE FROM t USING s WHERE t.id = s.id"), vec!["s"]);
+        assert_eq!(
+            read("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"),
+            vec!["s"]
+        );
+        // Subqueries inside the WHERE of a plain SELECT count too.
+        assert_eq!(
+            read("SELECT * FROM a WHERE id IN (SELECT b.id FROM b)"),
+            vec!["a", "b"]
+        );
+        // Non-query statements carry no read targets.
+        assert_eq!(read("CREATE TABLE t (id INT)"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn correlated_subquery_ref_arms_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE a (id INT PRIMARY KEY, pattern TEXT, low INT, high INT)",
+        );
+        run(&mut db, "CREATE TABLE b (x INT, y INT)");
+        run(
+            &mut db,
+            "INSERT INTO a VALUES (1, 'z', 0, 9), (2, 'q', 5, 6)",
+        );
+        run(&mut db, "INSERT INTO b VALUES (10, 2), (20, 8)");
+        // Non-correlated subqueries still resolve fine (control).
+        run(&mut db, "SELECT id FROM a WHERE id IN (SELECT x FROM b)");
+        // Each collector arm: an outer reference inside Between / Like /
+        // Case / Cast / HAVING / projection of the inner query is a loud
+        // refusal instead of a silent NULL-mismatch.
+        for sql in [
+            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE b.y BETWEEN a.low AND a.high)",
+            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE b.y LIKE a.pattern)",
+            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE CASE WHEN b.y > 0 THEN a.id ELSE b.y END > 0)",
+            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE CAST(a.low AS INT) > 0)",
+            "SELECT id FROM a WHERE id IN (SELECT a.id FROM b)",
+            "SELECT id FROM a WHERE id IN (SELECT x FROM b GROUP BY x HAVING SUM(b.y) > a.id)",
+        ] {
+            let e = db.execute(sql).unwrap_err();
+            assert!(
+                e.to_string().contains("correlated subqueries are not supported"),
+                "{sql}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_by_expression_validation() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 5)");
+        // Composite-aggregate projections over a group column resolve via
+        // check_group_refs/eval_group_expr (Cast, Case, function-arg arms).
+        let r = rows(
+            &mut db,
+            "SELECT SUM(n) + id AS s FROM t GROUP BY id ORDER BY s",
+        );
+        assert_eq!(
+            r.rows
+                .iter()
+                .map(|row| row[0].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![7, 31]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT CASE WHEN SUM(n) >= 30 THEN 'big' ELSE 'small' END AS bucket FROM t GROUP BY id ORDER BY bucket",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("big".into())],
+                vec![Value::Str("small".into())]
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT SUM(n) + ABS(id) AS s FROM t GROUP BY id ORDER BY s",
+        );
+        assert_eq!(
+            r.rows
+                .iter()
+                .map(|row| row[0].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![7, 31]
+        );
+        // A non-group column inside a composite is rejected loudly.
+        let e = db
+            .execute("SELECT SUM(n) + n FROM t GROUP BY id")
+            .unwrap_err();
+        assert!(e.to_string().contains("must appear in GROUP BY"), "{e}");
+        let e = db
+            .execute("SELECT SUM(n) + t.id AS s FROM t GROUP BY id")
+            .unwrap_err();
+        assert!(e.to_string().contains("must appear in GROUP BY"), "{e}");
+    }
+
+    #[test]
+    fn value_literal_rendering() {
+        // The resolved-SQL literal renderer: scalars round-trip with their
+        // type preserved and anything non-scalar or non-finite refuses to
+        // render (a peer would otherwise diverge on "inf"/"NaN" literals).
+        assert_eq!(value_literal(&Value::Null).unwrap(), "NULL");
+        assert_eq!(value_literal(&Value::Bool(true)).unwrap(), "TRUE");
+        assert_eq!(value_literal(&Value::Bool(false)).unwrap(), "FALSE");
+        assert_eq!(value_literal(&Value::Int(-7)).unwrap(), "-7");
+        // Debug keeps the type: 3.0 stays a FLOAT literal, not "3".
+        assert_eq!(value_literal(&Value::Float(3.0)).unwrap(), "3.0");
+        // SQL string literal escaping via the shared helper.
+        assert_eq!(
+            value_literal(&Value::Str("it's \"quoted\"".into())).unwrap(),
+            "'it''s \"quoted\"'"
+        );
+        for bad in [
+            Value::Float(f64::NAN),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Array(vec![Value::Int(1)]),
+            Value::Bytes(vec![1, 2]),
+        ] {
+            let e = value_literal(&bad).unwrap_err();
+            assert!(e.to_string().contains("cannot render"), "{bad:?}: {e}");
+        }
     }
 }
 

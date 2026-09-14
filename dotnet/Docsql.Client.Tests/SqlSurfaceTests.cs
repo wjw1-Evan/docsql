@@ -331,4 +331,126 @@ public sealed class SqlSurfaceTests : IClassFixture<ServerFixture>
         }
         Assert.Equal(1L, Long("SELECT COUNT(*) FROM stx_t"));
     }
+
+    // ---------- MERGE / Upsert / CTE / CTAS / FK ----------
+
+    [Fact]
+    public void Merge_upsert_updates_matches_and_inserts_misses()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS mg_t",
+            "CREATE TABLE mg_t (id INT PRIMARY KEY, v TEXT)",
+            "INSERT INTO mg_t VALUES (1, 'a')");
+        // 派生子查询作为 USING 源:命中行更新、未命中行插入。
+        Exec(
+            "MERGE INTO mg_t USING (SELECT 1 AS id, 'x' AS v UNION ALL SELECT 2, 'y') feed " +
+            "ON mg_t.id = feed.id " +
+            "WHEN MATCHED THEN UPDATE SET v = feed.v " +
+            "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (feed.id, feed.v)");
+        Assert.Equal(new[] { "1", "x", "2", "y" }, RowsFlat(
+            "SELECT id, v FROM mg_t ORDER BY id"));
+    }
+
+    [Fact]
+    public void Merge_rejects_multiple_source_rows_matching_one_target()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS mg2_t",
+            "CREATE TABLE mg2_t (id INT PRIMARY KEY, v TEXT)",
+            "INSERT INTO mg2_t VALUES (1, 'a')");
+        var ex = Assert.Throws<DocsqlException>(() =>
+            Exec(
+                "MERGE INTO mg2_t USING (SELECT 1 AS id, 'p' AS v UNION ALL SELECT 1, 'q') s " +
+                "ON mg2_t.id = s.id " +
+                "WHEN MATCHED THEN UPDATE SET v = s.v " +
+                "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"));
+        Assert.Contains("multiple source rows matched", ex.Message);
+    }
+
+    [Fact]
+    public void Upsert_or_replace_ignore_and_on_conflict_do_nothing()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS up_t",
+            "CREATE TABLE up_t (id INT PRIMARY KEY, v TEXT)",
+            "INSERT INTO up_t VALUES (1, 'a')");
+        // OR REPLACE 以新值覆盖冲突行。
+        Exec("INSERT OR REPLACE INTO up_t VALUES (1, 'b')");
+        Assert.Equal("b", Scalar("SELECT v FROM up_t WHERE id = 1"));
+        // OR IGNORE 对冲突行静默跳过。
+        Exec("INSERT OR IGNORE INTO up_t VALUES (1, 'z')");
+        Assert.Equal("b", Scalar("SELECT v FROM up_t WHERE id = 1"));
+        // ON CONFLICT DO NOTHING 同 OR IGNORE 语义。
+        Exec("INSERT INTO up_t VALUES (1, 'w') ON CONFLICT (id) DO NOTHING");
+        Assert.Equal("b", Scalar("SELECT v FROM up_t WHERE id = 1"));
+        Assert.Equal(1L, Long("SELECT COUNT(*) FROM up_t"));
+    }
+
+    [Fact]
+    public void Create_table_as_select_and_with_cte()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS src_t", "DROP TABLE IF EXISTS ctas_t", "DROP TABLE IF EXISTS w_t",
+            "CREATE TABLE src_t (id INT, v TEXT)",
+            "INSERT INTO src_t VALUES (1, 'a'), (2, 'b')");
+        // CTAS:把查询结果物化成新表。
+        Exec("CREATE TABLE ctas_t AS SELECT id AS k, v FROM src_t WHERE id < 3");
+        Assert.Equal(new[] { "1", "a", "2", "b" }, RowsFlat("SELECT k, v FROM ctas_t ORDER BY k"));
+        // 非递归 WITH:CTE 作为 FROM 源。
+        Exec("CREATE TABLE w_t AS WITH w AS (SELECT v FROM src_t WHERE id = 2) SELECT v FROM w");
+        Assert.Equal(new[] { "b" }, Column("SELECT v FROM w_t"));
+    }
+
+    [Fact]
+    public void Foreign_key_parent_delete_enforced_until_children_removed()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS fkp", "DROP TABLE IF EXISTS fkc",
+            "CREATE TABLE fkp (id INT PRIMARY KEY)",
+            "CREATE TABLE fkc (id INT PRIMARY KEY, pid INT REFERENCES fkp(id))",
+            "INSERT INTO fkp VALUES (1), (2)",
+            "INSERT INTO fkc VALUES (10, 1)");
+        // 有子行引用时删父行被拒,报错文案可读。
+        var ex = Assert.Throws<DocsqlException>(() => Exec("DELETE FROM fkp WHERE id = 1"));
+        Assert.Contains("FOREIGN KEY constraint failed", ex.Message);
+        Assert.Contains("fkc.pid references fkp.id", ex.Message);
+        // 未被引用的父行不受影响。
+        Exec("DELETE FROM fkp WHERE id = 2");
+        Assert.Equal(1L, Long("SELECT COUNT(*) FROM fkp"));
+        // 移除引用行后父行可删。
+        Exec("DELETE FROM fkc WHERE id = 10");
+        Exec("DELETE FROM fkp WHERE id = 1");
+        Assert.Equal(0L, Long("SELECT COUNT(*) FROM fkp"));
+    }
+
+    [Fact]
+    public void Update_and_delete_returning_projects_rows()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS rt_t",
+            "CREATE TABLE rt_t (id INT, v INT)",
+            "INSERT INTO rt_t VALUES (1, 10), (2, 20)");
+        Assert.Equal(new[] { "1", "11" }, RowsFlat(
+            "UPDATE rt_t SET v = v + 1 WHERE id = 1 RETURNING id, v"));
+        Assert.Equal(new[] { "2" }, Column("DELETE FROM rt_t WHERE id = 2 RETURNING id"));
+        Assert.Equal(1L, Long("SELECT COUNT(*) FROM rt_t"));
+    }
+
+    [Fact]
+    public void Correlated_subquery_rejected_loudly()
+    {
+        Exec(
+            "DROP TABLE IF EXISTS cs_a", "DROP TABLE IF EXISTS cs_b",
+            "CREATE TABLE cs_a (id INT PRIMARY KEY, low INT)",
+            "CREATE TABLE cs_b (x INT, y INT)",
+            "INSERT INTO cs_a VALUES (1, 0)",
+            "INSERT INTO cs_b VALUES (10, 1)");
+        // 非相关子查询照常可用。
+        Assert.Equal(1L, Long(
+            "SELECT COUNT(*) FROM cs_a WHERE id IN (SELECT y FROM cs_b)"));
+        // 内层 WHERE 引用外层表 = 显式拒绝,而非静默 NULL 错配。
+        var ex = Assert.Throws<DocsqlException>(() => Scalar(
+            "SELECT id FROM cs_a WHERE id IN (SELECT x FROM cs_b WHERE b.y BETWEEN cs_a.low AND cs_a.id)"));
+        Assert.Contains("correlated subqueries are not supported", ex.Message);
+    }
 }

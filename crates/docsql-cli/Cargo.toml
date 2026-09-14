@@ -11,3 +11,5 @@ docsql-core = { path = "../docsql-core" }
 [dev-dependencies]
 sqlparser = "0.62"
 tempfile.workspace = true
+docsql-server = { path = "../docsql-server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

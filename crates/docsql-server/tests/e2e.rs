@@ -1084,6 +1084,55 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
     );
 }
 
+/// MERGE over a fan-out cluster: the resolved statement replays on peers via
+/// the same write path, so a derived-subquery USING source must fan out the
+/// *rewritten* statement (alias intact) and converge on every node.
+#[tokio::test]
+async fn merge_with_derived_source_replicates_across_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a, b) = (free(), free());
+    spawn_node(&dir, "mpeer0", &a, vec![b.clone()], None).await;
+    spawn_node(&dir, "mpeer1", &b, vec![a.clone()], None).await;
+
+    let mut n0 = Client::connect(&a).await;
+    n0.sql("CREATE TABLE mg (id INT PRIMARY KEY, v TEXT)").await;
+    n0.sql("INSERT INTO mg VALUES (1, 'a')").await;
+    let resp = n0
+        .sql(
+            "MERGE INTO mg USING (SELECT 1 AS id, 'x' AS v UNION ALL SELECT 2, 'y') feed \
+             ON mg.id = feed.id \
+             WHEN MATCHED THEN UPDATE SET v = feed.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (feed.id, feed.v)",
+        )
+        .await;
+    assert_eq!(resp.frame_type, proto::RESP_AFFECTED);
+    assert!(
+        wait_seen(
+            &b,
+            "SELECT id, v FROM mg ORDER BY id",
+            "[[1,\"x\"],[2,\"y\"]]"
+        )
+        .await,
+        "peer did not converge on the merged state"
+    );
+    // Enforce the double-match refusal on the peer too (same resolved path).
+    let e = n0
+        .sql(
+            "MERGE INTO mg USING (SELECT 1 AS id, 'p' AS v UNION ALL SELECT 1, 'q') s \
+             ON mg.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+        )
+        .await;
+    assert_eq!(e.frame_type, proto::RESP_ERROR);
+}
+
 /// Two-node symmetric cluster: transaction semantics must hold across
 /// replication — a rolled-back write never reaches the peer, committed
 /// transaction writes replay in order, and savepoint rollbacks trim exactly

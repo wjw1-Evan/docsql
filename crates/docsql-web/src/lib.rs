@@ -1701,9 +1701,12 @@ fn target_for(state: &WebState, node: &Option<String>) -> Result<String, serde_j
 }
 
 /// Remote-node budget: SQL can be heavier than a status probe (scans, big
-/// result sets), so the budget is wider than the probe's.
+/// result sets), so the budget is wider than the probe's. 90s also covers
+/// genuinely slow management operations (user provisioning runs ~60k PBKDF2
+/// rounds; a coverage-instrumented or loaded node has measured >20s), so a
+/// live-but-slow node is never mistaken for a dead one.
 const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const NODE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const NODE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// Mirrors the server's inbound frame cap (64 MiB) so large result sets
 /// round-trip untruncated.
 const NODE_RECV_CAP: usize = 64 * 1024 * 1024;

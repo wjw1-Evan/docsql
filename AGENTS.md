@@ -23,11 +23,15 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 # 提交门禁(全部通过才能提交)
 cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                      # 473 用例
+cargo test --workspace                      # 540 用例
+
+# 覆盖率回归门禁(workspace 行/函数覆盖率低于阈值即失败;默认 85%/80%,
+# 基线 91.3%/87.6%;cargo-llvm-cov 缺失时自动安装)
+./deploy/coverage.sh
 
 # 改 dotnet 或协议时(cargo build 先行:测试进程会启动 target/debug/docsql-server)
 cargo build -p docsql-server
-cd dotnet && dotnet test                    # Client 62 + EFCore 22
+cd dotnet && dotnet test                    # Client 90 + EFCore 24 + Aspire 12
 
 # 改复制/部署逻辑后必跑;默认先构建 :local 镜像(构建内含 cargo test 门禁)
 ./deploy/run-tests.sh                       # single 34 + cluster 81
@@ -40,7 +44,7 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d   
 
 - compose 必须带 profile(不带 = 空操作);数据卷 external,`down -v` 不清数据;清数据唯一入口 `./deploy/reset-data.sh`;首次部署需先建卷(见 README;run-tests.sh 自动重建 dev 卷)。
 - 测试布局:Rust 单测在各模块内;e2e 在 `crates/docsql-server/tests/e2e.rs`(pub/sub、join/repair、备份恢复、故障转移)与 `crates/docsql-web/tests/e2e.rs`(真实 HTTP);.NET 为两个 xUnit 套件;部署测试 `deploy/single-test.sh` / `deploy/multinode-test.sh`。
-- CI `.github/workflows/docker-image.yml`(Rust 1.98.1 / .NET 10)执行同样门禁 + dotnet 测试 → 多架构镜像 → main 分支部署测试;CI 失败等同门禁失败。
+- CI `.github/workflows/docker-image.yml`(Rust 1.98.1 / .NET 10)执行同样门禁 + 覆盖门禁(`deploy/coverage.sh`) + dotnet 测试 → 多架构镜像 → main 分支部署测试;CI 失败等同门禁失败。
 - NuGet 发布:`.github/workflows/nuget-publish.yml` 在 push `v*` tag(或手动)时 pack 四个 .NET 包并推 GitHub Packages(`dotnet/Docsql.sln` 含 Aspire 包与示例;Aspire 测试不起容器,CI 直接可跑)。
 
 ### Mimosa 安全门禁(本机 commit/push 钩子)

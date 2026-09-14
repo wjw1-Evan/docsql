@@ -8,19 +8,62 @@
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let cfg = match config_from_env(&args, |name| std::env::var(name).ok()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("refusing to start: {e}");
+            std::process::exit(2);
+        }
+    };
+    match &cfg.upstream {
+        Some(u) => eprintln!("docsql web console on http://{} (managing {u})", cfg.listen),
+        None => eprintln!(
+            "docsql web console on http://{} (no managed node configured — \
+             data endpoints report an error until one is set)",
+            cfg.listen
+        ),
+    }
+    if let Some(tls) = &cfg.tls {
+        eprintln!("docsql web console serving HTTPS (cert {})", tls.cert_path);
+    }
+    let listen = cfg.listen.clone();
+    docsql_web::run(cfg.map_api(), &listen).await
+}
+
+/// TLS on/off from the environment. Native TLS serves HTTPS directly only
+/// when both cert and key are set; `DOCSQL_WEB_TLS_CERT` without
+/// `DOCSQL_WEB_TLS_KEY` (or vice versa) refuses startup.
+fn tls_from_env(
+    getenv: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<docsql_web::TlsConfig>, String> {
+    let cert = getenv("DOCSQL_WEB_TLS_CERT").filter(|p| !p.is_empty());
+    let key = getenv("DOCSQL_WEB_TLS_KEY").filter(|p| !p.is_empty());
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some(docsql_web::TlsConfig {
+            cert_path: cert,
+            key_path: key,
+        })),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("DOCSQL_WEB_TLS_CERT and DOCSQL_WEB_TLS_KEY must be set together".into())
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Assemble the [WebConfig] from positional args and the environment. Pure
+/// over an injected env provider so tests can cover the resolution order
+/// (positional > DOCSQL_UPSTREAM > first peer) and the TLS pairing rule.
+fn config_from_env(
+    args: &[String],
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<WebCfg, String> {
     let listen = args
         .get(2)
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:7700".into());
-    let token = std::env::var("DOCSQL_TOKEN").ok().filter(|t| !t.is_empty());
-    // The console's own username/password account. Unset (or empty) keeps
-    // the legacy token-only gate; set, the console forces first-use setup
-    // at the configured path and locks the data endpoints behind it.
-    let auth_file = std::env::var("DOCSQL_WEB_AUTH_FILE")
-        .ok()
-        .filter(|p| !p.is_empty());
-    // Cluster nodes to monitor and switch between on the status page.
-    let peers: Vec<String> = std::env::var("DOCSQL_PEERS")
+    let token = getenv("DOCSQL_TOKEN").filter(|t| !t.is_empty());
+    let auth_file = getenv("DOCSQL_WEB_AUTH_FILE").filter(|p| !p.is_empty());
+    let peers: Vec<String> = getenv("DOCSQL_PEERS")
         .unwrap_or_default()
         .split(',')
         .map(|p| p.trim().to_string())
@@ -28,59 +71,159 @@ async fn main() -> std::io::Result<()> {
         .collect();
     // The default managed node: explicit argument first, then the
     // DOCSQL_UPSTREAM environment, then the first configured peer.
-    // All three sources are trimmed — peers already are above.
     let upstream = args
         .get(1)
         .cloned()
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty())
         .or_else(|| {
-            std::env::var("DOCSQL_UPSTREAM")
-                .ok()
+            getenv("DOCSQL_UPSTREAM")
                 .map(|u| u.trim().to_string())
                 .filter(|u| !u.is_empty())
         })
         .or_else(|| peers.first().cloned());
-    match &upstream {
-        Some(u) => eprintln!("docsql web console on http://{listen} (managing {u})"),
-        None => eprintln!(
-            "docsql web console on http://{listen} (no managed node configured — \
-             data endpoints report an error until one is set)"
-        ),
-    }
-    // Native TLS: both vars must be set to serve HTTPS directly. Without
-    // them the console is plain HTTP — put a TLS-terminating reverse proxy
-    // in front for production (and set DOCSQL_WEB_COOKIE_SECURE=1).
-    let tls = match (
-        std::env::var("DOCSQL_WEB_TLS_CERT")
-            .ok()
-            .filter(|p| !p.is_empty()),
-        std::env::var("DOCSQL_WEB_TLS_KEY")
-            .ok()
-            .filter(|p| !p.is_empty()),
-    ) {
-        (Some(cert), Some(key)) => {
-            eprintln!("docsql web console serving HTTPS (cert {cert})");
-            Some(docsql_web::TlsConfig {
-                cert_path: cert,
-                key_path: key,
-            })
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            eprintln!("refusing to start: DOCSQL_WEB_TLS_CERT and DOCSQL_WEB_TLS_KEY must be set together");
-            std::process::exit(2);
-        }
-        (None, None) => None,
-    };
-    docsql_web::run(
+    let tls = tls_from_env(&getenv)?;
+    Ok(WebCfg {
+        listen,
+        token,
+        auth_file,
+        peers,
+        upstream,
+        tls,
+    })
+}
+
+/// Resolved startup options (private): the exact shape handed to
+/// [docsql_web::run]. Split from the public [docsql_web::WebConfig] only so
+/// the binary can log `listen` before entering the server.
+struct WebCfg {
+    listen: String,
+    token: Option<String>,
+    auth_file: Option<String>,
+    peers: Vec<String>,
+    upstream: Option<String>,
+    tls: Option<docsql_web::TlsConfig>,
+}
+
+impl WebCfg {
+    fn map_api(self) -> docsql_web::WebConfig {
         docsql_web::WebConfig {
-            upstream,
-            token,
-            peers,
-            auth_file,
-            tls,
-        },
-        &listen,
-    )
-    .await
+            upstream: self.upstream,
+            token: self.token,
+            peers: self.peers,
+            auth_file: self.auth_file,
+            tls: self.tls,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn env<'m>(map: &'m [(&'m str, &'m str)]) -> impl Fn(&str) -> Option<String> + 'm {
+        move |n| {
+            map.iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_without_args_or_env() {
+        let cfg = config_from_env(&args(&[]), no_env).unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:7700");
+        assert!(cfg.upstream.is_none());
+        assert!(cfg.token.is_none());
+        assert!(cfg.auth_file.is_none());
+        assert!(cfg.peers.is_empty());
+        assert!(cfg.tls.is_none());
+    }
+
+    #[test]
+    fn upstream_resolution_order() {
+        // Positional arg wins over everything.
+        let cfg = config_from_env(
+            &args(&["docsql-web", "node-a:7600", "0.0.0.0:7800"]),
+            no_env,
+        )
+        .unwrap();
+        assert_eq!(cfg.upstream.as_deref(), Some("node-a:7600"));
+        assert_eq!(cfg.listen, "0.0.0.0:7800");
+        // DOCSQL_UPSTREAM wins over the first peer.
+        let cfg = config_from_env(
+            &args(&[]),
+            env(&[("DOCSQL_UPSTREAM", " a:1 "), ("DOCSQL_PEERS", "b:2,c:3")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.upstream.as_deref(), Some("a:1"));
+        assert_eq!(cfg.peers, vec!["b:2", "c:3"]);
+        // No arg/env but peers configured: first peer.
+        let cfg = config_from_env(&args(&[]), env(&[("DOCSQL_PEERS", "b:2,c:3")])).unwrap();
+        assert_eq!(cfg.upstream.as_deref(), Some("b:2"));
+    }
+
+    #[test]
+    fn peers_split_and_trim_and_ignore_blanks() {
+        let cfg = config_from_env(
+            &args(&["docsql-web", "   ", "x:1"]),
+            env(&[("DOCSQL_PEERS", " a:1 ,,b:2,")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.peers, vec!["a:1", "b:2"]);
+        // A blank positional upstream is dropped, not taken literally — the
+        // resolution falls through to the first configured peer.
+        assert_eq!(cfg.upstream.as_deref(), Some("a:1"));
+        // Same blank, but no peers: env then takes over.
+        let cfg = config_from_env(
+            &args(&["docsql-web", "   "]),
+            env(&[("DOCSQL_UPSTREAM", "z:9")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.upstream.as_deref(), Some("z:9"));
+    }
+
+    #[test]
+    fn tls_pairing_rule() {
+        let cfg = config_from_env(
+            &args(&[]),
+            env(&[("DOCSQL_WEB_TLS_CERT", "/c"), ("DOCSQL_WEB_TLS_KEY", "/k")]),
+        )
+        .unwrap();
+        let tls = cfg.tls.unwrap();
+        assert_eq!(tls.cert_path, "/c");
+        assert_eq!(tls.key_path, "/k");
+        // One sans the other must refuse startup.
+        assert!(config_from_env(&args(&[]), env(&[("DOCSQL_WEB_TLS_CERT", "/c")])).is_err());
+        assert!(config_from_env(&args(&[]), env(&[("DOCSQL_WEB_TLS_KEY", "/k")])).is_err());
+        assert!(config_from_env(&args(&[]), no_env).unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn token_and_auth_file_filters_blanks() {
+        let cfg = config_from_env(
+            &args(&[]),
+            env(&[
+                ("DOCSQL_TOKEN", "t"),
+                ("DOCSQL_WEB_AUTH_FILE", "/auth/users.json"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cfg.token.as_deref(), Some("t"));
+        assert_eq!(cfg.auth_file.as_deref(), Some("/auth/users.json"));
+        let cfg = config_from_env(
+            &args(&[]),
+            env(&[("DOCSQL_TOKEN", ""), ("DOCSQL_WEB_AUTH_FILE", "")]),
+        )
+        .unwrap();
+        assert!(cfg.token.is_none() && cfg.auth_file.is_none());
+    }
 }

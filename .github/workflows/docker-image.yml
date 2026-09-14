@@ -57,9 +57,22 @@ jobs:
       - run: dotnet test
         working-directory: dotnet
 
+  coverage:
+    name: coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Fails when workspace line/function coverage drops below the floors in
+      # deploy/coverage.sh (a tuned -llvm-cov build; doubles as a test run).
+      - run: ./deploy/coverage.sh
+
   build:
     name: build & publish image
-    needs: [test, dotnet]
+    needs: [test, dotnet, coverage]
     runs-on: ubuntu-latest
     permissions:
       contents: read

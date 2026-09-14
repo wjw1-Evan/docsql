@@ -38,11 +38,36 @@ enum Format {
     Json,
 }
 
-fn main() {
+/// Parsed command-line startup mode.
+#[derive(Debug, PartialEq, Eq)]
+enum CliMode {
+    /// `connect <addr> [token]` — remote shell over the v1 protocol.
+    Remote {
+        addr: String,
+        token: Option<String>,
+        user: Option<String>,
+    },
+    /// Embedded shell over a file path or `:memory:`.
+    Embedded { path: String },
+}
+
+/// Parsed startup options. Pure over an injected argument iterator so the
+/// whole flag/positional surface is testable without a process.
+#[derive(Debug)]
+struct CliArgs {
+    format: Format,
+    script: Option<String>,
+    mode: CliMode,
+}
+
+/// Mirror of `main()`'s old argv walk: flags may appear anywhere, the first
+/// non-flag consumes a mode, and `connect` may carry `--user <name>` with
+/// the trailing positional as the token.
+fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
     let mut format = Format::Table;
     let mut script: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
-    let mut it = std::env::args().skip(1);
+    let mut it = it.peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--csv" => format = Format::Csv,
@@ -50,10 +75,7 @@ fn main() {
             "--table" => format = Format::Table,
             "-f" | "--file" => match it.next() {
                 Some(p) => script = Some(p),
-                None => {
-                    eprintln!("DocSQL: {a} requires a script path");
-                    std::process::exit(2);
-                }
+                None => return Err(format!("{a} requires a script path")),
             },
             _ => rest.push(a),
         }
@@ -77,31 +99,55 @@ fn main() {
             }
         }
         let token = positional.first().cloned();
-        remote_shell(
-            &addr,
-            token.as_deref(),
-            user.as_deref(),
+        return Ok(CliArgs {
             format,
-            script.as_deref(),
-        );
-        return;
+            script,
+            mode: CliMode::Remote { addr, token, user },
+        });
     }
     let path = rest
         .first()
         .cloned()
         .unwrap_or_else(|| ":memory:".to_string());
-    let mut db = if path == ":memory:" {
-        Database::in_memory()
-    } else {
-        Database::open(std::path::Path::new(&path))
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("DocSQL: cannot open {path}: {e}");
-        std::process::exit(1);
+    Ok(CliArgs {
+        format,
+        script,
+        mode: CliMode::Embedded { path },
+    })
+}
+
+fn main() {
+    let args = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("DocSQL: {e}");
+        std::process::exit(2);
     });
-    println!("DocSQL — type SQL statements ending with ';', quit with exit;");
-    let stdin = std::io::BufReader::new(std::io::stdin().lock());
-    run_embedded(&mut db, format, script.as_deref(), stdin);
+    let format = args.format;
+    let script = args.script;
+    match args.mode {
+        CliMode::Remote { addr, token, user } => {
+            remote_shell(
+                &addr,
+                token.as_deref(),
+                user.as_deref(),
+                format,
+                script.as_deref(),
+            );
+        }
+        CliMode::Embedded { path } => {
+            let mut db = if path == ":memory:" {
+                Database::in_memory()
+            } else {
+                Database::open(std::path::Path::new(&path))
+            }
+            .unwrap_or_else(|e| {
+                eprintln!("DocSQL: cannot open {path}: {e}");
+                std::process::exit(1);
+            });
+            println!("DocSQL — type SQL statements ending with ';', quit with exit;");
+            let stdin = std::io::BufReader::new(std::io::stdin().lock());
+            run_embedded(&mut db, format, script.as_deref(), stdin);
+        }
+    }
 }
 
 /// Statement loop shared by interactive stdin and `-f` script files: lines
@@ -974,5 +1020,259 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn as_remote(
+        args: CliArgs,
+    ) -> (
+        String,
+        Option<String>,
+        Option<String>,
+        Format,
+        Option<String>,
+    ) {
+        match args.mode {
+            CliMode::Remote { addr, token, user } => (addr, token, user, args.format, args.script),
+            other => panic!("expected remote mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_args_embedded_default() {
+        let empty = parse_args(std::iter::empty::<String>()).unwrap();
+        assert_eq!(
+            empty.mode,
+            CliMode::Embedded {
+                path: ":memory:".into()
+            }
+        );
+        assert_eq!(empty.format, Format::Table);
+        let file = parse_args(["some.db"].into_iter().map(String::from)).unwrap();
+        assert_eq!(
+            file.mode,
+            CliMode::Embedded {
+                path: "some.db".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_flags_anywhere_and_script_consumption() {
+        let args = parse_args(
+            ["--csv", "d.db", "-f", "/tmp/a.sql", "--json"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(args.format, Format::Json);
+        assert_eq!(args.script.as_deref(), Some("/tmp/a.sql"));
+        assert_eq!(
+            args.mode,
+            CliMode::Embedded {
+                path: "d.db".into()
+            }
+        );
+        // `--file` spelling alongside.
+        let args = parse_args(
+            ["--file", "b.sql", "--table", "x"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(args.format, Format::Table);
+        assert_eq!(args.script.as_deref(), Some("b.sql"));
+        // A dangling -f with no argument is a loud parse error.
+        let err = parse_args(["-f"].into_iter().map(String::from)).unwrap_err();
+        assert!(err.contains("requires a script path"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_args_connect_mode() {
+        let (addr, token, user, format, script) = as_remote(
+            parse_args(
+                ["connect", "node-a:7600", "--json", "tok-123"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap(),
+        );
+        assert_eq!(addr, "node-a:7600");
+        assert_eq!(token.as_deref(), Some("tok-123"));
+        assert!(user.is_none());
+        assert_eq!(format, Format::Json);
+        assert!(script.is_none());
+
+        let (addr, token, user, format, _) = as_remote(
+            parse_args(
+                ["--csv", "connect", "h:1", "--user", "alice", "-f", "/x.s"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap(),
+        );
+        assert_eq!((addr.as_str(), format), ("h:1", Format::Csv));
+        assert_eq!(user.as_deref(), Some("alice"));
+        assert!(token.is_none());
+
+        // `connect` with no address defaults the loopback port.
+        let (addr, _, _, _, _) =
+            as_remote(parse_args(["connect"].into_iter().map(String::from)).unwrap());
+        assert_eq!(addr, "127.0.0.1:7600");
+
+        // A token after the address lands as the positional, not the user.
+        let (_, token, user, _, _) = as_remote(
+            parse_args(
+                ["connect", "h:1", "--user", "bob", "tok-9"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap(),
+        );
+        assert_eq!(user.as_deref(), Some("bob"));
+        assert_eq!(token.as_deref(), Some("tok-9"));
+    }
+
+    fn server_config_test(db: &std::path::Path, address: &str) -> docsql_server::ServerConfig {
+        docsql_server::ServerConfig {
+            db_path: db.to_path_buf(),
+            listen: address.to_string(),
+            auth_token: Some("cli-test-token-123".into()),
+            read_token: None,
+            max_conn: 16,
+            idle_timeout_secs: 0,
+            auth_lock_threshold: 0,
+            cluster_token: None,
+            replicate_to: None,
+            peers: Vec::new(),
+            advertise: None,
+            read_only: false,
+            transport_key: None,
+            async_commit: false,
+            catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 0,
+            backup_dir: None,
+            statement_timeout_ms: 0,
+        }
+    }
+
+    /// Drive `remote_shell` against a real server started in-process
+    /// (tokio::spawn — never a subprocess). Covers the wire layer
+    /// (Remote::connect/round_trip, reader_loop, frame printing), inline
+    /// pub/sub commands and token auth end to end.
+    #[test]
+    fn remote_shell_e2e_over_in_process_server() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reserve an ephemeral port, then hand it to the server.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let cfg = server_config_test(&dir.path().join("db"), &addr.to_string());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.spawn(docsql_server::run(cfg));
+        // Wait for the listener, then run the shell against a small script.
+        let mut up = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(up, "server never accepted connections");
+        let script = dir.path().join("r.sql");
+        std::fs::write(
+            &script,
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n\
+             INSERT INTO t VALUES (1, 'x'), (2, 'y');\n\
+             SELECT id, v FROM t ORDER BY id;\n",
+        )
+        .unwrap();
+        remote_shell(
+            &addr.to_string(),
+            Some("cli-test-token-123"),
+            None,
+            Format::Csv,
+            Some(script.to_str().unwrap()),
+        );
+        handle.abort();
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
+
+    /// Cover the inline pub/sub command path (parse → frame → response)
+    /// against a live in-process server, plus the reader-thread push
+    /// printing (RESP_PUSH) via a subscription.
+    #[test]
+    fn remote_shell_pubsub_e2e_over_in_process_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let cfg = server_config_test(&dir.path().join("db"), &addr.to_string());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.spawn(docsql_server::run(cfg));
+        let mut up = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(up, "server never accepted connections");
+        // subscribe + publish round trip through the inline command parser.
+        let script = dir.path().join("p.sql");
+        std::fs::write(
+            &script,
+            "publish mych hello world;\n\
+             pubsub channels;\n\
+             pubsub trim mych 1;\n",
+        )
+        .unwrap();
+        remote_shell(
+            &addr.to_string(),
+            Some("cli-test-token-123"),
+            None,
+            Format::Table,
+            Some(script.to_str().unwrap()),
+        );
+        handle.abort();
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn print_frame_error_and_affected_arms() {
+        // Error frames go to stderr and signal script failure.
+        assert!(!print_frame(
+            &Frame::new(proto::RESP_ERROR, b"boom".to_vec()),
+            Format::Table
+        ));
+        assert!(print_frame(
+            &Frame::new(proto::RESP_AFFECTED, 3u64.to_le_bytes().to_vec()),
+            Format::Table
+        ));
+        // A malformed RESP_ROWS payload must not panic the shell.
+        assert!(print_frame(
+            &Frame::new(proto::RESP_ROWS, b"not json".to_vec()),
+            Format::Table
+        ));
+    }
+
+    #[test]
+    fn parse_args_user_flag_without_value() {
+        // `connect h:1 --user` — the missing value makes --user None and the
+        // bare "connect" path still resolves (parses without panicking).
+        let (_, _, user, _, _) = as_remote(
+            parse_args(["connect", "h:1", "--user"].into_iter().map(String::from)).unwrap(),
+        );
+        assert!(user.is_none());
     }
 }
