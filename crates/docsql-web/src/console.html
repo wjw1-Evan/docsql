@@ -585,7 +585,7 @@ function aboutDialog() {
         <div class="about-logo">${logo}</div>
         <div>
           <div class="about-name">DocSQL Studio</div>
-          <div class="about-ver">文档数据库管理控制台 v${CONSOLE_VERSION} · SSMS 风格</div>
+          <div class="about-ver">文档数据库管理控制台 v${CONSOLE_VERSION}</div>
         </div>
       </div>
       <p class="about-desc">DocSQL 是 Rust 原生文档数据库:JSON 文档整体存储、完整 SQL、对称集群复制
@@ -1708,10 +1708,15 @@ function openDashboard() {
           return;
         }
         const s = m.storage, sv = m.server;
+        // 索引总数:旧版本节点(载荷无该字段)回退为逐表求和,兼容滚动升级。
+        const idxN = m.totals.indexes != null
+          ? m.totals.indexes
+          : (m.tables || []).reduce((n, t) => n + (t.indexes || []).length, 0);
         // 节点返回的 meta 载荷不受控制台控制,所有字段过 esc 再进 innerHTML。
         const cards = [
           [`${esc(m.totals.tables)}<small> 张</small>`, '用户表'],
           [`${esc(m.totals.rows)}<small> 行</small>`, '表数据总行数'],
+          [`${esc(idxN)}<small> 个</small>`, '索引(含主键/唯一约束)'],
           [`${esc(s.num_pages)}<small> 页 × ${esc(s.page_size / 1024)}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, '已分配页'],
           [`${fmtBytes(s.db_bytes)}<small> / WAL ${fmtBytes(s.wal_bytes)}</small>`, '数据文件 / WAL'],
           [`${fmtDur(sv.uptime_ms)}<small> · v${esc(sv.version)}</small>`, '服务运行时长 · 版本'],
