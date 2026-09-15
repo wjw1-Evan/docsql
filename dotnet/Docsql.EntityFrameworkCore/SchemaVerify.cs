@@ -88,7 +88,7 @@ internal static partial class SchemaSync
             // unique 漂移(同名但非 UNIQUE)由 SyncIndexes 以「先删后建」修复,
             // 校验必须看得见,否则约束永远不会被强制。
             if (expectedUniqueIndexes.Contains(iname)
-                && !actual.Sql.Contains("UNIQUE", StringComparison.OrdinalIgnoreCase))
+                && !actual.Sql.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
                 return false;
         }
         // 模型已移除的 EF 命名索引是回收对象(SyncIndexes 只回收模型表上的

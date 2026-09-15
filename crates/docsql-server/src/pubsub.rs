@@ -41,14 +41,11 @@ pub const MAX_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 // checkpoints and restart durability come for free.
 // ---------------------------------------------------------------------------
 
-/// Create the backing table on startup (idempotent).
+/// Create the backing table on startup (idempotent). The DDL lives in the
+/// engine (`Database::ensure_pubsub_table`) so the reserved system name can
+/// only be created through the sanctioned internal path.
 pub fn ensure_table(db: &mut Database) -> Result<(), String> {
-    db.execute(&format!(
-        "CREATE TABLE IF NOT EXISTS {PUBSUB_TABLE} \
-         (id INT PRIMARY KEY AUTOINCREMENT, channel TEXT, ts_ms INT, payload TEXT)"
-    ))
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    db.ensure_pubsub_table().map_err(|e| e.to_string())
 }
 
 /// SQL string literal (single quotes doubled).

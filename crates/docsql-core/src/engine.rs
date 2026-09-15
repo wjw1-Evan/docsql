@@ -62,6 +62,17 @@ pub const CLUSTER_POS_TABLE: &str = "_cluster_pos";
 /// reachable addresses.
 pub const CLUSTER_ID_TABLE: &str = "_cluster_id";
 
+/// Upper bound for LPAD/RPAD target lengths (in characters). The padded
+/// result goes into a document whose hard cap is `MAX_DOC_SIZE`, so this
+/// is pure allocation-bomb armor: an unbounded `String::with_capacity`
+/// used to abort the process on a single `SELECT LPAD('a', 2^62)`.
+const MAX_PAD_LENGTH: usize = 1 << 20;
+
+/// Upper bound for the number of grouping sets one GROUP BY may expand to
+/// (ROLLUP/CUBE/GROUPING SETS combine as a cartesian product — three
+/// 12-element CUBEs used to multiply into an astronomic with_capacity).
+const MAX_GROUPING_SETS: usize = 16_384;
+
 /// True for the engine-managed system tables: excluded from user-facing
 /// catalogs, digests, dumps and snapshot wipes.
 pub fn is_system_table(name: &str) -> bool {
@@ -660,16 +671,20 @@ impl<'a> ReadCx<'a> {
 
     /// Virtual information_schema tables from the catalog.
     fn information_schema(&self, which: &str) -> Vec<Object> {
+        // Engine/internal tables stay out of the standard dictionaries —
+        // same display rule as the object tree and the Oracle views (their
+        // existence, names and shapes are not every user's business).
+        let visible = self.tables.iter().filter(|(n, _)| !is_internal_table(n));
         let mut out = Vec::new();
         if which.ends_with("tables") {
-            for (name, meta) in self.tables {
+            for (name, meta) in visible {
                 out.push(Object::from([
                     ("table_name".into(), Value::Str(name.clone())),
                     ("pages".into(), Value::Int(meta.pages.len() as i64)),
                 ]));
             }
         } else {
-            for (name, meta) in self.tables {
+            for (name, meta) in visible {
                 for col in &meta.columns {
                     out.push(Object::from([
                         ("table_name".into(), Value::Str(name.clone())),
@@ -826,8 +841,11 @@ impl<'a> ReadCx<'a> {
             // INDEX definitions for schema sync.
             let mut docs: Vec<Object> = self
                 .tables
-                .keys()
-                .map(|n| {
+                .iter()
+                // Same display rule as information_schema: engine/user
+                // storage tables are not listed to readers.
+                .filter(|(n, _)| !is_internal_table(n))
+                .map(|(n, _)| {
                     Object::from([
                         ("type".into(), Value::Str("table".into())),
                         ("name".into(), Value::Str(n.clone())),
@@ -836,7 +854,7 @@ impl<'a> ReadCx<'a> {
                     ])
                 })
                 .collect();
-            for (tbl, meta) in self.tables {
+            for (tbl, meta) in self.tables.iter().filter(|(n, _)| !is_internal_table(n)) {
                 for d in &meta.index_defs {
                     docs.push(Object::from([
                         ("type".into(), Value::Str("index".into())),
@@ -1049,6 +1067,9 @@ impl<'a> ReadCx<'a> {
         }
         let mut out: Vec<Vec<Value>> = Vec::new();
         for set in &grouping_sets {
+            // Statement timeout reaches here too: the sets × rows × groups
+            // loops below run outside the WHERE scan's own sampling.
+            self.deadline.check()?;
             // Group the rows by this set's expressions. Groups hash by the
             // encoded key — the same byte identity DISTINCT uses — instead
             // of a linear scan per row (O(rows × groups)).
@@ -3124,9 +3145,11 @@ impl Database {
     /// Tables a statement READS (authorization input for user connections):
     /// every table referenced in a query's FROM/JOINs (derived tables and
     /// subqueries included — inside CTE bodies, projections and predicates
-    /// too) and the source of an INSERT ... SELECT. Fails CLOSED: a query
-    /// shape the walker cannot fully classify returns `None`, and the
-    /// caller must deny rather than guess.
+    /// too), the source of an INSERT ... SELECT, the tables read by a
+    /// write's expressions (UPDATE assignment subqueries, MERGE WHEN
+    /// predicates, aggregate FILTER conditions) and a CTAS/CREATE VIEW
+    /// source query. Fails CLOSED: a query shape the walker cannot fully
+    /// classify returns `None`, and the caller must deny rather than guess.
     pub fn stmt_read_targets(stmt: &Statement) -> Option<Vec<String>> {
         let mut out = Vec::new();
         match stmt {
@@ -3137,6 +3160,12 @@ impl Database {
                 }
             }
             Statement::Update(u) => {
+                // Assignment values may carry subqueries (`SET v =
+                // (SELECT pw FROM docsql_users …)`); exec_update
+                // substitutes and evaluates them, so they are reads.
+                for a in &u.assignments {
+                    walk_expr(&a.value, &mut out)?;
+                }
                 // The update target itself is a WRITE target; extra FROM
                 // tables are reads.
                 if let Some(kind) = &u.from {
@@ -3167,9 +3196,24 @@ impl Database {
             Statement::Merge(m) => {
                 // The USING side is a read; the merge target comes from
                 // stmt_write_targets. ON/assignments referencing the target
-                // are writes, not reads.
+                // are writes, not reads. WHEN predicates are evaluated per
+                // row and may carry subqueries — walk them too.
                 walk_factor(&m.source, &mut out)?;
+                for clause in &m.clauses {
+                    if let Some(pred) = &clause.predicate {
+                        walk_expr(pred, &mut out)?;
+                    }
+                }
             }
+            Statement::CreateTable(create) => {
+                // CTAS: the source query executes at creation time and is
+                // authorization input (the admin-only DDL gate shadows this
+                // today, but the classification must stay honest).
+                if let Some(q) = &create.query {
+                    walk_query(q, &mut out)?;
+                }
+            }
+            Statement::CreateView(view) => walk_query(&view.query, &mut out)?,
             _ => {}
         }
         out.sort();
@@ -3593,6 +3637,16 @@ impl Database {
         {
             return Ok(());
         }
+        // Reserved engine names: the internal-ddl flag is the sanctioned
+        // way past the CREATE TABLE guard (same pattern as
+        // ensure_user_tables; always cleared on the way out).
+        self.internal_ddl = true;
+        let result = self.ensure_cluster_tables_inner();
+        self.internal_ddl = false;
+        result
+    }
+
+    fn ensure_cluster_tables_inner(&mut self) -> Result<()> {
         self.execute(&format!(
             "CREATE TABLE IF NOT EXISTS {CLUSTER_LOG_TABLE} (seq INT PRIMARY KEY, sql TEXT)"
         ))?;
@@ -3603,6 +3657,21 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS {CLUSTER_ID_TABLE} (id TEXT)"
         ))?;
         Ok(())
+    }
+
+    /// Create the pub/sub backing table (idempotent). Lives in core so the
+    /// server's pubsub store and every test use the same sanctioned path
+    /// past the reserved-name guard in CREATE TABLE.
+    pub fn ensure_pubsub_table(&mut self) -> Result<()> {
+        self.internal_ddl = true;
+        let result = self
+            .execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {PUBSUB_TABLE} \
+             (id INT PRIMARY KEY AUTOINCREMENT, channel TEXT, ts_ms INT, payload TEXT)"
+            ))
+            .map(|_| ());
+        self.internal_ddl = false;
+        result
     }
 
     /// This node's persistent random identity: the key other nodes store
@@ -5255,6 +5324,13 @@ impl Database {
                 "table name {name} is reserved for the user/role subsystem"
             ));
         }
+        if crate::engine::is_system_table(&name) && !self.internal_ddl {
+            // Squatting an engine system name would break replication,
+            // digests and pub/sub on this database (the tables are excluded
+            // from dumps by name). Only the internal replay path may create
+            // reserved names, and it never creates these.
+            return err(format!("table name {name} is reserved for the engine"));
+        }
         if self.tables.contains_key(&name) {
             if create.if_not_exists {
                 return Ok(ExecOutcome::Affected(0));
@@ -6568,7 +6644,19 @@ fn expand_grouping_sets(exprs: &[SqlExpr]) -> Result<Vec<Vec<SqlExpr>>> {
             SqlExpr::GroupingSets(lists) => lists.clone(),
             other => vec![vec![other.clone()]],
         };
-        let mut next = Vec::with_capacity(sets.len() * alternatives.len());
+        // Super-grouping items multiply (SQL:2016 cartesian semantics);
+        // cap the product so `CUBE(a1..a12), CUBE(b1..b12), …` cannot turn
+        // into an astronomic allocation before the error surfaces.
+        let product = match sets.len().checked_mul(alternatives.len()) {
+            Some(p) => p,
+            None => return err("GROUP BY expands past the supported grouping set limit"),
+        };
+        if product > MAX_GROUPING_SETS {
+            return err(format!(
+                "GROUP BY expands to more than {MAX_GROUPING_SETS} grouping sets"
+            ));
+        }
+        let mut next = Vec::with_capacity(product);
         for base in &sets {
             for alt in &alternatives {
                 let mut combined = base.clone();
@@ -7566,6 +7654,15 @@ fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
                         walk_expr(inner, out)?;
                     }
                 }
+            }
+            // Aggregate FILTER (WHERE …) is evaluated per row and may carry
+            // subqueries — an unwalked filter would let a read-only user
+            // run a hidden subquery the classifier never sees.
+            if let Some(cond) = &f.filter {
+                walk_expr(cond, out)?;
+            }
+            for og in &f.within_group {
+                walk_expr(&og.expr, out)?;
             }
             Some(())
         }
@@ -8638,6 +8735,16 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 _ => return err(format!("function {name}: length must be an integer")),
             };
+            // Bound the padded width: an astronomic length used to reach
+            // String::with_capacity directly and abort the whole process
+            // on allocation failure (single-writer engine = node-wide DoS
+            // from one SELECT). Documents cap out at MAX_DOC_SIZE, so a
+            // 1 MiB character budget is far above every legitimate use.
+            if len > MAX_PAD_LENGTH {
+                return err(format!(
+                    "function {name}: length exceeds the supported maximum ({MAX_PAD_LENGTH})"
+                ));
+            }
             let pad = match args.get(2) {
                 Some(Value::Str(p)) if !p.is_empty() => p.clone(),
                 Some(Value::Str(_)) => " ".to_string(),
@@ -15847,11 +15954,7 @@ mod tx_rollback_tests {
     #[test]
     fn dump_script_skips_pubsub_store() {
         let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE _pubsub_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, \
-             channel TEXT, ts INT, payload TEXT)",
-        );
+        db.ensure_pubsub_table().unwrap();
         run(
             &mut db,
             "INSERT INTO _pubsub_messages VALUES (1, 'ch', 1, 'p')",
@@ -16409,11 +16512,7 @@ mod complex_query_tests {
         run(&mut b, "CREATE TABLE d (x TEXT)");
         assert_ne!(digests_of(&mut a), digests_of(&mut b));
         // The pubsub system table is node-local queue state, never compared.
-        run(
-            &mut a,
-            "CREATE TABLE _pubsub_messages \
-             (id INT PRIMARY KEY AUTOINCREMENT, payload TEXT)",
-        );
+        a.ensure_pubsub_table().unwrap();
         let base = digests_of(&mut a);
         run(
             &mut a,
@@ -17507,6 +17606,137 @@ mod complex_query_tests {
         );
         // Non-query statements carry no read targets.
         assert_eq!(read("CREATE TABLE t (id INT)"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn stmt_read_targets_cover_expression_reads() {
+        // The write-adjacent expression surfaces a write path actually
+        // evaluates — UPDATE assignment subqueries, aggregate FILTER
+        // conditions, MERGE WHEN predicates and CTAS/CREATE VIEW sources —
+        // must classify as reads, or a granted write on one table leaks
+        // data out of tables the user cannot SELECT (docsql_users hashes
+        // being the prize).
+        let parse = |sql: &str| {
+            let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+            stmts.swap_remove(0)
+        };
+        let read = |sql: &str| Database::stmt_read_targets(&parse(sql)).unwrap_or_default();
+
+        // UPDATE: assignment-value subquery (exec_update substitutes and
+        // evaluates these).
+        assert_eq!(
+            read("UPDATE t SET v = (SELECT pw FROM docsql_users LIMIT 1) WHERE id = 1"),
+            vec!["docsql_users"]
+        );
+        // Aggregate FILTER carries a hidden subquery.
+        assert_eq!(
+            read("SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM secret)) FROM t"),
+            vec!["secret", "t"]
+        );
+        // MERGE WHEN predicate subqueries.
+        assert_eq!(
+            read(
+                "MERGE INTO t USING s ON t.id = s.id \
+                 WHEN MATCHED AND t.id IN (SELECT id FROM audit) THEN UPDATE SET v = s.v"
+            ),
+            vec!["audit", "s"]
+        );
+        // CTAS and CREATE VIEW sources execute at creation time.
+        assert_eq!(read("CREATE TABLE x AS SELECT * FROM src"), vec!["src"]);
+        assert_eq!(read("CREATE VIEW v AS SELECT * FROM src"), vec!["src"]);
+    }
+
+    #[test]
+    fn lpad_rejects_astronomic_lengths() {
+        // One SELECT used to be able to abort the whole node via
+        // with_capacity(2^62).
+        let mut db = Database::in_memory().unwrap();
+        let e = db
+            .execute("SELECT LPAD('a', 9223372036854775807)")
+            .expect_err("must error");
+        assert!(e.to_string().contains("maximum"), "{e}");
+        // Normal padding is untouched, including truncation.
+        let r = rows(&mut db, "SELECT LPAD('x', 3, 'ab'), RPAD('toolong', 4)");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("abx".into()), Value::Str("tool".into())]]
+        );
+    }
+
+    #[test]
+    fn grouping_sets_product_is_capped() {
+        // Three 12-element CUBEs multiply to 2^36 sets: the expansion must
+        // refuse instead of allocating.
+        let mut db = Database::in_memory().unwrap();
+        let cols: Vec<String> = (1..=12).map(|i| format!("c{i} INT")).collect();
+        run(&mut db, &format!("CREATE TABLE wide ({})", cols.join(", ")));
+        let cube = format!(
+            "CUBE({})",
+            (1..=12)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let sql = format!("SELECT c1 FROM wide GROUP BY {cube}, {cube}, {cube}");
+        let e = db.execute(&sql).expect_err("must error");
+        assert!(e.to_string().contains("grouping sets"), "{e}");
+        // A single CUBE(12) stays under the cap.
+        let vals: Vec<String> = (1..=12).map(|i| i.to_string()).collect();
+        run(
+            &mut db,
+            &format!("INSERT INTO wide VALUES ({})", vals.join(", ")),
+        );
+        let r = rows(
+            &mut db,
+            &format!("SELECT count(*) FROM wide GROUP BY {cube}"),
+        );
+        assert_eq!(r.rows.len(), 4096);
+    }
+
+    #[test]
+    fn dictionaries_hide_internal_tables() {
+        let mut db = Database::in_memory().unwrap();
+        db.ensure_pubsub_table().unwrap();
+        run(&mut db, "CREATE TABLE user_t (id INT)");
+        for sql in [
+            "SELECT name FROM sqlite_master WHERE type = 'table'",
+            "SELECT table_name FROM information_schema.tables",
+            "SELECT table_name FROM information_schema.columns WHERE column_name = 'payload'",
+        ] {
+            let r = rows(&mut db, sql);
+            let hit = r.rows.iter().any(|row| {
+                row.first()
+                    .is_some_and(|v| matches!(v, Value::Str(s) if s == PUBSUB_TABLE))
+            });
+            assert!(!hit, "{sql} must not list {PUBSUB_TABLE}");
+        }
+        let r = rows(
+            &mut db,
+            "SELECT name FROM sqlite_master WHERE type = 'table'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("user_t".into())]]);
+    }
+
+    #[test]
+    fn create_table_cannot_squat_system_names() {
+        // A user-created table named like an engine system table would be
+        // excluded from dumps/digests by name — a silent data-loss trap.
+        let mut db = Database::in_memory().unwrap();
+        for name in [
+            PUBSUB_TABLE,
+            CLUSTER_LOG_TABLE,
+            CLUSTER_POS_TABLE,
+            CLUSTER_ID_TABLE,
+        ] {
+            let e = db
+                .execute(&format!("CREATE TABLE {name} (x INT)"))
+                .err()
+                .unwrap_or_else(|| panic!("{name} must be refused"));
+            assert!(e.to_string().contains("reserved"), "{e}");
+        }
+        // The sanctioned internal path still works.
+        db.ensure_cluster_tables().unwrap();
+        db.ensure_pubsub_table().unwrap();
     }
 
     #[test]

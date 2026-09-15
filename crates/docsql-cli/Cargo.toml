@@ -7,6 +7,9 @@ description = "DocSQL interactive shell"
 
 [dependencies]
 docsql-core = { path = "../docsql-core" }
+# Hidden password prompt (termios echo off on unix); already in the
+# dependency tree via tokio, so this adds no new vendor surface.
+libc = "0.2"
 
 [dev-dependencies]
 sqlparser = "0.62"

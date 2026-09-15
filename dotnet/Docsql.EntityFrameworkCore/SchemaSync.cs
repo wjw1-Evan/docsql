@@ -133,7 +133,7 @@ internal static partial class SchemaSync
                 // without UNIQUE would be silently kept by IF NOT EXISTS,
                 // so the constraint never gets enforced. Drop and recreate.
                 if (index.IsUnique && ExistingIndexSql(conn, table, iname) is { } ddl
-                    && !ddl.Contains("UNIQUE", StringComparison.OrdinalIgnoreCase))
+                    && !ddl.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
                 {
                     using var drop = conn.CreateCommand();
                     drop.CommandText = $"DROP INDEX IF EXISTS {Quote(iname)}";
@@ -189,5 +189,7 @@ internal static partial class SchemaSync
         return result is string s && s.Length > 0 ? s : null;
     }
 
-    private static string Quote(string id) => $"\"{id}\"";
+    // Embedded quotes escaped by doubling, same rule as the ADO.NET
+    // layer's QuoteIdent; string.Format keeps the nesting readable.
+    private static string Quote(string id) => string.Format("\"{0}\"", id.Replace("\"", "\"\""));
 }

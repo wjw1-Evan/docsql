@@ -1091,7 +1091,12 @@ async fn console_account_setup_login_and_gate() {
         .await
         .json();
     assert_eq!(st["mode"], "login");
-    assert_eq!(st["username"], "admin");
+    // The account name is session-holder information: a pre-auth status
+    // call learns only that a login exists.
+    assert!(
+        st.get("username").is_none(),
+        "pre-auth status must not leak the username: {st}"
+    );
 
     // Wrong password → 401 (generic message); right one → a new session.
     let r = http(
@@ -1233,7 +1238,12 @@ async fn console_account_persists_across_restart() {
         .await
         .json();
     assert_eq!(st["mode"], "login");
-    assert_eq!(st["username"], "admin");
+    // The account name is session-holder information: a pre-auth status
+    // call learns only that a login exists.
+    assert!(
+        st.get("username").is_none(),
+        "pre-auth status must not leak the username: {st}"
+    );
     let r = http(
         &addr2,
         "POST",
@@ -1811,7 +1821,12 @@ async fn console_account_change_credentials() {
     let st = http(&addr, "GET", "/api/auth/status", None, None)
         .await
         .json();
-    assert_eq!(st["username"], "admin");
+    // The account name is session-holder information: a pre-auth status
+    // call learns only that a login exists.
+    assert!(
+        st.get("username").is_none(),
+        "pre-auth status must not leak the username: {st}"
+    );
 
     // Weak new password: 400, account untouched.
     let r = http_cookie(
@@ -1838,7 +1853,12 @@ async fn console_account_change_credentials() {
     let st = http(&addr, "GET", "/api/auth/status", None, None)
         .await
         .json();
-    assert_eq!(st["username"], "root");
+    // Same rule after the rename: no username over an unauthenticated
+    // status call.
+    assert!(
+        st.get("username").is_none(),
+        "pre-auth status must not leak the username: {st}"
+    );
 
     // Old credentials no longer log in; the new ones do.
     let r = http(
@@ -2490,7 +2510,12 @@ async fn setup_input_policy_trim_and_cookie_flags() {
         .await
         .json();
     assert_eq!(st["mode"], "login");
-    assert_eq!(st["username"], "admin");
+    // The account name is session-holder information: a pre-auth status
+    // call learns only that a login exists.
+    assert!(
+        st.get("username").is_none(),
+        "pre-auth status must not leak the username: {st}"
+    );
     let r = http(
         &addr,
         "POST",

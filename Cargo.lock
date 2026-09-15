@@ -237,6 +237,7 @@ version = "0.1.0"
 dependencies = [
  "docsql-core",
  "docsql-server",
+ "libc",
  "sqlparser",
  "tempfile",
  "tokio",

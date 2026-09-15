@@ -226,6 +226,13 @@ pub const FLAG_REPLICATION: u16 = 0x0002;
 /// loss window on power failure).
 const ASYNC_COMMIT_INTERVAL_MS: u64 = 2;
 
+/// Prepared-statement budget per connection. The client never sends
+/// REQ_CLOSE_STMT today, so the map grows for the life of a pooled
+/// connection — without a cap, one connection pins unbounded server
+/// memory with megabyte templates it never executes.
+const MAX_PREPARED_STATEMENTS: usize = 1024;
+const MAX_PREPARED_TEMPLATE_BYTES: usize = 64 * 1024;
+
 /// One replication write acknowledged while the sync gate was open.
 #[derive(Debug, Clone)]
 pub struct QueuedWrite {
@@ -993,7 +1000,6 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
             // and subscribe, but every durable write is refused here so
             // no handler can accidentally apply one.
             if role == ConnRole::ReadOnly {
-                let is_repl = frame.flags & FLAG_REPLICATION != 0;
                 let sub = if frame.frame_type == proto::REQ_PUBSUB {
                     serde_json::from_slice::<serde_json::Value>(&frame.payload)
                         .ok()
@@ -1005,10 +1011,23 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     || frame.frame_type == proto::REQ_PROMOTE
                     || sub.as_deref() == Some("trim")
                     || (frame.frame_type == proto::REQ_SQL
-                        && !is_repl
                         && docsql_core::engine::Database::is_write_statement(
                             &proto::decode_sql(&frame.payload).unwrap_or_default(),
-                        ));
+                        ))
+                    || (frame.frame_type == proto::REQ_EXECUTE && {
+                        // The prepared template decides the statement kind —
+                        // bound params cannot turn a SELECT into a write.
+                        // REQ_EXECUTE must be classified here like REQ_SQL,
+                        // or a read-only token prepares a write once and
+                        // executes it through the unguarded frame type.
+                        serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                            .ok()
+                            .and_then(|v| v.get("handle").and_then(|h| h.as_u64()))
+                            .and_then(|h| prepared.get(&h))
+                            .is_some_and(|tpl| {
+                                docsql_core::engine::Database::is_write_statement(tpl)
+                            })
+                    });
                 if writes {
                     let _ = tx
                         .send(Frame::new(
@@ -1042,7 +1061,12 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
             }
             // Once at least one database user exists, legacy anonymous
             // (token-less) access closes: data operations then require the
-            // client token (admin) or a REQ_AUTH_USER login.
+            // client token (admin) or a REQ_AUTH_USER login. FLAG_REPLICATION
+            // frames stay exempt in the token-less compatibility mode —
+            // node-to-node fanout and join legitimately speak them with a
+            // vacuous AUTH — but REQ_EXECUTE has no replication meaning and
+            // used to be reachable by anonymous connections purely because
+            // it was missing from this list.
             if role == ConnRole::Client
                 && !token_authed
                 && user.is_none()
@@ -1051,6 +1075,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 && matches!(
                     frame.frame_type,
                     proto::REQ_SQL
+                        | proto::REQ_EXECUTE
                         | proto::REQ_PUBLISH
                         | proto::REQ_PUBSUB
                         | proto::REQ_PROMOTE
@@ -1064,6 +1089,35 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             "authentication required: this node has user accounts \
                              (use the client token or a username/password login)",
                         ),
+                    ))
+                    .await;
+                continue;
+            }
+            // The replication channel is for nodes. Frames only peers speak
+            // (sequenced writes, catch-up, digests, join sync/hold) are
+            // refused to user logins and read-only tokens — including the
+            // token-less compatibility mode, where "any authenticated
+            // connection may replicate" must not widen into "any connection
+            // sheds its grants (or its replica's read-only posture) by
+            // setting the replication flag". Peers authenticate with the
+            // cluster/client token and carry no user, so real replication
+            // is unaffected.
+            if frame.flags & FLAG_REPLICATION != 0
+                && matches!(
+                    frame.frame_type,
+                    proto::REQ_SQL_SEQ
+                        | proto::REQ_CATCHUP
+                        | proto::REQ_DIGEST
+                        | proto::REQ_SYNC
+                        | proto::REQ_HOLD
+                        | proto::REQ_RELEASE
+                )
+                && (user.is_some() || role == ConnRole::ReadOnly)
+            {
+                let _ = tx
+                    .send(Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("replication frames require node (token) credentials"),
                     ))
                     .await;
                 continue;
@@ -1173,39 +1227,69 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     }
                 }
                 proto::REQ_STATUS if authed => {
-                    // Read-only node report for cluster monitoring; not an SQL
-                    // statement, so it bypasses the query log.
-                    let payload = serde_json::to_vec(&status_payload(&state).await)
-                        .unwrap_or_else(|_| b"{}".to_vec());
-                    Some(Frame::new(proto::RESP_STATUS, payload))
+                    // Topology, paths and journal windows are node-operational
+                    // detail: user logins need the admin role for it (token
+                    // connections are the operator's own credential).
+                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("cluster status requires the admin role"),
+                        ))
+                    } else {
+                        // Read-only node report for cluster monitoring; not an SQL
+                        // statement, so it bypasses the query log.
+                        let payload = serde_json::to_vec(&status_payload(&state).await)
+                            .unwrap_or_else(|_| b"{}".to_vec());
+                        Some(Frame::new(proto::RESP_STATUS, payload))
+                    }
                 }
                 proto::REQ_LOGS if authed => {
-                    // Recent statement-audit entries + sync events for the
-                    // console's logs page; like REQ_STATUS this is not an SQL
-                    // statement, so it bypasses the query log.
-                    let limit = querylog::parse_logs_limit(&frame.payload);
-                    Some(Frame::new(
-                        proto::RESP_LOGS,
-                        querylog::logs_payload(&state.query_log, &state.sync_log, limit),
-                    ))
+                    // The statement audit log carries other users' data
+                    // values (only PASSWORD literals are redacted): same
+                    // admin rule as reading the user tables.
+                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("the audit log requires the admin role"),
+                        ))
+                    } else {
+                        // Recent statement-audit entries + sync events for the
+                        // console's logs page; like REQ_STATUS this is not an SQL
+                        // statement, so it bypasses the query log.
+                        let limit = querylog::parse_logs_limit(&frame.payload);
+                        Some(Frame::new(
+                            proto::RESP_LOGS,
+                            querylog::logs_payload(&state.query_log, &state.sync_log, limit),
+                        ))
+                    }
                 }
                 proto::REQ_META if authed => {
-                    // Object-explorer metadata for the console's node
-                    // switching: the same core::meta walk the console runs
-                    // on its embedded engine, so remote nodes report
-                    // shape-identical /api/meta payloads. Not an SQL
-                    // statement, so it bypasses the query log.
-                    let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-                    let meta = docsql_core::meta::build_meta(
-                        &mut db,
-                        &state.db_path,
-                        state.started,
-                        env!("CARGO_PKG_VERSION"),
-                    );
-                    Some(Frame::new(
-                        proto::RESP_META,
-                        docsql_core::json::to_string(&meta).into_bytes(),
-                    ))
+                    // Full catalog shape (tables, columns, row counts, paths):
+                    // admin-only for user logins, same boundary as the audit
+                    // log above.
+                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("catalog metadata requires the admin role"),
+                        ))
+                    } else {
+                        // Object-explorer metadata for the console's node
+                        // switching: the same core::meta walk the console runs
+                        // on its embedded engine, so remote nodes report
+                        // shape-identical /api/meta payloads. Not an SQL
+                        // statement, so it bypasses the query log.
+                        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                        let meta = docsql_core::meta::build_meta(
+                            &mut db,
+                            &state.db_path,
+                            state.started,
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                        Some(Frame::new(
+                            proto::RESP_META,
+                            docsql_core::json::to_string(&meta).into_bytes(),
+                        ))
+                    }
                 }
                 proto::REQ_SQL if authed => {
                     // Grants were refreshed above, before the frame gates.
@@ -1218,7 +1302,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // read.
                     let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
                     let mut logged = false;
-                    let resp = match querylog::try_serve_log_view(&sql, &state) {
+                    let resp = match querylog::try_serve_log_view(&sql, &state, user.as_ref()) {
                         // 读日志的查询本身不写日志(避免读日志刷日志)。
                         Some(f) => f,
                         None => {
@@ -1321,7 +1405,14 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                             if is_replication { None } else { Some(conn_id) },
                                             false,
                                             None,
-                                            if is_replication { None } else { user.as_ref() },
+                                            // The user identity survives the
+                                            // replication flag: peers carry no
+                                            // user and are unaffected, but a
+                                            // user connection must not drop its
+                                            // grants (or the admin-only user
+                                            // tables' write gate) by setting one
+                                            // header bit.
+                                            user.as_ref(),
                                             stmt_deadline,
                                         )
                                         .await
@@ -1345,12 +1436,27 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 proto::REQ_PREPARE if authed => {
                     // Server-side prepared statements: the template carries
                     // `?` placeholders; binding happens at REQ_EXECUTE with
-                    // typed literals rendered inside the server.
+                    // typed literals rendered inside the server. The per-
+                    // connection budget keeps a single connection from
+                    // pinning unbounded server memory (the client never
+                    // closes handles today).
                     let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
                     if sql.trim().is_empty() {
                         Some(Frame::new(
                             proto::RESP_ERROR,
                             err_payload("prepare: empty statement"),
+                        ))
+                    } else if sql.len() > MAX_PREPARED_TEMPLATE_BYTES {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("prepare: statement template too large"),
+                        ))
+                    } else if prepared.len() >= MAX_PREPARED_STATEMENTS {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload(
+                                "prepare: too many prepared statements on this connection",
+                            ),
                         ))
                     } else {
                         let h = next_stmt_handle;
@@ -1384,7 +1490,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             let deadline = state
                                 .statement_timeout
                                 .map(|t| std::time::Instant::now() + t);
-                            let (resp, logged) = match querylog::try_serve_log_view(&sql, &state) {
+                            let (resp, logged) =
+                                match querylog::try_serve_log_view(&sql, &state, user.as_ref())
+                                {
                                 // 读日志的查询本身不写日志(避免读日志刷日志)。
                                 Some(f) => (f, false),
                                 None => (
@@ -1965,6 +2073,28 @@ fn authorize_statement(
                 if !g.may_dml(&t, bit) {
                     return Err(format!(
                         "{label} on table {t} requires the readwrite role or a table grant"
+                    ));
+                }
+            }
+            // A write also READS: the INSERT .. SELECT source, UPDATE
+            // assignment subqueries, MERGE WHEN predicates. Those tables are
+            // authorization input — without this check a user holding only a
+            // write grant could copy docsql_users password hashes (or any
+            // ungranted table) into a table of their own and read them back.
+            let sources = Database::stmt_read_targets(s).ok_or_else(|| {
+                "this statement shape cannot be authorized for user connections".to_string()
+            })?;
+            for t in &sources {
+                if docsql_core::useradmin::is_user_table(t) {
+                    return Err("user/role data is visible to the admin role only".into());
+                }
+                if readable_by_all(t) {
+                    continue;
+                }
+                if !g.may_select(t) {
+                    return Err(format!(
+                        "SELECT on table {t} requires the readonly/readwrite role \
+                         or a table grant"
                     ));
                 }
             }

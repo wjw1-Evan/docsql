@@ -200,7 +200,18 @@ fn word_tokens(lower: &str) -> Vec<(usize, usize)> {
 
 /// Serve `SELECT ... FROM docsql_log` from the ring buffer.
 /// Returns None when the SQL does not target the log view.
-pub fn try_serve_log_view(sql: &str, state: &Arc<ServerState>) -> Option<crate::Frame> {
+pub(crate) fn try_serve_log_view(
+    sql: &str,
+    state: &Arc<ServerState>,
+    user: Option<&crate::UserAuth>,
+) -> Option<crate::Frame> {
+    // The audit log carries other users' statement text (only PASSWORD
+    // literals are redacted), so a non-admin login must not harvest it.
+    // Returning None drops the query into the normal path, where
+    // docsql_log simply does not exist for them.
+    if user.is_some_and(|u| !u.grants.admin) {
+        return None;
+    }
     let lower = sql.to_lowercase();
     if !lower.trim_start().starts_with("select") {
         return None;

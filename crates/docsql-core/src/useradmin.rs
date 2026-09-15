@@ -428,23 +428,31 @@ fn priv_names(privs: &[TablePriv]) -> String {
 
 /// Canonical text: names folded, privileges normalized, the password
 /// rendered exactly as carried (callers substitute the stored hash form).
+/// Every name is rendered through `q()` — the resolved text is what
+/// replicates to peers and lands in logs, and an unquoted identifier that
+/// came in via a quoted parse (say `"a; b"`) would re-parse as two
+/// statements on the far side.
 pub fn render(stmt: &UserAdminStmt, password: &str) -> String {
     match stmt {
         UserAdminStmt::CreateUser { name, .. } => {
-            format!("CREATE USER {name} PASSWORD {}", lit(password))
+            format!("CREATE USER {} PASSWORD {}", q(name), lit(password))
         }
         UserAdminStmt::AlterUserPassword { name, .. } => {
-            format!("ALTER USER {name} PASSWORD {}", lit(password))
+            format!("ALTER USER {} PASSWORD {}", q(name), lit(password))
         }
-        UserAdminStmt::DropUser { name } => format!("DROP USER {name}"),
-        UserAdminStmt::CreateRole { name } => format!("CREATE ROLE {name}"),
-        UserAdminStmt::DropRole { name } => format!("DROP ROLE {name}"),
-        UserAdminStmt::GrantRoles { roles, to } => {
-            format!("GRANT {} TO {}", roles.join(", "), to.join(", "))
-        }
-        UserAdminStmt::RevokeRoles { roles, from } => {
-            format!("REVOKE {} FROM {}", roles.join(", "), from.join(", "))
-        }
+        UserAdminStmt::DropUser { name } => format!("DROP USER {}", q(name)),
+        UserAdminStmt::CreateRole { name } => format!("CREATE ROLE {}", q(name)),
+        UserAdminStmt::DropRole { name } => format!("DROP ROLE {}", q(name)),
+        UserAdminStmt::GrantRoles { roles, to } => format!(
+            "GRANT {} TO {}",
+            roles.iter().map(|r| q(r)).collect::<Vec<_>>().join(", "),
+            to.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")
+        ),
+        UserAdminStmt::RevokeRoles { roles, from } => format!(
+            "REVOKE {} FROM {}",
+            roles.iter().map(|r| q(r)).collect::<Vec<_>>().join(", "),
+            from.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")
+        ),
         UserAdminStmt::GrantTable {
             privileges,
             tables,
@@ -453,7 +461,7 @@ pub fn render(stmt: &UserAdminStmt, password: &str) -> String {
             "GRANT {} ON {} TO {}",
             priv_names(privileges),
             tables.iter().map(|t| q(t)).collect::<Vec<_>>().join(", "),
-            to.join(", ")
+            to.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")
         ),
         UserAdminStmt::RevokeTable {
             privileges,
@@ -463,7 +471,7 @@ pub fn render(stmt: &UserAdminStmt, password: &str) -> String {
             "REVOKE {} ON {} FROM {}",
             priv_names(privileges),
             tables.iter().map(|t| q(t)).collect::<Vec<_>>().join(", "),
-            from.join(", ")
+            from.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")
         ),
     }
 }

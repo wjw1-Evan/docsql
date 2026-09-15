@@ -6,8 +6,21 @@
 //! Kept in core so both the engine (hashing at CREATE/ALTER USER) and the
 //! server (verification at REQ_AUTH_USER) share one implementation.
 
-/// PBKDF2 iteration count for newly hashed passwords.
-pub const PBKDF2_ITERATIONS: u32 = 60_000;
+/// PBKDF2 iteration count for newly hashed passwords. Runs on the auth
+/// path (server REQ_AUTH_USER + web console login) in spawn_blocking;
+/// 210k keeps a login at tens of milliseconds while staying far above
+/// offline-guessing commodity GPU rates.
+pub const PBKDF2_ITERATIONS: u32 = 210_000;
+
+/// Upper bound for iterations accepted in a stored credential. Stored
+/// forms replicate verbatim (a compromised peer could otherwise plant
+/// `iterations = 2^32-1` and turn every later login of that user into a
+/// multi-second CPU burn). Values above the bound fail closed: never
+/// hashed anew, never verified.
+pub const MAX_PBKDF2_ITERATIONS: u32 = 2_000_000;
+
+/// Upper bound for the salt carried in a stored credential (bytes).
+pub const MAX_SALT_LEN: usize = 64;
 
 /// Stored-credential prefix: `$pbkdf2-sha256$<iterations>$<salt-hex>$<hash-hex>`.
 pub const HASH_PREFIX: &str = "$pbkdf2-sha256";
@@ -234,10 +247,13 @@ impl StoredPw {
         let rest = s.strip_prefix(HASH_PREFIX)?.strip_prefix('$')?;
         let mut parts = rest.split('$');
         let iterations = parts.next()?.parse::<u32>().ok()?;
-        if iterations < 1 {
+        if !(1..=MAX_PBKDF2_ITERATIONS).contains(&iterations) {
             return None;
         }
         let salt = unhex(parts.next()?)?;
+        if salt.len() > MAX_SALT_LEN || salt.is_empty() {
+            return None;
+        }
         let hash_arr: [u8; 32] = unhex(parts.next()?)?.try_into().ok()?;
         if parts.next().is_some() {
             return None;
@@ -250,7 +266,15 @@ impl StoredPw {
     }
 
     /// Constant-time password check against this stored credential.
+    /// Out-of-bound parameters fail closed (deny the login) instead of
+    /// running an attacker-chosen work factor.
     pub fn verify(&self, password: &str) -> bool {
+        if self.iterations > MAX_PBKDF2_ITERATIONS
+            || self.salt.len() > MAX_SALT_LEN
+            || self.salt.is_empty()
+        {
+            return false;
+        }
         let mut got = [0u8; 32];
         pbkdf2_hmac_sha256(password.as_bytes(), &self.salt, self.iterations, &mut got);
         constant_time_eq(&got, &self.hash)
@@ -388,5 +412,34 @@ mod tests {
         assert!(!StoredPw::parse("$pbkdf2-sha256$0$aa$bb").is_some());
         assert!(is_stored_form(&stored));
         assert!(!is_stored_form("plaintext"));
+    }
+
+    #[test]
+    fn stored_form_bounds_reject_attacker_work_factors() {
+        // A stored credential replicates verbatim; out-of-bound work
+        // factors must not parse (never stored) and must fail verification
+        // closed (an old poisoned entry denies login instead of burning
+        // CPU on every attempt).
+        let salt16 = "aa".repeat(16);
+        let hash64 = "bb".repeat(32);
+        let over = format!(
+            "{HASH_PREFIX}${}${salt16}${hash64}",
+            MAX_PBKDF2_ITERATIONS + 1
+        );
+        assert!(!StoredPw::parse(&over).is_some());
+        assert!(!is_stored_form(&over));
+
+        let long_salt = "cc".repeat(MAX_SALT_LEN + 1);
+        let big_salt = format!("{HASH_PREFIX}$1000${long_salt}${hash64}");
+        assert!(!StoredPw::parse(&big_salt).is_some());
+
+        //verify() fail-closed on a hand-built out-of-bound entry (could
+        // exist in a database written before the bound).
+        let poisoned = StoredPw {
+            iterations: u32::MAX,
+            salt: vec![7u8; 16],
+            hash: [0u8; 32],
+        };
+        assert!(!poisoned.verify("anything"));
     }
 }

@@ -4155,6 +4155,256 @@ async fn user_login_lockout_mirrors_token_auth() {
     assert!(payload_str(&f).contains("locked"), "{}", payload_str(&f));
 }
 
+#[tokio::test]
+async fn readonly_token_cannot_write_via_prepared_execute() {
+    // REQ_EXECUTE used to be absent from the frame-level read-only gate:
+    // a read-only token could PREPARE a write once and EXECUTE it through
+    // the unguarded frame type.
+    let (_dir, addr) = start_server_sec(Some("writer-tk"), Some("reader-tk"), None, 0, 0, 10).await;
+    let mut w = Client::connect(&addr).await;
+    assert_eq!(w.auth("writer-tk").await.frame_type, proto::RESP_AFFECTED);
+    w.sql("CREATE TABLE pr (id INT)").await;
+
+    let mut r = Client::connect(&addr).await;
+    assert_eq!(r.auth("reader-tk").await.frame_type, proto::RESP_AFFECTED);
+    let handle = {
+        r.send(&Frame::new(
+            proto::REQ_PREPARE,
+            proto::encode_sql("INSERT INTO pr VALUES (1)").unwrap(),
+        ))
+        .await;
+        let f = r.recv().await;
+        assert_eq!(f.frame_type, proto::RESP_PREPARED, "{}", payload_str(&f));
+        let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+        v["handle"].as_u64().unwrap()
+    };
+    let body = serde_json::json!({"handle": handle, "params": []});
+    r.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        body.to_string().into_bytes(),
+    ))
+    .await;
+    let f = r.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(payload_str(&f).contains("read-only"), "{}", payload_str(&f));
+    let f = w.sql("SELECT COUNT(*) FROM pr").await;
+    assert!(
+        payload_str(&f).contains("[[0]]"),
+        "no row may have leaked: {}",
+        payload_str(&f)
+    );
+
+    // Reads through prepared statements stay available.
+    let sel = {
+        r.send(&Frame::new(
+            proto::REQ_PREPARE,
+            proto::encode_sql("SELECT 1").unwrap(),
+        ))
+        .await;
+        let f = r.recv().await;
+        let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+        v["handle"].as_u64().unwrap()
+    };
+    let body = serde_json::json!({"handle": sel, "params": []});
+    r.send(&Frame::new(
+        proto::REQ_EXECUTE,
+        body.to_string().into_bytes(),
+    ))
+    .await;
+    assert_eq!(r.recv().await.frame_type, proto::RESP_ROWS);
+
+    // The replication flag no longer exempts the read-only gate either:
+    // repl-flagged write SQL from a read-only token is still a write.
+    let mut f = Frame::new(
+        proto::REQ_SQL,
+        proto::encode_sql("INSERT INTO pr VALUES (2)").unwrap(),
+    );
+    f.flags = docsql_server::FLAG_REPLICATION;
+    r.send(&f).await;
+    let resp = r.recv().await;
+    assert_eq!(resp.frame_type, proto::RESP_ERROR, "{}", payload_str(&resp));
+    assert!(payload_str(&resp).contains("read-only"));
+}
+
+#[tokio::test]
+async fn anonymous_data_and_execute_frames_close_with_users() {
+    // Once users exist the anonymous gate closes the data plane: REQ_SQL,
+    // and — newly — REQ_EXECUTE, which used to be reachable purely because
+    // it was missing from the gate's frame list. The replication channel
+    // (REQ_HOLD/REQ_SYNC/…) stays answerable to token-less peers: their
+    // AUTH is vacuous when no tokens are configured, and join/fanout
+    // depend on that documented compatibility mode.
+    let (_dir, addr) = start_server(None).await;
+    let mut bootstrap = Client::connect(&addr).await;
+    let pw = ["an", "on", "pw", "12"].concat();
+    bootstrap
+        .sql(&format!("CREATE USER nia PASSWORD '{pw}'"))
+        .await;
+    assert_eq!(
+        bootstrap.sql("GRANT readwrite TO nia").await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    drop(bootstrap);
+
+    for frame in [
+        Frame::new(proto::REQ_SQL, proto::encode_sql("SELECT 1").unwrap()),
+        Frame::new(proto::REQ_EXECUTE, b"{\"handle\":1,\"params\":[]}".to_vec()),
+        Frame::new(
+            proto::REQ_PUBLISH,
+            b"{\"channel\":\"c\",\"payload\":\"x\"}".to_vec(),
+        ),
+    ] {
+        let mut anon = Client::connect(&addr).await;
+        anon.send(&frame).await;
+        let f = anon.recv().await;
+        assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+        assert!(
+            payload_str(&f).contains("authentication required"),
+            "{}",
+            payload_str(&f)
+        );
+    }
+
+    // The replication channel still speaks the token-less compat dialect.
+    let mut digest = Frame::new(proto::REQ_DIGEST, Vec::new());
+    digest.flags = docsql_server::FLAG_REPLICATION;
+    let mut anon = Client::connect(&addr).await;
+    anon.send(&digest).await;
+    assert_eq!(
+        anon.recv().await.frame_type,
+        proto::RESP_DIGEST,
+        "token-less peers must keep working (documented compat)"
+    );
+}
+
+#[tokio::test]
+async fn user_connections_cannot_ride_the_replication_channel() {
+    // A user login that sets FLAG_REPLICATION used to shed its grants and
+    // execute with token-level privileges; the replication-only frames
+    // (hold/sync/digest/catchup) used to be open to it entirely.
+    let (_dir, addr) = start_server(None).await;
+    let mut admin = Client::connect(&addr).await;
+    admin.sql("CREATE TABLE rc (id INT)").await;
+    let pw = ["rc", "us", "er", "12"].concat();
+    admin
+        .sql(&format!("CREATE USER rita PASSWORD '{pw}'"))
+        .await;
+    assert_eq!(
+        admin.sql("GRANT readwrite TO rita").await.frame_type,
+        proto::RESP_AFFECTED
+    );
+
+    let mut rita = Client::connect(&addr).await;
+    assert_eq!(
+        user_login(&mut rita, "rita", &pw).await.frame_type,
+        proto::RESP_AFFECTED
+    );
+
+    // DDL rides the flag: without her grants this used to succeed.
+    let mut f = Frame::new(
+        proto::REQ_SQL,
+        proto::encode_sql("CREATE TABLE smuggled (a INT)").unwrap(),
+    );
+    f.flags = docsql_server::FLAG_REPLICATION;
+    rita.send(&f).await;
+    let resp = rita.recv().await;
+    assert_eq!(resp.frame_type, proto::RESP_ERROR, "{}", payload_str(&resp));
+    assert!(
+        payload_str(&resp).contains("admin"),
+        "{}",
+        payload_str(&resp)
+    );
+
+    // The peer-only frames refuse a user login outright.
+    for frame in [
+        Frame::new(proto::REQ_HOLD, b"127.0.0.1:1".to_vec()),
+        Frame::new(proto::REQ_DIGEST, Vec::new()),
+    ] {
+        let mut probe_frame = frame;
+        probe_frame.flags = docsql_server::FLAG_REPLICATION;
+        rita.send(&probe_frame).await;
+        let resp = rita.recv().await;
+        assert_eq!(resp.frame_type, proto::RESP_ERROR, "{}", payload_str(&resp));
+    }
+
+    // Operational reads are admin-only for user logins...
+    for frame in [
+        Frame::new(proto::REQ_STATUS, Vec::new()),
+        Frame::new(proto::REQ_LOGS, b"20".to_vec()),
+        Frame::new(proto::REQ_META, Vec::new()),
+    ] {
+        rita.send(&frame).await;
+        let resp = rita.recv().await;
+        assert_eq!(resp.frame_type, proto::RESP_ERROR, "{}", payload_str(&resp));
+    }
+    // ...while the admin user passes, and her grants stay intact.
+    admin.send(&Frame::new(proto::REQ_STATUS, Vec::new())).await;
+    assert_eq!(admin.recv().await.frame_type, proto::RESP_STATUS);
+}
+
+#[tokio::test]
+async fn write_statements_authorize_their_read_sources() {
+    // INSERT .. SELECT / assignment subqueries / aggregate FILTER read
+    // tables the write-target check never saw: a user holding only a
+    // write grant on one table could copy docsql_users password hashes
+    // into a table of their own.
+    let (_dir, addr) = start_server(None).await;
+    let mut admin = Client::connect(&addr).await;
+    admin.sql("CREATE TABLE sink (a TEXT, b TEXT)").await;
+    admin.sql("CREATE TABLE src (v TEXT)").await;
+    admin.sql("INSERT INTO src VALUES ('s')").await;
+    let pw = ["wr", "it", "er", "12"].concat();
+    admin
+        .sql(&format!("CREATE USER milo PASSWORD '{pw}'"))
+        .await;
+    for grant in [
+        "GRANT INSERT ON sink TO milo",
+        "GRANT UPDATE ON sink TO milo",
+        "GRANT SELECT ON sink TO milo",
+    ] {
+        assert_eq!(
+            admin.sql(grant).await.frame_type,
+            proto::RESP_AFFECTED,
+            "{grant}"
+        );
+    }
+
+    let mut milo = Client::connect(&addr).await;
+    assert_eq!(
+        user_login(&mut milo, "milo", &pw).await.frame_type,
+        proto::RESP_AFFECTED
+    );
+
+    // Plain writes inside his grants keep working.
+    assert_eq!(
+        milo.sql("INSERT INTO sink VALUES ('a', 'b')")
+            .await
+            .frame_type,
+        proto::RESP_AFFECTED
+    );
+    // ...but every read smuggled through a write is refused. The user-table
+    // lines are stopped by the internal-table gate (its message differs),
+    // the plain-source line by the read-source grant check.
+    for sql in [
+        "INSERT INTO sink SELECT v, v FROM src",
+        "INSERT INTO sink SELECT name, pw FROM docsql_users",
+        "UPDATE sink SET a = (SELECT pw FROM docsql_users LIMIT 1) WHERE a = 'a'",
+        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM docsql_users)) FROM sink",
+    ] {
+        let f = milo.sql(sql).await;
+        assert_eq!(
+            f.frame_type,
+            proto::RESP_ERROR,
+            "{sql}: {}",
+            payload_str(&f)
+        );
+    }
+    // And the audit log is admin-only for user logins (it carries other
+    // users' statement values).
+    let f = milo.sql("SELECT sql FROM docsql_log LIMIT 1").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+}
+
 /// Protocol-level identity and admin guards: a peer connection never
 /// authenticates as a database user, one connection holds one identity,
 /// and non-admin users are refused backup trigger/restore and PROMOTE.

@@ -1496,7 +1496,7 @@ function renderGrid(container, cols, rows, opts) {
       `<td class="rownum">${ri + 1}</td>` +
       row.map(v => `<td title="${v === null ? 'NULL' : esc(fmtCell(v))}">${v === null ? '<span class="null">NULL</span>' : esc(fmtCell(v))}</td>`).join('') +
       (btns ? `<td class="rowact">${(btns(row, ri) || []).map((b, i) =>
-        `<button data-bt="${ri}:${i}"${b.cls ? ` class="${b.cls}"` : ''}${b.title ? ` title="${esc(b.title)}"` : ''}>${b.label}</button>`).join('')}</td>` : '') +
+        `<button data-bt="${ri}:${i}"${b.cls ? ` class="${esc(b.cls)}"` : ''}${b.title ? ` title="${esc(b.title)}"` : ''}>${esc(b.label)}</button>`).join('')}</td>` : '') +
       '</tr>').join('');
     wrap.innerHTML = `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
     $$('th[data-ci]', wrap).forEach(th => th.onclick = () => {

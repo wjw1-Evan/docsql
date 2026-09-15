@@ -51,6 +51,27 @@ enum CliMode {
     Embedded { path: String },
 }
 
+/// The one-shot usage text (`--help` / `-h`; also the tail of any
+/// unknown-flag error).
+fn usage() -> String {
+    "\
+DocSQL shell
+
+  docsql <file.db>               embedded mode (SQL from stdin)
+  docsql :memory:                embedded in-memory
+  docsql connect <addr> [token]  remote mode over the v1 protocol
+  docsql connect <addr> --user <name>
+                                 username/password login (password comes from
+                                 DOCSQL_PASSWORD or a hidden prompt)
+
+Options:
+  -f, --file <script.sql>  execute a script file instead of stdin
+      --csv | --json       row output format (default: aligned table)
+  -h, --help               this text
+"
+    .to_string()
+}
+
 /// Parsed startup options. Pure over an injected argument iterator so the
 /// whole flag/positional surface is testable without a process.
 #[derive(Debug)]
@@ -62,7 +83,9 @@ struct CliArgs {
 
 /// Mirror of `main()`'s old argv walk: flags may appear anywhere, the first
 /// non-flag consumes a mode, and `connect` may carry `--user <name>` with
-/// the trailing positional as the token.
+/// the trailing positional as the token. Unknown `-`-prefixed arguments are
+/// rejected — they used to fall through as positionals, so a stray
+/// `docsql --help` quietly created a database literally named `--help`.
 fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
     let mut format = Format::Table;
     let mut script: Option<String> = None;
@@ -77,6 +100,11 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
                 Some(p) => script = Some(p),
                 None => return Err(format!("{a} requires a script path")),
             },
+            // Connect-scoped flag: consumed by the connect branch below.
+            "--user" => rest.push(a),
+            _ if a.starts_with('-') => {
+                return Err(format!("unknown option {a}\n\n{}", usage()));
+            }
             _ => rest.push(a),
         }
     }
@@ -94,6 +122,8 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
         while let Some(a) = it.next() {
             if a == "--user" {
                 user = it.next().cloned();
+            } else if a.starts_with('-') {
+                return Err(format!("unknown option {a}\n\n{}", usage()));
             } else {
                 positional.push(a.clone());
             }
@@ -117,7 +147,12 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
 }
 
 fn main() {
-    let args = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", usage());
+        return;
+    }
+    let args = parse_args(argv.into_iter()).unwrap_or_else(|e| {
         eprintln!("DocSQL: {e}");
         std::process::exit(2);
     });
@@ -341,20 +376,60 @@ fn auth(remote: &mut Remote, token: &str) -> bool {
     }
 }
 
+/// Read one line from stdin with terminal echo disabled, restoring the
+/// original termios on every path. Plain `read_line` used to leave the
+/// password in the terminal scrollback. The FFI is the only way to do
+/// this without spawning a subprocess (production code must not); scoped
+/// to these two calls and nothing else.
+#[cfg(unix)]
+fn read_password_hidden() -> std::io::Result<String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    // Not a tty (pipe/file input): echo is already a non-issue.
+    if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    let original = term;
+    term.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    // Restore before reporting the read result: the terminal must never
+    // stay echo-less, even when stdin failed.
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    read?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(not(unix))]
+fn read_password_hidden() -> std::io::Result<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 /// Username/password login (REQ_AUTH_USER, JSON body). The password is
-/// taken from DOCSQL_PASSWORD or an interactive prompt.
+/// taken from DOCSQL_PASSWORD or an interactive hidden prompt.
 fn auth_user(remote: &mut Remote, user: &str) -> bool {
     let password = match std::env::var("DOCSQL_PASSWORD") {
         Ok(p) if !p.is_empty() => p,
         _ => {
             eprint!("password for {user}: ");
             let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            if std::io::stdin().read_line(&mut line).is_err() {
-                eprintln!("cannot read password from stdin");
-                return false;
-            }
-            line.trim_end_matches(['\r', '\n']).to_string()
+            let line = match read_password_hidden() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("cannot read password from stdin: {e}");
+                    return false;
+                }
+            };
+            eprintln!();
+            line
         }
     };
     let body = docsql_core::json::to_string(&Value::Object(docsql_core::value::Object::from([
@@ -1103,6 +1178,21 @@ mod tests {
         // A dangling -f with no argument is a loud parse error.
         let err = parse_args(["-f"].into_iter().map(String::from)).unwrap_err();
         assert!(err.contains("requires a script path"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flags_instead_of_db_paths() {
+        // `docsql --help` used to open a database literally named `--help`
+        // (plus its WAL) in the working directory.
+        for argv in [
+            vec!["--help"],
+            vec!["-x", "d.db"],
+            vec!["d.db", "--unknown"],
+            vec!["connect", "n:7600", "--usr", "tok"],
+        ] {
+            let err = parse_args(argv.into_iter().map(String::from)).unwrap_err();
+            assert!(err.contains("unknown option"), "err: {err}");
+        }
     }
 
     #[test]

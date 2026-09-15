@@ -86,6 +86,9 @@ pub struct WebState {
     /// otherwise every user shares one bucket and ten wrong passwords from
     /// anyone lock out everybody.
     pub trust_proxy: bool,
+    /// Mark the session cookie `Secure` (native TLS serving, or the
+    /// `DOCSQL_WEB_COOKIE_SECURE=1` opt-in for TLS-terminating proxies).
+    pub secure_cookie: bool,
     /// Process-lifetime HTTP request counters for /metrics, keyed by
     /// (method, normalized path, status code). Bounded cardinality: only
     /// the console's own fixed routes are named, everything else lumps
@@ -145,7 +148,21 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         Some(path) => Some(AuthShared::open(path).map_err(std::io::Error::other)?),
         None => None,
     };
+    if auth.is_none() {
+        // Fail-open legacy mode: say so loudly, once, at startup — the
+        // common accident is a deployment with a node token but no account
+        // gate, which leaves every data endpoint reachable without
+        // credentials.
+        eprintln!(
+            "WARNING: DOCSQL_WEB_AUTH_FILE is not set; the console API is open \
+             without credentials (legacy mode). Set it to require an account."
+        );
+    }
     let tls = cfg.tls;
+    let secure_cookie = tls.is_some()
+        || std::env::var("DOCSQL_WEB_COOKIE_SECURE")
+            .ok()
+            .is_some_and(|v| v.trim() == "1");
     let state = Arc::new(WebState {
         upstream: cfg.upstream,
         token: cfg.token,
@@ -156,6 +173,7 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         trust_proxy: std::env::var("DOCSQL_WEB_TRUST_PROXY")
             .ok()
             .is_some_and(|v| v.trim() == "1"),
+        secure_cookie,
         http_requests: Mutex::new(std::collections::HashMap::new()),
     });
     let app = build_router(state);
@@ -666,12 +684,10 @@ struct CredentialsBody {
     password: String,
 }
 
-fn session_cookie(token: &str) -> String {
-    // Secure keeps the session off plaintext hops; opt-in because the
-    // common deployment terminates TLS at a proxy and speaks http inside.
-    let secure = std::env::var("DOCSQL_WEB_COOKIE_SECURE")
-        .ok()
-        .is_some_and(|v| v.trim() == "1");
+fn session_cookie(token: &str, secure: bool) -> String {
+    // Secure keeps the session off plaintext hops: automatic when the
+    // console serves TLS itself, opt-in via DOCSQL_WEB_COOKIE_SECURE=1
+    // when a proxy terminates TLS and speaks http inside.
     format!(
         "{}={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
         auth::SESSION_COOKIE,
@@ -681,9 +697,10 @@ fn session_cookie(token: &str) -> String {
     )
 }
 
-fn with_session_cookie(resp: Response, token: &str) -> Response {
+fn with_session_cookie(state: &WebState, resp: Response, token: &str) -> Response {
     let mut resp = resp;
-    let value = HeaderValue::from_str(&session_cookie(token)).expect("cookie header value");
+    let value = HeaderValue::from_str(&session_cookie(token, state.secure_cookie))
+        .expect("cookie header value");
     resp.headers_mut().append(header::SET_COOKIE, value);
     resp
 }
@@ -692,16 +709,29 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-async fn auth_status(State(state): State<Arc<WebState>>) -> Response {
+async fn auth_status(
+    State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let Some(a) = &state.auth else {
         return json_response(StatusCode::OK, json!({"mode": "off"}));
     };
     match a.mode() {
         auth::AuthMode::Setup => json_response(StatusCode::OK, json!({"mode": "setup"})),
-        auth::AuthMode::Login => json_response(
-            StatusCode::OK,
-            json!({"mode": "login", "username": a.username().unwrap_or_default()}),
-        ),
+        auth::AuthMode::Login => {
+            // The account name is session holder's information: a
+            // pre-auth visitor learns only that a login exists (the login
+            // form collects the name itself).
+            let signed_in = session_from(&headers).is_some_and(|t| a.sessions.verify(&t));
+            if signed_in {
+                json_response(
+                    StatusCode::OK,
+                    json!({"mode": "login", "username": a.username().unwrap_or_default()}),
+                )
+            } else {
+                json_response(StatusCode::OK, json!({"mode": "login"}))
+            }
+        }
     }
 }
 
@@ -743,6 +773,7 @@ async fn auth_setup(
             a.lockout.lock().unwrap().reset(source);
             let token = a.sessions.create();
             with_session_cookie(
+                &state,
                 json_response(
                     StatusCode::OK,
                     json!({"ok": true, "username": creds.username}),
@@ -812,6 +843,7 @@ async fn auth_login(
     let username = a.username().unwrap_or_default();
     let token = a.sessions.create();
     with_session_cookie(
+        &state,
         json_response(StatusCode::OK, json!({"ok": true, "username": username})),
         &token,
     )
@@ -2103,6 +2135,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
         };
         assert_eq!(resolve_node(&state, &None).unwrap(), None);
@@ -2133,6 +2166,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
         };
         assert_eq!(target_for(&state, &None).unwrap(), "node-a:7600");
@@ -2166,6 +2200,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
         };
         let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
@@ -2177,6 +2212,7 @@ mod tests {
         // With the flag the first forwarded hop owns the bucket.
         let trusted = WebState {
             trust_proxy: true,
+            secure_cookie: false,
             ..state
         };
         assert_eq!(lockout_key(&trusted, &headers, peer), client);
@@ -2197,6 +2233,7 @@ mod tests {
             sync_log: querylog::SyncLog::new(1),
             auth: None,
             trust_proxy: false,
+            secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
         });
         let res = build_router(state)

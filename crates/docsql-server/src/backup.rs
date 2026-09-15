@@ -210,7 +210,7 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     let name = format!("backup-{}.sql", next_stamp(&state.backup_dir, now_ms()));
     std::fs::create_dir_all(&state.backup_dir).map_err(|e| format!("backup dir: {e}"))?;
     let tmp = state.backup_dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, script.as_bytes()).map_err(|e| format!("backup write: {e}"))?;
+    write_private(&tmp, script.as_bytes()).map_err(|e| format!("backup write: {e}"))?;
     std::fs::rename(&tmp, state.backup_dir.join(&name))
         .map_err(|e| format!("backup rename: {e}"))?;
     // Integrity sidecar (sha256sum format: "<hex>  <name>"), written
@@ -220,14 +220,36 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     let digest = docsql_core::kdf::sha256(script.as_bytes());
     let sidecar = state.backup_dir.join(format!("{name}.sha256"));
     let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
-    std::fs::write(
+    write_private(
         &tmp,
-        format!("{}  {}\n", docsql_core::kdf::hex(&digest), name),
+        format!("{}  {}\n", docsql_core::kdf::hex(&digest), name).as_bytes(),
     )
     .map_err(|e| format!("backup checksum write: {e}"))?;
     std::fs::rename(&tmp, sidecar).map_err(|e| format!("backup checksum rename: {e}"))?;
     prune_backups(&state.backup_dir, state.backup_keep);
     Ok(name)
+}
+
+/// Write bytes with owner-only permissions. A backup is the entire
+/// database — documents plus the PBKDF2 password hashes — in plain SQL;
+/// the default 0644 made it readable by every local account.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 /// Verify a backup file against its `.sha256` sidecar (sha256sum format).
@@ -322,6 +344,15 @@ pub(crate) async fn handle_backup(
     };
     match action.as_str() {
         "list" => {
+            // The listing names every snapshot of the whole database (and
+            // the status payload carries the backup directory): admin rule,
+            // same as trigger/restore below.
+            if user.is_some_and(|u| !u.grants.admin) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("backup listing requires the admin role"),
+                );
+            }
             let payload = backup_payload(state);
             Frame::new(proto::RESP_BACKUP, payload)
         }

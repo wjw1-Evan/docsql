@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### 全库安全审查修复批次(2026-09-15)
+
+#### 修复
+
+- **prepared statements 绕过只读与匿名门**:`REQ_EXECUTE` 不在帧级只读门的帧类型
+  白名单里,只读 token 可以先 `REQ_PREPARE` 一条写语句再执行;匿名连接同理。现在
+  `REQ_EXECUTE` 按模板语句分类走与 `REQ_SQL` 相同的门,并进入匿名门帧列表;
+- **写语句的读源表不做授权**:`INSERT … SELECT` 的源表、`UPDATE` 赋值子查询、聚合
+  `FILTER (WHERE …)` 子查询、`MERGE WHEN` 谓词与 CTAS/CREATE VIEW 源查询此前都不进
+  读目标分类——持有任意表写授权的用户可以把 `docsql_users` 口令哈希复制进自己的表
+  再读回。`stmt_read_targets` 补齐上述形状,服务端对写语句同样施加读授权;
+- **用户连接经复制帧剥离授权**:用户登录连接发送带 `FLAG_REPLICATION` 的 `REQ_SQL`
+  时,执行侧用户身份曾被置空(语句以 token 级权限执行);现在用户身份全程保留,
+  授权照常生效。`REQ_HOLD`/`REQ_SYNC`/`REQ_DIGEST`/`REQ_CATCHUP`/`REQ_RELEASE`/
+  `REQ_SQL_SEQ` 六个节点专属帧同时拒绝用户登录与只读 token(peer 不受影响);
+- **审计日志与运维面收敛**:`docsql_log` 视图与 `REQ_LOGS`(语句级审计,仅密码字面量
+  脱敏)、`REQ_STATUS`/`REQ_META`(拓扑/路径/全目录结构)与备份清单对非 admin 数据库
+  用户一律拒绝;web 控制台 `/api/auth/status` 未认证时不再返回账号用户名;
+- **两处单语句进程 abort(DoS)**:`SELECT LPAD('a', 2^62)` 经无界 `with_capacity`
+  直接 abort 引擎;三个 12 元素 `CUBE` 的 GROUPING SETS 笛卡尔积同样打穿分配器。
+  分别加上界(LPAD ≤ 1 Mi 字符、分组集 ≤ 16384)并在聚合路径接入语句超时采样;
+- **复制可注入超界口令哈希**:存储型凭据此前接受任意 PBKDF2 迭代数与盐长,被入侵的
+  peer 可以植入 `iterations = 2^32-1` 的用户,让每次登录烧数十亿轮 HMAC。存储格式
+  现在上界校验(迭代 ≤ 200 万、盐 ≤ 64 字节),越界条目验证直接拒绝;新建凭据迭代数
+  60 000 → 210 000(旧条目按格式内嵌值继续可验证);
+- **字典视图泄漏内部表**:`sqlite_master` 与 `information_schema` 此前列出引擎系统表
+  与用户/角色存储表(存在性/形状),现在与对象树同一过滤(`is_internal_table`);
+  引擎层同时拒绝 `CREATE TABLE` 抢注系统表名(此前只有服务端网关拦截);
+- **备份文件 0600**:备份是整库明文 SQL(含口令哈希),落盘从默认 0644 收紧为属主
+  可读;web 控制台会话 cookie 在原生 TLS 下自动附加 `Secure`;
+- **CLI**:未知 `-` 参数此前被静默当作数据库路径(`docsql --help` 会在当前目录创建
+  名为 `--help` 的库与 WAL),现在报错退出并新增 `-h/--help`;交互式密码输入关闭
+  终端回显;
+- **EF Core 提供程序**:SchemaSync 标识符引用补内嵌双引号转义;唯一索引漂移判断从
+  子串 `Contains("UNIQUE")` 收紧为 DDL `CREATE UNIQUE INDEX` 前缀(索引名含
+  UNIQUE 字样的普通索引不再误判)。
+
 ### 复制快照与 WAL 恢复健壮性修复(2026-09-15)
 
 #### 修复

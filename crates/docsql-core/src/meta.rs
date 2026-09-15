@@ -258,8 +258,7 @@ mod tests {
     fn meta_hides_pubsub_backing_table() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = Database::open(&dir.path().join("m.db")).unwrap();
-        d.execute("CREATE TABLE _pubsub_messages (payload TEXT)")
-            .unwrap();
+        d.ensure_pubsub_table().unwrap();
         let v = build_meta(&mut d, &dir.path().join("m.db"), Instant::now(), "1.0");
         match &v {
             Value::Object(o) => match o.get("tables") {

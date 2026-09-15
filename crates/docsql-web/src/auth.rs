@@ -22,8 +22,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const MIN_PASSWORD_LEN: usize = 8;
-/// PBKDF2 iterations (OWASP 2023 recommendation for PBKDF2-HMAC-SHA256).
-pub const PBKDF2_ITERATIONS: u32 = 60_000;
+/// PBKDF2 iterations — kept in step with the server's database-user
+/// hashing (`docsql_core::kdf::PBKDF2_ITERATIONS`); runs at login on the
+/// blocking pool, so a human-facing latency of tens of milliseconds is
+/// the ceiling.
+pub const PBKDF2_ITERATIONS: u32 = docsql_core::kdf::PBKDF2_ITERATIONS;
 /// Login lockout, mirroring the server's REQ_AUTH behavior.
 pub const LOCK_THRESHOLD: usize = 10;
 pub const LOCK_WINDOW: Duration = Duration::from_secs(60);
@@ -253,8 +256,9 @@ fn parse_creds(bytes: &[u8]) -> Result<Creds, String> {
         .map_err(|_| "corrupt credential file: hash len")?;
     let iterations = v["iterations"].as_u64().unwrap_or(PBKDF2_ITERATIONS as u64) as u32;
     // A hand-edited 0 would hit pbkdf2_hmac_sha256's assert and panic the
-    // login handler on every attempt — corrupt like any other tampering.
-    if iterations < 1 {
+    // login handler on every attempt; an astronomic value would turn each
+    // login into a CPU burn — both are corrupt like any other tampering.
+    if !(1..=docsql_core::kdf::MAX_PBKDF2_ITERATIONS).contains(&iterations) {
         return Err("corrupt credential file: iterations".into());
     }
     Ok(Creds {

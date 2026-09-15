@@ -11,7 +11,8 @@ set -euo pipefail
 
 LINE_MIN="${DOCSQL_COV_LINE_MIN:-85}"
 FUNC_MIN="${DOCSQL_COV_FUNC_MIN:-80}"
-LCOV="/tmp/docsql-lcov.txt"
+LCOV="$(mktemp "${TMPDIR:-/tmp}/docsql-lcov.XXXXXX")"
+trap 'rm -f "$LCOV"' EXIT
 
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
   echo "coverage: installing cargo-llvm-cov (rustup llvm-tools-preview + cargo install)..."

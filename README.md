@@ -119,7 +119,7 @@ INSERT INTO orders (id, note)
 
 ## 测试
 
-- Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(604 项,亦在本地 Docker 构建内作为门禁执行)
+- Rust:单元 + SQL 集成 + 协议 + 端到端 + 复制故障转移 + 发布订阅(pub/sub 实时/回放/续传/trim/跨节点)+ 批处理/目录元数据(622 项,亦在本地 Docker 构建内作为门禁执行)
 - Docker:compose 双 profile 部署测试全绿——多节点 81 项(3 节点对等集群:任意节点写入/多向 SQL 复制/事务回滚/一致性收敛/GUID 主键跨节点收敛/Web 控制台 + 集群状态探测/跨节点 pub/sub 与重启回放/节点离线再上线自动补齐/网络分区与重启收敛/新节点加入自动同步)+ 单节点 34 项(SQL 读写/事务回滚/容器重启持久性/GUID 主键生成与重启续用/与集群隔离/Web 控制台/pub/sub 实时与重启回放/自动备份与恢复演练)
 - .NET:xUnit(ADO.NET Client 96 项 + EF Core 45 项 + Aspire 集成 12 项:CRUD/LINQ/Include/Savepoint/集群/加密传输/pub/sub/认证契约/事务回滚/参数类型(含 DECIMAL/BLOB/DateOnly/TimeOnly)与长语句契约/复合索引/资源模型快照与 DI 注册)
 - CI(GitHub Actions,push/PR 触发):`cargo fmt` + `cargo clippy -D warnings` + `cargo test` + `dotnet test`(含按 GitHub Packages 发布包构建 Aspire 示例)全过 → 构建镜像 → main 分支另跑同一套部署测试(81 + 34 项)
@@ -198,7 +198,7 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 
 **登录方式**:
 
-- 协议帧 `REQ_AUTH_USER`(JSON `{"user","password"}`);密码以盐化 PBKDF2-HMAC-SHA256(60000 轮)存储,校验常数时间;未知用户与错误密码返回同一错误并执行等价计算(防用户名枚举);失败同样按来源 IP 锁定(10 次/60 秒)。
+- 协议帧 `REQ_AUTH_USER`(JSON `{"user","password"}`);密码以盐化 PBKDF2-HMAC-SHA256(210000 轮)存储,校验常数时间;未知用户与错误密码返回同一错误并执行等价计算(防用户名枚举);失败同样按来源 IP 锁定(10 次/60 秒)。
 - ADO.NET 连接串:`host=...;port=...;user=analyst;password=...`(与 `token=` 二选一,同时给出时用户登录优先);EF Core `UseDocsql("...")` 同一连接串。
 - CLI:`docsql-cli connect 127.0.0.1:7600 --user analyst`(密码从 `DOCSQL_PASSWORD` 或交互提示读取,不走命令行参数)。
 
