@@ -28,11 +28,21 @@ const INTERNAL: u8 = 2;
 const HALF_PAGE: usize = PAGE_SIZE / 2;
 
 /// Serialized node size — `header` is 3 (leaf) or 7 (internal), `payload`
-/// the per-cell locator width (8 or 4).
-fn node_bytes<T>(cells: &[(Value, T)], header: usize, payload: usize) -> Result<usize> {
+/// the per-cell locator width (8 or 4). `scratch` is a caller-owned reuse
+/// buffer: key bytes are encoded into it (cleared per key) instead of a
+/// fresh `Vec` per key — an insert used to re-encode every key of the node
+/// just to test page fit.
+fn node_bytes<T>(
+    cells: &[(Value, T)],
+    header: usize,
+    payload: usize,
+    scratch: &mut Vec<u8>,
+) -> Result<usize> {
     let mut n = header;
     for (k, _) in cells {
-        n += 2 + encode::encode_to_vec(k)?.len() + payload;
+        scratch.clear();
+        encode::encode(k, scratch)?;
+        n += 2 + scratch.len() + payload;
     }
     Ok(n)
 }
@@ -50,12 +60,15 @@ fn split_at_for_insert<T>(
     at: usize,
     header: usize,
     payload: usize,
+    scratch: &mut Vec<u8>,
 ) -> Result<usize> {
     let mut prefix = Vec::with_capacity(cells.len() + 1);
     prefix.push(header);
     for (k, _) in cells {
+        scratch.clear();
+        encode::encode(k, scratch)?;
         let last = *prefix.last().unwrap();
-        prefix.push(last + 2 + encode::encode_to_vec(k)?.len() + payload);
+        prefix.push(last + 2 + scratch.len() + payload);
     }
     let total = *prefix.last().unwrap();
     debug_assert!(total > PAGE_SIZE, "only overflowing nodes split");
@@ -150,6 +163,9 @@ pub struct BTree {
 struct Ctx<'a> {
     pager: &'a Pager,
     tx: &'a mut Tx,
+    /// Reuse buffer for key encoding during size probes (`node_bytes`,
+    /// `split_at_for_insert`) — never outlives a call.
+    scratch: Vec<u8>,
 }
 
 impl BTree {
@@ -271,10 +287,18 @@ impl BTree {
 
     fn get_at(reader: &PageReader, tx: &Tx, id: u32, key: &Value) -> Result<Option<u64>> {
         match Self::read_node(reader, tx, id)? {
-            Node::Leaf { cells } => Ok(cells
-                .iter()
-                .find(|(k, _)| Value::cmp_values(k, key) == Ordering::Equal)
-                .map(|(_, v)| *v)),
+            // Leaves are kept sorted by cmp_values (insert uses
+            // partition_point), so the first key >= `key` decides.
+            Node::Leaf { cells } => {
+                let i = cells.partition_point(|(k, _)| Value::cmp_values(k, key) == Ordering::Less);
+                Ok(
+                    if i < cells.len() && Value::cmp_values(&cells[i].0, key) == Ordering::Equal {
+                        Some(cells[i].1)
+                    } else {
+                        None
+                    },
+                )
+            }
             Node::Internal { leftmost, cells } => {
                 for child in candidate_children(&cells, leftmost, key) {
                     if let Some(v) = Self::get_at(reader, tx, child, key)? {
@@ -295,7 +319,11 @@ impl BTree {
         val: u64,
         unique: bool,
     ) -> Result<()> {
-        let mut ctx = Ctx { pager, tx };
+        let mut ctx = Ctx {
+            pager,
+            tx,
+            scratch: Vec::new(),
+        };
         if let Some((mid, right)) = Self::insert_rec(&mut ctx, self.root, &key, val, unique)? {
             // Grow a new root above the split pair.
             let old_root = self.root;
@@ -328,16 +356,20 @@ impl BTree {
                 if unique && at > 0 && Value::cmp_values(&cells[at - 1].0, key) == Ordering::Equal {
                     return Err(BTreeError::Duplicate);
                 }
-                let kb = encode::encode_to_vec(key)?;
-                if 2 + kb.len() + 8 > HALF_PAGE {
-                    return Err(BTreeError::KeyTooLarge(kb.len()));
+                let kb_len = {
+                    ctx.scratch.clear();
+                    encode::encode(key, &mut ctx.scratch)?;
+                    ctx.scratch.len()
+                };
+                if 2 + kb_len + 8 > HALF_PAGE {
+                    return Err(BTreeError::KeyTooLarge(kb_len));
                 }
                 cells.insert(at, (key.clone(), val));
-                if node_bytes(&cells, 3, 8)? <= PAGE_SIZE {
+                if node_bytes(&cells, 3, 8, &mut ctx.scratch)? <= PAGE_SIZE {
                     Self::write_node(ctx.pager, ctx.tx, id, &Node::Leaf { cells })?;
                     Ok(None)
                 } else {
-                    let m = split_at_for_insert(&cells, at, 3, 8)?;
+                    let m = split_at_for_insert(&cells, at, 3, 8, &mut ctx.scratch)?;
                     let mid_key = cells[m].0.clone();
                     let right_cells = cells.split_off(m);
                     let right = ctx.pager.allocate_page(ctx.tx)?;
@@ -360,12 +392,16 @@ impl BTree {
                     // split into parents); binary_search would panic on Ok.
                     let at = cells
                         .partition_point(|(k, _)| Value::cmp_values(k, &mid) != Ordering::Greater);
-                    let mb = encode::encode_to_vec(&mid)?;
-                    if 2 + mb.len() + 4 > HALF_PAGE {
-                        return Err(BTreeError::KeyTooLarge(mb.len()));
+                    let mb_len = {
+                        ctx.scratch.clear();
+                        encode::encode(&mid, &mut ctx.scratch)?;
+                        ctx.scratch.len()
+                    };
+                    if 2 + mb_len + 4 > HALF_PAGE {
+                        return Err(BTreeError::KeyTooLarge(mb_len));
                     }
                     cells.insert(at, (mid, right));
-                    if node_bytes(&cells, 7, 4)? <= PAGE_SIZE {
+                    if node_bytes(&cells, 7, 4, &mut ctx.scratch)? <= PAGE_SIZE {
                         Self::write_node(
                             ctx.pager,
                             ctx.tx,
@@ -374,7 +410,7 @@ impl BTree {
                         )?;
                         Ok(None)
                     } else {
-                        let m = split_at_for_insert(&cells, at, 7, 4)?;
+                        let m = split_at_for_insert(&cells, at, 7, 4, &mut ctx.scratch)?;
                         let mid_key = cells[m].0.clone();
                         let right_cells = cells.split_off(m);
                         let new_leftmost = right_cells[0].1;
@@ -530,15 +566,29 @@ impl BTree {
             Value,
             u64,
         )>| {
-            // binary_search lands on *an* equal key; equal keys may not be
-            // contiguous after interleaved updates, so scan the whole leaf.
-            for i in 0..cells.len() {
-                if Value::cmp_values(&cells[i].0, key) == Ordering::Equal && cells[i].1 == loc {
-                    cells.remove(i);
-                    return true;
+            // Cells are sorted by cmp_values (insert maintains the order;
+            // `delete` above already relies on binary search over them), so
+            // equal keys form one contiguous run: land on it with
+            // binary_search, then scan only that run for the locator — the
+            // old full-leaf scan was O(cells) on every index-entry removal.
+            match cells.binary_search_by(|(k, _)| Value::cmp_values(k, key)) {
+                Err(_) => false,
+                Ok(mut i) => {
+                    while i > 0 && Value::cmp_values(&cells[i - 1].0, key) == Ordering::Equal {
+                        i -= 1;
+                    }
+                    let mut j = i;
+                    while j < cells.len() && Value::cmp_values(&cells[j].0, key) == Ordering::Equal
+                    {
+                        if cells[j].1 == loc {
+                            cells.remove(j);
+                            return true;
+                        }
+                        j += 1;
+                    }
+                    false
                 }
             }
-            false
         })
     }
 

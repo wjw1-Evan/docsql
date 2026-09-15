@@ -249,17 +249,70 @@ fn spawn_checkpoint_thread(
 
 struct Page {
     data: Vec<u8>,
+    /// Ticket at the page's last touch. Queue entries whose ticket no
+    /// longer matches the page's current one are stale re-pushes.
+    ticket: u64,
 }
 
 /// Buffer pool state guarded by `Pager.pool`'s mutex.
 #[derive(Default)]
 struct PoolState {
     map: HashMap<u32, Page>,
-    order: std::collections::VecDeque<u32>, // FIFO eviction track
+    /// (page, ticket) history in arrival order: every hit re-tickets the
+    /// page and appends, so the live tail of the queue is recency order —
+    /// LRU eviction (FIFO let a cyclic working set slightly larger than
+    /// the pool evict its own hot pages every pass). Stale entries drain
+    /// lazily at eviction/compaction.
+    order: std::collections::VecDeque<(u32, u64)>,
+    ticket: u64,
+}
+
+impl PoolState {
+    /// Promote `id` to most-recently-used and copy its image out.
+    fn touch(&mut self, id: u32) -> Option<Vec<u8>> {
+        let data = {
+            let p = self.map.get_mut(&id)?;
+            self.ticket += 1;
+            p.ticket = self.ticket;
+            self.order.push_back((id, self.ticket));
+            p.data.clone()
+        };
+        self.compact_if_needed();
+        Some(data)
+    }
+
+    /// Cap the history queue by dropping entries that no longer name the
+    /// page's current ticket. Amortized O(1) per push.
+    fn compact_if_needed(&mut self) {
+        if self.order.len() < self.map.len() * 2 + 64 {
+            return;
+        }
+        self.order
+            .retain(|(id, t)| self.map.get(id).is_some_and(|p| p.ticket == *t));
+    }
+
+    /// Evict the least-recently-used live page, skipping stale queue
+    /// entries; false when the queue is drained.
+    fn evict_one(&mut self) -> bool {
+        while let Some((id, t)) = self.order.pop_front() {
+            if self.map.get(&id).is_some_and(|p| p.ticket == t) {
+                self.map.remove(&id);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Promote a pooled page to most-recently-used and copy its image out
+/// (`None` when not pooled). The pool guard lives only inside this call so
+/// readers never hold the pool lock across file IO.
+fn pool_touch(pager: &Pager, id: u32) -> Option<Vec<u8>> {
+    lock(&pager.pool).touch(id)
 }
 
 /// The 16-byte data-file header (`magic | page_size | num_pages`), shared by
@@ -428,8 +481,8 @@ impl Pager {
         if id == 0 {
             return Err(PagerError::OutOfRange(0, self.num_pages()));
         }
-        if let Some(p) = lock(&self.pool).map.get(&id) {
-            return Ok(p.data.clone());
+        if let Some(data) = pool_touch(self, id) {
+            return Ok(data);
         }
         if id >= self.num_pages() {
             return Err(PagerError::OutOfRange(id, self.num_pages()));
@@ -454,24 +507,19 @@ impl Pager {
         // lock is held the pending verdict cannot race a commit, and a newer
         // committed image in pending wins over the possibly-stale file copy.
         let mut st = lock(&self.pool);
-        if let Some(p) = st.map.get(&id) {
-            return Ok(p.data.clone());
+        if let Some(data) = st.touch(id) {
+            return Ok(data);
         }
         let data = match (lock(&self.pending_writes).get(&id).cloned(), file_img) {
             (Some(p), _) => p,
             (None, Some(f)) => f,
             (None, None) => return Err(file_err.expect("one of the two is set").into()),
         };
-        while st.map.len() >= self.max_pool {
-            match st.order.pop_front() {
-                Some(old) => {
-                    st.map.remove(&old);
-                }
-                None => break,
-            }
-        }
-        st.order.push_back(id);
-        st.map.insert(id, Page { data });
+        while st.map.len() >= self.max_pool && st.evict_one() {}
+        st.ticket += 1;
+        let ticket = st.ticket;
+        st.order.push_back((id, ticket));
+        st.map.insert(id, Page { data, ticket });
         Ok(st.map.get(&id).unwrap().data.clone())
     }
 

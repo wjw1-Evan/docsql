@@ -18,3 +18,9 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 rust_decimal = "1"
 num-traits = "0.2"
+
+# Cross-crate inlining for the parse/eval-heavy read path (SQL text to
+# rows); costs link time only.
+[profile.release]
+lto = "thin"
+codegen-units = 1

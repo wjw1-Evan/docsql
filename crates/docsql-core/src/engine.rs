@@ -185,12 +185,33 @@ pub enum TxControl {
 /// [`Database::execute_parsed`], while `tx`/`is_write` route the request
 /// (write path, transaction control, replication timing) without re-parsing
 /// the text.
+/// Process-wide parsed-statement cache (`SQL text → classified AST`).
+/// Bounded two ways: oversized statements never enter (a multi-MB batch
+/// INSERT would churn the map), and a full map clears wholesale — a
+/// workload with more distinct texts than the cap simply falls back to
+/// always-parse, the previous behavior. Errors are not cached.
+fn stmt_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, ParsedStatement>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ParsedStatement>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Second-sight filter behind the statement cache: hashes of texts that
+/// parsed once (cap-bounded, cleared wholesale). A repeat sighting promotes
+/// the text into the cache — see [`Database::parse_classified`].
+fn stmt_seen() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[derive(Clone)]
 pub struct ParsedStatement {
     pub stmt: AnyStmt,
     pub tx: TxControl,
     pub is_write: bool,
 }
-
 /// A parsed statement: standard SQL (`sqlparser` AST) or one of the
 /// hand-parsed user-management statements (sqlparser 0.62 does not accept
 /// `CREATE USER … PASSWORD` / `GRANT role TO user`). The SQL AST is boxed —
@@ -3233,7 +3254,59 @@ impl Database {
     /// (write path, transaction control) without re-parsing the text.
     /// User-management statements are hand-parsed first (sqlparser 0.62
     /// rejects their grammar) and always classify as writes.
+    ///
+    /// Results go through the process-wide statement cache: parsing is pure
+    /// syntax — nothing catalog- or connection-dependent — so entries never
+    /// go stale and no invalidation exists to get wrong. Every tier parses
+    /// through here (write path, MVCC read views, routing probes), so a
+    /// repeated point query skips the ~4 µs sqlparser pass.
     pub fn parse_classified(sql: &str) -> Result<ParsedStatement> {
+        const CACHE_MAX_SQL: usize = 4096;
+        const CACHE_ENTRIES: usize = 256;
+        const SEEN_CAP: usize = 1024;
+        let cacheable = sql.len() <= CACHE_MAX_SQL;
+        if cacheable {
+            let hit = stmt_cache()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(sql)
+                .cloned();
+            if let Some(parsed) = hit {
+                return Ok(parsed);
+            }
+        }
+        let parsed = Self::parse_classified_uncached(sql)?;
+        if cacheable {
+            // Second-sight gate: pay the cache-write cost (an AST clone)
+            // only for text seen before, so distinct-literal workloads —
+            // per-row generated lookups, rendered bindings — skip it. The
+            // u64 hash is a heuristic only: a false positive merely writes
+            // the cache early (the cache key is the exact text, so
+            // correctness never depends on the hash), a false negative
+            // just delays caching by one sight.
+            let mut seen = stmt_seen().lock().unwrap_or_else(|p| p.into_inner());
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            sql.hash(&mut hasher);
+            let h = hasher.finish();
+            if seen.contains(&h) {
+                drop(seen);
+                let mut cache = stmt_cache().lock().unwrap_or_else(|p| p.into_inner());
+                if cache.len() >= CACHE_ENTRIES {
+                    cache.clear();
+                }
+                cache.insert(sql.to_string(), parsed.clone());
+            } else {
+                if seen.len() >= SEEN_CAP {
+                    seen.clear();
+                }
+                seen.insert(h);
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// The uncached parse behind [`Self::parse_classified`].
+    fn parse_classified_uncached(sql: &str) -> Result<ParsedStatement> {
         match crate::useradmin::parse(sql) {
             Some(Ok(ua)) => {
                 return Ok(ParsedStatement {
@@ -4598,29 +4671,23 @@ impl Database {
             overflow_free: meta.overflow_free.clone(),
         };
         let mut roots = meta.index_roots.clone();
-        let idx_cols: Vec<String> = roots.keys().cloned().collect();
+        let idx_specs = idx_specs(&meta, &roots);
         let mut tx = self.pager.begin_tx();
         // Pass 1: drop every updated row's old index entries before any
         // replacement lands — a multi-row unique-key shift (SET id = id + 1,
         // key swaps between rows) must not collide with a not-yet-replaced
         // row's still-present old key.
         for (loc, old_doc, _) in &updates {
-            if let Err(e) = reindex_remove(
-                &self.pager,
-                &mut tx,
-                &meta,
-                &idx_cols,
-                &mut roots,
-                old_doc,
-                *loc,
-            ) {
+            if let Err(e) =
+                reindex_remove(&self.pager, &mut tx, &idx_specs, &mut roots, old_doc, *loc)
+            {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
             }
         }
         // Pass 2: apply the new images.
         for i in 0..updates.len() {
-            let (loc, _, new_doc) = updates[i].clone();
+            let (loc, new_doc) = (updates[i].0, updates[i].2.clone());
             let page = crate::heap::unpack_loc(loc).0;
             let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
             let out = heap.replace(&self.pager, &mut tx, loc, &new_doc)?;
@@ -4645,8 +4712,7 @@ impl Database {
                 if let Err(e) = reindex_repoint(
                     &self.pager,
                     &mut tx,
-                    &meta,
-                    &idx_cols,
+                    &idx_specs,
                     &mut roots,
                     &before,
                     *old_l,
@@ -4659,8 +4725,7 @@ impl Database {
             if let Err(e) = reindex_insert(
                 &self.pager,
                 &mut tx,
-                &meta,
-                &idx_cols,
+                &idx_specs,
                 &mut roots,
                 &new_doc,
                 out.placed,
@@ -4830,7 +4895,7 @@ impl Database {
             overflow_free: meta.overflow_free.clone(),
         };
         let mut roots = meta.index_roots.clone();
-        let idx_cols: Vec<String> = roots.keys().cloned().collect();
+        let idx_specs = idx_specs(&meta, &roots);
         let mut tx = self.pager.begin_tx();
         let affected: std::collections::BTreeSet<u32> = targets
             .iter()
@@ -4843,22 +4908,13 @@ impl Database {
         let locs: Vec<u64> = targets.iter().map(|(l, _)| *l).collect();
         let moves = heap.remove_many(&self.pager, &mut tx, &locs)?;
         for (loc, doc) in &targets {
-            reindex_remove(
-                &self.pager,
-                &mut tx,
-                &meta,
-                &idx_cols,
-                &mut roots,
-                doc,
-                *loc,
-            )?;
+            reindex_remove(&self.pager, &mut tx, &idx_specs, &mut roots, doc, *loc)?;
         }
         for (old_l, new_l) in &moves {
             reindex_repoint(
                 &self.pager,
                 &mut tx,
-                &meta,
-                &idx_cols,
+                &idx_specs,
                 &mut roots,
                 &before,
                 *old_l,
@@ -5616,6 +5672,10 @@ impl Database {
         };
         let mut guid_filled = autoguid_appended;
         let mut next_autoinc = self.autoinc_next_for(&table, &meta)?;
+        // DEFAULT texts parsed once per statement (was re-parsed by
+        // sqlparser for every row that omitted the column).
+        let mut default_exprs: std::collections::HashMap<String, SqlExpr> =
+            std::collections::HashMap::new();
         let mut new_docs: Vec<Object> = Vec::new();
         for row in rows {
             let mut row = row;
@@ -5654,11 +5714,19 @@ impl Database {
                 }
             }
             let mut doc: Object = columns.iter().cloned().zip(row).collect();
-            // DEFAULT: fill declared columns the INSERT omitted.
+            // DEFAULT: fill declared columns the INSERT omitted (parse once
+            // per statement; evaluation stays per row).
             for (col, text) in &meta.defaults {
                 if !doc.contains_key(col) {
-                    let e = parse_expr_text(text)?;
-                    doc.insert(col.clone(), eval_const(&e)?);
+                    let e = match default_exprs.get(col) {
+                        Some(e) => e,
+                        None => {
+                            let e = parse_expr_text(text)?;
+                            default_exprs.insert(col.clone(), e);
+                            default_exprs.get(col).expect("just inserted")
+                        }
+                    };
+                    doc.insert(col.clone(), eval_const(e)?);
                 }
             }
             meta.check(&doc)?;
@@ -5745,7 +5813,7 @@ impl Database {
         // Every indexed column (constraint trees + plain CREATE INDEX trees),
         // hoisted once so the per-row maintenance loops below do not clone
         // the roots map per row.
-        let idx_cols: Vec<String> = roots.keys().cloned().collect();
+        let idx_specs = idx_specs(&meta, &roots);
 
         // ON CONFLICT [target]: the target names one unique constraint whose
         // conflicts are skipped; without it every unique constraint takes
@@ -5765,6 +5833,11 @@ impl Database {
             },
             _ => None,
         };
+        // The targeted conflict root's column list, resolved once per
+        // statement (was a fresh `index_columns_of` allocation per row).
+        let scope_cols: Option<Vec<String>> = conflict_scope
+            .as_deref()
+            .map(|root| meta.index_columns_of(root));
 
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
@@ -5798,22 +5871,13 @@ impl Database {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
                     continue;
                 };
-                reindex_remove(
-                    &self.pager,
-                    &mut tx,
-                    &meta,
-                    &idx_cols,
-                    &mut roots,
-                    doc,
-                    *loc,
-                )?;
+                reindex_remove(&self.pager, &mut tx, &idx_specs, &mut roots, doc, *loc)?;
             }
             for (old_l, new_l) in &moves {
                 reindex_repoint(
                     &self.pager,
                     &mut tx,
-                    &meta,
-                    &idx_cols,
+                    &idx_specs,
                     &mut roots,
                     &before,
                     *old_l,
@@ -5848,11 +5912,11 @@ impl Database {
                     }
                     // Targeted: only this constraint's conflicts are skipped;
                     // a conflict on any other unique constraint still errors
-                    // (the insert below enforces it).
+                    // (the insert below enforces it). The constraint's column
+                    // list resolves once per statement, not per row.
                     Some(root) => {
-                        let cols = meta.index_columns_of(root);
-                        if let Some(key) = index_key_of(&doc, &cols) {
-                            if BTree::open(roots[root])
+                        if let Some(key) = index_key_of(&doc, scope_cols.as_deref().unwrap()) {
+                            if BTree::open(roots[root.as_str()])
                                 .get(&PageReader::current(&self.pager), &tx, &key)
                                 .map_err(|e| index_err(root, e))?
                                 .is_some()
@@ -5888,20 +5952,19 @@ impl Database {
             // Non-constraint CREATE INDEX trees. Composite unique trees
             // (CREATE UNIQUE INDEX over several columns) enforce their
             // duplicates right here, at tree-insert time.
-            for col in &idx_cols {
-                if indexed.contains(col) {
+            for spec in &idx_specs {
+                if indexed.contains(&spec.root_key) {
                     continue;
                 }
-                let cols = meta.index_columns_of(col);
-                let Some(v) = index_key_of(&doc, &cols) else {
+                let Some(v) = index_key_of(&doc, &spec.cols) else {
                     continue;
                 };
-                let root = roots[col.as_str()];
+                let root = roots[&spec.root_key];
                 let mut tree = BTree::open(root);
-                tree.insert(&self.pager, &mut tx, v, loc, meta.root_key_unique(col))
-                    .map_err(|e| index_err(col, e))?;
+                tree.insert(&self.pager, &mut tx, v, loc, spec.unique)
+                    .map_err(|e| index_err(&spec.root_key, e))?;
                 if tree.root != root {
-                    roots.insert(col.clone(), tree.root);
+                    roots.insert(spec.root_key.clone(), tree.root);
                 }
             }
             placed.push((loc, doc));
@@ -6142,29 +6205,23 @@ impl Database {
             overflow_free: meta.overflow_free.clone(),
         };
         let mut roots = meta.index_roots.clone();
-        let idx_cols: Vec<String> = roots.keys().cloned().collect();
+        let idx_specs = idx_specs(&meta, &roots);
         let mut tx = self.pager.begin_tx();
 
         // Pass 1: drop every matched row's old index entries before any
         // replacement lands (a multi-row key shift must not collide with a
         // not-yet-replaced row's still-present old key).
         for (loc, old_doc, _) in &updates {
-            if let Err(e) = reindex_remove(
-                &self.pager,
-                &mut tx,
-                &meta,
-                &idx_cols,
-                &mut roots,
-                old_doc,
-                *loc,
-            ) {
+            if let Err(e) =
+                reindex_remove(&self.pager, &mut tx, &idx_specs, &mut roots, old_doc, *loc)
+            {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
             }
         }
         // Pass 2: replace the matched rows, following in-page repacks.
         for i in 0..updates.len() {
-            let (loc, _, new_doc) = updates[i].clone();
+            let (loc, new_doc) = (updates[i].0, updates[i].2.clone());
             let page = crate::heap::unpack_loc(loc).0;
             let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
             let out = heap.replace(&self.pager, &mut tx, loc, &new_doc)?;
@@ -6182,8 +6239,7 @@ impl Database {
                 if let Err(e) = reindex_repoint(
                     &self.pager,
                     &mut tx,
-                    &meta,
-                    &idx_cols,
+                    &idx_specs,
                     &mut roots,
                     &before,
                     *old_l,
@@ -6196,8 +6252,7 @@ impl Database {
             if let Err(e) = reindex_insert(
                 &self.pager,
                 &mut tx,
-                &meta,
-                &idx_cols,
+                &idx_specs,
                 &mut roots,
                 &new_doc,
                 out.placed,
@@ -6223,15 +6278,7 @@ impl Database {
                 }
                 self.check_fks(&meta, &doc)?;
                 let loc = heap.insert(&self.pager, &mut tx, &doc)?;
-                reindex_insert(
-                    &self.pager,
-                    &mut tx,
-                    &meta,
-                    &idx_cols,
-                    &mut roots,
-                    &doc,
-                    loc,
-                )?;
+                reindex_insert(&self.pager, &mut tx, &idx_specs, &mut roots, &doc, loc)?;
                 inserted += 1;
             }
         }
@@ -7432,7 +7479,11 @@ fn expr_name(e: &SqlExpr) -> String {
 /// Encoded identity of a document (UPDATE ... FROM / DELETE ... USING match
 /// target rows by content).
 fn object_key(doc: &Object) -> Vec<u8> {
-    encode::encode_to_vec(&Value::Object(doc.clone())).unwrap_or_default()
+    let mut out = Vec::new();
+    match encode::encode_object(doc, &mut out) {
+        Ok(()) => out,
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Rebuild a target table's document from its qualified slice of a merged
@@ -9502,15 +9553,37 @@ fn mirror_op(op: &BinaryOperator) -> Option<BinaryOperator> {
     })
 }
 
+/// Per-tree maintenance spec, resolved once per statement: column list and
+/// uniqueness of one index root. Hoisted because the per-row maintenance
+/// loops used to re-resolve both through `index_columns_of` /
+/// `root_key_unique` — a linear `index_defs` scan plus a `Vec` clone — for
+/// every row of every tree.
+struct IdxSpec {
+    root_key: String,
+    cols: Vec<String>,
+    unique: bool,
+}
+
+/// Resolve [`IdxSpec`]s for every tree in `roots`, in root-key order
+/// (matches the previous per-row `roots.keys()` iteration order).
+fn idx_specs(meta: &TableMeta, roots: &std::collections::BTreeMap<String, u32>) -> Vec<IdxSpec> {
+    roots
+        .keys()
+        .map(|k| IdxSpec {
+            root_key: k.clone(),
+            cols: meta.index_columns_of(k),
+            unique: meta.root_key_unique(k),
+        })
+        .collect()
+}
+
 /// Re-point index entries after in-page slot moves: delete (key, old_loc)
 /// and insert (key, new_loc) in every tree. `before` holds the page's
 /// documents as they were before the mutation.
-#[allow(clippy::too_many_arguments)]
 fn reindex_repoint(
     pager: &Pager,
     tx: &mut crate::pager::Tx,
-    meta: &TableMeta,
-    root_keys: &[String],
+    specs: &[IdxSpec],
     roots: &mut std::collections::BTreeMap<String, u32>,
     before: &[(u64, Object)],
     old_l: u64,
@@ -9519,17 +9592,16 @@ fn reindex_repoint(
     let Some((_, doc)) = before.iter().find(|(l, _)| *l == old_l) else {
         return err("index fixup: moved document not found");
     };
-    for root_key in root_keys {
-        let cols = meta.index_columns_of(root_key);
-        if let Some(key) = index_key_of(doc, &cols) {
-            let root = roots[root_key];
+    for spec in specs {
+        if let Some(key) = index_key_of(doc, &spec.cols) {
+            let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
             tree.delete_entry(pager, tx, &key, old_l)
-                .map_err(|e| index_err(root_key, e))?;
-            tree.insert(pager, tx, key, new_l, meta.root_key_unique(root_key))
-                .map_err(|e| index_err(root_key, e))?;
+                .map_err(|e| index_err(&spec.root_key, e))?;
+            tree.insert(pager, tx, key, new_l, spec.unique)
+                .map_err(|e| index_err(&spec.root_key, e))?;
             if tree.root != root {
-                roots.insert(root_key.clone(), tree.root);
+                roots.insert(spec.root_key.clone(), tree.root);
             }
         }
     }
@@ -9559,26 +9631,24 @@ fn index_key_of(doc: &Object, cols: &[String]) -> Option<Value> {
     Some(Value::Array(key))
 }
 
-/// Remove one document's entries from every index tree (`root_keys` names
-/// the trees; column sets resolve through `index_columns_of`).
+/// Remove one document's entries from every index tree (`specs` carries the
+/// resolved column lists; see [`IdxSpec`]).
 fn reindex_remove(
     pager: &Pager,
     tx: &mut crate::pager::Tx,
-    meta: &TableMeta,
-    root_keys: &[String],
+    specs: &[IdxSpec],
     roots: &mut std::collections::BTreeMap<String, u32>,
     doc: &Object,
     loc: u64,
 ) -> Result<()> {
-    for root_key in root_keys {
-        let cols = meta.index_columns_of(root_key);
-        if let Some(key) = index_key_of(doc, &cols) {
-            let root = roots[root_key];
+    for spec in specs {
+        if let Some(key) = index_key_of(doc, &spec.cols) {
+            let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
             tree.delete_entry(pager, tx, &key, loc)
-                .map_err(|e| index_err(root_key, e))?;
+                .map_err(|e| index_err(&spec.root_key, e))?;
             if tree.root != root {
-                roots.insert(root_key.clone(), tree.root);
+                roots.insert(spec.root_key.clone(), tree.root);
             }
         }
     }
@@ -9586,26 +9656,24 @@ fn reindex_remove(
 }
 
 /// Insert one document's index entries (fast-path UPDATE pass 2). Uniqueness
-/// comes from the tree: `root_key_unique` trees (constraint columns and
+/// comes from the tree: `unique` trees (constraint columns and
 /// CREATE UNIQUE INDEX) reject duplicates at insert.
 fn reindex_insert(
     pager: &Pager,
     tx: &mut crate::pager::Tx,
-    meta: &TableMeta,
-    root_keys: &[String],
+    specs: &[IdxSpec],
     roots: &mut std::collections::BTreeMap<String, u32>,
     doc: &Object,
     loc: u64,
 ) -> Result<()> {
-    for root_key in root_keys {
-        let cols = meta.index_columns_of(root_key);
-        if let Some(key) = index_key_of(doc, &cols) {
-            let root = roots[root_key];
+    for spec in specs {
+        if let Some(key) = index_key_of(doc, &spec.cols) {
+            let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
-            tree.insert(pager, tx, key, loc, meta.root_key_unique(root_key))
-                .map_err(|e| index_err(root_key, e))?;
+            tree.insert(pager, tx, key, loc, spec.unique)
+                .map_err(|e| index_err(&spec.root_key, e))?;
             if tree.root != root {
-                roots.insert(root_key.clone(), tree.root);
+                roots.insert(spec.root_key.clone(), tree.root);
             }
         }
     }
@@ -9962,6 +10030,24 @@ fn union_of_fields(docs: &[Object]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_classified_cache_hits_and_bypasses() {
+        let a = Database::parse_classified("SELECT 1, 'x' FROM dual").unwrap();
+        let b = Database::parse_classified("SELECT 1, 'x' FROM dual").unwrap();
+        assert_eq!(a.is_write, b.is_write);
+        assert_eq!(a.tx, b.tx);
+        assert_eq!(format!("{:?}", a.stmt), format!("{:?}", b.stmt));
+        // Different text must not collide.
+        let c = Database::parse_classified("SELECT 2, 'x' FROM dual").unwrap();
+        assert_ne!(format!("{:?}", a.stmt), format!("{:?}", c.stmt));
+        // Oversized statements bypass the cache and still parse.
+        let big = format!("SELECT '{}'", "x".repeat(6000));
+        assert!(big.len() > 4096);
+        assert!(Database::parse_classified(&big).is_ok());
+        // Parse errors stay per-call (never cached).
+        assert!(Database::parse_classified("SELECT !").is_err());
+    }
 
     fn run(db: &mut Database, sql: &str) -> ExecOutcome {
         db.execute(sql)

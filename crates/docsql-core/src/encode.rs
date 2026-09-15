@@ -190,12 +190,13 @@ impl<'a> Decoder<'a> {
     }
 }
 
+fn put_u32(out: &mut Vec<u8>, v: usize) -> Result<(), EncodeError> {
+    let v = u32::try_from(v).map_err(|_| EncodeError::TooManyItems)?;
+    out.extend_from_slice(&v.to_le_bytes());
+    Ok(())
+}
+
 pub fn encode(value: &Value, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-    fn put_u32(out: &mut Vec<u8>, v: usize) -> Result<(), EncodeError> {
-        let v = u32::try_from(v).map_err(|_| EncodeError::TooManyItems)?;
-        out.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
     match value {
         Value::Null => out.push(0),
         Value::Bool(b) => {
@@ -248,6 +249,20 @@ pub fn encode_to_vec(value: &Value) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
     encode(value, &mut out)?;
     Ok(out)
+}
+
+/// Encode an object document directly — byte-identical to encoding
+/// `Value::Object(doc)` — without cloning the document into a `Value`
+/// first (`Heap::insert` used to deep-copy every field of every row here).
+pub fn encode_object(doc: &Object, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    out.push(7);
+    put_u32(out, doc.len())?;
+    for (k, v) in doc {
+        put_u32(out, k.len())?;
+        out.extend_from_slice(k.as_bytes());
+        encode(v, out)?;
+    }
+    Ok(())
 }
 
 /// Decode exactly one value; trailing bytes are an error.

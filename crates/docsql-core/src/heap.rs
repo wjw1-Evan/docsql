@@ -389,7 +389,8 @@ impl Heap {
     /// Documents larger than one page are laid out overflow-style (see the
     /// module docs). Returns the new document's locator.
     pub fn insert(&mut self, pager: &Pager, tx: &mut Tx, doc: &Object) -> Result<u64> {
-        let bytes = encode::encode_to_vec(&Value::Object(doc.clone()))?;
+        let mut bytes = Vec::new();
+        encode::encode_object(doc, &mut bytes)?;
         if bytes.len() > MAX_DOC_SIZE {
             return Err(HeapError::DocTooLarge(bytes.len(), MAX_DOC_SIZE));
         }
@@ -505,7 +506,8 @@ impl Heap {
         loc: u64,
         doc: &Object,
     ) -> Result<ReplaceOutcome> {
-        let bytes = encode::encode_to_vec(&Value::Object(doc.clone()))?;
+        let mut bytes = Vec::new();
+        encode::encode_object(doc, &mut bytes)?;
         if bytes.len() > MAX_DOC_SIZE {
             return Err(HeapError::DocTooLarge(bytes.len(), MAX_DOC_SIZE));
         }

@@ -91,11 +91,18 @@ fn write_value(out: &mut String, v: &Value) {
     }
 }
 
-/// Escape `s` for embedding inside a JSON string literal — the escaped
-/// body only, no surrounding quotes (for callers assembling JSON by hand).
-pub fn escape_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+/// Append the JSON-escaped body of `s` (no surrounding quotes) to `out`.
+/// The clean prefix up to the first escapable char goes in as one slice;
+/// escape_str used to build a fresh `String` per value, which put an
+/// allocation plus full copy on every string cell of every response row.
+fn push_escaped(out: &mut String, s: &str) {
+    let Some(first) = s.find(|c| matches!(c, '"' | '\\' | '\n' | '\r' | '\t') || (c as u32) < 0x20)
+    else {
+        out.push_str(s);
+        return;
+    };
+    out.push_str(&s[..first]);
+    for c in s[first..].chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -108,12 +115,19 @@ pub fn escape_str(s: &str) -> String {
             c => out.push(c),
         }
     }
+}
+
+/// Escape `s` for embedding inside a JSON string literal — the escaped
+/// body only, no surrounding quotes (for callers assembling JSON by hand).
+pub fn escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    push_escaped(&mut out, s);
     out
 }
 
 fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
-    out.push_str(&escape_str(s));
+    push_escaped(out, s);
     out.push('"');
 }
 
