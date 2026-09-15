@@ -1643,6 +1643,95 @@ async fn pubsub_resume_from_id_after_reconnect() {
     );
 }
 
+/// Large-backlog replay spans multiple server-side windows: 1200 persisted
+/// messages (a third of them on a channel that must be filtered out) reach
+/// an `earliest` subscriber exactly once and in id order even though the
+/// per-connection writer buffer truncates any single replay; resuming from
+/// the last seen id picks the stream back up (at-least-once), and live
+/// delivery continues after the backlog is drained.
+#[tokio::test]
+async fn pubsub_replay_backlog_resumes_across_windows() {
+    let (_dir, addr) = start_server(None).await;
+    let mut publisher = Client::connect(&addr).await;
+    const TOTAL: i64 = 1200;
+    for i in 1..=TOTAL {
+        let ch = if i % 3 == 0 { "noise" } else { "news" };
+        let r = publisher.publish(ch, &format!("m{i}")).await;
+        assert_eq!(r.frame_type, proto::RESP_ROWS);
+    }
+    let expected: Vec<String> = (1..=TOTAL)
+        .filter(|i| i % 3 != 0)
+        .map(|i| format!("m{i}"))
+        .collect();
+
+    // Drain across as many connections as the writer buffer truncation
+    // takes: each round replays a prefix, the next resumes from the last
+    // fully received id.
+    let mut got: Vec<(i64, String)> = Vec::new();
+    while got.len() < expected.len() {
+        let from = got.last().map(|(id, _)| *id).unwrap_or(0);
+        let before = got.len();
+        let mut sub = Client::connect(&addr).await;
+        let r = sub.subscribe("news", &from.to_string()).await;
+        assert_eq!(affected_u64(&r), 1);
+        while let Some(f) = recv_timeout(&mut sub, 1000).await {
+            let m: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            got.push((
+                m["id"].as_i64().unwrap(),
+                m["payload"].as_str().unwrap().into(),
+            ));
+        }
+        assert!(
+            got.len() > before,
+            "a resume round from id {from} must make progress"
+        );
+    }
+    let ids: Vec<i64> = got.iter().map(|(id, _)| *id).collect();
+    let payloads: Vec<String> = got.into_iter().map(|(_, p)| p).collect();
+    assert_eq!(payloads, expected, "filtered, ordered, no gap, no dup");
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "strictly id-ordered");
+
+    // Live delivery still works after the full backlog drained.
+    let mut sub = Client::connect(&addr).await;
+    sub.subscribe("news", "latest").await;
+    publisher.publish("news", "live-after-backlog").await;
+    let f = sub.recv().await;
+    let m: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+    assert_eq!(m["payload"], "live-after-backlog");
+}
+
+/// Replay of large payloads streams through byte-bounded windows: four
+/// 300 KB messages replay in full and in order (the adaptive window is
+/// ~1 MB, so this crosses several), and a `latest` subscriber on the same
+/// channel is untouched by the replay.
+#[tokio::test]
+async fn pubsub_replay_large_payloads_across_byte_bounded_windows() {
+    let (_dir, addr) = start_server(None).await;
+    let mut publisher = Client::connect(&addr).await;
+    let big = "x".repeat(300 * 1024);
+    for _ in 0..4 {
+        let r = publisher.publish("bulk", &big).await;
+        assert_eq!(r.frame_type, proto::RESP_ROWS);
+    }
+    let mut sub = Client::connect(&addr).await;
+    let r = sub.subscribe("bulk", "earliest").await;
+    assert_eq!(affected_u64(&r), 1);
+    for n in 0..4 {
+        let f = sub.recv().await;
+        let m: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+        assert_eq!(m["channel"], "bulk");
+        assert_eq!(
+            m["payload"].as_str().map(str::len),
+            Some(300 * 1024),
+            "frame {n}: full payload intact"
+        );
+    }
+    assert!(
+        recv_timeout(&mut sub, 300).await.is_none(),
+        "replay stops at the watermark"
+    );
+}
+
 /// PUBSUB introspection and unsubscribe bookkeeping.
 #[tokio::test]
 async fn pubsub_unsubscribe_and_introspection() {

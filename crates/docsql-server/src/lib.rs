@@ -88,6 +88,10 @@ pub struct ServerState {
     /// AUTH_LOCKOUT and further AUTH attempts are rejected unread.
     pub auth_failures:
         tokio::sync::Mutex<std::collections::HashMap<String, Vec<std::time::Instant>>>,
+    /// Server-wide PBKDF2 concurrency gate: password verification runs on
+    /// the blocking pool, and unbounded concurrent derivations would let
+    /// distributed auth floods starve every other blocking task.
+    pub auth_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// Live connection budget (resource control). Acquired per accepted
     /// connection, released on close; None = unlimited.
     pub conn_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -226,6 +230,26 @@ pub const FLAG_REPLICATION: u16 = 0x0002;
 /// loss window on power failure).
 const ASYNC_COMMIT_INTERVAL_MS: u64 = 2;
 
+/// Pre-auth frame deadline: a connection that has not completed AUTH must
+/// not hold its task and read buffer open forever (slowloris). Generous
+/// enough for a human at an interactive password prompt. Token-less
+/// deployments (auth disabled) start connections as authenticated clients
+/// and are unaffected — that mode's boundary is the network itself.
+const PRE_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Concurrent PBKDF2 derivations server-wide (REQ_AUTH_USER verifications
+/// and unknown-user decoy burns). Excess attempts queue on this gate
+/// instead of pinning the blocking pool — a distributed password-spray
+/// must not turn every login into CPU contention for everyone.
+const AUTH_DERIVE_CONCURRENCY: usize = 8;
+
+/// Join-window queue budget: acknowledged-but-not-yet-applied replication
+/// writes during bootstrap. Past it, acks are REFUSED — the origin sees a
+/// failed fan-out leg and convergence degrades to the documented digest →
+/// snapshot path — instead of one long window pinning unbounded memory.
+const MAX_SYNC_QUEUE_ENTRIES: usize = 200_000;
+const MAX_SYNC_QUEUE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Prepared-statement budget per connection. The client never sends
 /// REQ_CLOSE_STMT today, so the map grows for the life of a pooled
 /// connection — without a cap, one connection pins unbounded server
@@ -252,6 +276,9 @@ pub struct QueuedWrite {
 pub struct SyncGate {
     /// Replication writes acknowledged but not yet applied.
     pub pending: Vec<QueuedWrite>,
+    /// Sum of `pending[*].sql.len()` — the budget feed for
+    /// MAX_SYNC_QUEUE_BYTES, maintained by every mutation site.
+    pub pending_bytes: usize,
     /// True once bootstrap concluded: no more queuing, direct applies.
     pub closed: bool,
 }
@@ -405,6 +432,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         read_token: cfg.read_token,
         cluster_token: cfg.cluster_token,
         auth_failures: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        auth_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(AUTH_DERIVE_CONCURRENCY)),
         conn_slots: (cfg.max_conn > 0)
             .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.max_conn))),
         auth_lock_threshold: cfg.auth_lock_threshold,
@@ -421,6 +449,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         next_hold_id: std::sync::atomic::AtomicU64::new(1),
         sync_queue: tokio::sync::Mutex::new(SyncGate {
             pending: Vec::new(),
+            pending_bytes: 0,
             closed: !peers_configured,
         }),
         advertise: cfg.advertise.clone(),
@@ -476,6 +505,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                 let mut gate = st.sync_queue.lock().await;
                 let n = gate.pending.len();
                 gate.pending = Vec::new();
+                gate.pending_bytes = 0;
                 gate.closed = true;
                 // Acknowledged writes that will never be applied: keep the
                 // divergence observable in REQ_STATUS like any other
@@ -624,7 +654,7 @@ fn set_tcp_keepalive(s: TcpStream) -> TcpStream {
 /// True when `peer` resolves to a loopback address on the port we listen on
 /// (or is literally the listen address): forwarding there would loop back.
 fn is_self_peer(listen: &str, peer: &str) -> bool {
-    if listen == peer {
+    if listen.eq_ignore_ascii_case(peer) {
         return true;
     }
     use std::net::ToSocketAddrs;
@@ -634,11 +664,25 @@ fn is_self_peer(listen: &str, peer: &str) -> bool {
     else {
         return false;
     };
-    match peer.to_socket_addrs() {
-        Ok(addrs) => addrs
-            .collect::<Vec<_>>()
-            .iter()
-            .any(|a| a.port() == port && a.ip().is_loopback()),
+    let peer_addrs = match peer.to_socket_addrs() {
+        Ok(a) => a.collect::<Vec<_>>(),
+        Err(_) => return false,
+    };
+    // A loopback advertisement with our listen port is us; so is any
+    // address that resolves to the same socket as our own listen address
+    // (the joiner advertising its LAN IP while listen says 0.0.0.0 must
+    // not register itself as its own peer and double-apply its writes).
+    if peer_addrs
+        .iter()
+        .any(|a| a.port() == port && a.ip().is_loopback())
+    {
+        return true;
+    }
+    match listen.to_socket_addrs() {
+        Ok(ls) => {
+            let lset: std::collections::HashSet<_> = ls.collect();
+            peer_addrs.iter().any(|a| lset.contains(a))
+        }
         Err(_) => false,
     }
 }
@@ -765,6 +809,15 @@ async fn user_login_frame(
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         db.user_stored_pw(&name)
     };
+    // Server-wide derivation gate: verification is CPU-bound on the
+    // blocking pool; queuing excess attempts keeps a distributed auth
+    // flood from starving every other blocking task.
+    let permit = state
+        .auth_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("auth gate never closed");
     let ok = tokio::task::spawn_blocking(move || match stored {
         Some(s) => docsql_core::kdf::StoredPw::parse(&s)
             .map(|p| p.verify(&pw))
@@ -779,6 +832,7 @@ async fn user_login_frame(
     })
     .await
     .unwrap_or(false);
+    drop(permit);
     if !ok {
         record_auth_failure(state, source_ip).await;
         querylog::sync_event(
@@ -832,7 +886,12 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
         buf: Vec::new(),
         metrics: state.metrics.clone(),
     };
-    let (tx, mut rx) = mpsc::channel::<Frame>(256);
+    // Depth 32, not the historical 256: large frames (4 MB dump/catch-up
+    // chunks) queued behind a stalled socket used to buffer up to
+    // 256 × 4 MB ≈ 1 GB per connection before the writer's 10 s stall
+    // timeout tore it down. 32 keeps the same streaming throughput while
+    // bounding the buffer.
+    let (tx, mut rx) = mpsc::channel::<Frame>(32);
     let key = state.transport_key;
     let wmetrics = state.metrics.clone();
 
@@ -902,20 +961,38 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let result = async {
         loop {
             let read = conn.read_frame();
-            let frame = match state.idle_timeout {
-                Some(t) => match tokio::time::timeout(t, read).await {
+            let frame = if role == ConnRole::Unauthed {
+                // Pre-auth budget: an unauthenticated socket gets one
+                // bounded window to say AUTH — it must not pin its task
+                // and read buffer indefinitely.
+                match tokio::time::timeout(PRE_AUTH_TIMEOUT, read).await {
                     Ok(f) => f?,
                     Err(_) => {
                         let _ = tx
                             .send(Frame::new(
                                 proto::RESP_ERROR,
-                                err_payload("idle session timed out; reconnect"),
+                                err_payload("authentication timeout; reconnect"),
                             ))
                             .await;
                         break;
                     }
-                },
-                None => read.await?,
+                }
+            } else {
+                match state.idle_timeout {
+                    Some(t) => match tokio::time::timeout(t, read).await {
+                        Ok(f) => f?,
+                        Err(_) => {
+                            let _ = tx
+                                .send(Frame::new(
+                                    proto::RESP_ERROR,
+                                    err_payload("idle session timed out; reconnect"),
+                                ))
+                                .await;
+                            break;
+                        }
+                    },
+                    None => read.await?,
+                }
             };
             let Some(mut frame) = frame else { break };
             if state.auth_lock_threshold > 0 {
@@ -2983,14 +3060,12 @@ async fn handle_subscribe(
     };
     let mut inner = state.pubsub.lock().await;
     let count = inner.register(conn, kind, &name, tx.clone());
-    // Snapshot and history fetch under the same registry hold: publishes
-    // committing after this point notify this subscription live with
-    // id > watermark; earlier ones are covered by the replay below.
-    let (watermark, history) = {
+    // Watermark under the same registry hold: publishes committing after
+    // this point notify this subscription live with id > watermark;
+    // earlier ones are covered by the replay below.
+    let watermark = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-        let wm = pubsub::query_max_id(&mut db);
-        let hist = pubsub::query_history(&mut db, after_id.unwrap_or(wm), wm).unwrap_or_default();
-        (wm, hist)
+        pubsub::query_max_id(&mut db)
     };
     // Confirmation and replay use try_send: a subscriber that stopped
     // draining its socket must not park this task while it holds the
@@ -3004,21 +3079,61 @@ async fn handle_subscribe(
     // skip-through tracks replay progress, not the raw watermark: only
     // messages the subscriber actually received are suppressed from the
     // live stream, so an interrupted replay leaves a resumable gap.
+    // Chunked replay: each window is one short engine read sized by
+    // [`pubsub::ReplayWindow`] (row cap 512, byte budget ~1 MB), so memory
+    // stays proportional to a window instead of the whole history. The
+    // registry lock is held throughout — the module-header ordering
+    // contract (replay and live pushes never interleave or gap) depends
+    // on it — which means a `from earliest` replay of an enormous backlog
+    // delays publish notifications for as long as the requested replay
+    // spans. That is the replay guarantee's own cost; the historical
+    // whole-history Vec materialization on top of it was pure memory
+    // amplification and is gone.
     let mut progress = after_id.unwrap_or(watermark);
-    for m in &history {
-        let hit = match kind {
-            pubsub::SubKind::Channel => m.channel == name,
-            pubsub::SubKind::Pattern => pubsub::pattern_matches(&name, &m.channel),
+    let mut cursor = progress;
+    let mut window = pubsub::ReplayWindow::new();
+    while cursor < watermark {
+        let chunk = {
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+            pubsub::query_history_chunk(&mut db, cursor, watermark, window.limit())
         };
-        if !hit {
-            continue;
+        if chunk.is_empty() {
+            break;
         }
-        let pattern = (kind == pubsub::SubKind::Pattern).then_some(name.as_str());
-        let f = pubsub::push_frame(pattern, &m.channel, m.id, m.ts, &m.payload);
-        if tx.try_send(f).is_err() {
-            break; // channel full or connection gone: stop replaying
+        let rows = chunk.len();
+        let chunk_bytes = chunk
+            .iter()
+            .map(|m| m.channel.len() + m.payload.len())
+            .sum();
+        let chunk_max_row = chunk
+            .iter()
+            .map(|m| m.channel.len() + m.payload.len())
+            .max()
+            .unwrap_or(0);
+        cursor = chunk.last().map(|m| m.id).unwrap_or(cursor);
+        let mut stalled = false;
+        for m in &chunk {
+            let hit = match kind {
+                pubsub::SubKind::Channel => m.channel == name,
+                pubsub::SubKind::Pattern => pubsub::pattern_matches(&name, &m.channel),
+            };
+            if !hit {
+                continue;
+            }
+            let pattern = (kind == pubsub::SubKind::Pattern).then_some(name.as_str());
+            let f = pubsub::push_frame(pattern, &m.channel, m.id, m.ts, &m.payload);
+            if tx.try_send(f).is_err() {
+                // Channel full or connection gone: stop replaying — the
+                // delivered prefix stays armed, the rest is resumable by id.
+                stalled = true;
+                break;
+            }
+            progress = m.id;
         }
-        progress = m.id;
+        window.advance(rows, chunk_bytes, chunk_max_row);
+        if stalled || cursor >= watermark {
+            break;
+        }
     }
     inner.arm_filter(conn, kind, &name, progress);
 }
@@ -3788,6 +3903,19 @@ async fn gate_enqueue(
     if gate.closed {
         return None;
     }
+    if gate.pending.len() >= MAX_SYNC_QUEUE_ENTRIES
+        || gate.pending_bytes + sql.len() > MAX_SYNC_QUEUE_BYTES
+    {
+        // Refuse the ack: the origin sees a failed fan-out leg, and the
+        // digest check on the next rejoin degrades to snapshot repair —
+        // the documented convergence path — instead of the window pinning
+        // unbounded memory.
+        return Some(Frame::new(
+            proto::RESP_ERROR,
+            err_payload("sync window saturated; retry after bootstrap"),
+        ));
+    }
+    gate.pending_bytes += sql.len();
     gate.pending.push(QueuedWrite {
         origin,
         sql: sql.to_string(),
@@ -3920,7 +4048,8 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
                     .is_some_and(|pos| pos >= *seq)
             };
             if covered {
-                state.sync_queue.lock().await.pending.remove(0);
+                let mut gate = state.sync_queue.lock().await;
+                gate.pending_bytes -= gate.pending.remove(0).sql.len();
                 continue;
             }
         }
@@ -3948,7 +4077,10 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
             // (see execute_sql's `seq_pos`).
             querylog::record(state, "sync", &q.sql, 0.0, &resp, true);
         }
-        state.sync_queue.lock().await.pending.remove(0);
+        {
+            let mut gate = state.sync_queue.lock().await;
+            gate.pending_bytes -= gate.pending.remove(0).sql.len();
+        }
     }
 }
 

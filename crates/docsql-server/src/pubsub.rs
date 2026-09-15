@@ -15,8 +15,8 @@
 //! order.
 //!
 //! Delivery is best-effort per message: each connection has a bounded
-//! writer channel (256 frames); a connection that stops draining loses
-//! live pushes but nothing else — the message stays persisted and a
+//! writer channel; a connection that stops draining loses live pushes and
+//! replay tails but nothing else — the message stays persisted and a
 //! re-subscribe from the last seen id replays it (at-least-once).
 
 use crate::Frame;
@@ -68,11 +68,20 @@ pub fn store_insert(
         sql_literal(payload)
     ))
     .map_err(|e| e.to_string())?;
-    Ok(query_max_id(db))
+    // Statement-scoped readback: a `SELECT MAX(id)` here would full-scan
+    // the heap on every PUBLISH, growing with retention depth.
+    db.last_insert_id()
+        .ok_or_else(|| "publish store: no autoincrement id assigned".to_string())
 }
 
 /// Highest message id persisted on this node (0 on empty).
 pub fn query_max_id(db: &mut Database) -> i64 {
+    // Counter-cache read (O(1) warm); sits on the subscribe path under the
+    // registry lock, where the SQL aggregate's full heap scan shows up as
+    // delayed publishes.
+    if let Some(max) = db.max_autoinc(PUBSUB_TABLE) {
+        return max;
+    }
     let sql = format!("SELECT MAX(id) AS max_id FROM {PUBSUB_TABLE}");
     match db.execute(&sql) {
         Ok(ExecOutcome::Rows(r)) => match r.rows.first().and_then(|row| row.first()) {
@@ -90,6 +99,61 @@ pub struct StoredMessage {
     pub payload: String,
 }
 
+/// Replay window row cap: the subscribe replay fetches in bounded chunks
+/// instead of materializing the whole history under the registry lock.
+pub const REPLAY_CHUNK_ROWS: i64 = 512;
+/// Replay window byte budget: [`ReplayWindow`] sizes each chunk so its
+/// footprint stays near this target (bounded above by budget + one
+/// max-size row) no matter the message sizes — payloads cap at 4 MB
+/// each, so a fixed 512-row window of worst-case messages would be 2 GB.
+pub const REPLAY_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Adaptive replay chunk sizing. Seeds at one row and then derives the
+/// row cap from the observed row sizes — `budget / max(avg_row, max_row)`
+/// clamped to `[1, REPLAY_CHUNK_ROWS]` — so small-message backlogs
+/// saturate at the row cap (fast, short engine holds) while large-payload
+/// backlogs shrink to the byte budget. The running max-row guard also
+/// caps the transition window after a size switch: without it, a backlog
+/// that turned from tiny to huge rows could hand one 512-row window of
+/// 4 MB payloads to the engine at once.
+#[derive(Debug)]
+pub struct ReplayWindow {
+    rows: i64,
+    max_row: usize,
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplayWindow {
+    pub fn new() -> Self {
+        ReplayWindow {
+            rows: 1,
+            max_row: 0,
+        }
+    }
+
+    /// Row cap for the next `query_history_chunk` call.
+    pub fn limit(&self) -> i64 {
+        self.rows
+    }
+
+    /// Feed one delivered chunk: `chunk_rows` rows totalling `chunk_bytes`
+    /// bytes, the largest row `chunk_max_row` bytes.
+    pub fn advance(&mut self, chunk_rows: usize, chunk_bytes: usize, chunk_max_row: usize) {
+        if chunk_rows == 0 {
+            return;
+        }
+        self.max_row = self.max_row.max(chunk_max_row);
+        let avg = chunk_bytes / chunk_rows;
+        let denom = self.max_row.max(avg).max(1) as i64;
+        self.rows = (REPLAY_CHUNK_BYTES as i64 / denom).clamp(1, REPLAY_CHUNK_ROWS);
+    }
+}
+
 /// Messages with `after_id < id <= upto_id`, in id order (all channels;
 /// callers filter by channel or pattern).
 pub fn query_history(
@@ -104,7 +168,31 @@ pub fn query_history(
         "SELECT id, channel, ts_ms, payload FROM {PUBSUB_TABLE} \
          WHERE id > {after_id} AND id <= {upto_id} ORDER BY id"
     );
-    match db.execute(&sql) {
+    decode_history(db.execute(&sql))
+}
+
+/// [`query_history`] with a row cap — the streaming primitive the
+/// subscribe replay uses to keep memory proportional to one window.
+pub fn query_history_chunk(
+    db: &mut Database,
+    after_id: i64,
+    upto_id: i64,
+    limit: i64,
+) -> Vec<StoredMessage> {
+    if after_id >= upto_id || limit <= 0 {
+        return Vec::new();
+    }
+    let sql = format!(
+        "SELECT id, channel, ts_ms, payload FROM {PUBSUB_TABLE} \
+         WHERE id > {after_id} AND id <= {upto_id} ORDER BY id LIMIT {limit}"
+    );
+    decode_history(db.execute(&sql)).unwrap_or_default()
+}
+
+fn decode_history(
+    result: docsql_core::engine::Result<ExecOutcome>,
+) -> Result<Vec<StoredMessage>, String> {
+    match result {
         Ok(ExecOutcome::Rows(r)) => Ok(r
             .rows
             .into_iter()
@@ -353,14 +441,16 @@ impl Inner {
         let mut reached: HashSet<ConnId> = HashSet::new();
         let mut dead_exact: Vec<ConnId> = Vec::new();
         let mut dead_pattern: Vec<(String, ConnId)> = Vec::new();
-        // Exact-channel subscribers.
+        // Exact-channel subscribers: one serialization, cloned per
+        // subscriber (a busy channel with N listeners used to re-serialize
+        // the same JSON N times).
         if let Some(subs) = self.channels.get(channel) {
+            let frame = push_frame(None, channel, id, ts, payload);
             for (conn, sub) in subs {
                 if id <= sub.skip_through {
                     continue; // covered by that subscriber's replay
                 }
-                let frame = push_frame(None, channel, id, ts, payload);
-                match sub.tx.try_send(frame) {
+                match sub.tx.try_send(frame.clone()) {
                     Ok(()) => {
                         reached.insert(*conn);
                     }
@@ -376,12 +466,12 @@ impl Inner {
             if !pattern_matches(pattern, channel) {
                 continue;
             }
+            let frame = push_frame(Some(pattern), channel, id, ts, payload);
             for (conn, sub) in subs {
                 if id <= sub.skip_through {
                     continue;
                 }
-                let frame = push_frame(Some(pattern), channel, id, ts, payload);
-                match sub.tx.try_send(frame) {
+                match sub.tx.try_send(frame.clone()) {
                     Ok(()) => {
                         reached.insert(*conn);
                     }
@@ -603,6 +693,83 @@ mod tests {
 
     fn tx() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
         mpsc::channel(256)
+    }
+
+    #[test]
+    fn replay_window_grows_to_row_cap_on_small_messages() {
+        let mut w = ReplayWindow::new();
+        assert_eq!(w.limit(), 1, "seed conservatively");
+        // A 200-row chunk of ~100 B rows: jump straight to the row cap.
+        w.advance(200, 20_000, 120);
+        assert_eq!(w.limit(), REPLAY_CHUNK_ROWS);
+        // Stays at the cap while rows stay small.
+        w.advance(REPLAY_CHUNK_ROWS as usize, 51_200, 100);
+        assert_eq!(w.limit(), REPLAY_CHUNK_ROWS);
+        // Blank payloads never divide by zero and count as small.
+        let mut blank = ReplayWindow::new();
+        blank.advance(10, 0, 0);
+        assert_eq!(blank.limit(), REPLAY_CHUNK_ROWS);
+    }
+
+    #[test]
+    fn replay_window_shrinks_on_large_payloads() {
+        let mut w = ReplayWindow::new();
+        // One 1.5 MB row: budget / row_size floors at a single row.
+        w.advance(1, 1_500_000, 1_500_000);
+        assert_eq!(w.limit(), 1);
+        // The running max-row guard keeps later windows at one row even
+        // if a chunk averages small again.
+        w.advance(64, 6_400, 100);
+        assert_eq!(w.limit(), 1);
+    }
+
+    #[test]
+    fn replay_window_guards_the_size_switch() {
+        // Rows grow to the cap on a tiny-message backlog...
+        let mut w = ReplayWindow::new();
+        w.advance(200, 20_000, 120);
+        assert_eq!(w.limit(), REPLAY_CHUNK_ROWS);
+        // ...then a huge row lands in an otherwise small chunk: the next
+        // window collapses to one row instead of loading 512 × 4 MB.
+        w.advance(
+            REPLAY_CHUNK_ROWS as usize,
+            51_200 + 4 * 1024 * 1024,
+            4 * 1024 * 1024,
+        );
+        assert_eq!(w.limit(), 1);
+    }
+
+    #[test]
+    fn replay_chunks_match_full_history() {
+        let mut db = Database::in_memory().unwrap();
+        ensure_table(&mut db).unwrap();
+        for i in 0..1500 {
+            store_insert(&mut db, "ch", i, &format!("m{i}")).unwrap();
+        }
+        let upto = query_max_id(&mut db);
+        let full = query_history(&mut db, 0, upto).unwrap();
+        // The chunked primitive the subscribe replay uses must cover the
+        // exact same id sequence as the one-shot query.
+        let mut chunked = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let c = query_history_chunk(&mut db, cursor, upto, REPLAY_CHUNK_ROWS);
+            assert!(c.len() as i64 <= REPLAY_CHUNK_ROWS);
+            if c.is_empty() {
+                break;
+            }
+            cursor = c.last().unwrap().id;
+            let done = (c.len() as i64) < REPLAY_CHUNK_ROWS;
+            chunked.extend(c);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(chunked.len(), full.len());
+        assert!(chunked.iter().zip(full.iter()).all(|(a, b)| a.id == b.id));
+        // Degenerate windows stay empty, never loop.
+        assert!(query_history_chunk(&mut db, upto, upto, 512).is_empty());
+        assert!(query_history_chunk(&mut db, 0, 0, 512).is_empty());
     }
 
     #[test]

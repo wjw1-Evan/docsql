@@ -2454,6 +2454,12 @@ pub struct Database {
     /// be re-derived on peers the way AUTOINCREMENT's deterministic max+1
     /// can. Reset at the start of every statement; see `take_resolved_sql`.
     resolved_sql: Option<String>,
+    /// AUTOINCREMENT id assigned by the last INSERT (max over inserted
+    /// rows; explicit values count). Lets callers that must know the
+    /// assigned id — protocol INSERTs, the pub/sub store — read it back
+    /// without a second `SELECT MAX(id)` statement, which is a full heap
+    /// scan. Reset at the start of every statement.
+    last_insert_id: Option<i64>,
     /// Next seq for the catch-up journal ([`Database::journal_append`]).
     /// Seeded lazily from MAX(seq)+1 (in-memory counter under the write
     /// lock; gaps from failed statements are harmless — positions pull
@@ -2727,6 +2733,7 @@ impl Database {
             stmt_deadline: StmtDeadline::default(),
             autoinc_cache: std::collections::HashMap::new(),
             resolved_sql: None,
+            last_insert_id: None,
             journal_next: None,
             cluster_id: None,
             internal_ddl: false,
@@ -3393,6 +3400,7 @@ impl Database {
     /// use after [`Database::parse_classified`] routed the request.
     pub fn execute_parsed(&mut self, parsed: ParsedStatement) -> Result<ExecOutcome> {
         self.resolved_sql = None;
+        self.last_insert_id = None;
         match parsed.stmt {
             AnyStmt::Sql(stmt) => self.exec_stmt(*stmt),
             AnyStmt::UserAdmin(ua) => self.exec_user_admin(&ua),
@@ -3469,6 +3477,26 @@ impl Database {
     /// directly inside `exec_insert`).
     pub(crate) fn set_resolved_sql(&mut self, sql: String) {
         self.resolved_sql = Some(sql);
+    }
+
+    /// AUTOINCREMENT id the last INSERT assigned (max over inserted rows,
+    /// explicit values included; None when the last statement was not an
+    /// inserting one or the table has no AUTOINCREMENT column). The
+    /// statement-scoped readback avoids a second `SELECT MAX(id)` — a full
+    /// heap scan — on every insert-and-learn-the-id caller.
+    pub fn last_insert_id(&self) -> Option<i64> {
+        self.last_insert_id
+    }
+
+    /// Current MAX(id) of a table's AUTOINCREMENT column via the counter
+    /// cache: O(1) warm, one heap scan when an UPDATE/DELETE/restart
+    /// invalidated it. None when the table is unknown or has no
+    /// AUTOINCREMENT column — callers fall back to the SQL aggregate.
+    pub fn max_autoinc(&mut self, table: &str) -> Option<i64> {
+        let meta = self.tables.get(table)?.clone();
+        meta.autoinc.as_ref()?;
+        self.autoinc_next_for(table, &meta).ok()?;
+        self.autoinc_cache.get(table).map(|next| next - 1)
     }
 
     /// PRIMARY KEY / UNIQUE constraint indexes as named entries,
@@ -5931,6 +5959,13 @@ impl Database {
                 .unwrap_or(next_autoinc)
                 .max(next_autoinc);
             self.autoinc_cache.insert(table.clone(), used);
+            // Max id this statement actually placed (explicit values count;
+            // an INSERT that placed no rows leaves the previous value).
+            self.last_insert_id = placed
+                .iter()
+                .filter_map(|(_, d)| d.get(col))
+                .filter_map(|v| v.as_i64())
+                .max();
         }
         new_docs = placed.into_iter().map(|(_, d)| d).collect();
         if let Some(ret) = &insert.returning {
@@ -11725,6 +11760,52 @@ mod tests {
         run(&mut db, "INSERT INTO t (id, v) VALUES (10, 'ten')");
         let r = rows(&mut db, "INSERT INTO t (v) VALUES ('c') RETURNING id");
         assert_eq!(r.rows[0][0], Value::Int(11));
+    }
+
+    #[test]
+    fn last_insert_id_tracks_the_assigned_autoincrement_value() {
+        let mut db = Database::in_memory().unwrap();
+        // Not an insert: None.
+        assert_eq!(db.last_insert_id(), None);
+        run(&mut db, "CREATE TABLE t (id INT AUTOINCREMENT, v TEXT)");
+        run(&mut db, "INSERT INTO t (v) VALUES ('a'), ('b')");
+        // Multi-row insert: the max assigned id, no SELECT MAX round-trip.
+        assert_eq!(db.last_insert_id(), Some(2));
+        // Explicit id counts too.
+        run(&mut db, "INSERT INTO t (id, v) VALUES (10, 'ten')");
+        assert_eq!(db.last_insert_id(), Some(10));
+        // Every statement scope resets it, including reads and failures.
+        run(&mut db, "SELECT 1");
+        assert_eq!(db.last_insert_id(), None);
+        assert!(db.execute("INSERT INTO missing VALUES (1)").is_err());
+        assert_eq!(db.last_insert_id(), None);
+        // Table without AUTOINCREMENT: stays None.
+        run(&mut db, "CREATE TABLE u (id INT, v TEXT)");
+        run(&mut db, "INSERT INTO u VALUES (7, 'x')");
+        assert_eq!(db.last_insert_id(), None);
+    }
+
+    #[test]
+    fn max_autoinc_matches_sql_max_and_survives_invalidation() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT AUTOINCREMENT, v TEXT)");
+        // Empty table: 0 (matching the SQL aggregate on no rows).
+        assert_eq!(db.max_autoinc("t"), Some(0));
+        run(&mut db, "INSERT INTO t (v) VALUES ('a'), ('b')");
+        run(&mut db, "INSERT INTO t (id, v) VALUES (10, 'ten')");
+        assert_eq!(db.max_autoinc("t"), Some(10));
+        // Missing table / no AUTOINCREMENT column: None (fallback signal).
+        assert_eq!(db.max_autoinc("ghost"), None);
+        run(&mut db, "CREATE TABLE u (id INT)");
+        assert_eq!(db.max_autoinc("u"), None);
+        // DELETE invalidates the counter cache; the re-derived max still
+        // equals the SQL aggregate.
+        run(&mut db, "DELETE FROM t WHERE id = 10");
+        let sql_max = match run(&mut db, "SELECT MAX(id) FROM t") {
+            ExecOutcome::Rows(r) => r.rows[0][0].clone(),
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(db.max_autoinc("t"), sql_max.as_i64());
     }
 
     #[test]
