@@ -4,60 +4,137 @@
 <meta charset="utf-8">
 <meta name="description" content="DocSQL console">
 <title>DocSQL Studio — 管理控制台</title>
+<script>
+/* 主题引导:必须在首帧前定 <html data-theme>,否则浅→深闪变。
+   手动切换过(有存储值)用存储值,否则跟随系统偏好。 */
+(() => { let t = null; try { t = localStorage.getItem('docsql.theme'); } catch (e) {}
+  if (t !== 'dark' && t !== 'light')
+    t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  document.documentElement.dataset.theme = t; })();
+</script>
 <style>
   /* ============ DocSQL Studio(SSMS 风格)============ */
   :root {
+    color-scheme: light;
     --chrome: #f0f0f0; --chrome2: #f7f7f7; --border: #d4d4d4; --border2: #e4e4e4;
-    --accent: #0072c6; --accent-dk: #005a9e;
+    --accent: #0072c6; --accent-dk: #005a9e; --accent-bd: #005a9e; --accent-hover: #1a86d4;
+    --panel: #fff; --doc-bg: #fff; --input-bg: #fff;
+    --btn-hi: #fdfdfd; --btn-lo: #f0f0f0; --btn-hi-h: #f0f7fd; --btn-lo-h: #e4f0fb;
+    --btn-active: #dceefa; --btn-bd-h: #a6d3f0; --btn-dis-fg: #aaa; --btn-dis-bg: #f5f5f5; --btn-dis-bd: var(--border2);
     --tree-sel: #cce4f7; --tree-hover: #e8f2fc; --tree-sel-bd: #99d1ff;
     --grid-hd: #f5f6f7; --grid-bd: #dcdfe3; --grid-hover: #f0f7fd;
     --err: #e81123; --ok: #107c10; --warn: #ff8c00;
     --txt: #1a1a1a; --txt2: #555; --txt3: #888;
+    --null-fg: #a5a5a5; --dim-fg: #999;
     --mono: ui-monospace, Menlo, Consolas, monospace;
     --ui: "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
     --sql-kw: #0000c0; --sql-str: #a31515; --sql-num: #800000; --sql-cm: #008000; --sql-fn: #c7254e;
+    --sel-bg: #b4d7ff;
+    --pur-fg: #6a4fa3; --pur-bg: #f4effc; --pur-bd: #ddd0ee;
+    --bbadge-bg: #eef6fd; --bbadge-bd: #b8d7f0;
+    --gbadge-fg: #5f7d3a; --gbadge-bg: #f2f8ea; --gbadge-bd: #d3e3c0;
+    --role-bg: #e7f0ea; --role-fg: var(--accent-dk);
+    --chip-bg: #f2f2f2; --chip-bd: #e2e2e2;
+    --logo-a: #eaf4fd; --logo-b: #d6e9fa; --logo-bd: #bcd9f2;
+    --ic-page: #fff; --ic-tbl: #cfe3f7; --ic-col: #e8f0fb; --ic-key: #ffe9a8;
+    --ic-fd1: #f5c26b; --ic-fd2: #ffd98a;
+    --x-hover-bg: #ffd7d4;
+    --scroll-thumb: #c8c8c8; --scroll-thumb-h: #a8a8a8;
+    --shadow-1: 0 1px 2px rgba(0,0,0,.05);
+    --shadow-pop: 0 3px 12px rgba(0,0,0,.2);
+    --shadow-dlg: 0 6px 24px rgba(0,0,0,.25);
+    --overlay: rgba(0,0,0,.25); --overlay-strong: rgba(0,0,0,.35);
+    --toast-bg: #323130; --toast-fg: #fff;
+    --sb-busy: #ff8c00; --sb-err: #e81123;
+  }
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --chrome: #232428; --chrome2: #2a2b30; --border: #41434a; --border2: #34363c;
+    --accent: #2d7fc1; --accent-dk: #8ab9e8; --accent-bd: #26699f; --accent-hover: #3d8fd1;
+    --panel: #2b2c31; --doc-bg: #1e1f23; --input-bg: #1e1f23;
+    --btn-hi: #33343a; --btn-lo: #2b2c31; --btn-hi-h: #333d48; --btn-lo-h: #2f3944;
+    --btn-active: #3a4552; --btn-bd-h: #4a6a86; --btn-dis-fg: #5c5f66; --btn-dis-bg: #28292d; --btn-dis-bd: #34363c;
+    --tree-sel: rgba(61,143,209,.30); --tree-hover: rgba(255,255,255,.055); --tree-sel-bd: #3d8fd1;
+    --grid-hd: #28292e; --grid-bd: #3b3d44; --grid-hover: rgba(61,143,209,.12);
+    --err: #f0574d; --ok: #43b05c; --warn: #e8a33d;
+    --txt: #e6e6e6; --txt2: #b6bac2; --txt3: #7f848e;
+    --null-fg: #6f747d; --dim-fg: #767b85;
+    --sql-kw: #569cd6; --sql-str: #ce9178; --sql-num: #b5cea8; --sql-cm: #6a9955; --sql-fn: #dcdcaa;
+    --sel-bg: rgba(61,143,209,.40);
+    --pur-fg: #c3a6f0; --pur-bg: rgba(150,110,220,.16); --pur-bd: rgba(150,110,220,.35);
+    --bbadge-bg: rgba(61,143,209,.15); --bbadge-bd: rgba(61,143,209,.40);
+    --gbadge-fg: #8fc78f; --gbadge-bg: rgba(90,180,90,.13); --gbadge-bd: rgba(90,180,90,.35);
+    --role-bg: rgba(61,143,209,.16); --role-fg: #8ab9e8;
+    --chip-bg: #303238; --chip-bd: #45474e;
+    --logo-a: #2c3a4a; --logo-b: #253242; --logo-bd: #3d5570;
+    --ic-page: #2b2c31; --ic-tbl: #314862; --ic-col: #2c3f55; --ic-key: #57491f;
+    --ic-fd1: #a8823c; --ic-fd2: #c29a4a;
+    --x-hover-bg: rgba(240,87,77,.28);
+    --scroll-thumb: #4a4d55; --scroll-thumb-h: #5f636d;
+    --shadow-1: 0 1px 2px rgba(0,0,0,.35);
+    --shadow-pop: 0 3px 14px rgba(0,0,0,.5);
+    --shadow-dlg: 0 8px 28px rgba(0,0,0,.55);
+    --overlay: rgba(0,0,0,.45); --overlay-strong: rgba(0,0,0,.55);
+    --toast-bg: #3a3b40; --toast-fg: #eee;
+    --sb-busy: #a3721c; --sb-err: #b03d33;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
+  html { scrollbar-color: var(--scroll-thumb) transparent; }
   body {
     font: 12px/1.5 var(--ui); color: var(--txt); background: var(--chrome);
     margin: 0; display: flex; flex-direction: column; overflow: hidden;
     -webkit-user-select: none; user-select: none;
   }
-  button, input, select, textarea { font: inherit; }
+  button, input, select, textarea { font: inherit; color: var(--txt); }
   button {
-    background: linear-gradient(#fdfdfd, #f0f0f0); border: 1px solid var(--border);
+    background: linear-gradient(var(--btn-hi), var(--btn-lo)); border: 1px solid var(--border);
     border-radius: 3px; padding: 3px 10px; cursor: pointer; color: var(--txt);
+    transition: background-color .12s ease, border-color .12s ease, color .12s ease;
   }
-  button:hover { background: linear-gradient(#f0f7fd, #e4f0fb); border-color: #a6d3f0; }
-  button:active { background: #dceefa; }
-  button:disabled { color: #aaa; border-color: var(--border2); background: #f5f5f5; cursor: default; }
-  button.primary { background: var(--accent); border-color: var(--accent-dk); color: #fff; }
-  button.primary:hover { background: #1a86d4; }
+  button:hover { background: linear-gradient(var(--btn-hi-h), var(--btn-lo-h)); border-color: var(--btn-bd-h); }
+  button:active { background: var(--btn-active); }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: -1px;
+  }
+  button:disabled { color: var(--btn-dis-fg); border-color: var(--btn-dis-bd);
+                    background: var(--btn-dis-bg); cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent-bd); color: #fff; }
+  button.primary:hover { background: var(--accent-hover); }
   button.danger { color: var(--err); }
+  ::placeholder { color: var(--txt3); opacity: 1; }
   input[type=text], textarea, select {
-    border: 1px solid var(--border); border-radius: 2px; padding: 3px 6px; background: #fff;
+    border: 1px solid var(--border); border-radius: 2px; padding: 3px 6px; background: var(--input-bg);
     -webkit-user-select: text; user-select: text;
   }
   input[type=text]:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+  /* ---------- 主题化图标填充/描边(SVG 表现属性不支持 var(),用类替代)---------- */
+  .if-page { fill: var(--ic-page); } .if-tbl { fill: var(--ic-tbl); } .if-col { fill: var(--ic-col); }
+  .if-key { fill: var(--ic-key); } .if-fd1 { fill: var(--ic-fd1); } .if-fd2 { fill: var(--ic-fd2); }
+  .if-ok { fill: var(--ok); } .if-acc-s { stroke: var(--accent); } .if-acc-f { fill: var(--accent); }
+  .if-err-s { stroke: var(--err); } .if-dim-s { stroke: var(--dim-fg); }
 
   /* ---------- 菜单栏 ---------- */
   #menubar {
     display: flex; align-items: center; height: 28px; background: var(--chrome);
     border-bottom: 1px solid var(--border); padding: 0 6px; flex: none;
   }
-  #menubar .brand { font-weight: 600; color: var(--accent-dk); margin-right: 10px; }
-.role-badge { display:inline-block; padding:1px 8px; border-radius:9px; background:var(--accent-bg, #e7f0ea); color:var(--accent-dk); font-size:12px; margin-right:4px; }
-.role-badge.builtin { background:#eee; color:#555; font-weight:600; }
-.grant-chip { display:inline-block; padding:1px 7px; border-radius:8px; background:#f2f2f2; border:1px solid #e2e2e2; font-size:11.5px; margin:1px 3px 1px 0; font-family:var(--mono); }
-button.danger { color:var(--err); }
+  #menubar .brand { display: inline-flex; align-items: center; gap: 5px;
+                    font-weight: 600; color: var(--accent-dk); margin-right: 10px; }
+  .brand-glyph { display: inline-flex; }
+  .brand-svg ellipse, .brand-svg path { stroke: var(--accent); stroke-width: 1.2; }
+.role-badge { display:inline-block; padding:1px 8px; border-radius:9px; background:var(--role-bg); color:var(--role-fg); font-size:12px; margin-right:4px; }
+.role-badge.builtin { background:var(--chip-bg); color:var(--txt2); font-weight:600; }
+.grant-chip { display:inline-block; padding:1px 7px; border-radius:8px; background:var(--chip-bg); border:1px solid var(--chip-bd); font-size:11.5px; margin:1px 3px 1px 0; font-family:var(--mono); }
   #menubar .brand small { color: var(--txt3); font-weight: 400; }
   .menu { position: relative; }
-  .menu > span { display: inline-block; padding: 4px 10px; border-radius: 2px; cursor: default; }
+  .menu > span { display: inline-block; padding: 4px 10px; border-radius: 2px; cursor: default;
+                 transition: background-color .12s ease; }
   .menu > span:hover, .menu.open > span { background: var(--tree-sel); }
   .menu-drop {
     display: none; position: absolute; top: 100%; left: 0; min-width: 190px; z-index: 300;
-    background: #fff; border: 1px solid var(--border); box-shadow: 0 3px 10px rgba(0,0,0,.18);
+    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow-pop);
     padding: 3px 0;
   }
   .menu.open .menu-drop { display: block; }
@@ -74,11 +151,13 @@ button.danger { color:var(--err); }
   #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
   #toolbar .spacer { flex: 1; }
   .tb-ico { display: inline-flex; vertical-align: -3px; margin-right: 4px; }
+  #conn-dot { font-weight: 700; color: var(--err); }
+  #conn-dot.ok { color: var(--ok); }
 
   /* ---------- 主区域 ---------- */
   #main { flex: 1; display: flex; min-height: 0; }
   #explorer {
-    width: 268px; min-width: 180px; background: #fff;
+    width: 268px; min-width: 180px; background: var(--panel);
     display: flex; flex-direction: column; flex: none;
   }
   /* ---------- 布局分隔条(拖动调整各块大小)---------- */
@@ -87,7 +166,7 @@ button.danger { color:var(--err); }
                 border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
   .splitter.h { height: 5px; cursor: row-resize; background: var(--chrome);
                 border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-  .splitter:hover, .splitter.drag { background: var(--accent); border-color: var(--accent-dk); }
+  .splitter:hover, .splitter.drag { background: var(--accent); border-color: var(--accent-bd); }
   body.resizing-x, body.resizing-x * { cursor: col-resize !important; }
   body.resizing-y, body.resizing-y * { cursor: row-resize !important; }
   .panel-title {
@@ -99,7 +178,8 @@ button.danger { color:var(--err); }
   .panel-title .mini button { padding: 1px 6px; font-size: 12px; }
   #tree { flex: 1; overflow: auto; padding: 4px 0 12px; -webkit-user-select: none; user-select: none; }
   .tnode { display: flex; align-items: center; gap: 4px; padding: 2px 6px 2px 0;
-           white-space: nowrap; cursor: default; }
+           white-space: nowrap; cursor: default;
+           transition: background-color .08s ease; }
   .tnode:hover { background: var(--tree-hover); }
   .tnode.sel { background: var(--tree-sel); outline: 1px dotted var(--tree-sel-bd); }
   .tnode .twist { width: 14px; flex: none; text-align: center; color: var(--txt3);
@@ -107,17 +187,18 @@ button.danger { color:var(--err); }
   .tnode .tico { width: 17px; flex: none; display: inline-flex; }
   .tnode .tlabel { overflow: hidden; text-overflow: ellipsis; }
   .tnode .tlabel .cnt { color: var(--txt3); }
-  .tnode .badge { font-size: 10px; color: var(--accent-dk); border: 1px solid #b8d7f0;
-                  border-radius: 6px; padding: 0 4px; margin-left: 4px; background: #eef6fd; }
-  .tnode .badge.obs { color: #5f7d3a; border-color: #d3e3c0; background: #f2f8ea; }
-  .tnode .badge.pk { color: #6a4fa3; border-color: #ddd0ee; background: #f4effc; }
+  .tnode .dim { color: var(--dim-fg); font-style: italic; }
+  .tnode .badge { font-size: 10px; color: var(--accent-dk); border: 1px solid var(--bbadge-bd);
+                  border-radius: 6px; padding: 0 4px; margin-left: 4px; background: var(--bbadge-bg); }
+  .tnode .badge.obs { color: var(--gbadge-fg); border-color: var(--gbadge-bd); background: var(--gbadge-bg); }
+  .tnode .badge.pk { color: var(--pur-fg); border-color: var(--pur-bd); background: var(--pur-bg); }
   .tnode .tlabel .obs-col { color: var(--txt3); }
   .tnode .ttl-flag { color: var(--warn); margin-left: 3px; font-size: 11px; }
   .tchildren { padding-left: 15px; }
   .tchildren.collapsed { display: none; }
 
   /* ---------- 文档区 ---------- */
-  #docarea { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fff; }
+  #docarea { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--doc-bg); }
   #tabstrip {
     display: flex; align-items: stretch; background: var(--chrome); border-bottom: 1px solid var(--border);
     overflow-x: auto; flex: none; min-height: 27px;
@@ -125,11 +206,12 @@ button.danger { color:var(--err); }
   .tab {
     display: flex; align-items: center; gap: 5px; padding: 4px 8px 4px 12px; cursor: default;
     border-right: 1px solid var(--border2); white-space: nowrap; color: var(--txt2);
+    transition: background-color .1s ease, color .1s ease;
   }
-  .tab.active { background: #fff; color: var(--txt); box-shadow: inset 0 2px 0 var(--accent); }
+  .tab.active { background: var(--doc-bg); color: var(--txt); box-shadow: inset 0 2px 0 var(--accent); }
   .tab .x { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;
             border-radius: 2px; color: var(--txt3); font-size: 12px; }
-  .tab .x:hover { background: #ffd7d4; color: var(--err); }
+  .tab .x:hover { background: var(--x-hover-bg); color: var(--err); }
   #tabcontent { flex: 1; min-height: 0; position: relative; }
   .doc { position: absolute; inset: 0; display: none; flex-direction: column; min-height: 0; }
   .doc.active { display: flex; }
@@ -141,11 +223,11 @@ button.danger { color:var(--err); }
   .doc-bar .meta { color: var(--txt3); }
   .doc-bar .spacer { flex: 1; }
   /* 日志页类别切换按钮(doc-bar 内的 segmented control) */
-  .doc-bar .catbtn.on { background: var(--accent); border-color: var(--accent-dk); color: #fff; }
+  .doc-bar .catbtn.on { background: var(--accent); border-color: var(--accent-bd); color: #fff; }
 
   /* ---------- 查询编辑器 ---------- */
   .q-wrap { flex: 1; display: flex; flex-direction: column; min-height: 120px; }
-  .editor { flex: 1.2; display: flex; min-height: 90px; background: #fff; overflow: hidden; }
+  .editor { flex: 1.2; display: flex; min-height: 90px; background: var(--doc-bg); overflow: hidden; }
   .gutter {
     flex: none; width: 44px; background: var(--chrome); border-right: 1px solid var(--border2);
     overflow: hidden; text-align: right; padding: 6px 6px 6px 0;
@@ -159,10 +241,10 @@ button.danger { color:var(--err); }
   }
   .hl { pointer-events: none; z-index: 1; color: var(--txt); }
   .src {
-    z-index: 2; background: transparent; color: transparent; caret-color: #000;
+    z-index: 2; background: transparent; color: transparent; caret-color: var(--txt);
     border: 0; outline: 0; resize: none; -webkit-user-select: text; user-select: text;
   }
-  .src::selection { background: #b4d7ff; color: transparent; }
+  .src::selection { background: var(--sel-bg); color: transparent; }
   .k { color: var(--sql-kw); font-weight: 600; } .s { color: var(--sql-str); }
   .n { color: var(--sql-num); } .c { color: var(--sql-cm); font-style: italic; }
   .f { color: var(--sql-fn); }
@@ -171,8 +253,9 @@ button.danger { color:var(--err); }
   .res-wrap { flex: 1; display: flex; flex-direction: column; min-height: 60px; }
   .res-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); background: var(--chrome2); flex: none; }
   .res-tab { padding: 4px 16px; cursor: default; color: var(--txt2); border: 1px solid transparent;
-             border-bottom: 0; margin-bottom: -1px; }
-  .res-tab.active { background: #fff; color: var(--txt); border-color: var(--border);
+             border-bottom: 0; margin-bottom: -1px; transition: background-color .1s ease, color .1s ease; }
+  .res-tab:hover { background: var(--tree-hover); }
+  .res-tab.active { background: var(--doc-bg); color: var(--txt); border-color: var(--border);
                     box-shadow: inset 0 2px 0 var(--accent); }
   .res-pane { flex: 1; overflow: auto; display: none; min-height: 0; }
   .res-pane.active { display: block; }
@@ -194,11 +277,11 @@ button.danger { color:var(--err); }
   .grid th.rownum { z-index: 3; cursor: default; }
   .grid tr.sel td { background: var(--tree-sel); }
   .grid td:hover { background: var(--grid-hover); }
-  .grid .null { color: #b0b0b0; font-style: italic; }
+  .grid .null { color: var(--null-fg); font-style: italic; }
   .grid th.rowact, .grid td.rowact { width: 1%; white-space: nowrap; text-align: right; }
   .grid td.rowact button { margin-left: 5px; }
   .grid-label { font-weight: 600; color: var(--txt2); padding: 6px 10px 2px; }
-  .tag { font-size: 10px; color: #6a4fa3; border: 1px solid #ddd0ee; background: #f4effc;
+  .tag { font-size: 10px; color: var(--pur-fg); border: 1px solid var(--pur-bd); background: var(--pur-bg);
          border-radius: 3px; padding: 0 4px; margin-left: 4px; vertical-align: 1px; }
 
   /* ---------- 仪表盘 ---------- */
@@ -206,8 +289,9 @@ button.danger { color:var(--err); }
   .dash h2 { margin: 0 0 4px; font-size: 18px; }
   .dash .sub { color: var(--txt3); margin-bottom: 16px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
-  .card { border: 1px solid var(--border); border-radius: 4px; padding: 12px 14px; background: #fff;
-          box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .card { border: 1px solid var(--border); border-radius: 4px; padding: 12px 14px; background: var(--panel);
+          box-shadow: var(--shadow-1); transition: border-color .12s ease, box-shadow .12s ease; }
+  .card:hover { border-color: var(--btn-bd-h); }
   .card .v { font-size: 24px; font-weight: 600; color: var(--accent-dk); }
   .card .v small { font-size: 12px; color: var(--txt3); font-weight: 400; }
   .card .k { color: var(--txt2); margin-top: 2px; }
@@ -218,25 +302,27 @@ button.danger { color:var(--err); }
     height: 24px; flex: none; background: var(--accent); color: #fff; display: flex;
     align-items: center; gap: 0; font-size: 11.5px;
   }
-  #statusbar.busy { background: var(--warn); }
-  #statusbar.err { background: var(--err); }
+  #statusbar.busy { background: var(--sb-busy); }
+  #statusbar.err { background: var(--sb-err); }
   #statusbar span { padding: 0 10px; border-right: 1px solid rgba(255,255,255,.25); }
   #statusbar .grow { flex: 1; border: 0; }
 
   /* ---------- 右键菜单 / 弹窗 / 提示 ---------- */
   #ctxmenu {
-    display: none; position: fixed; z-index: 500; background: #fff; border: 1px solid var(--border);
-    box-shadow: 0 3px 12px rgba(0,0,0,.2); padding: 3px 0; min-width: 180px;
+    display: none; position: fixed; z-index: 500; background: var(--panel); border: 1px solid var(--border);
+    box-shadow: var(--shadow-pop); padding: 3px 0; min-width: 180px;
   }
   #ctxmenu div { padding: 4px 24px 4px 28px; cursor: default; white-space: nowrap; }
   #ctxmenu div:hover { background: var(--tree-sel); }
+  #ctxmenu .kbd { float: right; color: var(--txt3); margin-left: 22px; }
   #ctxmenu hr { border: 0; border-top: 1px solid var(--border2); margin: 3px 0; }
   #overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.25); z-index: 600;
-    align-items: center; justify-content: center;
+    display: none; position: fixed; inset: 0; background: var(--overlay); z-index: 600;
+    align-items: center; justify-content: center; animation: ov-fade .12s ease-out;
   }
-  .dialog { background: #fff; border: 1px solid var(--border); box-shadow: 0 6px 24px rgba(0,0,0,.25);
-            min-width: 360px; max-width: 520px; border-radius: 4px; overflow: hidden; }
+  .dialog { background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow-dlg);
+            min-width: 360px; max-width: 520px; border-radius: 4px; overflow: hidden;
+            animation: dlg-pop .15s cubic-bezier(.2,.9,.3,1); }
   .dialog h3 { margin: 0; padding: 9px 14px; background: var(--chrome); border-bottom: 1px solid var(--border);
                font-size: 13px; }
   .dialog .body { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
@@ -247,15 +333,15 @@ button.danger { color:var(--err); }
                   justify-content: flex-end; gap: 8px; background: var(--chrome2); }
   .dialog .err-line { color: var(--err); min-height: 16px; }
   /* 控制台账号:首次设置/登录遮罩(必须完成才能使用,不可点击关闭) */
-  #auth-ov { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 900;
-             display: none; align-items: center; justify-content: center; }
+  #auth-ov { position: fixed; inset: 0; background: var(--overlay-strong); z-index: 900;
+             display: none; align-items: center; justify-content: center; animation: ov-fade .12s ease-out; }
   /* 新建表:列编辑网格 */
   .dialog .hint { color: var(--txt3); line-height: 1.6; }
   table.colgrid { border-collapse: collapse; width: 100%; }
   .colgrid th, .colgrid td { border: 1px solid var(--border2); padding: 2px 5px; text-align: left; }
   .colgrid th { background: var(--grid-hd); color: var(--txt2); font-weight: 600; }
   .colgrid input[type=text] { width: 100%; border-color: transparent; background: transparent; }
-  .colgrid input[type=text]:focus { border-color: var(--accent); background: #fff; }
+  .colgrid input[type=text]:focus { border-color: var(--accent); background: var(--input-bg); }
   .colgrid input[type=checkbox], .colgrid select { vertical-align: middle; }
   .colgrid .delcol { border: 0; background: none; padding: 0 4px; color: var(--txt3); }
   .colgrid .delcol:hover { color: var(--err); }
@@ -268,9 +354,10 @@ button.danger { color:var(--err); }
   .about-dialog .body { gap: 13px; }
   .about-hero { display: flex; align-items: center; gap: 12px; }
   .about-logo { width: 46px; height: 46px; flex: none; border-radius: 8px;
-                background: linear-gradient(160deg, #eaf4fd, #d6e9fa); border: 1px solid #bcd9f2;
+                background: linear-gradient(160deg, var(--logo-a), var(--logo-b)); border: 1px solid var(--logo-bd);
                 display: flex; align-items: center; justify-content: center; }
   .about-logo svg { width: 30px; height: 30px; }
+  .about-logo svg * { stroke: var(--accent); }
   .about-name { font-size: 17px; font-weight: 600; }
   .about-ver { color: var(--txt3); margin-top: 1px; }
   .about-desc { margin: 0; color: var(--txt2); line-height: 1.75; }
@@ -286,19 +373,25 @@ button.danger { color:var(--err); }
   .about .kv .v a { color: var(--accent-dk); }
   #toasts { position: fixed; right: 14px; bottom: 34px; z-index: 700; display: flex;
             flex-direction: column; gap: 6px; }
-  .toast { background: #323130; color: #fff; border-radius: 4px; padding: 8px 14px; max-width: 380px;
-           box-shadow: 0 3px 10px rgba(0,0,0,.3); animation: tin .18s ease-out; }
-  .toast.err { background: var(--err); }
+  .toast { background: var(--toast-bg); color: var(--toast-fg); border-radius: 4px; padding: 8px 14px;
+           max-width: 380px; box-shadow: var(--shadow-pop); animation: tin .18s ease-out; }
+  .toast.err { background: var(--err); color: #fff; }
   @keyframes tin { from { opacity: 0; transform: translateY(6px); } }
+  @keyframes ov-fade { from { opacity: 0; } }
+  @keyframes dlg-pop { from { opacity: 0; transform: scale(.97) translateY(4px); } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
   ::-webkit-scrollbar { width: 14px; height: 14px; }
-  ::-webkit-scrollbar-thumb { background: #c8c8c8; border: 3px solid #fff; border-radius: 7px; }
-  ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+  ::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 3px solid transparent;
+                              border-radius: 8px; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--scroll-thumb-h); }
 </style>
 </head>
 <body>
 
 <div id="menubar">
-  <span class="brand">DocSQL <small>Studio</small></span>
+  <span class="brand"><span class="brand-glyph" id="brand-glyph"></span>DocSQL <small>Studio</small></span>
   <div class="menu" data-menu><span>文件</span><div class="menu-drop">
     <div data-act="new-query">新建查询<span class="kbd">Ctrl+N</span></div>
     <div data-act="new-table">新建表…</div>
@@ -320,7 +413,7 @@ button.danger { color:var(--err); }
 </div>
 
 <div id="toolbar">
-  <span title="连接状态" id="conn-dot" style="font-weight:700;color:#e81123">●</span>
+  <span title="连接状态" id="conn-dot">●</span>
   <div class="sep"></div>
   <span style="color:var(--txt2)">节点</span>
   <select id="nodesel" style="display:none;max-width:190px" title="切换管理的节点:默认节点(控制台启动时指定的管理目标)或 DOCSQL_PEERS 集群节点。控制台不存数据,所有操作以数据库客户端身份连接所选节点执行,认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
@@ -331,7 +424,8 @@ button.danger { color:var(--err); }
   <div class="sep"></div>
   <button id="btn-refresh" title="刷新对象资源管理器 (Ctrl+R)"><span class="tb-ico" data-ico="refresh"></span>刷新</button>
   <div class="spacer"></div>
-  <span id="tb-server" class="meta" style="color:#888"></span>
+  <button id="btn-theme" title="切换浅色 / 深色主题(首次进入跟随系统偏好)"><span class="tb-ico" id="theme-ico"></span></button>
+  <span id="tb-server" style="color:var(--txt3)"></span>
 </div>
 
 <!-- 控制台账号:首次使用设置 / 登录(DOCSQL_WEB_AUTH_FILE 启用时) -->
@@ -392,29 +486,38 @@ const fmtBytes = (n) => { if (!n) return '0 B'; const u = ['B','KB','MB','GB']; 
 const fmtDur = (ms) => { const s = Math.floor(ms/1000), d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   return d ? `${d}天${h}时${m}分` : h ? `${h}时${m}分` : m ? `${m}分${s%60}秒` : `${s}秒`; };
 // 控制台自身版本(与数据库节点版本无关;展示于仪表盘与「关于」)。
-const CONSOLE_VERSION = '1.0';
+const CONSOLE_VERSION = '1.1';
 
 /* ================= 图标(内联 SVG)================= */
+// 填充/描边颜色不用硬编码:走 .if-* 类(CSS 变量按主题解析),
+// 线稿中性色(#5b8dbf/#4a7a54 等)两主题下都可读,保留字面量。
 const SVG = (inner, vb) => `<svg width="16" height="16" viewBox="${vb||'0 0 16 16'}" fill="none" xmlns="http://www.w3.org/2000/svg">${inner}</svg>`;
 const ICONS = {
   server: SVG(`<ellipse cx="8" cy="3.4" rx="5.6" ry="2.1" stroke="#4a7a54" stroke-width="1.1"/><path d="M2.4 3.4v9.2c0 1.16 2.5 2.1 5.6 2.1s5.6-.94 5.6-2.1V3.4" stroke="#4a7a54" stroke-width="1.1"/><path d="M2.4 8c0 1.16 2.5 2.1 5.6 2.1S13.6 9.16 13.6 8" stroke="#4a7a54" stroke-width="1.1"/>`),
-  folder: SVG(`<path d="M1.5 4.2c0-.5.4-.9.9-.9h3l1.4 1.5h6.8c.5 0 .9.4.9.9v6.4c0 .5-.4.9-.9.9H2.4c-.5 0-.9-.4-.9-.9V4.2z" fill="#f5c26b" stroke="#c99b3f" stroke-width="1"/>`),
-  folderOpen: SVG(`<path d="M1.5 4.2c0-.5.4-.9.9-.9h3l1.4 1.5h6.8c.5 0 .9.4.9.9V7H1.5V4.2z" fill="#f5c26b" stroke="#c99b3f" stroke-width="1"/><path d="M1 7.4h13.8l-1.7 5.4c-.1.4-.5.7-.9.7H2.3c-.4 0-.8-.3-.9-.7L1 7.4z" fill="#ffd98a" stroke="#c99b3f" stroke-width="1"/>`),
-  table: SVG(`<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="#cfe3f7" stroke="#5b8dbf" stroke-width="1"/><path d="M1.5 5.6h13M1.5 8.7h13M6 5.6v8" stroke="#5b8dbf" stroke-width=".9"/>`),
-  column: SVG(`<rect x="4.5" y="2.5" width="7" height="11" rx="1" fill="#e8f0fb" stroke="#5b8dbf" stroke-width="1"/><path d="M4.5 5.5h7" stroke="#5b8dbf" stroke-width=".9"/>`),
-  key: SVG(`<circle cx="5" cy="6" r="2.8" stroke="#c8a000" stroke-width="1.3" fill="#ffe9a8"/><path d="M7 8l5.4 5.4M10 11l1.8-1.8M11.5 12.5l1.8-1.8" stroke="#c8a000" stroke-width="1.3"/>`),
+  folder: SVG(`<path class="if-fd1" d="M1.5 4.2c0-.5.4-.9.9-.9h3l1.4 1.5h6.8c.5 0 .9.4.9.9v6.4c0 .5-.4.9-.9.9H2.4c-.5 0-.9-.4-.9-.9V4.2z" stroke="#c99b3f" stroke-width="1"/>`),
+  folderOpen: SVG(`<path class="if-fd1" d="M1.5 4.2c0-.5.4-.9.9-.9h3l1.4 1.5h6.8c.5 0 .9.4.9.9V7H1.5V4.2z" stroke="#c99b3f" stroke-width="1"/><path class="if-fd2" d="M1 7.4h13.8l-1.7 5.4c-.1.4-.5.7-.9.7H2.3c-.4 0-.8-.3-.9-.7L1 7.4z" stroke="#c99b3f" stroke-width="1"/>`),
+  table: SVG(`<rect class="if-tbl" x="1.5" y="2.5" width="13" height="11" rx="1" stroke="#5b8dbf" stroke-width="1"/><path d="M1.5 5.6h13M1.5 8.7h13M6 5.6v8" stroke="#5b8dbf" stroke-width=".9"/>`),
+  column: SVG(`<rect class="if-col" x="4.5" y="2.5" width="7" height="11" rx="1" stroke="#5b8dbf" stroke-width="1"/><path d="M4.5 5.5h7" stroke="#5b8dbf" stroke-width=".9"/>`),
+  key: SVG(`<circle class="if-key" cx="5" cy="6" r="2.8" stroke="#c8a000" stroke-width="1.3"/><path d="M7 8l5.4 5.4M10 11l1.8-1.8M11.5 12.5l1.8-1.8" stroke="#c8a000" stroke-width="1.3"/>`),
   index: SVG(`<path d="M2.5 4h11M2.5 8h8M2.5 12h5" stroke="#8a6db8" stroke-width="1.6" stroke-linecap="round"/>`),
   view: SVG(`<ellipse cx="8" cy="8" rx="6.3" ry="4" stroke="#5b8dbf" stroke-width="1.1"/><circle cx="8" cy="8" r="1.9" fill="#5b8dbf"/>`),
-  query: SVG(`<path d="M3 3.5h7l3 3V12.5H3z" fill="#fff" stroke="#5b8dbf" stroke-width="1.1"/><path d="M5 7h6M5 9.4h4" stroke="#5b8dbf" stroke-width="1"/>`),
-  run: SVG(`<path d="M4.5 3l8 5-8 5z" fill="#107c10"/>`),
-  refresh: SVG(`<path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6v3h-3" stroke="#0072c6" stroke-width="1.4" fill="none" stroke-linecap="round"/>`),
-  explorer: SVG(`<rect x="2" y="3" width="12" height="10" rx="1" stroke="#888" stroke-width="1.1"/><path d="M6 3v10" stroke="#888" stroke-width="1.1"/>`),
-  chart: SVG(`<path d="M2.5 13V3M2.5 13h11" stroke="#666" stroke-width="1.2"/><rect x="4.5" y="8" width="2.2" height="4" fill="#0072c6"/><rect x="7.6" y="5.5" width="2.2" height="6.5" fill="#0072c6"/><rect x="10.7" y="7" width="2.2" height="5" fill="#0072c6"/>`),
-  dashboard: SVG(`<path d="M3 12a5 5 0 0 1 10 0" stroke="#0072c6" stroke-width="1.3"/><path d="M8 12l2.6-3.4" stroke="#e81123" stroke-width="1.4" stroke-linecap="round"/>`),
-  cluster: SVG(`<path d="M8 5.2 3.9 10.7M8 5.2l4.1 5.5" stroke="#4a7a54" stroke-width="1.1"/><circle cx="8" cy="3.2" r="2" fill="#cfe3f7" stroke="#4a7a54" stroke-width="1.1"/><circle cx="3" cy="12.4" r="2" fill="#cfe3f7" stroke="#4a7a54" stroke-width="1.1"/><circle cx="13" cy="12.4" r="2" fill="#cfe3f7" stroke="#4a7a54" stroke-width="1.1"/>`),
-  log: SVG(`<path d="M3 2h7l3 3v9H3z" fill="#fff" stroke="#8a6db8" stroke-width="1.1"/><path d="M5.5 6.5h5M5.5 9h5M5.5 11.5h3" stroke="#8a6db8" stroke-width="1"/>`),
+  query: SVG(`<path class="if-page" d="M3 3.5h7l3 3V12.5H3z" stroke="#5b8dbf" stroke-width="1.1"/><path d="M5 7h6M5 9.4h4" stroke="#5b8dbf" stroke-width="1"/>`),
+  run: SVG(`<path class="if-ok" d="M4.5 3l8 5-8 5z"/>`),
+  refresh: SVG(`<path class="if-acc-s" d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6v3h-3" stroke-width="1.4" fill="none" stroke-linecap="round"/>`),
+  explorer: SVG(`<rect class="if-dim-s" x="2" y="3" width="12" height="10" rx="1" stroke-width="1.1"/><path class="if-dim-s" d="M6 3v10" stroke-width="1.1"/>`),
+  chart: SVG(`<path class="if-dim-s" d="M2.5 13V3M2.5 13h11" stroke-width="1.2"/><rect class="if-acc-f" x="4.5" y="8" width="2.2" height="4"/><rect class="if-acc-f" x="7.6" y="5.5" width="2.2" height="6.5"/><rect class="if-acc-f" x="10.7" y="7" width="2.2" height="5"/>`),
+  dashboard: SVG(`<path class="if-acc-s" d="M3 12a5 5 0 0 1 10 0" stroke-width="1.3"/><path class="if-err-s" d="M8 12l2.6-3.4" stroke-width="1.4" stroke-linecap="round"/>`),
+  cluster: SVG(`<path d="M8 5.2 3.9 10.7M8 5.2l4.1 5.5" stroke="#4a7a54" stroke-width="1.1"/><circle class="if-tbl" cx="8" cy="3.2" r="2" stroke="#4a7a54" stroke-width="1.1"/><circle class="if-tbl" cx="3" cy="12.4" r="2" stroke="#4a7a54" stroke-width="1.1"/><circle class="if-tbl" cx="13" cy="12.4" r="2" stroke="#4a7a54" stroke-width="1.1"/>`),
+  log: SVG(`<path class="if-page" d="M3 2h7l3 3v9H3z" stroke="#8a6db8" stroke-width="1.1"/><path d="M5.5 6.5h5M5.5 9h5M5.5 11.5h3" stroke="#8a6db8" stroke-width="1"/>`),
+  sun: SVG(`<circle cx="8" cy="8" r="3.1" fill="#e8a33d"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke="#e8a33d" stroke-width="1.2" stroke-linecap="round"/>`),
+  moon: SVG(`<path d="M13.2 9.6A5.6 5.6 0 1 1 6.4 2.8a4.6 4.6 0 0 0 6.8 6.8z" fill="#e8a33d"/>`),
 };
 $$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
+// 菜单栏品牌徽标:数据库柱面线稿,描边随主题(品牌蓝)。
+$('#brand-glyph').innerHTML =
+  `<svg class="brand-svg" width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">` +
+  `<ellipse cx="8" cy="3.6" rx="5.7" ry="2.2"/><path d="M2.3 3.6v8.8c0 1.22 2.55 2.2 5.7 2.2s5.7-.98 5.7-2.2V3.6"/>` +
+  `<path d="M2.3 8c0 1.22 2.55 2.2 5.7 2.2s5.7-.98 5.7-2.2"/></svg>`;
 
 /* ================= API 层 ================= */
 // 浏览器不持有节点凭据:控制台与节点通信一律使用 Web 进程环境变量
@@ -575,9 +678,10 @@ function aboutDialog() {
     : '未知';
   const caps = ['对象资源管理器', '查询工作台', '数据网格', '表结构编辑', 'JSON 插入',
     '仪表盘', '集群状态', '日志', '备份恢复', '用户与角色'];
-  const logo = SVG(`<ellipse cx="8" cy="4" rx="6" ry="2.3" stroke="#0072c6" stroke-width="1.2"/>
-    <path d="M2 4v8c0 1.27 2.7 2.3 6 2.3s6-1.03 6-2.3V4" stroke="#0072c6" stroke-width="1.2"/>
-    <path d="M2 8c0 1.27 2.7 2.3 6 2.3S14 9.27 14 8" stroke="#0072c6" stroke-width="1.2"/>`);
+  // 描边颜色交给 .about-logo svg *(随主题取 --accent),这里只定形状。
+  const logo = SVG(`<ellipse cx="8" cy="4" rx="6" ry="2.3" stroke-width="1.2"/>
+    <path d="M2 4v8c0 1.27 2.7 2.3 6 2.3s6-1.03 6-2.3V4" stroke-width="1.2"/>
+    <path d="M2 8c0 1.27 2.7 2.3 6 2.3S14 9.27 14 8" stroke-width="1.2"/>`);
   const ov = showModal(`<div class="dialog about-dialog" style="min-width:470px;max-width:560px">
     <h3>关于 DocSQL Studio</h3>
     <div class="body about">
@@ -625,11 +729,10 @@ function aboutDialog() {
 const ui = {
   connState(state) {
     const dot = $('#conn-dot'), bar = $('#st-conn'), sb = $('#statusbar');
-    if (state === 'ok') { dot.textContent = '●'; dot.style.color = '#107c10';
-      bar.textContent = '已连接 ' + location.host; sb.className = ''; }
-    else if (state === 'unauth') { dot.textContent = '●'; dot.style.color = '#e81123';
-      bar.textContent = '未授权'; sb.className = 'err'; }
-    else { dot.textContent = '●'; dot.style.color = '#e81123'; bar.textContent = '未连接'; sb.className = ''; }
+    dot.classList.toggle('ok', state === 'ok');
+    if (state === 'ok') { bar.textContent = '已连接 ' + location.host; sb.className = ''; }
+    else if (state === 'unauth') { bar.textContent = '未授权'; sb.className = 'err'; }
+    else { bar.textContent = '未连接'; sb.className = ''; }
   },
   status(text, cls) {
     const sb = $('#statusbar');
@@ -646,6 +749,41 @@ const ui = {
     setTimeout(() => el.remove(), isErr ? 5000 : 2600);
   }
 };
+
+/* ================= 主题(浅色 / 深色)================= */
+// <head> 的引导脚本已在首帧前按 localStorage(或系统偏好)设好
+// <html data-theme>;这里只负责切换按钮与图标。手动切换才写存储,
+// 不切换则每次进入跟随系统;存储值变化由多标签页各自管理。
+const theme = {
+  icon() {
+    const el = $('#theme-ico');
+    if (el) el.innerHTML = ICONS[document.documentElement.dataset.theme === 'dark' ? 'sun' : 'moon'] || '';
+  },
+  toggle() {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('docsql.theme', next); } catch (e) {}
+    this.icon();
+    ui.toast(next === 'dark' ? '已切换到深色主题' : '已切换到浅色主题');
+  },
+  follow() {
+    // 未手动选择过主题时跟随系统变化(存储被禁用等异常一律忽略)。
+    if (!window.matchMedia) return;
+    try {
+      matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+        let saved = null;
+        try { saved = localStorage.getItem('docsql.theme'); } catch (err) {}
+        if (saved !== 'dark' && saved !== 'light') {
+          document.documentElement.dataset.theme = e.matches ? 'dark' : 'light';
+          this.icon();
+        }
+      });
+    } catch (e) {}
+  },
+};
+$('#btn-theme').onclick = () => theme.toggle();
+theme.icon();
+theme.follow();
 
 /* ================= 节点切换 ================= */
 // 管理节点选择器:默认管理节点 + DOCSQL_PEERS 中的集群节点。控制台是
@@ -704,7 +842,7 @@ const ctx = {
   open(items, x, y) {
     const m = $('#ctxmenu');
     m.innerHTML = items.map(it => it === '-' ? '<hr>' :
-      `<div data-mi="${esc(it.id)}">${esc(it.label)}${it.kbd ? `<span class="kbd" style="float:right;color:#999;margin-left:22px">${esc(it.kbd)}</span>` : ''}</div>`).join('');
+      `<div data-mi="${esc(it.id)}">${esc(it.label)}${it.kbd ? `<span class="kbd">${esc(it.kbd)}</span>` : ''}</div>`).join('');
     m.style.display = 'block';
     const r = m.getBoundingClientRect();
     m.style.left = Math.min(x, innerWidth - r.width - 6) + 'px';
@@ -1109,7 +1247,7 @@ function deleteRowDialog(tableName, meta, cols, row, after) {
   const sql = `DELETE FROM "${qident(tableName)}" WHERE ${where}`;
   const ov = showModal(`<div class="dialog"><h3>删除行</h3><div class="body">
     <div class="hint">执行并沿集群写路径扇出,不可撤销:</div>
-    <pre style="white-space:pre-wrap;word-break:break-all;margin:6px 0;font-family:var(--mono);font-size:12px;color:var(--txt2);background:var(--bg);border:1px solid var(--border);padding:8px;border-radius:3px">${esc(sql)}</pre>
+    <pre style="white-space:pre-wrap;word-break:break-all;margin:6px 0;font-family:var(--mono);font-size:12px;color:var(--txt2);background:var(--chrome2);border:1px solid var(--border);padding:8px;border-radius:3px">${esc(sql)}</pre>
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>取消</button><button class="primary danger" data-ok>删除该行</button></div></div>`);
   $('[data-ok]', ov).onclick = async () => {
@@ -2243,8 +2381,8 @@ function openLogsTab() {
         for (const r of rows) {
           const isData = r.cat === 'data';
           const cat = isData
-            ? `<span style="color:var(--accent-dk)">数据</span>${r.replicated ? '<span style="font-size:10px;color:#6a4fa3;border:1px solid #ddd0ee;border-radius:6px;padding:0 4px;margin-left:4px;background:#f4effc" title="来自对等节点扇出的复制应用">复制</span>' : ''}`
-            : `<span style="color:#4a7a54">同步</span>`;
+            ? `<span style="color:var(--accent-dk)">数据</span>${r.replicated ? '<span class="tag" title="来自对等节点扇出的复制应用">复制</span>' : ''}`
+            : `<span style="color:var(--ok)">同步</span>`;
           const content = isData
             ? esc(r.text)
             : `<b style="font-weight:600">${esc(SYNC_EVENTS[r.event] || r.event)}</b>${r.target ? ` → <span style="font-family:var(--mono)">${esc(r.target)}</span>` : ''}${r.text ? ` · ${esc(r.text)}` : ''}`;
@@ -2363,7 +2501,7 @@ const explorer = {
 
     // 填充已展开分支
     if (this.expanded.has('tables')) {
-      $(`[data-ch="tables"]`, tree).innerHTML = tablesInner.join('') || '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无表)</span></div>';
+      $(`[data-ch="tables"]`, tree).innerHTML = tablesInner.join('') || '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无表)</span></div>';
       m.tables.forEach(t => {
         const p = 'table:' + t.name;
         if (!this.expanded.has(p)) return;
@@ -2395,10 +2533,10 @@ const explorer = {
             : esc(i);
           return this.node('idx:' + t.name + '.' + i, ICONS.index, label, {kind: 'index', name: i, more: t.name});
         }).join('')
-          : '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无索引)</span></div>';
+          : '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无索引)</span></div>';
         const keys = t.keys.length ? t.keys.map(kk =>
           this.node('key:' + t.name + '.' + kk, ICONS.key, esc(kk), {kind: 'key', name: kk, more: t.name})).join('')
-          : '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无键)</span></div>';
+          : '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无键)</span></div>';
         const el = $(`[data-ch="${CSS.escape(p)}"]`, tree);
         if (el) el.innerHTML =
           this.node(p + '/columns', ICONS.folder, `列 <span class="cnt" title="声明 ${t.columns.length} 列,数据中实测 ${(t.observed || []).length} 个顶层字段">(${colLabel})</span>`, {children: true}) +
@@ -2415,7 +2553,7 @@ const explorer = {
         this.node('systable:' + t.name, ICONS.table,
           `${esc(t.name)} <span class="cnt" title="引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据">(${esc(t.row_count)})</span>`,
           {kind: 'systable', name: t.name, more: t.row_count})).join('')
-        || '<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:#999">(无系统表)</span></div>';
+        || '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无系统表)</span></div>';
     }
     if (this.expanded.has('sys')) {
       const sysViews = [
