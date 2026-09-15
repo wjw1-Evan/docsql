@@ -155,6 +155,20 @@ fn config_from_env(
     let backup_interval_secs = env_num("DOCSQL_BACKUP_INTERVAL_SECS", 86_400, &getenv)?;
     let backup_keep = env_num("DOCSQL_BACKUP_KEEP", 7, &getenv)?;
     let statement_timeout_ms = env_num("DOCSQL_STATEMENT_TIMEOUT_MS", 0, &getenv)?;
+    // Startup-fail-fast only; the consumer is docsql_core::kdf's once-read
+    // override (test suites lower it to keep auth-path e2e meaningful).
+    if let Some(raw) = getenv("DOCSQL_PBKDF2_ITERATIONS") {
+        let n: u64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| "DOCSQL_PBKDF2_ITERATIONS must be an integer".to_string())?;
+        if n == 0 || n > docsql_core::kdf::MAX_PBKDF2_ITERATIONS as u64 {
+            return Err(format!(
+                "DOCSQL_PBKDF2_ITERATIONS must be 1..={}",
+                docsql_core::kdf::MAX_PBKDF2_ITERATIONS
+            ));
+        }
+    }
     let backup_dir = getenv("DOCSQL_BACKUP_DIR")
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());

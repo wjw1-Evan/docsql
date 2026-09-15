@@ -573,7 +573,8 @@ fn stored_password_form(password: &str) -> Result<String, String> {
             "password must be at least 8 characters (got {password_len})"
         ));
     }
-    let salt = crate::guid::rand_bytes(16);
+    // OS entropy, not the guid PRF: see kdf::os_random_bytes.
+    let salt = crate::kdf::os_random_bytes(16);
     Ok(kdf::hash_password(password, &salt))
 }
 

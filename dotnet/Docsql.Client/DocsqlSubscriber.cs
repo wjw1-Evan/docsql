@@ -172,7 +172,21 @@ public sealed class DocsqlSubscriber : IDisposable
                 {
                     throw new DocsqlException("连接已断开: " + _deadReason);
                 }
-                throw new DocsqlException("订阅请求超时(服务器无响应或连接已断开)");
+                // 超时即投毒:请求是否已在服务端生效不可知,而它的迟到应答
+                // 无法与下一个请求的应答区分(帧内没有序号)。连接从此不可
+                // 复用 —— 后续控制调用立即失败,应用经 OnError 重连重订阅,
+                // 迟到的应答永远不会被错认成别的请求的确认。
+                _deadReason = "订阅请求超时;连接状态不可信,请重建连接";
+                _dead = true;
+                try
+                {
+                    OnError?.Invoke(new DocsqlException(_deadReason));
+                }
+                catch
+                {
+                    // 观察者异常不影响投毒流程
+                }
+                throw new DocsqlException(_deadReason);
             }
             if (_dead && _pendingResp is null)
             {

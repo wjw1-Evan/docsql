@@ -416,4 +416,42 @@ public sealed class ClientSurfaceTests : IClassFixture<ServerFixture>
         Assert.Equal("tok", full.Token);
         Assert.Equal(key, full.Key);
     }
+
+    [Fact]
+    public void ConnectionString_masks_credentials_once_open()
+    {
+        // ADO.NET Persist Security Info 语义:Open 之后读取
+        // ConnectionString 不得交还凭据(诊断/日志面),除非显式
+        // persist security info=true。Closed 时原文照返(设置面)。
+        var closed = new DocsqlConnection("host=h;port=1;token=tok-secret;password=pw-secret");
+        Assert.Contains("tok-secret", closed.ConnectionString);
+        Assert.Contains("pw-secret", closed.ConnectionString);
+
+        using var conn = new DocsqlConnection(
+            $"host=127.0.0.1;port={_fx.Port};token=tok-secret");
+        conn.Open();
+        var cs = conn.ConnectionString;
+        Assert.DoesNotContain("tok-secret", cs);
+        Assert.Contains("token=***", cs);
+        // 掩码串仍能解析出端点(诊断可读,凭据不可读)。
+        Assert.Equal("127.0.0.1", new DocsqlConnectionStringBuilder { ConnectionString = cs }.Host);
+
+        using var optin = new DocsqlConnection(
+            $"host=127.0.0.1;port={_fx.Port};token=tok-secret;persist security info=true");
+        optin.Open();
+        Assert.Contains("tok-secret", optin.ConnectionString);
+    }
+
+    [Fact]
+    public void MaskCredentials_covers_all_credential_keys()
+    {
+        var masked = DocsqlConnection.MaskCredentials(
+            "host=h;password=pw;token=tk;key=" + new string('a', 64) + ";user=u");
+        Assert.Contains("password=***", masked);
+        Assert.Contains("token=***", masked);
+        Assert.Contains("key=***", masked);
+        Assert.DoesNotContain("pw", masked);
+        Assert.DoesNotContain("tk", masked);
+        Assert.Contains("user=u", masked);
+    }
 }

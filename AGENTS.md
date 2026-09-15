@@ -116,6 +116,6 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 - `DOCSQL_BACKUP_INTERVAL_SECS` / `DOCSQL_BACKUP_KEEP` / `DOCSQL_BACKUP_DIR`:自动备份(默认 86400s / 7 份 / `<db>/backups`)。
 - `DOCSQL_MAX_CONN` / `DOCSQL_IDLE_TIMEOUT`:连接上限(超限立即拒绝) / 空闲断开(**订阅客户端需定期 PING 保活**)。
 - `DOCSQL_REPLICATE_TO` / `DOCSQL_READ_ONLY=1`:主从写转发 / 副本只读。
-- `DOCSQL_LOG_FILE`(审计 JSONL 落盘)、`DOCSQL_SLOW_MS`(慢查询阈值,默认 100ms,写 stderr):测试要用时显式指定临时路径。数值型 env(`DOCSQL_MAX_CONN`/`DOCSQL_IDLE_TIMEOUT`/`DOCSQL_CATCHUP_WINDOW`/`DOCSQL_BACKUP_*`/`DOCSQL_SLOW_MS`/`DOCSQL_STATEMENT_TIMEOUT_MS`)非法值一律拒绝启动(exit 2),勿改回静默回退。
+- `DOCSQL_LOG_FILE`(审计 JSONL 落盘)、`DOCSQL_SLOW_MS`(慢查询阈值,默认 100ms,写 stderr):测试要用时显式指定临时路径。数值型 env(`DOCSQL_MAX_CONN`/`DOCSQL_IDLE_TIMEOUT`/`DOCSQL_CATCHUP_WINDOW`/`DOCSQL_BACKUP_*`/`DOCSQL_SLOW_MS`/`DOCSQL_STATEMENT_TIMEOUT_MS`/`DOCSQL_PBKDF2_ITERATIONS`)非法值一律拒绝启动(exit 2),勿改回静默回退。`DOCSQL_PBKDF2_ITERATIONS`(新建凭据的迭代数,默认 210000,e2e 置 1000;存量凭据按各自存储值校验)进程内只读一次,必须在首次哈希前设置。
 - `DOCSQL_DEV_IMAGE_TAG`(dev compose,默认 `local`;部署测试传 `ci` 复用 CI 缓存镜像)vs `DOCSQL_IMAGE_TAG`(prod compose,默认 `latest`):两栈互不影响,可同时运行。
 - `DOCSQL_DEV_TOKEN`(dev compose;prod 走 `.env` 的 `DOCSQL_TOKEN`):客户端 token,同值下发全部 dev 节点与两个 web 控制台,控制台以它认证节点。**控制台建首个数据库用户前必须配置**——节点存在任一用户后匿名连接被拒(含控制台自身),且匿名连接连 DROP USER 都执行不了,未配 token 即自锁,只能配 token 重建容器解锁或 reset-data.sh 清卷;run-tests.sh 显式置空保测试确定性。

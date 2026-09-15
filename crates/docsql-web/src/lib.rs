@@ -157,6 +157,19 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
             "WARNING: DOCSQL_WEB_AUTH_FILE is not set; the console API is open \
              without credentials (legacy mode). Set it to require an account."
         );
+    } else if matches!(
+        auth.as_ref().map(AuthShared::mode),
+        Some(auth::AuthMode::Setup)
+    ) {
+        // One-shot claim window: the account file exists but no account
+        // does, so whoever reaches the port first owns the console. The
+        // default loopback bind contains this; an exposed port should not
+        // sit in this state.
+        eprintln!(
+            "WARNING: console account is not set up yet — the first visitor \
+             to reach this port will claim it (create the account promptly, \
+             or keep the port loopback-only)."
+        );
     }
     let tls = cfg.tls;
     let secure_cookie = tls.is_some()
@@ -672,8 +685,28 @@ fn lockout_key(state: &WebState, headers: &HeaderMap, peer: SocketAddr) -> std::
     peer.ip()
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("console.html"))
+async fn index() -> Response {
+    // The console is a self-contained page (inline script/style, same-origin
+    // fetches only), so a CSP costs nothing and caps the blast radius of
+    // any future escaping slip: everything must come from this origin, no
+    // framing, no base hijack.
+    let mut resp = Html(include_str!("console.html")).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 // ---- console account (first-use setup + login) ----

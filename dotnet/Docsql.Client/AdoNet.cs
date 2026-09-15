@@ -86,6 +86,20 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
             : 15;
         set => this["connect timeout"] = value.ToString();
     }
+
+    /// <summary>ADO.NET 语义:连接打开后 ConnectionString 是否仍返回凭据
+    /// (默认 false —— Open 之后读取 ConnectionString 得到的是掩码副本,
+    /// 防止诊断代码/日志经属性带出口令与 token)。</summary>
+    public bool PersistSecurityInfo
+    {
+        get => TryGetValue("persist security info", out var v)
+            && (v as string ?? "").Equals("true", StringComparison.OrdinalIgnoreCase);
+        set => this["persist security info"] = value.ToString();
+    }
+
+    /// <summary>关键字不区分大小写地存在性检查(含同义写法)。</summary>
+    public bool HasCredential =>
+        ContainsKey("password") || ContainsKey("token") || ContainsKey("key");
 }
 
 /// <summary>
@@ -311,9 +325,41 @@ public sealed class DocsqlConnection : DbConnection
         return Convert.FromHexString(hex);
     }
 
-    private DocsqlConnectionStringBuilder Parsed => new() { ConnectionString = ConnectionString };
+    // Raw backing store — internal reads (endpoint parsing, pool keys) must
+    // always see the credentials, while the public getter masks them after
+    // Open (ADO.NET Persist Security Info semantics, see below).
+    private string _connectionString = "";
 
-    public override string ConnectionString { get; set; } = "";
+    private DocsqlConnectionStringBuilder Parsed => new() { ConnectionString = _connectionString };
+
+    /// <summary>连接打开后默认掩去 password/token/key(ADO.NET Persist
+    /// Security Info 语义);连接串写 "persist security info=true" 才返回
+    /// 原文。诊断代码读到的串交给日志或异常不再携带凭据。</summary>
+    public override string ConnectionString
+    {
+        get => ShouldMaskCredentials ? MaskCredentials(_connectionString) : _connectionString;
+        set => _connectionString = value ?? "";
+    }
+
+    private bool ShouldMaskCredentials
+    {
+        get
+        {
+            if (_state != ConnectionState.Open) return false;
+            return !new DocsqlConnectionStringBuilder { ConnectionString = _connectionString }
+                .PersistSecurityInfo;
+        }
+    }
+
+    internal static string MaskCredentials(string raw)
+    {
+        var b = new DocsqlConnectionStringBuilder { ConnectionString = raw };
+        foreach (var k in new[] { "password", "token", "key" })
+        {
+            if (b.ContainsKey(k)) b[k] = "***";
+        }
+        return b.ConnectionString;
+    }
 
     public override string Database => "docsql";
 
@@ -788,6 +834,47 @@ public sealed class DocsqlCommand : DbCommand
                     }
                     j++;
                 }
+                sb.Append(sql[i..j]);
+                i = j;
+                continue;
+            }
+            if (c == '"')
+            {
+                // Quoted identifier: copy verbatim — an @-lookalike inside
+                // "some@ident" is part of the name, not a parameter.
+                int j = i + 1;
+                while (j < sql.Length)
+                {
+                    if (sql[j] == '"')
+                    {
+                        if (j + 1 < sql.Length && sql[j + 1] == '"')
+                        {
+                            j += 2;
+                            continue;
+                        }
+                        j++;
+                        break;
+                    }
+                    j++;
+                }
+                sb.Append(sql[i..j]);
+                i = j;
+                continue;
+            }
+            if (c == '-' && i + 1 < sql.Length && sql[i + 1] == '-')
+            {
+                // Line comment: verbatim through the newline.
+                int j = sql.IndexOf('\n', i);
+                j = j < 0 ? sql.Length : j + 1;
+                sb.Append(sql[i..j]);
+                i = j;
+                continue;
+            }
+            if (c == '/' && i + 1 < sql.Length && sql[i + 1] == '*')
+            {
+                // Block comment: verbatim through the closing star-slash.
+                int close = sql.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                int j = close < 0 ? sql.Length : close + 2;
                 sb.Append(sql[i..j]);
                 i = j;
                 continue;

@@ -10,6 +10,7 @@
 
 using System.Collections.Concurrent;
 using System.Data.Common;
+using System.Text;
 using System.Runtime.CompilerServices;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -109,17 +110,23 @@ internal sealed class DocsqlAutoCreateInterceptor : DbCommandInterceptor
 /// <summary>
 /// schema 同步记账(测试与诊断用):按连接串键控的全量同步次数。
 /// 不参与判定,只做观测 —— 校验路径是否生效可直接断言。
+/// 键存的是连接串的 SHA-256 摘要而非原文:工厂模式下每个不同连接串
+/// 永久占一格,原文键会把口令/token 留在进程内存里直到退出。
 /// </summary>
 internal static class SchemaSyncAccounting
 {
     private static readonly ConcurrentDictionary<string, int> FullSyncs = new(StringComparer.Ordinal);
 
+    private static string Key(string connectionString) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(connectionString)));
+
     internal static void RecordFullSync(string connectionString) =>
-        FullSyncs.AddOrUpdate(connectionString, 1, static (_, v) => v + 1);
+        FullSyncs.AddOrUpdate(Key(connectionString), 1, static (_, v) => v + 1);
 
     internal static int FullSyncCount(string connectionString) =>
-        FullSyncs.TryGetValue(connectionString, out var v) ? v : 0;
+        FullSyncs.TryGetValue(Key(connectionString), out var v) ? v : 0;
 
     internal static void Reset(string connectionString) =>
-        FullSyncs.TryRemove(connectionString, out _);
+        FullSyncs.TryRemove(Key(connectionString), out _);
 }

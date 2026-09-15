@@ -82,6 +82,20 @@ fn config_from_env(
                 .filter(|u| !u.is_empty())
         })
         .or_else(|| peers.first().cloned());
+    // Fail fast on a nonsensical override (the consumer is
+    // docsql_core::kdf's once-read iterations setting).
+    if let Some(raw) = getenv("DOCSQL_PBKDF2_ITERATIONS") {
+        let n: u64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| "DOCSQL_PBKDF2_ITERATIONS must be an integer".to_string())?;
+        if n == 0 || n > docsql_core::kdf::MAX_PBKDF2_ITERATIONS as u64 {
+            return Err(format!(
+                "DOCSQL_PBKDF2_ITERATIONS must be 1..={}",
+                docsql_core::kdf::MAX_PBKDF2_ITERATIONS
+            ));
+        }
+    }
     let tls = tls_from_env(&getenv)?;
     Ok(WebCfg {
         listen,

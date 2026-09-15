@@ -24,6 +24,19 @@ async fn start_web_auth(
     start_web_full(token, peers, upstream, auth_file, None).await
 }
 
+/// Pin new-credential PBKDF2 work low for the whole test process: the
+/// production 210k makes every login hundreds of milliseconds in debug
+/// builds, which both slows the auth suites and stretches the 60s
+/// lockout window wide enough to break its own threshold test under
+/// load. Stored formats carry their iteration count, so nothing else
+/// changes. Must run before the first hash (OnceLock caches the read).
+fn force_fast_pbkdf2() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("DOCSQL_PBKDF2_ITERATIONS", "1000");
+    });
+}
+
 /// Full-control console start, including optional native TLS (PEM paths).
 async fn start_web_full(
     token: Option<&str>,
@@ -47,6 +60,7 @@ async fn start_web_full(
             key_path,
         }),
     };
+    force_fast_pbkdf2();
     let listen = addr.clone();
     tokio::spawn(async move { docsql_web::run(cfg, &listen).await });
     for _ in 0..100 {

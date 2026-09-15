@@ -225,18 +225,53 @@ pub struct StoredPw {
     pub hash: [u8; 32],
 }
 
+/// `n` bytes from the operating system CSPRNG (/dev/urandom; std has no
+/// direct API and the project adds no crypto crates). Credential salts
+/// come from here: uniqueness alone is not the requirement — a salt the
+/// attacker can predict or force to repeat across processes weakens
+/// precomputation resistance. Falls back to the guid module's PRF stream
+/// only where no OS entropy device exists, which keeps salts unique (the
+/// historical behavior) if no longer unpredictable.
+pub fn os_random_bytes(n: usize) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = vec![0u8; n];
+            if f.read_exact(&mut buf).is_ok() {
+                return buf;
+            }
+        }
+    }
+    crate::guid::rand_bytes(n)
+}
+
+/// Iterations for NEWLY hashed passwords: `PBKDF2_ITERATIONS` by default,
+/// lowerable via `DOCSQL_PBKDF2_ITERATIONS` (bounded by
+/// MAX_PBKDF2_ITERATIONS). Read once per process — test suites set it low
+/// so auth-path e2e stays fast and its lockout windows stay meaningful;
+/// deployments should not need to touch it. Stored formats carry their
+/// own iteration count, so entries hashed at any other setting still
+/// verify.
+fn effective_iterations() -> u32 {
+    static ONCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var("DOCSQL_PBKDF2_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| (1..=MAX_PBKDF2_ITERATIONS).contains(n))
+            .unwrap_or(PBKDF2_ITERATIONS)
+    })
+}
+
 /// Hash a plaintext password into the stored form.
 pub fn hash_password(password: &str, salt_bytes: &[u8]) -> String {
+    let iterations = effective_iterations();
     let mut hash = [0u8; 32];
-    pbkdf2_hmac_sha256(
-        password.as_bytes(),
-        salt_bytes,
-        PBKDF2_ITERATIONS,
-        &mut hash,
-    );
+    pbkdf2_hmac_sha256(password.as_bytes(), salt_bytes, iterations, &mut hash);
     format!(
         "{HASH_PREFIX}${}${}${}",
-        PBKDF2_ITERATIONS,
+        iterations,
         hex(salt_bytes),
         hex(&hash)
     )

@@ -902,6 +902,7 @@ async fn replication_and_failover() {
     let primary_addr = free();
 
     // Replica: read-only, no upstream.
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join("replica.db"),
         listen: replica_addr.clone(),
@@ -924,6 +925,7 @@ async fn replication_and_failover() {
         statement_timeout_ms: 0,
     }));
     // Primary: forwards writes to the replica.
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join("primary.db"),
         listen: primary_addr.clone(),
@@ -1031,6 +1033,7 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             .map(|(_, a)| a.clone())
             .collect::<Vec<_>>()
             .join(",");
+        force_fast_pbkdf2();
         tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
             db_path: dir.path().join(format!("peer{i}.db")),
             listen: addr.clone(),
@@ -1155,6 +1158,7 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             .map(|(_, a)| a.clone())
             .collect::<Vec<_>>()
             .join(",");
+        force_fast_pbkdf2();
         tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
             db_path: dir.path().join(format!("txpeer{i}.db")),
             listen: addr.clone(),
@@ -1423,6 +1427,7 @@ async fn query_log_records_statements() {
     drop(l);
     let db = dir.path().join("qlog.db");
     let db_str = db.clone();
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: db_str,
         listen: addr.clone(),
@@ -1884,6 +1889,7 @@ async fn pubsub_cross_node_delivery() {
             .map(|(_, a)| a.clone())
             .collect::<Vec<_>>()
             .join(",");
+        force_fast_pbkdf2();
         tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
             db_path: dir.path().join(format!("pubsub_peer{i}.db")),
             listen: addr.clone(),
@@ -1965,6 +1971,7 @@ async fn symmetric_cluster_guid_autogen_converges() {
             .map(|(_, a)| a.clone())
             .collect::<Vec<_>>()
             .join(",");
+        force_fast_pbkdf2();
         tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
             db_path: dir.path().join(format!("guidpeer{i}.db")),
             listen: addr.clone(),
@@ -2205,6 +2212,20 @@ async fn logs_frame_over_wire() {
 
 /// One cluster node bound to `addr`, with the given static peer mesh and
 /// optional advertised address (DOCSQL_ADVERTISE). Waits for the port.
+/// Pin new-credential PBKDF2 work low for the whole test process: the
+/// production 210k makes every login hundreds of milliseconds in debug
+/// builds, which both slows the auth suites and stretches the 60s
+/// lockout window wide enough to break its own threshold test under
+/// load. Stored formats carry their iteration count, so nothing else
+/// changes. Runs before any CREATE USER / login can hash — every spawn
+/// funnels through here first.
+fn force_fast_pbkdf2() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("DOCSQL_PBKDF2_ITERATIONS", "1000");
+    });
+}
+
 async fn spawn_node(
     dir: &tempfile::TempDir,
     name: &str,
@@ -2212,6 +2233,7 @@ async fn spawn_node(
     peers: Vec<String>,
     advertise: Option<&str>,
 ) {
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join(format!("{name}.db")),
         listen: addr.to_string(),
@@ -2474,6 +2496,7 @@ async fn spawn_node_window(
     peers: Vec<String>,
     window: u64,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    force_fast_pbkdf2();
     let handle = tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join(format!("{name}.db")),
         listen: addr.to_string(),
@@ -2529,6 +2552,7 @@ async fn wait_port_down(addr: &str) {
 /// background flusher, and the fused write units are disabled (their
 /// immediate `end` sync would re-impose one fsync per clustered write).
 async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers: Vec<String>) {
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join(format!("{name}.db")),
         listen: addr.to_string(),
@@ -3807,6 +3831,7 @@ async fn backup_restore_refused_on_read_only_replica() {
     let port = l.local_addr().unwrap().port();
     drop(l);
     let addr = format!("127.0.0.1:{port}");
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join("replica.db"),
         listen: addr.clone(),
@@ -3948,6 +3973,7 @@ async fn backup_dir_override_is_honored() {
     let port = l.local_addr().unwrap().port();
     drop(l);
     let addr = format!("127.0.0.1:{port}");
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: dir.path().join("e2e.db"),
         listen: addr.clone(),
@@ -5141,6 +5167,7 @@ async fn transport_key_requires_sealed_frames() {
     drop(l);
     let addr = format!("127.0.0.1:{port}");
     let key: crypto::TransportKey = [0x42; 32];
+    force_fast_pbkdf2();
     tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
         db_path: db,
         listen: addr.clone(),

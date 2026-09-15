@@ -331,8 +331,24 @@ pub fn random_token() -> String {
 
 // ---- sessions ----
 
+/// Live sessions kept at once. The console has one account; every entry
+/// beyond a handful is either a stale tab or someone hammering the login
+/// form with stolen credentials — evicting the soonest-to-expire keeps
+/// the table bounded without ever evicting an active session (active
+/// sessions renew and sit at the full TTL).
+pub const SESSION_MAX_LIVE: usize = 64;
+/// Absolute lifetime. The sliding 12h TTL alone lets a continuously-used
+/// session live forever; a stolen cookie then never expires. 24h walls
+/// that off without touching interactive use.
+pub const SESSION_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+struct SessionEntry {
+    created: Instant,
+    expires: Instant,
+}
+
 pub struct Sessions {
-    map: Mutex<HashMap<String, Instant>>,
+    map: Mutex<HashMap<String, SessionEntry>>,
 }
 
 impl Default for Sessions {
@@ -350,21 +366,41 @@ impl Sessions {
 
     pub fn create(&self) -> String {
         let token = random_token();
-        self.map
-            .lock()
-            .unwrap()
-            .insert(token.clone(), Instant::now() + SESSION_TTL);
+        let mut map = self.map.lock().unwrap();
+        let now = Instant::now();
+        while map.len() >= SESSION_MAX_LIVE {
+            // Evict the soonest-to-expire session: the least valuable
+            // under both sliding and absolute rules.
+            let victim = map
+                .iter()
+                .min_by_key(|(_, e)| e.expires)
+                .map(|(t, _)| t.clone());
+            match victim {
+                Some(t) => {
+                    map.remove(&t);
+                }
+                None => break,
+            }
+        }
+        map.insert(
+            token.clone(),
+            SessionEntry {
+                created: now,
+                expires: now + SESSION_TTL,
+            },
+        );
         token
     }
 
-    /// Sliding expiry: every accepted request extends the session.
+    /// Sliding expiry within an absolute lifetime: every accepted request
+    /// extends the session, but never past SESSION_MAX_AGE since creation.
     pub fn verify(&self, token: &str) -> bool {
         let mut map = self.map.lock().unwrap();
         let now = Instant::now();
-        map.retain(|_, exp| *exp > now);
+        map.retain(|_, e| e.expires > now);
         match map.get_mut(token) {
-            Some(exp) if *exp > now => {
-                *exp = now + SESSION_TTL;
+            Some(e) if e.expires > now && now.duration_since(e.created) < SESSION_MAX_AGE => {
+                e.expires = now + SESSION_TTL;
                 true
             }
             _ => false,
