@@ -2392,6 +2392,7 @@ mod tests {
         let m = remote_meta(&addr, None).await;
         assert!(m.get("error").is_none(), "{m}");
         assert_eq!(m["totals"]["tables"], 1);
+        assert_eq!(m["totals"]["indexes"], 1); // id PK autoindex
         assert_eq!(m["tables"][0]["name"], "rm");
         assert_eq!(m["tables"][0]["row_count"], 1);
         assert!(!m["tables"][0]["columns"].as_array().unwrap().is_empty());

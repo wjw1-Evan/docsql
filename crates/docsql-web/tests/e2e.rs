@@ -438,7 +438,10 @@ async fn meta_and_stats_report_live_catalog() {
     .await;
 
     let meta = http(&addr, "GET", "/api/meta", None, None).await.json();
-    assert_eq!(meta["totals"], json!({"tables": 1, "rows": 2}));
+    assert_eq!(
+        meta["totals"],
+        json!({"tables": 1, "rows": 2, "indexes": 1}) // id PK autoindex
+    );
     let t = &meta["tables"][0];
     assert_eq!(t["name"], "m");
     assert_eq!(t["row_count"], 2);

@@ -28,6 +28,7 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
     let mut tables = Vec::new();
     let mut system_tables = Vec::new();
     let mut total_rows = 0u64;
+    let mut total_indexes = 0u64;
     for t in &catalog {
         let row_count = match db.execute(&format!(
             "SELECT COUNT(*) FROM {}",
@@ -46,6 +47,10 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
             continue;
         }
         total_rows += row_count;
+        // Index census for the dashboard: one count per B+ tree, constraint
+        // autoindexes (PK/UNIQUE) included — same set the object explorer
+        // lists under each table's 索引 branch.
+        total_indexes += t.index_defs.len() as u64;
         let columns: Vec<Value> = t
             .columns
             .iter()
@@ -148,6 +153,7 @@ pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: 
             Value::Object(Object::from([
                 ("tables".into(), int(tables.len() as u64)),
                 ("rows".into(), int(total_rows)),
+                ("indexes".into(), int(total_indexes)),
             ])),
         ),
         ("tables".into(), Value::Array(tables)),
@@ -243,6 +249,7 @@ mod tests {
             Value::Object(Object::from([
                 ("tables".into(), Value::Int(1)),
                 ("rows".into(), Value::Int(2)),
+                ("indexes".into(), Value::Int(2)), // PK autoindex + mi
             ]))
         );
     }
@@ -293,6 +300,7 @@ mod tests {
                 Value::Object(Object::from([
                     ("tables".into(), Value::Int(1)),
                     ("rows".into(), Value::Int(1)),
+                    ("indexes".into(), Value::Int(0)),
                 ]))
             ),
             _ => unreachable!(),
