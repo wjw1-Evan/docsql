@@ -38,6 +38,11 @@ pub struct QueryLog {
     /// Set once a sink problem has been reported; a broken audit sink must
     /// at least be visible, not silently produce no trail.
     sink_warned: std::sync::atomic::AtomicBool,
+    /// Earliest next attempt to (re)open a failed sink: a bad path or a
+    /// full disk must not turn every statement into an open() syscall, but
+    /// the audit trail also must not stay latched off forever after one
+    /// transient error.
+    sink_retry_after: Mutex<Option<std::time::Instant>>,
     pub capacity: usize,
     pub slow_ms: f64,
     pub log_file: Option<String>,
@@ -55,6 +60,7 @@ impl QueryLog {
             ring: Mutex::new(VecDeque::new()),
             sink: Mutex::new(None),
             sink_warned: std::sync::atomic::AtomicBool::new(false),
+            sink_retry_after: Mutex::new(None),
             capacity: 1000,
             // Fail fast on a malformed threshold (consistent with the
             // server binary's numeric env validation): a typo would
@@ -87,28 +93,54 @@ impl QueryLog {
             })) {
                 let mut sink = self.sink.lock().unwrap_or_else(|p| p.into_inner());
                 if sink.is_none() {
-                    *sink = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .ok();
-                    if sink.is_none()
-                        && !self
-                            .sink_warned
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        eprintln!("query log file {path}: cannot open for append");
+                    let now = std::time::Instant::now();
+                    let retry_ok = self
+                        .sink_retry_after
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_none_or(|t| now >= t);
+                    if retry_ok {
+                        *sink = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .ok();
+                        if sink.is_none() {
+                            *self
+                                .sink_retry_after
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) =
+                                Some(now + std::time::Duration::from_secs(10));
+                            if !self
+                                .sink_warned
+                                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                eprintln!("query log file {path}: cannot open for append");
+                            }
+                        }
                     }
                 }
                 if let Some(f) = sink.as_mut() {
                     use std::io::Write;
                     if let Err(err) = writeln!(f, "{line}") {
+                        // Drop the handle so the next push reopens; retry
+                        // slowly and keep the failure visible.
+                        *sink = None;
+                        *self
+                            .sink_retry_after
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
                         if !self
                             .sink_warned
                             .swap(true, std::sync::atomic::Ordering::Relaxed)
                         {
                             eprintln!("query log file {path}: {err}");
                         }
+                    } else {
+                        // Healthy again: re-arm the one-shot warning.
+                        self.sink_warned
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -487,6 +519,7 @@ mod tests {
             ring: Mutex::new(VecDeque::new()),
             sink: Mutex::new(None),
             sink_warned: std::sync::atomic::AtomicBool::new(false),
+            sink_retry_after: Mutex::new(None),
             capacity: 10,
             slow_ms: 1000.0,
             log_file,

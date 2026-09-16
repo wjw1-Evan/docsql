@@ -128,7 +128,19 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
                 positional.push(a.clone());
             }
         }
-        let token = positional.first().cloned();
+        // Token precedence: positional (with a leak warning), else the
+        // DOCSQL_TOKEN environment variable — argv is visible in `ps` and
+        // shell history, so scripts should prefer the env.
+        let token = match positional.first().cloned() {
+            Some(t) => {
+                eprintln!(
+                    "warning: passing the token on the command line exposes it to `ps`; \
+                     prefer DOCSQL_TOKEN"
+                );
+                Some(t)
+            }
+            None => std::env::var("DOCSQL_TOKEN").ok().filter(|t| !t.is_empty()),
+        };
         return Ok(CliArgs {
             format,
             script,

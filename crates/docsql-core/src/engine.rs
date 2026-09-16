@@ -314,7 +314,16 @@ pub struct BatchError {
 
 /// Session snapshot of all tables: (meta, docs) per table. Used by
 /// transaction rollback and the SAVEPOINT stack.
-type TableSnapshot = std::collections::BTreeMap<String, (TableMeta, Vec<Object>)>;
+/// Catalog state captured at BEGIN / SAVEPOINT: table metas are shared
+/// behind `Arc`, so a snapshot clones pointers (and each later mutation
+/// deep-copies just the one table it touches), not the database. Document
+/// content is restored through the pager's page undo journal — the old
+/// whole-database deep copy made every BEGIN an O(database) allocation.
+#[derive(Clone)]
+struct TableSnapshot {
+    tables: std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
+    autoinc: std::collections::HashMap<String, i64>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TableMeta {
@@ -364,6 +373,7 @@ impl TableMeta {
         Heap {
             pages: self.pages.clone(),
             overflow_free: self.overflow_free.clone(),
+            dropped: Vec::new(),
         }
     }
 
@@ -2695,9 +2705,10 @@ pub struct Database {
     /// its replication bookkeeping (journal append / position update) share
     /// one fsync and are atomic on crash.
     write_unit: u8,
-    /// SAVEPOINT stack inside the open transaction: (name, snapshot). Each
-    /// ROLLBACK TO restores its snapshot and drops everything above it.
-    savepoints: Vec<(String, TableSnapshot)>,
+    /// SAVEPOINT stack inside the open transaction: (name, snapshot, undo
+    /// journal mark). Each ROLLBACK TO restores its snapshot and drops
+    /// everything above it, including the journal tail.
+    savepoints: Vec<(String, TableSnapshot, usize)>,
     /// Session transaction snapshot: full table state at BEGIN. Rollback
     /// restores it; commit just discards it (durability is the WAL's job).
     tx_snapshot: Option<TableSnapshot>,
@@ -2808,9 +2819,8 @@ impl Database {
         // Reserve pages 0 (header) and 1 (catalog); allocate 1 if missing.
         while pager.num_pages() <= CATALOG_PAGE {
             let mut tx = pager.begin_tx();
-            let before = pager.num_pages();
-            let id = pager.allocate_page(&mut tx)?;
-            debug_assert_eq!(id, before);
+            let _ = pager.num_pages();
+            pager.allocate_page(&mut tx)?;
             pager.commit_tx(tx)?;
         }
         let mut tables = std::collections::BTreeMap::new();
@@ -3247,6 +3257,12 @@ impl Database {
             let id = self.pager.allocate_page(tx)?;
             chain.push(id);
         }
+        // A shrinking catalog releases its tail pages for reuse (they are no
+        // longer linked into the chain the save below writes).
+        for &extra in &chain[need..] {
+            self.pager.free_page(tx, extra)?;
+        }
+        chain.truncate(need);
         for i in 0..need {
             let start = i * CATALOG_CHUNK;
             let end = (start + CATALOG_CHUNK).min(bytes.len());
@@ -3269,23 +3285,48 @@ impl Database {
         Ok(())
     }
 
-    fn snapshot_all(
-        &mut self,
-    ) -> Result<std::collections::BTreeMap<String, (TableMeta, Vec<Object>)>> {
-        let names: Vec<String> = self.tables.keys().cloned().collect();
-        let mut snap = std::collections::BTreeMap::new();
-        for name in names {
-            let meta = self
-                .tables
-                .get(&name)
-                .map(|a| a.as_ref().clone())
-                .unwrap_or_default();
-            // A read failure must surface: snapshotting an unreadable table
-            // as empty would turn the next ROLLBACK into a permanent wipe.
-            let docs = self.table_docs_cx(&name)?;
-            snap.insert(name, (meta, docs));
+    /// Cheap catalog snapshot (Arc clones + the autoinc cache): document
+    /// rollback rides the pager's page undo journal instead of a deep copy.
+    fn catalog_snapshot(&self) -> TableSnapshot {
+        TableSnapshot {
+            tables: self.tables.clone(),
+            autoinc: self.autoinc_cache.clone(),
         }
-        Ok(snap)
+    }
+
+    /// Restore the catalog from `snap` and replay `undo` in reverse into one
+    /// commit: `Set` writes the pre-image back, `Alloc` returns the page to
+    /// the reusable pool, `Free` reserves it (the restored catalog owns it
+    /// again), `Realloc` needs nothing (its pre-image was recorded when the
+    /// transaction freed it).
+    fn restore_transaction(
+        &mut self,
+        snap: TableSnapshot,
+        undo: Vec<crate::pager::UndoOp>,
+        sync_catalog: bool,
+    ) -> Result<()> {
+        let mut tx = self.pager.begin_tx();
+        for op in undo.into_iter().rev() {
+            match op {
+                crate::pager::UndoOp::Set(id, image) => {
+                    self.pager.write_page(&mut tx, id, 0, &image)?;
+                }
+                crate::pager::UndoOp::Alloc(id) => {
+                    self.pager.free_page(&mut tx, id)?;
+                }
+                crate::pager::UndoOp::Free(id) => {
+                    self.pager.reserve_page(id);
+                }
+                crate::pager::UndoOp::Realloc(_) => {}
+            }
+        }
+        self.tables = snap.tables;
+        self.autoinc_cache = snap.autoinc;
+        if sync_catalog {
+            self.save_catalog_into(&mut tx)?;
+        }
+        self.commit_pager_tx(tx)?;
+        Ok(())
     }
 
     fn rollback_tx(&mut self) -> Result<ExecOutcome> {
@@ -3293,22 +3334,15 @@ impl Database {
             return err("no transaction in progress");
         };
         self.savepoints.clear();
-        self.tables.clear();
-        // Tables created inside the transaction have no snapshot entry, so
-        // their autoinc watermarks survive a table-clear; re-CREATE would
-        // resume from the stale value instead of max+1 = 1.
-        self.autoinc_cache.clear();
-        for (name, (mut meta, docs)) in snap {
-            self.rewrite_table(&name, &mut meta, docs)?;
-        }
-        self.save_catalog()?;
+        let undo = self.pager.take_undo();
+        self.restore_transaction(snap, undo, true)?;
         Ok(ExecOutcome::Affected(0))
     }
 
-    /// SAVEPOINT name: snapshot the current transaction state so a later
-    /// ROLLBACK TO can restore it (the transaction stays open). Capped: each
-    /// savepoint holds a whole-database copy, so an unbounded stack is a
-    /// one-connection memory bomb.
+    /// SAVEPOINT name: mark the current transaction state so a later
+    /// ROLLBACK TO can restore it (the transaction stays open). Holds Arc
+    /// pointers plus a journal mark — cost is O(tables), not O(database).
+    /// Capped so a savepoint flood cannot pin unbounded journal memory.
     fn savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
         const MAX_SAVEPOINTS: usize = 64;
         if self.tx_snapshot.is_none() {
@@ -3319,15 +3353,19 @@ impl Database {
                 "too many savepoints (max {MAX_SAVEPOINTS}); release or roll back some first"
             ));
         }
-        let snap = self.snapshot_all()?;
-        self.savepoints.push((name.to_string(), snap));
+        let snap = self.catalog_snapshot();
+        // Mark BEFORE the baseline images: the tail a later ROLLBACK TO
+        // replays must include them.
+        let mark = self.pager.undo_mark();
+        self.pager.undo_savepoint()?;
+        self.savepoints.push((name.to_string(), snap, mark));
         Ok(ExecOutcome::Affected(0))
     }
 
     /// RELEASE SAVEPOINT name: forget the savepoint (changes stay). With
     /// duplicate names the most recent one is released (SQLite semantics).
     fn release_savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
-        let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n == name) else {
+        let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) else {
             return err(format!("savepoint {name} does not exist"));
         };
         self.savepoints.truncate(pos);
@@ -3337,19 +3375,17 @@ impl Database {
     /// ROLLBACK TO SAVEPOINT name: restore that savepoint's state; the
     /// outer transaction continues and later savepoints are discarded.
     fn rollback_to_savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
-        let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n == name) else {
+        let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) else {
             return err(format!("savepoint {name} does not exist"));
         };
         let snap = self.savepoints[pos].1.clone();
+        let mark = self.savepoints[pos].2;
         self.savepoints.truncate(pos);
-        self.tables.clear();
-        // Same stale-autoinc-cache hazard as a full ROLLBACK: tables whose
-        // pre-savepoint image is absent were created after the savepoint.
-        self.autoinc_cache.clear();
-        for (name, (mut meta, docs)) in snap {
-            self.rewrite_table(&name, &mut meta, docs)?;
-        }
-        self.save_catalog()?;
+        let undo = self.pager.take_undo_to(mark);
+        // The transaction stays open: no catalog save is needed (the journal
+        // replay already restored the catalog pages; the in-memory map comes
+        // from the snapshot). `sync_catalog=false` keeps this cheap.
+        self.restore_transaction(snap, undo, false)?;
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -4006,12 +4042,48 @@ impl Database {
     /// describe stream-applied ops, which the snapshot adoption
     /// accounting (positions reset to the sampled heads) keeps valid.
     pub fn wipe_user_tables(&mut self) -> Result<()> {
-        self.tables.retain(|name, _| is_system_table(name));
+        let doomed: Vec<String> = self
+            .tables
+            .keys()
+            .filter(|n| !is_system_table(n))
+            .cloned()
+            .collect();
+        let mut tx = self.pager.begin_tx();
+        for name in doomed {
+            if let Some(meta) = self.tables.get(&name) {
+                self.free_table_storage(&mut tx, meta)?;
+            }
+            self.tables.remove(&name);
+        }
         // Wiped tables may be recreated from a snapshot: drop their
         // AUTOINCREMENT watermarks with them or the recreated table resumes
         // from a stale counter (see DROP TABLE).
         self.autoinc_cache.clear();
-        self.save_catalog()
+        self.save_catalog_into(&mut tx)?;
+        self.commit_pager_tx(tx)?;
+        Ok(())
+    }
+
+    /// Release every page a table's storage occupies: heap pages, index-tree
+    /// pages and recycled overflow-chain pages. Called for tables being
+    /// dropped or wiped (a `rewrite_table` keeps `overflow_free`, which its
+    /// next incarnation reuses for chains, so it frees only heap/tree pages).
+    fn free_table_storage(&self, tx: &mut crate::pager::Tx, meta: &TableMeta) -> Result<()> {
+        for &p in &meta.pages {
+            self.pager.free_page(tx, p)?;
+        }
+        for &p in &meta.overflow_free {
+            self.pager.free_page(tx, p)?;
+        }
+        for (root_key, &root) in &meta.index_roots {
+            for p in BTree::open(root)
+                .collect_pages(&PageReader::current(&self.pager), tx)
+                .map_err(|e| index_err(root_key, e))?
+            {
+                self.pager.free_page(tx, p)?;
+            }
+        }
+        Ok(())
     }
 
     // ---- catch-up replication: journal + positions ----
@@ -4401,6 +4473,10 @@ impl Database {
                 ..
             } => {
                 if object_type == sqlparser::ast::ObjectType::Index {
+                    // Composites roots removed below release their tree in
+                    // the same catalog transaction; pages staged here never
+                    // fight the readers (write lock held, snapshots use WAL).
+                    let mut dropped_roots: Vec<(String, u32)> = Vec::new();
                     for n in &names {
                         let iname = obj_name(n);
                         // Constraint indexes are derived from the table's
@@ -4443,7 +4519,9 @@ impl Database {
                                     {
                                         let def = meta.index_defs.remove(dpos);
                                         if def.columns.len() > 1 {
-                                            meta.index_roots.remove(&iname);
+                                            if let Some(root) = meta.index_roots.remove(&iname) {
+                                                dropped_roots.push((iname.clone(), root));
+                                            }
                                         }
                                         // Lift UNIQUE only when this index was
                                         // the sole source: table-declared
@@ -4473,7 +4551,17 @@ impl Database {
                             }
                         }
                     }
-                    self.save_catalog()?;
+                    let mut tx = self.pager.begin_tx();
+                    for (root_key, root) in dropped_roots {
+                        for p in BTree::open(root)
+                            .collect_pages(&PageReader::current(&self.pager), &tx)
+                            .map_err(|e| index_err(&root_key, e))?
+                        {
+                            self.pager.free_page(&mut tx, p)?;
+                        }
+                    }
+                    self.save_catalog_into(&mut tx)?;
+                    self.commit_pager_tx(tx)?;
                     return Ok(ExecOutcome::Affected(0));
                 }
                 if object_type != sqlparser::ast::ObjectType::Table {
@@ -4523,7 +4611,11 @@ impl Database {
                         .ok();
                     }
                 }
+                let mut tx = self.pager.begin_tx();
                 for name in &dropping {
+                    if let Some(meta) = self.tables.get(name) {
+                        self.free_table_storage(&mut tx, meta)?;
+                    }
                     self.tables.remove(name);
                     // A recreated table must start its AUTOINCREMENT counter
                     // from its own rows (max+1), not inherit the dropped
@@ -4531,7 +4623,8 @@ impl Database {
                     // different value and the nodes diverge.
                     self.autoinc_cache.remove(name);
                 }
-                self.save_catalog()?;
+                self.save_catalog_into(&mut tx)?;
+                self.commit_pager_tx(tx)?;
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Insert(insert) => self.exec_insert(insert),
@@ -4581,13 +4674,16 @@ impl Database {
                 if self.tx_snapshot.is_some() {
                     return err("transaction already in progress");
                 }
-                self.tx_snapshot = Some(self.snapshot_all()?);
+                self.pager.begin_undo();
+                self.tx_snapshot = Some(self.catalog_snapshot());
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Commit { .. } => {
                 if self.tx_snapshot.take().is_none() {
                     return err("no transaction in progress");
                 }
+                // The page undo journal dies with the transaction.
+                self.pager.end_undo();
                 // Savepoints die with their transaction: a stale mark must
                 // not be reachable from a later transaction's ROLLBACK TO.
                 self.savepoints.clear();
@@ -4647,21 +4743,52 @@ impl Database {
         }
     }
 
-    /// Rewrite the whole table from `docs` (delete+reinsert; old pages and
-    /// old index trees are orphaned). Rebuilds every index tree for the
-    /// table, updates `meta` in place, and re-inserts it into the catalog.
+    /// Rewrite the whole table from `docs` (delete+reinsert). Rebuilds every
+    /// index tree for the table, updates `meta` in place, and re-inserts it
+    /// into the catalog. The old heap pages and index-tree pages are released
+    /// into the pager's reusable pool inside the same transaction, so a
+    /// rebuild reuses its own storage instead of growing the file.
     fn rewrite_table(
         &mut self,
         table: &str,
         meta: &mut TableMeta,
         docs: Vec<Object>,
     ) -> Result<()> {
+        self.rewrite_table_inner(table, meta, docs, true)
+    }
+
+    fn rewrite_table_inner(
+        &mut self,
+        table: &str,
+        meta: &mut TableMeta,
+        docs: Vec<Object>,
+        free_old: bool,
+    ) -> Result<()> {
         let mut heap = Heap {
             pages: Vec::new(),
             overflow_free: meta.overflow_free.clone(),
+            dropped: Vec::new(),
         };
         let cols: Vec<String> = meta.index_roots.keys().cloned().collect();
         let mut tx = self.pager.begin_tx();
+        // Release old storage BEFORE the rebuild: allocations below then pop
+        // those pages back (same transaction, so the catalog switch and the
+        // page rewrites are atomic; snapshots rebuild old versions from the
+        // WAL and never observe the reuse). Restore paths skip this (see
+        // `rewrite_table_restore`).
+        if free_old {
+            for &p in &meta.pages {
+                self.pager.free_page(&mut tx, p)?;
+            }
+            for (root_key, &root) in &meta.index_roots {
+                for p in BTree::open(root)
+                    .collect_pages(&PageReader::current(&self.pager), &tx)
+                    .map_err(|e| index_err(root_key, e))?
+                {
+                    self.pager.free_page(&mut tx, p)?;
+                }
+            }
+        }
         let mut pairs: Vec<(u64, Object)> = Vec::with_capacity(docs.len());
         for doc in &docs {
             let loc = heap.insert(&self.pager, &mut tx, doc)?;
@@ -4750,6 +4877,7 @@ impl Database {
             let docs = Heap {
                 pages: meta.pages.clone(),
                 overflow_free: meta.overflow_free.clone(),
+                dropped: Vec::new(),
             }
             .scan(&PageReader::current(&self.pager))?;
             for d in &docs {
@@ -4981,6 +5109,7 @@ impl Database {
         let mut heap = Heap {
             pages: meta.pages.clone(),
             overflow_free: meta.overflow_free.clone(),
+            dropped: Vec::new(),
         };
         let mut roots = meta.index_roots.clone();
         let idx_specs = idx_specs(&meta, &roots);
@@ -5068,6 +5197,11 @@ impl Database {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
             }
+        }
+        // Emptied heap pages are released inside this transaction so later
+        // statements reuse them instead of growing the file.
+        for p in std::mem::take(&mut heap.dropped) {
+            self.pager.free_page(&mut tx, p)?;
         }
         if heap.pages != meta.pages
             || roots != meta.index_roots
@@ -5217,6 +5351,7 @@ impl Database {
         let mut heap = Heap {
             pages: meta.pages.clone(),
             overflow_free: meta.overflow_free.clone(),
+            dropped: Vec::new(),
         };
         let mut roots = meta.index_roots.clone();
         let idx_specs = idx_specs(&meta, &roots);
@@ -5244,6 +5379,11 @@ impl Database {
                 *old_l,
                 *new_l,
             )?;
+        }
+        // Emptied heap pages are released inside this transaction so later
+        // statements reuse them instead of growing the file.
+        for p in std::mem::take(&mut heap.dropped) {
+            self.pager.free_page(&mut tx, p)?;
         }
         if heap.pages != meta.pages
             || roots != meta.index_roots
@@ -6194,6 +6334,7 @@ impl Database {
         let mut heap = Heap {
             pages: meta.pages.clone(),
             overflow_free: meta.overflow_free.clone(),
+            dropped: Vec::new(),
         };
         let mut roots = meta.index_roots.clone();
         let mut tx = self.pager.begin_tx();
@@ -6392,6 +6533,7 @@ impl Database {
             let mut combined = match (Heap {
                 pages: meta.pages.clone(),
                 overflow_free: meta.overflow_free.clone(),
+                dropped: Vec::new(),
             }
             .scan(&PageReader::current(&self.pager)))
             {
@@ -6408,6 +6550,11 @@ impl Database {
             }
         }
         let count = placed.len() as u64;
+        // Emptied heap pages are released inside this transaction so later
+        // statements reuse them instead of growing the file.
+        for p in std::mem::take(&mut heap.dropped) {
+            self.pager.free_page(&mut tx, p)?;
+        }
         if heap.pages != meta.pages
             || roots != meta.index_roots
             || heap.overflow_free != meta.overflow_free
@@ -6618,6 +6765,7 @@ impl Database {
         let mut heap = Heap {
             pages: meta.pages.clone(),
             overflow_free: meta.overflow_free.clone(),
+            dropped: Vec::new(),
         };
         let mut roots = meta.index_roots.clone();
         let idx_specs = idx_specs(&meta, &roots);
@@ -6748,6 +6896,11 @@ impl Database {
                 }
                 inserted += 1;
             }
+        }
+        // Emptied heap pages are released inside this transaction so later
+        // statements reuse them instead of growing the file.
+        for p in std::mem::take(&mut heap.dropped) {
+            self.pager.free_page(&mut tx, p)?;
         }
         if heap.pages != meta.pages
             || roots != meta.index_roots
@@ -10830,6 +10983,107 @@ mod tests {
         // and the failed UPDATE changed nothing
         let r = rows(&mut db, "SELECT name FROM t WHERE id = 4");
         assert_eq!(r.rows, vec![vec![Value::Str("u4".into())]]);
+    }
+
+    #[test]
+    fn rollback_restores_truncate_and_large_tables_from_page_undo() {
+        // Transaction rollback rides the pager's page undo journal (no
+        // whole-database deep copy at BEGIN). TRUNCATE rewrites every page:
+        // rolling it back must restore content and page ownership exactly.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        for i in 0..300 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'value-{i}')"));
+        }
+        run(&mut db, "BEGIN");
+        run(&mut db, "TRUNCATE TABLE t");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0],
+            Value::Int(0)
+        );
+        run(&mut db, "INSERT INTO t VALUES (999, 'after-truncate')");
+        run(&mut db, "ROLLBACK");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0],
+            Value::Int(300)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT v FROM t WHERE id = 7").rows,
+            vec![vec![Value::Str("value-7".into())]]
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t WHERE id = 999").rows[0][0],
+            Value::Int(0)
+        );
+        // Page ownership after the rollback is coherent: new writes reuse
+        // storage and survive a reopen.
+        run(&mut db, "INSERT INTO t VALUES (1000, 'post-rollback')");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb-undo.db");
+        drop(db);
+        let mut disk = Database::open(&path).unwrap();
+        run(&mut disk, "CREATE TABLE u (id INT PRIMARY KEY)");
+        for i in 0..50 {
+            run(&mut disk, &format!("INSERT INTO u VALUES ({i})"));
+        }
+        let pages = disk.num_pages();
+        run(&mut disk, "BEGIN");
+        run(&mut disk, "DELETE FROM u");
+        run(&mut disk, "ROLLBACK");
+        assert_eq!(
+            rows(&mut disk, "SELECT COUNT(*) FROM u").rows[0][0],
+            Value::Int(50)
+        );
+        // Reopen after the rollback: everything intact.
+        drop(disk);
+        let mut disk = Database::open(&path).unwrap();
+        assert_eq!(
+            rows(&mut disk, "SELECT COUNT(*) FROM u").rows[0][0],
+            Value::Int(50)
+        );
+        assert!(disk.num_pages() <= pages + 8);
+    }
+
+    #[test]
+    fn rewrite_truncate_and_drop_reuse_pages() {
+        // Page reuse: rebuild/TRUNCATE/DROP churn must not grow the data file
+        // without bound (the old behavior orphaned every replaced page).
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        for i in 0..200 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'value-{i}')"));
+        }
+        let baseline = db.num_pages();
+        for _ in 0..5 {
+            run(&mut db, "TRUNCATE TABLE t");
+            for i in 0..200 {
+                run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'value-{i}')"));
+            }
+        }
+        assert!(
+            db.num_pages() <= baseline + 16,
+            "TRUNCATE churn grew the file: {baseline} -> {}",
+            db.num_pages()
+        );
+        for _ in 0..5 {
+            run(&mut db, "UPDATE t SET v = v || '!'");
+        }
+        assert!(
+            db.num_pages() <= baseline + 32,
+            "rewrite churn grew the file: {baseline} -> {}",
+            db.num_pages()
+        );
+        // Data is intact after all the churn.
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(200));
+        let before_drop = db.num_pages();
+        run(&mut db, "DROP TABLE t");
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        assert!(
+            db.num_pages() <= before_drop + 4,
+            "DROP+CREATE grew the file: {before_drop} -> {}",
+            db.num_pages()
+        );
     }
 
     #[test]

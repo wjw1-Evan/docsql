@@ -133,6 +133,14 @@ pub struct Pager {
     /// a page whose newest version predates the snapshot is served from the
     /// current read surfaces without touching the WAL.
     page_lsn: std::sync::Mutex<HashMap<u32, u64>>,
+    /// Pages freed by committed transactions, reused by the next
+    /// allocation (see [`ReusablePages`]). Shared with every `Tx` so an
+    /// abandoned transaction can hand back the ids it popped.
+    reusable: std::sync::Arc<std::sync::Mutex<ReusablePages>>,
+    /// Explicit-transaction undo journal (empty unless a SQL BEGIN is
+    /// active). Holds one 4 KB pre-image per *modified* page — proportional
+    /// to the transaction's writes, not to the database size.
+    undo: std::sync::Mutex<UndoState>,
     /// Registered read snapshots (MVCC stage B); see [`SnapEntry`].
     snaps: std::sync::Mutex<SnapState>,
     /// Background checkpoint coordinator; see `maybe_checkpoint`.
@@ -254,6 +262,67 @@ struct Page {
     ticket: u64,
 }
 
+/// Pages released by committed transactions, available for immediate reuse.
+/// In-memory only: a restart starts with an empty pool and whatever was
+/// freed-but-unused is simply never reused again (the file keeps its size,
+/// the pages stay unreferenced) — correctness never depends on a durable
+/// free list, which is why this needs no WAL or header format change. The
+/// `set` dedups: a page freed twice must never be handed out twice.
+#[derive(Default)]
+struct ReusablePages {
+    order: Vec<u32>,
+    set: std::collections::HashSet<u32>,
+}
+
+impl ReusablePages {
+    fn push(&mut self, id: u32) {
+        if self.set.insert(id) {
+            self.order.push(id);
+        }
+    }
+
+    fn pop(&mut self) -> Option<u32> {
+        // Entries reserved by an undo (`reserve`) stay in `order` but are no
+        // longer in `set`; skip them.
+        while let Some(id) = self.order.pop() {
+            if self.set.remove(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+}
+
+/// One entry of the explicit-transaction undo journal (see
+/// [`Pager::begin_undo`]). Replayed in reverse to restore the pre-transaction
+/// page state; the catalog itself is snapshotted by the engine as Arc clones.
+pub enum UndoOp {
+    /// A page image to restore: the first modification in a savepoint region
+    /// records the region's starting image, and every SAVEPOINT records a
+    /// fresh image for each page touched so far (`freed` handling below).
+    Set(u32, Vec<u8>),
+    /// A page allocated by the transaction (not by freeing another page it
+    /// had itself released): rollback returns it to the reusable pool.
+    Alloc(u32),
+    /// A page allocated *after* the transaction released it: rollback makes
+    /// it live again (its content was never overwritten before the reuse, so
+    /// the recorded/restored image is already correct).
+    Realloc(u32),
+    /// A page released by the transaction: rollback reserves it so no later
+    /// allocation can hand it out while the restored catalog references it.
+    Free(u32),
+}
+
+#[derive(Default)]
+struct UndoState {
+    active: bool,
+    ops: Vec<UndoOp>,
+    /// Pages whose current-region `Set` pre-image is already in `ops`.
+    recorded: std::collections::HashSet<u32>,
+    /// Pages released by this transaction so far (decides Alloc vs Realloc).
+    freed: std::collections::HashSet<u32>,
+}
+
 /// Buffer pool state guarded by `Pager.pool`'s mutex.
 #[derive(Default)]
 struct PoolState {
@@ -364,6 +433,8 @@ impl Pager {
             max_pool: DEFAULT_POOL_PAGES,
             pending_writes: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             page_lsn: std::sync::Mutex::new(HashMap::new()),
+            reusable: std::sync::Arc::new(std::sync::Mutex::new(ReusablePages::default())),
+            undo: std::sync::Mutex::new(UndoState::default()),
             snaps: std::sync::Mutex::new(SnapState::default()),
             ckpt: std::sync::Arc::new(CkptShared {
                 st: std::sync::Mutex::new(CkptState::default()),
@@ -583,11 +654,177 @@ impl Pager {
         )
     }
 
-    /// Allocate a new page, zero-filled (visible only after commit).
+    /// Allocate a zero-filled page, preferring one released by an earlier
+    /// committed transaction (visible only after commit either way). Reuse
+    /// keeps TRUNCATE/ROLLBACK/rewrite churn from growing the file without
+    /// bound; callers always write the page in full, so the zero fill only
+    /// matters for pages written partially (none today).
     pub fn allocate_page(&self, tx: &mut Tx) -> Result<u32> {
-        let id = self.num_pages.fetch_add(1, Ordering::Relaxed);
-        tx.staged.insert(id, vec![0u8; PAGE_SIZE]);
+        let reused = lock(&self.reusable).pop();
+        let id = match reused {
+            Some(id) => {
+                tx.reused.push(id);
+                id
+            }
+            None => self.num_pages.fetch_add(1, Ordering::Relaxed),
+        };
+        // Realloc: the transaction freed this page itself, so the restored
+        // catalog still owns it and its content must be recorded NOW (the
+        // zero-fill below would otherwise become the rollback target, and
+        // the caller's write_page finds the page already staged).
+        let was_freed = {
+            let u = lock(&self.undo);
+            u.active && u.freed.contains(&id)
+        };
+        {
+            let mut u = lock(&self.undo);
+            if u.active && was_freed && u.recorded.insert(id) {
+                drop(u);
+                let image = self.current_page_image(id)?;
+                let mut u = lock(&self.undo);
+                u.ops.push(UndoOp::Set(id, image));
+                u.ops.push(UndoOp::Realloc(id));
+            } else if u.active && !was_freed {
+                u.ops.push(UndoOp::Alloc(id));
+            }
+        }
+        tx.staged.entry(id).or_insert_with(|| vec![0u8; PAGE_SIZE]);
         Ok(id)
+    }
+
+    /// Release a page. The release takes effect only when `tx` commits —
+    /// until then the current catalog may still reference it, and an
+    /// aborted transaction must leave it owned. A page allocated by this
+    /// same transaction is simply discarded (its staged image is dropped).
+    pub fn free_page(&self, tx: &mut Tx, id: u32) -> Result<()> {
+        if id == 0 || id >= self.num_pages() {
+            return Err(PagerError::OutOfRange(id, self.num_pages()));
+        }
+        {
+            let mut u = lock(&self.undo);
+            if u.active {
+                // Frees never modify content, so no image is needed: undoing
+                // the Free (reserving the page) leaves the restored catalog
+                // reading the bytes it always had. A later reuse's first
+                // write records the page's content (still intact) as its
+                // region image, which the rollback replay writes back.
+                u.freed.insert(id);
+                u.ops.push(UndoOp::Free(id));
+            }
+        }
+        tx.staged.remove(&id);
+        tx.to_free.push(id);
+        Ok(())
+    }
+
+    /// Begin recording the undo journal for an explicit transaction.
+    pub fn begin_undo(&self) {
+        let mut u = lock(&self.undo);
+        *u = UndoState {
+            active: true,
+            ..UndoState::default()
+        };
+    }
+
+    /// Stop recording and drop the journal (SQL COMMIT).
+    pub fn end_undo(&self) {
+        let mut u = lock(&self.undo);
+        *u = UndoState::default();
+    }
+
+    /// Journal length marker for SAVEPOINT; call before `undo_savepoint` so
+    /// the savepoint's baseline images land inside the tail a ROLLBACK TO
+    /// replays.
+    pub fn undo_mark(&self) -> usize {
+        lock(&self.undo).ops.len()
+    }
+
+    /// SAVEPOINT baseline: record the *current* image of every page touched
+    /// in this transaction so far. Per-page-per-region accounting keeps the
+    /// journal proportional to what each region wrote, while savepoints stay
+    /// exact (a page rewritten after the savepoint is restored to the
+    /// baseline, not to the transaction start).
+    pub fn undo_savepoint(&self) -> Result<()> {
+        let ids: Vec<u32> = {
+            let u = lock(&self.undo);
+            if !u.active {
+                return Ok(());
+            }
+            u.recorded.iter().copied().collect()
+        };
+        let mut images = Vec::with_capacity(ids.len());
+        for id in ids {
+            images.push((id, self.current_page_image(id)?));
+        }
+        let mut u = lock(&self.undo);
+        if u.active {
+            for (id, image) in images {
+                u.ops.push(UndoOp::Set(id, image));
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the journal tail from `mark` (ROLLBACK TO SAVEPOINT) and rebuild
+    /// the recording sets from what remains.
+    pub fn take_undo_to(&self, mark: usize) -> Vec<UndoOp> {
+        let mut u = lock(&self.undo);
+        let tail = u.ops.split_off(mark);
+        u.recorded = u
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                UndoOp::Set(id, _) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        u.freed = u
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                UndoOp::Free(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        tail
+    }
+
+    /// Take the whole journal and stop recording (SQL ROLLBACK).
+    pub fn take_undo(&self) -> Vec<UndoOp> {
+        let mut u = lock(&self.undo);
+        let ops = std::mem::take(&mut u.ops);
+        u.active = false;
+        u.recorded.clear();
+        u.freed.clear();
+        ops
+    }
+
+    /// Undo of a `Free`: the page is live again in the restored catalog, so
+    /// make sure no allocation can hand it out.
+    pub fn reserve_page(&self, id: u32) {
+        lock(&self.reusable).set.remove(&id);
+    }
+
+    /// Commit-time release of `to_free` into the reusable pool.
+    fn release_pages(&self, to_free: Vec<u32>) {
+        if to_free.is_empty() {
+            return;
+        }
+        let mut r = lock(&self.reusable);
+        for id in to_free {
+            r.push(id);
+        }
+    }
+
+    /// Return ids popped from the reusable pool by an abandoned tx.
+    fn return_reused(&self, reused: Vec<u32>) {
+        if reused.is_empty() {
+            return;
+        }
+        let mut r = lock(&self.reusable);
+        for id in reused {
+            r.push(id);
+        }
     }
 
     /// Begin a write transaction. Staged page writes are private until commit.
@@ -596,6 +833,9 @@ impl Pager {
         Tx {
             id: txid,
             staged: HashMap::new(),
+            to_free: Vec::new(),
+            reused: Vec::new(),
+            reusable: self.reusable.clone(),
         }
     }
 
@@ -623,6 +863,12 @@ impl Pager {
         }
         if let std::collections::hash_map::Entry::Vacant(e) = tx.staged.entry(id) {
             let base = self.current_page_image(id)?;
+            {
+                let mut u = lock(&self.undo);
+                if u.active && u.recorded.insert(id) {
+                    u.ops.push(UndoOp::Set(id, base.clone()));
+                }
+            }
             e.insert(base);
         }
         let page = tx.staged.get_mut(&id).expect("just inserted");
@@ -749,8 +995,13 @@ impl Pager {
         Ok(())
     }
 
-    fn commit_tx_inner(&self, tx: Tx, fsync: bool) -> Result<u64> {
+    fn commit_tx_inner(&self, mut tx: Tx, fsync: bool) -> Result<u64> {
         if tx.staged.is_empty() {
+            // A transaction that only released pages: nothing to log (the
+            // pool is in-memory and the old catalog still owns the pages
+            // until this commit), just take the release.
+            self.release_pages(std::mem::take(&mut tx.to_free));
+            tx.reused.clear();
             return Ok(0);
         }
         self.try_free_truncate()?;
@@ -789,6 +1040,12 @@ impl Pager {
             }
             lsn
         };
+        // WAL-committed: the old catalog version can no longer be observed
+        // (snapshots rebuild from the WAL), so the pages are safe to reuse.
+        self.release_pages(std::mem::take(&mut tx.to_free));
+        // The committed tx's allocations keep their ids: do not return them
+        // to the pool via Drop.
+        tx.reused.clear();
         if fsync {
             // The WAL fsync also durable-d every earlier deferred commit:
             // flush those pages too, then write this tx's pages (they are in
@@ -884,12 +1141,14 @@ impl Pager {
     /// WAL bound: a ruled-out transaction leaves dead frames in the log
     /// (a failed snapshot adoption appends tens of MB), and nothing else
     /// would shrink it until the next successful commit.
-    pub fn abort_tx(&self, tx: Tx) -> Result<()> {
+    pub fn abort_tx(&self, mut tx: Tx) -> Result<()> {
         if !tx.staged.is_empty() {
             self.ckpt.appends.fetch_add(1, Ordering::Relaxed);
             lock(&self.wal).abort(tx.id)?;
             self.maybe_checkpoint()?;
         }
+        // Frees never took effect; reuse ids popped from the pool go back.
+        self.return_reused(std::mem::take(&mut tx.reused));
         Ok(())
     }
 
@@ -1089,6 +1348,24 @@ impl<'a> PageReader<'a> {
 pub struct Tx {
     id: u64,
     staged: HashMap<u32, Vec<u8>>,
+    /// Pages to release into the reusable pool when this tx commits.
+    to_free: Vec<u32>,
+    /// Ids popped from the reusable pool by this tx's allocations.
+    reused: Vec<u32>,
+    /// Shared with the pager so a dropped (never committed) tx can hand the
+    /// reused ids back.
+    reusable: std::sync::Arc<std::sync::Mutex<ReusablePages>>,
+}
+
+impl Drop for Tx {
+    fn drop(&mut self) {
+        if !self.reused.is_empty() {
+            let mut r = lock(&self.reusable);
+            for id in self.reused.drain(..) {
+                r.push(id);
+            }
+        }
+    }
 }
 
 impl Drop for Pager {
@@ -1403,6 +1680,56 @@ mod tests {
         let page = pager.read_page(page_id).unwrap().to_vec();
         assert_eq!(&page[..magic.len()], magic);
         assert_eq!(&page[20..26], b"APPEND");
+    }
+
+    #[test]
+    fn freed_pages_are_reused_and_stay_valid() {
+        let (_dir, path) = tmp_db("reuse.db");
+        let pager = Pager::open(&path).unwrap();
+        let mut tx = pager.begin_tx();
+        let a = pager.allocate_page(&mut tx).unwrap();
+        let b = pager.allocate_page(&mut tx).unwrap();
+        pager.write_page(&mut tx, a, 0, b"alive").unwrap();
+        pager.write_page(&mut tx, b, 0, b"second").unwrap();
+        pager.commit_tx(tx).unwrap();
+        let pages_before = pager.num_pages();
+
+        // Free b and commit: the next allocation must get b back, not grow.
+        let mut tx = pager.begin_tx();
+        pager.free_page(&mut tx, b).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let mut tx = pager.begin_tx();
+        let c = pager.allocate_page(&mut tx).unwrap();
+        assert_eq!(c, b, "freed page must be reused");
+        pager.write_page(&mut tx, c, 0, b"recycled").unwrap();
+        pager.commit_tx(tx).unwrap();
+        assert_eq!(pager.num_pages(), pages_before);
+        assert_eq!(&pager.read_page(a).unwrap()[..5], b"alive");
+        assert_eq!(&pager.read_page(b).unwrap()[..8], b"recycled");
+
+        // A free rolled back by an aborted tx never takes effect.
+        let mut tx = pager.begin_tx();
+        pager.free_page(&mut tx, a).unwrap();
+        pager.abort_tx(tx).unwrap();
+        assert_eq!(&pager.read_page(a).unwrap()[..5], b"alive");
+        // A page allocated in an aborted tx returns to the pool.
+        let mut tx = pager.begin_tx();
+        pager.free_page(&mut tx, b).unwrap();
+        pager.commit_tx(tx).unwrap();
+        let mut tx = pager.begin_tx();
+        let d = pager.allocate_page(&mut tx).unwrap();
+        assert_eq!(d, b);
+        pager.abort_tx(tx).unwrap();
+        let mut tx = pager.begin_tx();
+        let e = pager.allocate_page(&mut tx).unwrap();
+        assert_eq!(e, b, "aborted allocation must hand the id back");
+        pager.abort_tx(tx).unwrap();
+
+        // Reopen: the file is intact and the pool starts empty.
+        drop(pager);
+        let pager = Pager::open(&path).unwrap();
+        assert_eq!(&pager.read_page(a).unwrap()[..5], b"alive");
+        assert_eq!(&pager.read_page(b).unwrap()[..8], b"recycled");
     }
 
     #[test]

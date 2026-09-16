@@ -101,6 +101,15 @@ pub struct ServerState {
     pub apply_locks: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
     >,
+    /// Fan-out circuit breaker: target -> (retry_after, consecutive
+    /// transport failures). A peer that accepts TCP but never answers would
+    /// otherwise add the full IO budget to EVERY write (the fan-out runs
+    /// under write_order); backing off for a growing window keeps the write
+    /// path responsive while the peer recovers or its outage shows in the
+    /// sync log. Application errors (peer rejected the statement) never trip
+    /// it — the peer is alive and answering.
+    pub peer_backoff:
+        tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
     /// Live connection budget (resource control). Acquired per accepted
     /// connection, released on close; None = unlimited.
     pub conn_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -474,6 +483,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         peers: tokio::sync::Mutex::new(peers),
         tx_pending: tokio::sync::Mutex::new(TxPending::new()),
         apply_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        peer_backoff: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         tx_owner: std::sync::Mutex::new(None),
         write_order: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         holds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -638,6 +648,33 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             }
         });
     }
+}
+
+/// Peers accepted from dynamic join registration. The static config list is
+/// operator-controlled; this caps what an authenticated joiner can append
+/// (each entry costs a per-write connection attempt, so an unbounded list is
+/// a write-path DoS).
+const MAX_DYNAMIC_PEERS: usize = 64;
+
+/// Parse a peer address as `host:port` (IPv4/hostname, or bracketed IPv6).
+/// Rejects empty/garbage: a black-hole entry would stretch every write by
+/// the fan-out timeout.
+fn parse_peer_addr(s: &str) -> Option<(String, u16)> {
+    if s.is_empty() || s.len() > 300 || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        return (sa.port() != 0).then(|| (sa.ip().to_string(), sa.port()));
+    }
+    let (host, port) = s.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((host.to_string(), port))
 }
 
 /// Frame types spoken only by cluster nodes (sequenced writes, catch-up,
@@ -947,9 +984,13 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let writer = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
             let f = if let Some(k) = key {
+                let flags = f.flags | crypto::FLAG_ENCRYPTED;
+                // The transmitted header is the tag's associated data: a
+                // MITM cannot flip a flag without invalidating the frame.
+                let payload = crypto::seal(&k, f.frame_type, flags, &f.payload);
                 Frame {
-                    flags: f.flags | crypto::FLAG_ENCRYPTED,
-                    payload: crypto::seal(&k, &f.payload),
+                    flags,
+                    payload,
                     ..f
                 }
             } else {
@@ -1081,7 +1122,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                         .await;
                     break;
                 }
-                match crypto::open(&k, &frame.payload) {
+                match crypto::open(&k, frame.frame_type, frame.flags, &frame.payload) {
                     Ok(pt) => frame.payload = pt,
                     Err(e) => {
                         let _ = tx
@@ -2182,11 +2223,16 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
     // journal_head/oldest may lazily create the cluster tables (&mut path):
     // take them on the WRITE tier FIRST — holding the read guard while
     // asking for the write lock would deadlock the same thread.
-    let (journal_head, journal_oldest) = {
+    let (journal_head, journal_oldest, user_state) = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         (
             db.journal_head().unwrap_or(0),
             db.journal_oldest().unwrap_or(0),
+            // A node whose only state is user accounts still holds data a
+            // fresh joiner must adopt (the user tables replicate); `tables`
+            // alone would classify it as empty and two such nodes would
+            // never converge.
+            db.any_user_exists().unwrap_or(false),
         )
     };
     // Read tier: the census is a set of plain SELECTs — concurrent readers
@@ -2228,6 +2274,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         },
         "durable_lsn": db.durable_lsn(),
         "totals": {"tables": user_tables, "rows": total_rows},
+        "user_state": user_state,
         "metrics": state.metrics.snapshot_json(),
         "cluster_id": state.cluster_id,
         "journal_head": journal_head,
@@ -2768,7 +2815,10 @@ pub(crate) const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub(crate) const RECV_CAP: usize = 64 * 1024 * 1024;
 
 /// Read one response frame from an outbound connection.
-async fn read_response_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
+async fn read_response_frame(
+    stream: &mut TcpStream,
+    key: Option<&crypto::TransportKey>,
+) -> std::io::Result<Frame> {
     let mut header = [0u8; proto::HEADER_LEN];
     tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut header)).await??;
     let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
@@ -2782,7 +2832,29 @@ async fn read_response_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
     let mut payload = vec![0u8; len];
     tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut payload)).await??;
     buf.extend_from_slice(&payload);
-    let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
+    let (mut f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
+    // Peer responses are sealed like any other frame; the old code handed
+    // encrypted payloads to its callers (status JSON, AUTH replies), so a
+    // keyed cluster could not actually talk to itself.
+    match key {
+        Some(k) => {
+            if f.flags & crypto::FLAG_ENCRYPTED == 0 {
+                return Err(std::io::Error::other(format!(
+                    "peer sent an unencrypted {} response on a keyed transport",
+                    f.frame_type
+                )));
+            }
+            f.payload = crypto::open(k, f.frame_type, f.flags, &f.payload)
+                .map_err(std::io::Error::other)?;
+        }
+        None => {
+            if f.flags & crypto::FLAG_ENCRYPTED != 0 {
+                return Err(std::io::Error::other(
+                    "peer sent an encrypted response but no transport key is configured",
+                ));
+            }
+        }
+    }
     Ok(f)
 }
 
@@ -2795,11 +2867,11 @@ async fn auth_on(
 ) -> std::io::Result<()> {
     let mut frame = Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec());
     if let Some(k) = key {
-        frame.payload = crypto::seal(k, &frame.payload);
         frame.flags |= crypto::FLAG_ENCRYPTED;
+        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload);
     }
     write_frame_on(stream, &frame).await?;
-    let resp = read_response_frame(stream).await?;
+    let resp = read_response_frame(stream, key).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "peer rejected AUTH: {}",
@@ -2832,8 +2904,8 @@ fn replication_frame(
     let mut frame = Frame::new(frame_type, payload);
     frame.flags = FLAG_REPLICATION;
     if let Some(k) = key {
-        frame.payload = crypto::seal(k, &frame.payload);
         frame.flags |= crypto::FLAG_ENCRYPTED;
+        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload);
     }
     frame
 }
@@ -2856,7 +2928,7 @@ async fn send_frame_on(
 ) -> std::io::Result<(Frame, TcpStream)> {
     let frame = replication_frame(frame_type, payload.to_vec(), key);
     write_frame_on(&mut stream, &frame).await?;
-    let resp = read_response_frame(&mut stream).await?;
+    let resp = read_response_frame(&mut stream, key).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "replica rejected: {}",
@@ -2944,7 +3016,7 @@ async fn forward_frame_raw(
     let mut stream = open_peer_conn(target, key, auth).await?;
     let frame = replication_frame(frame_type, payload.to_vec(), key);
     write_frame_on(&mut stream, &frame).await?;
-    read_response_frame(&mut stream).await
+    read_response_frame(&mut stream, key).await
 }
 
 /// Credential fan-out presents to peers: the cluster token when
@@ -3011,8 +3083,65 @@ async fn fanout_targets(state: &ServerState) -> Vec<String> {
     if let Some(target) = state.replicate_to.lock().await.clone() {
         targets.push(target);
     }
-    targets.extend(state.peers.lock().await.clone());
+    for peer in state.peers.lock().await.clone() {
+        if !targets.contains(&peer) {
+            targets.push(peer);
+        }
+    }
     targets
+}
+
+/// Budget for a write to a peer currently in backoff: enough for a healthy
+/// peer to answer (the receiver may be waiting out a client transaction, so
+/// the budget is not tiny), small enough that a black-holed peer does not
+/// add the full IO timeout to every write under write_order.
+const FANOUT_TRIAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Transport-level failure? Only these trip the circuit breaker.
+fn transport_failure(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionRefused
+            | ConnectionAborted
+            | ConnectionReset
+            | BrokenPipe
+            | UnexpectedEof
+            | NotConnected
+            | AddrNotAvailable
+            | TimedOut
+    )
+}
+
+/// Record one fan-out outcome for `target`: success clears the breaker,
+/// transport failures extend the backoff (2s doubling to 60s).
+async fn note_fanout_failure(state: &ServerState, target: &str, e: &std::io::Error) {
+    if !transport_failure(e) {
+        return;
+    }
+    let mut backoff = state.peer_backoff.lock().await;
+    let failures = backoff.get(target).map(|(_, n)| *n + 1).unwrap_or(1);
+    let secs = (1u64 << failures.min(5)).min(60);
+    let was_cold = !backoff.contains_key(target);
+    backoff.insert(
+        target.to_string(),
+        (
+            std::time::Instant::now() + std::time::Duration::from_secs(secs),
+            failures,
+        ),
+    );
+    if was_cold {
+        eprintln!(
+            "replication: {target} unreachable ({e}); backoff {secs}s (writes buffered by peers' rejoin repair)"
+        );
+    }
+}
+
+async fn note_fanout_success(state: &ServerState, target: &str) {
+    let mut backoff = state.peer_backoff.lock().await;
+    if let Some((_, n)) = backoff.remove(target) {
+        eprintln!("replication: {target} recovered after {n} failure(s)");
+    }
 }
 
 /// Fan one SQL write out to the replication upstream and every peer, in
@@ -3024,14 +3153,38 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u6
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
     let targets = fanout_targets(state).await;
+    let now = std::time::Instant::now();
+    let in_backoff: std::collections::HashSet<String> = {
+        let backoff = state.peer_backoff.lock().await;
+        backoff
+            .iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(t, _)| t.clone())
+            .collect()
+    };
     let mut tasks = tokio::task::JoinSet::new();
     for target in targets {
         let sql = sql.to_string();
         let auth = auth.clone();
         let node_id = state.cluster_id.clone();
+        let trial = in_backoff.contains(&target);
         tasks.spawn(async move {
-            let res =
-                forward_write(&target, &sql, seq, &node_id, key.as_ref(), auth.as_deref()).await;
+            let call = forward_write(&target, &sql, seq, &node_id, key.as_ref(), auth.as_deref());
+            // Backed-off peers still receive every write — just with a
+            // short budget, so a restarted peer recovers immediately (its
+            // answer clears the breaker) while a dead one cannot stretch
+            // the write path.
+            let res = if trial {
+                match tokio::time::timeout(FANOUT_TRIAL_BUDGET, call).await {
+                    Ok(r) => r,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "peer in backoff did not answer within the trial budget",
+                    )),
+                }
+            } else {
+                call.await
+            };
             (target, sql, res)
         });
     }
@@ -3039,9 +3192,11 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u6
         let (target, sql, res) = joined.expect("fan-out task cannot panic");
         match &res {
             Ok(()) => {
+                note_fanout_success(state, &target).await;
                 querylog::sync_event(&state.sync_log, "forward", &target, Some(&sql), true, None)
             }
             Err(e) => {
+                note_fanout_failure(state, &target, e).await;
                 eprintln!("replication to {target} failed: {e}");
                 querylog::sync_event(
                     &state.sync_log,
@@ -3650,7 +3805,7 @@ async fn hold_peer(
     }
     // The peer accepted the connection: if it now fails to answer in time
     // it is busy (alive, writes possibly in flight) — never "unreachable".
-    let resp = read_response_frame(&mut stream)
+    let resp = read_response_frame(&mut stream, state.transport_key.as_ref())
         .await
         .map_err(|e| HoldFail::Busy(format!("no hold answer: {e}")))?;
     match resp.frame_type {
@@ -3814,11 +3969,38 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
     // this point is inside the dump and could not have fanned to it;
     // every write after it fans out to the joiner and postdates the dump.
     if !advertise.is_empty() {
-        let mut peers = state.peers.lock().await;
-        if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise) {
-            peers.push(advertise.clone());
-            eprintln!("cluster join: registered peer {advertise}");
-            querylog::sync_event(&state.sync_log, "join", &advertise, None, true, None);
+        if parse_peer_addr(&advertise).is_none() {
+            eprintln!("cluster join: ignoring malformed advertise {advertise:?}");
+            querylog::sync_event(
+                &state.sync_log,
+                "join",
+                "",
+                None,
+                false,
+                Some(format!("malformed advertise {advertise:?}")),
+            );
+        } else {
+            let mut peers = state.peers.lock().await;
+            if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise) {
+                if peers.len() >= MAX_DYNAMIC_PEERS {
+                    eprintln!(
+                        "cluster join: peer list full ({MAX_DYNAMIC_PEERS}), \
+                         ignoring {advertise}"
+                    );
+                    querylog::sync_event(
+                        &state.sync_log,
+                        "join",
+                        &advertise,
+                        None,
+                        false,
+                        Some("peer list full".into()),
+                    );
+                } else {
+                    peers.push(advertise.clone());
+                    eprintln!("cluster join: registered peer {advertise}");
+                    querylog::sync_event(&state.sync_log, "join", &advertise, None, true, None);
+                }
+            }
         }
     }
     // Releases are idempotent and watchdog-backed: send them concurrently
@@ -4040,7 +4222,7 @@ async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<S
         write_frame_on(&mut stream, &frame).await?;
         let mut script = String::new();
         loop {
-            let f = read_response_frame(&mut stream).await?;
+            let f = read_response_frame(&mut stream, state.transport_key.as_ref()).await?;
             match f.frame_type {
                 proto::RESP_SYNC => {
                     script.push_str(&proto::decode_sql(&f.payload).map_err(std::io::Error::other)?);
@@ -4196,9 +4378,20 @@ async fn finish_snapshot_adopt<'a>(
     script_len: usize,
 ) {
     seed_positions(state, heads);
-    drain_sync_queue(state, true).await;
+    let drain_failures = drain_sync_queue(state, true).await;
     drop(order);
-    seed_fresh_positions(state).await;
+    if drain_failures == 0 {
+        seed_fresh_positions(state).await;
+    } else {
+        // Some acknowledged queued write did not land: raising positions to
+        // the origins' current heads would mark the gap as covered and hide
+        // it from every future incremental catch-up. Leave the positions
+        // where they are; the next restart's digest repair pulls the gap.
+        eprintln!(
+            "sync: {drain_failures} queued write(s) failed to replay; \
+             positions left unseeded so a later rejoin re-pulls them"
+        );
+    }
     // The snapshot replayed through the engine batch path (not execute_sql),
     // so the epoch/has-users bookkeeping needs an explicit nudge: user
     // connections on THIS node must re-resolve, and if the snapshot carried
@@ -4238,7 +4431,12 @@ async fn finish_snapshot_adopt<'a>(
 /// transaction delays the gate closing but never merges queued writes
 /// into it; the drain waits with a loud heartbeat rather than give up on
 /// acknowledged data.
-async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
+async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) -> u64 {
+    /// Extra in-place attempts for an acknowledged queued write whose replay
+    /// errored: a transient failure (I/O, lock) must not strand data the
+    /// origin already acknowledged. Permanent failures (duplicate keys from
+    /// a snapshot-covered row) stay observable in `replay_failures`.
+    const REPLAY_RETRIES: usize = 2;
     let _order = if order_held {
         None
     } else {
@@ -4259,6 +4457,7 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
             }
         }
     };
+    let mut total_failures = 0u64;
     loop {
         // Peek-then-pop: the item stays in the queue until its replay
         // finishes. If this future is dropped mid-replay (the watchdog's
@@ -4299,10 +4498,21 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
             .origin
             .as_ref()
             .map(|(origin, seq)| (origin.as_str(), *seq));
-        let resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos, None, None).await;
+        let mut resp =
+            execute_sql(state, &q.sql, false, true, None, true, seq_pos, None, None).await;
+        let mut attempts = 0usize;
+        let mut failures = 0u64;
+        while resp.frame_type == proto::RESP_ERROR && attempts < REPLAY_RETRIES {
+            attempts += 1;
+            // Replay failures leave no partial state (each replay is its own
+            // write unit), so a bounded retry is safe and recovers transient
+            // I/O/lock errors without stranding an acknowledged write.
+            resp = execute_sql(state, &q.sql, false, true, None, true, seq_pos, None, None).await;
+        }
         if resp.frame_type == proto::RESP_ERROR {
             let msg = String::from_utf8_lossy(&resp.payload).into_owned();
-            eprintln!("sync: queued replay failed: {msg}");
+            failures += 1;
+            eprintln!("sync: queued replay failed after retries: {msg}");
             state
                 .replay_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4323,7 +4533,9 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) {
             let mut gate = state.sync_queue.lock().await;
             gate.pending_bytes -= gate.pending.remove(0).sql.len();
         }
+        total_failures += failures;
     }
+    total_failures
 }
 
 /// Startup sync: a fresh node pulls the cluster state from a peer that
@@ -4361,7 +4573,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                     if let (Some(node_id), Some(head)) = (&info.node_id, info.journal_head) {
                         heads.push((node_id.clone(), head));
                     }
-                    if info.tables > 0 {
+                    if info.tables > 0 || info.user_state {
                         saw_data = true;
                         match join_from(&state, peer, &heads).await {
                             JoinApply::Applied => {
@@ -5009,7 +5221,7 @@ async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::i
     let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
     let frame = replication_frame(frame_type, vec![], state.transport_key.as_ref());
     write_frame_on(&mut stream, &frame).await?;
-    read_response_frame(&mut stream).await
+    read_response_frame(&mut stream, state.transport_key.as_ref()).await
 }
 
 /// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
@@ -5101,6 +5313,8 @@ async fn probe_all_peer_reports(
 #[derive(Debug, Clone)]
 pub(crate) struct PeerInfo {
     pub(crate) tables: u64,
+    /// Peer holds user accounts (see the status payload's `user_state`).
+    pub(crate) user_state: bool,
     pub(crate) node_id: Option<String>,
     pub(crate) journal_head: Option<u64>,
     pub(crate) journal_oldest: Option<u64>,
@@ -5119,8 +5333,12 @@ pub(crate) async fn probe_peer_info(state: &ServerState, peer: &str) -> std::io:
     }
     let v: serde_json::Value = serde_json::from_slice(&resp.payload)
         .map_err(|e| std::io::Error::other(format!("bad status payload: {e}")))?;
+    // A successful probe proves the node is reachable: drop any fan-out
+    // backoff so writes flow again without waiting the window out.
+    note_fanout_success(state, peer).await;
     Ok(PeerInfo {
         tables: v["totals"]["tables"].as_u64().unwrap_or(0),
+        user_state: v["user_state"].as_bool() == Some(true),
         node_id: v["cluster_id"].as_str().map(String::from),
         journal_head: v["journal_head"].as_u64(),
         journal_oldest: v["journal_oldest"].as_u64(),
@@ -5260,6 +5478,23 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
         }
         let mut idx = 0;
         while idx < served {
+            // A single entry the requester cannot read (its inbound frame cap
+            // is RECV_CAP) would kill the connection mid-pull. Fail the pull
+            // explicitly instead, so the requester adopts a snapshot.
+            if batch[idx].1.len() + 12 > RECV_CAP {
+                let _ = tx
+                    .send(Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload(&format!(
+                            "catchup: journal entry at seq {} is too large ({} bytes) \
+                             for one frame; snapshot repair required",
+                            batch[idx].0,
+                            batch[idx].1.len()
+                        )),
+                    ))
+                    .await;
+                return;
+            }
             let (payload, packed) = pack_catchup_entries(&batch[idx..served], BUDGET);
             if tx
                 .send(Frame::new(proto::RESP_CATCHUP, payload))
@@ -5314,7 +5549,11 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
         );
         write_frame_on(&mut stream, &frame).await?;
         loop {
-            let f = tokio::time::timeout(IO_TIMEOUT, read_response_frame(&mut stream)).await??;
+            let f = tokio::time::timeout(
+                IO_TIMEOUT,
+                read_response_frame(&mut stream, state.transport_key.as_ref()),
+            )
+            .await??;
             match f.frame_type {
                 proto::RESP_CATCHUP => {
                     for (_, sql) in decode_catchup_entries(&f.payload)? {

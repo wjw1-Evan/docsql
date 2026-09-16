@@ -276,6 +276,11 @@ pub struct Heap {
     /// oversized insert before fresh pager pages are allocated. Persisted in
     /// the table's catalog entry (`overflow_free`).
     pub overflow_free: Vec<u32>,
+    /// Pages dropped from `pages` by remove/replace during this statement
+    /// (an emptied page). The caller releases them through the pager inside
+    /// the same transaction (`Pager::free_page`) so later statements can
+    /// reuse them instead of growing the data file.
+    pub dropped: Vec<u32>,
 }
 
 /// Where a replaced document ended up, plus slot moves its page-mates
@@ -573,6 +578,7 @@ impl Heap {
             let moves = repack(&mut page);
             if count_of(&page) == 0 {
                 self.pages.retain(|&p| p != page_id);
+                self.dropped.push(page_id);
             }
             let moved = moves
                 .iter()
@@ -654,6 +660,7 @@ impl Heap {
             );
             if count_of(&page) == 0 {
                 self.pages.retain(|&p| p != page_id);
+                self.dropped.push(page_id);
             }
         }
         Ok(all_moves)

@@ -53,6 +53,22 @@ fn sql_literal(s: &str) -> String {
     docsql_core::stmt::sql_string_literal(s)
 }
 
+/// Store retention: messages are the only unbounded table in the engine
+/// (excluded from dumps), so a publisher could otherwise fill the volume
+/// message by message. Rows are dropped oldest-first by id range (an
+/// indexed delete, no scan), keeping at least the newest
+/// [`keep_rows_for`]; payloads cap at 4 MB each.
+pub const MAX_STORE_ROWS: i64 = 200_000;
+pub const MAX_STORE_BYTES: i64 = 512 * 1024 * 1024;
+
+/// Number of newest rows to keep after inserting a `payload_len`-byte
+/// message: the row cap, tightened for large payloads so the store's byte
+/// footprint stays near [`MAX_STORE_BYTES`].
+fn keep_rows_for(payload_len: usize) -> i64 {
+    let by_bytes = MAX_STORE_BYTES / (payload_len.max(1) as i64);
+    MAX_STORE_ROWS.min(by_bytes.max(1))
+}
+
 /// Append one message in the caller's engine write path; returns the
 /// assigned id (AUTOINCREMENT max+1, monotonic while any row exists).
 pub fn store_insert(
@@ -60,6 +76,18 @@ pub fn store_insert(
     channel: &str,
     ts: i64,
     payload: &str,
+) -> Result<i64, String> {
+    store_insert_keeping(db, channel, ts, payload, keep_rows_for(payload.len()))
+}
+
+/// [`store_insert`] with an explicit retention depth (tests drive the quota
+/// without producing [`MAX_STORE_ROWS`] messages).
+pub fn store_insert_keeping(
+    db: &mut Database,
+    channel: &str,
+    ts: i64,
+    payload: &str,
+    keep: i64,
 ) -> Result<i64, String> {
     db.execute(&format!(
         "INSERT INTO {PUBSUB_TABLE} (channel, ts_ms, payload) VALUES ({}, {}, {})",
@@ -70,8 +98,17 @@ pub fn store_insert(
     .map_err(|e| e.to_string())?;
     // Statement-scoped readback: a `SELECT MAX(id)` here would full-scan
     // the heap on every PUBLISH, growing with retention depth.
-    db.last_insert_id()
-        .ok_or_else(|| "publish store: no autoincrement id assigned".to_string())
+    let id = db
+        .last_insert_id()
+        .ok_or_else(|| "publish store: no autoincrement id assigned".to_string())?;
+    let threshold = id - keep.max(1);
+    if threshold > 0 {
+        db.execute(&format!(
+            "DELETE FROM {PUBSUB_TABLE} WHERE id <= {threshold}"
+        ))
+        .map_err(|e| format!("publish store retention: {e}"))?;
+    }
+    Ok(id)
 }
 
 /// Highest message id persisted on this node (0 on empty).
@@ -885,6 +922,19 @@ mod tests {
         assert!(query_history(&mut db, id3, id3).unwrap().is_empty());
         // Trim keeps only the newest message of "news".
         assert_eq!(store_trim(&mut db, "news", 1).unwrap(), 1);
+        // Automatic retention: oldest rows drop once the depth is exceeded,
+        // and the newest survives (ids keep advancing, replay anchors hold).
+        let mut qdb = Database::in_memory().unwrap();
+        ensure_table(&mut qdb).unwrap();
+        for i in 0..10i64 {
+            store_insert_keeping(&mut qdb, "q", i, &format!("m{i}"), 3).unwrap();
+        }
+        assert_eq!(query_max_id(&mut qdb), 10);
+        let history = query_history(&mut qdb, 0, 100).unwrap();
+        let ids: Vec<i64> = history.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![8, 9, 10], "retention must keep the newest rows");
+        assert_eq!(keep_rows_for(MAX_PAYLOAD_LEN), 128);
+        assert_eq!(keep_rows_for(1), MAX_STORE_ROWS);
         let hist = {
             let upto = query_max_id(&mut db);
             query_history(&mut db, 0, upto).unwrap()

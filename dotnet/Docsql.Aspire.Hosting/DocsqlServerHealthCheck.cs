@@ -15,16 +15,21 @@ internal sealed class DocsqlServerHealthCheck(DocsqlServerResource resource) : I
         try
         {
             var endpoint = resource.GetEndpoint(DocsqlServerResource.PrimaryEndpointName);
-            var expression = ReferenceExpression.Create($"{endpoint.Property(EndpointProperty.HostAndPort)}");
-            var hostPort = await expression.GetValueAsync(cancellationToken) ?? string.Empty;
-            var separator = hostPort.LastIndexOf(':');
-            if (separator <= 0)
+            // Host and Port separately: `HostAndPort` renders IPv6 as
+            // `[::1]:port`, and passing the bracketed literal to
+            // TcpClient.ConnectAsync fails DNS parsing.
+            var hostExpr = ReferenceExpression.Create($"{endpoint.Property(EndpointProperty.Host)}");
+            var portExpr = ReferenceExpression.Create($"{endpoint.Property(EndpointProperty.Port)}");
+            var host = (await hostExpr.GetValueAsync(cancellationToken) ?? string.Empty).Trim('[', ']');
+            var portText = await portExpr.GetValueAsync(cancellationToken) ?? string.Empty;
+            if (host.Length == 0 || !int.TryParse(portText, out var port) || port is <= 0 or > 65535)
             {
-                return HealthCheckResult.Unhealthy($"DocSQL endpoint '{resource.Name}' has no allocated host:port yet.");
+                return HealthCheckResult.Unhealthy(
+                    $"DocSQL endpoint '{resource.Name}' has no allocated host:port yet.");
             }
 
             using var client = new TcpClient();
-            await client.ConnectAsync(hostPort[..separator], int.Parse(hostPort[(separator + 1)..]), cancellationToken);
+            await client.ConnectAsync(host, port, cancellationToken);
             return HealthCheckResult.Healthy();
         }
         catch (Exception ex)

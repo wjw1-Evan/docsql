@@ -5231,7 +5231,8 @@ async fn transport_key_requires_sealed_frames() {
     let f = c.recv().await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
     assert_ne!(f.flags & FLAG_ENCRYPTED, 0);
-    let msg = String::from_utf8(crypto::open(&key, &f.payload).unwrap()).unwrap();
+    let msg =
+        String::from_utf8(crypto::open(&key, f.frame_type, f.flags, &f.payload).unwrap()).unwrap();
     assert!(msg.contains("transport encrypted"), "{msg}");
 
     // Sealed with the wrong key: refused before touching the engine.
@@ -5241,12 +5242,18 @@ async fn transport_key_requires_sealed_frames() {
         frame_type: proto::REQ_SQL,
         flags: FLAG_ENCRYPTED,
         topology_version: 0,
-        payload: crypto::seal(&bad, &proto::encode_sql("SELECT 1").unwrap()),
+        payload: crypto::seal(
+            &bad,
+            proto::REQ_SQL,
+            FLAG_ENCRYPTED,
+            &proto::encode_sql("SELECT 1").unwrap(),
+        ),
     })
     .await;
     let f = c.recv().await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
-    let msg = String::from_utf8(crypto::open(&key, &f.payload).unwrap()).unwrap();
+    let msg =
+        String::from_utf8(crypto::open(&key, f.frame_type, f.flags, &f.payload).unwrap()).unwrap();
     assert!(msg.contains("decrypt failed"), "{msg}");
 
     // Correctly sealed frame: normal SQL execution.
@@ -5255,12 +5262,17 @@ async fn transport_key_requires_sealed_frames() {
         frame_type: proto::REQ_SQL,
         flags: FLAG_ENCRYPTED,
         topology_version: 0,
-        payload: crypto::seal(&key, &proto::encode_sql("SELECT 1").unwrap()),
+        payload: crypto::seal(
+            &key,
+            proto::REQ_SQL,
+            FLAG_ENCRYPTED,
+            &proto::encode_sql("SELECT 1").unwrap(),
+        ),
     })
     .await;
     let f = c.recv().await;
     assert_ne!(f.flags & FLAG_ENCRYPTED, 0);
-    let plaintext = crypto::open(&key, &f.payload).unwrap();
+    let plaintext = crypto::open(&key, f.frame_type, f.flags, &f.payload).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
     assert_eq!(v["columns"][0], "1");
     assert_eq!(v["rows"][0][0], 1);

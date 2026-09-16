@@ -310,11 +310,24 @@ public sealed class ProtocolConnection : IDisposable
         {
             return request;
         }
+        var flags = (ushort)(request.Flags | FlagEncrypted);
         return request with
         {
-            Flags = (ushort)(request.Flags | FlagEncrypted),
-            Payload = Seal(_key, request.Payload),
+            Flags = flags,
+            Payload = Seal(_key, request.Type, flags, request.Payload),
         };
+    }
+
+    /// <summary>Associated data for the GCM tag: the transmitted header
+    /// fields a receiver routes on (type + flags), bound little-endian like
+    /// the wire form. A MITM flipping a flag invalidates the frame instead
+    /// of re-routing it (the server does the same).</summary>
+    private static byte[] Aad(FrameType type, ushort flags)
+    {
+        var aad = new byte[4];
+        BinaryPrimitives.WriteUInt16LittleEndian(aad.AsSpan(0, 2), (ushort)type);
+        BinaryPrimitives.WriteUInt16LittleEndian(aad.AsSpan(2, 2), flags);
+        return aad;
     }
 
     /// <summary>仅发送一帧(订阅连接拆开用:响应帧与推送帧需分别接收)。</summary>
@@ -336,15 +349,15 @@ public sealed class ProtocolConnection : IDisposable
     /// <summary>仅接收一帧(已解密);阻塞直至一帧完整到达。</summary>
     public Frame Receive() => ReadFrame();
 
-    /// <summary>AES-256-GCM:nonce(12) ‖ 密文 ‖ tag(16)。</summary>
-    private static byte[] Seal(byte[] key, byte[] plaintext)
+    /// <summary>AES-256-GCM:nonce(12) ‖ 密文 ‖ tag(16),头部字段作为 AAD。</summary>
+    private static byte[] Seal(byte[] key, FrameType type, ushort flags, byte[] plaintext)
     {
         var nonce = new byte[12];
         RandomNumberGenerator.Fill(nonce);
         using var gcm = new AesGcm(key, 16);
         var ct = new byte[plaintext.Length];
         var tag = new byte[16];
-        gcm.Encrypt(nonce, plaintext, ct, tag);
+        gcm.Encrypt(nonce, plaintext, ct, tag, Aad(type, flags));
         var sealed_ = new byte[12 + ct.Length + 16];
         nonce.CopyTo(sealed_, 0);
         ct.CopyTo(sealed_, 12);
@@ -352,7 +365,7 @@ public sealed class ProtocolConnection : IDisposable
         return sealed_;
     }
 
-    private static byte[] Unseal(byte[] key, byte[] sealed_)
+    private static byte[] Unseal(byte[] key, FrameType type, ushort flags, byte[] sealed_)
     {
         if (sealed_.Length < 12 + 16)
             throw new DocsqlException("加密载荷过短");
@@ -363,7 +376,7 @@ public sealed class ProtocolConnection : IDisposable
         var pt = new byte[ct.Length];
         try
         {
-            gcm.Decrypt(nonce, ct, tag, pt);
+            gcm.Decrypt(nonce, ct, tag, pt, Aad(type, flags));
         }
         catch (CryptographicException)
         {
@@ -417,7 +430,7 @@ public sealed class ProtocolConnection : IDisposable
         {
             if (_key is null)
                 throw new DocsqlException("服务端返回加密帧但客户端未配置 key");
-            payload = Unseal(_key, payload);
+            payload = Unseal(_key, type, flags, payload);
         }
         return new Frame(type, flags, topo, payload);
     }

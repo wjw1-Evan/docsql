@@ -177,9 +177,8 @@ struct Ctx<'a> {
 impl BTree {
     /// Create a fresh tree (allocates a root leaf inside `tx`).
     pub fn create(pager: &Pager, tx: &mut Tx) -> Result<BTree> {
-        let next_page = pager.num_pages();
+        // May reuse a page released earlier in this transaction.
         let root = pager.allocate_page(tx)?;
-        debug_assert_eq!(root, next_page);
         let mut page = vec![0u8; PAGE_SIZE];
         page[0] = LEAF;
         pager.write_page(tx, root, 0, &page)?;
@@ -458,6 +457,38 @@ impl BTree {
                 }
             }
         }
+    }
+
+    /// Every page id reachable from this tree's root (depth-guarded), for
+    /// releasing a tree that is being replaced or dropped. Uses `tx` so a
+    /// page staged by the current transaction reads back its staged image.
+    pub fn collect_pages(&self, reader: &PageReader, tx: &Tx) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        Self::collect_rec(reader, tx, self.root, &mut out, 0)?;
+        Ok(out)
+    }
+
+    fn collect_rec(
+        reader: &PageReader,
+        tx: &Tx,
+        id: u32,
+        out: &mut Vec<u32>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
+        out.push(id);
+        match Self::read_node(reader, tx, id)? {
+            Node::Leaf { .. } => {}
+            Node::Internal { leftmost, cells } => {
+                Self::collect_rec(reader, tx, leftmost, out, depth + 1)?;
+                for (_, child) in cells {
+                    Self::collect_rec(reader, tx, child, out, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// In-order scan of all (key, val) pairs.
