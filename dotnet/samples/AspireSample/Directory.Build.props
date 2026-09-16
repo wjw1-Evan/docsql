@@ -3,7 +3,7 @@
   <PropertyGroup>
     <!-- GitHub Packages 已发布版本(两个 Docsql 包共用);升级包版本时同步更新。
          nuget.config 描述包源,凭据由用户级配置/环境提供,见 README。 -->
-    <DocsqlPackageVersion>0.4.0</DocsqlPackageVersion>
+    <DocsqlPackageVersion>0.5.0</DocsqlPackageVersion>
   </PropertyGroup>
 
 </Project>
