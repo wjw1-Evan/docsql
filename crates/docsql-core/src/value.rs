@@ -12,6 +12,178 @@ pub use rust_decimal::Decimal;
 /// stable across processes and replays.
 pub type Object = BTreeMap<String, Value>;
 
+/// Days since epoch ← days-from-civil (Howard Hinnant). Inverse of the
+/// engine's `civil_from_days`; both are pinned by known-answer tests.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// Format UTC milliseconds as fixed-width RFC 3339 text
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`). Fixed width + zero padding + UTC make the
+/// text form lexicographically ordered exactly like the numeric form.
+pub fn format_timestamp_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // civil_from_days lives in the engine (shared with SYSDATE/backup
+    // stamping); re-derive the calendar here to keep value.rs leaf-level.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    let h = rem / 3600;
+    let mi = (rem % 3600) / 60;
+    let se = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{se:02}.{millis:03}Z")
+}
+
+/// Parse a timestamp in any of the accepted forms into UTC milliseconds:
+/// `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, `...:SS`, `...SS.mmm[...]`, separator
+/// `T` or space, optional trailing `Z`/`±HH:MM`/`±HHMM` offset. Returns
+/// None on anything malformed — callers turn that into NULL (predicates)
+/// or an error (CAST), never a wrong time.
+pub fn parse_timestamp_ms(text: &str) -> Option<i64> {
+    let s = text.trim();
+    let b = s.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let sub = s.get(from..to)?;
+        if sub.is_empty() || !sub.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        sub.parse::<i64>().ok()
+    };
+    let y = num(0, 4)?;
+    let mo = num(5, 7)?;
+    let d = num(8, 10)?;
+    // Year range 0001..=9999: the canonical text form has a 4-digit year,
+    // and instants outside it could not round-trip through that text.
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&mo) {
+        return None;
+    }
+    // Full calendar validation (leap years included): a malformed date must
+    // not parse into a wrong instant.
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(mo - 1) as usize];
+    if d < 1 || d > dim as i64 {
+        return None;
+    }
+    // Split off the optional time part and the optional offset.
+    let (rest, offset_min) = match s.get(10..) {
+        Some(rest) if rest.starts_with('T') || rest.starts_with('t') || rest.starts_with(' ') => {
+            let time = &rest[1..];
+            // Offset: trailing Z / ±HH:MM / ±HHMM.
+            let bytes = time.as_bytes();
+            let mut offset_min = 0i64;
+            let mut time = time;
+            if let Some(last) = bytes.last() {
+                let cut = if *last == b'Z' || *last == b'z' {
+                    Some(time.len() - 1)
+                } else {
+                    match time.rfind(['+', '-']) {
+                        Some(pos) if pos > 0 => {
+                            let off = &time[pos..];
+                            let digits: String = off[1..].chars().filter(|c| *c != ':').collect();
+                            if digits.len() != 4 {
+                                return None;
+                            }
+                            let oh: i64 = digits[..2].parse().ok()?;
+                            let om: i64 = digits[2..].parse().ok()?;
+                            if oh > 23 || om > 59 {
+                                return None;
+                            }
+                            let mag = oh * 60 + om;
+                            offset_min = if off.starts_with('-') { -mag } else { mag };
+                            Some(pos)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(cut) = cut {
+                    time = &time[..cut];
+                }
+            }
+            (time, offset_min)
+        }
+        Some(rest) if rest.trim().is_empty() => ("", 0),
+        _ => return None,
+    };
+    let tb = rest.as_bytes();
+    let (mut hh, mut mm, mut ss, mut ms) = (0i64, 0i64, 0i64, 0i64);
+    match tb.len() {
+        0 => {}
+        5 => {
+            if tb[2] != b':' {
+                return None;
+            }
+            hh = num(11, 13)?;
+            mm = num(14, 16)?;
+        }
+        8 => {
+            if tb[2] != b':' || tb[5] != b':' {
+                return None;
+            }
+            hh = num(11, 13)?;
+            mm = num(14, 16)?;
+            ss = num(17, 19)?;
+        }
+        n if n > 9 => {
+            if tb[2] != b':' || tb[5] != b':' || tb[8] != b'.' {
+                return None;
+            }
+            hh = num(11, 13)?;
+            mm = num(14, 16)?;
+            ss = num(17, 19)?;
+            let frac = &rest[9..];
+            if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            // Millisecond precision; extra digits truncate (never round a
+            // stored instant away from its parsed text).
+            let mut scaled = String::from(frac);
+            while scaled.len() < 3 {
+                scaled.push('0');
+            }
+            ms = scaled[..3].parse().ok()?;
+        }
+        _ => return None,
+    }
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, mo as u32, d as u32);
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss;
+    Some(secs * 1000 + ms - offset_min * 60_000)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -21,6 +193,13 @@ pub enum Value {
     /// Exact decimal (SQL DECIMAL/NUMERIC). Compared numerically against
     /// Int/Float; arithmetic stays exact while no Float is involved.
     Decimal(Decimal),
+    /// Point in time: UTC milliseconds since the Unix epoch (SQL TIMESTAMP).
+    /// Displayed as fixed-width RFC 3339 UTC text (year 0001..=9999, the
+    /// range the canonical text round-trips); its own comparison band
+    /// (never mixed with Str — a parseable string inserted into the time
+    /// order would break transitivity, the exact class of the old
+    /// Int/Float comparison bug).
+    Timestamp(i64),
     Str(String),
     Bytes(Vec<u8>),
     Array(Vec<Value>),
@@ -35,6 +214,7 @@ impl Value {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::Decimal(_) => "decimal",
+            Value::Timestamp(_) => "timestamp",
             Value::Str(_) => "string",
             Value::Bytes(_) => "bytes",
             Value::Array(_) => "array",
@@ -71,7 +251,9 @@ impl Value {
     }
 
     /// Total ordering used by indexes and ORDER BY. Null < Bool < numbers
-    /// (int/float/decimal compared numerically) < Str < Bytes < Array < Object.
+    /// (int/float/decimal compared numerically) < Timestamp < Str < Bytes
+    /// < Array < Object. Timestamp never mixes with Str: the band keeps the
+    /// order total (see the variant doc).
     pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         fn rank(v: &Value) -> u8 {
@@ -79,10 +261,11 @@ impl Value {
                 Value::Null => 0,
                 Value::Bool(_) => 1,
                 Value::Int(_) | Value::Float(_) | Value::Decimal(_) => 2,
-                Value::Str(_) => 3,
-                Value::Bytes(_) => 4,
-                Value::Array(_) => 5,
-                Value::Object(_) => 6,
+                Value::Timestamp(_) => 3,
+                Value::Str(_) => 4,
+                Value::Bytes(_) => 5,
+                Value::Array(_) => 6,
+                Value::Object(_) => 7,
             }
         }
         let (ra, rb) = (rank(a), rank(b));
@@ -111,6 +294,7 @@ impl Value {
                     (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
                 }
             }
+            (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             (Value::Array(x), Value::Array(y)) => {
@@ -207,6 +391,7 @@ impl fmt::Display for Value {
             Value::Int(i) => write!(f, "{i}"),
             Value::Float(x) => write!(f, "{x}"),
             Value::Decimal(d) => write!(f, "{d}"),
+            Value::Timestamp(ms) => write!(f, "{}", format_timestamp_ms(*ms)),
             Value::Str(s) => write!(f, "{s}"),
             Value::Bytes(b) => write!(
                 f,
@@ -468,6 +653,117 @@ mod tests {
         assert_eq!(
             Value::cmp_values(&Value::Float(f64::NAN), &Value::Float(f64::NAN)),
             Equal
+        );
+    }
+
+    #[test]
+    fn timestamp_parse_and_format_kat() {
+        use super::{format_timestamp_ms, parse_timestamp_ms};
+        // Known answers.
+        assert_eq!(format_timestamp_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_timestamp_ms(1_789_430_400_123),
+            "2026-09-15T00:00:00.123Z"
+        );
+        assert_eq!(parse_timestamp_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_timestamp_ms("2026-09-15T00:00:00.123Z"),
+            Some(1_789_430_400_123)
+        );
+        // Accepted forms.
+        assert_eq!(
+            parse_timestamp_ms("2026-09-15"),
+            Some(1_789_430_400_000),
+            "date-only = midnight UTC"
+        );
+        assert_eq!(
+            parse_timestamp_ms("2026-09-16"),
+            Some(1_789_516_800_000),
+            "any date-only form is midnight UTC"
+        );
+        // Leap-year calendar: 2024-02-29 exists, 2023-02-29 does not.
+        assert_eq!(parse_timestamp_ms("2024-02-29"), Some(1_709_164_800_000));
+        assert_eq!(parse_timestamp_ms("2023-02-29"), None);
+        assert_eq!(
+            parse_timestamp_ms("2026-09-15 12:30"),
+            parse_timestamp_ms("2026-09-15T12:30:00.000Z")
+        );
+        assert_eq!(
+            parse_timestamp_ms("2026-09-15T12:30:45.5"),
+            Some(parse_timestamp_ms("2026-09-15T12:30:45.500Z").unwrap())
+        );
+        // Offset handling: +08:00 subtracts the offset from the wall clock.
+        assert_eq!(
+            parse_timestamp_ms("2026-09-15T08:00:00+08:00"),
+            parse_timestamp_ms("2026-09-15T00:00:00Z")
+        );
+        assert_eq!(
+            parse_timestamp_ms("2026-09-15T00:00:00-0530"),
+            parse_timestamp_ms("2026-09-15T05:30:00Z")
+        );
+        // Malformed forms never parse to a wrong time.
+        for bad in [
+            "",
+            "garbage",
+            "2026-13-01",
+            "2026-09-31T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-09-15T25:00:00Z",
+            "2026-09-15T12:60:00Z",
+            "2026-9-15",
+            "2026-09-15T12:30:00+99:00",
+            "2026-09-15T12:30:00Zx",
+        ] {
+            assert_eq!(parse_timestamp_ms(bad), None, "{bad:?} must not parse");
+        }
+        // Format ∘ parse = identity across a spread of instants (negative,
+        // epoch, far future — the fixed-width text form is total).
+        for ms in [
+            -86_400_000_001i64,
+            -1,
+            0,
+            1,
+            999,
+            1_789_430_400_123,
+            253_402_300_799_999,
+        ] {
+            assert_eq!(
+                parse_timestamp_ms(&format_timestamp_ms(ms)),
+                Some(ms),
+                "{ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_has_its_own_total_order_band() {
+        use super::Value;
+        use std::cmp::Ordering::*;
+        let ts = |ms| Value::Timestamp(ms);
+        assert_eq!(Value::cmp_values(&ts(1), &ts(2)), Less);
+        assert_eq!(Value::cmp_values(&ts(2), &ts(1)), Greater);
+        // The band sits between numbers and strings and never mixes: a
+        // parseable string compared with a Timestamp keeps the string rank
+        // (the predicate layer owns the coercion — cmp_values must stay a
+        // total order, and a parseable string woven into the time order
+        // would break transitivity).
+        assert_eq!(Value::cmp_values(&Value::Int(9), &ts(-9_000_000_000)), Less);
+        assert_eq!(
+            Value::cmp_values(&ts(-9_000_000_000), &Value::Int(9)),
+            Greater
+        );
+        assert_eq!(
+            Value::cmp_values(&ts(0), &Value::Str("1970-01-01T00:00:00.000Z".into())),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Str("1970-01-01T00:00:00.000Z".into()),
+                &ts(86_400_000)
+            ),
+            // The Str band ranks ABOVE the whole Timestamp band regardless
+            // of the instants involved.
+            Greater
         );
     }
 }

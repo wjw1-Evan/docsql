@@ -945,9 +945,11 @@ public sealed class DocsqlCommand : DbCommand
             p => (p.ParameterName?.TrimStart('@') ?? "") == name);
 
     /// <summary>参数值 → JSON(REQ_EXECUTE 的 params 数组元素)。字符串值在
-    /// 服务端转义绑定;DateTime 族沿用 culture-invariant 可排序文本形态。
-    /// decimal 与 byte[] 用带类型标记的对象载荷($dec/$bytes),精确值不经过
-    /// IEEE double,服务端解码为引擎原生 DECIMAL/BLOB 值。</summary>
+    /// 服务端转义绑定;decimal 与 byte[] 用带类型标记的对象载荷($dec/$bytes),
+    /// 精确值不经过 IEEE double,服务端解码为引擎原生 DECIMAL/BLOB 值。
+    /// DateTime/DateTimeOffset 走 $ts 标记:引擎原生 TIMESTAMP(UTC 毫秒,
+    /// 毫秒精度),比较/排序按时间带执行;本地值转为 UTC 后存储,旧库中的
+    /// ISO 文本值读取路径兼容(Convert.ToDateTime 双向解析)。</summary>
     private static string JsonOf(object? v) => v switch
     {
         null or DBNull => "null",
@@ -960,12 +962,14 @@ public sealed class DocsqlCommand : DbCommand
         float f => JsonSerializer.Serialize((double)f),
         // 精确小数文本走 $dec 标记,服务端渲染 CAST(... AS DECIMAL)。
         decimal m => "{\"$dec\":\"" + m.ToString(CultureInfo.InvariantCulture) + "\"}",
-        // Date/time values keep the culture-invariant, lexicographically
-        // sortable text form the engine stores (GetDateTime parses it back).
-        DateTime dt => JsonSerializer.Serialize(
-            dt.ToString("O", CultureInfo.InvariantCulture)),
-        DateTimeOffset dto => JsonSerializer.Serialize(
-            dto.ToString("O", CultureInfo.InvariantCulture)),
+        // DateTime 族走 $ts 标记(UTC 毫秒):引擎原生 TIMESTAMP 值,
+        // 与时间列的时间带比较/排序一致。Kind=Unspecified 按 UTC 存取
+        // (不偷偷做本地时区换算);存量 ISO 文本值的读取路径不变。
+        DateTime dt => "{\"$ts\":" + new DateTimeOffset(dt.Kind == DateTimeKind.Local
+                ? dt.ToUniversalTime()
+                : DateTime.SpecifyKind(dt, DateTimeKind.Utc),
+            TimeSpan.Zero).ToUnixTimeMilliseconds() + "}",
+        DateTimeOffset dto => "{\"$ts\":" + dto.ToUnixTimeMilliseconds() + "}",
         TimeSpan ts => JsonSerializer.Serialize(
             ts.ToString("c", CultureInfo.InvariantCulture)),
         DateOnly d => JsonSerializer.Serialize(
@@ -1167,6 +1171,13 @@ public sealed class DocsqlDataReader : DbDataReader
         if (e.TryGetProperty("$dec", out var dec) && dec.ValueKind == JsonValueKind.String)
         {
             return decimal.Parse(dec.GetString()!, CultureInfo.InvariantCulture);
+        }
+        // TIMESTAMP: UTC milliseconds (engine stores i64 ms, year 0001-9999).
+        // Surfaced as UTC DateTime so existing readers keep working; the
+        // engine is millisecond-precision, sub-ms digits do not round-trip.
+        if (e.TryGetProperty("$ts", out var ts) && ts.ValueKind == JsonValueKind.Number)
+        {
+            return DateTimeOffset.FromUnixTimeMilliseconds(ts.GetInt64()).UtcDateTime;
         }
         if (e.TryGetProperty("$bytes", out var bytes) && bytes.ValueKind == JsonValueKind.Array)
         {

@@ -201,7 +201,18 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     // dump itself is synchronous, O(data) in memory).
     let script = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-        db.dump_script().map_err(|e| format!("backup dump: {e}"))?
+        // PITR anchor: the journal position this dump covers. A restore to
+        // a timestamp T replays journal entries with seq > this and
+        // commit-time <= T on top of the dump. Recorded under the SAME
+        // write-lock window as the dump, so entry N is inside the dump iff
+        // its seq <= N_head — no replication-lag ambiguity.
+        let head = db.journal_head().map_err(|e| format!("backup dump: {e}"))?;
+        let dump = db.dump_script().map_err(|e| format!("backup dump: {e}"))?;
+        format!(
+            "-- docsql-backup v2 journal-seq={head} ts={}\n{}",
+            now_ms(),
+            dump
+        )
     };
     drop(_order);
     // All locks released: filesystem work never blocks writers. The stamp
@@ -301,6 +312,19 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
     let mut first = true;
     loop {
         tick.tick().await;
+        // Incremental export runs on EVERY tick (cheap, journal-bounded):
+        // skipping it on the fresh-base first tick would leave the PITR
+        // chain behind across restarts.
+        if state.sync_queue.lock().await.closed && try_begin_backup(&state) {
+            if let Err(e) = export_incremental(&state).await {
+                eprintln!("incremental export failed: {e}");
+            }
+            let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
+            b.running = false;
+        }
+        // Full backup freshness: first tick writes one when none exists or
+        // the newest is older than the interval; a fresh base is kept (a
+        // restart storm must not squeeze real history out of keep-N).
         if first {
             first = false;
             if let Some(newest) = read_backup_files(&state.backup_dir).pop() {
@@ -322,6 +346,224 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
                 eprintln!("backup failed: {e}");
             }
         }
+    }
+}
+
+/// Parsed base-backup header (the `-- docsql-backup v2` line).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BackupHeader {
+    journal_seq: u64,
+    ts_ms: u64,
+}
+
+/// Parse a base backup's v2 header (absent in v1 files → journal_seq 0).
+fn parse_backup_header(dir: &Path, name: &str) -> Option<BackupHeader> {
+    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    parse_backup_header_text(&text)
+}
+
+fn parse_backup_header_text(text: &str) -> Option<BackupHeader> {
+    for line in text.lines().take(4) {
+        let Some(rest) = line.strip_prefix("-- docsql-backup v2 ") else {
+            continue;
+        };
+        let mut journal_seq = None;
+        let mut ts_ms = None;
+        for part in rest.split_whitespace() {
+            if let Some(v) = part.strip_prefix("journal-seq=") {
+                journal_seq = v.parse().ok();
+            }
+            if let Some(v) = part.strip_prefix("ts=") {
+                ts_ms = v.parse().ok();
+            }
+        }
+        return Some(BackupHeader {
+            journal_seq: journal_seq?,
+            ts_ms: ts_ms.unwrap_or(0),
+        });
+    }
+    None
+}
+
+/// Parsed incremental header (`-- docsql-pitr incr from=<F> to=<T>`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PitrHeader {
+    from: u64,
+    to: u64,
+}
+
+fn parse_pitr_header(dir: &Path, name: &str) -> Option<PitrHeader> {
+    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    parse_pitr_header_text(&text)
+}
+
+fn parse_pitr_header_text(text: &str) -> Option<PitrHeader> {
+    let line = text.lines().next()?;
+    let rest = line.strip_prefix("-- docsql-pitr incr ")?;
+    let mut from = None;
+    let mut to = None;
+    for part in rest.split_whitespace() {
+        if let Some(v) = part.strip_prefix("from=") {
+            from = v.parse().ok();
+        }
+        if let Some(v) = part.strip_prefix("to=") {
+            to = v.parse().ok();
+        }
+    }
+    Some(PitrHeader {
+        from: from?,
+        to: to?,
+    })
+}
+
+/// One replayable journal entry out of an incremental file body line.
+fn parse_pitr_entry(line: &str) -> Option<(u64, i64, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let seq = v.get("seq")?.as_u64()?;
+    let ts = v.get("ts")?.as_i64()?;
+    let sql = v.get("sql")?.as_str()?.to_string();
+    Some((seq, ts, sql))
+}
+
+/// Journal entries to replay for a restore targeting `target_ms`:
+/// everything with seq > base_seq and commit-time <= target, in seq order,
+/// across all incremental files. Entries with unknown ts (pre-PITR rows)
+/// never match a time window — they always sit before the first post-
+/// upgrade base's journal position anyway.
+fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for name in read_incr_files(dir) {
+        verify_backup_checksum(dir, &name)?;
+        let text = std::fs::read_to_string(dir.join(&name))
+            .map_err(|e| format!("incr read {name}: {e}"))?;
+        if let Some(h) = parse_pitr_header_text(&text) {
+            if h.to <= base_seq {
+                continue; // entirely covered by the base dump
+            }
+        }
+        for line in text.lines() {
+            if line.starts_with("--") || line.trim().is_empty() {
+                continue;
+            }
+            if let Some((_, ts, sql)) = parse_pitr_entry(line) {
+                if ts <= target_ms {
+                    out.push(sql);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Sentinel the snapshot-adopt path writes over voided journal text: never
+/// export it (replaying it is a no-op PRAGMA, but it would waste the window).
+const JOURNAL_VOID_SENTINEL: &str = "PRAGMA discarded_by_snapshot_adoption;";
+
+/// PITR cursor: the journal seq everything on disk already covers — the
+/// newest incremental's `to`, else the newest base backup's journal-seq,
+/// else 0.
+fn pitr_cursor(dir: &Path) -> u64 {
+    let mut cursor = 0u64;
+    if let Some(name) = read_incr_files(dir).last() {
+        cursor = parse_pitr_header(dir, name).map(|h| h.to).unwrap_or(0);
+    }
+    if cursor == 0 {
+        if let Some(name) = read_backup_files(dir).last() {
+            if let Some(h) = parse_backup_header(dir, name) {
+                cursor = h.journal_seq;
+            }
+        }
+    }
+    cursor
+}
+
+/// Export journal entries after the cursor into one incremental file.
+async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
+    let cursor = pitr_cursor(&state.backup_dir);
+    let entries = {
+        let Some(_order) = crate::lock_engine_for_write(state).await else {
+            return Err("incremental export timed out waiting for the open transaction".into());
+        };
+        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+        db.journal_entries_after(cursor, 200_000)
+            .map_err(|e| format!("journal read: {e}"))?
+    };
+    let usable: Vec<&(u64, Option<i64>, String)> = entries
+        .iter()
+        .filter(|(_, ts, sql)| ts.is_some() && sql != JOURNAL_VOID_SENTINEL)
+        .collect();
+    if usable.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&state.backup_dir).map_err(|e| format!("backup dir: {e}"))?;
+    let name = format!("incr-{}.sql", next_incr_stamp(&state.backup_dir, now_ms()));
+    let mut body = format!(
+        "-- docsql-pitr incr from={cursor} to={}\n",
+        usable.last().unwrap().0
+    );
+    for (seq, ts, sql) in &usable {
+        body.push_str(&format!(
+            "{{\"seq\":{},\"ts\":{},\"sql\":{}}}\n",
+            seq,
+            ts.unwrap_or(0),
+            serde_json::to_string(sql).map_err(|e| format!("incr encode: {e}"))?
+        ));
+    }
+    let bytes = body.into_bytes();
+    let tmp = state.backup_dir.join(format!("{name}.tmp"));
+    write_private(&tmp, &bytes).map_err(|e| format!("incr write: {e}"))?;
+    std::fs::rename(&tmp, state.backup_dir.join(&name)).map_err(|e| format!("incr rename: {e}"))?;
+    let digest = docsql_core::kdf::sha256(&bytes);
+    let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
+    write_private(
+        &tmp,
+        format!("{}  {}\n", docsql_core::kdf::hex(&digest), name).as_bytes(),
+    )
+    .map_err(|e| format!("incr checksum write: {e}"))?;
+    let sidecar = state.backup_dir.join(format!("{name}.sha256"));
+    std::fs::rename(&tmp, sidecar).map_err(|e| format!("incr checksum rename: {e}"))?;
+    prune_incr(&state.backup_dir, state.backup_keep.max(4));
+    Ok(())
+}
+
+fn read_incr_files(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("incr-") && n.ends_with(".sql"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn next_incr_stamp(dir: &Path, now: u64) -> String {
+    let mut ms = now;
+    for name in read_incr_files(dir) {
+        let stem = name
+            .strip_prefix("incr-")
+            .and_then(|s| s.strip_suffix(".sql"))
+            .unwrap_or("");
+        if let Some(existing) = parse_stamp(stem) {
+            ms = ms.max(existing + 1);
+        }
+    }
+    utc_stamp(ms)
+}
+
+/// Prune the oldest incremental files past `keep` (sidecars go with them).
+fn prune_incr(dir: &Path, keep: usize) {
+    let keep = keep.max(1);
+    let mut names = read_incr_files(dir);
+    while names.len() > keep {
+        let victim = names.remove(0);
+        if let Err(e) = std::fs::remove_file(dir.join(&victim)) {
+            eprintln!("incr prune failed for {victim}: {e}");
+            break;
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{victim}.sha256")));
     }
 }
 
@@ -411,6 +653,31 @@ pub(crate) async fn handle_backup(
             );
             Frame::new(proto::RESP_AFFECTED, b"backup started".to_vec())
         }
+        "export" => {
+            // Manual incremental export: journal entries after the cursor
+            // land in one incr file (the timer does this every tick; tests
+            // and operators can force it on demand).
+            if !state.sync_queue.lock().await.closed {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("export: node is still in startup sync; retry later"),
+                );
+            }
+            if !try_begin_backup(state) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("backup already in progress"),
+                );
+            }
+            let res = export_incremental(state).await;
+            let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
+            b.running = false;
+            drop(b);
+            match res {
+                Ok(()) => Frame::new(proto::RESP_AFFECTED, b"export done".to_vec()),
+                Err(e) => Frame::new(proto::RESP_ERROR, crate::err_payload(&e)),
+            }
+        }
         "restore" => {
             if role == ConnRole::ReadOnly {
                 return Frame::new(
@@ -492,10 +759,27 @@ pub(crate) async fn handle_backup(
             use std::sync::atomic::Ordering;
             state.restore_progress.applied.store(0, Ordering::Relaxed);
             state.restore_progress.total.store(0, Ordering::Relaxed);
+            // Optional point-in-time target: ISO timestamp text or UTC ms.
+            // Replays base + journal chain entries committed at/before it.
+            let parsed_target: Option<Result<Option<i64>, String>> = serde_json::from_slice::<
+                serde_json::Value,
+            >(&frame.payload)
+            .ok()
+            .and_then(|v| v.get("to").cloned())
+            .map(|to| match to {
+                serde_json::Value::Number(n) => Ok(n.as_i64()),
+                serde_json::Value::String(s) => Ok(docsql_core::value::parse_timestamp_ms(&s)),
+                _ => Err("restore: \"to\" must be a number or string".into()),
+            });
+            let target_ms = match parsed_target {
+                Some(Ok(t)) => t,
+                Some(Err(m)) => return Frame::new(proto::RESP_ERROR, crate::err_payload(&m)),
+                None => None,
+            };
             let st = state.clone();
             let file_clone = file.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_restore(&st, &file_clone).await {
+                if let Err(e) = run_restore(&st, &file_clone, target_ms).await {
                     eprintln!("restore of {file_clone} failed: {e}");
                 }
             });
@@ -542,9 +826,13 @@ fn valid_backup_name(name: &str) -> bool {
 /// Replay one backup file through the normal write path. Caller must have
 /// claimed `BackupShared.restore`; this finishes the status either way,
 /// including the post-replay cluster convergence pass.
-async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
+async fn run_restore(
+    state: &Arc<ServerState>,
+    file: &str,
+    target_ms: Option<i64>,
+) -> Result<usize, String> {
     let _running = RestoreFlagGuard(state.clone(), file.to_string());
-    let res = restore_inner(state, file).await;
+    let res = restore_inner(state, file, target_ms).await;
     // Convergence pass on success: the replay fanned out every statement,
     // but peers offline (or mid-fan-out-failure) during the restore missed
     // statements. Used to be "wait for their next restart repair" — now
@@ -670,20 +958,42 @@ async fn run_restore(state: &Arc<ServerState>, file: &str) -> Result<usize, Stri
     res
 }
 
-async fn restore_inner(state: &Arc<ServerState>, file: &str) -> Result<usize, String> {
+async fn restore_inner(
+    state: &Arc<ServerState>,
+    file: &str,
+    target_ms: Option<i64>,
+) -> Result<usize, String> {
     // Filesystem work before any engine lock: the script is O(data).
     // Integrity first: a sidecar mismatch refuses the whole-cluster replay
     // up front (missing sidecar = legacy backup, tolerated).
     verify_backup_checksum(&state.backup_dir, file)?;
     let script = std::fs::read_to_string(state.backup_dir.join(file))
         .map_err(|e| format!("restore read: {e}"))?;
+    // Point-in-time: base dump + this node's journal chain up to the
+    // target. Requires a v2 base (journal-seq anchor) — v1 files have no
+    // position to anchor the replay window and fail loudly instead.
+    let pitr_stmts = match target_ms {
+        Some(target) => {
+            let head = parse_backup_header_text(&script)
+                .ok_or_else(|| {
+                    "restore to timestamp requires a v2 backup (journal-seq header);                      take a new full backup first"
+                        .to_string()
+                })?
+                .journal_seq;
+            collect_pitr_entries(&state.backup_dir, head, target)?
+        }
+        None => Vec::new(),
+    };
     // A backup of an empty database is an empty script: restoring it is a
     // clean no-op (post-backup tables survive), not a parse error.
-    let stmts = if script.trim().is_empty() {
+    let mut stmts = if script.trim().is_empty() {
         Vec::new()
     } else {
         docsql_core::stmt::split_statements(&script).map_err(|e| format!("restore parse: {e}"))?
     };
+    if !pitr_stmts.is_empty() {
+        stmts.extend(pitr_stmts);
+    }
     let total = stmts.len();
     use std::sync::atomic::Ordering;
     state.restore_progress.total.store(total, Ordering::Relaxed);

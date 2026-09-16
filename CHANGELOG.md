@@ -5,6 +5,30 @@
 
 ## [未发布]
 
+### PITR / 精确 TIMESTAMP / 用户视图(2026-09-16 三大特性)
+
+#### 新增
+
+- **精确 TIMESTAMP 类型**:`TIMESTAMP '2026-09-15T08:30:00Z'` 字面量、
+  `NOW()`/`CURRENT_TIMESTAMP`、`CAST` 双向(ISO 文本/UTC 毫秒整数)、
+  `TIMESTAMP ± INT`(毫秒)与 `TIMESTAMP - TIMESTAMP`(时长);
+  与字符串比较自动按时间解析(不可解析 → NULL);索引探针自动把可解析
+  字符串边界提升进时间带(混合序带列需显式 CAST);wire 以
+  `{"$ts": 毫秒}` 无损承载;写语句中的 `NOW()/SYSDATE()/CURRENT_TIMESTAMP`
+  在执行节点折叠为字面量后进期刊/扇出(副本重放零偏差,红线 #8 落地);
+  .NET 驱动 DateTime/DateTimeOffset 参数与 EF 列类型映射同步切换为
+  TIMESTAMP(毫秒精度;存量 ISO 文本列读取兼容);
+- **PITR / 增量备份**:期刊(带提交时间戳)无条件记录(单节点也记);
+  全量备份头部锚定 journal-seq;增量段 `incr-*.sql` 按游标导出期刊条目
+  (REQ_BACKUP `{"action":"export"}`,定时任务每 tick 自动执行);
+  `{"action":"restore","file":…,"to":"<ISO/毫秒>"}` 重放
+  基准备份 + 期刊链中提交时间 ≤ 目标 的条目,恢复后照常收敛验证;
+- **用户视图**:`CREATE VIEW / CREATE OR REPLACE VIEW / DROP VIEW`;
+  SELECT 穿透(视图套视图、外层 WHERE/ORDER BY/LIMIT 组合);
+  建视图时干跑校验 + 自引用检查;写/DDL 对视图显式报错;
+  dump/恢复/集群复制全链路携带视图;授权:读视图只需视图授权(权限收口),
+  写语句经视图读源需基表授权(fail-closed 展开)。
+
 ### 银行级合规增量(2026-09-16)
 
 #### 修复

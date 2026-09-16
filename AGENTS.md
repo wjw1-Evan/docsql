@@ -23,7 +23,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 # 提交门禁(全部通过才能提交)
 cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                      # 664 用例
+cargo test --workspace                      # 675 用例
 
 # 覆盖率回归门禁(workspace 行/函数覆盖率低于阈值即失败;默认 85%/80%,
 # 基线 92.9%/88.6%;cargo-llvm-cov 缺失时自动安装)

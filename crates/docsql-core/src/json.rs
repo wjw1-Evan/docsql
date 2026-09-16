@@ -81,6 +81,15 @@ fn write_value(out: &mut String, v: &Value) {
             let _ = write!(out, "{d}");
             out.push_str("\"}");
         }
+        Value::Timestamp(ms) => {
+            // A bare JSON number would decay into a double on JS consumers
+            // (> 2^53 is not the issue here — the issue is the TYPE: a wall
+            // clock must survive as a timestamp, not as a generic number).
+            // {"$ts": <millis>} round-trips exactly, mirroring $dec.
+            out.push_str("{\"$ts\":");
+            let _ = write!(out, "{ms}");
+            out.push('}');
+        }
         Value::Str(s) => write_json_string(out, s),
         Value::Bytes(b) => {
             // Encode as {"$bytes": [ints]} — non-standard but lossless.
@@ -159,8 +168,9 @@ fn write_json_string(out: &mut String, s: &str) {
 }
 
 /// Wire markers decode back to their exact scalar types: `{"$dec":"..."}` is
-/// the lossless DECIMAL carrier and `{"$bytes":[...]}` the BLOB carrier.
-/// Shapes that do not qualify stay plain objects.
+/// the lossless DECIMAL carrier, `{"$bytes":[...]}` the BLOB carrier and
+/// `{"$ts":<millis>}` the TIMESTAMP carrier. Shapes that do not qualify stay
+/// plain objects.
 fn decode_marker(obj: Object) -> Value {
     if obj.len() == 1 {
         if let Some(Value::Str(s)) = obj.get("$dec") {
@@ -172,6 +182,9 @@ fn decode_marker(obj: Object) -> Value {
             if let Some(f) = parse_float_marker(s) {
                 return Value::Float(f);
             }
+        }
+        if let Some(Value::Int(ms)) = obj.get("$ts") {
+            return Value::Timestamp(*ms);
         }
         if let Some(Value::Array(items)) = obj.get("$bytes") {
             let mut bytes = Vec::with_capacity(items.len());

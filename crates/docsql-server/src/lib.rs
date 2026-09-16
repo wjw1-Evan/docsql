@@ -1610,6 +1610,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         Database::parse_classified(&effective).ok();
                                     let authorized = match (&parsed_stmt, &user) {
                                         (Some(p), Some(u)) => authorize_statement(
+                                            None,
                                             &p.stmt,
                                             &p.tx,
                                             p.is_write,
@@ -2067,6 +2068,12 @@ fn json_param_to_value(p: &serde_json::Value) -> Value {
                     return Value::Decimal(d);
                 }
             }
+            // TIMESTAMP: UTC milliseconds (the ADO.NET driver's $ts marker).
+            if let Some(serde_json::Value::Number(n)) = o.get("$ts") {
+                if let Some(ms) = n.as_i64() {
+                    return Value::Timestamp(ms);
+                }
+            }
             if let Some(serde_json::Value::Array(a)) = o.get("$bytes") {
                 let mut bytes = Vec::with_capacity(a.len());
                 for v in a {
@@ -2193,6 +2200,10 @@ fn render_param(p: &Value) -> String {
             )
         }
         Value::Str(s) => docsql_core::stmt::sql_string_literal(s),
+        Value::Timestamp(ms) => format!(
+            "CAST({} AS TIMESTAMP)",
+            docsql_core::stmt::sql_string_literal(&docsql_core::value::format_timestamp_ms(*ms))
+        ),
         Value::Bytes(b) => {
             let mut hex = String::with_capacity(b.len() * 2 + 3);
             hex.push_str("x'");
@@ -2381,6 +2392,7 @@ fn readable_by_all(t: &str) -> bool {
 /// Token/anonymous-legacy connections never reach here. Fails closed: a
 /// query shape the read-target walker cannot fully classify is denied.
 fn authorize_statement(
+    db: Option<&docsql_core::engine::Database>,
     stmt: &AnyStmt,
     tx_kind: &TxControl,
     is_write: bool,
@@ -2443,6 +2455,31 @@ fn authorize_statement(
             let sources = Database::stmt_read_targets(s).ok_or_else(|| {
                 "this statement shape cannot be authorized for user connections".to_string()
             })?;
+            // View expansion: a view is a SELECT permission boundary, not a
+            // license to write through it. A write reading a view needs the
+            // grants on the view's BASE tables (fail-closed, chain capped).
+            let sources = {
+                let mut queue: Vec<String> = sources;
+                let mut seen = std::collections::BTreeSet::new();
+                let mut out: Vec<String> = Vec::new();
+                let mut depth = 0usize;
+                while let Some(t) = queue.pop() {
+                    if !seen.insert(t.clone()) {
+                        continue;
+                    }
+                    match db.and_then(|d| d.view_base_tables(&t)) {
+                        Some(bases) => {
+                            depth += 1;
+                            if depth > 16 {
+                                return Err("view chain too deep to authorize".into());
+                            }
+                            queue.extend(bases);
+                        }
+                        None => out.push(t),
+                    }
+                }
+                out
+            };
             for t in &sources {
                 if docsql_core::useradmin::is_user_table(t) {
                     return Err("user/role data is visible to the admin role only".into());
@@ -2577,7 +2614,10 @@ async fn execute_sql_inner(
     // Per-user authorization (token/anonymous-legacy connections carry no
     // user identity and are not restricted here).
     if let Some(u) = user {
-        if let Err(denial) = authorize_statement(&p.stmt, &tx_kind, is_write, &u.grants) {
+        let db_ref = state.db.read().unwrap_or_else(|p| p.into_inner());
+        if let Err(denial) =
+            authorize_statement(Some(&db_ref), &p.stmt, &tx_kind, is_write, &u.grants)
+        {
             return Frame::new(proto::RESP_ERROR, err_payload(&denial));
         }
     }
@@ -2637,14 +2677,13 @@ async fn execute_sql_inner(
     }
     let queues = !is_replication && matches!(tx_kind, TxControl::Begin);
     let deadline = tokio::time::Instant::now() + BEGIN_QUEUE_WAIT;
-    // Journaling needs a fan-out target: a node without peers or upstream
-    // has nobody to ever pull its catch-up journal, and appending would be
-    // a second engine commit per write for nothing. Peers only change at
-    // restart, so one check up front is exact.
-    let journal_wanted = !is_replication
-        && is_write
-        && matches!(tx_kind, TxControl::None)
-        && (!state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some());
+    // Journaling is unconditional for originated writes: beyond catch-up it
+    // is the PITR source (point-in-time restore replays base + journal up
+    // to a timestamp), so a node without peers still journals. Replicated
+    // applies are excluded — foreign ops live in the ORIGIN's journal;
+    // re-journaling them here would re-broadcast them to third nodes with
+    // this node's origin (unbounded amplification).
+    let journal_wanted = !is_replication && is_write && matches!(tx_kind, TxControl::None);
     let (outcome, in_tx, _order_guard, resolved, journal_seq) = loop {
         // Plain reads wait out a foreign transaction too: the engine applies
         // a transaction's statements to the in-memory tables immediately, so

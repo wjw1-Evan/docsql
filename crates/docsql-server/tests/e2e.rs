@@ -3261,12 +3261,11 @@ async fn joined_node_tracks_origin_head_and_rejoin_pulls_incrementally() {
     d.abort();
 }
 
-/// A node with no fan-out target can never have its journal pulled, and
-/// appending is an engine write of its own: journaling there doubled
-/// every write's fsync cost for nothing. Regression: single-node writes
-/// must leave the catch-up journal empty.
+/// The catch-up journal doubled as the PITR source: single-node writes
+/// MUST journal (with commit timestamps), or point-in-time restore has
+/// nothing to replay. Inverts the old no-fan-out-no-journal shortcut.
 #[tokio::test]
-async fn single_node_does_not_journal_writes() {
+async fn single_node_journals_writes_for_pitr() {
     let dir = tempfile::tempdir().unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
@@ -3283,8 +3282,15 @@ async fn single_node_does_not_journal_writes() {
     let r = c.sql("SELECT COUNT(*) FROM _cluster_log").await;
     assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
     assert!(
-        payload_str(&r).contains("[[0]]"),
-        "single-node writes must not journal: {}",
+        payload_str(&r).contains("[[4]]"),
+        "single-node writes must journal (1 DDL + 3 rows): {}",
+        payload_str(&r)
+    );
+    // Every entry carries its commit timestamp (PITR replay watermark).
+    let r = c.sql("SELECT COUNT(ts) FROM _cluster_log").await;
+    assert!(
+        payload_str(&r).contains("[[4]]"),
+        "journal entries must carry ts: {}",
         payload_str(&r)
     );
 }
@@ -3292,6 +3298,48 @@ async fn single_node_does_not_journal_writes() {
 /// Server with automatic backups enabled on a 1s cadence. Returns
 /// (data dir, default backup dir, addr) — the backup dir is derived from
 /// the db path exactly like production (`<db dir>/backups`).
+/// Long-interval server for PITR tests: automatic fulls would otherwise
+/// rotate/prune the anchor base mid-test; incrementals export on demand
+/// (REQ_BACKUP action "export").
+async fn start_server_pitr() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+    let db = dir.path().join("e2e.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 3600,
+        backup_keep: 8,
+        backup_dir: Some(backups.clone()),
+        statement_timeout_ms: 0,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            return (dir, backups, addr);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("server did not come up");
+}
+
 async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
     let dir = tempfile::tempdir().unwrap();
     let backups = dir.path().join("backups");
@@ -3329,6 +3377,131 @@ async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::Path
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("server did not come up");
+}
+
+/// PITR: journal-based point-in-time restore. A base backup anchors the
+/// journal position; incremental files carry journal entries with commit
+/// timestamps; restoring the base with `to: T` replays exactly the entries
+/// committed at/before T — a mid-state (row B present, row C absent) that
+/// no full backup ever captured comes back intact.
+#[tokio::test]
+async fn pitr_restore_to_timestamp_replays_journal_chain() {
+    let (_dir, backups, addr) = start_server_pitr().await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE led (id INT PRIMARY KEY, tag TEXT)")
+        .await;
+
+    async fn wait_backup_idle(addr: &str) {
+        for _ in 0..500 {
+            let v = backup_list(addr, None).await;
+            if v["running"] == false && v["restore"]["running"] != true {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("backup did not go idle");
+    }
+    async fn trigger(addr: &str, body: &str) -> Frame {
+        let mut c = Client::connect(addr).await;
+        c.send(&Frame::new(proto::REQ_BACKUP, body.as_bytes().to_vec()))
+            .await;
+        c.recv().await
+    }
+    async fn wait_for_backup_containing(backups: &std::path::Path, needle: &str) -> String {
+        for _ in 0..250 {
+            let mut names: Vec<String> = std::fs::read_dir(backups)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n.starts_with("backup-") && n.ends_with(".sql"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            for n in names.iter().rev() {
+                if let Ok(text) = std::fs::read_to_string(backups.join(n)) {
+                    if text.contains(needle) {
+                        return n.clone();
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no base backup containing {needle} appeared");
+    }
+    async fn wait_for_incr_containing(backups: &std::path::Path, needle: &str) {
+        for _ in 0..250 {
+            let found = std::fs::read_dir(backups)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            let n = e.file_name().to_string_lossy().into_owned();
+                            n.starts_with("incr-") && n.ends_with(".sql")
+                        })
+                        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                        .any(|t| t.contains(needle))
+                })
+                .unwrap_or(false);
+            if found {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no incremental containing {needle} appeared");
+    }
+
+    // Startup full backup covers the (empty) state; wait it out.
+    wait_backup_idle(&addr).await;
+    c.sql("CREATE TABLE led (id INT PRIMARY KEY, tag TEXT)")
+        .await;
+    c.sql("INSERT INTO led VALUES (1, 'A')").await;
+    wait_backup_idle(&addr).await;
+    // Anchor base: contains the table and row A, journal-seq >= A.
+    let r = trigger(&addr, r#"{"action":"trigger"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    wait_backup_idle(&addr).await;
+    let base = wait_for_backup_containing(&backups, "'A'").await;
+
+    // Row B inside the target window; export its journal entry.
+    c.sql("INSERT INTO led VALUES (2, 'B')").await;
+    let r = trigger(&addr, r#"{"action":"export"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    wait_for_incr_containing(&backups, "VALUES (2, 'B')").await;
+    // Target after B's commit; the sleep guarantees C commits on a LATER
+    // millisecond (same-ms commits would fall inside the target too).
+    let t_target = docsql_core::now_ms() as i64;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Row C AFTER the target; exported too (per-entry ts excludes it).
+    c.sql("INSERT INTO led VALUES (3, 'C')").await;
+    let r = trigger(&addr, r#"{"action":"export"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    wait_for_incr_containing(&backups, "VALUES (3, 'C')").await;
+
+    // Restore the anchor base to the moment between B and C.
+    let iso = docsql_core::value::format_timestamp_ms(t_target);
+    let r = trigger(
+        &addr,
+        &format!(r#"{{"action":"restore","file":"{base}","to":"{iso}"}}"#),
+    )
+    .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    for _ in 0..500 {
+        let v = backup_list(&addr, None).await;
+        if v["restore"]["running"] != true {
+            assert_eq!(v["restore"]["ok"], true, "restore failed: {v}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rows = c.sql("SELECT id FROM led ORDER BY id").await;
+    let v: serde_json::Value = serde_json::from_slice(&rows.payload).unwrap();
+    let ids: Vec<i64> = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2], "restore-to-T must give A+B without C");
 }
 
 /// Backup file names in `dir`, newest first (the UTC stamp is fixed-width,

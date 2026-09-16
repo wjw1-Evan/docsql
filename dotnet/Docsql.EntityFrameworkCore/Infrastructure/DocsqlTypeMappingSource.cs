@@ -29,11 +29,11 @@ public sealed class DocsqlTypeMappingSource(
     private static readonly GuidTypeMapping Guid = new("TEXT", DbType.Guid);
     private static readonly DocsqlBytesMapping Bytes = new();
 
-    // Date/time literals must be plain ISO-8601 strings: the base mappings
-    // render `TIMESTAMP '...'` / `TIME '...'`, which the engine rejects as
-    // unsupported expressions — inline constants in LINQ would then fail
-    // while closure-parameterized equivalents work. The text form matches
-    // the ADO parameter path exactly, so both paths store one format.
+    // DateTime/DateTimeOffset map to the engine's native TIMESTAMP (UTC
+    // milliseconds, ms precision). The engine now accepts typed literals,
+    // so constants render as CAST('…' AS TIMESTAMP) — matching the ADO
+    // parameter path ($ts marker), both paths store one typed value.
+    // Sub-millisecond digits in "O" text are truncated by the engine.
     private static readonly IsoDateTimeMapping DateTime = new();
     private static readonly IsoDateTimeOffsetMapping DateTimeOffset = new();
     private static readonly IsoTimeSpanMapping TimeSpan = new();
@@ -42,18 +42,20 @@ public sealed class DocsqlTypeMappingSource(
 
     private sealed class IsoDateTimeMapping : DateTimeTypeMapping
     {
-        public IsoDateTimeMapping() : base("TEXT", System.Data.DbType.DateTime) { }
+        public IsoDateTimeMapping() : base("TIMESTAMP", System.Data.DbType.DateTime) { }
 
         protected override string GenerateNonNullSqlLiteral(object value) =>
-            $"'{((System.DateTime)value).ToString("O", CultureInfo.InvariantCulture)}'";
+            "CAST('" + ((System.DateTime)value).ToString("O", CultureInfo.InvariantCulture)
+            + "' AS TIMESTAMP)";
     }
 
     private sealed class IsoDateTimeOffsetMapping : DateTimeOffsetTypeMapping
     {
-        public IsoDateTimeOffsetMapping() : base("TEXT", System.Data.DbType.DateTimeOffset) { }
+        public IsoDateTimeOffsetMapping() : base("TIMESTAMP", System.Data.DbType.DateTimeOffset) { }
 
         protected override string GenerateNonNullSqlLiteral(object value) =>
-            $"'{((DateTimeOffset)value).ToString("O", CultureInfo.InvariantCulture)}'";
+            "CAST('" + ((DateTimeOffset)value).ToString("O", CultureInfo.InvariantCulture)
+            + "' AS TIMESTAMP)";
     }
 
     private sealed class IsoTimeSpanMapping : TimeSpanTypeMapping

@@ -113,7 +113,7 @@ impl<'a> Decoder<'a> {
                 self.u8()?;
                 Ok(())
             }
-            2 | 3 => {
+            2 | 3 | 9 => {
                 self.take(8)?;
                 Ok(())
             }
@@ -185,6 +185,12 @@ impl<'a> Decoder<'a> {
                 raw.copy_from_slice(b);
                 Value::Decimal(Decimal::deserialize(raw))
             }
+            9 => {
+                let b = self.take(8)?;
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(b);
+                Value::Timestamp(i64::from_le_bytes(raw))
+            }
             t => return Err(EncodeError::UnknownTag(t)),
         })
     }
@@ -214,6 +220,10 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         Value::Decimal(d) => {
             out.push(8);
             out.extend_from_slice(&d.serialize());
+        }
+        Value::Timestamp(ms) => {
+            out.push(9);
+            out.extend_from_slice(&ms.to_le_bytes());
         }
         Value::Str(s) => {
             out.push(4);
@@ -325,6 +335,10 @@ mod tests {
             "12345678901234567890.123456".parse().unwrap(),
         ));
         roundtrip(Value::Decimal(Decimal::new(-1, 28)));
+        roundtrip(Value::Timestamp(0));
+        roundtrip(Value::Timestamp(-1));
+        roundtrip(Value::Timestamp(1_789_430_400_123));
+        roundtrip(Value::Timestamp(253_402_300_799_999));
         roundtrip(Value::Str("hello 世界 🎉".into()));
         roundtrip(Value::Bytes(vec![0, 1, 255, 128]));
     }

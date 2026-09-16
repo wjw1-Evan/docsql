@@ -211,6 +211,12 @@ pub struct ParsedStatement {
     pub stmt: AnyStmt,
     pub tx: TxControl,
     pub is_write: bool,
+    /// Original statement text. Wall-clock folding re-parses a rewritten
+    /// copy of this (journaled writes must not carry NOW()/SYSDATE()) and
+    /// the server's queue path holds a parsed statement long before the
+    /// write lock — the text rides along so the fold is available at every
+    /// execute_parsed call site.
+    pub source: String,
 }
 /// A parsed statement: standard SQL (`sqlparser` AST) or one of the
 /// hand-parsed user-management statements (sqlparser 0.62 does not accept
@@ -364,6 +370,19 @@ pub(crate) struct TableMeta {
     /// see heap.rs / docs/design/002): reused by the next oversized insert.
     /// Persisted in the catalog; empty for tables without overflow history.
     overflow_free: Vec<u32>,
+    /// User view: the AS query text (CREATE VIEW). `None` for real tables.
+    /// Views live in the same catalog namespace (one name, one object); a
+    /// SELECT naming one expands to this query's rows. No storage, no
+    /// indexes, no writes.
+    view_sql: Option<String>,
+}
+
+impl TableMeta {
+    /// True when this catalog entry is a user view (CREATE VIEW), not a
+    /// stored table.
+    pub(crate) fn is_view(&self) -> bool {
+        self.view_sql.is_some()
+    }
 }
 
 impl TableMeta {
@@ -693,6 +712,7 @@ pub struct TableDigest {
 /// they legitimately differ between nodes holding identical data.
 fn schema_hash(meta: &TableMeta) -> u64 {
     let mut h = DefaultHasher::new();
+    meta.view_sql.hash(&mut h);
     meta.columns.hash(&mut h);
     meta.primary_key.hash(&mut h);
     meta.unique.hash(&mut h);
@@ -1174,6 +1194,26 @@ impl<'a> ReadCx<'a> {
                 v => format!("USER_{}", &v[5..]),
             };
             return Ok((view, alias, docs));
+        }
+        // User view (CREATE VIEW): expand to the stored query's rows. The
+        // expansion re-executes the view body as a plain SELECT over the
+        // current catalog (a view of a view recurses naturally; the body
+        // self-references cannot resolve, so cycles are impossible by
+        // construction — created views only see names that already exist).
+        if let Some(meta) = self.tables.get(&tname) {
+            if meta.is_view() {
+                let body = meta.view_sql.clone().unwrap_or_default();
+                let q = Database::plain_read_query(&Database::parse_classified(&body)?)?;
+                let ExecOutcome::Rows(r) = self.exec_query(q)? else {
+                    return err(format!("view {tname} body must be a SELECT"));
+                };
+                let docs: Vec<Object> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| r.columns.iter().cloned().zip(row).collect())
+                    .collect();
+                return Ok((tname, alias, docs));
+            }
         }
         let docs = self.table_docs(&tname)?;
         Ok((tname, alias, docs))
@@ -2158,6 +2198,73 @@ impl<'a> ReadCx<'a> {
         Ok(Some(out))
     }
 
+    /// Promote a probe plan's string bounds into the tree's key band: a
+    /// parseable timestamp string against a TIMESTAMP-keyed tree must
+    /// compare chronologically — the raw cmp_values band ranks Str above
+    /// every Timestamp, which would silently turn `WHERE ts > '2026-…'`
+    /// into an empty result. Sampling min+max keys decides the band (two
+    /// leaf reads); mixed-band trees keep the literal and need an explicit
+    /// `CAST('…' AS TIMESTAMP)` (documented boundary). Scalar bounds only:
+    /// composite Array prefixes keep their elements (same CAST rule).
+    fn promote_plan_bounds(
+        &self,
+        tree: &BTree,
+        tx: &crate::pager::Tx,
+        plan: &ProbePlan,
+    ) -> Result<ProbePlan> {
+        let band_is_timestamp = |sample: &[(Value, u64)]| {
+            sample
+                .first()
+                .is_some_and(|(k, _)| matches!(k, Value::Timestamp(_)))
+        };
+        let tree_band_timestamp = |min: bool, max: bool| min && max;
+        let promotes = |v: &Value| -> bool {
+            matches!(v, Value::Str(s) if crate::value::parse_timestamp_ms(s).is_some())
+        };
+        let promote = |v: &Value| -> Value {
+            if let Value::Str(s) = v {
+                if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                    return Value::Timestamp(ms);
+                }
+            }
+            v.clone()
+        };
+        // Cheap pre-check: no string bound anywhere → the plan is untouched
+        // (and the two leaf reads are not paid).
+        let has_str_bound = match plan {
+            ProbePlan::Eq(v) | ProbePlan::Prefix(v) => promotes(v),
+            ProbePlan::Range { lo, hi } => {
+                lo.as_ref().is_some_and(|(v, _)| promotes(v))
+                    || hi.as_ref().is_some_and(|(v, _)| promotes(v))
+            }
+        };
+        if !has_str_bound {
+            return Ok(plan.clone());
+        }
+        let reader = self.reader();
+        let min_is_ts = band_is_timestamp(
+            &tree
+                .scan_limited(&reader, tx, Some(1))
+                .map_err(|e| index_err("probe bound", e))?,
+        );
+        let max_is_ts = band_is_timestamp(
+            &tree
+                .scan_limited_rev(&reader, tx, Some(1))
+                .map_err(|e| index_err("probe bound", e))?,
+        );
+        if !tree_band_timestamp(min_is_ts, max_is_ts) {
+            return Ok(plan.clone());
+        }
+        Ok(match &plan {
+            ProbePlan::Eq(v) => ProbePlan::Eq(promote(v)),
+            ProbePlan::Prefix(v) => ProbePlan::Prefix(promote(v)),
+            ProbePlan::Range { lo, hi } => ProbePlan::Range {
+                lo: lo.as_ref().map(|(v, incl)| (promote(v), *incl)),
+                hi: hi.as_ref().map(|(v, incl)| (promote(v), *incl)),
+            },
+        })
+    }
+
     /// Index entries selected by `plan`, in key order. `max` caps the walk to
     /// the first `max` entries; pass it only when every entry the plan can
     /// return is a result (exact probes), since a non-unique run must not
@@ -2171,7 +2278,8 @@ impl<'a> ReadCx<'a> {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let reader = self.reader();
-        let pairs = match plan {
+        let plan = self.promote_plan_bounds(tree, tx, plan)?;
+        let pairs = match &plan {
             ProbePlan::Eq(v) => {
                 // Bounded range + equal filter so non-unique trees return
                 // every duplicate match (get() would yield one entry).
@@ -2249,7 +2357,8 @@ impl<'a> ReadCx<'a> {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let reader = self.reader();
-        let pairs = match plan {
+        let plan = self.promote_plan_bounds(tree, tx, plan)?;
+        let pairs = match &plan {
             ProbePlan::Eq(v) => tree
                 .range_bounded_rev_limited(&reader, tx, Some((v, true)), Some((v, true)), max)
                 .map_err(|e| index_err(col, e))?,
@@ -2890,6 +2999,8 @@ impl Database {
                                 m.get("autoinc").and_then(|v| v.as_str()).map(String::from);
                             let autoguid =
                                 m.get("autoguid").and_then(|v| v.as_str()).map(String::from);
+                            let view_sql =
+                                m.get("view_sql").and_then(|v| v.as_str()).map(String::from);
                             let index_defs = match m.get("index_defs") {
                                 Some(Value::Array(a)) => a
                                     .iter()
@@ -3000,6 +3111,7 @@ impl Database {
                                     not_null,
                                     autoinc,
                                     autoguid,
+                                    view_sql,
                                     indexes,
                                     index_defs,
                                     constraint_unique,
@@ -3106,6 +3218,9 @@ impl Database {
             // reason as AUTOINCREMENT.
             if let Some(col) = &meta.autoguid {
                 m.insert("autoguid".into(), Value::Str(col.clone()));
+            }
+            if let Some(sql) = &meta.view_sql {
+                m.insert("view_sql".into(), Value::Str(sql.clone()));
             }
             if !meta.unique.is_empty() {
                 m.insert(
@@ -3496,6 +3611,24 @@ impl Database {
         }
     }
 
+    /// Base tables a view's body reads (one level). `None` when `name` is
+    /// not a view or the body cannot be classified — authorization callers
+    /// must fail closed on None. Views are a SELECT permission boundary
+    /// (a grant on the view hides its bases), but a write reading THROUGH
+    /// a view still needs the base grants.
+    pub fn view_base_tables(&self, name: &str) -> Option<Vec<String>> {
+        let meta = self.tables.get(name)?;
+        let sql = meta.view_sql.as_ref()?;
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+        let stmt = stmts.swap_remove(0);
+        let mut out = Vec::new();
+        match stmt {
+            Statement::Query(q) => walk_query(&q, &mut out)?,
+            _ => return None,
+        }
+        Some(out)
+    }
+
     /// Tables a statement READS (authorization input for user connections):
     /// every table referenced in a query's FROM/JOINs (derived tables and
     /// subqueries included — inside CTE bodies, projections and predicates
@@ -3645,6 +3778,7 @@ impl Database {
                     stmt: AnyStmt::UserAdmin(ua),
                     tx: TxControl::None,
                     is_write: true,
+                    source: sql.to_string(),
                 })
             }
             Some(Err(m)) => return err(m),
@@ -3663,6 +3797,7 @@ impl Database {
             stmt: AnyStmt::Sql(Box::new(stmt)),
             tx,
             is_write,
+            source: sql.to_string(),
         })
     }
 
@@ -3806,6 +3941,24 @@ impl Database {
     pub fn execute_parsed(&mut self, parsed: ParsedStatement) -> Result<ExecOutcome> {
         self.resolved_sql = None;
         self.last_insert_id = None;
+        // Wall-clock fold (journaled-write red line): a write carrying
+        // NOW()/SYSDATE()/CURRENT_TIMESTAMP resolves the instant ONCE here
+        // and ships the literal through resolved_sql — a replica replaying
+        // the text would stamp its own clock and silently diverge. The
+        // re-parsed statement carries the folded literal, so the INSERT
+        // canonical rewrite below (if any) renders folded values too.
+        if parsed.is_write && crate::stmt::mentions_wall_clock(&parsed.source) {
+            if let Some(folded) =
+                crate::stmt::fold_wall_clocks(&parsed.source, crate::now_ms() as i64)
+            {
+                let reparsed = Self::parse_classified(&folded)?;
+                let outcome = self.execute_parsed(reparsed)?;
+                if self.resolved_sql.is_none() {
+                    self.resolved_sql = Some(folded);
+                }
+                return Ok(outcome);
+            }
+        }
         match parsed.stmt {
             AnyStmt::Sql(stmt) => self.exec_stmt(*stmt),
             AnyStmt::UserAdmin(ua) => self.exec_user_admin(&ua),
@@ -4120,9 +4273,24 @@ impl Database {
     }
 
     fn ensure_cluster_tables_inner(&mut self) -> Result<()> {
+        let preexisting = self.tables.contains_key(CLUSTER_LOG_TABLE);
         self.execute(&format!(
-            "CREATE TABLE IF NOT EXISTS {CLUSTER_LOG_TABLE} (seq INT PRIMARY KEY, sql TEXT)"
+            "CREATE TABLE IF NOT EXISTS {CLUSTER_LOG_TABLE} (seq INT PRIMARY KEY, sql TEXT, ts INT)"
         ))?;
+        // Migration: journals created before PITR have no ts column. Entries
+        // migrated this way keep ts NULL — PITR export skips NULL-ts rows
+        // (they predate the feature and always sit before the first
+        // post-upgrade base backup's journal position).
+        if preexisting {
+            let has_ts = self
+                .execute(&format!("SELECT ts FROM {CLUSTER_LOG_TABLE} LIMIT 1"))
+                .is_ok();
+            if !has_ts {
+                self.execute(&format!(
+                    "ALTER TABLE {CLUSTER_LOG_TABLE} ADD COLUMN ts INT"
+                ))?;
+            }
+        }
         self.execute(&format!(
             "CREATE TABLE IF NOT EXISTS {CLUSTER_POS_TABLE} (node_id TEXT PRIMARY KEY, seq INT)"
         ))?;
@@ -4201,8 +4369,11 @@ impl Database {
             Some(n) => n,
             None => self.journal_seq_boundary("MAX")? + 1,
         };
+        // ts = entry commit time (ms): the PITR replay watermark. One clock
+        // read per journaled write is nothing next to the write itself.
+        let ts = crate::now_ms() as i64;
         self.execute(&format!(
-            "INSERT INTO {CLUSTER_LOG_TABLE} (seq, sql) VALUES ({next}, {})",
+            "INSERT INTO {CLUSTER_LOG_TABLE} (seq, sql, ts) VALUES ({next}, {}, {ts})",
             value_literal(&Value::Str(sql.to_string()))?
         ))?;
         self.journal_next = Some(next + 1);
@@ -4268,6 +4439,32 @@ impl Database {
     /// some peer would pull them back and resurrect discarded writes), but
     /// the seq space and every recorded position must keep their meaning.
     /// Replays of a voided entry are a parsed no-op.
+    /// Journal entries with `seq > after`, in seq order, capped at `limit`:
+    /// the PITR incremental export source. `ts` is the entry's commit time
+    /// (None for rows migrated from the pre-PITR journal shape).
+    pub fn journal_entries_after(
+        &mut self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Option<i64>, String)>> {
+        self.ensure_cluster_tables()?;
+        let r = self.execute(&format!(
+            "SELECT seq, ts, sql FROM {CLUSTER_LOG_TABLE} WHERE seq > {after} \
+             ORDER BY seq LIMIT {limit}"
+        ))?;
+        let mut out = Vec::new();
+        if let ExecOutcome::Rows(rows) = r {
+            for row in rows.rows {
+                let seq = row.first().and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
+                let ts = row.get(1).and_then(Value::as_i64);
+                if let Some(Value::Str(sql)) = row.get(2) {
+                    out.push((seq, ts, sql.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn journal_void_all(&mut self) -> Result<()> {
         self.ensure_cluster_tables()?;
         self.execute(&format!(
@@ -4345,16 +4542,36 @@ impl Database {
             .filter(|n| !is_internal_table(n))
             .cloned()
             .collect();
+        // Views drop with their own statement kind: DROP TABLE on a view is
+        // a wrong-kind error (restore replays the prelude verbatim).
+        let view_names: Vec<String> = names
+            .iter()
+            .filter(|n| self.tables.get(*n).is_some_and(|m| m.is_view()))
+            .cloned()
+            .collect();
+        let table_names: Vec<String> = names
+            .iter()
+            .filter(|n| !self.tables.get(*n).is_some_and(|m| m.is_view()))
+            .cloned()
+            .collect();
         let mut ddl = String::new();
-        if !names.is_empty() {
-            let drops = names
+        if !view_names.is_empty() {
+            let drops = view_names
+                .iter()
+                .map(|n| quote_ident(n))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ddl.push_str(&format!("DROP VIEW IF EXISTS {drops};\n"));
+        }
+        if !table_names.is_empty() {
+            let drops = table_names
                 .iter()
                 .map(|n| quote_ident(n))
                 .collect::<Vec<_>>()
                 .join(", ");
             ddl.push_str(&format!("DROP TABLE IF EXISTS {drops};\n"));
         }
-        for name in &names {
+        for name in &table_names {
             let meta = self.tables.get(name).cloned().unwrap();
             ddl.push_str(&format!("CREATE TABLE {} (\n", quote_ident(name)));
             let mut parts: Vec<String> = Vec::new();
@@ -4457,6 +4674,15 @@ impl Database {
             ddl.push_str(&s);
             ddl.push_str(";\n");
         }
+        // Views last: their bodies reference restored tables (the CREATE
+        // dry-runs the body, so the table must exist by then).
+        for name in &view_names {
+            if let Some(meta) = self.tables.get(name) {
+                if let Some(body) = &meta.view_sql {
+                    ddl.push_str(&format!("CREATE VIEW {} AS {body};\n", quote_ident(name)));
+                }
+            }
+        }
         Ok(ddl)
     }
 
@@ -4479,6 +4705,7 @@ impl Database {
     fn exec_stmt(&mut self, stmt: Statement) -> Result<ExecOutcome> {
         match stmt {
             Statement::CreateTable(create) => self.exec_create(create),
+            Statement::CreateView(view) => self.exec_create_view(view),
             Statement::Drop {
                 object_type,
                 names,
@@ -4577,8 +4804,38 @@ impl Database {
                     self.commit_pager_tx(tx)?;
                     return Ok(ExecOutcome::Affected(0));
                 }
+                if object_type == sqlparser::ast::ObjectType::View {
+                    // Views have no storage: drop the catalog entry only.
+                    // DROP TABLE on a view errors (wrong-kind mismatch), and
+                    // so does DROP VIEW on a table.
+                    for name in names.iter().map(obj_name) {
+                        match self.tables.get(&name) {
+                            None if if_exists => {}
+                            None => return err(format!("view {name} does not exist")),
+                            Some(meta) if !meta.is_view() => {
+                                return err(format!(
+                                    "{name} is a table, not a view (use DROP TABLE)"
+                                ));
+                            }
+                            Some(_) => {
+                                let mut tx = self.pager.begin_tx();
+                                self.tables.remove(&name);
+                                self.save_catalog_into(&mut tx)?;
+                                self.commit_pager_tx(tx)?;
+                            }
+                        }
+                    }
+                    return Ok(ExecOutcome::Affected(0));
+                }
                 if object_type != sqlparser::ast::ObjectType::Table {
-                    return err("only DROP TABLE/INDEX are supported");
+                    return err("only DROP TABLE/VIEW/INDEX are supported");
+                }
+                // Mixed-kind target: DROP TABLE on a view must not silently
+                // drop the rest.
+                for name in names.iter().map(obj_name) {
+                    if self.tables.get(&name).is_some_and(|m| m.is_view()) {
+                        return err(format!("{name} is a view, not a table (use DROP VIEW)"));
+                    }
                 }
                 // Validate every target before touching the catalog: a missing
                 // name mid-list must not leave earlier drops applied in memory
@@ -4731,6 +4988,11 @@ impl Database {
                     let name = obj_name(&target.name);
                     if !self.tables.contains_key(&name) && !tr.if_exists {
                         return err(format!("table {name} does not exist"));
+                    }
+                    if self.tables.get(&name).is_some_and(|m| m.is_view()) {
+                        return err(format!(
+                            "cannot TRUNCATE view {name} (it is a view, not a table)"
+                        ));
                     }
                     if self.tables.contains_key(&name) {
                         let mut meta = self
@@ -4929,6 +5191,11 @@ impl Database {
             return err("UPDATE ... JOIN is not supported (use UPDATE ... FROM)");
         }
         let tname = obj_name(&name);
+        if self.tables.get(&tname).is_some_and(|m| m.is_view()) {
+            return err(format!(
+                "cannot UPDATE view {tname} (it is a view, not a table)"
+            ));
+        }
         let tkey = alias
             .as_ref()
             .map(|a| a.name.value.clone())
@@ -5272,6 +5539,11 @@ impl Database {
             return err("only simple table names in DELETE");
         };
         let tname = obj_name(&name);
+        if self.tables.get(&tname).is_some_and(|m| m.is_view()) {
+            return err(format!(
+                "cannot DELETE from view {tname} (it is a view, not a table)"
+            ));
+        }
         let tkey = alias
             .as_ref()
             .map(|a| a.name.value.clone())
@@ -5444,6 +5716,11 @@ impl Database {
             return err("index storage options are not supported");
         }
         let table = obj_name(&idx.table_name);
+        if self.tables.get(&table).is_some_and(|m| m.is_view()) {
+            return err(format!(
+                "cannot index view {table} (it is a view, not a table)"
+            ));
+        }
         let iname = idx
             .name
             .as_ref()
@@ -5534,6 +5811,7 @@ impl Database {
         let Some(mut meta) = self.tables.get(&tname).map(|a| a.as_ref().clone()) else {
             return err(format!("table {tname} does not exist"));
         };
+        ensure_not_view("ALTER", &tname, &meta)?;
         // rewrite_table persists the catalog in its own transaction; only
         // metadata-only ALTERs (plain ADD COLUMN) need the tail save.
         let mut rewrote = false;
@@ -5929,6 +6207,86 @@ impl Database {
         Ok(())
     }
 
+    /// CREATE VIEW: a named SELECT stored in the catalog namespace. Views
+    /// have no storage, no indexes and no declared columns — a SELECT naming
+    /// one expands to the stored query's rows (see `load_table_factor`).
+    /// The body is dry-run once at create time so missing tables/columns
+    /// fail loudly, and `CREATE OR REPLACE` re-points an existing view.
+    fn exec_create_view(&mut self, view: sqlparser::ast::CreateView) -> Result<ExecOutcome> {
+        if view.materialized {
+            return err("materialized views are not supported (CREATE VIEW only)");
+        }
+        if view.secure || view.with_no_schema_binding {
+            return err("SECURE / WITH NO SCHEMA BINDING views are not supported");
+        }
+        if !view.columns.is_empty() {
+            // Column aliases would need per-row projection renaming; the
+            // projection's own aliases already name the columns.
+            return err("CREATE VIEW column list is not supported (alias the projection)");
+        }
+        let name = obj_name(&view.name);
+        if name.starts_with('#') {
+            return err("temp views (#name) are not supported");
+        }
+        if crate::useradmin::is_user_table(&name) {
+            return err(format!(
+                "view name {name} is reserved for the user/role subsystem"
+            ));
+        }
+        if crate::engine::is_system_table(&name) {
+            return err(format!("view name {name} is reserved for the engine"));
+        }
+        let exists = self.tables.contains_key(&name);
+        if exists && !view.or_replace {
+            if view.if_not_exists {
+                return Ok(ExecOutcome::Affected(0));
+            }
+            return err(format!("view {name} already exists"));
+        }
+        if exists {
+            let meta = self.tables.get(&name).expect("checked just above");
+            if !meta.is_view() {
+                return err(format!(
+                    "{name} is a table; use DROP TABLE before CREATE VIEW"
+                ));
+            }
+        }
+        let body = format!("{}", view.query);
+        // Self-reference guard: with OR REPLACE the old view still resolves
+        // (dry-run below would recurse into itself forever). A view body
+        // naming its own view is rejected up front.
+        {
+            let mut refs = Vec::new();
+            let mut stmts = Parser::parse_sql(&GenericDialect {}, &body)
+                .map_err(|e| SqlError::Parse(e.to_string()))?;
+            if let Statement::Query(q) = stmts.swap_remove(0) {
+                if walk_query(&q, &mut refs).is_none() {
+                    return err("view body cannot be classified");
+                }
+                if refs.iter().any(|r| r == &name) {
+                    return err(format!("view {name} cannot reference itself"));
+                }
+            } else {
+                return err("view body must be a SELECT");
+            }
+        }
+        // Dry-run the body once: missing tables/columns/unsupported shapes
+        // fail at CREATE time, not at first SELECT. The body executes as a
+        // plain SELECT over the CURRENT catalog (a self-reference errors —
+        // the name does not resolve yet — which is exactly the cycle check).
+        {
+            let q = Self::plain_read_query(&Self::parse_classified(&body)?)?;
+            self.exec_query_cx(q)?;
+        }
+        let meta = TableMeta {
+            view_sql: Some(body),
+            ..Default::default()
+        };
+        self.tables.insert(name.clone(), std::sync::Arc::new(meta));
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
     fn exec_create(&mut self, create: sqlparser::ast::CreateTable) -> Result<ExecOutcome> {
         use sqlparser::ast::ColumnOption as CO;
         let name = obj_name(&create.name);
@@ -6157,6 +6515,7 @@ impl Database {
         let Some(meta) = self.tables.get(&table).cloned() else {
             return err(format!("table {table} does not exist"));
         };
+        ensure_not_view("INSERT into", &table, &meta)?;
         let mut columns: Vec<String> = if insert.columns.is_empty() {
             meta.columns.clone()
         } else {
@@ -7536,6 +7895,7 @@ fn join_key_of(v: &Value) -> Option<JoinKey> {
         // ultra-wide-integer range, mirroring Int/Float (cmp_values then
         // terminates candidates exactly).
         Value::Decimal(d) => JoinKey::Num(num_key(d.to_f64()?)),
+        Value::Timestamp(ms) => JoinKey::Num(num_key(*ms as f64)),
         Value::Str(s) => JoinKey::Str(s.clone()),
         Value::Bytes(b) => JoinKey::Bytes(b.clone()),
         Value::Array(items) => {
@@ -8119,6 +8479,11 @@ fn value_literal(v: &Value) -> Result<String> {
             Ok(hex)
         }
         Value::Str(s) => Ok(crate::stmt::sql_string_literal(s)),
+        // TIMESTAMP '…' form: bare ISO text would re-parse as Str on replay.
+        Value::Timestamp(ms) => Ok(format!(
+            "CAST({} AS TIMESTAMP)",
+            crate::stmt::sql_string_literal(&crate::value::format_timestamp_ms(*ms))
+        )),
         // Structured values (JSON_EXTRACT output, INSERT ... SELECT from a
         // JSON function, etc.) have no literal syntax in this dialect: the
         // engine's canonical JSON text wrapped in JSON_EXTRACT round-trips
@@ -8148,6 +8513,18 @@ fn default_expr_text(e: &SqlExpr) -> String {
 /// Double-quoted SQL identifier.
 fn quote_ident(name: &str) -> String {
     crate::stmt::sql_quote_ident(name)
+}
+
+/// Views reject every write and every schema change: they are named SELECTs
+/// with no storage. The guard names the offending kind explicitly (SQLite:
+/// "cannot modify X because it is a view").
+fn ensure_not_view(kind: &str, table: &str, meta: &TableMeta) -> Result<()> {
+    if meta.is_view() {
+        return Err(SqlError::Message(format!(
+            "cannot {kind} view {table} (it is a view, not a table)"
+        )));
+    }
+    Ok(())
 }
 
 fn obj_name(name: &ObjectName) -> String {
@@ -8633,6 +9010,7 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
             scalar_function(&name, &args)
         }
         SqlExpr::Identifier(i) => err(format!("column {} not allowed here", i.value)),
+        SqlExpr::TypedString(ts) => typed_string_value(ts),
         other => err(format!("unsupported expression: {other}")),
     }
 }
@@ -8736,6 +9114,10 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             }
         }
         SqlExpr::Value(v) => sql_value(v),
+        // Typed string literal: `TIMESTAMP '2026-09-16T00:00:00Z'`. A
+        // malformed timestamp is a query error (static text, evaluated on
+        // every row) — unlike a compared string, which degrades to NULL.
+        SqlExpr::TypedString(ts) => typed_string_value(ts),
         SqlExpr::UnaryOp { op, expr } => {
             let v = eval_expr(expr, doc)?;
             match (op, v) {
@@ -8965,6 +9347,31 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
     }
 }
 
+/// Typed string literal (`TIMESTAMP '…'` / `DATE '…'`): a malformed
+/// timestamp is a query error — the text is static, unlike a compared
+/// string, which degrades to NULL in predicates.
+fn typed_string_value(ts: &sqlparser::ast::TypedString) -> Result<Value> {
+    let is_ts = matches!(
+        ts.data_type,
+        sqlparser::ast::DataType::Timestamp(_, _)
+            | sqlparser::ast::DataType::TimestampNtz(_)
+            | sqlparser::ast::DataType::Datetime(_)
+            | sqlparser::ast::DataType::Date
+    );
+    if !is_ts {
+        return err(format!("typed literal {} is not supported", ts.data_type));
+    }
+    let text = match &ts.value.value {
+        sqlparser::ast::Value::SingleQuotedString(s)
+        | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+        other => return err(format!("bad typed literal value: {other}")),
+    };
+    Ok(Value::Timestamp(
+        crate::value::parse_timestamp_ms(&text)
+            .ok_or_else(|| SqlError::Message(format!("bad TIMESTAMP literal '{text}'")))?,
+    ))
+}
+
 /// SQL LIKE with `%` (any run) and `_` (one char); backtracking matcher.
 fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
     let s: Vec<char> = s.chars().collect();
@@ -9095,11 +9502,7 @@ fn apply_limit_clause(
 /// Current wall clock as the canonical text form (UTC, RFC 3339-style
 /// seconds precision) — the SYSDATE() compatibility function's value.
 fn now_ms_string() -> String {
-    let ms = crate::now_ms();
-    let secs = ms / 1000;
-    let millis = ms % 1000;
-    let (y, mo, d, h, mi, se) = civil_from_secs(secs);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}.{millis:03}Z")
+    crate::value::format_timestamp_ms(crate::now_ms() as i64)
 }
 
 /// Days since epoch → (y, m, d) — Howard Hinnant's `civil_from_days`.
@@ -9116,21 +9519,6 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-/// Seconds since epoch → (y, m, d, h, mi, s).
-fn civil_from_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (y, mo, d) = civil_from_days(days);
-    (
-        y,
-        mo,
-        d,
-        (rem / 3600) as u32,
-        ((rem % 3600) / 60) as u32,
-        (rem % 60) as u32,
-    )
 }
 
 /// True when the statement's projection or WHERE references the Oracle
@@ -9193,6 +9581,9 @@ fn value_to_text(v: &Value) -> String {
         Value::Decimal(d) => d.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Null => String::new(),
+        // Timestamp renders as canonical fixed-width ISO text (Display),
+        // not the debug enum shape.
+        Value::Timestamp(ms) => crate::value::format_timestamp_ms(*ms),
         other => format!("{other:?}"),
     }
 }
@@ -9227,6 +9618,7 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
                 SqlError::Message(format!("cannot CAST {d} AS {type_name}: out of range"))
             })?),
             Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
+            Value::Timestamp(ms) => Value::Int(ms),
             Value::Str(s) => Value::Int(
                 s.trim()
                     .parse::<i64>()
@@ -9237,6 +9629,25 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
         v if t.contains("CHAR") || t.contains("TEXT") || t.contains("STRING") => {
             Value::Str(value_to_text(&v))
         }
+        // TIMESTAMP/DATETIME: strings parse in any accepted timestamp form
+        // (malformed → error, like the numeric casts); integers are UTC
+        // milliseconds. Timestamp→Int (ms) has its arm in the INT branch.
+        v if t.contains("TIMESTAMP") || t.contains("DATETIME") => match v {
+            Value::Timestamp(_) => v,
+            Value::Int(i) => Value::Timestamp(i),
+            Value::Str(s) => {
+                Value::Timestamp(crate::value::parse_timestamp_ms(&s).ok_or_else(|| {
+                    SqlError::Message(format!("cannot CAST '{s}' AS {type_name}: not a timestamp"))
+                })?)
+            }
+            other => {
+                return err(format!(
+                    "cannot CAST {} AS {type_name}: cast from {} is not defined",
+                    value_to_text(&other),
+                    other.type_name()
+                ))
+            }
+        },
         v if t.contains("BOOL") => match v {
             Value::Bool(_) => v,
             Value::Int(i) => Value::Bool(i != 0),
@@ -9302,6 +9713,10 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
     }
     let null_prop = |v: &Value| matches!(v, Value::Null);
     Ok(match name {
+        "NOW" | "CURRENT_TIMESTAMP" | "NOW_MS" => {
+            exact_arity(name, args, 0)?;
+            Value::Timestamp(crate::now_ms() as i64)
+        }
         "UPPER" | "UCASE" => {
             exact_arity(name, args, 1)?;
             Value::Str(value_to_text(arg(args, 0, name)?).to_uppercase())
@@ -9431,6 +9846,7 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                     Value::Int(_) => "integer",
                     Value::Float(_) => "float",
                     Value::Decimal(_) => "decimal",
+                    Value::Timestamp(_) => "timestamp",
                     Value::Str(_) => "text",
                     Value::Bytes(_) => "blob",
                     Value::Array(_) => "array",
@@ -9736,6 +10152,7 @@ fn json_type_name(v: &Value) -> &'static str {
         Value::Int(_) => "integer",
         Value::Float(_) => "real",
         Value::Decimal(_) => "real",
+        Value::Timestamp(_) => "timestamp",
         Value::Str(_) => "text",
         Value::Bytes(_) => "blob",
         Value::Array(_) => "array",
@@ -10761,12 +11178,27 @@ fn binop(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             (a, b) => Value::Str(format!("{}{}", value_to_text(&a), value_to_text(&b))),
         },
-        Eq => Value::Bool(Value::cmp_values(&l, &r) == Ordering::Equal),
-        NotEq => Value::Bool(Value::cmp_values(&l, &r) != Ordering::Equal),
-        Lt => Value::Bool(Value::cmp_values(&l, &r) == Ordering::Less),
-        LtEq => Value::Bool(Value::cmp_values(&l, &r) != Ordering::Greater),
-        Gt => Value::Bool(Value::cmp_values(&l, &r) == Ordering::Greater),
-        GtEq => Value::Bool(Value::cmp_values(&l, &r) != Ordering::Less),
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            // Coercion only (timestamp vs parseable string); it must never
+            // touch NULL — NULL is a comparable value here (NULL = NULL is
+            // true; hash-join and unique-check semantics rely on that).
+            let Some((l, r)) = coerce_timestamp_operands(l, r) else {
+                // A string that is not a timestamp compared with a
+                // TIMESTAMP: unknown, not a silent wrong ordering.
+                return Ok(Value::Null);
+            };
+            let ord = Value::cmp_values(&l, &r);
+            let out = match op {
+                Eq => ord == Ordering::Equal,
+                NotEq => ord != Ordering::Equal,
+                Lt => ord == Ordering::Less,
+                LtEq => ord != Ordering::Greater,
+                Gt => ord == Ordering::Greater,
+                GtEq => ord != Ordering::Less,
+                _ => unreachable!("matched above"),
+            };
+            Value::Bool(out)
+        }
         And => match (l, r) {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a && b),
             _ => return err("AND requires booleans"),
@@ -10777,6 +11209,36 @@ fn binop(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         },
         other => return err(format!("unsupported operator: {other}")),
     })
+}
+
+/// Comparison-side TIMESTAMP coercion: a string operand against a TIMESTAMP
+/// parses into the comparison (any accepted timestamp form — `WHERE ts >
+/// '2026-09-16'` works); an unparseable string yields None → the comparison
+/// is NULL. cmp_values itself never mixes the bands (a parseable string
+/// inserted into the time order would break transitivity), so this is the
+/// single funnel where the predicate-level rule lives — the index-probe
+/// bound builder shares it (see `promote_timestamp_bound`).
+fn coerce_timestamp_operands(l: Value, r: Value) -> Option<(Value, Value)> {
+    use crate::value::parse_timestamp_ms;
+    match (&l, &r) {
+        (Value::Timestamp(t), Value::Str(s)) => {
+            parse_timestamp_ms(s).map(|p| (Value::Timestamp(*t), Value::Timestamp(p)))
+        }
+        (Value::Str(s), Value::Timestamp(t)) => {
+            parse_timestamp_ms(s).map(|p| (Value::Timestamp(p), Value::Timestamp(*t)))
+        }
+        (Value::Timestamp(_), Value::Int(_))
+        | (Value::Int(_), Value::Timestamp(_))
+        | (Value::Timestamp(_), Value::Decimal(_))
+        | (Value::Decimal(_), Value::Timestamp(_))
+        | (Value::Timestamp(_), Value::Float(_))
+        | (Value::Float(_), Value::Timestamp(_)) => {
+            // No silent numeric-date semantics: CAST(ms AS TIMESTAMP)
+            // makes the intent explicit.
+            None
+        }
+        _ => Some((l, r)),
+    }
 }
 
 /// NULL-safe equality for `IS [NOT] DISTINCT FROM` (SQL:2003). The engine's
@@ -10791,6 +11253,32 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     use BinaryOperator::*;
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
+    }
+    // TIMESTAMP arithmetic: ± INTEGER shifts by milliseconds,
+    // TIMESTAMP - TIMESTAMP yields the duration in milliseconds
+    // (checked: i64 ms covers ~292 million years either way, but a
+    // pathological literal must not panic). Timestamp + Timestamp and
+    // numeric↔timestamp mixing are errors — CAST explicitly.
+    if matches!(l, Value::Timestamp(_)) || matches!(r, Value::Timestamp(_)) {
+        return Ok(match (op, l, r) {
+            (Plus, Value::Timestamp(t), Value::Int(n))
+            | (Plus, Value::Int(n), Value::Timestamp(t)) => t
+                .checked_add(n)
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Null),
+            (Minus, Value::Timestamp(t), Value::Int(n)) => t
+                .checked_sub(n)
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Null),
+            (Minus, Value::Timestamp(a), Value::Timestamp(b)) => {
+                a.checked_sub(b).map(Value::Int).unwrap_or(Value::Null)
+            }
+            _ => {
+                return err(
+                    "timestamp arithmetic: TIMESTAMP ± INTEGER (ms) or TIMESTAMP - TIMESTAMP",
+                )
+            }
+        });
     }
     // Decimal wins over Float in mixed arithmetic: exactness survives
     // `amount * 1.5` while Int stays promoted losslessly.
@@ -15006,9 +15494,15 @@ mod tests {
 
     #[test]
     fn create_view_rejected() {
+        // Plain views are supported now; the explicit-rejection surface that
+        // remains is materialized / decorated views (same red line class:
+        // never silently accept-and-ignore).
         let mut db = Database::in_memory().unwrap();
-        let e = db.execute("CREATE VIEW v AS SELECT 1").unwrap_err();
-        assert!(e.to_string().contains("unsupported statement"), "{e}");
+        run(&mut db, "CREATE TABLE t (id INT)");
+        let e = db
+            .execute("CREATE MATERIALIZED VIEW v AS SELECT * FROM t")
+            .unwrap_err();
+        assert!(e.to_string().contains("materialized"), "{e}");
     }
 
     #[test]
@@ -15896,6 +16390,301 @@ mod tests {
         assert_eq!(r.rows, vec![vec![Value::Int(3), Value::Int(42)]]);
     }
 
+    // ---- 精确 TIMESTAMP:类型、协变、探针、折叠 ----
+
+    #[test]
+    fn timestamp_literal_and_wire_roundtrip() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE ev (id INT PRIMARY KEY, at TIMESTAMP)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO ev VALUES (1, TIMESTAMP '2026-09-15T08:30:00.123Z')",
+        );
+        let r = rows(&mut db, "SELECT at FROM ev");
+        assert!(
+            matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1_789_461_000_123),
+            "TIMESTAMP 字面量必须存为毫秒: {:?}",
+            r.rows[0][0]
+        );
+        // Wire format: {"$ts": millis} survives a JSON round-trip exactly.
+        let wire = crate::json::to_string(&r.rows[0][0]);
+        assert_eq!(wire, format!("{{\"$ts\":{}}}", 1_789_461_000_123i64));
+        let back = crate::json::from_str(&wire).unwrap();
+        assert_eq!(back, r.rows[0][0]);
+        // Display is the canonical ISO text.
+        assert_eq!(value_to_text(&r.rows[0][0]), "2026-09-15T08:30:00.123Z");
+    }
+
+    #[test]
+    fn timestamp_string_comparison_works_on_index_and_scan_paths() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE ev2 (id INT PRIMARY KEY, at TIMESTAMP)",
+        );
+        // id=1 有一棵 ts 索引,forces the indexed probe path; id=2/3 走同树。
+        run(&mut db, "CREATE INDEX idx_ev2_at ON ev2 (at)");
+        run(
+            &mut db,
+            "INSERT INTO ev2 VALUES (1, TIMESTAMP '2026-01-01T00:00:00Z')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO ev2 VALUES (2, TIMESTAMP '2026-06-15T12:00:00Z')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO ev2 VALUES (3, TIMESTAMP '2026-12-31T23:59:59.999Z')",
+        );
+        // String literal against the TIMESTAMP column: predicate coercion AND
+        // the index-probe bound promotion must agree (same rows, both paths).
+        let via_index = rows(
+            &mut db,
+            "SELECT id FROM ev2 WHERE at > '2026-06-01T00:00:00Z' ORDER BY id",
+        );
+        assert_eq!(
+            via_index.rows,
+            vec![vec![Value::Int(2)], vec![Value::Int(3)]],
+            "索引探针的字符串下界必须按时间比较"
+        );
+        // Exact-equality probe with a string.
+        let eq = rows(
+            &mut db,
+            "SELECT id FROM ev2 WHERE at = '2026-06-15T12:00:00Z'",
+        );
+        assert_eq!(eq.rows, vec![vec![Value::Int(2)]]);
+        // Range with both bounds.
+        let between = rows(
+            &mut db,
+            "SELECT id FROM ev2 WHERE at >= '2026-01-01T00:00:00Z' AND at < '2026-12-01T00:00:00Z' ORDER BY id",
+        );
+        assert_eq!(between.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        // Non-index path agrees (force the scan by filtering another column).
+        let scan = rows(
+            &mut db,
+            "SELECT id FROM ev2 WHERE id + 0 > 0 AND at > '2026-06-01T00:00:00Z' ORDER BY id",
+        );
+        assert_eq!(scan.rows, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+        // DESC window (reverse probe) agrees too.
+        let desc = rows(&mut db, "SELECT id FROM ev2 ORDER BY at DESC LIMIT 1");
+        assert_eq!(desc.rows, vec![vec![Value::Int(3)]]);
+        // Unparseable string vs TIMESTAMP: NULL (unknown), never a wrong row.
+        let junk = rows(&mut db, "SELECT id FROM ev2 WHERE at > 'not-a-time'");
+        assert!(junk.rows.is_empty(), "unparseable bound must match nothing");
+    }
+
+    #[test]
+    fn timestamp_now_folds_to_literal_for_replication() {
+        // 红线 #8:时间类非确定值必须定值回写。NOW() 在写语句里折叠为
+        // 字面量,resolved SQL 与原始文本不再含 NOW(),副本重放零偏差。
+        let mut a = Database::in_memory().unwrap();
+        run(
+            &mut a,
+            "CREATE TABLE t3 (id INT PRIMARY KEY, at TIMESTAMP, who TEXT)",
+        );
+        let sql = "INSERT INTO t3 VALUES (1, NOW(), 'x')";
+        a.execute(sql).unwrap();
+        let resolved = a.take_resolved_sql().expect("NOW() 必须触发定值回写");
+        assert!(
+            !resolved.to_uppercase().contains("NOW("),
+            "resolved 不得再含 NOW(): {resolved}"
+        );
+        assert!(
+            resolved.contains("CAST(") && resolved.contains("AS TIMESTAMP"),
+            "resolved 必须是 TIMESTAMP 字面量: {resolved}"
+        );
+        // The folded text replays EXACTLY on the replica.
+        let mut b = Database::in_memory().unwrap();
+        run(
+            &mut b,
+            "CREATE TABLE t3 (id INT PRIMARY KEY, at TIMESTAMP, who TEXT)",
+        );
+        b.execute(&resolved).unwrap();
+        let ra = rows(&mut a, "SELECT at, who FROM t3");
+        let rb = rows(&mut b, "SELECT at, who FROM t3");
+        assert_eq!(ra.rows, rb.rows, "副本重放必须零偏差");
+        assert!(b.take_resolved_sql().is_none(), "字面量重放不再折叠");
+        // SYSDATE() (compat text form) folds to a string literal too.
+        a.execute(
+            "INSERT INTO t3 VALUES (2, CAST('2026-01-01T00:00:00Z' AS TIMESTAMP), SYSDATE())",
+        )
+        .unwrap();
+        let resolved = a.take_resolved_sql().expect("SYSDATE() 必须折叠");
+        assert!(
+            !resolved.to_uppercase().contains("SYSDATE("),
+            "resolved 不得再含 SYSDATE(): {resolved}"
+        );
+    }
+
+    #[test]
+    fn timestamp_cast_and_arithmetic() {
+        let mut db = Database::in_memory().unwrap();
+        // CAST both directions.
+        let r = rows(&mut db, "SELECT CAST('2026-01-01T00:00:00Z' AS TIMESTAMP)");
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1_767_225_600_000));
+        let r = rows(
+            &mut db,
+            "SELECT CAST(CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) AS INT)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1_767_225_600_000)]]);
+        // Malformed CAST is a loud error (not NULL — CAST is explicit).
+        assert!(db.execute("SELECT CAST('nope' AS TIMESTAMP)").is_err());
+        // Arithmetic: + ms, - ms, difference of two instants.
+        let r = rows(
+            &mut db,
+            "SELECT CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) + 1500",
+        );
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1_767_225_600_000 + 1500));
+        let r = rows(
+            &mut db,
+            "SELECT CAST('2026-01-02T00:00:00Z' AS TIMESTAMP) - CAST('2026-01-01T00:00:00Z' AS TIMESTAMP)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(86_400_000)]]);
+        // Timestamp + Timestamp is meaningless: NULL like other type errors
+        // in the arithmetic path? No — an explicit error, matching arith's
+        // non-numeric rule.
+        assert!(db
+            .execute(
+                "SELECT CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) + CAST('2026-01-01T00:00:00Z' AS TIMESTAMP)"
+            )
+            .is_err());
+        // VALUE_LITERAL round-trip: stored Timestamps replay as TIMESTAMP
+        // literals, never degrading to text.
+        let lit = value_literal(&Value::Timestamp(1_767_225_600_000)).unwrap();
+        assert_eq!(lit, "CAST('2026-01-01T00:00:00.000Z' AS TIMESTAMP)");
+        let mut db2 = Database::in_memory().unwrap();
+        run(&mut db2, "CREATE TABLE rt (v VALUE)");
+        // (schemaless columns accept any scalar; the literal re-parses to
+        // the same Timestamp)
+        db2.execute(&format!("INSERT INTO rt VALUES ({lit})"))
+            .unwrap();
+        let r = rows(&mut db2, "SELECT v FROM rt");
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1_767_225_600_000));
+    }
+
+    // ---- 用户视图:CREATE VIEW / SELECT 穿透 / 写拒绝 / dump 往返 ----
+
+    #[test]
+    fn view_create_select_and_replace() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+        run(
+            &mut db,
+            "CREATE VIEW big AS SELECT id, v FROM t WHERE id > 1",
+        );
+        let r = rows(&mut db, "SELECT id, v FROM big ORDER BY id");
+        assert_eq!(r.rows, vec![vec![Value::Int(2), Value::Str("b".into())]]);
+        // WHERE over the view (outer filter composes with the body filter).
+        let r = rows(&mut db, "SELECT id FROM big WHERE v = 'b'");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        // OR REPLACE re-points the view.
+        run(&mut db, "CREATE OR REPLACE VIEW big AS SELECT id FROM t");
+        let r = rows(&mut db, "SELECT id FROM big ORDER BY id");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        // View of a view.
+        run(
+            &mut db,
+            "CREATE VIEW small AS SELECT id FROM big WHERE id = 1",
+        );
+        let r = rows(&mut db, "SELECT id FROM small");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // Body referencing a missing table fails at CREATE time.
+        assert!(db.execute("CREATE VIEW bad AS SELECT * FROM nope").is_err());
+        // Duplicate name without OR REPLACE errors.
+        assert!(db.execute("CREATE VIEW small AS SELECT 1").is_err());
+        assert!(db
+            .execute("CREATE VIEW small IF NOT EXISTS AS SELECT 1")
+            .is_ok());
+        // Self-reference is impossible (name resolves only after creation).
+        assert!(db
+            .execute("CREATE OR REPLACE VIEW small AS SELECT * FROM small")
+            .is_err());
+    }
+
+    #[test]
+    fn view_rejects_writes_and_schema_changes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY)");
+        run(&mut db, "CREATE VIEW v AS SELECT * FROM t");
+        for sql in [
+            "INSERT INTO v VALUES (1)",
+            "UPDATE v SET id = 2",
+            "DELETE FROM v",
+            "TRUNCATE TABLE v",
+            "ALTER TABLE v ADD COLUMN x INT",
+            "CREATE INDEX iv ON v (id)",
+        ] {
+            assert!(db.execute(sql).is_err(), "{sql} must fail on a view");
+        }
+        // Wrong-kind drops are loud.
+        assert!(db.execute("DROP TABLE v").is_err());
+        run(&mut db, "DROP VIEW v");
+        assert!(db.execute("DROP VIEW IF EXISTS v").is_ok());
+        assert!(
+            db.execute("SELECT * FROM v").is_err(),
+            "dropped view is gone"
+        );
+        // A table named like a view cannot be DROP VIEW'd.
+        assert!(db.execute("DROP VIEW t").is_err());
+    }
+
+    #[test]
+    fn view_survives_dump_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("view.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+            run(
+                &mut db,
+                "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id > 0",
+            );
+            run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+            run(&mut db, "DROP TABLE t");
+            // 视图指向已删表:SELECT 响亮报错(SQLite 语义),dump 时该视图
+            // 的 CREATE 会因基表缺失而失败——生产路径应先 DROP VIEW;
+            // 本测试转而在删除表之前导出。
+            assert!(db.execute("SELECT * FROM v").is_err());
+            run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+            run(
+                &mut db,
+                "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id > 0",
+            );
+            run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        }
+        let script = {
+            let mut db = Database::open(&path).unwrap();
+            let dump = db.dump_script().unwrap();
+            // Replay into a fresh database (backup restore semantics).
+            let mut fresh = Database::open(&dir.path().join("restored.db")).unwrap();
+            let batch = fresh.execute_batch(&dump);
+            assert!(
+                batch.error.is_none(),
+                "dump replay failed: {:?}",
+                batch.error
+            );
+            dump
+        };
+        assert!(
+            script.contains("CREATE VIEW"),
+            "dump 必须携带视图: {script}"
+        );
+        assert!(
+            script.contains("DROP VIEW IF EXISTS"),
+            "dump 必须先清视图: {script}"
+        );
+        // Reopened / replayed databases answer through the view.
+        for p in ["view.db", "restored.db"] {
+            let mut db = Database::open(&dir.path().join(p)).unwrap();
+            let r = rows(&mut db, "SELECT id FROM v");
+            assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{p}");
+        }
+    }
+
     // ---- 银行场景合规:账务语义端到端 ----
 
     fn ledger_db() -> Database {
@@ -16560,8 +17349,10 @@ mod tx_rollback_tests {
             db.execute("PRAGMA foreign_keys = 1"),
             Ok(ExecOutcome::Affected(0))
         ));
-        // 不支持的语句
-        assert!(db.execute("CREATE VIEW v AS SELECT 1").is_err());
+        // 不支持的语句(CREATE VIEW 已升级为受支持,物化视图仍拒绝)
+        assert!(db
+            .execute("CREATE MATERIALIZED VIEW v AS SELECT 1")
+            .is_err());
         assert!(db.execute("EXPLAIN SELECT 1").is_err());
         assert!(db.execute("VACUUM").is_err());
     }
@@ -19095,12 +19886,21 @@ mod complex_query_tests {
     }
 
     #[test]
-    fn civil_from_secs_known_dates() {
+    fn format_timestamp_known_dates() {
         // 2026-09-13T00:00:00Z and the epoch.
-        assert_eq!(civil_from_secs(1_789_257_600), (2026, 9, 13, 0, 0, 0));
-        assert_eq!(civil_from_secs(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(
+            crate::value::format_timestamp_ms(1_789_257_600_000),
+            "2026-09-13T00:00:00.000Z"
+        );
+        assert_eq!(
+            crate::value::format_timestamp_ms(0),
+            "1970-01-01T00:00:00.000Z"
+        );
         // 2000-02-29T23:59:59Z — leap day and second-of-day edge.
-        assert_eq!(civil_from_secs(951_868_799), (2000, 2, 29, 23, 59, 59));
+        assert_eq!(
+            crate::value::format_timestamp_ms(951_868_799_000),
+            "2000-02-29T23:59:59.000Z"
+        );
     }
 
     #[test]

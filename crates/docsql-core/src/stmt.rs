@@ -43,6 +43,121 @@ pub fn sql_literal_end(sql: &str, open: usize) -> (usize, bool) {
     (b.len(), false)
 }
 
+/// Cheap pre-filter for [`fold_wall_clocks`]: true when the text contains
+/// any wall-clock function token at all. ASCII-lowercase is byte-length
+/// preserving, so a byte scan over the lowercase copy indexes the original
+/// safely (the Unicode `to_lowercase` panic class is off the table).
+pub fn mentions_wall_clock(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.contains("now(") || lower.contains("sysdate(") || lower.contains("current_timestamp")
+}
+
+/// Fold wall-clock functions in a WRITE statement into literals stamped with
+/// `now_ms`, returning the rewritten SQL (None when nothing folded).
+///
+/// Red line (non-deterministic generated values): a journaled/fanned-out
+/// write carrying `NOW()`/`SYSDATE()`/`CURRENT_TIMESTAMP` would let every
+/// peer stamp its own clock and silently diverge by the replica lag. The
+/// writing node resolves the instant ONCE and ships the literal. Replacement
+/// happens on the SQL TEXT — outside string literals, quoted identifiers and
+/// comments — so a value like `'call now()'` is never touched. The result
+/// re-parses identically in every other respect.
+pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
+    if !mentions_wall_clock(sql) {
+        return None;
+    }
+    let b = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let ts_lit = format!(
+        "CAST({} AS TIMESTAMP)",
+        sql_string_literal(&crate::value::format_timestamp_ms(now_ms))
+    );
+    let str_lit = sql_string_literal(&crate::value::format_timestamp_ms(now_ms));
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut folded = false;
+    let lower_bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = sql_literal_end(sql, i);
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+            b'"' | b'`' => {
+                // Quoted identifier run with doubling escapes.
+                let quote = b[i];
+                out.push_str(&sql[i..i + 1]);
+                i += 1;
+                while i < b.len() {
+                    let ch_len = utf8_len(b[i]);
+                    out.push_str(&sql[i..i + ch_len]);
+                    if b[i] == quote {
+                        if b.get(i + 1) == Some(&quote) {
+                            out.push_str(&sql[i + 1..i + 2]);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += ch_len;
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let word = &lower_bytes[start..i];
+                let is_call = (word == b"now" || word == b"sysdate")
+                    && lower_bytes.get(i) == Some(&b'(')
+                    && lower_bytes[i + 1..]
+                        .iter()
+                        .find(|&&x| x != b' ' && x != b'\t' && x != b'\r' && x != b'\n')
+                        == Some(&b')');
+                if is_call {
+                    let mut j = i + 1;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    out.push_str(if word == b"now" { &ts_lit } else { &str_lit });
+                    folded = true;
+                    i = j + 1;
+                } else if word == b"current_timestamp" {
+                    out.push_str(&ts_lit);
+                    folded = true;
+                } else {
+                    out.push_str(&sql[start..i]);
+                }
+            }
+            c if c < 0x80 => {
+                out.push(c as char);
+                i += 1;
+            }
+            _ => {
+                // Non-ASCII UTF-8 sequence: copy it whole (char boundaries
+                // are guaranteed by the input being a valid &str).
+                let ch_len = utf8_len(b[i]);
+                out.push_str(&sql[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
+    folded.then_some(out)
+}
+
+/// Length in bytes of the UTF-8 sequence starting with byte `b` (1 for ASCII;
+/// the input being a valid `&str` guarantees the continuation bytes exist).
+fn utf8_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
 /// Quote/comment-aware split on top-level semicolons: string literals,
 /// quoted identifiers, `--` line comments and `/* */` block comments never
 /// split. Needed because user-management statements are hand-parsed and
@@ -285,5 +400,40 @@ mod tests {
         // an empty batch.
         assert!(split_statements("/* only a comment */").is_err());
         assert!(split_statements("/* a */; /* b */").is_err());
+    }
+
+    #[test]
+    fn fold_wall_clocks_respects_literals_and_idents() {
+        use super::{fold_wall_clocks, mentions_wall_clock};
+        assert!(!mentions_wall_clock("SELECT 1"));
+        assert!(mentions_wall_clock("INSERT INTO t VALUES (now())"));
+        // Plain fold.
+        let out = fold_wall_clocks("INSERT INTO t VALUES (NOW(), sysdate( ))", 1_000).unwrap();
+        assert!(
+            out.contains("CAST('1970-01-01T00:00:01.000Z' AS TIMESTAMP)"),
+            "{out}"
+        );
+        assert!(out.contains("'1970-01-01T00:00:01.000Z'"), "{out}");
+        assert!(!out.to_lowercase().contains("now("));
+        // String literal contents are never touched: with nothing outside
+        // the literal to fold, there is nothing to do (None), and a mixed
+        // statement keeps the literal verbatim while folding the call.
+        assert!(fold_wall_clocks("INSERT INTO t VALUES ('call now() later')", 1_000).is_none());
+        let out =
+            fold_wall_clocks("INSERT INTO t VALUES ('call now() later', now())", 1_000).unwrap();
+        assert!(out.contains("'call now() later'"), "{out}");
+        assert!(out.contains("AS TIMESTAMP"), "{out}");
+        // Quoted identifiers are untouched: a column literally named NOW()
+        // is not a call, and with nothing else to fold the result is None.
+        assert!(fold_wall_clocks("SELECT \"NOW()\" FROM t", 1_000).is_none());
+        // Mixed: the quoted identifier stays, the bare call folds.
+        let out = fold_wall_clocks("SELECT \"NOW()\", now() FROM t", 1_000).unwrap();
+        assert!(out.contains("\"NOW()\""), "{out}");
+        assert!(out.contains("AS TIMESTAMP"), "{out}");
+        // CURRENT_TIMESTAMP folds without parentheses.
+        let out = fold_wall_clocks("INSERT INTO t VALUES (CURRENT_TIMESTAMP)", 1_000).unwrap();
+        assert!(out.contains("AS TIMESTAMP"), "{out}");
+        // Nothing to fold → None.
+        assert!(fold_wall_clocks("INSERT INTO t VALUES (1)", 1_000).is_none());
     }
 }
