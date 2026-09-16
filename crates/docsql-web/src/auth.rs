@@ -716,4 +716,53 @@ mod tests {
         s.keep_only(None);
         assert!(!s.verify(a.as_str()));
     }
+
+    #[test]
+    fn sessions_evict_soonest_expiry_at_capacity() {
+        // Default + 容量上限:第 SESSION_MAX_LIVE+1 个会话挤掉最快过期者,
+        // 存活令牌恰好保持在上限内。
+        let s = Sessions::default();
+        let mut tokens = Vec::new();
+        for _ in 0..(SESSION_MAX_LIVE + 2) {
+            tokens.push(s.create());
+        }
+        let live = tokens.iter().filter(|t| s.verify(t)).count();
+        assert!(
+            (SESSION_MAX_LIVE - 1..=SESSION_MAX_LIVE).contains(&live),
+            "live={live}"
+        );
+        // 显式下线单个会话。
+        let gone = tokens[0].clone();
+        s.drop_session(&gone);
+        assert!(!s.verify(&gone));
+    }
+
+    #[test]
+    fn lockout_threshold_and_reset() {
+        let mut l = Lockout::default();
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        // 无记录 / 阈值内:不锁。
+        assert!(!l.check(ip));
+        for _ in 0..(LOCK_THRESHOLD - 1) {
+            l.record_failure(ip);
+        }
+        assert!(!l.check(ip));
+        // 过阈值:锁定并持续到 reset。
+        l.record_failure(ip);
+        assert!(l.check(ip));
+        assert!(l.check(ip), "lock persists until reset");
+        l.reset(ip);
+        assert!(!l.check(ip));
+    }
+
+    #[test]
+    fn store_open_rejects_unreadable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        // 目录路径:读取报错(非 NotFound)→ 拒绝启动而不是当成未初始化。
+        let e = match AuthStore::open(dir.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("opening a directory must not succeed"),
+        };
+        assert!(e.contains("cannot read"), "{e}");
+    }
 }

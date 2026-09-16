@@ -2430,6 +2430,67 @@ async fn logs_frame_over_wire() {
     );
 }
 
+// ---- 视图授权收口:读视图只需视图授权,写经视图读源需基表授权 ----
+
+/// 用户被授予视图 SELECT:读视图放行(权限收口——基表可隐藏);但
+/// INSERT INTO 基表 SELECT FROM 视图 需要基表授权(fail-closed 展开),
+/// 授予基表授权后才放行。
+#[tokio::test]
+async fn view_grants_authorize_reads_and_expand_write_sources() {
+    force_fast_pbkdf2();
+    let dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+    drop(l);
+    spawn_node(&dir, "vw", &addr, vec![], None).await;
+
+    let mut admin = Client::connect(&addr).await;
+    admin
+        .sql("CREATE TABLE secret_t (id INT PRIMARY KEY, v TEXT)")
+        .await;
+    admin.sql("INSERT INTO secret_t VALUES (1, 'x')").await;
+    admin
+        .sql("CREATE VIEW pub_v AS SELECT id, v FROM secret_t")
+        .await;
+    // 建号需要客户端 token 路径之外的匿名窗口:此节点无用户,匿名可用。
+    admin
+        .sql("CREATE USER analyst PASSWORD 'pw-analyst-1'")
+        .await;
+    admin.sql("GRANT SELECT ON pub_v TO analyst").await;
+
+    // 分析者登录:读视图放行,读基表拒绝。
+    let mut analyst = Client::connect(&addr).await;
+    let f = user_login(&mut analyst, "analyst", "pw-analyst-1").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let vr = analyst.sql("SELECT id, v FROM pub_v").await;
+    assert_eq!(
+        vr.frame_type,
+        proto::RESP_ROWS,
+        "视图授权即可读: {}",
+        payload_str(&vr)
+    );
+    let br = analyst.sql("SELECT * FROM secret_t").await;
+    assert_eq!(br.frame_type, proto::RESP_ERROR, "基表未授权必须拒绝");
+    // 视图不暴露基表行给未授权写:INSERT INTO 基表 SELECT FROM 视图 拒绝。
+    // 目标表由 admin 建(自定义用户无 DDL 权),INSERT 授权先就位:
+    // 这样拒绝只可能来自读源展开。
+    admin
+        .sql("CREATE TABLE mine (id INT PRIMARY KEY, v TEXT)")
+        .await;
+    admin.sql("GRANT INSERT ON mine TO analyst").await;
+    let w = analyst.sql("INSERT INTO mine SELECT * FROM pub_v").await;
+    assert_eq!(
+        w.frame_type,
+        proto::RESP_ERROR,
+        "写经视图读源必须展开为基表授权: {}",
+        payload_str(&w)
+    );
+    // 授予基表 SELECT 后放行(展开语义的正向面)。
+    admin.sql("GRANT SELECT ON secret_t TO analyst").await;
+    let w = analyst.sql("INSERT INTO mine SELECT * FROM pub_v").await;
+    assert_eq!(w.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&w));
+}
+
 // ---- cluster join: a fresh node automatically syncs the cluster state ----
 
 /// One cluster node bound to `addr`, with the given static peer mesh and

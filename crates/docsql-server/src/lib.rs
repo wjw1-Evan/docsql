@@ -5916,6 +5916,351 @@ mod security_tests {
         // Exactly at the floor passes.
         assert!(check_token_strength("DOCSQL_TOKEN", "12345678").is_ok());
     }
+
+    #[test]
+    fn parse_peer_addr_accepts_shapes_and_rejects_garbage() {
+        // SocketAddr 形态(IPv4/IPv6)与 host:port 形态。
+        assert_eq!(
+            parse_peer_addr("10.1.2.3:7600"),
+            Some(("10.1.2.3".into(), 7600))
+        );
+        assert_eq!(parse_peer_addr("[::1]:7601"), Some(("::1".into(), 7601)));
+        assert_eq!(
+            parse_peer_addr("node-a.local:7600"),
+            Some(("node-a.local".into(), 7600))
+        );
+        // 垃圾输入:空串、端口 0、空 host、非数字端口、控制字符、超长。
+        assert_eq!(parse_peer_addr(""), None);
+        assert_eq!(parse_peer_addr("10.1.2.3:0"), None);
+        assert_eq!(parse_peer_addr("node-a.local:0"), None);
+        assert_eq!(parse_peer_addr(":7600"), None);
+        assert_eq!(parse_peer_addr("host:port"), None);
+        assert_eq!(parse_peer_addr("host:7600\n"), None);
+        assert_eq!(parse_peer_addr(&format!("{}:7600", "h".repeat(301))), None);
+        assert_eq!(parse_peer_addr("no-port-here"), None);
+    }
+
+    #[test]
+    fn is_self_peer_matches_literal_loopback_and_resolved_forms() {
+        // 字面相等(大小写不敏感)即自身。
+        assert!(is_self_peer("0.0.0.0:7600", "0.0.0.0:7600"));
+        assert!(!is_self_peer("0.0.0.0:7600", "0.0.0.1:7600"));
+        // 回环地址 + 同监听端口 = 自身(advertise 127.0.0.1)。
+        assert!(is_self_peer("0.0.0.0:7600", "127.0.0.1:7600"));
+        assert!(is_self_peer("0.0.0.0:7600", "localhost:7600"));
+        // 同端口但非回环 ≠ 自身;回环但端口不同 ≠ 自身。
+        assert!(!is_self_peer("0.0.0.0:7600", "127.0.0.1:7601"));
+        assert!(!is_self_peer("0.0.0.0:7600", "192.0.2.99:7600"));
+        // 解析失败的 listen 串保守返回 false,不 panic。
+        assert!(!is_self_peer("not an addr", "127.0.0.1:7600"));
+        assert!(!is_self_peer("0.0.0.0:7600", "definitely not an addr"));
+    }
+
+    #[test]
+    fn render_param_covers_timestamp_and_nested_documents() {
+        // TIMESTAMP 绑定为显式 CAST(重放零偏差)。
+        let bound = bind_params("SELECT ?", &[Value::Timestamp(1_577_836_800_000)]).unwrap();
+        assert_eq!(
+            bound,
+            "SELECT CAST('2020-01-01T00:00:00.000Z' AS TIMESTAMP)"
+        );
+        // 嵌套文档走 JSON 文本字面量。
+        let v = Value::Array(vec![Value::Int(1), Value::Str("s".into())]);
+        let bound = bind_params("SELECT ?", &[v]).unwrap();
+        assert_eq!(bound, "SELECT '[1,\"s\"]'");
+        // Float 与 Bool 的裸渲染。
+        assert_eq!(
+            bind_params("SELECT ?, ?", &[Value::Float(2.5), Value::Bool(false)]).unwrap(),
+            "SELECT 2.5, FALSE"
+        );
+    }
+
+    #[test]
+    fn outcome_frame_renders_all_three_arms() {
+        let f = outcome_frame::<String>(Ok(ExecOutcome::Affected(3)));
+        assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+        assert_eq!(proto::decode_affected(&f.payload), 3);
+        let f = outcome_frame::<String>(Ok(ExecOutcome::Rows(docsql_core::engine::QueryResult {
+            columns: vec!["a".into()],
+            rows: vec![vec![Value::Int(1)]],
+        })));
+        assert_eq!(f.frame_type, proto::RESP_ROWS);
+        let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+        assert_eq!(v["rows"][0][0], 1);
+        let f = outcome_frame::<String>(Err("kaput".into()));
+        assert_eq!(f.frame_type, proto::RESP_ERROR);
+        assert!(String::from_utf8_lossy(&f.payload).contains("kaput"));
+    }
+
+    #[test]
+    fn readable_by_all_classifies_system_and_compat_surfaces() {
+        assert!(readable_by_all("_pubsub_messages"));
+        assert!(readable_by_all("_cluster_log"));
+        assert!(readable_by_all("sqlite_master"));
+        assert!(readable_by_all("information_schema"));
+        assert!(readable_by_all("@compat"));
+        assert!(!readable_by_all("user_tbl"));
+        assert!(!readable_by_all("docsql_users"));
+    }
+
+    #[test]
+    fn parse_name_array_validates_pubsub_name_payloads() {
+        assert_eq!(
+            parse_name_array(br#"["a","b"]"#).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // 空数组 = 全部退订。
+        assert_eq!(parse_name_array(b"[]").unwrap(), Vec::<String>::new());
+        // 非数组 / 非字符串元素 / 空名 / 超长名 / 坏 JSON。
+        assert!(parse_name_array(b"{\"a\":1}").is_err());
+        assert!(parse_name_array(b"[1]").is_err());
+        assert!(parse_name_array(br#"[""]"#).is_err());
+        assert!(parse_name_array(&format!("[\"{}\"]", "c".repeat(300)).into_bytes()).is_err());
+        assert!(parse_name_array(b"not json").is_err());
+    }
+
+    #[test]
+    fn catchup_entries_pack_decode_round_trip_and_budget_split() {
+        let entries = vec![
+            (1u64, "INSERT INTO t VALUES (1)".to_string()),
+            (2u64, "UPDATE t SET v = 'x' WHERE id = 1".to_string()),
+            (3u64, "DELETE FROM t".to_string()),
+        ];
+        let (payload, count) = pack_catchup_entries(&entries, usize::MAX);
+        assert_eq!(count, 3);
+        assert_eq!(decode_catchup_entries(&payload).unwrap(), entries);
+        // 预算装不下第二条:只发第一条,但至少前进一条。
+        let first_len = 8 + 4 + entries[0].1.len();
+        let (payload, count) = pack_catchup_entries(&entries, first_len + 4);
+        assert_eq!(count, 1);
+        assert_eq!(
+            decode_catchup_entries(&payload).unwrap(),
+            entries[..1].to_vec()
+        );
+        // 截断载荷报错,不静默丢尾。
+        let (payload, _) = pack_catchup_entries(&entries, usize::MAX);
+        assert!(decode_catchup_entries(&payload[..payload.len() - 3]).is_err());
+        assert!(decode_catchup_entries(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_seq_frame_round_trip_and_rejects_malformed() {
+        let sql = "INSERT INTO t VALUES (1)";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        payload.extend_from_slice(&(5u32).to_le_bytes());
+        payload.extend_from_slice(b"node1");
+        payload.extend_from_slice(&proto::encode_sql(sql).unwrap());
+        assert_eq!(
+            parse_seq_frame(&payload),
+            Some((42, "node1".to_string(), sql.to_string()))
+        );
+        // 载荷过短 / id_len 越界 / 坏 UTF-8 / 坏 SQL 编码。
+        assert_eq!(parse_seq_frame(&payload[..11]), None);
+        let mut bad = payload.clone();
+        bad[8..12].copy_from_slice(&9999u32.to_le_bytes());
+        assert_eq!(parse_seq_frame(&bad), None);
+        let mut bad = payload.clone();
+        bad[12..17].copy_from_slice(&[0xff; 5]);
+        assert_eq!(parse_seq_frame(&bad), None);
+        let mut bad = payload.clone();
+        bad.truncate(12 + 5 + 1); // 只剩 1 字节,不够 SQL 编码
+        assert_eq!(parse_seq_frame(&bad), None);
+    }
+
+    #[test]
+    fn affected_count_reads_wellformed_frames_only() {
+        assert_eq!(
+            affected_count(&Frame::new(
+                proto::RESP_AFFECTED,
+                9u64.to_le_bytes().to_vec()
+            )),
+            9
+        );
+        // 错误帧型 / 载荷长度不对 → 0。
+        assert_eq!(
+            affected_count(&Frame::new(proto::RESP_ERROR, 9u64.to_le_bytes().to_vec())),
+            0
+        );
+        assert_eq!(
+            affected_count(&Frame::new(proto::RESP_AFFECTED, vec![1, 2, 3])),
+            0
+        );
+    }
+
+    #[test]
+    fn replication_frame_sets_flags_and_seals_with_key() {
+        let f = replication_frame(proto::REQ_DIGEST, b"hi".to_vec(), None);
+        assert_eq!(f.frame_type, proto::REQ_DIGEST);
+        assert_eq!(f.flags & FLAG_REPLICATION, FLAG_REPLICATION);
+        assert_eq!(f.payload, b"hi");
+        // 有密钥时置加密位并封 payload。
+        let key = crypto::parse_key_hex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap();
+        let f = replication_frame(proto::REQ_DIGEST, b"hi".to_vec(), Some(&key));
+        assert_ne!(f.payload, b"hi");
+        assert_eq!(f.flags & crypto::FLAG_ENCRYPTED, crypto::FLAG_ENCRYPTED);
+    }
+
+    #[test]
+    fn advance_position_never_moves_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = docsql_core::engine::Database::open(&dir.path().join("db")).unwrap();
+        advance_position(&mut db, "node-a", 10);
+        advance_position(&mut db, "node-a", 7); // 迟到的低 seq 不得压低
+        assert_eq!(db.position_get("node-a").unwrap(), Some(7 + 3));
+        advance_position(&mut db, "node-a", 12);
+        assert_eq!(db.position_get("node-a").unwrap(), Some(12));
+    }
+
+    #[test]
+    fn authorize_statement_routes_by_role_and_expands_view_sources() {
+        use docsql_core::useradmin::{UserAdminStmt, PRIV_INSERT, PRIV_SELECT};
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE secret_t (id INT PRIMARY KEY, v TEXT)",
+            "INSERT INTO secret_t VALUES (1, 'x')",
+            "CREATE TABLE mine (id INT PRIMARY KEY, v TEXT)",
+            "CREATE VIEW pub_v AS SELECT id, v FROM secret_t",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let parse = |sql: &str| docsql_core::engine::Database::parse_classified(sql).unwrap();
+        let grants = |admin: bool, privs: &[(&str, u8)]| {
+            let mut g = docsql_core::useradmin::UserGrants {
+                admin,
+                ..Default::default()
+            };
+            for (t, b) in privs {
+                g.table_privs.insert((*t).to_string(), *b);
+            }
+            g
+        };
+        // admin 全过。
+        let p = parse("SELECT * FROM secret_t");
+        assert!(
+            authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(true, &[])).is_ok()
+        );
+        let p = parse("DROP TABLE secret_t");
+        assert!(
+            authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(true, &[])).is_ok()
+        );
+        // 用户管理语句对非 admin 拒绝(即使形状是 UserAdmin)。
+        let ua = AnyStmt::UserAdmin(UserAdminStmt::CreateUser {
+            name: "u".into(),
+            password: "pw".into(),
+        });
+        assert!(
+            authorize_statement(None, &ua, &TxControl::None, false, &grants(false, &[])).is_err()
+        );
+        // 事务内语句不在本检查点(缓冲语句逐条已授权)。
+        let p = parse("SELECT * FROM secret_t");
+        assert!(authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &TxControl::Begin,
+            p.is_write,
+            &grants(false, &[])
+        )
+        .is_ok());
+        // 读:未授权表拒绝、系统表面放行、表级 SELECT 放行。
+        let p = parse("SELECT * FROM secret_t");
+        let e = authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(false, &[]))
+            .unwrap_err();
+        assert!(e.contains("SELECT on table secret_t"), "{e}");
+        let p = parse("SELECT * FROM _pubsub_messages");
+        assert!(
+            authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(false, &[])).is_ok()
+        );
+        let p = parse("SELECT * FROM secret_t");
+        assert!(authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("secret_t", PRIV_SELECT)])
+        )
+        .is_ok());
+        // 写:INSERT 无位拒绝、有位放行。
+        let p = parse("INSERT INTO mine VALUES (1, 'x')");
+        let e = authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(false, &[]))
+            .unwrap_err();
+        assert!(e.contains("INSERT on table mine"), "{e}");
+        let p = parse("INSERT INTO mine VALUES (1, 'x')");
+        assert!(authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("mine", PRIV_INSERT)])
+        )
+        .is_ok());
+        // 写同时读:INSERT..SELECT 未授权读源拒绝;视图读源 fail-closed 展开为基表。
+        let p = parse("INSERT INTO mine SELECT * FROM secret_t");
+        let e = authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("mine", PRIV_INSERT)]),
+        )
+        .unwrap_err();
+        assert!(e.contains("SELECT on table secret_t"), "{e}");
+        let p = parse("INSERT INTO mine SELECT * FROM pub_v");
+        let e = authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("mine", PRIV_INSERT)]),
+        )
+        .unwrap_err();
+        assert!(e.contains("SELECT on table secret_t"), "{e}");
+        let p = parse("INSERT INTO mine SELECT * FROM pub_v");
+        assert!(authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("mine", PRIV_INSERT), ("secret_t", PRIV_SELECT)])
+        )
+        .is_ok());
+        // 用户存储表对非 admin 的读写都拒绝。
+        let p = parse("SELECT * FROM docsql_users");
+        assert!(authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("docsql_users", PRIV_SELECT)])
+        )
+        .is_err());
+        // DDL 对非 admin 拒绝。
+        let p = parse("CREATE TABLE nope (id INT)");
+        let e = authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(false, &[]))
+            .unwrap_err();
+        assert!(e.contains("admin role"), "{e}");
+        // 深视图链 >16 拒绝(fail-closed)。
+        db.execute("CREATE TABLE deep_base (id INT)").unwrap();
+        db.execute("CREATE VIEW v0 AS SELECT id FROM deep_base")
+            .unwrap();
+        for i in 1..20 {
+            db.execute(&format!("CREATE VIEW v{i} AS SELECT id FROM v{}", i - 1))
+                .unwrap();
+        }
+        let p = parse("INSERT INTO mine SELECT * FROM v19");
+        let e = authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("mine", PRIV_INSERT)]),
+        )
+        .unwrap_err();
+        assert!(e.contains("view chain too deep"), "{e}");
+    }
 }
 
 #[cfg(test)]

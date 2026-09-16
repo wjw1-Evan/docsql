@@ -1458,8 +1458,17 @@ mod tests {
         std::fs::write(
             &script,
             "publish mych hello world;\n\
+             subscribe mych earliest;\n\
+             psubscribe my.*;\n\
+             pubsub numsub;\n\
+             pubsub numpat;\n\
+             unsubscribe mych;\n\
+             punsubscribe my.*;\n\
              pubsub channels;\n\
-             pubsub trim mych 1;\n",
+             pubsub trim mych 1;\n\
+             help;\n\
+             auth cli-test-token-123;\n\
+             SELECT 1\n",
         )
         .unwrap();
         remote_shell(
@@ -1516,6 +1525,187 @@ mod tests {
         ));
         print_push(&Frame::new(proto::RESP_PUSH, b"plain".to_vec()));
     }
+
+    #[test]
+    fn run_embedded_interactive_accumulates_and_survives_errors() {
+        // 交互分支(script=None):多行累积、help、exit、错误后继续。
+        let mut db = Database::in_memory().unwrap();
+        let input = std::io::Cursor::new(
+            "CREATE TABLE t (\n  id INT PRIMARY KEY,\n  v TEXT\n);\n\
+             help;\n\
+             SELECT * FROM missing_tbl;\n\
+             INSERT INTO t VALUES (1, 'ok');\n\
+             exit;\n\
+             INSERT INTO t VALUES (2, 'after-exit-ignored');\n",
+        );
+        run_embedded(&mut db, Format::Table, None, input);
+        match db.execute("SELECT COUNT(*) FROM t").unwrap() {
+            ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
+            other => panic!("{other:?}"),
+        }
+        // 交互模式在 EOF 处理悬挂语句(无结尾分号也执行)。
+        let mut db2 = Database::in_memory().unwrap();
+        let input2 = std::io::Cursor::new("CREATE TABLE u (id INT);\nINSERT INTO u VALUES (9)\n");
+        run_embedded(&mut db2, Format::Csv, None, input2);
+        match db2.execute("SELECT COUNT(*) FROM u").unwrap() {
+            ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_loop_queues_frames_prints_pushes_and_stops_on_garbage() {
+        // 一条本地 TCP 对直接驱动读线程:普通帧进队列、RESP_PUSH 不进
+        // 队列(打印即弃)、超限帧长与坏帧都让线程收线(通道关闭)。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let server = listener.accept().unwrap().0;
+        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        std::thread::spawn(move || reader_loop(server, tx));
+        let mut client = client;
+        let send = |s: &mut std::net::TcpStream, f: &Frame| {
+            s.write_all(&f.encode().unwrap()).unwrap();
+            s.flush().unwrap();
+        };
+        send(
+            &mut client,
+            &Frame::new(proto::RESP_AFFECTED, 5u64.to_le_bytes().to_vec()),
+        );
+        let f = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+        // 推送帧由读线程消化,永不出现在队列里。
+        send(
+            &mut client,
+            &Frame::new(
+                proto::RESP_PUSH,
+                br#"{"kind":"message","channel":"c","id":1,"payload":"p"}"#.to_vec(),
+            ),
+        );
+        send(
+            &mut client,
+            &Frame::new(proto::RESP_AFFECTED, 6u64.to_le_bytes().to_vec()),
+        );
+        let f = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            proto::decode_affected(&f.payload),
+            6,
+            "push must not consume a queue slot"
+        );
+        // 声称超限的帧长:线程打印并退出,队列随之关闭。
+        let mut bogus = vec![0u8; proto::HEADER_LEN];
+        bogus[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        client.write_all(&bogus).unwrap();
+        client.flush().unwrap();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn reader_loop_exits_on_undecodable_frame() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let server = listener.accept().unwrap().0;
+        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        std::thread::spawn(move || reader_loop(server, tx));
+        let mut client = client;
+        // 合法帧头 + 破损载荷:decode 失败必须收线而不是死循环。
+        let mut buf = vec![0u8; proto::HEADER_LEN];
+        buf[16..20].copy_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&[0xff; 8]);
+        client.write_all(&buf).unwrap();
+        client.flush().unwrap();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn auth_reports_rejections_and_connection_loss() {
+        // 错误 token:RESP_ERROR → false。
+        let dir = tempfile::tempdir().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let cfg = server_config_test(&dir.path().join("db"), &addr.to_string());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.spawn(docsql_server::run(cfg));
+        let mut up = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(up, "server never accepted connections");
+        let mut remote = Remote::connect(&addr.to_string()).unwrap();
+        assert!(!auth(&mut remote, "wrong-token-value"));
+        // 正确 token 仍可用(同一连接上重试)。
+        assert!(auth(&mut remote, "cli-test-token-123"));
+        handle.abort();
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+
+        // 对端接受后立刻关闭:round_trip 收不到帧 → "connection closed"。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let drop_addr = listener.local_addr().unwrap();
+        let dropper = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            drop(s);
+        });
+        let mut dead = Remote::connect(&drop_addr.to_string()).unwrap();
+        dropper.join().unwrap();
+        assert!(!auth(&mut dead, "any-token"));
+    }
+
+    #[test]
+    fn auth_user_uses_env_password_and_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let cfg = server_config_test(&dir.path().join("db"), &addr.to_string());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.spawn(docsql_server::run(cfg));
+        let mut up = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(up, "server never accepted connections");
+        // DOCSQL_PASSWORD 提供口令(无用户存在 → 登录被拒,但不走交互提示)。
+        std::env::set_var("DOCSQL_PASSWORD", "pw-from-env-1");
+        let mut remote = Remote::connect(&addr.to_string()).unwrap();
+        assert!(!auth_user(&mut remote, "ghost"));
+        std::env::remove_var("DOCSQL_PASSWORD");
+        handle.abort();
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn print_frame_tolerates_malformed_rows_payloads() {
+        // rows 数组元素不是数组:按空行处理,不 panic。
+        let payload = br#"{"columns":["a"],"rows":[1,2]}"#.to_vec();
+        assert!(print_frame(
+            &Frame::new(proto::RESP_ROWS, payload),
+            Format::Table
+        ));
+        // columns 不是数组:同样降级。
+        let payload = br#"{"columns":"a","rows":[[1]]}"#.to_vec();
+        assert!(print_frame(
+            &Frame::new(proto::RESP_ROWS, payload),
+            Format::Csv
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1530,6 +1720,18 @@ mod statement_ready_tests {
         assert!(statements_ready("SELECT 'a''b;';"));
         assert!(!statements_ready("SELECT \"ready?;"));
         assert!(statements_ready("SELECT \"ready?;\";"));
+    }
+
+    #[test]
+    fn backtick_identifiers_and_doubled_backticks() {
+        // 反引号标识符里的 `;` 是数据;成对反引号是转义。
+        assert!(statements_ready("SELECT `a;b` FROM t;"));
+        assert!(!statements_ready("SELECT `a;b FROM t;"));
+        assert!(!statements_ready("SELECT `x``y;"));
+        assert!(statements_ready("SELECT `x``y`;"));
+        // 未闭合的块注释 / 未闭合反引号都不算就绪。
+        assert!(!statements_ready("SELECT `open;"));
+        assert!(!statements_ready("SELECT 1; /* still open"));
     }
 
     #[test]

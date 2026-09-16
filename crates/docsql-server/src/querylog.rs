@@ -573,4 +573,45 @@ mod tests {
         let words: Vec<&str> = toks.iter().map(|(s, e)| &sql[*s..*e]).collect();
         assert_eq!(words, vec!["select"]);
     }
+
+    #[test]
+    fn querylog_new_reads_env_and_defaults() {
+        // 默认形状:1000 容量 / 100ms 慢查询阈值 / 无审计文件。
+        std::env::remove_var("DOCSQL_SLOW_MS");
+        std::env::remove_var("DOCSQL_LOG_FILE");
+        let q = QueryLog::new();
+        assert_eq!(q.capacity, 1000);
+        assert_eq!(q.slow_ms, 100.0);
+        assert!(q.log_file.is_none());
+        assert_eq!(QueryLog::default().capacity, 1000);
+        // 合法环境注入覆盖两处 env 分支(非法值分支是 exit(2),不在测试面)。
+        std::env::set_var("DOCSQL_SLOW_MS", "250");
+        std::env::set_var("DOCSQL_LOG_FILE", "/tmp/docsql-test-audit.jsonl");
+        let q = QueryLog::new();
+        assert_eq!(q.slow_ms, 250.0);
+        assert_eq!(q.log_file.as_deref(), Some("/tmp/docsql-test-audit.jsonl"));
+        std::env::remove_var("DOCSQL_SLOW_MS");
+        std::env::remove_var("DOCSQL_LOG_FILE");
+    }
+
+    #[test]
+    fn slow_entries_report_to_stderr_and_ring_evicts() {
+        // 超阈值语句走慢查询 stderr 分支;环形缓冲按容量驱逐最旧。
+        let q = QueryLog {
+            ring: Mutex::new(VecDeque::new()),
+            sink: Mutex::new(None),
+            sink_warned: std::sync::atomic::AtomicBool::new(false),
+            sink_retry_after: Mutex::new(None),
+            capacity: 2,
+            slow_ms: 0.5,
+            log_file: None,
+        };
+        q.push(entry(1, "slow one"));
+        q.push(entry(2, "slow two"));
+        q.push(entry(3, "slow three"));
+        let snap = q.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].sql, "slow two");
+        assert_eq!(snap[1].sql, "slow three");
+    }
 }

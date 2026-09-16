@@ -2568,4 +2568,100 @@ mod tests {
         assert!(s["page_size"].as_u64().is_some());
         assert!(s["uptime_ms"].as_u64().is_some());
     }
+
+    #[test]
+    fn user_ident_charset_whitelist() {
+        assert!(valid_user_ident("analyst_1"));
+        assert!(valid_user_ident("_hidden"));
+        assert!(valid_user_ident("a$b"));
+        assert!(!valid_user_ident(""));
+        assert!(!valid_user_ident("1abc"), "首字符必须字母/下划线");
+        assert!(!valid_user_ident("has space"));
+        assert!(!valid_user_ident("has-dash"));
+        assert!(!valid_user_ident(&"x".repeat(65)));
+        assert!(valid_user_ident(&"x".repeat(64)));
+    }
+
+    #[test]
+    fn user_admin_statement_builder_covers_all_actions() {
+        let body = |action: &str, name: Option<&str>| UsersActionBody {
+            action: action.to_string(),
+            node: None,
+            name: name.map(String::from),
+            password: None,
+            role: None,
+            table: None,
+            privs: None,
+        };
+        // 正向:每个 action 产出固定模板语句。
+        let mut cu = body("create_user", Some("alice"));
+        cu.password = Some("aaaaaaaa".into());
+        assert_eq!(
+            build_user_admin_statement(&cu).unwrap(),
+            "CREATE USER alice PASSWORD 'aaaaaaaa'"
+        );
+        cu.action = "alter_password".into();
+        assert_eq!(
+            build_user_admin_statement(&cu).unwrap(),
+            "ALTER USER alice PASSWORD 'aaaaaaaa'"
+        );
+        // 密码长度校验(过短)。
+        cu.password = Some("short".into());
+        let e = build_user_admin_statement(&cu).unwrap_err();
+        assert!(e.contains("8-256"), "{e}");
+        // 缺名字 / 非法名字:字段校验错误。
+        let e = build_user_admin_statement(&body("create_user", None)).unwrap_err();
+        assert!(e.contains("用户名"), "{e}");
+        let e = build_user_admin_statement(&body("drop_user", Some("9bad"))).unwrap_err();
+        assert!(e.contains("不合法"), "{e}");
+        assert_eq!(
+            build_user_admin_statement(&body("drop_user", Some("bob"))).unwrap(),
+            "DROP USER bob"
+        );
+        assert_eq!(
+            build_user_admin_statement(&body("create_role", Some("auditor"))).unwrap(),
+            "CREATE ROLE auditor"
+        );
+        assert_eq!(
+            build_user_admin_statement(&body("drop_role", Some("auditor"))).unwrap(),
+            "DROP ROLE auditor"
+        );
+        let mut b = body("grant_role", Some("alice"));
+        b.role = Some("auditor".into());
+        assert_eq!(
+            build_user_admin_statement(&b).unwrap(),
+            "GRANT auditor TO alice"
+        );
+        b.action = "revoke_role".into();
+        assert_eq!(
+            build_user_admin_statement(&b).unwrap(),
+            "REVOKE auditor FROM alice"
+        );
+        // grant/revoke table:缺表名、表名超长、未知权限逐一拒绝。
+        let mut b = body("grant_table", Some("alice"));
+        let e = build_user_admin_statement(&b).unwrap_err();
+        assert!(e.contains("表名"), "{e}");
+        b.table = Some("t1".into());
+        let e = build_user_admin_statement(&b).unwrap_err();
+        assert!(e.contains("权限列表"), "{e}");
+        b.privs = Some(vec!["SELECT".into(), "LOAD".into()]);
+        let e = build_user_admin_statement(&b).unwrap_err();
+        assert!(e.contains("未知权限"), "{e}");
+        b.privs = Some(vec!["select".into(), "ALL".into()]);
+        assert_eq!(
+            build_user_admin_statement(&b).unwrap(),
+            "GRANT select, ALL ON \"t1\" TO alice"
+        );
+        b.action = "revoke_table".into();
+        assert_eq!(
+            build_user_admin_statement(&b).unwrap(),
+            "REVOKE select, ALL ON \"t1\" FROM alice"
+        );
+        b.table = Some("x".repeat(129));
+        let e = build_user_admin_statement(&b).unwrap_err();
+        assert!(e.contains("1-128"), "{e}");
+        // 未知 action 显式报错。
+        let e = build_user_admin_statement(&body("explode", Some("alice"))).unwrap_err();
+        assert!(e.contains("未知操作"), "{e}");
+    }
 }

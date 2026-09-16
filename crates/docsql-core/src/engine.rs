@@ -16685,6 +16685,286 @@ mod tests {
         }
     }
 
+    // ---- 覆盖率补强:TIMESTAMP/视图错误路径与边界 ----
+
+    #[test]
+    fn timestamp_arithmetic_and_cast_error_paths() {
+        let mut db = Database::in_memory().unwrap();
+        // Int + Timestamp(mirror)与 Timestamp - Int。
+        let r = rows(
+            &mut db,
+            "SELECT 1000 + CAST('1970-01-01T00:00:00Z' AS TIMESTAMP),              CAST('1970-01-01T00:00:01Z' AS TIMESTAMP) - 1000",
+        );
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1000));
+        assert!(matches!(&r.rows[0][1], Value::Timestamp(ms) if *ms == 0));
+        // 数值与 TIMESTAMP 比较无隐式语义 → NULL。
+        let r = rows(
+            &mut db,
+            "SELECT CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) = 1767225600000, \
+                    CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) > 3.5",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Null, Value::Null]]);
+        // 溢出折叠为 NULL(checked 算术)。
+        let r = rows(
+            &mut db,
+            "SELECT CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) + 9223372036854775807",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Null]]);
+        // 非法 CAST:字符串不解析、Float/Decimal/Blob 源未定义。
+        assert!(db.execute("SELECT CAST('x' AS TIMESTAMP)").is_err());
+        assert!(db.execute("SELECT CAST(1.5 AS TIMESTAMP)").is_err());
+        assert!(db.execute("SELECT CAST(x'00' AS TIMESTAMP)").is_err());
+        // TIMESTAMP → TEXT 走规范 ISO 形式(Display 权威)。
+        let r = rows(
+            &mut db,
+            "SELECT CAST(CAST('2026-01-01T00:00:00Z' AS TIMESTAMP) AS TEXT)",
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("2026-01-01T00:00:00.000Z".into())]]
+        );
+    }
+
+    #[test]
+    fn timestamp_typed_literal_variants() {
+        let mut db = Database::in_memory().unwrap();
+        // DATE '…' = 当日零点;DATETIME 别名;TIME 等未支持类型显式报错。
+        let r = rows(&mut db, "SELECT DATE '2026-09-15'");
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1_789_430_400_000));
+        let r = rows(&mut db, "SELECT DATETIME '2026-09-15T10:00:00Z'");
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(_)));
+        assert!(db.execute("SELECT TIME '10:00:00'").is_err());
+        // DEFAULT 位置也接受 TIMESTAMP 字面量(eval_const 路径)。
+        run(&mut db, "CREATE TABLE ev4 (id INT PRIMARY KEY, at TIMESTAMP DEFAULT TIMESTAMP '2020-01-01T00:00:00Z')");
+        run(&mut db, "INSERT INTO ev4 (id) VALUES (1)");
+        let r = rows(&mut db, "SELECT at FROM ev4");
+        assert!(matches!(&r.rows[0][0], Value::Timestamp(ms) if *ms == 1_577_836_800_000));
+    }
+
+    #[test]
+    fn timestamp_probe_mixed_band_needs_explicit_cast() {
+        // 混合序带列(同列既有 Str 又有 Timestamp):字符串字面量边界不提升
+        // (文档化边界)——显式 CAST 后按时间精确匹配。
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE mx (id INT PRIMARY KEY, at TIMESTAMP)",
+        );
+        run(&mut db, "CREATE INDEX idx_mx_at ON mx (at)");
+        run(
+            &mut db,
+            "INSERT INTO mx VALUES (1, TIMESTAMP '2026-01-01T00:00:00Z')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO mx VALUES (2, TIMESTAMP '2026-06-01T00:00:00Z')",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM mx WHERE at = CAST('2026-06-01T00:00:00Z' AS TIMESTAMP)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn view_error_paths_and_read_through_writes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE base_t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO base_t VALUES (1, 'x')");
+        // 装饰/临时/保留名/列清单逐一显式拒绝。
+        assert!(
+            db.execute("CREATE MATERIALIZED VIEW mv AS SELECT 1")
+                .is_err(),
+            "物化视图拒绝"
+        );
+        assert!(
+            db.execute("CREATE VIEW #tv AS SELECT 1").is_err(),
+            "临时视图拒绝"
+        );
+        assert!(
+            db.execute("CREATE VIEW v (a) AS SELECT 1").is_err(),
+            "列清单拒绝"
+        );
+        assert!(
+            db.execute("CREATE VIEW _cluster_log AS SELECT 1").is_err(),
+            "引擎保留名拒绝"
+        );
+        assert!(
+            db.execute("CREATE VIEW docsql_users AS SELECT 1").is_err(),
+            "用户子系统保留名拒绝"
+        );
+        // 写语句经视图读源(读穿透):INSERT..SELECT 与 MERGE USING 都展开。
+        run(&mut db, "CREATE VIEW vw AS SELECT id, v FROM base_t");
+        run(&mut db, "CREATE TABLE dst (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO dst SELECT * FROM vw");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM dst");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Int(1)]],
+            "读穿透:视图作为 SELECT 源"
+        );
+        run(&mut db, "CREATE TABLE tgt (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO tgt VALUES (1, 'x')");
+        run(
+            &mut db,
+            "MERGE INTO tgt USING vw ON tgt.id = vw.id WHEN MATCHED THEN UPDATE SET v = vw.v",
+        );
+        // information_schema 照常工作(视图不产生列行,不炸页面)。
+        let r = rows(&mut db, "SELECT COUNT(*) FROM information_schema.tables");
+        assert!(!r.rows.is_empty());
+    }
+
+    // ---- 覆盖率补强:检查遍历器/分组形态/MERGE 分支/复合前缀探针 ----
+
+    #[test]
+    fn drop_column_check_walker_shapes() {
+        // DROP COLUMN 走 expr_references_ident 的全部 AST 形态:
+        // 每条 CHECK 用一种表达式,引用列被删即拒绝。
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE w (a INT, b INT, name TEXT, z INT,
+             CHECK (a BETWEEN 0 AND 10),
+             CHECK (a IN (1, 2, 3)),
+             CHECK (LENGTH(name) > 0),
+             CHECK (CASE WHEN a > 0 THEN 1 ELSE 0 END = 1),
+             CHECK (-b < 5),
+             CHECK (a + b > 0))",
+        );
+        for col in ["a", "b", "name"] {
+            let e = db
+                .execute(&format!("ALTER TABLE w DROP COLUMN {col}"))
+                .unwrap_err();
+            assert!(
+                e.to_string().contains("references it"),
+                "DROP {col} must report the CHECK reference: {e}"
+            );
+        }
+        // 未被引用的列照常删除。
+        run(&mut db, "ALTER TABLE w DROP COLUMN z");
+    }
+
+    #[test]
+    fn insert_null_walks_check_null_ref_shapes() {
+        // INSERT 的 CHECK 求值走 expr_has_null_ref(CASE/BinaryOp/IsNull)。
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE n (v TEXT, CHECK (CASE WHEN v IS NOT NULL THEN 1 ELSE 0 END = 1))",
+        );
+        run(&mut db, "INSERT INTO n VALUES ('x')");
+        // NULL 入 CASE → ELSE 0 = 1 为假:约束如实拒绝(NULL 语义走的是
+        // 引用检查 expr_has_null_ref,不是免检)。
+        assert!(db.execute("INSERT INTO n VALUES (NULL)").is_err());
+    }
+
+    #[test]
+    fn merge_clause_error_branches() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE m_t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE m_s (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO m_s VALUES (1, 'x')");
+        // WHEN NOT MATCHED THEN UPDATE 拒绝。
+        assert!(db
+            .execute(
+                "MERGE INTO m_t USING m_s ON m_t.id = m_s.id \
+                 WHEN NOT MATCHED THEN UPDATE SET v = 'y'"
+            )
+            .is_err());
+        // WHEN NOT MATCHED AND <谓词> 拒绝。
+        assert!(db
+            .execute(
+                "MERGE INTO m_t USING m_s ON m_t.id = m_s.id \
+                 WHEN NOT MATCHED AND m_s.v = 'x' THEN INSERT VALUES (1, 'x')"
+            )
+            .is_err());
+        // MERGE INSERT ROW 拒绝。
+        assert!(db
+            .execute(
+                "MERGE INTO m_t USING m_s ON m_t.id = m_s.id \
+                 WHEN NOT MATCHED THEN INSERT ROW"
+            )
+            .is_err());
+        // 重复 WHEN NOT MATCHED 拒绝。
+        assert!(db
+            .execute(
+                "MERGE INTO m_t USING m_s ON m_t.id = m_s.id \
+                 WHEN NOT MATCHED THEN INSERT VALUES (1, 'a') \
+                 WHEN NOT MATCHED THEN INSERT VALUES (2, 'b')"
+            )
+            .is_err());
+        // VALUES 行数非 1 拒绝。
+        assert!(db
+            .execute(
+                "MERGE INTO m_t USING m_s ON m_t.id = m_s.id \
+                 WHEN NOT MATCHED THEN INSERT VALUES (1, 'a'), (2, 'b')"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn having_and_group_expr_shapes() {
+        // HAVING 引用检查(check_having_refs)与分组求值
+        // (eval_group_expr)的函数/CASE/复合标识符/一元/CAST/嵌套形态。
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE emp (id INT, dept TEXT, n INT)");
+        run(
+            &mut db,
+            "INSERT INTO emp VALUES (1, 'cs', 5), (2, 'cs', 3), (3, 'hr', 7)",
+        );
+        // 函数形态 + CAST 形态 + 一元形态。
+        let r = rows(
+            &mut db,
+            "SELECT dept, COUNT(*) AS c FROM emp GROUP BY dept \
+             HAVING LENGTH(dept) > 1 AND CAST(COUNT(*) AS TEXT) != '' AND -COUNT(*) < 0 \
+             ORDER BY dept",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("cs".into()), Value::Int(2)],
+                vec![Value::Str("hr".into()), Value::Int(1)]
+            ]
+        );
+        // CASE 形态。
+        let r = rows(
+            &mut db,
+            "SELECT dept FROM emp GROUP BY dept HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("cs".into())]]);
+        // 复合标识符(别名限定)形态。
+        let r = rows(
+            &mut db,
+            "SELECT e.dept FROM emp e GROUP BY e.dept HAVING e.dept = 'hr'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("hr".into())]]);
+        // 未在 GROUP BY/聚合中的列 → 响亮报错。
+        assert!(db
+            .execute("SELECT dept FROM emp GROUP BY dept HAVING n > 0")
+            .is_err());
+    }
+
+    #[test]
+    fn composite_index_prefix_probe_and_retain() {
+        // 复合索引前缀探针:只按前导列等值(a=1)走 Prefix 扫描 + 逐键保留,
+        // b 的取值不限制(前缀保留过滤必须留下全部 b 变体)。
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE cp (a INT, b INT, v TEXT)");
+        run(&mut db, "CREATE INDEX idx_cp ON cp (a, b)");
+        for i in 0..40 {
+            run(
+                &mut db,
+                &format!("INSERT INTO cp VALUES (1, {}, 'r{i}')", i % 3),
+            );
+        }
+        run(&mut db, "INSERT INTO cp VALUES (2, 9, 'other')");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM cp WHERE a = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(40)]]);
+        // 前缀 + 第二列范围:前缀探针 + 残余过滤。
+        let r = rows(&mut db, "SELECT COUNT(*) FROM cp WHERE a = 1 AND b = 2");
+        assert_eq!(r.rows, vec![vec![Value::Int(13)]]);
+    }
+
     // ---- 银行场景合规:账务语义端到端 ----
 
     fn ledger_db() -> Database {

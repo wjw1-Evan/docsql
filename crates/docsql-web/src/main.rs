@@ -240,4 +240,23 @@ mod tests {
         .unwrap();
         assert!(cfg.token.is_none() && cfg.auth_file.is_none());
     }
+
+    #[test]
+    fn map_api_carries_every_field() {
+        let cfg = config_from_env(
+            &args(&["docsql-web", "u:1", "0.0.0.0:7800"]),
+            env(&[
+                ("DOCSQL_TOKEN", "t"),
+                ("DOCSQL_WEB_AUTH_FILE", "/auth/users.json"),
+                ("DOCSQL_PEERS", "p:1,p:2"),
+            ]),
+        )
+        .unwrap();
+        let api = cfg.map_api();
+        assert_eq!(api.upstream.as_deref(), Some("u:1"));
+        assert_eq!(api.token.as_deref(), Some("t"));
+        assert_eq!(api.auth_file.as_deref(), Some("/auth/users.json"));
+        assert_eq!(api.peers, vec!["p:1".to_string(), "p:2".to_string()]);
+        assert!(api.tls.is_none());
+    }
 }

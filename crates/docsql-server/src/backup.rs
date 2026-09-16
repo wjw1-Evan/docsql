@@ -1321,4 +1321,61 @@ mod tests {
             "20260910T081530123Z"
         );
     }
+
+    #[test]
+    fn pitr_header_and_entry_parsers() {
+        // Base header (v2).
+        let text =
+            "-- docsql-backup v2 journal-seq=42 ts=1789000000000\nDROP TABLE IF EXISTS \"t\";\n";
+        let h = parse_backup_header_text(text).expect("v2 header parses");
+        assert_eq!(h.journal_seq, 42);
+        assert_eq!(h.ts_ms, 1_789_000_000_000);
+        // v1 (no header) → None: restore-to-timestamp refuses it loudly.
+        assert_eq!(parse_backup_header_text("SELECT 1;\n"), None);
+        // Incremental header.
+        let ih = parse_pitr_header_text("-- docsql-pitr incr from=7 to=9\n").expect("incr header");
+        assert_eq!((ih.from, ih.to), (7, 9));
+        // Entry lines round-trip with embedded quotes in SQL.
+        let e = parse_pitr_entry(
+            "{\"seq\":8,\"ts\":1789000000123,\"sql\":\"INSERT INTO t VALUES ('it''s')\"}",
+        )
+        .expect("entry parses");
+        assert_eq!(e.0, 8);
+        assert_eq!(e.1, 1_789_000_000_123);
+        assert_eq!(e.2, "INSERT INTO t VALUES ('it''s')");
+        // Malformed lines never parse into partial entries.
+        assert!(parse_pitr_entry("not json").is_none());
+        assert!(parse_pitr_entry("{\"seq\":\"x\",\"ts\":1,\"sql\":\"\"}").is_none());
+        assert!(parse_pitr_entry("-- comment").is_none());
+    }
+
+    #[test]
+    fn collect_pitr_entries_filters_by_time_and_base_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two incrementals: one entirely below the base seq (skipped), one
+        // straddling the target (per-entry ts filter).
+        std::fs::write(
+            dir.path().join("incr-1.sql"),
+            "-- docsql-pitr incr from=1 to=2\n{\"seq\":1,\"ts\":100,\"sql\":\"A1\"}\n{\"seq\":2,\"ts\":200,\"sql\":\"A2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("incr-2.sql"),
+            "-- docsql-pitr incr from=3 to=5\n{\"seq\":3,\"ts\":300,\"sql\":\"B1\"}\n{\"seq\":4,\"ts\":420,\"sql\":\"B2\"}\n{\"seq\":5,\"ts\":500,\"sql\":\"B3\"}\n",
+        )
+        .unwrap();
+        // base_seq=3: the first file is entirely covered; entries ts<=400.
+        let out = collect_pitr_entries(dir.path(), 3, 400).unwrap();
+        assert_eq!(out, vec!["B1"], "base 覆盖段跳过 + ts 过滤");
+        // No target filtering needed → everything after base seq replays.
+        let out = collect_pitr_entries(dir.path(), 3, i64::MAX).unwrap();
+        assert_eq!(out, vec!["B1", "B2", "B3"]);
+        // Checksum verification is honored for incremental files too.
+        std::fs::write(
+            dir.path().join("incr-2.sql.sha256"),
+            b"deadbeef  incr-2.sql\n",
+        )
+        .unwrap();
+        assert!(collect_pitr_entries(dir.path(), 0, i64::MAX).is_err());
+    }
 }

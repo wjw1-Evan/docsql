@@ -1067,4 +1067,85 @@ mod tests {
         assert_eq!(ps.notify("news", 2, 0, "x").await, 0);
         assert!(ps.lock().await.channels(None).is_empty());
     }
+
+    #[test]
+    fn query_max_id_falls_back_to_sql_when_table_missing() {
+        // 无存储表:max_autoinc 未命中,SQL 聚合报错 → 0(而不是 panic)。
+        let mut db = Database::in_memory().unwrap();
+        assert_eq!(query_max_id(&mut db), 0);
+    }
+
+    #[test]
+    fn replay_window_default_and_blank_chunks_are_noops() {
+        let mut w = ReplayWindow::default();
+        assert_eq!(w.limit(), 1, "default seeds conservatively");
+        w.advance(0, 4096, 64);
+        assert_eq!(w.limit(), 1, "zero-row chunk never resizes");
+    }
+
+    #[test]
+    fn parse_after_id_validates_from_kinds() {
+        let from = |v: serde_json::Value| parse_after_id(&v);
+        assert_eq!(from(serde_json::json!({"from": null})).unwrap(), None);
+        assert_eq!(from(serde_json::json!({"from": "latest"})).unwrap(), None);
+        assert_eq!(
+            from(serde_json::json!({"from": "earliest"})).unwrap(),
+            Some(0)
+        );
+        assert_eq!(from(serde_json::json!({"from": "42"})).unwrap(), Some(42));
+        // 非法字符串 / 非整数数字 / 非字符串类型显式报错。
+        let e = from(serde_json::json!({"from": "bogus"})).unwrap_err();
+        assert!(e.contains("expected latest|earliest"), "{e}");
+        assert!(from(serde_json::json!({"from": 1.5})).is_err());
+        assert!(from(serde_json::json!({"from": true})).is_err());
+    }
+
+    #[tokio::test]
+    async fn per_connection_subscription_limit_enforced() {
+        let ps = PubSub::default();
+        let conn = ps.next_conn_id();
+        {
+            let mut inner = ps.lock().await;
+            for i in 0..MAX_SUBS_PER_CONN {
+                let (t, _r) = tx();
+                inner
+                    .register(conn, SubKind::Channel, &format!("ch-{i}"), t)
+                    .unwrap();
+            }
+            let (t, _r) = tx();
+            let e = inner
+                .register(conn, SubKind::Channel, "one-too-many", t)
+                .unwrap_err();
+            assert!(e.contains("per connection"), "{e}");
+            // 替换既有订阅不占新槽。
+            let (t2, _r2) = tx();
+            assert_eq!(
+                inner.register(conn, SubKind::Channel, "ch-0", t2).unwrap(),
+                MAX_SUBS_PER_CONN
+            );
+        }
+        // 空名单退订 = 该种类全部退订,计数清零。
+        let remaining = ps.lock().await.unregister(conn, SubKind::Channel, &[]);
+        assert_eq!(remaining, 0);
+        assert_eq!(ps.lock().await.channels(None).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn remove_conn_clears_both_kinds_and_counters() {
+        let ps = PubSub::new();
+        let conn = ps.next_conn_id();
+        let (tc, _rc) = tx();
+        let (tp, _rp) = tx();
+        {
+            let mut inner = ps.lock().await;
+            inner.register(conn, SubKind::Channel, "news", tc).unwrap();
+            inner.register(conn, SubKind::Pattern, "n*", tp).unwrap();
+            assert_eq!(inner.channels(None), vec!["news".to_string()]);
+            inner.remove_conn(conn);
+            assert!(inner.channels(None).is_empty());
+            assert_eq!(inner.numpat(), 0);
+            assert_eq!(inner.total, 0);
+            assert_eq!(inner.conn_count(conn), 0);
+        }
+    }
 }
