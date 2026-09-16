@@ -285,6 +285,7 @@ pub struct Heap {
 
 /// Where a replaced document ended up, plus slot moves its page-mates
 /// suffered (their index entries must be re-pointed).
+#[derive(Debug)]
 pub struct ReplaceOutcome {
     pub placed: u64,
     pub moved: Vec<(u64, u64)>,
@@ -971,5 +972,115 @@ mod tests {
         pager.abort_tx(tx).unwrap();
         let docs = heap.scan(&PageReader::current(&pager)).unwrap();
         assert_eq!(docs.len(), 1);
+    }
+
+    // ---- 损坏/敌意槽位防御:读取端必须响亮报错,绝不静默回错数据 ----
+
+    /// Craft a heap page with one live slot whose region is `region`.
+    /// Layout: u16 count | slot dir | ... | region.
+    fn craft_page(pid: u32, region: Vec<u8>) -> Vec<u8> {
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[0..2].copy_from_slice(&1u16.to_le_bytes());
+        // slot 0 directory: offset+len (region packed at page end).
+        let off = (PAGE_SIZE - region.len()) as u16;
+        let len = region.len() as u16;
+        page[2..4].copy_from_slice(&off.to_le_bytes());
+        page[4..6].copy_from_slice(&len.to_le_bytes());
+        page[off as usize..].copy_from_slice(&region);
+        let _ = pid;
+        page
+    }
+
+    fn write_raw_page(pager: &Pager, pid: u32, page: &[u8]) {
+        let mut tx = pager.begin_tx();
+        pager
+            .write_page(&mut tx, pid, 0, page)
+            .or_else(|_| pager.write_page(&mut tx, pid, 0, &page[..PAGE_SIZE]))
+            .unwrap();
+        pager.commit_tx(tx).unwrap();
+    }
+
+    fn overflow_region(total: u32, chain_head: u32, inline: &[u8]) -> Vec<u8> {
+        let mut r = vec![OVERFLOW_MARK];
+        r.extend_from_slice(&total.to_le_bytes());
+        r.extend_from_slice(&chain_head.to_le_bytes());
+        r.extend_from_slice(inline);
+        r
+    }
+
+    fn chain_page(next: u32, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![CHAIN_MARK];
+        p.extend_from_slice(&next.to_le_bytes());
+        p.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        p.extend_from_slice(payload);
+        while p.len() < PAGE_SIZE {
+            p.push(0);
+        }
+        p
+    }
+
+    #[test]
+    fn overflow_chain_corruption_is_rejected_loudly() {
+        let (_d, pager) = db("heap-corr.db");
+        // Allocate the raw pages the crafted chain references (1 = main, 2+).
+        {
+            let mut tx = pager.begin_tx();
+            for _ in 0..3 {
+                pager.allocate_page(&mut tx).unwrap();
+            }
+            pager.commit_tx(tx).unwrap();
+        }
+        // Pages: 1 = main page with an overflow-marked slot, 2.. = chain.
+        let mk_main = |total: u32, head: u32, inline: &[u8]| {
+            craft_page(1, overflow_region(total, head, inline))
+        };
+
+        // (1) total exceeds MAX_DOC_SIZE: refused before any allocation.
+        write_raw_page(&pager, 1, &mk_main(u32::MAX, 2, &[0xaa; 8]));
+        let heap = Heap {
+            pages: vec![1],
+            overflow_free: Vec::new(),
+            dropped: Vec::new(),
+        };
+        let err = heap
+            .scan(&PageReader::current(&pager))
+            .expect_err("hostile total must fail");
+        assert!(
+            format!("{err}").contains("exceeds max document size"),
+            "{err}"
+        );
+
+        // (2) chain head points to itself: cycle detected.
+        write_raw_page(&pager, 1, &mk_main(10_000, 2, &[0xaa; 8]));
+        write_raw_page(&pager, 2, &chain_page(2, &[0xbb; 32]));
+        let err = heap
+            .scan(&PageReader::current(&pager))
+            .expect_err("cyclic chain must fail");
+        assert!(format!("{err}").contains("corrupt"), "{err}");
+
+        // (3) chain terminates early: short read refused (no silent
+        // truncation of a stored document).
+        write_raw_page(&pager, 1, &mk_main(10_000, 2, &[0xaa; 8]));
+        write_raw_page(&pager, 2, &chain_page(0, &[0xbb; 16]));
+        let err = heap
+            .scan(&PageReader::current(&pager))
+            .expect_err("short chain must fail");
+        assert!(format!("{err}").contains("short read"), "{err}");
+    }
+
+    #[test]
+    fn replace_dead_slot_and_out_of_range_slot_are_rejected() {
+        let (_d, pager) = db("heap-dead.db");
+        let mut heap = Heap::default();
+        let mut tx = pager.begin_tx();
+        let loc = heap.insert(&pager, &mut tx, &doc(1, "live")).unwrap();
+        pager.commit_tx(tx).unwrap();
+        // Slot 99 is out of range on page 1.
+        let bad_loc = crate::heap::pack_loc(1, 99);
+        let err = heap
+            .replace(&pager, &mut pager.begin_tx(), bad_loc, &doc(1, "nope"))
+            .expect_err("out-of-range slot must fail");
+        assert!(format!("{err}").contains("out of range"), "{err}");
+        let _ = loc;
     }
 }

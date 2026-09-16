@@ -3565,6 +3565,69 @@ async fn pitr_restore_to_timestamp_replays_journal_chain() {
     assert_eq!(ids, vec![1, 2], "restore-to-T must give A+B without C");
 }
 
+/// PITR 错误路径:v1 头(无 journal-seq)的备份对 restore-to-timestamp
+/// 响亮拒绝;坏 "to" 参数在网关即拒;无待导出条目的 export 幂等成功。
+#[tokio::test]
+async fn pitr_error_paths_are_loud() {
+    let (_dir, backups, addr) = start_server_pitr().await;
+    wait_backup_idle_pitr(&addr).await;
+    async fn trigger(addr: &str, body: &str) -> Frame {
+        let mut c = Client::connect(addr).await;
+        c.send(&Frame::new(proto::REQ_BACKUP, body.as_bytes().to_vec()))
+            .await;
+        c.recv().await
+    }
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE e (id INT PRIMARY KEY)").await;
+    wait_backup_idle_pitr(&addr).await;
+
+    // v1 备份(手工剥离 v2 头)对 to-restore 拒绝。
+    let v1 = "backup-v1legacy.sql";
+    std::fs::write(backups.join(v1), b"SELECT 1;\n").unwrap();
+    // 拒绝由后台 restore 任务异步呈现:轮询状态断言 ok=false + 指明缺头。
+    let r = trigger(
+        &addr,
+        r#"{"action":"restore","file":"backup-v1legacy.sql","to":"2026-01-01T00:00:00Z"}"#,
+    )
+    .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "调度即确认");
+    for _ in 0..250 {
+        let v = backup_list(&addr, None).await;
+        if v["restore"]["running"] != true {
+            assert_eq!(v["restore"]["ok"], false, "v1 restore must fail: {v}");
+            let err = v["restore"]["error"].as_str().unwrap_or_default();
+            assert!(err.contains("v2 backup"), "must name the header: {err}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 坏 "to" 值在网关即拒。
+    let r = trigger(
+        &addr,
+        r#"{"action":"restore","file":"whatever.sql","to":"not-a-time"}"#,
+    )
+    .await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR);
+    // 空期刊导出:幂等成功。
+    let r = trigger(&addr, r#"{"action":"export"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    // 触发合法全量后再 to-restore:无 v1 头问题,正常调度。
+    let r = trigger(&addr, r#"{"action":"trigger"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+    wait_backup_idle_pitr(&addr).await;
+}
+
+async fn wait_backup_idle_pitr(addr: &str) {
+    for _ in 0..500 {
+        let v = backup_list(addr, None).await;
+        if v["running"] == false && v["restore"]["running"] != true {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("backup did not go idle");
+}
+
 /// Backup file names in `dir`, newest first (the UTC stamp is fixed-width,
 /// so name order is time order).
 fn backup_names(dir: &std::path::Path) -> Vec<String> {
