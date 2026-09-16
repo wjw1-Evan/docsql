@@ -98,6 +98,9 @@ internal sealed class DocsqlAutoCreateInterceptor : DbCommandInterceptor
 
         // 先校验后同步:模型对象齐备时零 DDL;外部删表/加字段在下一个
         // 上下文被校验发现,语义与逐连接全量同步一致。
+        // 注意「下一个上下文」以连接为单位:UseDocsql(DocsqlConnection)
+        // 共享同一连接实例时,(连接, 模型) 记账使复查只发生一次 —— 外部
+        // DDL 之后需要 Dispose/重建上下文(或换连接)才会被发现。
         if (!SchemaSync.VerifyModel(connection, model))
         {
             SchemaSync.SyncModel(connection, model);

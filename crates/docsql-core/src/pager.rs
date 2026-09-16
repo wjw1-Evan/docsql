@@ -316,6 +316,12 @@ pub enum UndoOp {
 #[derive(Default)]
 struct UndoState {
     active: bool,
+    /// Set while a rollback replay writes pre-images back (`restore_transaction`).
+    /// A replayed `Set` for a page whose first write postdates the savepoint
+    /// would otherwise record the *current dirty image* as its pre-image —
+    /// and a later full ROLLBACK would resurrect exactly the changes being
+    /// rolled back and commit them. Replay must never append to the journal.
+    replaying: bool,
     ops: Vec<UndoOp>,
     /// Pages whose current-region `Set` pre-image is already in `ops`.
     recorded: std::collections::HashSet<u32>,
@@ -666,7 +672,15 @@ impl Pager {
                 tx.reused.push(id);
                 id
             }
-            None => self.num_pages.fetch_add(1, Ordering::Relaxed),
+            None => {
+                let id = self.num_pages.fetch_add(1, Ordering::Relaxed);
+                // A brand-new page id exists nowhere to return to once the
+                // tx aborts (the file header already counts it) — track it
+                // like a pool borrow so abort/drop recycles it instead of
+                // stranding the id (and its 4 KB) until restart.
+                tx.reused.push(id);
+                id
+            }
         };
         // Realloc: the transaction freed this page itself, so the restored
         // catalog still owns it and its content must be recorded NOW (the
@@ -674,17 +688,17 @@ impl Pager {
         // the caller's write_page finds the page already staged).
         let was_freed = {
             let u = lock(&self.undo);
-            u.active && u.freed.contains(&id)
+            u.active && !u.replaying && u.freed.contains(&id)
         };
         {
             let mut u = lock(&self.undo);
-            if u.active && was_freed && u.recorded.insert(id) {
+            if u.active && !u.replaying && was_freed && u.recorded.insert(id) {
                 drop(u);
                 let image = self.current_page_image(id)?;
                 let mut u = lock(&self.undo);
                 u.ops.push(UndoOp::Set(id, image));
                 u.ops.push(UndoOp::Realloc(id));
-            } else if u.active && !was_freed {
+            } else if u.active && !u.replaying && !was_freed {
                 u.ops.push(UndoOp::Alloc(id));
             }
         }
@@ -702,7 +716,7 @@ impl Pager {
         }
         {
             let mut u = lock(&self.undo);
-            if u.active {
+            if u.active && !u.replaying {
                 // Frees never modify content, so no image is needed: undoing
                 // the Free (reserving the page) leaves the restored catalog
                 // reading the bytes it always had. A later reuse's first
@@ -799,6 +813,21 @@ impl Pager {
         ops
     }
 
+    /// Suppress undo recording while a rollback replay writes pre-images
+    /// back. Replay writes must never append: a replayed `Set` whose page was
+    /// first written after the savepoint would otherwise record the current
+    /// dirty image as its pre-image, and a later full ROLLBACK would commit
+    /// exactly the changes being rolled back. Must be paired with
+    /// [`Pager::resume_undo`] on every path.
+    pub fn pause_undo(&self) {
+        lock(&self.undo).replaying = true;
+    }
+
+    /// Resume undo recording after [`Pager::pause_undo`].
+    pub fn resume_undo(&self) {
+        lock(&self.undo).replaying = false;
+    }
+
     /// Undo of a `Free`: the page is live again in the restored catalog, so
     /// make sure no allocation can hand it out.
     pub fn reserve_page(&self, id: u32) {
@@ -865,7 +894,7 @@ impl Pager {
             let base = self.current_page_image(id)?;
             {
                 let mut u = lock(&self.undo);
-                if u.active && u.recorded.insert(id) {
+                if u.active && !u.replaying && u.recorded.insert(id) {
                     u.ops.push(UndoOp::Set(id, base.clone()));
                 }
             }
@@ -901,8 +930,18 @@ impl Pager {
             wal.fence()?;
             wal.sync().map_err(PagerError::Wal)?;
         }
-        self.flush_pending()?;
-        self.maybe_checkpoint()
+        // The fence is durable: the transaction committed no matter what
+        // happens below. A failed flush/checkpoint keeps its images queued
+        // (reads fall back to `pending_writes`, recovery replays the WAL)
+        // and the next call retries — surfacing the error would make the
+        // client re-run an already-durable COMMIT.
+        if let Err(e) = self.flush_pending() {
+            eprintln!("docsql-pager: post-fence flush failed (will retry): {e}");
+        }
+        if let Err(e) = self.maybe_checkpoint() {
+            eprintln!("docsql-pager: post-fence checkpoint failed (will retry): {e}");
+        }
+        Ok(())
     }
 
     /// Write `pending_writes` through to the data file and update the pool.
@@ -1049,9 +1088,18 @@ impl Pager {
         if fsync {
             // The WAL fsync also durable-d every earlier deferred commit:
             // flush those pages too, then write this tx's pages (they are in
-            // `pending_writes` like any deferred image).
-            self.flush_pending()?;
-            self.maybe_checkpoint()?;
+            // `pending_writes` like any deferred image). Past the fsync the
+            // commit point is crossed — the transaction replays on recovery
+            // no matter what — so a data-file flush/checkpoint failure must
+            // NOT fail the statement: the client would retry an
+            // already-durable write. The images stay queued and the next
+            // flush/checkpoint retries them.
+            if let Err(e) = self.flush_pending() {
+                eprintln!("docsql-pager: post-commit flush failed (will retry): {e}");
+            }
+            if let Err(e) = self.maybe_checkpoint() {
+                eprintln!("docsql-pager: post-commit checkpoint failed (will retry): {e}");
+            }
         }
         Ok(lsn)
     }
@@ -1350,7 +1398,9 @@ pub struct Tx {
     staged: HashMap<u32, Vec<u8>>,
     /// Pages to release into the reusable pool when this tx commits.
     to_free: Vec<u32>,
-    /// Ids popped from the reusable pool by this tx's allocations.
+    /// Ids this tx borrowed from the reusable pool, plus brand-new page ids
+    /// it grew the file by (both are returned on abort/drop; a commit keeps
+    /// them and clears the list).
     reused: Vec<u32>,
     /// Shared with the pager so a dropped (never committed) tx can hand the
     /// reused ids back.

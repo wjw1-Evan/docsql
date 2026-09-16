@@ -328,6 +328,7 @@ pub(crate) async fn handle_backup(
     role: ConnRole,
     frame: &Frame,
     user: Option<&crate::UserAuth>,
+    peer: &str,
 ) -> Frame {
     let action = if frame.payload.is_empty() {
         "list".to_string()
@@ -390,6 +391,16 @@ pub(crate) async fn handle_backup(
                     eprintln!("backup failed: {e}");
                 }
             });
+            // Audit: snapshots replace the whole backup set (keep-N) — the
+            // trail must say who triggered it.
+            querylog::record(
+                state,
+                peer,
+                &format!("BACKUP TRIGGER{}", audit_identity(user)),
+                0.0,
+                &Frame::new(proto::RESP_AFFECTED, b"backup started".to_vec()),
+                false,
+            );
             Frame::new(proto::RESP_AFFECTED, b"backup started".to_vec())
         }
         "restore" => {
@@ -474,17 +485,38 @@ pub(crate) async fn handle_backup(
             state.restore_progress.applied.store(0, Ordering::Relaxed);
             state.restore_progress.total.store(0, Ordering::Relaxed);
             let st = state.clone();
+            let file_clone = file.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_restore(&st, &file).await {
-                    eprintln!("restore of {file} failed: {e}");
+                if let Err(e) = run_restore(&st, &file_clone).await {
+                    eprintln!("restore of {file_clone} failed: {e}");
                 }
             });
+            // Audit: a restore replaces every table in the database — the
+            // single most destructive operation the wire exposes; the trail
+            // must say who started it and from which file.
+            querylog::record(
+                state,
+                peer,
+                &format!("RESTORE {file}{}", audit_identity(user)),
+                0.0,
+                &Frame::new(proto::RESP_AFFECTED, b"restore started".to_vec()),
+                false,
+            );
             Frame::new(proto::RESP_AFFECTED, b"restore started".to_vec())
         }
         other => Frame::new(
             proto::RESP_ERROR,
             crate::err_payload(&format!("backup: unknown action \"{other}\"")),
         ),
+    }
+}
+
+/// Identity suffix for backup audit entries: token connections are already
+/// identified by the trail's `peer` field; user logins by their name.
+fn audit_identity(user: Option<&crate::UserAuth>) -> String {
+    match user {
+        Some(u) => format!(" by user={}", u.name),
+        None => String::new(),
     }
 }
 

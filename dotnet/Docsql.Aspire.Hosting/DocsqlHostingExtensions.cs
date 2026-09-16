@@ -107,7 +107,11 @@ public static class DocsqlHostingExtensions
     /// 命名 {节点名}-console;返回原 server builder 以便继续链式配置。
     /// 控制台账号门默认开启(凭据存于 /auth 卷);镜像与 server 严格同版本。
     /// </summary>
-    public static IResourceBuilder<DocsqlServerResource> WithWebConsole(this IResourceBuilder<DocsqlServerResource> builder, int? port = null, string? consoleName = null)
+    /// <param name="secureCookie">
+    /// 控制台部署在 TLS 反代之后时传 true(下发 DOCSQL_WEB_COOKIE_SECURE=1,
+    /// 会话 cookie 带 Secure 标志;aspire publish 产出的 compose 默认无 TLS,
+    /// 不得开启)。</param>
+    public static IResourceBuilder<DocsqlServerResource> WithWebConsole(this IResourceBuilder<DocsqlServerResource> builder, int? port = null, string? consoleName = null, bool secureCookie = false)
     {
         var image = builder.Resource.Annotations.OfType<ContainerImageAnnotation>().Single();
         var console = new DocsqlWebConsoleResource(consoleName ?? $"{builder.Resource.Name}-console");
@@ -127,6 +131,10 @@ public static class DocsqlHostingExtensions
                 context.Args.Add($"0.0.0.0:{WebConsolePort}");
             })
             .WithEnvironment("DOCSQL_WEB_AUTH_FILE", "/auth/console-auth.json");
+        if (secureCookie)
+        {
+            consoleBuilder = consoleBuilder.WithEnvironment("DOCSQL_WEB_COOKIE_SECURE", "1");
+        }
         consoleBuilder.WithVolume(VolumeNameGenerator.Generate(consoleBuilder, "auth"), "/auth");
 
         if (builder.Resource.TokenParameter is { } token)

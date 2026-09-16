@@ -107,7 +107,26 @@ public sealed class ProtocolConnection : IDisposable
     /// <see cref="SendAsync(Frame, CancellationToken, int)"/> and the ADO.NET
     /// CommandTimeout. 0 = infinite (tests/diagnostics only).
     /// </summary>
-    public int ReadTimeoutMs { get; set; } = 30_000;
+    /// <remarks>
+    /// The setter pushes the value into the socket: the synchronous path
+    /// blocks in <c>_stream.Read</c>, which is governed by
+    /// <c>ReceiveTimeout</c> — an auto-property here made a per-statement
+    /// CommandTimeout a silent no-op on the sync path (the async path passes
+    /// the budget explicitly and was unaffected).
+    /// </remarks>
+    private int _readTimeoutMs = 30_000;
+    public int ReadTimeoutMs
+    {
+        get => _readTimeoutMs;
+        set
+        {
+            _readTimeoutMs = value;
+            if (_tcp is { Client: not null } && _tcp.Connected)
+            {
+                _tcp.ReceiveTimeout = value;
+            }
+        }
+    }
 
     /// <summary>True after a timeout/IO failure left the frame stream in an
     /// unknown position: the connection must be discarded, never pooled.</summary>

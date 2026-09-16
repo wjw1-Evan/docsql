@@ -3299,34 +3299,47 @@ impl Database {
     /// the reusable pool, `Free` reserves it (the restored catalog owns it
     /// again), `Realloc` needs nothing (its pre-image was recorded when the
     /// transaction freed it).
+    ///
+    /// Recording is paused for the replay (`pause_undo`): a replayed `Set`
+    /// for a page first written after the savepoint must not treat the
+    /// current dirty image as a new pre-image — that would let a later full
+    /// ROLLBACK resurrect and commit the changes being rolled back here.
+    /// The restored image *is* the transaction-start state, so future writes
+    /// re-record it naturally.
     fn restore_transaction(
         &mut self,
         snap: TableSnapshot,
         undo: Vec<crate::pager::UndoOp>,
         sync_catalog: bool,
     ) -> Result<()> {
-        let mut tx = self.pager.begin_tx();
-        for op in undo.into_iter().rev() {
-            match op {
-                crate::pager::UndoOp::Set(id, image) => {
-                    self.pager.write_page(&mut tx, id, 0, &image)?;
+        self.pager.pause_undo();
+        let replay = || -> Result<()> {
+            let mut tx = self.pager.begin_tx();
+            for op in undo.into_iter().rev() {
+                match op {
+                    crate::pager::UndoOp::Set(id, image) => {
+                        self.pager.write_page(&mut tx, id, 0, &image)?;
+                    }
+                    crate::pager::UndoOp::Alloc(id) => {
+                        self.pager.free_page(&mut tx, id)?;
+                    }
+                    crate::pager::UndoOp::Free(id) => {
+                        self.pager.reserve_page(id);
+                    }
+                    crate::pager::UndoOp::Realloc(_) => {}
                 }
-                crate::pager::UndoOp::Alloc(id) => {
-                    self.pager.free_page(&mut tx, id)?;
-                }
-                crate::pager::UndoOp::Free(id) => {
-                    self.pager.reserve_page(id);
-                }
-                crate::pager::UndoOp::Realloc(_) => {}
             }
-        }
-        self.tables = snap.tables;
-        self.autoinc_cache = snap.autoinc;
-        if sync_catalog {
-            self.save_catalog_into(&mut tx)?;
-        }
-        self.commit_pager_tx(tx)?;
-        Ok(())
+            self.tables = snap.tables;
+            self.autoinc_cache = snap.autoinc;
+            if sync_catalog {
+                self.save_catalog_into(&mut tx)?;
+            }
+            self.commit_pager_tx(tx)?;
+            Ok(())
+        };
+        let result = replay();
+        self.pager.resume_undo();
+        result
     }
 
     fn rollback_tx(&mut self) -> Result<ExecOutcome> {
@@ -5783,11 +5796,21 @@ impl Database {
                         return err(format!("table {new_name} already exists"));
                     }
                     let docs = self.table_docs_cx(&tname)?;
+                    let old_entry = self.tables.get(&tname).cloned();
                     self.tables.remove(&tname);
                     // The old name must not keep a stale AUTOINCREMENT
                     // watermark for a table created under it later.
                     self.autoinc_cache.remove(&tname);
-                    self.rewrite_table(&new_name, &mut meta, docs)?;
+                    if let Err(e) = self.rewrite_table(&new_name, &mut meta, docs) {
+                        // rewrite_table's own failure restore only covers the
+                        // NEW name's entry (absent here) — without this the
+                        // old entry would stay removed and the table (and its
+                        // data pages) would vanish from the catalog.
+                        if let Some(old) = old_entry {
+                            self.tables.insert(tname.clone(), old);
+                        }
+                        return Err(e);
+                    }
                     return Ok(ExecOutcome::Affected(0));
                 }
                 other => return err(format!("unsupported ALTER TABLE operation: {other}")),
@@ -6835,6 +6858,7 @@ impl Database {
         // plain inserts. Only source rows that matched no target row are
         // inserted.
         let mut inserted = 0usize;
+        let mut inserted_docs: Vec<Object> = Vec::new();
         if let Some((cols, exprs)) = &not_matched_ins {
             // Auto-generated GUIDs are random: letting each node generate its
             // own would silently diverge replicas (the INSERT path rewrites
@@ -6885,6 +6909,7 @@ impl Database {
                 }
                 meta.check(&doc)?;
                 self.check_fks(&meta, &doc)?;
+                inserted_docs.push(doc.clone());
                 let loc = heap.insert(&self.pager, &mut tx, &doc)?;
                 reindex_insert(&self.pager, &mut tx, &idx_specs, &mut roots, &doc, loc)?;
                 if let Some(col) = &meta.autoinc {
@@ -6895,6 +6920,45 @@ impl Database {
                     self.autoinc_cache.insert(tname.clone(), next_autoinc);
                 }
                 inserted += 1;
+            }
+        }
+        // Legacy files whose constraint columns predate trees keep the
+        // whole-set duplicate check (same gate as the INSERT path): with no
+        // constraint tree, the reindex inserts above cannot reject
+        // duplicates, and a MERGE could silently write a repeated business
+        // key. Everything so far is staged in `tx` — the abort paths below
+        // discard it (all-or-nothing).
+        let has_constraints = meta.primary_key.is_some() || !meta.unique.is_empty();
+        let constraint_treed = meta
+            .primary_key
+            .iter()
+            .chain(meta.unique.iter())
+            .any(|c| roots.contains_key(c));
+        if has_constraints && !constraint_treed && (updates.len() + inserted) > 0 {
+            let mut combined: Vec<Object> = match (Heap {
+                pages: meta.pages.clone(),
+                overflow_free: meta.overflow_free.clone(),
+                dropped: Vec::new(),
+            }
+            .scan(&PageReader::current(&self.pager)))
+            {
+                Ok(docs) => docs,
+                Err(e) => {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e.into());
+                }
+            };
+            // Swap the updated rows' pre-images for their post-images
+            // (unambiguous: a pre-image's PK value is unique in committed
+            // data), then add the not-matched inserts.
+            for (_, old, _) in &updates {
+                combined.retain(|d| d != old);
+            }
+            combined.extend(updates.iter().map(|(_, _, n)| n.clone()));
+            combined.extend(inserted_docs.iter().cloned());
+            if let Err(e) = meta.check_unique(&combined) {
+                self.pager.abort_tx(tx)?;
+                return Err(e);
             }
         }
         // Emptied heap pages are released inside this transaction so later
@@ -7148,7 +7212,11 @@ fn add_values(a: Value, b: Value) -> Result<Value> {
         return Ok(x.checked_add(y).map(Value::Decimal).unwrap_or(Value::Null));
     }
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_add(y))),
+        // Overflow yields NULL, matching the scalar `+` path (a wrapped
+        // negative SUM would silently book a huge total as a loss).
+        (Value::Int(x), Value::Int(y)) => {
+            Ok(x.checked_add(y).map(Value::Int).unwrap_or(Value::Null))
+        }
         (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 + y)),
         (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + y as f64)),
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x + y)),
@@ -9145,8 +9213,19 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
         },
         v if t.contains("INT") => match v {
             Value::Int(_) => v,
-            Value::Float(f) => Value::Int(f as i64),
-            Value::Decimal(d) => Value::Int(d.trunc().to_i64().unwrap_or(0)),
+            Value::Float(f) => {
+                // `f as i64` saturates silently; a financial conversion that
+                // cannot be represented must fail loudly instead of turning
+                // a huge amount into i64::MAX. (`i64::MAX as f64` rounds up
+                // to 2^63, so `>=` there; `i64::MIN as f64` is exact.)
+                if !f.is_finite() || f >= i64::MAX as f64 || f < i64::MIN as f64 {
+                    return err(format!("cannot CAST {f} AS {type_name}: out of range"));
+                }
+                Value::Int(f as i64)
+            }
+            Value::Decimal(d) => Value::Int(d.trunc().to_i64().ok_or_else(|| {
+                SqlError::Message(format!("cannot CAST {d} AS {type_name}: out of range"))
+            })?),
             Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
             Value::Str(s) => Value::Int(
                 s.trim()
@@ -15785,6 +15864,39 @@ mod tests {
     }
 
     #[test]
+    fn sum_integer_overflow_yields_null_not_wraparound() {
+        // SUM must match the scalar `+` overflow semantics (NULL): a wrapped
+        // negative would silently book a huge total as a loss.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "INSERT INTO t VALUES (9223372036854775807)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let r = rows(&mut db, "SELECT SUM(a) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Null]], "got {:?}", r.rows);
+        // In-range sums stay exact.
+        let r = rows(&mut db, "SELECT SUM(a - 1) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(i64::MAX - 1)]]);
+    }
+
+    #[test]
+    fn cast_out_of_range_to_int_errors_instead_of_zero_or_saturation() {
+        let mut db = Database::in_memory().unwrap();
+        // DECIMAL → INT used to unwrap_or(0): a huge amount silently became 0.
+        let e = db
+            .execute("SELECT CAST(CAST('1e28' AS DECIMAL) AS INT)")
+            .unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e}");
+        // Float → INT used to saturate at i64::MAX.
+        let e = db.execute("SELECT CAST(1e30 AS INT)").unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e}");
+        let e = db.execute("SELECT CAST(1e308 * 10 AS INT)").unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e}");
+        // In-range truncation and parsing keep working.
+        let r = rows(&mut db, "SELECT CAST(3.7 AS INT), CAST('42' AS INT)");
+        assert_eq!(r.rows, vec![vec![Value::Int(3), Value::Int(42)]]);
+    }
+
+    #[test]
     fn float_precision_and_negative_sorting() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v REAL)");
@@ -16079,6 +16191,90 @@ mod tx_rollback_tests {
             "回滚的行重开后不应复活: {out:?}"
         );
     }
+
+    #[test]
+    fn rollback_after_rollback_to_does_not_revive_discarded_changes() {
+        // The ROLLBACK TO replay must not re-record the current (dirty) page
+        // image as a fresh pre-image: that poisoned journal made a later
+        // full ROLLBACK resurrect and *commit* the discarded UPDATE.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sp-poison.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+            db.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("SAVEPOINT sp").unwrap();
+            // First touch of this page in the transaction: its Set pre-image
+            // lands inside the savepoint tail.
+            db.execute("UPDATE t SET v = 999 WHERE id = 1").unwrap();
+            db.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+            db.execute("ROLLBACK").unwrap();
+            let out = rows(&mut db, "SELECT v FROM t WHERE id = 1");
+            assert_eq!(
+                out.rows,
+                vec![vec![Value::Int(100)]],
+                "全量回滚不得复活已丢弃的 UPDATE"
+            );
+        }
+        let mut db = Database::open(&path).unwrap();
+        let out = rows(&mut db, "SELECT v FROM t WHERE id = 1");
+        assert_eq!(
+            out.rows,
+            vec![vec![Value::Int(100)]],
+            "复活像若已落 WAL,重开后即成事实——必须保持 100"
+        );
+    }
+
+    #[test]
+    fn writes_after_rollback_to_roll_back_to_transaction_start() {
+        // After ROLLBACK TO the journal must retain the transaction-start
+        // pre-image: a later write then a full ROLLBACK restores the tx
+        // start (100), not the savepoint-time image (999).
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("SAVEPOINT sp").unwrap();
+        db.execute("UPDATE t SET v = 999 WHERE id = 1").unwrap();
+        db.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+        db.execute("UPDATE t SET v = 777 WHERE id = 1").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        let out = rows(&mut db, "SELECT v FROM t WHERE id = 1");
+        assert_eq!(out.rows, vec![vec![Value::Int(100)]]);
+    }
+
+    #[test]
+    fn savepoint_tail_alloc_pages_return_to_pool_after_full_rollback() {
+        // Alloc compensated by ROLLBACK TO, then a full ROLLBACK, must leave
+        // the page reusable — the old sequence stranded it (reserve without
+        // a matching Alloc) until restart.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, pad TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("SAVEPOINT sp").unwrap();
+        // ~1KB docs force fresh heap pages past the savepoint.
+        let pad = "y".repeat(1000);
+        for i in 2..202 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, '{pad}')"))
+                .unwrap();
+        }
+        db.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        // The recycled pages must be handed out again by later inserts.
+        for i in 202..402 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'z')"))
+                .unwrap();
+        }
+        let out = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(out.rows, vec![vec![Value::Int(201)]]);
+    }
+
     // ---- 覆盖率补充:错误分支 / 管理语句 / 事务语义 ----
 
     use crate::engine::{ExecOutcome, Value};

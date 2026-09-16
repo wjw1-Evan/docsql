@@ -1246,6 +1246,21 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                         .flatten()
                         .map(|g| UserAuth { name, grants: g })
                 };
+                if refreshed.is_none() {
+                    // The account was dropped (or its grants became
+                    // unresolvable): close instead of degrading to an
+                    // anonymous session. In the token-less compat mode an
+                    // anonymous slot can still answer node-only frames, and
+                    // a dropped account must not keep a live socket riding
+                    // on that exemption.
+                    let _ = tx
+                        .send(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("session closed: this account no longer exists"),
+                        ))
+                        .await;
+                    break;
+                }
                 user = refreshed;
                 user_epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
             }
@@ -1428,6 +1443,16 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             .store(false, std::sync::atomic::Ordering::SeqCst);
                         *state.replicate_to.lock().await = None;
                         querylog::sync_event(&state.sync_log, "promote", "", None, true, None);
+                        // Failover changes who owns writes cluster-wide: the
+                        // trail must say who pulled the trigger.
+                        querylog::record(
+                            &state,
+                            &peer,
+                            &format!("PROMOTE{}", audit_identity(user.as_ref())),
+                            0.0,
+                            &Frame::new(proto::RESP_AFFECTED, b"promoted".to_vec()),
+                            false,
+                        );
                         Some(Frame::new(proto::RESP_AFFECTED, b"promoted".to_vec()))
                     }
                 }
@@ -1795,15 +1820,24 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                     // position already covers: out-of-order
                                     // applies must never overwrite newer rows,
                                     // and a retried frame must be idempotent.
-                                    let origin_lock = {
-                                        let mut locks = state.apply_locks.lock().await;
-                                        locks
-                                            .entry(node_id.clone())
-                                            .or_insert_with(|| {
-                                                std::sync::Arc::new(tokio::sync::Mutex::new(()))
-                                            })
-                                            .clone()
-                                    };
+                                    let (origin_lock, origin_rejected) =
+                                        origin_apply_lock(&state, &node_id).await;
+                                    if origin_rejected {
+                                        // node_id is client-controlled payload:
+                                        // past the origin cap, reject instead of
+                                        // growing apply_locks and the persisted
+                                        // position table without bound. The
+                                        // origin sees fan-out failure (backoff);
+                                        // divergence converges through
+                                        // digest/snapshot repair.
+                                        Some(Frame::new(
+                                            proto::RESP_ERROR,
+                                            err_payload(&format!(
+                                                "too many replication origins \
+                                                 (max {MAX_APPLY_ORIGINS})"
+                                            )),
+                                        ))
+                                    } else {
                                     let _origin_guard = origin_lock.lock_owned().await;
                                     let already_applied = {
                                         let mut db = state
@@ -1845,6 +1879,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                     );
                                     Some(resp)
                                     }
+                                    }
                                 }
                             }
                         }
@@ -1873,7 +1908,28 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             .metrics
                             .publishes_total
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Some(handle_publish(&state, &frame, replication_ok).await)
+                        let started = std::time::Instant::now();
+                        let resp = handle_publish(&state, &frame, replication_ok).await;
+                        // PUBLISH persists a message (a durable write): the
+                        // trail records who published where; the payload
+                        // itself stays out (size only).
+                        let channel = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                            .ok()
+                            .and_then(|v| v["channel"].as_str().map(String::from))
+                            .unwrap_or_default();
+                        querylog::record(
+                            &state,
+                            &peer,
+                            &format!(
+                                "PUBLISH {channel} ({} bytes){}",
+                                frame.payload.len(),
+                                audit_identity(user.as_ref())
+                            ),
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            &resp,
+                            replication_ok,
+                        );
+                        Some(resp)
                     }
                 }
                 proto::REQ_SUBSCRIBE if authed => {
@@ -1891,10 +1947,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     handle_unsubscribe(&state, conn_id, &frame, pubsub::SubKind::Pattern).await,
                 ),
                 proto::REQ_PUBSUB if authed => {
-                    Some(handle_pubsub_cmd(&state, &frame, user.as_ref(), replication_ok).await)
+                    Some(handle_pubsub_cmd(&state, &frame, user.as_ref(), &peer, replication_ok).await)
                 }
                 proto::REQ_BACKUP if authed => {
-                    Some(backup::handle_backup(&state, role, &frame, user.as_ref()).await)
+                    Some(backup::handle_backup(&state, role, &frame, user.as_ref(), &peer).await)
                 }
                 // Cluster-join frames are node-internal: they always ride
                 // FLAG_REPLICATION (peer connections under cluster-token
@@ -3446,12 +3502,19 @@ async fn handle_subscribe(
     // The replay itself runs WITHOUT the registry lock (the old code held
     // it end to end, so a `from earliest` backlog stalled every publish —
     // and every write behind write_order — for the whole replay). The
-    // ordering contract is kept by arming and sampling atomically: each
-    // round arms the filter at `progress` and reads the watermark under
-    // the SAME registry lock, so every message ≤ the sample was dropped
-    // from the live stream (filter not yet armed when it was published) and
-    // is replayed by this round's delta, while every later id is delivered
-    // live and never replayed. No gap, no duplicate.
+    // handoff correctness:
+    //
+    // The subscription registers with `skip_through = i64::MAX` and KEEPS it
+    // for the whole catch-up — the replay is the only delivery path, so no
+    // publish/notify interleaving can deliver a message twice. Each round
+    // samples the next bound; chunks never scan past it. Exiting samples
+    // the watermark and arms the filter at it INSIDE one registry lock (the
+    // same lock `notify` takes): a message committed before that sample is
+    // ≤ it and was already replayed (cursor ≥ sample), a message committed
+    // after it sees a filter at ≤ itself and flows live — either way
+    // exactly once. (Arming per round at the replayed progress — the
+    // previous scheme — left (progress, next watermark] delivered live AND
+    // replayed: a systematic duplicate for every publish mid-backlog.)
     drop(inner);
     // Chunked replay: each window is one short engine read sized by
     // [`pubsub::ReplayWindow`] (row cap 512, byte budget ~1 MB), so memory
@@ -3461,12 +3524,17 @@ async fn handle_subscribe(
     let mut window = pubsub::ReplayWindow::new();
     let mut stalled = false;
     loop {
+        let mut exhausted = false;
         while cursor < watermark {
             let chunk = {
                 let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                 pubsub::query_history_chunk(&mut db, cursor, watermark, window.limit())
             };
             if chunk.is_empty() {
+                // (cursor, watermark] holds no replayable rows (ids trimmed
+                // away while this subscriber was reconnecting): stop
+                // scanning this range, nothing here can be delivered.
+                exhausted = true;
                 break;
             }
             let rows = chunk.len();
@@ -3490,8 +3558,23 @@ async fn handle_subscribe(
                 }
                 let pattern = (kind == pubsub::SubKind::Pattern).then_some(name.as_str());
                 let f = pubsub::push_frame(pattern, &m.channel, m.id, m.ts, &m.payload);
-                if tx.try_send(f).is_err() {
-                    // Channel full or connection gone: stop replaying — the
+                // Bounded send, not try_send: a live consumer drains the
+                // writer channel in microseconds, but blasting a whole chunk
+                // through a depth-32 channel in a hot loop outruns the writer
+                // task's scheduling — one spurious `Full` used to kill the
+                // whole catch-up after ~32 frames and force the client into
+                // re-subscribe grinding. Give the writer a real chance; only
+                // a consumer that frees no capacity within the budget (slow
+                // or gone) ends the replay early.
+                let sent =
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), tx.send(f))
+                        .await
+                    {
+                        Ok(Ok(())) => true,
+                        Ok(Err(_)) | Err(_) => false,
+                    };
+                if !sent {
+                    // Connection gone or not draining: stop replaying — the
                     // delivered prefix stays armed, the rest is resumable by
                     // id. Live pushes above `progress` still flow.
                     stalled = true;
@@ -3504,16 +3587,32 @@ async fn handle_subscribe(
                 break;
             }
         }
-        // Atomic arm + sample (see above). Re-sampling catches the messages
-        // published while the replay held no lock.
-        let mut inner = state.pubsub.lock().await;
-        inner.arm_filter(conn, kind, &name, progress);
+        if stalled || exhausted {
+            // Keep live delivery open above the last delivered id; the
+            // unreplayed range stays resumable by re-subscribing from that
+            // id (documented at-least-once recovery).
+            let mut inner = state.pubsub.lock().await;
+            inner.arm_filter(conn, kind, &name, progress);
+            drop(inner);
+            break;
+        }
+        // Catch-up continues: sample the next bound. No filter arm here —
+        // the registration-time full suppression stays on for the whole
+        // catch-up, so live delivery cannot race this sample; only the exit
+        // below arms, and only under the registry lock.
         watermark = {
             let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             pubsub::query_max_id(&mut db)
         };
-        drop(inner);
-        if stalled || cursor >= watermark {
+        if cursor >= watermark {
+            // Catch-up complete: everything ≤ the sampled watermark was
+            // replayed. Sampling and arming inside ONE registry lock closes
+            // the handoff — a message committed before the sample was
+            // replayed, a message committed after it flows live once this
+            // arm lands (see the block comment above).
+            let mut inner = state.pubsub.lock().await;
+            inner.arm_filter(conn, kind, &name, watermark);
+            drop(inner);
             break;
         }
     }
@@ -3554,10 +3653,21 @@ fn parse_name_array(payload: &[u8]) -> Result<Vec<String>, String> {
 
 /// REQ_PUBSUB: channels / numsub / numpat introspection (local registry)
 /// and trim (replicated write).
+/// Identity suffix for audit trail entries of non-SQL operations
+/// (PUBLISH/TRIM/PROMOTE/backup): token connections are identified by the
+/// `peer` field the trail already carries; user logins by their name.
+fn audit_identity(user: Option<&UserAuth>) -> String {
+    match user {
+        Some(u) => format!(" by user={}", u.name),
+        None => String::new(),
+    }
+}
+
 async fn handle_pubsub_cmd(
     state: &Arc<ServerState>,
     frame: &Frame,
     user: Option<&UserAuth>,
+    peer: &str,
     is_replication: bool,
 ) -> Frame {
     let v: serde_json::Value = match serde_json::from_slice(&frame.payload) {
@@ -3648,6 +3758,19 @@ async fn handle_pubsub_cmd(
                     total += affected_count(&f);
                 }
             }
+            // TRIM destroys the only persisted copy of the deleted range:
+            // the trail must say who trimmed what.
+            querylog::record(
+                state,
+                peer,
+                &format!(
+                    "PUBSUB TRIM {channel} KEEP {keep} (deleted {total}){}",
+                    audit_identity(user)
+                ),
+                0.0,
+                &Frame::new(proto::RESP_AFFECTED, total.to_le_bytes().to_vec()),
+                is_replication,
+            );
             Frame::new(proto::RESP_AFFECTED, total.to_le_bytes().to_vec())
         }
         other => Frame::new(
@@ -5372,6 +5495,39 @@ fn parse_seq_frame(payload: &[u8]) -> Option<(u64, String, String)> {
     let node_id = std::str::from_utf8(rest.get(..id_len)?).ok()?.to_string();
     let sql = proto::decode_sql(rest.get(id_len..)?).ok()?;
     Some((seq, node_id, sql))
+}
+
+/// Distinct REQ_SQL_SEQ origins tracked concurrently. `node_id` rides in the
+/// frame payload, so without a cap a hostile (or compat-mode token-level)
+/// sender grows `apply_locks` and the persisted `_cluster_pos` rows forever.
+/// Real clusters have a handful of members; past the cap the frame is
+/// rejected, which the origin observes as fan-out failure and the cluster
+/// heals through digest/snapshot repair.
+const MAX_APPLY_ORIGINS: usize = 256;
+/// Bound on one origin id's bytes (real ids are GUID-shaped, ~36 bytes).
+const MAX_ORIGIN_ID_LEN: usize = 128;
+
+/// Per-origin apply lock; `origin_rejected` is true when the origin is new
+/// and the cap is exhausted (the caller answers with an error frame).
+async fn origin_apply_lock(
+    state: &Arc<ServerState>,
+    node_id: &str,
+) -> (std::sync::Arc<tokio::sync::Mutex<()>>, bool) {
+    let mut locks = state.apply_locks.lock().await;
+    if locks.contains_key(node_id) {
+        return (
+            locks.get(node_id).expect("checked just above").clone(),
+            false,
+        );
+    }
+    if node_id.is_empty() || node_id.len() > MAX_ORIGIN_ID_LEN || locks.len() >= MAX_APPLY_ORIGINS {
+        return ((std::sync::Arc::new(tokio::sync::Mutex::new(()))), true);
+    }
+    let lock = locks
+        .entry(node_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    (lock, false)
 }
 
 /// Pack journal entries into one RESP_CATCHUP payload, respecting the

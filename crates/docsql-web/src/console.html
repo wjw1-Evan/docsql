@@ -2837,7 +2837,7 @@ const explorer = {
       if (meta && meta.error) {
         this.meta = null;
         this.unreachable = true;
-        $('#tree').innerHTML = `<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:var(--err)">${api.node ? T('节点 {0} 不可用:', api.node) : ''}${esc(meta.error)}</span></div>`;
+        $('#tree').innerHTML = `<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:var(--err)">${api.node ? T('节点 {0} 不可用:', esc(api.node)) : ''}${esc(meta.error)}</span></div>`;
         updateServerLabel();
         ui.status(T('对象资源管理器刷新失败'), 'err');
         return;
@@ -3116,7 +3116,9 @@ const lang = {
       applyI18n(tb.el);
       if (tb.load) tb.load();
       const label = $('.t', tb.stripEl);
-      if (label) label.textContent = esc(tb.titleFn ? tb.titleFn() : tb.title);
+      // textContent 不解析 HTML——这里不能再过 esc(),否则表名中的
+      // & < > 会被二次转义成实体显示出来(开标签路径 esc 是对的)。
+      if (label) label.textContent = tb.titleFn ? tb.titleFn() : tb.title;
       const x = $('.x', tb.stripEl);
       if (x) x.title = T('关闭');
     }

@@ -72,17 +72,20 @@ public sealed class DocsqlSubscriber : IDisposable
     /// </summary>
     public Action<Exception>? OnError { get; set; }
 
-    /// <param name="keepAlive">PING cadence; must stay below the node's
-    /// DOCSQL_IDLE_TIMEOUT (the server resets its idle timer only on inbound
-    /// frames, so a subscriber on a quiet channel was disconnected every
-    /// interval and had to be rebuilt). Zero disables the keepalive.</param>
+    /// <param name="keepAlive">PING cadence; must stay well below BOTH the
+    /// node's DOCSQL_IDLE_TIMEOUT and the client read budget (the sync read
+    /// timeout defaults to 30s — a cadence equal to it raced the reader's
+    /// ReceiveTimeout on quiet channels: one late PING killed the connection
+    /// and forced a rebuild). Zero disables the keepalive.</param>
     public DocsqlSubscriber(string connectionString, TimeSpan? keepAlive = null)
     {
         var b = new DocsqlConnectionStringBuilder { ConnectionString = connectionString };
         _proto = DocsqlConnection.ConnectAndAuth(b, null, b.ConnectTimeout * 1000);
         _reader = new Thread(ReadLoop) { IsBackground = true, Name = "docsql-subscriber" };
         _reader.Start();
-        var period = keepAlive ?? TimeSpan.FromSeconds(30);
+        // 10s default: ~3x headroom under the 30s read timeout while staying
+        // far below any sane server idle timeout.
+        var period = keepAlive ?? TimeSpan.FromSeconds(10);
         if (period > TimeSpan.Zero)
         {
             _keepAlive = new System.Threading.Timer(

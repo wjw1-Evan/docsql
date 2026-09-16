@@ -1697,6 +1697,110 @@ async fn pubsub_replay_concurrent_with_publish_loses_nothing() {
     );
 }
 
+/// Publishes racing a multi-window catch-up replay must never be delivered
+/// twice: while the catch-up runs, the subscription keeps its registration
+/// full-suppression (the replay is the only delivery path) and only the
+/// final sample+arm — atomic under the registry lock — opens the live
+/// stream. The old per-round arming at the replayed progress delivered every
+/// publish that landed mid-backlog BOTH live and replayed. Phase 1 below
+/// (concurrent publisher × backlog replay, no re-subscribe) must therefore
+/// be duplicate-free; phase 2 recovers any stall gap by cursor resume, where
+/// re-delivery past the gap is the documented at-least-once behavior.
+#[tokio::test]
+async fn pubsub_publish_during_multiwindow_replay_never_duplicates() {
+    let (_dir, addr) = start_server(None).await;
+    let mut publisher = Client::connect(&addr).await;
+    // 3+ replay windows (512-row cap each) so the catch-up spans several
+    // rounds while the concurrent publisher is running.
+    const BACKLOG: i64 = 1500;
+    const LIVE: i64 = 200;
+    for i in 0..BACKLOG {
+        publisher.publish("hot", &format!("backlog-{i}")).await;
+    }
+
+    let mut sub = Client::connect(&addr).await;
+    let r = sub.subscribe("hot", "earliest").await;
+    assert_eq!(affected_u64(&r), 1);
+
+    let pub_task = tokio::spawn(async move {
+        let mut p = Client::connect(&addr).await;
+        for i in 0..LIVE {
+            p.publish("hot", &format!("live-{i}")).await;
+        }
+    });
+
+    // Phase 1: collect everything that arrives while the replay and the
+    // concurrent publisher run. No re-subscribes here — duplicates in this
+    // slice are a protocol violation.
+    let mut phase1: Vec<i64> = Vec::new();
+    let mut quiet = 0usize;
+    while quiet < 60 && phase1.len() < (BACKLOG + LIVE) as usize {
+        match recv_timeout(&mut sub, 100).await {
+            Some(f) if f.frame_type == proto::RESP_PUSH => {
+                let m: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+                phase1.push(m["id"].as_i64().unwrap());
+                quiet = 0;
+            }
+            Some(_) => {}
+            None => quiet += 1,
+        }
+    }
+    pub_task.await.unwrap();
+    let mut sorted1 = phase1.clone();
+    sorted1.sort_unstable();
+    sorted1.dedup();
+    assert_eq!(
+        sorted1.len(),
+        phase1.len(),
+        "mid-replay publishes must not be duplicated"
+    );
+
+    // Phase 2: recover any stall gap by cursor resume (at-least-once).
+    let mut seen = phase1.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() >= (BACKLOG + LIVE) as usize || std::time::Instant::now() >= deadline {
+            break;
+        }
+        let mut s = seen.clone();
+        s.sort_unstable();
+        s.dedup();
+        let mut want = 1i64;
+        for id in &s {
+            if *id == want {
+                want += 1;
+            } else if *id > want {
+                break;
+            }
+        }
+        let r = sub.subscribe("hot", &(want - 1).to_string()).await;
+        assert_eq!(affected_u64(&r), 1);
+        let mut quiet = 0usize;
+        while quiet < 20 {
+            match recv_timeout(&mut sub, 100).await {
+                Some(f) if f.frame_type == proto::RESP_PUSH => {
+                    let m: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+                    seen.push(m["id"].as_i64().unwrap());
+                    quiet = 0;
+                }
+                Some(_) => {}
+                None => quiet += 1,
+            }
+        }
+    }
+    let mut all = seen.clone();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(
+        all,
+        (1..=BACKLOG + LIVE).collect::<Vec<i64>>(),
+        "every message must arrive at least once"
+    );
+}
+
 /// Cursor resume: disconnect, miss a publish, re-subscribe from the last
 /// seen id and receive exactly the missed message (at-least-once).
 #[tokio::test]
