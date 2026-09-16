@@ -292,8 +292,29 @@ public sealed class ProtocolConnection : IDisposable
 
     public Frame Send(Frame request)
     {
-        Write(request);
-        return Receive();
+        try
+        {
+            Write(request);
+            return Receive();
+        }
+        catch (Exception e) when (e is IOException or SocketException)
+        {
+            // 镜像 SendAsync 的收尾:同步读路径上的任何失败(超时表现为
+            // socket 超时的 IOException,断流表现为 IOException)都要毒化
+            // 连接。服务端随后仍可能送出迟到应答——被复用的连接会把那帧
+            // 当成下一条语句的应答(TCP 有序),静默错配数据;关闭 socket
+            // 让 Close() 的弃用判定与后续使用都拦得住。同步超时与异步
+            // 路径一样转译为 TimeoutException,两条路径异常形状一致。
+            bool timedOut = e is SocketException { SocketErrorCode: SocketError.TimedOut }
+                || e.InnerException is SocketException { SocketErrorCode: SocketError.TimedOut };
+            Broken = true;
+            try { _tcp.Dispose(); } catch { /* already gone */ }
+            if (timedOut)
+            {
+                throw new TimeoutException($"statement read timed out after {ReadTimeoutMs} ms");
+            }
+            throw;
+        }
     }
 
     /// <summary><see cref="Send"/> 的真异步形态。取消只到语句边界:一帧发到

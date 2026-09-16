@@ -254,6 +254,14 @@ public sealed class DocsqlSubscriber : IDisposable
         Exception? fatal = null;
         while (_running)
         {
+            // 投毒后必须静默:OnError 的契约是"触发后本实例停止投递、不会
+            // 自愈"。RoundTrip 超时路径只置 _dead 并 FireError,线程本身还
+            // 活着——不检查就会继续把推送分发给"已经被告知重建"的应用,
+            // 造成重建窗口期的并发双投递。
+            if (_dead)
+            {
+                return;
+            }
             Frame f;
             try
             {

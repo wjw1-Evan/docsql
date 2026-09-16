@@ -50,6 +50,20 @@ pub fn format_timestamp_ms(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{se:02}.{millis:03}Z")
 }
 
+/// Smallest UTC millisecond instant the canonical 4-digit-year text form
+/// can carry (0001-01-01T00:00:00.000Z). Values outside this range have no
+/// round-trippable text, so every construction site must reject them —
+/// otherwise `value_literal` emits a CAST the replica cannot re-parse.
+pub const TIMESTAMP_MIN_MS: i64 = -62_135_596_800_000;
+/// Largest such instant (9999-12-31T23:59:59.999Z).
+pub const TIMESTAMP_MAX_MS: i64 = 253_402_300_799_999;
+
+/// True when `ms` lies inside the canonical TIMESTAMP domain
+/// (see [`TIMESTAMP_MIN_MS`]).
+pub fn is_valid_timestamp_ms(ms: i64) -> bool {
+    (TIMESTAMP_MIN_MS..=TIMESTAMP_MAX_MS).contains(&ms)
+}
+
 /// Parse a timestamp in any of the accepted forms into UTC milliseconds:
 /// `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, `...:SS`, `...SS.mmm[...]`, separator
 /// `T` or space, optional trailing `Z`/`±HH:MM`/`±HHMM` offset. Returns
@@ -112,7 +126,10 @@ pub fn parse_timestamp_ms(text: &str) -> Option<i64> {
                         Some(pos) if pos > 0 => {
                             let off = &time[pos..];
                             let digits: String = off[1..].chars().filter(|c| *c != ':').collect();
-                            if digits.len() != 4 {
+                            // `len()` counts bytes: reject before slicing so
+                            // a multibyte char can never straddle `digits[..2]`
+                            // (`+1中` is four bytes but not four digits).
+                            if digits.len() != 4 || !digits.bytes().all(|c| c.is_ascii_digit()) {
                                 return None;
                             }
                             let oh: i64 = digits[..2].parse().ok()?;

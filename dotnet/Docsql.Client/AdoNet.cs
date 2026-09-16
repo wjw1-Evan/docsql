@@ -28,8 +28,23 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
 
     public int Port
     {
-        get => TryGetValue("port", out var v) ? int.Parse((string)v) : 7600;
+        get => TryGetValue("port", out var v) && int.TryParse((string)v, out var n)
+            ? n
+            : (ContainsKey("port")
+                ? throw new ArgumentException($"port '{v}' is not a valid integer")
+                : 7600);
         set => this["port"] = value.ToString();
+    }
+
+    /// <summary>DateTime 参数的线协议形态:<c>ts</c>(默认)发引擎原生
+    /// {"$ts":ms} 标记,精度无损、与 TIMESTAMP 列同带比较;<c>iso</c> 发
+    /// ISO-8601 文本——对 79a94ba 之前的服务端(不认 $ts,参数会退化成
+    /// 字符串字面量匹配不到行)与存量文本时间列的过渡期显式兼容开关。</summary>
+    public bool TimestampIso
+    {
+        get => TryGetValue("timestampformat", out var v)
+            && (v as string ?? "").Equals("iso", StringComparison.OrdinalIgnoreCase);
+        set => this["timestampformat"] = value ? "iso" : "ts";
     }
 
     public string Token
@@ -348,7 +363,7 @@ public sealed class DocsqlConnection : DbConnection
     // Open (ADO.NET Persist Security Info semantics, see below).
     private string _connectionString = "";
 
-    private DocsqlConnectionStringBuilder Parsed => new() { ConnectionString = _connectionString };
+    internal DocsqlConnectionStringBuilder Parsed => new() { ConnectionString = _connectionString };
 
     /// <summary>连接打开后默认掩去 password/token/key(ADO.NET Persist
     /// Security Info 语义);连接串写 "persist security info=true" 才返回
@@ -751,7 +766,8 @@ public sealed class DocsqlCommand : DbCommand
     private Frame SqlFrame() =>
         new(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(CommandText));
 
-    private static Frame ExecuteBody(ulong handle, List<object?> values)
+    private static Frame ExecuteBody(
+        ulong handle, List<object?> values, bool timestampIso)
     {
         var sb = new StringBuilder(values.Count * 8 + 32);
         sb.Append("{\"handle\":").Append(handle).Append(",\"params\":[");
@@ -761,7 +777,7 @@ public sealed class DocsqlCommand : DbCommand
             {
                 sb.Append(',');
             }
-            sb.Append(JsonOf(values[i]));
+            sb.Append(JsonOf(values[i], timestampIso));
         }
         sb.Append("]}");
         return new Frame(FrameType.ReqExecute, 0, 0, Encoding.UTF8.GetBytes(sb.ToString()));
@@ -786,7 +802,7 @@ public sealed class DocsqlCommand : DbCommand
         // 与 REQ_SQL 同路径。响应帧形状与 REQ_SQL 完全一致。
         var (template, values) = RewriteParameters();
         var (handle, _) = conn.Proto.GetOrPrepare(template);
-        return conn.Proto.Send(ExecuteBody(handle, values));
+        return conn.Proto.Send(ExecuteBody(handle, values, conn.Parsed.TimestampIso));
     }
 
     /// <summary><see cref="Execute"/> 的真异步形态(同一服务端绑定路径)。</summary>
@@ -808,7 +824,9 @@ public sealed class DocsqlCommand : DbCommand
             .GetOrPrepareAsync(template, cancellationToken)
             .ConfigureAwait(false);
         return await conn.Proto
-            .SendAsync(ExecuteBody(handle, values), cancellationToken, readTimeoutMs)
+            .SendAsync(
+                ExecuteBody(handle, values, conn.Parsed.TimestampIso),
+                cancellationToken, readTimeoutMs)
             .ConfigureAwait(false);
     }
 
@@ -950,7 +968,7 @@ public sealed class DocsqlCommand : DbCommand
     /// DateTime/DateTimeOffset 走 $ts 标记:引擎原生 TIMESTAMP(UTC 毫秒,
     /// 毫秒精度),比较/排序按时间带执行;本地值转为 UTC 后存储,旧库中的
     /// ISO 文本值读取路径兼容(Convert.ToDateTime 双向解析)。</summary>
-    private static string JsonOf(object? v) => v switch
+    private static string JsonOf(object? v, bool timestampIso = false) => v switch
     {
         null or DBNull => "null",
         bool b => b ? "true" : "false",
@@ -958,17 +976,25 @@ public sealed class DocsqlCommand : DbCommand
             => JsonSerializer.Serialize(Convert.ToInt64(v, CultureInfo.InvariantCulture)),
         uint or ushort => JsonSerializer.Serialize(Convert.ToInt64(v, CultureInfo.InvariantCulture)),
         ulong u => JsonSerializer.Serialize(u),
+        // 非有限浮点:JSON 数字装不下,发 $float 标记(引擎双向对称)。
+        // System.Text.Json 对 NaN/∞ 的 Serialize 直接抛异常,不发标记就发不出去。
+        double d when !double.IsFinite(d) => FloatJson(d),
         double d => JsonSerializer.Serialize(d),
+        float f when !float.IsFinite(f) => FloatJson(f),
         float f => JsonSerializer.Serialize((double)f),
         // 精确小数文本走 $dec 标记,服务端渲染 CAST(... AS DECIMAL)。
         decimal m => "{\"$dec\":\"" + m.ToString(CultureInfo.InvariantCulture) + "\"}",
         // DateTime 族走 $ts 标记(UTC 毫秒):引擎原生 TIMESTAMP 值,
         // 与时间列的时间带比较/排序一致。Kind=Unspecified 按 UTC 存取
         // (不偷偷做本地时区换算);存量 ISO 文本值的读取路径不变。
+        DateTime dt when timestampIso => IsoJson(dt.Kind == DateTimeKind.Local
+                ? dt.ToUniversalTime()
+                : DateTime.SpecifyKind(dt, DateTimeKind.Utc)),
         DateTime dt => "{\"$ts\":" + new DateTimeOffset(dt.Kind == DateTimeKind.Local
                 ? dt.ToUniversalTime()
                 : DateTime.SpecifyKind(dt, DateTimeKind.Utc),
             TimeSpan.Zero).ToUnixTimeMilliseconds() + "}",
+        DateTimeOffset dto when timestampIso => IsoJson(dto.UtcDateTime),
         DateTimeOffset dto => "{\"$ts\":" + dto.ToUnixTimeMilliseconds() + "}",
         TimeSpan ts => JsonSerializer.Serialize(
             ts.ToString("c", CultureInfo.InvariantCulture)),
@@ -988,6 +1014,19 @@ public sealed class DocsqlCommand : DbCommand
         _ => throw new NotSupportedException(
             $"parameter type {v.GetType().Name} is not supported"),
     };
+
+    private static string FloatJson(double d) => d switch
+    {
+        _ when double.IsNaN(d) => "{\"$float\":\"NaN\"}",
+        _ when d > 0 => "{\"$float\":\"inf\"}",
+        _ => "{\"$float\":\"-inf\"}",
+    };
+
+    /// <summary>ISO-8601 文本参数(timestampformat=iso):对不认 $ts 标记的
+    /// 旧服务端与存量文本时间列的过渡期兼容形态;引擎的比较路径会把可解析
+    /// 的时间文本按时间语义比较。</summary>
+    private static string IsoJson(DateTime utc) =>
+        JsonSerializer.Serialize(utc.ToString("O", CultureInfo.InvariantCulture));
 
     private static string BytesJson(byte[] b)
     {
@@ -1125,6 +1164,7 @@ public sealed class DocsqlDataReader : DbDataReader
     private readonly List<object?[]> _rows = new();
     private readonly List<Type> _types = new();
     private int _pos = -1;
+    private bool _closed;
 
     private readonly int _recordsAffected;
 
@@ -1189,12 +1229,36 @@ public sealed class DocsqlDataReader : DbDataReader
             }
             return b;
         }
+        // Non-finite floats ride the same marker family (the engine cannot
+        // emit them as JSON numbers): NaN/inf/-inf map straight onto the
+        // double constants so GetDouble works instead of handing the caller
+        // the raw marker string.
+        if (e.TryGetProperty("$float", out var f) && f.ValueKind == JsonValueKind.String)
+        {
+            return f.GetString() switch
+            {
+                "NaN" => double.NaN,
+                "inf" or "+inf" or "Infinity" => double.PositiveInfinity,
+                "-inf" or "-Infinity" => double.NegativeInfinity,
+                _ => e.GetRawText(),
+            };
+        }
         return e.GetRawText();
     }
 
     public override int FieldCount => _columns.Count;
     public override bool HasRows => _rows.Count > 0;
-    public override bool IsClosed => false;
+    public override bool IsClosed => _closed;
+
+    public override void Close() => _closed = true;
+
+    // ADO.NET contract: IsClosed flips on Dispose — EF's RelationalDataReader
+    // double-dispose guard and Dapper read the flag to dedupe cleanup.
+    protected override void Dispose(bool disposing)
+    {
+        _closed = true;
+        base.Dispose(disposing);
+    }
     public override int RecordsAffected => _recordsAffected;
 
     public override bool Read()

@@ -429,9 +429,12 @@ fn parse_pitr_entry(line: &str) -> Option<(u64, i64, String)> {
 /// everything with seq > base_seq and commit-time <= target, in seq order,
 /// across all incremental files. Entries with unknown ts (pre-PITR rows)
 /// never match a time window — they always sit before the first post-
-/// upgrade base's journal position anyway.
+/// upgrade base's journal position anyway. The chain is audited for
+/// continuity against the base (and for overlaps between files): a trimmed
+/// journal window or a pruned incremental segment must fail the restore
+/// loudly — replaying a partial chain would silently drop committed writes.
 fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
+    let mut entries: Vec<(u64, i64, String)> = Vec::new();
     for name in read_incr_files(dir) {
         verify_backup_checksum(dir, &name)?;
         let text = std::fs::read_to_string(dir.join(&name))
@@ -445,12 +448,38 @@ fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec
             if line.starts_with("--") || line.trim().is_empty() {
                 continue;
             }
-            if let Some((_, ts, sql)) = parse_pitr_entry(line) {
-                if ts <= target_ms {
-                    out.push(sql);
+            if let Some((seq, ts, sql)) = parse_pitr_entry(line) {
+                // Per-entry check, not just file-level: a segment exported
+                // before the base dump can still straddle its journal head,
+                // and entries ≤ base_seq are already inside the dump —
+                // replaying them again duplicates rows (or trips PKs).
+                if seq > base_seq {
+                    entries.push((seq, ts, sql));
                 }
             }
         }
+    }
+    // Files are chronological but overlapping exports can interleave;
+    // order by seq, then walk the chain demanding no gap.
+    entries.sort_by_key(|(seq, _, _)| *seq);
+    let mut expected = base_seq + 1;
+    let mut out = Vec::new();
+    for (seq, ts, sql) in entries {
+        if seq < expected {
+            continue; // duplicate of an already-audited seq (overlapping export)
+        }
+        if seq > expected {
+            return Err(format!(
+                "incremental chain has a gap: journal seq {expected}..{seq} is missing \
+                 (journal window trimmed or a segment pruned); take a fresh full backup"
+            ));
+        }
+        // Snapshot-adoption voids occupy their seq (exported for contiguity)
+        // but replay as nothing.
+        if sql != JOURNAL_VOID_SENTINEL && ts <= target_ms {
+            out.push(sql);
+        }
+        expected += 1;
     }
     Ok(out)
 }
@@ -459,19 +488,19 @@ fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec
 /// export it (replaying it is a no-op PRAGMA, but it would waste the window).
 const JOURNAL_VOID_SENTINEL: &str = "PRAGMA discarded_by_snapshot_adoption;";
 
-/// PITR cursor: the journal seq everything on disk already covers — the
-/// newest incremental's `to`, else the newest base backup's journal-seq,
-/// else 0.
+/// PITR cursor: the journal seq everything on disk already covers — the max
+/// of the newest incremental's `to` and the newest base backup's
+/// journal-seq, else 0. The max matters when a base lands mid-window
+/// (export before, full after): resuming from the older incremental `to`
+/// would re-export entries the base already contains.
 fn pitr_cursor(dir: &Path) -> u64 {
     let mut cursor = 0u64;
     if let Some(name) = read_incr_files(dir).last() {
         cursor = parse_pitr_header(dir, name).map(|h| h.to).unwrap_or(0);
     }
-    if cursor == 0 {
-        if let Some(name) = read_backup_files(dir).last() {
-            if let Some(h) = parse_backup_header(dir, name) {
-                cursor = h.journal_seq;
-            }
+    if let Some(name) = read_backup_files(dir).last() {
+        if let Some(h) = parse_backup_header(dir, name) {
+            cursor = cursor.max(h.journal_seq);
         }
     }
     cursor
@@ -488,17 +517,31 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
         db.journal_entries_after(cursor, 200_000)
             .map_err(|e| format!("journal read: {e}"))?
     };
-    let usable: Vec<&(u64, Option<i64>, String)> = entries
-        .iter()
-        .filter(|(_, ts, sql)| ts.is_some() && sql != JOURNAL_VOID_SENTINEL)
-        .collect();
+    // Everything with a ts rides into the file — INCLUDING snapshot-adoption
+    // sentinels: they occupy journal seqs, and dropping them here would punch
+    // holes into the chain that the restore-side continuity audit (rightly)
+    // rejects. The restore skips replaying them.
+    let usable: Vec<&(u64, Option<i64>, String)> =
+        entries.iter().filter(|(_, ts, _)| ts.is_some()).collect();
     if usable.is_empty() {
         return Ok(());
     }
+    // The window must be contiguous from the cursor: a first entry above
+    // cursor+1 means the journal window was trimmed below the cursor, and a
+    // segment that starts with a hole can never restore truthfully.
+    let first_seq = usable[0].0;
+    if first_seq > cursor + 1 {
+        return Err(format!(
+            "journal window trimmed below the PITR cursor (first live seq {first_seq}, \
+             cursor {cursor}); take a fresh full backup to re-anchor the chain"
+        ));
+    }
     std::fs::create_dir_all(&state.backup_dir).map_err(|e| format!("backup dir: {e}"))?;
     let name = format!("incr-{}.sql", next_incr_stamp(&state.backup_dir, now_ms()));
+    // `from` is the segment's true first seq (not the cursor): restore-side
+    // audits and operators reading the file must see what is actually inside.
     let mut body = format!(
-        "-- docsql-pitr incr from={cursor} to={}\n",
+        "-- docsql-pitr incr from={first_seq} to={}\n",
         usable.last().unwrap().0
     );
     for (seq, ts, sql) in &usable {
@@ -597,7 +640,9 @@ pub(crate) async fn handle_backup(
         "list" => {
             // The listing names every snapshot of the whole database (and
             // the status payload carries the backup directory): admin rule,
-            // same as trigger/restore below.
+            // same as trigger/restore below — except read-only tokens,
+            // which may list but not trigger (documented split, covered by
+            // backup_trigger_over_wire).
             if user.is_some_and(|u| !u.grants.admin) {
                 return Frame::new(
                     proto::RESP_ERROR,
@@ -656,7 +701,20 @@ pub(crate) async fn handle_backup(
         "export" => {
             // Manual incremental export: journal entries after the cursor
             // land in one incr file (the timer does this every tick; tests
-            // and operators can force it on demand).
+            // and operators can force it on demand). Same gates as trigger:
+            // it takes the write path and writes durable files.
+            if role == ConnRole::ReadOnly {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("read-only token; writes are not permitted"),
+                );
+            }
+            if user.is_some_and(|u| !u.grants.admin) {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    crate::err_payload("backup export requires the admin role"),
+                );
+            }
             if !state.sync_queue.lock().await.closed {
                 return Frame::new(
                     proto::RESP_ERROR,
@@ -673,6 +731,16 @@ pub(crate) async fn handle_backup(
             let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
             b.running = false;
             drop(b);
+            // Audit: a manual export is an operator action on the backup
+            // trail, same as trigger/restore.
+            querylog::record(
+                state,
+                peer,
+                &format!("BACKUP EXPORT{}", audit_identity(user)),
+                0.0,
+                &Frame::new(proto::RESP_AFFECTED, b"export done".to_vec()),
+                false,
+            );
             match res {
                 Ok(()) => Frame::new(proto::RESP_AFFECTED, b"export done".to_vec()),
                 Err(e) => Frame::new(proto::RESP_ERROR, crate::err_payload(&e)),
@@ -745,6 +813,32 @@ pub(crate) async fn handle_backup(
                     }
                 }
             }
+            // Optional point-in-time target: ISO timestamp text or UTC ms.
+            // Replays base + journal chain entries committed at/before it.
+            // Parsed and validated BEFORE the restore flag is armed: a bad
+            // request must fail cleanly, never wedge the node's backup/restore
+            // state (the flag's cleanup guard only exists once run_restore
+            // spawns). An unparseable value is an error, not a silent fall
+            // back to full restore — the operator asked for a point in time.
+            let parsed_target: Option<Result<i64, String>> =
+                serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                    .ok()
+                    .and_then(|v| v.get("to").cloned())
+                    .map(|to| match to {
+                        serde_json::Value::Number(n) => n.as_i64().ok_or_else(|| {
+                            "restore: \"to\" number is not an integer UTC-millis value".to_string()
+                        }),
+                        serde_json::Value::String(s) => docsql_core::value::parse_timestamp_ms(&s)
+                            .ok_or_else(|| {
+                                format!("restore: \"to\" is not a parseable timestamp: \"{s}\"")
+                            }),
+                        _ => Err("restore: \"to\" must be a number or string".into()),
+                    });
+            let target_ms = match parsed_target {
+                Some(Ok(t)) => Some(t),
+                Some(Err(m)) => return Frame::new(proto::RESP_ERROR, crate::err_payload(&m)),
+                None => None,
+            };
             {
                 let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
                 let busy = b.running || b.restore.as_ref().is_some_and(|r| r.running);
@@ -759,23 +853,6 @@ pub(crate) async fn handle_backup(
             use std::sync::atomic::Ordering;
             state.restore_progress.applied.store(0, Ordering::Relaxed);
             state.restore_progress.total.store(0, Ordering::Relaxed);
-            // Optional point-in-time target: ISO timestamp text or UTC ms.
-            // Replays base + journal chain entries committed at/before it.
-            let parsed_target: Option<Result<Option<i64>, String>> = serde_json::from_slice::<
-                serde_json::Value,
-            >(&frame.payload)
-            .ok()
-            .and_then(|v| v.get("to").cloned())
-            .map(|to| match to {
-                serde_json::Value::Number(n) => Ok(n.as_i64()),
-                serde_json::Value::String(s) => Ok(docsql_core::value::parse_timestamp_ms(&s)),
-                _ => Err("restore: \"to\" must be a number or string".into()),
-            });
-            let target_ms = match parsed_target {
-                Some(Ok(t)) => t,
-                Some(Err(m)) => return Frame::new(proto::RESP_ERROR, crate::err_payload(&m)),
-                None => None,
-            };
             let st = state.clone();
             let file_clone = file.clone();
             tokio::spawn(async move {
@@ -1353,7 +1430,9 @@ mod tests {
     fn collect_pitr_entries_filters_by_time_and_base_seq() {
         let dir = tempfile::tempdir().unwrap();
         // Two incrementals: one entirely below the base seq (skipped), one
-        // straddling the target (per-entry ts filter).
+        // straddling the base head (per-entry seq filter — entries ≤ base
+        // are inside the dump and must not replay twice) with per-entry ts
+        // filtering on top.
         std::fs::write(
             dir.path().join("incr-1.sql"),
             "-- docsql-pitr incr from=1 to=2\n{\"seq\":1,\"ts\":100,\"sql\":\"A1\"}\n{\"seq\":2,\"ts\":200,\"sql\":\"A2\"}\n",
@@ -1364,12 +1443,16 @@ mod tests {
             "-- docsql-pitr incr from=3 to=5\n{\"seq\":3,\"ts\":300,\"sql\":\"B1\"}\n{\"seq\":4,\"ts\":420,\"sql\":\"B2\"}\n{\"seq\":5,\"ts\":500,\"sql\":\"B3\"}\n",
         )
         .unwrap();
-        // base_seq=3: the first file is entirely covered; entries ts<=400.
-        let out = collect_pitr_entries(dir.path(), 3, 400).unwrap();
-        assert_eq!(out, vec!["B1"], "base 覆盖段跳过 + ts 过滤");
-        // No target filtering needed → everything after base seq replays.
+        // base_seq=2: everything after the base replays, ts<=400 keeps B1.
+        let out = collect_pitr_entries(dir.path(), 2, 400).unwrap();
+        assert_eq!(out, vec!["B1"], "ts 过滤");
+        // base_seq=3: seq 3 is INSIDE the base dump — replaying it would
+        // duplicate the write (or trip a PK); the per-entry filter drops it.
         let out = collect_pitr_entries(dir.path(), 3, i64::MAX).unwrap();
-        assert_eq!(out, vec!["B1", "B2", "B3"]);
+        assert_eq!(out, vec!["B2", "B3"], "seq<=base 不重放");
+        // base_seq=0: the whole chain replays.
+        let out = collect_pitr_entries(dir.path(), 0, i64::MAX).unwrap();
+        assert_eq!(out, vec!["A1", "A2", "B1", "B2", "B3"]);
         // Checksum verification is honored for incremental files too.
         std::fs::write(
             dir.path().join("incr-2.sql.sha256"),
@@ -1377,5 +1460,46 @@ mod tests {
         )
         .unwrap();
         assert!(collect_pitr_entries(dir.path(), 0, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn collect_pitr_entries_rejects_gaps_and_skips_sentinels() {
+        let dir = tempfile::tempdir().unwrap();
+        // A trimmed/pruned window leaves a hole: seq 5 exists, 3..=4 do not.
+        std::fs::write(
+            dir.path().join("incr-1.sql"),
+            "-- docsql-pitr incr from=3 to=5\n{\"seq\":5,\"ts\":500,\"sql\":\"C1\"}\n",
+        )
+        .unwrap();
+        let err = collect_pitr_entries(dir.path(), 2, i64::MAX).unwrap_err();
+        assert!(err.contains("gap"), "断链必须响亮报错: {err}");
+        // Snapshot-adoption sentinels occupy their seq but replay as
+        // nothing — the chain stays contiguous through them.
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir2.path().join("incr-1.sql"),
+            concat!(
+                "-- docsql-pitr incr from=3 to=5\n",
+                "{\"seq\":3,\"ts\":300,\"sql\":\"PRAGMA discarded_by_snapshot_adoption;\"}\n",
+                "{\"seq\":4,\"ts\":400,\"sql\":\"C2\"}\n",
+            ),
+        )
+        .unwrap();
+        let out = collect_pitr_entries(dir2.path(), 2, i64::MAX).unwrap();
+        assert_eq!(out, vec!["C2"], "哨兵占位不重放");
+        // Overlapping exports dedup by seq.
+        let dir3 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir3.path().join("incr-1.sql"),
+            "-- docsql-pitr incr from=1 to=2\n{\"seq\":1,\"ts\":100,\"sql\":\"D1\"}\n{\"seq\":2,\"ts\":200,\"sql\":\"D2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir3.path().join("incr-2.sql"),
+            "-- docsql-pitr incr from=2 to=3\n{\"seq\":2,\"ts\":200,\"sql\":\"D2\"}\n{\"seq\":3,\"ts\":300,\"sql\":\"D3\"}\n",
+        )
+        .unwrap();
+        let out = collect_pitr_entries(dir3.path(), 0, i64::MAX).unwrap();
+        assert_eq!(out, vec!["D1", "D2", "D3"], "重叠导出去重");
     }
 }

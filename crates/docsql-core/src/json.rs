@@ -184,7 +184,12 @@ fn decode_marker(obj: Object) -> Value {
             }
         }
         if let Some(Value::Int(ms)) = obj.get("$ts") {
-            return Value::Timestamp(*ms);
+            // Out-of-domain instants stay a plain object instead of becoming
+            // Timestamps the canonical text form (and value_literal replay)
+            // cannot represent.
+            if crate::value::is_valid_timestamp_ms(*ms) {
+                return Value::Timestamp(*ms);
+            }
         }
         if let Some(Value::Array(items)) = obj.get("$bytes") {
             let mut bytes = Vec::with_capacity(items.len());

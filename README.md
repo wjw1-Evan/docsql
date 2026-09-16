@@ -202,7 +202,7 @@ DROP USER analyst;                             -- 级联清理其授权与角色
 **登录方式**:
 
 - 协议帧 `REQ_AUTH_USER`(JSON `{"user","password"}`);密码以盐化 PBKDF2-HMAC-SHA256(210000 轮)存储,校验常数时间;未知用户与错误密码返回同一错误并执行等价计算(防用户名枚举);失败同样按来源 IP 锁定(10 次/60 秒)。
-- ADO.NET 连接串:`host=...;port=...;user=analyst;password=...`(与 `token=` 二选一,同时给出时用户登录优先);EF Core `UseDocsql("...")` 同一连接串。
+- ADO.NET 连接串:`host=...;port=...;user=analyst;password=...`(与 `token=` 二选一,同时给出时用户登录优先);EF Core `UseDocsql("...")` 同一连接串。可加 `timestampformat=iso` 让 DateTime 参数以 ISO 文本下发(连接旧版本服务端或对接存量 ISO 文本时间列的过渡开关,默认 `ts` 走原生毫秒标记)。
 - CLI:`docsql-cli connect 127.0.0.1:7600 --user analyst`(密码从 `DOCSQL_PASSWORD` 或交互提示读取,不走命令行参数)。
 
 **Web 控制台管理**:「视图 → 用户与角色」页可完成上述全部操作(用户列表/角色管理/按表勾选表级权限)。**节点启用用户后,务必为控制台与节点配置一致的 `DOCSQL_TOKEN`(开发栈为 `DOCSQL_DEV_TOKEN`)**,否则控制台的匿名连接会被拒绝;详见[安全指南 · 数据库用户与角色](docs/security.md#数据库用户与角色)与[功能总览 · 控制台](docs/features.md#9-web-控制台docsql-studio)。

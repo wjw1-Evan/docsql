@@ -25,6 +25,15 @@ internal static partial class SchemaSync
         if (table is null) return;
 
         var pk = entity.FindPrimaryKey();
+        // 复合主键显式报错:引擎只支持单列 PRIMARY KEY(表级复合 PK 报错),
+        // 此前静默建成无约束堆表——重复键行能插入,EF 的身份解析与并发判定
+        // 在运行期以难排查的方式炸。与 Migrations 桩同一显式失败哲学。
+        if (pk is { Properties.Count: > 1 })
+        {
+            throw new NotSupportedException(
+                "composite primary keys are not supported; use a single-column key " +
+                "or a CREATE UNIQUE INDEX over the key columns");
+        }
         var cols = new List<string>();
         var modelColumns = new List<(string Name, string Type)>();
         foreach (var p in entity.GetProperties())
@@ -137,6 +146,18 @@ internal static partial class SchemaSync
                 columns.Add(column);
             }
             if (columns.Count == 0 || columns.Count != index.Properties.Count) continue;
+            // 模型声明降序索引:引擎对 CREATE INDEX ... DESC 显式报错,这里
+            // 静默建 ASC 会得到一个与模型方向相反的索引——显式失败。
+            // IsDescending 在只读优化模型上对"未存储方向"直接抛
+            // InvalidOperationException(EF 契约:该情况即升序),按契约捕获。
+            bool hasDescending;
+            try { hasDescending = index.IsDescending is { } d && d.Any(x => x); }
+            catch (InvalidOperationException) { hasDescending = false; }
+            if (hasDescending)
+            {
+                throw new NotSupportedException(
+                    $"descending index {iname} is not supported; declare ascending indexes");
+            }
             var columnList = string.Join(", ", columns.Select(Quote));
 
             try

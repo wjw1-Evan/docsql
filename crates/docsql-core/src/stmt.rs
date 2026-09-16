@@ -44,12 +44,14 @@ pub fn sql_literal_end(sql: &str, open: usize) -> (usize, bool) {
 }
 
 /// Cheap pre-filter for [`fold_wall_clocks`]: true when the text contains
-/// any wall-clock function token at all. ASCII-lowercase is byte-length
-/// preserving, so a byte scan over the lowercase copy indexes the original
-/// safely (the Unicode `to_lowercase` panic class is off the table).
+/// any wall-clock function token at all (substring match — the scanner does
+/// the precise work). ASCII-lowercase is byte-length preserving, so a byte
+/// scan over the lowercase copy indexes the original safely (the Unicode
+/// `to_lowercase` panic class is off the table). The name alone (no `(`)
+/// catches `NOW ()` / `SYSDATE\n()`, which parse identically to `NOW()`.
 pub fn mentions_wall_clock(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
-    lower.contains("now(") || lower.contains("sysdate(") || lower.contains("current_timestamp")
+    lower.contains("now") || lower.contains("sysdate") || lower.contains("current_timestamp")
 }
 
 /// Fold wall-clock functions in a WRITE statement into literals stamped with
@@ -59,8 +61,11 @@ pub fn mentions_wall_clock(sql: &str) -> bool {
 /// write carrying `NOW()`/`SYSDATE()`/`CURRENT_TIMESTAMP` would let every
 /// peer stamp its own clock and silently diverge by the replica lag. The
 /// writing node resolves the instant ONCE and ships the literal. Replacement
-/// happens on the SQL TEXT — outside string literals, quoted identifiers and
-/// comments — so a value like `'call now()'` is never touched. The result
+/// happens on the SQL TEXT — outside string literals, quoted identifiers
+/// and comments — so a value like `'call now()'` (or an apostrophe inside a
+/// comment) is never touched. Whitespace between the call name and its
+/// empty argument list is tolerated (`NOW ()` ≡ `NOW()`); anything but the
+/// zero-argument form stays verbatim for the engine to judge. The result
 /// re-parses identically in every other respect.
 pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
     if !mentions_wall_clock(sql) {
@@ -83,6 +88,28 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                 let (end, _) = sql_literal_end(sql, i);
                 out.push_str(&sql[i..end]);
                 i = end;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                // Line comment: verbatim through the newline. An apostrophe
+                // inside (`-- don't`) must not pair with a real quote and
+                // drag literal contents into the code scan.
+                let start = i;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // Block comment: verbatim through `*/` (or end of input —
+                // let the parser complain about the unterminated form).
+                let start = i;
+                let mut j = i + 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = if j + 1 < b.len() { j + 2 } else { b.len() };
+                out.push_str(&sql[start..j]);
+                i = j;
             }
             b'"' | b'`' => {
                 // Quoted identifier run with doubling escapes.
@@ -110,21 +137,32 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                     i += 1;
                 }
                 let word = &lower_bytes[start..i];
-                let is_call = (word == b"now" || word == b"sysdate")
-                    && lower_bytes.get(i) == Some(&b'(')
-                    && lower_bytes[i + 1..]
-                        .iter()
-                        .find(|&&x| x != b' ' && x != b'\t' && x != b'\r' && x != b'\n')
-                        == Some(&b')');
-                if is_call {
-                    let mut j = i + 1;
-                    while j < b.len() && b[j].is_ascii_whitespace() {
-                        j += 1;
+                // Look past whitespace for the argument list (`NOW ()` is
+                // the same call as `NOW()` to the parser). Only the empty
+                // argument list folds; other arities stay verbatim.
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let empty_call = b.get(j) == Some(&b'(')
+                    && b[j + 1..].iter().find(|&&x| !x.is_ascii_whitespace()) == Some(&b')');
+                let close = {
+                    let mut k = j + 1;
+                    while k < b.len() && b[k].is_ascii_whitespace() {
+                        k += 1;
                     }
+                    k
+                };
+                if (word == b"now" || word == b"sysdate") && empty_call {
                     out.push_str(if word == b"now" { &ts_lit } else { &str_lit });
                     folded = true;
-                    i = j + 1;
-                } else if word == b"current_timestamp" {
+                    i = close + 1;
+                } else if word == b"current_timestamp" && empty_call {
+                    out.push_str(&ts_lit);
+                    folded = true;
+                    i = close + 1;
+                } else if word == b"current_timestamp" && b.get(j) != Some(&b'(') {
+                    // Bare keyword form.
                     out.push_str(&ts_lit);
                     folded = true;
                 } else {
@@ -400,6 +438,34 @@ mod tests {
         // an empty batch.
         assert!(split_statements("/* only a comment */").is_err());
         assert!(split_statements("/* a */; /* b */").is_err());
+    }
+
+    #[test]
+    fn fold_wall_clocks_skips_comments_and_tolerates_whitespace() {
+        let now = 1_789_461_000_123i64;
+        let stamped = crate::value::format_timestamp_ms(now);
+        // Apostrophes inside comments must not pair with real quotes and
+        // drag literal contents into the code scan.
+        let folded =
+            fold_wall_clocks("/* use it's */ INSERT INTO t VALUES ('now()', now())", now).unwrap();
+        assert!(folded.contains("'now()'"), "literal untouched: {folded}");
+        assert!(folded.contains(&stamped), "call folded: {folded}");
+        // Line comments likewise (this shape used to abort the fold and
+        // journal the raw text — every replica stamped its own clock).
+        let folded = fold_wall_clocks("-- don't\nINSERT INTO t VALUES (sysdate())", now).unwrap();
+        assert!(folded.contains(&stamped), "fold past the comment: {folded}");
+        // Whitespace between the name and the (empty) argument list folds
+        // identically to the tight form.
+        assert!(fold_wall_clocks("INSERT INTO t VALUES (NOW ())", now)
+            .unwrap()
+            .contains("CAST("));
+        assert!(fold_wall_clocks("UPDATE t SET at = sysdate ( )", now).is_some());
+        // current_timestamp with an argument stays verbatim (the engine
+        // rejects that shape at eval, the same as before).
+        assert!(fold_wall_clocks("SELECT current_timestamp(6)", now).is_none());
+        // The pre-filter sees through whitespace/newline spellings.
+        assert!(mentions_wall_clock("INSERT INTO t VALUES (now ())"));
+        assert!(mentions_wall_clock("UPDATE t SET at = SYSDATE\n()"));
     }
 
     #[test]

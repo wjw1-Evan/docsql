@@ -283,6 +283,12 @@ pub fn store_trim(db: &mut Database, channel: &str, keep: i64) -> Result<u64, St
     }
 }
 
+/// Byte that may appear inside a SQL identifier (ASCII letters, digits,
+/// underscore, dollar — the GenericDialect identifier charset).
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
 /// `SELECT ... FROM docsql_pubsub` view: rewrite the identifier onto the
 /// backing table and ride the normal SQL path (WHERE / ORDER BY / LIMIT
 /// for free). ASCII-case-insensitive, byte-length-preserving swap so the
@@ -307,7 +313,14 @@ pub fn try_rewrite_pubsub_view(sql: &str) -> Option<String> {
             i = end;
             continue;
         }
-        if i + needle.len() <= lb.len() && &lb[i..i + needle.len()] == needle {
+        if i + needle.len() <= lb.len()
+            && &lb[i..i + needle.len()] == needle
+            // Identifier boundaries on both sides: a longer user table name
+            // (`docsql_pubsub2`, `xdocsql_pubsub_log`) contains the needle as
+            // a substring but must never be rewritten.
+            && (i == 0 || !is_ident_byte(lb[i - 1]))
+            && (i + needle.len() == lb.len() || !is_ident_byte(lb[i + needle.len()]))
+        {
             out.push_str(PUBSUB_TABLE);
             i += needle.len();
         } else {
@@ -1174,6 +1187,30 @@ mod tests {
             let inner = ps.lock().await;
             assert_eq!(inner.numpat(), 0);
             assert_eq!(inner.total, 1);
+        }
+    }
+
+    #[test]
+    fn pubsub_view_rewrite_respects_identifier_boundaries() {
+        // The compat view rewrites onto the backing table...
+        assert_eq!(
+            try_rewrite_pubsub_view("SELECT * FROM docsql_pubsub").unwrap(),
+            format!("SELECT * FROM {PUBSUB_TABLE}")
+        );
+        // ...but a longer USER table name merely containing the needle is
+        // data, not the view (it used to be rewritten and then fail with
+        // "no such table").
+        for own in [
+            "docsql_pubsub2",
+            "xdocsql_pubsub_log",
+            "docsql_pubsub_audit",
+        ] {
+            let sql = format!("SELECT * FROM {own}");
+            assert_eq!(
+                try_rewrite_pubsub_view(&sql).unwrap(),
+                sql,
+                "{own} must not be rewritten"
+            );
         }
     }
 

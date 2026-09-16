@@ -488,6 +488,46 @@ fn parse_expr_text(s: &str) -> Result<SqlExpr> {
         .map_err(|e| SqlError::Parse(e.to_string()))
 }
 
+/// True when the expression calls a wall-clock function (NOW/SYSDATE/
+/// CURRENT_TIMESTAMP, any case): its value differs between nodes and
+/// instants, so a stored DEFAULT carrying it must be resolved per row on
+/// the writing node and shipped as a literal (red line: non-deterministic
+/// generated values are fixed by the writer).
+fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Function(f) => {
+            let n = f.name.to_string().to_ascii_lowercase();
+            if n == "now" || n == "sysdate" || n == "current_timestamp" {
+                return true;
+            }
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                list.args.iter().any(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) => expr_calls_wall_clock(inner),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_calls_wall_clock(left) || expr_calls_wall_clock(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } => expr_calls_wall_clock(expr),
+        SqlExpr::Nested(inner) => expr_calls_wall_clock(inner),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_calls_wall_clock(expr) || expr_calls_wall_clock(low) || expr_calls_wall_clock(high)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            expr_calls_wall_clock(expr) || list.iter().any(expr_calls_wall_clock)
+        }
+        _ => false,
+    }
+}
+
 /// Three-valued outcome of a CHECK predicate (SQL: FALSE rejects, TRUE and
 /// UNKNOWN pass).
 enum CheckOutcome {
@@ -797,6 +837,47 @@ impl ReadView {
 impl Drop for ReadView {
     fn drop(&mut self) {
         self.pager.end_snapshot(self.snap);
+    }
+}
+
+/// View-expansion recursion budget. `CREATE OR REPLACE` makes catalog
+/// cycles constructible (see `exec_create_view`'s transitive check), and a
+/// chain deep enough would blow the thread stack — one expansion level
+/// costs several engine frames, so the budget stays far under the 2 MiB
+/// test-thread stack while exceeding any sane view stack. Creation refuses
+/// chains past this depth too (the CREATE dry-run expands the body).
+const MAX_VIEW_EXPANSION_DEPTH: usize = 16;
+
+thread_local! {
+    static VIEW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII for one level of view expansion (a `Drop` decrement paired with
+/// the increment here, so early `?` returns unwind the count too).
+struct ViewDepthGuard;
+
+fn enter_view_expansion() -> Result<ViewDepthGuard> {
+    let entered = VIEW_DEPTH.with(|d| {
+        let n = d.get();
+        if n < MAX_VIEW_EXPANSION_DEPTH {
+            d.set(n + 1);
+            true
+        } else {
+            false
+        }
+    });
+    if entered {
+        Ok(ViewDepthGuard)
+    } else {
+        err(format!(
+            "view expansion too deep (view cycle or more than {MAX_VIEW_EXPANSION_DEPTH} nested views)"
+        ))
+    }
+}
+
+impl Drop for ViewDepthGuard {
+    fn drop(&mut self) {
+        VIEW_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
@@ -1197,11 +1278,14 @@ impl<'a> ReadCx<'a> {
         }
         // User view (CREATE VIEW): expand to the stored query's rows. The
         // expansion re-executes the view body as a plain SELECT over the
-        // current catalog (a view of a view recurses naturally; the body
-        // self-references cannot resolve, so cycles are impossible by
-        // construction — created views only see names that already exist).
+        // current catalog (a view of a view recurses naturally). CREATE
+        // OR REPLACE can still produce a catalog cycle despite the
+        // creation-time checks, so every expansion level is budgeted —
+        // a cycle or an absurdly deep chain errors instead of blowing
+        // the stack.
         if let Some(meta) = self.tables.get(&tname) {
             if meta.is_view() {
+                let _guard = enter_view_expansion()?;
                 let body = meta.view_sql.clone().unwrap_or_default();
                 let q = Database::plain_read_query(&Database::parse_classified(&body)?)?;
                 let ExecOutcome::Rows(r) = self.exec_query(q)? else {
@@ -2204,57 +2288,108 @@ impl<'a> ReadCx<'a> {
     /// every Timestamp, which would silently turn `WHERE ts > '2026-…'`
     /// into an empty result. Sampling min+max keys decides the band (two
     /// leaf reads); mixed-band trees keep the literal and need an explicit
-    /// `CAST('…' AS TIMESTAMP)` (documented boundary). Scalar bounds only:
-    /// composite Array prefixes keep their elements (same CAST rule).
+    /// `CAST('…' AS TIMESTAMP)` (documented boundary). Composite keys
+    /// promote element-wise: a bound Array element that is a parseable
+    /// string is lifted only when both sampled keys carry a Timestamp at
+    /// that position (single-column `ts = '…' AND x = 9` on `INDEX (ts, x)`
+    /// and trailing positions alike).
     fn promote_plan_bounds(
         &self,
         tree: &BTree,
         tx: &crate::pager::Tx,
         plan: &ProbePlan,
     ) -> Result<ProbePlan> {
-        let band_is_timestamp = |sample: &[(Value, u64)]| {
-            sample
-                .first()
-                .is_some_and(|(k, _)| matches!(k, Value::Timestamp(_)))
-        };
-        let tree_band_timestamp = |min: bool, max: bool| min && max;
         let promotes = |v: &Value| -> bool {
             matches!(v, Value::Str(s) if crate::value::parse_timestamp_ms(s).is_some())
         };
-        let promote = |v: &Value| -> Value {
-            if let Value::Str(s) = v {
-                if let Some(ms) = crate::value::parse_timestamp_ms(s) {
-                    return Value::Timestamp(ms);
+        fn bound_elements(v: &Value) -> Option<&[Value]> {
+            match v {
+                Value::Array(items) if !items.is_empty() => Some(items),
+                _ => None,
+            }
+        }
+        // Cheap pre-check: no parseable-string bound anywhere (scalar or in
+        // a composite Array) → the plan is untouched and the two leaf reads
+        // are not paid.
+        let has_str_bound =
+            match plan {
+                ProbePlan::Eq(v) | ProbePlan::Prefix(v) => {
+                    promotes(v) || bound_elements(v).is_some_and(|items| items.iter().any(promotes))
                 }
-            }
-            v.clone()
-        };
-        // Cheap pre-check: no string bound anywhere → the plan is untouched
-        // (and the two leaf reads are not paid).
-        let has_str_bound = match plan {
-            ProbePlan::Eq(v) | ProbePlan::Prefix(v) => promotes(v),
-            ProbePlan::Range { lo, hi } => {
-                lo.as_ref().is_some_and(|(v, _)| promotes(v))
-                    || hi.as_ref().is_some_and(|(v, _)| promotes(v))
-            }
-        };
+                ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|(v, _)| {
+                        promotes(v)
+                            || bound_elements(v).is_some_and(|items| items.iter().any(promotes))
+                    }),
+            };
         if !has_str_bound {
             return Ok(plan.clone());
         }
         let reader = self.reader();
-        let min_is_ts = band_is_timestamp(
-            &tree
-                .scan_limited(&reader, tx, Some(1))
-                .map_err(|e| index_err("probe bound", e))?,
-        );
-        let max_is_ts = band_is_timestamp(
-            &tree
-                .scan_limited_rev(&reader, tx, Some(1))
-                .map_err(|e| index_err("probe bound", e))?,
-        );
-        if !tree_band_timestamp(min_is_ts, max_is_ts) {
+        let sample = |rev: bool| -> Result<Vec<(Value, u64)>> {
+            if rev {
+                tree.scan_limited_rev(&reader, tx, Some(1))
+                    .map_err(|e| index_err("probe bound", e))
+            } else {
+                tree.scan_limited(&reader, tx, Some(1))
+                    .map_err(|e| index_err("probe bound", e))
+            }
+        };
+        let min_key = sample(false)?.into_iter().next().map(|(k, _)| k);
+        let max_key = sample(true)?.into_iter().next().map(|(k, _)| k);
+        // Position i of the tree band is Timestamp when both sampled keys
+        // carry a Timestamp there (scalar keys are position 0).
+        let band_ts_at = |i: usize| -> bool {
+            let at = |k: &Option<Value>| -> bool {
+                k.as_ref().is_some_and(|k| match k {
+                    Value::Timestamp(_) if i == 0 => true,
+                    Value::Array(items) => items
+                        .get(i)
+                        .is_some_and(|e| matches!(e, Value::Timestamp(_))),
+                    _ => false,
+                })
+            };
+            at(&min_key) && at(&max_key)
+        };
+        let any_band_ts = match min_key.as_ref() {
+            Some(Value::Array(items)) => (0..items.len()).any(band_ts_at),
+            Some(_) => band_ts_at(0),
+            None => false,
+        };
+        if !any_band_ts {
             return Ok(plan.clone());
         }
+        let promote = |v: &Value| -> Value {
+            match v {
+                Value::Str(s) => {
+                    if band_ts_at(0) {
+                        if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                            return Value::Timestamp(ms);
+                        }
+                    }
+                    v.clone()
+                }
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| {
+                            if let Value::Str(s) = e {
+                                if band_ts_at(i) {
+                                    if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                                        return Value::Timestamp(ms);
+                                    }
+                                }
+                            }
+                            e.clone()
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            }
+        };
         Ok(match &plan {
             ProbePlan::Eq(v) => ProbePlan::Eq(promote(v)),
             ProbePlan::Prefix(v) => ProbePlan::Prefix(promote(v)),
@@ -2460,8 +2595,10 @@ impl<'a> ReadCx<'a> {
     }
 
     /// A FROM relation that resolves to a real heap table: single-part name,
-    /// present in the catalog, and not a compatibility view that shadows
-    /// user tables of the same name in `load_table_factor`.
+    /// present in the catalog, and neither a compatibility view that shadows
+    /// user tables of the same name in `load_table_factor` nor a user view
+    /// (views resolve by expanding their stored SELECT — their own empty
+    /// storage must never satisfy a heap fast path).
     fn real_table_meta(
         &self,
         name: &sqlparser::ast::ObjectName,
@@ -2473,7 +2610,7 @@ impl<'a> ReadCx<'a> {
         if is_compat_view(&tname) {
             return None;
         }
-        self.tables.get(&tname)
+        self.tables.get(&tname).filter(|m| !m.is_view())
     }
 }
 
@@ -2585,9 +2722,17 @@ impl<'a> ReadCx<'a> {
             let fields = match src {
                 SqlExpr::Identifier(i) => vec![i.value.clone()],
                 SqlExpr::CompoundIdentifier(parts) => {
-                    let mut fields: Vec<String> = parts.iter().map(|p| p.value.clone()).collect();
-                    if let Some(last) = fields.last().cloned() {
-                        fields.push(last);
+                    // Same resolution order as `eval_expr` for qualified
+                    // names: the full dotted key first (schemaless docs can
+                    // hold a literal "t.name" field), then the bare column.
+                    let dotted = parts
+                        .iter()
+                        .map(|p| p.value.clone())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let mut fields = vec![dotted];
+                    if let Some(last) = parts.last() {
+                        fields.push(last.value.clone());
                     }
                     fields
                 }
@@ -2846,6 +2991,11 @@ pub struct Database {
     /// lock; gaps from failed statements are harmless — positions pull
     /// ranges, not counts).
     journal_next: Option<u64>,
+    /// Running total of journal SQL bytes (None = recompute lazily with one
+    /// SUM scan on the next [`Database::journal_trim_bytes`]). Drives the
+    /// byte cap: a count-only window lets a big-document workload grow
+    /// `_cluster_log` without bound (single documents reach 16 MiB).
+    journal_bytes: Option<u64>,
     /// This node's persistent random identity (see CLUSTER_ID_TABLE),
     /// cached after first read.
     cluster_id: Option<String>,
@@ -3140,6 +3290,7 @@ impl Database {
             resolved_sql: None,
             last_insert_id: None,
             journal_next: None,
+            journal_bytes: None,
             cluster_id: None,
             internal_ddl: false,
         })
@@ -3947,16 +4098,33 @@ impl Database {
         // the text would stamp its own clock and silently diverge. The
         // re-parsed statement carries the folded literal, so the INSERT
         // canonical rewrite below (if any) renders folded values too.
+        //
+        // Exception — statements that only DECLARE future behavior (plain
+        // CREATE TABLE / ALTER): folding `DEFAULT NOW()` would freeze the
+        // DDL-time instant into every future row. The call text stays; at
+        // INSERT time exec_insert resolves the instant per row and rewrites
+        // the journaled INSERT with explicit values (the auto-GUID
+        // mechanism). CTAS still folds — its query is row data created now.
         if parsed.is_write && crate::stmt::mentions_wall_clock(&parsed.source) {
-            if let Some(folded) =
-                crate::stmt::fold_wall_clocks(&parsed.source, crate::now_ms() as i64)
-            {
-                let reparsed = Self::parse_classified(&folded)?;
-                let outcome = self.execute_parsed(reparsed)?;
-                if self.resolved_sql.is_none() {
-                    self.resolved_sql = Some(folded);
+            let declares_defaults = match &parsed.stmt {
+                AnyStmt::Sql(stmt) => match stmt.as_ref() {
+                    Statement::CreateTable(create) => create.query.is_none(),
+                    Statement::AlterTable(_) => true,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !declares_defaults {
+                if let Some(folded) =
+                    crate::stmt::fold_wall_clocks(&parsed.source, crate::now_ms() as i64)
+                {
+                    let reparsed = Self::parse_classified(&folded)?;
+                    let outcome = self.execute_parsed(reparsed)?;
+                    if self.resolved_sql.is_none() {
+                        self.resolved_sql = Some(folded);
+                    }
+                    return Ok(outcome);
                 }
-                return Ok(outcome);
             }
         }
         match parsed.stmt {
@@ -4377,6 +4545,9 @@ impl Database {
             value_literal(&Value::Str(sql.to_string()))?
         ))?;
         self.journal_next = Some(next + 1);
+        if let Some(bytes) = self.journal_bytes.as_mut() {
+            *bytes += sql.len() as u64 + 64;
+        }
         Ok(next)
     }
 
@@ -4426,11 +4597,74 @@ impl Database {
         if head <= keep {
             return Ok(());
         }
+        self.journal_bytes = None; // rows deleted; recompute lazily
         self.execute(&format!(
             "DELETE FROM {CLUSTER_LOG_TABLE} WHERE seq <= {}",
             head - keep
         ))
         .map(|_| ())
+    }
+
+    /// Byte-dimension journal cap alongside the count window: drop oldest
+    /// entries until the journal's SQL text fits `max_bytes`. The count
+    /// window alone bounds nothing for big-document workloads (a single
+    /// journal entry can reach 16 MiB, so 100k entries ≈ 100 GB), and the
+    /// PITR-recommended `DOCSQL_CATCHUP_WINDOW=0` removes the count cap
+    /// entirely. Cheap when under the cap: the running total is cached in
+    /// memory (one SUM scan after open, then incremented per append).
+    pub fn journal_trim_bytes(&mut self, max_bytes: u64) -> Result<()> {
+        self.ensure_cluster_tables()?;
+        let total = match self.journal_bytes {
+            Some(b) => b,
+            None => {
+                let r =
+                    self.execute(&format!("SELECT SUM(LENGTH(sql)) FROM {CLUSTER_LOG_TABLE}"))?;
+                let b = match r {
+                    ExecOutcome::Rows(rows) => rows
+                        .rows
+                        .first()
+                        .and_then(|row| row.first())
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .max(0) as u64,
+                    _ => 0,
+                };
+                self.journal_bytes = Some(b);
+                b
+            }
+        };
+        if total <= max_bytes {
+            return Ok(());
+        }
+        // Delete oldest seqs until the removed bytes cover the excess. One
+        // ordered scan (rows are already seq-ordered in the heap) plus one
+        // ranged DELETE — both amortized against the many appends that let
+        // the total drift past the cap.
+        let r = self.execute(&format!(
+            "SELECT seq, LENGTH(sql) FROM {CLUSTER_LOG_TABLE} ORDER BY seq ASC"
+        ))?;
+        let excess = total - max_bytes;
+        let mut acc = 0u64;
+        let mut cutoff = 0u64;
+        if let ExecOutcome::Rows(rows) = r {
+            for row in &rows.rows {
+                let (Some(Value::Int(seq)), Some(Value::Int(n))) = (row.first(), row.get(1)) else {
+                    continue;
+                };
+                acc += (*n).max(0) as u64;
+                cutoff = *seq as u64;
+                if acc >= excess {
+                    break;
+                }
+            }
+        }
+        if cutoff > 0 {
+            self.journal_bytes = None; // recompute exactly after the delete
+            self.execute(&format!(
+                "DELETE FROM {CLUSTER_LOG_TABLE} WHERE seq <= {cutoff}"
+            ))?;
+        }
+        Ok(())
     }
 
     /// Void every journal entry's text, keeping the seqs allocated. Used
@@ -4467,6 +4701,7 @@ impl Database {
 
     pub fn journal_void_all(&mut self) -> Result<()> {
         self.ensure_cluster_tables()?;
+        self.journal_bytes = None; // text shrinks to the sentinel; recompute lazily
         self.execute(&format!(
             "UPDATE {CLUSTER_LOG_TABLE} SET sql = 'PRAGMA discarded_by_snapshot_adoption;'"
         ))
@@ -4675,8 +4910,10 @@ impl Database {
             ddl.push_str(";\n");
         }
         // Views last: their bodies reference restored tables (the CREATE
-        // dry-runs the body, so the table must exist by then).
-        for name in &view_names {
+        // dry-runs the body, so the table must exist by then), and a view
+        // of a view needs its base view restored first — dependency order,
+        // not catalog (alphabetical) order.
+        for name in &view_dependency_order(&view_names, &self.tables) {
             if let Some(meta) = self.tables.get(name) {
                 if let Some(body) = &meta.view_sql {
                     ddl.push_str(&format!("CREATE VIEW {} AS {body};\n", quote_ident(name)));
@@ -4716,7 +4953,11 @@ impl Database {
                     // Composites roots removed below release their tree in
                     // the same catalog transaction; pages staged here never
                     // fight the readers (write lock held, snapshots use WAL).
-                    let mut dropped_roots: Vec<(String, u32)> = Vec::new();
+                    //
+                    // Validate the whole list first: the mutation loop below
+                    // edits the in-memory catalog, so a mid-list failure must
+                    // not strand uncommitted changes (a later save would
+                    // persist them without a journal entry).
                     for n in &names {
                         let iname = obj_name(n);
                         // Constraint indexes are derived from the table's
@@ -4725,6 +4966,17 @@ impl Database {
                             return err("index associated with UNIQUE or PRIMARY KEY constraint \
                                  cannot be dropped");
                         }
+                        let owner = self
+                            .tables
+                            .iter()
+                            .any(|(_, m)| m.indexes.iter().any(|i| i == &iname));
+                        if !owner && !if_exists {
+                            return err(format!("index {iname} does not exist"));
+                        }
+                    }
+                    let mut dropped_roots: Vec<(String, u32)> = Vec::new();
+                    for n in &names {
+                        let iname = obj_name(n);
                         // Index names are database-wide, so at most one table
                         // owns the index. Locate it read-only first, then
                         // write-clone just that entry (`catalog_mut` →
@@ -4736,57 +4988,50 @@ impl Database {
                             .iter()
                             .find(|(_, m)| m.indexes.iter().any(|i| i == &iname))
                             .map(|(t, _)| t.clone());
-                        match owner {
-                            Some(owner) => {
-                                let Some(meta) = self.catalog_mut(&owner) else {
-                                    return err(format!("table {owner} does not exist"));
-                                };
-                                if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
-                                    meta.indexes.remove(pos);
-                                    // The B+ tree itself stays in index_roots:
-                                    // non-unique lookups still benefit from
-                                    // it — but only for single-column trees
-                                    // (keyed by the column itself). A
-                                    // composite tree is keyed by the index
-                                    // *name*; with the definition gone
-                                    // nothing can address it, and leaving it
-                                    // behind would let a column that shares
-                                    // the name look like a scalar tree.
-                                    if let Some(dpos) = meta
-                                        .index_defs
-                                        .iter()
-                                        .position(|d| d.name == iname.as_str())
-                                    {
-                                        let def = meta.index_defs.remove(dpos);
-                                        if def.columns.len() > 1 {
-                                            if let Some(root) = meta.index_roots.remove(&iname) {
-                                                dropped_roots.push((iname.clone(), root));
-                                            }
-                                        }
-                                        // Lift UNIQUE only when this index was
-                                        // the sole source: table-declared
-                                        // constraints and other unique indexes
-                                        // on the same column keep it enforced.
-                                        // Composite unique indexes never join
-                                        // meta.unique, so single-column lift
-                                        // rules cover everything here.
-                                        if def.unique
-                                            && def.columns.len() == 1
-                                            && !meta.constraint_unique.contains(&def.columns[0])
-                                            && meta.primary_key.as_deref()
-                                                != Some(def.columns[0].as_str())
-                                            && !meta.index_defs.iter().any(|d| {
-                                                d.columns.contains(&def.columns[0]) && d.unique
-                                            })
-                                        {
-                                            meta.unique.retain(|c| c != &def.columns[0]);
+                        if let Some(owner) = owner {
+                            let Some(meta) = self.catalog_mut(&owner) else {
+                                return err(format!("table {owner} does not exist"));
+                            };
+                            if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
+                                meta.indexes.remove(pos);
+                                // The B+ tree itself stays in index_roots:
+                                // non-unique lookups still benefit from
+                                // it — but only for single-column trees
+                                // (keyed by the column itself). A
+                                // composite tree is keyed by the index
+                                // *name*; with the definition gone
+                                // nothing can address it, and leaving it
+                                // behind would let a column that shares
+                                // the name look like a scalar tree.
+                                if let Some(dpos) = meta
+                                    .index_defs
+                                    .iter()
+                                    .position(|d| d.name == iname.as_str())
+                                {
+                                    let def = meta.index_defs.remove(dpos);
+                                    if def.columns.len() > 1 {
+                                        if let Some(root) = meta.index_roots.remove(&iname) {
+                                            dropped_roots.push((iname.clone(), root));
                                         }
                                     }
-                                }
-                            }
-                            None => {
-                                if !if_exists {
-                                    return err(format!("index {iname} does not exist"));
+                                    // Lift UNIQUE only when this index was
+                                    // the sole source: table-declared
+                                    // constraints and other unique indexes
+                                    // on the same column keep it enforced.
+                                    // Composite unique indexes never join
+                                    // meta.unique, so single-column lift
+                                    // rules cover everything here.
+                                    if def.unique
+                                        && def.columns.len() == 1
+                                        && !meta.constraint_unique.contains(&def.columns[0])
+                                        && meta.primary_key.as_deref()
+                                            != Some(def.columns[0].as_str())
+                                        && !meta.index_defs.iter().any(|d| {
+                                            d.columns.contains(&def.columns[0]) && d.unique
+                                        })
+                                    {
+                                        meta.unique.retain(|c| c != &def.columns[0]);
+                                    }
                                 }
                             }
                         }
@@ -4807,9 +5052,12 @@ impl Database {
                 if object_type == sqlparser::ast::ObjectType::View {
                     // Views have no storage: drop the catalog entry only.
                     // DROP TABLE on a view errors (wrong-kind mismatch), and
-                    // so does DROP VIEW on a table.
-                    for name in names.iter().map(obj_name) {
-                        match self.tables.get(&name) {
+                    // so does DROP VIEW on a table. Validate the whole list
+                    // before touching the catalog — a mid-list failure must
+                    // not leave earlier names already dropped and committed.
+                    let dropping: Vec<String> = names.iter().map(obj_name).collect();
+                    for name in &dropping {
+                        match self.tables.get(name) {
                             None if if_exists => {}
                             None => return err(format!("view {name} does not exist")),
                             Some(meta) if !meta.is_view() => {
@@ -4817,14 +5065,15 @@ impl Database {
                                     "{name} is a table, not a view (use DROP TABLE)"
                                 ));
                             }
-                            Some(_) => {
-                                let mut tx = self.pager.begin_tx();
-                                self.tables.remove(&name);
-                                self.save_catalog_into(&mut tx)?;
-                                self.commit_pager_tx(tx)?;
-                            }
+                            Some(_) => {}
                         }
                     }
+                    let mut tx = self.pager.begin_tx();
+                    for name in &dropping {
+                        self.tables.remove(name);
+                    }
+                    self.save_catalog_into(&mut tx)?;
+                    self.commit_pager_tx(tx)?;
                     return Ok(ExecOutcome::Affected(0));
                 }
                 if object_type != sqlparser::ast::ObjectType::Table {
@@ -4984,27 +5233,41 @@ impl Database {
             Statement::Query(q) => self.exec_query_cx(*q),
             Statement::Truncate(tr) => {
                 // Empty the tables; shape (columns/constraints) is kept.
-                for target in &tr.table_names {
-                    let name = obj_name(&target.name);
-                    if !self.tables.contains_key(&name) && !tr.if_exists {
+                // Validate every target (existence, kind, FK children)
+                // BEFORE truncating: a mid-list failure must not leave
+                // earlier tables already emptied and committed while the
+                // failed statement never reaches the journal — replicas
+                // would keep rows the origin lost.
+                let targets: Vec<String> =
+                    tr.table_names.iter().map(|t| obj_name(&t.name)).collect();
+                for name in &targets {
+                    if !self.tables.contains_key(name) && !tr.if_exists {
                         return err(format!("table {name} does not exist"));
                     }
-                    if self.tables.get(&name).is_some_and(|m| m.is_view()) {
+                    if self.tables.get(name).is_some_and(|m| m.is_view()) {
                         return err(format!(
                             "cannot TRUNCATE view {name} (it is a view, not a table)"
                         ));
                     }
-                    if self.tables.contains_key(&name) {
+                    if self.tables.contains_key(name) {
+                        // TRUNCATE is a full-table DELETE: child rows must
+                        // not be orphaned silently (same guard as DELETE).
+                        // Co-truncated tables are excluded — the whole list
+                        // is validated before any table is emptied, so
+                        // `TRUNCATE parent, child` must not fail on the
+                        // parent's rows the child still references.
+                        let removed = self.table_docs_cx(name)?;
+                        self.check_fk_parent_delete_skipping(name, &removed, &[], &targets)?;
+                    }
+                }
+                for name in &targets {
+                    if self.tables.contains_key(name) {
                         let mut meta = self
                             .tables
-                            .get(&name)
+                            .get(name)
                             .map(|a| a.as_ref().clone())
                             .unwrap_or_default();
-                        // TRUNCATE is a full-table DELETE: child rows must not
-                        // be orphaned silently (same guard as DELETE).
-                        let removed = self.table_docs_cx(&name)?;
-                        self.check_fk_parent_delete(&name, &removed, &[])?;
-                        self.rewrite_table(&name, &mut meta, Vec::new())?;
+                        self.rewrite_table(name, &mut meta, Vec::new())?;
                     }
                 }
                 Ok(ExecOutcome::Affected(0))
@@ -5753,6 +6016,13 @@ impl Database {
         }
         let mut cols: Vec<String> = Vec::with_capacity(idx.columns.len());
         for c in &idx.columns {
+            // Direction is part of the index definition: accepting DESC here
+            // and silently building ASC (as before) creates an index whose
+            // ORDER BY optimization direction is the opposite of what was
+            // declared. Same refusal discipline as INCLUDE/WHERE/USING.
+            if c.column.options.asc == Some(false) {
+                return err("descending indexes (CREATE INDEX ... DESC) are not supported");
+            }
             let col = match &c.column.expr {
                 SqlExpr::Identifier(i) => i.value.clone(),
                 other => expr_name(other),
@@ -5834,7 +6104,16 @@ impl Database {
                             CO::Default(e) => {
                                 meta.defaults.push((col.clone(), default_expr_text(e)))
                             }
-                            CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
+                            CO::Check(c) => {
+                                if expr_calls_wall_clock(&c.expr) {
+                                    return err(
+                                        "CHECK constraints cannot call wall-clock functions \
+                                         (NOW/SYSDATE/CURRENT_TIMESTAMP); every node would \
+                                         evaluate a different instant",
+                                    );
+                                }
+                                meta.checks.push(format!("{}", c.expr))
+                            }
                             CO::NotNull => add_not_null = true,
                             // Same parity as CREATE TABLE: these options on
                             // ADD COLUMN would dangle (no tree, no backfill).
@@ -6142,6 +6421,19 @@ impl Database {
         removed_docs: &[Object],
         replacement_docs: &[Object],
     ) -> Result<()> {
+        self.check_fk_parent_delete_skipping(table, removed_docs, replacement_docs, &[])
+    }
+
+    /// [`check_fk_parent_delete`] with a child-table exclusion list: children
+    /// named in `skip` are also being emptied by the same statement (e.g.
+    /// `TRUNCATE parent, child`), so their rows cannot end up orphaned.
+    fn check_fk_parent_delete_skipping(
+        &mut self,
+        table: &str,
+        removed_docs: &[Object],
+        replacement_docs: &[Object],
+        skip: &[String],
+    ) -> Result<()> {
         if removed_docs.is_empty() {
             return Ok(());
         }
@@ -6149,6 +6441,7 @@ impl Database {
         let children: Vec<(String, String, String)> = self
             .tables
             .iter()
+            .filter(|(child_name, _)| !skip.iter().any(|s| s.as_str() == child_name.as_str()))
             .flat_map(|(child_name, m)| {
                 m.foreign_keys
                     .iter()
@@ -6252,9 +6545,13 @@ impl Database {
             }
         }
         let body = format!("{}", view.query);
-        // Self-reference guard: with OR REPLACE the old view still resolves
-        // (dry-run below would recurse into itself forever). A view body
-        // naming its own view is rejected up front.
+        // Cycle guard: with OR REPLACE the old view still resolves during
+        // the dry-run below, and a replacement body can point back at
+        // itself through other views (a→b, then `CREATE OR REPLACE VIEW
+        // a AS SELECT * FROM b`). A direct self-reference is rejected up
+        // front; for OR REPLACE the view→view edges reachable from the
+        // new body must never return to `name` — otherwise every later
+        // SELECT would recurse until the expansion budget trips.
         {
             let mut refs = Vec::new();
             let mut stmts = Parser::parse_sql(&GenericDialect {}, &body)
@@ -6266,6 +6563,23 @@ impl Database {
                 if refs.iter().any(|r| r == &name) {
                     return err(format!("view {name} cannot reference itself"));
                 }
+                if exists {
+                    let mut stack = refs.clone();
+                    let mut seen = std::collections::BTreeSet::new();
+                    while let Some(next) = stack.pop() {
+                        if next == name {
+                            return err(format!(
+                                "view {name} cannot reference itself (through {next})"
+                            ));
+                        }
+                        if !seen.insert(next.clone()) {
+                            continue;
+                        }
+                        if let Some(deeper) = self.view_base_tables(&next) {
+                            stack.extend(deeper);
+                        }
+                    }
+                }
             } else {
                 return err("view body must be a SELECT");
             }
@@ -6274,7 +6588,11 @@ impl Database {
         // fail at CREATE time, not at first SELECT. The body executes as a
         // plain SELECT over the CURRENT catalog (a self-reference errors —
         // the name does not resolve yet — which is exactly the cycle check).
+        // The view under construction consumes one expansion level of its
+        // own, so a chain that would be too deep to SELECT is also too deep
+        // to CREATE (creatable implies selectable).
         {
+            let _guard = enter_view_expansion()?;
             let q = Self::plain_read_query(&Self::parse_classified(&body)?)?;
             self.exec_query_cx(q)?;
         }
@@ -6381,7 +6699,14 @@ impl Database {
                         meta.defaults
                             .push((col.name.value.clone(), default_expr_text(e)));
                     }
-                    CO::Check(c) => meta.checks.push(format!("{}", c.expr)),
+                    CO::Check(c) => {
+                        if expr_calls_wall_clock(&c.expr) {
+                            return err("CHECK constraints cannot call wall-clock functions \
+                                 (NOW/SYSDATE/CURRENT_TIMESTAMP); every node would \
+                                 evaluate a different instant");
+                        }
+                        meta.checks.push(format!("{}", c.expr))
+                    }
                     CO::ForeignKey(fk) => {
                         if fk.on_delete.is_some() || fk.on_update.is_some() {
                             return err(
@@ -6454,7 +6779,14 @@ impl Database {
                         meta.primary_key = Some(expr_name(&ic.column.expr));
                     }
                 }
-                TC::Check(chk) => meta.checks.push(format!("{}", chk.expr)),
+                TC::Check(chk) => {
+                    if expr_calls_wall_clock(&chk.expr) {
+                        return err("CHECK constraints cannot call wall-clock functions \
+                             (NOW/SYSDATE/CURRENT_TIMESTAMP); every node would \
+                             evaluate a different instant");
+                    }
+                    meta.checks.push(format!("{}", chk.expr))
+                }
                 TC::ForeignKey(fk) => {
                     if fk.on_delete.is_some() || fk.on_update.is_some() {
                         return err("FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
@@ -6591,6 +6923,11 @@ impl Database {
             _ => false,
         };
         let mut guid_filled = autoguid_appended;
+        // A wall-clock DEFAULT (`DEFAULT NOW()`) resolved per row on THIS
+        // node: the journaled INSERT must carry the explicit value or every
+        // peer would stamp its own clock at replay (same rewrite trigger as
+        // auto-GUID below).
+        let mut default_clock_filled = false;
         let mut next_autoinc = self.autoinc_next_for(&table, &meta)?;
         // DEFAULT texts parsed once per statement (was re-parsed by
         // sqlparser for every row that omitted the column).
@@ -6646,6 +6983,9 @@ impl Database {
                             default_exprs.get(col).expect("just inserted")
                         }
                     };
+                    if expr_calls_wall_clock(e) {
+                        default_clock_filled = true;
+                    }
                     doc.insert(col.clone(), eval_const(e)?);
                 }
             }
@@ -6675,10 +7015,12 @@ impl Database {
             return err("ON DUPLICATE KEY UPDATE is not supported");
         }
         // Replication-safe rewrite: the statement as written would let every
-        // peer fill its own random GUIDs. Emit a canonical INSERT carrying
-        // the generated ids explicitly — with the conflict clause preserved
-        // so peers resolve the same conflicts against identical state.
-        if guid_filled {
+        // peer fill its own random GUIDs — or stamp its own clock for a
+        // wall-clock DEFAULT. Emit a canonical INSERT carrying the generated
+        // ids / resolved instants explicitly — with the conflict clause
+        // preserved so peers resolve the same conflicts against identical
+        // state.
+        if guid_filled || default_clock_filled {
             let policy = if replace {
                 "OR REPLACE "
             } else if do_nothing {
@@ -7005,6 +7347,11 @@ impl Database {
         let Some(meta) = self.tables.get(&tname).cloned() else {
             return err(format!("table {tname} does not exist"));
         };
+        // Views have no storage: every other write shape rejects them here
+        // (exec_insert/update/delete, TRUNCATE, ALTER, CREATE INDEX);
+        // without this a MERGE inserts into the view's private empty
+        // heap — invisible rows and a dump that cannot replay.
+        ensure_not_view("MERGE into", &tname, &meta)?;
 
         // Exactly one WHEN MATCHED (UPDATE) and one WHEN NOT MATCHED
         // (INSERT) clause; per-clause predicates, BY SOURCE, DELETE WHERE
@@ -7263,6 +7610,14 @@ impl Database {
                                 default_exprs.get(col).expect("just inserted")
                             }
                         };
+                        if expr_calls_wall_clock(e) {
+                            // MERGE has no canonical resolved-text rewrite
+                            // (unlike INSERT); replaying the statement on a
+                            // peer would stamp a different clock. Fail loudly
+                            // instead of silently diverging.
+                            return err("MERGE INSERT cannot apply a wall-clock DEFAULT \
+                                 (NOW/SYSDATE/CURRENT_TIMESTAMP); supply the column explicitly");
+                        }
                         doc.insert(col.clone(), eval_const(e)?);
                     }
                 }
@@ -8480,10 +8835,21 @@ fn value_literal(v: &Value) -> Result<String> {
         }
         Value::Str(s) => Ok(crate::stmt::sql_string_literal(s)),
         // TIMESTAMP '…' form: bare ISO text would re-parse as Str on replay.
-        Value::Timestamp(ms) => Ok(format!(
-            "CAST({} AS TIMESTAMP)",
-            crate::stmt::sql_string_literal(&crate::value::format_timestamp_ms(*ms))
-        )),
+        Value::Timestamp(ms) => {
+            // Construction sites keep Timestamps inside 0001..=9999, but a
+            // legacy volume written before that guard could still hold an
+            // out-of-domain instant — fail the DUMP loudly here instead of
+            // emitting a literal the restore would reject half-way through.
+            if !crate::value::is_valid_timestamp_ms(*ms) {
+                return err(format!(
+                    "TIMESTAMP value {ms} is outside 0001-01-01..=9999-12-31 and cannot be dumped"
+                ));
+            }
+            Ok(format!(
+                "CAST({} AS TIMESTAMP)",
+                crate::stmt::sql_string_literal(&crate::value::format_timestamp_ms(*ms))
+            ))
+        }
         // Structured values (JSON_EXTRACT output, INSERT ... SELECT from a
         // JSON function, etc.) have no literal syntax in this dialect: the
         // engine's canonical JSON text wrapped in JSON_EXTRACT round-trips
@@ -8948,6 +9314,61 @@ fn fk_dependency_order(
     out
 }
 
+/// Views in creation-safe order for a dump: every view after the views its
+/// body references (CREATE VIEW dry-runs the body, so a view of a view needs
+/// its base view restored first — alphabetical order would replay
+/// `CREATE VIEW a AS SELECT * FROM z` before z exists). A cycle (not
+/// constructible through CREATE VIEW; defensive) falls back to name order,
+/// and replay fails loudly at the offending CREATE instead of silently
+/// omitting the rest.
+fn view_dependency_order(
+    names: &[String],
+    tables: &std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
+) -> Vec<String> {
+    let view_set: std::collections::BTreeSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    // Direct view→view edges (an unparseable body contributes none; the
+    // CREATE would fail at replay time anyway).
+    let edges: Vec<(String, Vec<String>)> = names
+        .iter()
+        .map(|n| {
+            let mut deps = Vec::new();
+            if let Some(sql) = tables.get(n).and_then(|m| m.view_sql.as_ref()) {
+                if let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) {
+                    if let Some(Statement::Query(q)) = stmts.pop() {
+                        let mut refs = Vec::new();
+                        if walk_query(&q, &mut refs).is_some() {
+                            deps = refs
+                                .into_iter()
+                                .filter(|r| view_set.contains(r.as_str()))
+                                .collect();
+                        }
+                    }
+                }
+            }
+            (n.clone(), deps)
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    while out.len() < names.len() {
+        let before = out.len();
+        for (name, deps) in edges.iter() {
+            if !out.contains(name) && deps.iter().all(|d| out.contains(d)) {
+                out.push(name.clone());
+            }
+        }
+        if out.len() == before {
+            let rest: Vec<String> = edges
+                .iter()
+                .map(|(n, _)| n.clone())
+                .filter(|n| !out.contains(n))
+                .collect();
+            out.extend(rest);
+            break;
+        }
+    }
+    out
+}
+
 /// Evaluate a constant expression (literal / arithmetic on literals).
 pub fn eval_const(e: &SqlExpr) -> Result<Value> {
     match e {
@@ -9169,8 +9590,14 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             if matches!(v, Value::Null) || matches!(lo, Value::Null) || matches!(hi, Value::Null) {
                 return Ok(Value::Bool(false));
             }
-            let inside = Value::cmp_values(&v, &lo) != Ordering::Less
-                && Value::cmp_values(&v, &hi) != Ordering::Greater;
+            // Same TIMESTAMP↔string coercion as the bare comparisons; an
+            // uncoercable pair is unknown, and unknown is false under either
+            // polarity (NOT BETWEEN an unknown is still unknown).
+            let (Some(lo_ord), Some(hi_ord)) = (cmp_coerced(&v, &lo), cmp_coerced(&v, &hi))
+            else {
+                return Ok(Value::Bool(false));
+            };
+            let inside = lo_ord != Ordering::Less && hi_ord != Ordering::Greater;
             Ok(Value::Bool(inside != *negated))
         }
         SqlExpr::Like {
@@ -9221,7 +9648,9 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                         let cv = eval_expr(&w.condition, doc)?;
                         !matches!(base, Value::Null)
                             && !matches!(cv, Value::Null)
-                            && Value::cmp_values(base, &cv) == Ordering::Equal
+                            // Same coercion funnel as `=`: `CASE ts WHEN
+                            // '2026-…' THEN` compares like `ts = '2026-…'`.
+                            && cmp_coerced(base, &cv) == Some(Ordering::Equal)
                     }
                     None => matches!(eval_expr(&w.condition, doc)?, Value::Bool(true)),
                 };
@@ -9325,7 +9754,9 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                     saw_null = true;
                     continue;
                 }
-                if Value::cmp_values(&v, &iv) == std::cmp::Ordering::Equal {
+                // Equality through the TIMESTAMP↔string coercion funnel, so
+                // `ts IN ('2026-…', …)` matches like `ts = '2026-…'` does.
+                if cmp_coerced(&v, &iv) == Some(Ordering::Equal) {
                     hit = true;
                     break;
                 }
@@ -9634,7 +10065,15 @@ fn cast_value(v: Value, type_name: &str) -> Result<Value> {
         // milliseconds. Timestamp→Int (ms) has its arm in the INT branch.
         v if t.contains("TIMESTAMP") || t.contains("DATETIME") => match v {
             Value::Timestamp(_) => v,
-            Value::Int(i) => Value::Timestamp(i),
+            Value::Int(i) => {
+                // Domain check: an out-of-range instant has no canonical
+                // text form, so `value_literal` could never replay it
+                // (backup restore / join snapshot would fail on this row).
+                if !crate::value::is_valid_timestamp_ms(i) {
+                    return err(format!("cannot CAST {i} AS {type_name}: out of range"));
+                }
+                Value::Timestamp(i)
+            }
             Value::Str(s) => {
                 Value::Timestamp(crate::value::parse_timestamp_ms(&s).ok_or_else(|| {
                     SqlError::Message(format!("cannot CAST '{s}' AS {type_name}: not a timestamp"))
@@ -10364,6 +10803,21 @@ fn value_to_literal(v: Value) -> Result<SqlExpr> {
         Value::Int(i) => SqlExpr::Value(V::Number(i.to_string(), false).into()),
         Value::Float(f) => SqlExpr::Value(V::Number(format!("{f}"), false).into()),
         Value::Str(s) => SqlExpr::Value(V::SingleQuotedString(s).into()),
+        // Exact/exotic scalars ride as subquery-independent expressions the
+        // same way value_literal renders them for dumps — a bare number or
+        // string would degrade Decimal to Float and Timestamp to Str.
+        other @ (Value::Decimal(_) | Value::Timestamp(_)) => {
+            parse_expr_text(&value_literal(&other)?)?
+        }
+        Value::Bytes(b) => {
+            let mut hex = String::with_capacity(b.len() * 2 + 3);
+            hex.push_str("x'");
+            for byte in &b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex.push('\'');
+            parse_expr_text(&hex)?
+        }
         other => return err(format!("cannot inline value as literal: {other:?}")),
     })
 }
@@ -11244,9 +11698,20 @@ fn coerce_timestamp_operands(l: Value, r: Value) -> Option<(Value, Value)> {
 /// NULL-safe equality for `IS [NOT] DISTINCT FROM` (SQL:2003). The engine's
 /// comparison is total — `NULL` is a sortable value, so `NULL` compares
 /// equal to `NULL` and unequal to everything else — which is exactly the
-/// DISTINCT FROM truth table.
+/// DISTINCT FROM truth table. Comparison goes through the TIMESTAMP↔string
+/// coercion funnel so `ts IS NOT DISTINCT FROM '2026-…'` behaves like `ts =
+/// '2026-…'`; an uncoercable pair is simply not equal.
 fn values_equal_null_safe(a: &Value, b: &Value) -> bool {
-    Value::cmp_values(a, b) == Ordering::Equal
+    cmp_coerced(a, b) == Some(Ordering::Equal)
+}
+
+/// `cmp_values` behind the predicate-level TIMESTAMP↔string rule
+/// ([`coerce_timestamp_operands`]): BETWEEN, IN, CASE and IS [NOT] DISTINCT
+/// FROM must compare exactly like `=`/`<`/`>` do. `None` mirrors the
+/// comparison-unknown result those operators report for an unparseable
+/// string against a TIMESTAMP.
+fn cmp_coerced(a: &Value, b: &Value) -> Option<Ordering> {
+    coerce_timestamp_operands(a.clone(), b.clone()).map(|(a, b)| Value::cmp_values(&a, &b))
 }
 
 fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
@@ -11260,16 +11725,24 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     // pathological literal must not panic). Timestamp + Timestamp and
     // numeric↔timestamp mixing are errors — CAST explicitly.
     if matches!(l, Value::Timestamp(_)) || matches!(r, Value::Timestamp(_)) {
+        // Result domain: an instant outside 0001..=9999 has no canonical
+        // text form (value_literal could not replay it), so it degrades to
+        // NULL like any other out-of-range arithmetic result.
+        let ts = |ms: i64| {
+            if crate::value::is_valid_timestamp_ms(ms) {
+                Value::Timestamp(ms)
+            } else {
+                Value::Null
+            }
+        };
         return Ok(match (op, l, r) {
             (Plus, Value::Timestamp(t), Value::Int(n))
-            | (Plus, Value::Int(n), Value::Timestamp(t)) => t
-                .checked_add(n)
-                .map(Value::Timestamp)
-                .unwrap_or(Value::Null),
-            (Minus, Value::Timestamp(t), Value::Int(n)) => t
-                .checked_sub(n)
-                .map(Value::Timestamp)
-                .unwrap_or(Value::Null),
+            | (Plus, Value::Int(n), Value::Timestamp(t)) => {
+                t.checked_add(n).map(ts).unwrap_or(Value::Null)
+            }
+            (Minus, Value::Timestamp(t), Value::Int(n)) => {
+                t.checked_sub(n).map(ts).unwrap_or(Value::Null)
+            }
             (Minus, Value::Timestamp(a), Value::Timestamp(b)) => {
                 a.checked_sub(b).map(Value::Int).unwrap_or(Value::Null)
             }
@@ -16630,6 +17103,415 @@ mod tests {
         );
         // A table named like a view cannot be DROP VIEW'd.
         assert!(db.execute("DROP VIEW t").is_err());
+    }
+
+    #[test]
+    fn view_cycle_via_or_replace_is_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE base (id INT)");
+        run(&mut db, "CREATE VIEW a AS SELECT * FROM base");
+        run(&mut db, "CREATE VIEW b AS SELECT * FROM a");
+        // a→b→a through OR REPLACE used to create a catalog cycle that
+        // stack-overflowed the process on the next SELECT; it must fail at
+        // CREATE time and leave the catalog untouched.
+        assert!(db
+            .execute("CREATE OR REPLACE VIEW a AS SELECT * FROM b")
+            .is_err());
+        assert!(db.execute("SELECT * FROM a").is_ok(), "a still resolves");
+        // Longer cycles are caught the same way.
+        run(&mut db, "CREATE VIEW c AS SELECT * FROM b");
+        assert!(db
+            .execute("CREATE OR REPLACE VIEW a AS SELECT * FROM c")
+            .is_err());
+    }
+
+    #[test]
+    fn view_expansion_depth_is_bounded() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE base (id INT)");
+        run(&mut db, "INSERT INTO base VALUES (7)");
+        run(&mut db, "CREATE VIEW v0 AS SELECT * FROM base");
+        // Chains up to the budget build and select fine.
+        for i in 1..=15 {
+            run(
+                &mut db,
+                &format!("CREATE VIEW v{i} AS SELECT * FROM v{}", i - 1),
+            );
+        }
+        let r = rows(&mut db, "SELECT id FROM v15");
+        assert_eq!(r.rows, vec![vec![Value::Int(7)]]);
+        // One more level is refused at CREATE: the dry-run (the view under
+        // construction plus its body's chain) already exceeds the budget,
+        // so a chain too deep to SELECT never enters the catalog.
+        assert!(db.execute("CREATE VIEW v16 AS SELECT * FROM v15").is_err());
+        // The guard itself is cycle defense for corrupt/legacy catalogs:
+        // a self-referencing entry planted directly into the catalog (only
+        // possible outside CREATE, which rejects cycles) errors loudly
+        // instead of recursing until the stack dies.
+        db.tables.insert(
+            "loop".into(),
+            std::sync::Arc::new(TableMeta {
+                view_sql: Some("SELECT * FROM loop".into()),
+                ..Default::default()
+            }),
+        );
+        let err = db.execute("SELECT * FROM loop").unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+    }
+
+    #[test]
+    fn view_count_and_order_window_expand_instead_of_empty_storage() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1,'a'), (2,'b'), (3,'c')");
+        run(
+            &mut db,
+            "CREATE VIEW big AS SELECT id, v FROM t WHERE id > 1",
+        );
+        // COUNT(*) used to answer 0 off the view's empty heap fast path.
+        let r = rows(&mut db, "SELECT COUNT(*) FROM big");
+        assert_eq!(r.rows[0][0], Value::Int(2));
+        // ORDER BY + LIMIT used to return an empty window for the same
+        // reason (the EF/console pagination shape).
+        let r = rows(&mut db, "SELECT id FROM big ORDER BY id LIMIT 2");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+        let r = rows(&mut db, "SELECT id FROM big ORDER BY id DESC LIMIT 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn merge_into_view_is_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10)");
+        run(&mut db, "CREATE TABLE src (id INT, v INT)");
+        run(&mut db, "INSERT INTO src VALUES (9, 90)");
+        run(&mut db, "CREATE VIEW vw AS SELECT * FROM t");
+        // MERGE's INSERT branch used to bypass the view guard and write an
+        // invisible row into the view's private empty heap.
+        assert!(db
+            .execute(
+                "MERGE INTO vw USING src ON vw.id = src.id \
+                 WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v)"
+            )
+            .is_err());
+        let dump = db.dump_script().unwrap();
+        assert!(!dump.contains("INSERT INTO vw"), "no zombie rows: {dump}");
+    }
+
+    #[test]
+    fn multi_target_ddl_is_atomic_on_failure() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE keep (id INT)");
+        run(&mut db, "INSERT INTO keep VALUES (1)");
+        run(&mut db, "CREATE VIEW v1 AS SELECT * FROM keep");
+        run(&mut db, "CREATE VIEW v2 AS SELECT * FROM keep");
+        // DROP VIEW with a missing tail: nothing is dropped (the first name
+        // used to be dropped and committed before the error).
+        assert!(db.execute("DROP VIEW v1, nope").is_err());
+        assert!(db.execute("SELECT * FROM v1").is_ok(), "v1 survives");
+        assert!(db.execute("DROP VIEW v2, keep").is_err());
+        assert!(db.execute("SELECT * FROM v2").is_ok(), "v2 survives");
+        // TRUNCATE with a missing tail: the first table keeps its rows.
+        assert!(db.execute("TRUNCATE keep, missing").is_err());
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM keep").rows[0][0],
+            Value::Int(1)
+        );
+        // DROP INDEX with a missing tail: the first index survives (the
+        // in-memory catalog used to lose it without a journal entry).
+        run(&mut db, "CREATE TABLE t2 (x INT)");
+        run(&mut db, "CREATE INDEX ia ON keep (id)");
+        run(&mut db, "CREATE INDEX ib ON t2 (x)");
+        assert!(db.execute("DROP INDEX ia, nope").is_err());
+        let r = rows(
+            &mut db,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ia'",
+        );
+        assert_eq!(r.rows.len(), 1, "ia survives");
+        // Co-truncated FK pairs are legal: both tables empty in one
+        // statement, no orphan check on the parent the child references.
+        run(&mut db, "CREATE TABLE parent (id INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "CREATE TABLE child (pid INT, FOREIGN KEY (pid) REFERENCES parent (id))",
+        );
+        run(&mut db, "INSERT INTO parent VALUES (1)");
+        run(&mut db, "INSERT INTO child VALUES (1)");
+        run(&mut db, "TRUNCATE parent, child");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM child").rows[0][0],
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn dump_orders_views_dependency_first_and_replays() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE base (id INT)");
+        run(&mut db, "INSERT INTO base VALUES (1)");
+        // `a` reads `z`: alphabetical dump order replayed CREATE a before z
+        // existed, and the whole restore failed the dry-run.
+        run(&mut db, "CREATE VIEW z AS SELECT * FROM base");
+        run(&mut db, "CREATE VIEW a AS SELECT * FROM z");
+        let dump = db.dump_script().unwrap();
+        assert!(
+            dump.find("CREATE VIEW \"z\"").unwrap() < dump.find("CREATE VIEW \"a\"").unwrap(),
+            "{dump}"
+        );
+        let mut fresh = Database::in_memory().unwrap();
+        for stmt in dump.split(";\n").filter(|x| !x.trim().is_empty()) {
+            run(&mut fresh, stmt);
+        }
+        assert_eq!(
+            rows(&mut fresh, "SELECT id FROM a").rows,
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    #[test]
+    fn timestamp_parsing_rejects_multibyte_offsets_without_panicking() {
+        // Four bytes, but not four digits: the old byte-length check sliced
+        // into the middle of a multibyte char and panicked the executor.
+        assert_eq!(
+            crate::value::parse_timestamp_ms("2026-09-15T12:30:00+1中"),
+            None
+        );
+        assert_eq!(
+            crate::value::parse_timestamp_ms("2026-09-15T12:30:00+中1"),
+            None
+        );
+        let mut db = Database::in_memory().unwrap();
+        assert!(db
+            .execute("SELECT CAST('2026-09-15T12:30:00+1中' AS TIMESTAMP)")
+            .is_err());
+        // The comparison-promotion path (formerly the same panic): the
+        // predicate degrades to NULL, not a crash.
+        run(&mut db, "CREATE TABLE t (id INT, ts TIMESTAMP)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, CAST('2026-09-15T12:30:00Z' AS TIMESTAMP))",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts > '2026-09-15T12:30:00+1中'",
+        );
+        assert!(r.rows.is_empty());
+    }
+
+    #[test]
+    fn timestamp_domain_is_enforced() {
+        let mut db = Database::in_memory().unwrap();
+        // Out-of-range instants have no canonical text form: admitting them
+        // used to produce dumps the restore could not re-parse.
+        assert!(db
+            .execute("SELECT CAST(253402300800000 AS TIMESTAMP)")
+            .is_err());
+        assert!(db
+            .execute("SELECT CAST(-62135596800001 AS TIMESTAMP)")
+            .is_err());
+        assert!(db
+            .execute("INSERT INTO t VALUES (1, CAST(253402300800000 AS TIMESTAMP))")
+            .is_err());
+        // The exact boundaries are legal.
+        let r = rows(
+            &mut db,
+            "SELECT CAST('0001-01-01T00:00:00.000Z' AS TIMESTAMP), \
+                    CAST('9999-12-31T23:59:59.999Z' AS TIMESTAMP)",
+        );
+        assert_eq!(r.rows[0][0], Value::Timestamp(-62_135_596_800_000));
+        assert_eq!(r.rows[0][1], Value::Timestamp(253_402_300_799_999));
+        // Arithmetic past the domain degrades to NULL (SQLite overflow
+        // style), never to an unrepresentable instant.
+        let r = rows(
+            &mut db,
+            "SELECT CAST('9999-12-31T23:59:59.999Z' AS TIMESTAMP) + 1",
+        );
+        assert_eq!(r.rows[0][0], Value::Null);
+        // The wire marker decodes only inside the domain; outside it stays
+        // a plain object rather than a broken Timestamp.
+        assert!(matches!(
+            crate::json::from_str("{\"$ts\":0}").unwrap(),
+            Value::Timestamp(0)
+        ));
+        assert!(matches!(
+            crate::json::from_str("{\"$ts\":253402300800000}").unwrap(),
+            Value::Object(_)
+        ));
+    }
+
+    #[test]
+    fn default_now_resolves_per_insert_and_rewrites_the_journal_text() {
+        let mut db = Database::in_memory().unwrap();
+        // The DDL keeps its call text: folding it would freeze the CREATE
+        // time into every future row.
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT, ts TIMESTAMP DEFAULT NOW())",
+        );
+        run(&mut db, "INSERT INTO t (id) VALUES (1)");
+        let resolved = db.take_resolved_sql().unwrap();
+        assert!(resolved.contains("AS TIMESTAMP"), "{resolved}");
+        assert!(!resolved.contains("NOW()"), "{resolved}");
+        // Insert-time semantics: a later row gets a later instant.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        run(&mut db, "INSERT INTO t (id) VALUES (2)");
+        let _ = db.take_resolved_sql();
+        let r = rows(&mut db, "SELECT ts FROM t ORDER BY id");
+        match (&r.rows[0][0], &r.rows[1][0]) {
+            (Value::Timestamp(a), Value::Timestamp(b)) => assert!(b > a),
+            other => panic!("expected timestamps: {other:?}"),
+        }
+        // CHECK constraints must not carry wall-clock calls at all: every
+        // node would evaluate a different instant.
+        assert!(db
+            .execute("CREATE TABLE bad (x TIMESTAMP, CHECK (x < NOW()))")
+            .is_err());
+        // MERGE has no canonical rewrite; applying a wall-clock DEFAULT
+        // through it would silently diverge replicas — explicit refusal.
+        run(&mut db, "CREATE TABLE src (id INT)");
+        run(&mut db, "INSERT INTO src VALUES (5)");
+        assert!(db
+            .execute(
+                "MERGE INTO t USING src ON t.id = src.id \
+                 WHEN NOT MATCHED THEN INSERT (id) VALUES (src.id)"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn composite_index_timestamp_string_bounds_are_promoted() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE cx (ts TIMESTAMP, x INT, id INT PRIMARY KEY)",
+        );
+        run(&mut db, "CREATE INDEX ctsx ON cx (ts, x)");
+        run(
+            &mut db,
+            "INSERT INTO cx VALUES (CAST('2026-06-01T00:00:00Z' AS TIMESTAMP), 9, 1)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO cx VALUES (CAST('2026-07-01T00:00:00Z' AS TIMESTAMP), 8, 2)",
+        );
+        // Leading position, equality on both columns with a bare string:
+        // the unpromoted Str prefix used to probe an empty band.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM cx WHERE ts = '2026-06-01T00:00:00Z' AND x = 9",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // Leading position, range bounds.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM cx WHERE ts >= '2026-06-01T00:00:00Z' \
+             AND ts <= '2026-07-01T00:00:00Z' ORDER BY id",
+        );
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn timestamp_string_comparisons_are_consistent_across_predicates() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, CAST('2026-06-01T00:00:00Z' AS TIMESTAMP))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (2, CAST('2027-01-01T00:00:00Z' AS TIMESTAMP))",
+        );
+        // BETWEEN must agree with the equivalent >= AND <= (only the binop
+        // funnel used to coerce timestamp strings).
+        let between = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts BETWEEN '2026-01-01' AND '2027-06-01' ORDER BY id",
+        );
+        let ge_le = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts >= '2026-01-01' AND ts <= '2027-06-01' ORDER BY id",
+        );
+        assert_eq!(between.rows, ge_le.rows);
+        assert_eq!(between.rows.len(), 2);
+        // IN matches the same rows as =.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts IN ('2026-06-01T00:00:00Z')",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // CASE compares like =.
+        let r = rows(
+            &mut db,
+            "SELECT CASE ts WHEN '2026-06-01T00:00:00Z' THEN 'hit' ELSE 'miss' END AS r \
+             FROM t WHERE id = 1",
+        );
+        assert_eq!(r.rows[0][0], Value::Str("hit".into()));
+        // IS NOT DISTINCT FROM compares like =.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts IS NOT DISTINCT FROM '2026-06-01T00:00:00Z'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn subquery_inlining_carries_exact_scalar_literals() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE src (id INT PRIMARY KEY, amount DECIMAL, ts TIMESTAMP, data BLOB)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO src VALUES (1, CAST('1.5' AS DECIMAL), \
+             CAST('2026-06-01T00:00:00Z' AS TIMESTAMP), x'0a0b')",
+        );
+        // Scalar subqueries over DECIMAL/TIMESTAMP/BLOB columns used to
+        // fail with "cannot inline value as literal".
+        let r = rows(
+            &mut db,
+            "SELECT id FROM src WHERE amount = (SELECT amount FROM src WHERE id = 1)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        let r = rows(
+            &mut db,
+            "SELECT id FROM src WHERE ts = (SELECT ts FROM src WHERE id = 1)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        let r = rows(
+            &mut db,
+            "SELECT id FROM src WHERE data IN (SELECT data FROM src)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn descending_index_creation_is_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, v INT)");
+        // DESC used to be silently ignored (an ASC tree was built); it must
+        // be refused like every other unimplemented index option.
+        assert!(db.execute("CREATE INDEX d ON t (v DESC)").is_err());
+        assert!(db.execute("CREATE INDEX d ON t (v ASC)").is_ok());
+    }
+
+    #[test]
+    fn journal_trim_bytes_drops_oldest_entries() {
+        let mut db = Database::in_memory().unwrap();
+        for i in 0..50 {
+            db.journal_append(&format!("-- entry {i} padding padding padding"))
+                .unwrap();
+        }
+        // A tiny byte cap keeps only the newest entries' bytes.
+        db.journal_trim_bytes(300).unwrap();
+        let head = db.journal_head().unwrap();
+        let oldest = db.journal_oldest().unwrap();
+        assert!(oldest > 1, "oldest trimmed: {oldest}");
+        assert_eq!(head, 50, "newest entries are never trimmed away");
+        let entries = db.journal_entries_after(oldest - 1, 1000).unwrap();
+        assert_eq!(entries.len() as u64, head - oldest + 1, "contiguous tail");
     }
 
     #[test]

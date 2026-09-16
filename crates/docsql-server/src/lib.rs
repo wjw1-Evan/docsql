@@ -3131,6 +3131,13 @@ pub(crate) fn fanout_auth(state: &ServerState) -> Option<&str> {
 /// entry shares the statement's fsync. Returns the journal seq, or None
 /// when journaling failed — peers then cannot place the op in the origin's
 /// journal and fall back to snapshot repair on divergence.
+/// Byte cap for the catch-up journal (`_cluster_log`), alongside the count
+/// window: big-document workloads would otherwise grow the journal without
+/// bound (entries reach MAX_DOC_SIZE; the count window can be disabled
+/// entirely for PITR with DOCSQL_CATCHUP_WINDOW=0). Same magnitude as the
+/// pub/sub store's byte cap.
+const JOURNAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 fn journal_append_trimmed(
     db: &mut docsql_core::engine::Database,
     state: &ServerState,
@@ -3140,10 +3147,16 @@ fn journal_append_trimmed(
         Ok(seq) => {
             // Amortized window trim: keep the journal bounded so positions
             // older than the window force snapshot fallback instead of
-            // unbounded growth.
-            if state.catchup_window > 0 && seq % 512 == 0 {
-                if let Err(e) = db.journal_trim(state.catchup_window) {
-                    eprintln!("catchup journal trim failed: {e}");
+            // unbounded growth. The byte cap runs on the same cadence and is
+            // a cached counter comparison while under the cap.
+            if seq % 512 == 0 {
+                if state.catchup_window > 0 {
+                    if let Err(e) = db.journal_trim(state.catchup_window) {
+                        eprintln!("catchup journal trim failed: {e}");
+                    }
+                }
+                if let Err(e) = db.journal_trim_bytes(JOURNAL_MAX_BYTES) {
+                    eprintln!("catchup journal byte trim failed: {e}");
                 }
             }
             Some(seq)
@@ -3839,13 +3852,37 @@ async fn forward_pubsub_all(
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
     let targets = fanout_targets(state).await;
+    // Same circuit breaker as the SQL fan-out: a partitioned peer must not
+    // stretch every PUBLISH by the full connect/IO timeout (PUBLISH holds
+    // write_order for the whole call). Backed-off peers still receive every
+    // frame — just on the short trial budget.
+    let now = std::time::Instant::now();
+    let in_backoff: std::collections::HashSet<String> = {
+        let backoff = state.peer_backoff.lock().await;
+        backoff
+            .iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(t, _)| t.clone())
+            .collect()
+    };
     let mut tasks = tokio::task::JoinSet::new();
     for target in targets {
         let payload = payload.to_vec();
         let auth = auth.clone();
+        let trial = in_backoff.contains(&target);
         tasks.spawn(async move {
-            let res =
-                forward_frame(&target, frame_type, &payload, key.as_ref(), auth.as_deref()).await;
+            let call = forward_frame(&target, frame_type, &payload, key.as_ref(), auth.as_deref());
+            let res = if trial {
+                match tokio::time::timeout(FANOUT_TRIAL_BUDGET, call).await {
+                    Ok(r) => r,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "peer in backoff did not answer within the trial budget",
+                    )),
+                }
+            } else {
+                call.await
+            };
             (target, res)
         });
     }
@@ -3854,10 +3891,12 @@ async fn forward_pubsub_all(
         let (target, res) = joined.expect("fan-out task cannot panic");
         match res {
             Ok(f) => {
+                note_fanout_success(state, &target).await;
                 querylog::sync_event(&state.sync_log, event, &target, None, true, None);
                 out.push(f);
             }
             Err(e) => {
+                note_fanout_failure(state, &target, &e).await;
                 eprintln!("pubsub replication to {target} failed: {e}");
                 querylog::sync_event(
                     &state.sync_log,
@@ -4265,6 +4304,29 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
 /// retries, and simultaneous joins break their mutual waits here.
 async fn handle_hold(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     let advertise = String::from_utf8_lossy(&frame.payload).trim().to_string();
+    // Validate BEFORE the write path freezes: an error after arming the hold
+    // would leave writes frozen until the 60s watchdog for no reason. The
+    // advertised address is validated and capped exactly like REQ_SYNC
+    // registration — in the token-less compatibility mode any client token
+    // can send REQ_HOLD, and a garbage address registered here would tax
+    // every write fan-out with a doomed connect/DNS attempt forever after.
+    if !advertise.is_empty() {
+        if parse_peer_addr(&advertise).is_none() {
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload("hold: advertise address must be host:port"),
+            );
+        }
+        if state.peers.lock().await.len() >= MAX_DYNAMIC_PEERS {
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload(&format!(
+                    "cluster join: peer list full ({MAX_DYNAMIC_PEERS}), \
+                     restart with an explicit DOCSQL_PEERS list"
+                )),
+            );
+        }
+    }
     let guard =
         match tokio::time::timeout(SYNC_HOLD_TIMEOUT, state.write_order.clone().lock_owned()).await
         {
@@ -6242,15 +6304,39 @@ mod security_tests {
         let e = authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &grants(false, &[]))
             .unwrap_err();
         assert!(e.contains("admin role"), "{e}");
-        // 深视图链 >16 拒绝(fail-closed)。
+        // 深视图链:fail-closed 现在分两层。引擎层拒建超过展开预算的链
+        // (16 节点,创建即拒——目录里不再存在查不了的链);授权层对整条
+        // 语句的总展开数另设上限,宽形状(引用多条独立链)同样触顶。
         db.execute("CREATE TABLE deep_base (id INT)").unwrap();
         db.execute("CREATE VIEW v0 AS SELECT id FROM deep_base")
             .unwrap();
-        for i in 1..20 {
+        for i in 1..=15 {
             db.execute(&format!("CREATE VIEW v{i} AS SELECT id FROM v{}", i - 1))
                 .unwrap();
         }
-        let p = parse("INSERT INTO mine SELECT * FROM v19");
+        // 第 17 层建不进去。
+        let e = db
+            .execute("CREATE VIEW v16 AS SELECT id FROM v15")
+            .unwrap_err();
+        assert!(e.to_string().contains("too deep"), "{e}");
+        // 16 节点单链:视图是授权边界,给基表授权即可通过。
+        let p = parse("INSERT INTO mine SELECT * FROM v15");
+        authorize_statement(
+            Some(&db),
+            &p.stmt,
+            &p.tx,
+            p.is_write,
+            &grants(false, &[("mine", PRIV_INSERT), ("deep_base", PRIV_SELECT)]),
+        )
+        .unwrap();
+        // 宽形状:三条独立链,总展开数超 16 被授权层拒绝。
+        db.execute("CREATE TABLE b2 (id INT)").unwrap();
+        db.execute("CREATE VIEW w0 AS SELECT id FROM b2").unwrap();
+        for i in 1..9 {
+            db.execute(&format!("CREATE VIEW w{i} AS SELECT id FROM w{}", i - 1))
+                .unwrap();
+        }
+        let p = parse("INSERT INTO mine SELECT * FROM v15, w8");
         let e = authorize_statement(
             Some(&db),
             &p.stmt,

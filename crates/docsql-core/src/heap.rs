@@ -179,6 +179,20 @@ fn load_page_owned(reader: &PageReader, tx: Option<&Tx>, id: u32) -> Result<Vec<
 /// `[mark][total:u32][chain_head:u32][inline prefix]` and the rest is
 /// assembled along the chain page list. Plain slots borrow the page; only
 /// overflow documents copy.
+/// Parse an overflow slot header (`0xFF | total:u32 | chain_head:u32`),
+/// failing loudly on truncation. Every path that decodes a slot starting
+/// with [`OVERFLOW_MARK`] — reads and the write paths that recycle chains
+/// (remove/replace) — goes through here, so a corrupt short slot can never
+/// reach the `content[5..9]` slice.
+fn overflow_slot_header(content: &[u8], page_id: u32) -> Result<(usize, u32)> {
+    if content.len() < OVERFLOW_SLOT_HEADER {
+        return Err(HeapError::Page(page_id, "overflow slot truncated"));
+    }
+    let total = u32::from_le_bytes(content[1..5].try_into().expect("4 bytes")) as usize;
+    let head = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
+    Ok((total, head))
+}
+
 fn slot_document_bytes<'a>(
     reader: &PageReader,
     tx: Option<&Tx>,
@@ -191,10 +205,7 @@ fn slot_document_bytes<'a>(
     if content.first() != Some(&OVERFLOW_MARK) {
         return Ok(Cow::Borrowed(content));
     }
-    if content.len() < OVERFLOW_SLOT_HEADER {
-        return Err(HeapError::Page(page_id, "overflow slot truncated"));
-    }
-    let total = u32::from_le_bytes(content[1..5].try_into().expect("4 bytes")) as usize;
+    let (total, mut next) = overflow_slot_header(content, page_id)?;
     // The write path enforces MAX_DOC_SIZE; the read path must too, or a
     // corrupt/hostile slot can drive a multi-GB allocation and a chain walk
     // sized by attacker-controlled `total`.
@@ -204,7 +215,6 @@ fn slot_document_bytes<'a>(
             "overflow chain corrupt (total exceeds max document size)",
         ));
     }
-    let mut next = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
     let mut out = content[OVERFLOW_SLOT_HEADER..].to_vec();
     let min_chunk = PAGE_SIZE - CHAIN_HEADER;
     let mut hops = 0usize;
@@ -553,7 +563,7 @@ impl Heap {
         // case the old chain is gone).
         if page[off] == OVERFLOW_MARK {
             let content = &page[off..off + len];
-            let head = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
+            let (_, head) = overflow_slot_header(content, page_id)?;
             recycle_chain(pager, tx, head, &mut self.overflow_free)?;
         }
         // Rebuild the page with the new document at the replaced document's
@@ -647,7 +657,7 @@ impl Heap {
                 // dies (they are unreachable afterwards).
                 if page[off] == OVERFLOW_MARK {
                     let content = &page[off..off + len];
-                    let head = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
+                    let (_, head) = overflow_slot_header(content, page_id)?;
                     recycle_chain(pager, tx, head, &mut self.overflow_free)?;
                 }
                 tombstone(&mut page, s);
@@ -1066,6 +1076,35 @@ mod tests {
             .scan(&PageReader::current(&pager))
             .expect_err("short chain must fail");
         assert!(format!("{err}").contains("short read"), "{err}");
+    }
+
+    #[test]
+    fn write_paths_reject_truncated_overflow_slots() {
+        let (_d, pager) = db("heap-wcorr.db");
+        {
+            let mut tx = pager.begin_tx();
+            pager.allocate_page(&mut tx).unwrap();
+            pager.commit_tx(tx).unwrap();
+        }
+        // A slot starting with the overflow mark but shorter than the
+        // 9-byte header: remove/replace used to slice content[5..9] and
+        // panic on the corrupt page; the shared header parse now refuses.
+        let region = vec![OVERFLOW_MARK, 0x01, 0x02, 0x03, 0x04, 0x05];
+        write_raw_page(&pager, 1, &craft_page(1, region));
+        let mut heap = Heap {
+            pages: vec![1],
+            overflow_free: Vec::new(),
+            dropped: Vec::new(),
+        };
+        let loc = crate::heap::pack_loc(1, 0);
+        let err = heap
+            .remove_many(&pager, &mut pager.begin_tx(), &[loc])
+            .expect_err("truncated overflow slot must fail on remove");
+        assert!(format!("{err}").contains("truncated"), "{err}");
+        let err = heap
+            .replace(&pager, &mut pager.begin_tx(), loc, &doc(9, "xxx"))
+            .expect_err("truncated overflow slot must fail on replace");
+        assert!(format!("{err}").contains("truncated"), "{err}");
     }
 
     #[test]

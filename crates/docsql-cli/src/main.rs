@@ -404,12 +404,40 @@ impl Remote {
             .write_all(&bytes)
             .and_then(|_| self.writer.flush())
             .map_err(|e| e.to_string())?;
+        // A server that accepts but never answers (wedged node, dead
+        // middlebox) must fail the script with a nonzero exit instead of
+        // hanging it forever. `DOCSQL_CLI_TIMEOUT_MS` overrides (0 =
+        // disable); the default stays clear of legitimate long queries.
+        let budget = match std::env::var("DOCSQL_CLI_TIMEOUT_MS") {
+            Ok(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
+            _ => Some(std::time::Duration::from_secs(600)),
+        };
         loop {
-            match self.queue.recv() {
+            let got = match budget {
+                Some(t) => match self.queue.recv_timeout(t) {
+                    Ok(f) => Some(Ok(f)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(Err(())),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                },
+                None => match self.queue.recv() {
+                    Ok(f) => Some(Ok(f)),
+                    Err(_) => Some(Err(())),
+                },
+            };
+            match got {
                 // Defensive: pushes normally print in the reader thread.
-                Ok(f) if f.frame_type == proto::RESP_PUSH => continue,
-                Ok(f) => return Ok(f),
-                Err(_) => return Err("connection closed".to_string()),
+                Some(Ok(f)) if f.frame_type == proto::RESP_PUSH => continue,
+                Some(Ok(f)) => return Ok(f),
+                Some(Err(())) => return Err("connection closed".to_string()),
+                None => {
+                    return Err("no response within the response budget \
+                         (set DOCSQL_CLI_TIMEOUT_MS to adjust, 0 disables)"
+                        .to_string())
+                }
             }
         }
     }
@@ -940,10 +968,24 @@ pub fn render_csv(r: &QueryResult) -> String {
 }
 
 fn csv_cell(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    // CSV formula injection guard: a cell starting with =, +, -, @ (or a
+    // tab/CR, which Excel also treats as formula introducers) would execute
+    // in Excel/LibreOffice/Sheets when the exported file is opened. A stored
+    // `=WEBSERVICE(...)` from any writer must not run on the analyst's
+    // machine — prefix a quote, the standard neutralizer.
+    let needs_guard = s
+        .as_bytes()
+        .first()
+        .is_some_and(|c| matches!(c, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'));
+    let guarded: std::borrow::Cow<str> = if needs_guard {
+        std::borrow::Cow::Owned(format!("'{s}"))
     } else {
-        s.to_string()
+        std::borrow::Cow::Borrowed(s)
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded.into_owned()
     }
 }
 

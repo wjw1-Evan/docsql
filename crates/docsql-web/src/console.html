@@ -3075,8 +3075,10 @@ const explorer = {
   },
 
   createScript(m) {
+    // 标识符一律加引号(与建表/编辑对话框同一纪律):表/列名含空格、
+    // 引号或分号时,裸拼的脚本轻则解析失败,重则被整段执行成注入。
     const cols = m.columns.map(c => {
-      let s = `  ${c.name} ${c.data_type || 'ANY'}`;
+      let s = `  "${qident(c.name)}" ${c.data_type || 'ANY'}`;
       if (c.primary_key) s += ' PRIMARY KEY';
       if (c.unique) s += ' UNIQUE';
       if (!c.nullable) s += ' NOT NULL';
@@ -3084,12 +3086,15 @@ const explorer = {
       if (c.default) s += ` DEFAULT ${c.default}`;
       return s;
     }).join(',\n');
-    let s = T('-- 表 {0}({1} 行,{2} 页)', m.name, m.row_count, m.pages) + `\nCREATE TABLE ${m.name} (\n${cols}\n);`;
+    // 表名进注释前剥掉换行:否则一个含换行的表名能把注释提前收线,
+    // 后半截名字作为 SQL 执行。
+    const safeName = String(m.name).replace(/[\r\n]+/g, ' ');
+    let s = T('-- 表 {0}({1} 行,{2} 页)', safeName, m.row_count, m.pages) + `\nCREATE TABLE "${qident(m.name)}" (\n${cols}\n);`;
     // 索引 DDL 用 index_defs 还原列与唯一性(仅名字不足以重建)。
     const defs = m.index_defs || [];
     for (const i of m.indexes) {
       const d = defs.find(x => x.name === i);
-      s += `\nCREATE ${d && d.unique ? 'UNIQUE ' : ''}INDEX ${i} ON ${m.name} (${d ? d.column : (m.columns[0] ? m.columns[0].name : '*')});`;
+      s += `\nCREATE ${d && d.unique ? 'UNIQUE ' : ''}INDEX "${qident(i)}" ON "${qident(m.name)}" (${d ? d.column.split(',').map(c => `"${qident(c.trim())}"`).join(', ') : (m.columns[0] ? `"${qident(m.columns[0].name)}"` : '*')});`;
     }
     return s;
   }

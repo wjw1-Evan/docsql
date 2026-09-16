@@ -438,8 +438,9 @@ async fn api_metrics(
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    // Scrape every known node in parallel — one wedged node must not stall
-    // the whole scrape past the probe budget.
+    // Scrape every known node in parallel on the probe budget — one wedged
+    // node reports `docsql_node_up 0` instead of stalling the whole scrape
+    // past a Prometheus scrape_timeout.
     let mut nodes: Vec<String> = Vec::new();
     if let Some(u) = state.upstream.as_deref().filter(|u| !u.is_empty()) {
         nodes.push(u.to_string());
@@ -455,7 +456,7 @@ async fn api_metrics(
         set.spawn(async move {
             (
                 addr.clone(),
-                remote_status_full(&addr, token.as_deref()).await,
+                remote_status_full_probed(&addr, token.as_deref()).await,
             )
         });
     }
@@ -1058,10 +1059,16 @@ async fn auth_change(
         Err(auth::ChangeError::Invalid(msg)) => {
             json_response(StatusCode::BAD_REQUEST, json!({"error": msg}))
         }
-        Err(auth::ChangeError::Io(msg)) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": format!("凭据写入失败:{msg}")}),
-        ),
+        Err(auth::ChangeError::Io(msg)) => {
+            // Same discipline as auth_setup: the raw io error names host
+            // paths and volume layout — log it server-side, hand the client
+            // the generic text.
+            eprintln!("auth change: credential write failed: {msg}");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "凭据写入失败,请检查控制台存储卷(详见服务端日志)"}),
+            )
+        }
     }
 }
 
@@ -1236,6 +1243,13 @@ fn build_user_admin_statement(b: &UsersActionBody) -> Result<String, String> {
         let len = p.chars().count();
         if !(8..=256).contains(&len) {
             return Err(format!("密码长度必须为 8-256 个字符(当前 {len})"));
+        }
+        // The engine treats this prefix as an already-hashed credential
+        // (replication replay form): a plaintext starting with it would be
+        // stored as-is and the account could never log in again. Reject up
+        // front with a clear message.
+        if p.starts_with("$pbkdf2-sha256") {
+            return Err("密码不能以 $pbkdf2-sha256 开头(该前缀保留给引擎的哈希回写)".into());
         }
         Ok(p.clone())
     };
@@ -2064,6 +2078,18 @@ pub async fn remote_status_full(addr: &str, token: Option<&str>) -> serde_json::
         }
         .await,
     )
+}
+
+/// [`remote_status_full`] on the probe budget (2s connect / 3s IO): the
+/// /metrics scrape must answer well inside a Prometheus scrape_timeout, and
+/// a wedged node must surface as `docsql_node_up 0` — not stall the whole
+/// scrape for the management channel's 90s IO budget. The probe path
+/// carries the same authenticated REQ_STATUS exchange.
+pub async fn remote_status_full_probed(addr: &str, token: Option<&str>) -> serde_json::Value {
+    match probe_node_inner(addr, token).await {
+        Ok((_, status)) => status,
+        Err((_, message)) => serde_json::json!({ "error": message }),
+    }
 }
 
 /// Fetch a managed node's backup report / trigger a backup (REQ_BACKUP).
