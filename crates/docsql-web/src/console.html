@@ -11,6 +11,12 @@
   if (t !== 'dark' && t !== 'light')
     t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
   document.documentElement.dataset.theme = t; })();
+/* 语言引导:与主题同理,首帧前定 <html lang>。手动切换过(有存储值)用
+   存储值,否则跟随浏览器语言(非 zh 开头一律英文)。 */
+(() => { let l = null; try { l = localStorage.getItem('docsql.lang'); } catch (e) {}
+  if (l !== 'zh' && l !== 'en')
+    l = (navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en';
+  document.documentElement.lang = l; })();
 </script>
 <style>
   /* ============ DocSQL Studio(SSMS 风格)============ */
@@ -392,39 +398,40 @@
 
 <div id="menubar">
   <span class="brand"><span class="brand-glyph" id="brand-glyph"></span>DocSQL <small>Studio</small></span>
-  <div class="menu" data-menu><span>文件</span><div class="menu-drop">
-    <div data-act="new-query">新建查询<span class="kbd">Ctrl+N</span></div>
-    <div data-act="new-table">新建表…</div>
+  <div class="menu" data-menu><span><span data-i18n>文件</span></span><div class="menu-drop">
+    <div data-act="new-query"><span data-i18n>新建查询</span><span class="kbd">Ctrl+N</span></div>
+    <div data-act="new-table"><span data-i18n>新建表…</span></div>
     <hr>
-    <div data-act="close-tab">关闭当前文档</div>
-    <div data-act="account" style="display:none">修改账号…</div>
-    <div data-act="logout" style="display:none">退出登录</div>
+    <div data-act="close-tab"><span data-i18n>关闭当前文档</span></div>
+    <div data-act="account" style="display:none"><span data-i18n>修改账号…</span></div>
+    <div data-act="logout" style="display:none"><span data-i18n>退出登录</span></div>
   </div></div>
-  <div class="menu" data-menu><span>视图</span><div class="menu-drop">
-    <div data-act="refresh">刷新对象资源管理器<span class="kbd">Ctrl+R</span></div>
-    <div data-act="dashboard">服务器仪表盘</div>
-    <div data-act="cluster">集群状态</div>
-    <div data-act="logs">日志</div>
-    <div data-act="backup">备份管理</div>
+  <div class="menu" data-menu><span><span data-i18n>视图</span></span><div class="menu-drop">
+    <div data-act="refresh"><span data-i18n>刷新对象资源管理器</span><span class="kbd">Ctrl+R</span></div>
+    <div data-act="dashboard"><span data-i18n>服务器仪表盘</span></div>
+    <div data-act="cluster"><span data-i18n>集群状态</span></div>
+    <div data-act="logs"><span data-i18n>日志</span></div>
+    <div data-act="backup"><span data-i18n>备份管理</span></div>
   </div></div>
-  <div class="menu" data-menu><span>帮助</span><div class="menu-drop">
-    <div data-act="about">关于 DocSQL Studio</div>
+  <div class="menu" data-menu><span><span data-i18n>帮助</span></span><div class="menu-drop">
+    <div data-act="about"><span data-i18n>关于 DocSQL Studio</span></div>
   </div></div>
 </div>
 
 <div id="toolbar">
-  <span title="连接状态" id="conn-dot">●</span>
+  <span title="连接状态" data-i18n-title id="conn-dot">●</span>
   <div class="sep"></div>
-  <span style="color:var(--txt2)">节点</span>
-  <select id="nodesel" style="display:none;max-width:190px" title="切换管理的节点:默认节点(控制台启动时指定的管理目标)或 DOCSQL_PEERS 集群节点。控制台不存数据,所有操作以数据库客户端身份连接所选节点执行,认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
+  <span style="color:var(--txt2)"><span data-i18n>节点</span></span>
+  <select id="nodesel" style="display:none;max-width:190px" data-i18n-title title="切换管理的节点:默认节点(控制台启动时指定的管理目标)或 DOCSQL_PEERS 集群节点。控制台不存数据,所有操作以数据库客户端身份连接所选节点执行,认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线"></select>
   <div class="sep"></div>
-  <button id="btn-newq" title="新建查询编辑器 (Ctrl+N)"><span class="tb-ico" data-ico="query"></span>新建查询</button>
-  <button id="btn-exec" class="primary" title="执行 (F5)"><span class="tb-ico" data-ico="run"></span>执行</button>
-  <button id="btn-parse" title="分析 (Ctrl+F5) — 仅语法检查,不执行">分析</button>
+  <button id="btn-newq" data-i18n-title title="新建查询编辑器 (Ctrl+N)"><span class="tb-ico" data-ico="query"></span><span data-i18n>新建查询</span></button>
+  <button id="btn-exec" class="primary" data-i18n-title title="执行 (F5)"><span class="tb-ico" data-ico="run"></span><span data-i18n>执行</span></button>
+  <button id="btn-parse" data-i18n-title title="分析 (Ctrl+F5) — 仅语法检查,不执行"><span data-i18n>分析</span></button>
   <div class="sep"></div>
-  <button id="btn-refresh" title="刷新对象资源管理器 (Ctrl+R)"><span class="tb-ico" data-ico="refresh"></span>刷新</button>
+  <button id="btn-refresh" data-i18n-title title="刷新对象资源管理器 (Ctrl+R)"><span class="tb-ico" data-ico="refresh"></span><span data-i18n>刷新</span></button>
   <div class="spacer"></div>
-  <button id="btn-theme" title="切换浅色 / 深色主题(首次进入跟随系统偏好)"><span class="tb-ico" id="theme-ico"></span></button>
+  <button id="btn-lang" title="切换界面语言 / Switch UI language"><span class="tb-ico" id="lang-ico"></span><span id="lang-label">EN</span></button>
+  <button id="btn-theme" data-i18n-title title="切换浅色 / 深色主题(首次进入跟随系统偏好)"><span class="tb-ico" id="theme-ico"></span></button>
   <span id="tb-server" style="color:var(--txt3)"></span>
 </div>
 
@@ -433,28 +440,28 @@
   <div class="dialog" style="min-width:380px">
     <h3 id="auth-title">登录 DocSQL Studio</h3>
     <div class="body">
-      <div class="row"><label>用户名</label><input type="text" id="auth-user" autocomplete="username"></div>
-      <div class="row"><label>密码</label><input type="password" id="auth-pass" autocomplete="current-password"></div>
-      <div class="row" id="auth-confirm-row" style="display:none"><label>确认密码</label><input type="password" id="auth-confirm" autocomplete="new-password"></div>
+      <div class="row"><label data-i18n>用户名</label><input type="text" id="auth-user" autocomplete="username"></div>
+      <div class="row"><label data-i18n>密码</label><input type="password" id="auth-pass" autocomplete="current-password"></div>
+      <div class="row" id="auth-confirm-row" style="display:none"><label data-i18n>确认密码</label><input type="password" id="auth-confirm" autocomplete="new-password"></div>
       <div class="hint" id="auth-hint"></div>
       <div class="err-line" id="auth-err"></div>
     </div>
-    <div class="foot"><button id="auth-ok" class="primary">登录</button></div>
+    <div class="foot"><button id="auth-ok" class="primary"><span data-i18n>登录</span></button></div>
   </div>
 </div>
 
 <div id="main">
   <div id="explorer">
     <div class="panel-title">
-      <span class="tb-ico" data-ico="explorer"></span>对象资源管理器
+      <span class="tb-ico" data-ico="explorer"></span><span data-i18n>对象资源管理器</span>
       <span class="mini">
-        <button id="exp-newtable" title="新建表">＋表</button>
-        <button id="exp-collapse" title="全部折叠">⊖</button>
+        <button id="exp-newtable" data-i18n-title title="新建表"><span data-i18n>＋表</span></button>
+        <button id="exp-collapse" data-i18n-title title="全部折叠">⊖</button>
       </span>
     </div>
     <div id="tree"></div>
   </div>
-  <div class="splitter v" id="split-explorer" title="拖动调整对象资源管理器宽度,双击恢复默认"></div>
+  <div class="splitter v" id="split-explorer" data-i18n-title title="拖动调整对象资源管理器宽度,双击恢复默认"></div>
   <div id="docarea">
     <div id="tabstrip"></div>
     <div id="tabcontent"></div>
@@ -462,11 +469,11 @@
 </div>
 
 <div id="statusbar">
-  <span id="st-conn">未连接</span>
+  <span id="st-conn" data-i18n>未连接</span>
   <span id="st-server">DocSQL</span>
   <span id="st-last" style="display:none"></span>
   <span class="grow"></span>
-  <span id="st-ready">就绪</span>
+  <span id="st-ready" data-i18n>就绪</span>
 </div>
 
 <div id="ctxmenu"></div>
@@ -481,12 +488,336 @@ const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // 引用标识符转义:表名等进入 "..." 时,内嵌 " 必须加倍,否则注入/断句。
 const qident = (s) => String(s).replace(/"/g, '""');
+
+/* ================= 多语言(中文 / English)================= */
+// 源语言是中文:界面文本以中文字符串本身为键,EN 只维护英文翻译,缺失键
+// 回退中文(永不出现 undefined 文案)。语言存 localStorage('docsql.lang'),
+// 未手动选择过则跟随浏览器语言(<head> 引导脚本已定 <html lang>)。
+// 切换即时生效:静态文本 data-i18n 重排 + 已打开标签页按各自 load/render
+// 重渲染,不刷新页面、不丢查询编辑器内容。
+let LANG = document.documentElement.lang === 'en' ? 'en' : 'zh';
+const EN = {
+  /* —— 通用 —— */
+  '取消': 'Cancel', '保存': 'Save', '创建': 'Create', '删除': 'Delete', '关闭': 'Close',
+  '刷新': 'Refresh', '确定': 'OK', '执行': 'Execute', '分析': 'Analyze', '编辑': 'Edit',
+  '删除该行': 'Delete Row', '恢复': 'Restore', '移除': 'Remove', '授予': 'Grant',
+  '登录': 'Sign In', '是': 'Yes', '否': 'No', '成功': 'Success', '失败': 'Failed', '无': 'None',
+  '表': 'Tables', '列': 'Columns', '值': 'Value', '键': 'Keys', '索引': 'Indexes',
+  '节点': 'Node', '默认': 'Default', '数据': 'Data', '同步': 'Sync', '复制': 'Replicated',
+  '时间': 'Time', '来源': 'Source', '类别': 'Category', '内容': 'Content', '结果': 'Results',
+  '操作': 'Actions', '大小': 'Size', '说明': 'Description', '成员': 'Members',
+  '用户': 'Users', '角色': 'Roles', '用户名': 'Username', '密码': 'Password',
+  '状态': 'Status', '延迟': 'Latency', '行数': 'Rows', '备注': 'Notes', '运行时长': 'Uptime',
+  '表名': 'Table Name', '索引名': 'Index Name', '角色名': 'Role Name', '列名': 'Column Name',
+  '类型': 'Type', '默认值': 'Default', '确认密码': 'Confirm Password', '新密码': 'New Password',
+  '当前密码': 'Current Password', '新用户名': 'New Username', '确认新密码': 'Confirm New Password',
+  '插入': 'Insert', '创建账号并进入': 'Create Account & Enter',
+  /* —— 菜单栏 / 工具栏 —— */
+  '文件': 'File', '新建查询': 'New Query', '新建表…': 'New Table…', '关闭当前文档': 'Close Current Document',
+  '修改账号…': 'Account Settings…', '退出登录': 'Sign Out', '视图': 'View',
+  '刷新对象资源管理器': 'Refresh Object Explorer', '服务器仪表盘': 'Server Dashboard',
+  '集群状态': 'Cluster Status', '日志': 'Logs', '备份管理': 'Backup Management',
+  '帮助': 'Help', '关于 DocSQL Studio': 'About DocSQL Studio', '连接状态': 'Connection status',
+  'DocSQL Studio — 管理控制台': 'DocSQL Studio — Management Console',
+  '新建查询编辑器 (Ctrl+N)': 'New query editor (Ctrl+N)',
+  '执行 (F5)': 'Execute (F5)',
+  '分析 (Ctrl+F5) — 仅语法检查,不执行': 'Analyze (Ctrl+F5) — syntax check only, nothing runs',
+  '刷新对象资源管理器 (Ctrl+R)': 'Refresh Object Explorer (Ctrl+R)',
+  '切换浅色 / 深色主题(首次进入跟随系统偏好)': 'Toggle light / dark theme (follows system preference on first visit)',
+  '拖动调整对象资源管理器宽度,双击恢复默认': 'Drag to resize Object Explorer; double-click to reset',
+  '拖动调整编辑器与结果区高度,双击恢复默认': 'Drag to resize editor and results; double-click to reset',
+  '切换管理的节点:默认节点(控制台启动时指定的管理目标)或 DOCSQL_PEERS 集群节点。控制台不存数据,所有操作以数据库客户端身份连接所选节点执行,认证使用服务端配置的 DOCSQL_TOKEN,● 在线 ○ 离线': 'Switch the managed node: the default node (the management target given at console startup) or nodes from DOCSQL_PEERS. The console stores no data — every operation connects to the selected node as a database client, authenticated with the server-side DOCSQL_TOKEN. ● online ○ offline',
+  /* —— 状态栏 / 连接 —— */
+  '未连接': 'Not Connected', '就绪': 'Ready', '未授权': 'Unauthorized',
+  '已连接 {0}': 'Connected to {0}',
+  '会话已过期,请重新登录': 'Session expired; please sign in again',
+  '未授权:请求被拒绝': 'Unauthorized: request denied',
+  '响应不是有效 JSON(HTTP {0})': 'Response is not valid JSON (HTTP {0})',
+  /* —— 登录 / 控制台账号 —— */
+  '登录 DocSQL Studio': 'Sign in to DocSQL Studio',
+  '初始设置 — 创建控制台账号': 'Initial Setup — Create Console Account',
+  '首次使用:设置控制台的用户名与密码(至少 8 位)。账号保存在控制台凭据文件中,数据本身仍全部位于数据库节点。': 'First use: set the console username and password (at least 8 characters). The account lives in the console credential file; the data itself stays entirely on the database nodes.',
+  '请以 {0} 登录': 'Sign in as {0}', '控制台账号': 'the console account',
+  '请输入用户名与密码': 'Please enter username and password',
+  '两次输入的密码不一致': 'Passwords do not match',
+  '两次输入的新密码不一致': 'New passwords do not match',
+  '失败({0})': 'Failed ({0})', '请求失败:{0}': 'Request failed: {0}',
+  '修改控制台账号': 'Console Account Settings',
+  '留空则不修改密码': 'Leave blank to keep the current password',
+  '修改密码后,其他已登录的会话将全部退出,当前浏览器会话保持不变。账号保存在控制台凭据文件中,与数据库用户无关。': 'After a password change, all other signed-in sessions are signed out; the current browser session stays signed in. The account lives in the console credential file and is unrelated to database users.',
+  '请输入当前密码': 'Please enter the current password',
+  '请输入新用户名': 'Please enter a new username',
+  '新密码至少 8 个字符': 'New password must be at least 8 characters',
+  '账号已更新': 'Account updated',
+  /* —— 关于 —— */
+  '节点 {0}': 'Node {0}', '默认节点({0})': 'Default node ({0})', '默认节点(未配置)': 'Default node (not configured)',
+  '默认节点': 'Default node',
+  '未知(对象资源管理器尚未刷新)': 'Unknown (Object Explorer not refreshed yet)', '未知': 'Unknown',
+  '对象资源管理器': 'Object Explorer', '查询工作台': 'Query Workbench', '数据网格': 'Data Grid',
+  '表结构编辑': 'Table Schema Editor', 'JSON 插入': 'JSON Insert', '仪表盘': 'Dashboard',
+  '备份恢复': 'Backup & Restore', '用户与角色': 'Users & Roles',
+  '文档数据库管理控制台 v{0}': 'Document database management console v{0}',
+  'DocSQL 是 Rust 原生文档数据库:JSON 文档整体存储、完整 SQL、对称集群复制与持久化发布订阅。本控制台是纯管理工具、自身零存储 —— 全部操作以数据库客户端身份连接管理节点执行。': 'DocSQL is a Rust-native document database: JSON documents stored as a whole, full SQL, symmetric cluster replication and persistent publish/subscribe. This console is a pure management tool with zero storage of its own — every operation connects to the management node as a database client.',
+  '主要能力': 'Key Capabilities', '连接与版本': 'Connection & Version',
+  '管理目标': 'Target', '服务端': 'Server', '控制台': 'Console',
+  '零存储': 'zero storage', '项目主页': 'Project homepage', '复制诊断信息': 'Copy Diagnostics',
+  '复制失败:浏览器不支持剪贴板': 'Copy failed: the browser does not support the clipboard',
+  '诊断信息已复制到剪贴板': 'Diagnostics copied to clipboard',
+  '复制失败:{0}': 'Copy failed: {0}',
+  '管理目标: {0}': 'Target: {0}', '服务端: {0}': 'Server: {0}', '页面: {0}': 'Page: {0}', '浏览器: {0}': 'Browser: {0}',
+  /* —— 单位 / 时长 —— */
+  '{0}天{1}时{2}分': '{0}d {1}h {2}m', '{0}时{1}分': '{0}h {1}m', '{0}分{1}秒': '{0}m {1}s', '{0}秒': '{0}s',
+  '张': 'tables', '行': 'rows', '个': '', '页': 'pages', '份': '', '天': 'd', '秒': 's',
+  '条语句': 'statements', '{0} 表': '{0} tables', '{0} 行': '{0} rows',
+  /* —— 主题 / 节点切换 —— */
+  '已切换到深色主题': 'Switched to dark theme', '已切换到浅色主题': 'Switched to light theme',
+  '默认节点 ({0})': 'Default node ({0})',
+  '已切换到节点 {0},对象资源管理器已刷新': 'Switched to node {0}; Object Explorer refreshed',
+  '已切换到默认节点 {0}': 'Switched to default node {0}',
+  '已切换到默认节点': 'Switched to default node',
+  '对象资源管理器宽度已恢复默认': 'Object Explorer width reset to default',
+  '编辑器高度已恢复默认比例': 'Editor height reset to default ratio',
+  '当前没有查询窗口': 'No active query window',
+  /* —— 表格弹窗族(新建/编辑表、插入文档、行编辑)—— */
+  "如 'abc'、7、true": "e.g. 'abc', 7, true",
+  'DEFAULT:SQL 字面量,字符串需带单引号;留空表示无默认值': 'DEFAULT: SQL literal; strings need single quotes; leave empty for no default',
+  'DEFAULT:SQL 字面量,字符串需带单引号;已有列的默认值不可在线修改': 'DEFAULT: SQL literal; strings need single quotes; defaults of existing columns cannot be changed online',
+  '删除此列': 'Remove this column', '如 users': 'e.g. users', '主键': 'Primary key', '非空': 'Not null', '自增': 'Auto-inc',
+  '+ 添加列': '+ Add Column',
+  'GUID + AUTO:主键自动生成时序有序 UUIDv7(INSERT 省略即可);INT + AUTO 为自增整数。其余类型仅作文档用途(无模式文档存储,类型不被强制);PK 不隐含 NOT NULL,勾选 PK 会自动勾上 NOT NULL。默认值填 SQL 字面量(字符串需带引号,如 \'n/a\';数字/布尔直接写),INSERT 省略该列时自动填入。': 'GUID + AUTO: the primary key auto-generates time-ordered UUIDv7 (just omit it in INSERT); INT + AUTO is an auto-increment integer. Other types are documentation only (schemaless document storage, types are not enforced); PK does not imply NOT NULL — checking PK also checks NOT NULL (you can uncheck). Defaults take SQL literals (quote strings, e.g. \'n/a\'; write numbers/booleans directly) and are filled in when INSERT omits the column.',
+  '请输入表名': 'Please enter a table name', '至少需要一列': 'At least one column is required',
+  '存在空列名': 'Empty column name found', '列名重复:{0}': 'Duplicate column name: {0}',
+  '正在创建表 {0}…': 'Creating table {0}…', '创建失败': 'Creation failed', '已创建表 {0}': 'Table {0} created',
+  '没有表元数据,先刷新对象资源管理器': 'No table metadata; refresh Object Explorer first',
+  '已有列的类型/约束/默认值不可在线修改(引擎不支持 ALTER COLUMN SET DEFAULT;如需变更请重建表)': 'Type/constraints/default of existing columns cannot be changed online (the engine does not support ALTER COLUMN SET DEFAULT; rebuild the table to change them)',
+  'ADD COLUMN 不支持主键': 'ADD COLUMN does not support primary keys',
+  'ADD COLUMN 不支持自增': 'ADD COLUMN does not support auto-increment',
+  '主键列不能删除': 'Primary key columns cannot be removed',
+  '重命名表请使用 ALTER TABLE ... RENAME TO': 'To rename the table, use ALTER TABLE ... RENAME TO',
+  '编辑表 — {0}': 'Edit Table — {0}',
+  '已有列可改名与删除(主键列除外),类型/约束/默认值不可在线修改;新增列支持类型 + 默认值 + NOT NULL(带默认值时自动回填存量行,NOT NULL 必须带默认值;ADD COLUMN 不支持 PK/UNIQUE/自增)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。': 'Existing columns can be renamed or removed (except primary key columns); their type/constraints/default cannot be changed online. New columns support type + default + NOT NULL (existing rows are backfilled with the default; NOT NULL requires a default; ADD COLUMN supports no PK/UNIQUE/auto-increment). Changes run in "rename → drop → add" order; statements before a failure have already taken effect.',
+  '新增 NOT NULL 列 {0} 必须填默认值': 'New NOT NULL column {0} requires a default value',
+  '没有变更': 'No changes', '正在更新表 {0}…': 'Updating table {0}…', '保存失败': 'Save failed',
+  '部分保存': 'Partially saved',
+  '第 {0} 条失败:{1}(其前的语句已生效)': 'Statement {0} failed: {1} (earlier statements have taken effect)',
+  '已更新表 {0}': 'Table {0} updated',
+  '插入文档 — {0}': 'Insert Document — {0}',
+  '输入 JSON 文档:对象插入一行,数组批量插入多行。允许包含未在表结构中声明的字段(文档式存储)。': 'Enter a JSON document: an object inserts one row, an array inserts rows in batch. Fields not declared in the table schema are allowed (document-style storage).',
+  'Ctrl+Enter 插入': 'Ctrl+Enter to insert',
+  'JSON 解析失败:{0}': 'JSON parse error: {0}', '数组为空': 'Array is empty',
+  '需要 JSON 对象(或对象数组)': 'A JSON object (or array of objects) is required',
+  '存在空对象 {}': 'Empty object {} found',
+  '正在插入 {0} 行到 {1}…': 'Inserting {0} rows into {1}…', '插入失败': 'Insert failed',
+  '第 {0} 条:{1}': 'Statement {0}: {1}',
+  '已插入 {0} 行到 {1}': 'Inserted {0} rows into {1}',
+  '自增列不可在线修改': 'Auto-increment columns cannot be edited online',
+  '无法定位该行:主键列不在查询结果中': 'Cannot locate the row: primary key columns are missing from the result',
+  '自增列不可修改': 'Auto-increment columns are read-only', '值为 NULL': 'Value is NULL',
+  '编辑行 — {0}': 'Edit Row — {0}',
+  '按主键定位该行并执行 UPDATE(集群按写路径扇出)。勾选 NULL 的值保存为 NULL;自增列只读。': 'Locates the row by primary key and runs UPDATE (fanned out through the cluster write path). Values with NULL checked are saved as NULL; auto-increment columns are read-only.',
+  '列 {0}:需要数值(或勾选 NULL)': 'Column {0}: a number is required (or check NULL)',
+  '列 {0}:不是有效数值': 'Column {0}: not a valid number',
+  '没有可修改的列': 'No editable columns', '正在更新 {0}…': 'Updating {0}…',
+  '更新失败': 'Update failed', '已更新该行': 'Row updated',
+  '删除行': 'Delete Row', '执行并沿集群写路径扇出,不可撤销:': 'Executes and fans out through the cluster write path; this cannot be undone:',
+  '正在删除…': 'Deleting…', '删除失败': 'Delete failed', '已删除该行': 'Row deleted',
+  /* —— 索引 —— */
+  '列 {0} 存在重复值(如 {1}),无法创建 UNIQUE 索引': 'Column {0} has duplicate values (e.g. {1}); cannot create a UNIQUE index',
+  '表 {0} 没有声明列,无法管理索引': 'Table {0} has no declared columns; cannot manage indexes',
+  '表 {0} 没有声明列,无法创建索引': 'Table {0} has no declared columns; cannot create an index',
+  '修改索引': 'Modify Index', '新建索引': 'New Index', '如 idx_{0}': 'e.g. idx_{0}',
+  'UNIQUE(拒绝重复值;NULL 不算重复)': 'UNIQUE (rejects duplicate values; NULLs do not count as duplicates)',
+  '仅支持单列索引。': 'Only single-column indexes are supported. ',
+  '修改按新定义重建:改名时先建新索引再删旧的(建新失败则原索引保持不变);同名修改先校验数据,再以「删旧 → 建新」重建。': 'Modifying rebuilds with the new definition: on rename the new index is created first and the old one dropped after (if creation fails, the original index stays); same-name changes validate the data first, then rebuild as "drop old → create new".',
+  'UNIQUE 索引创建时会校验既有数据,存在重复值将被拒绝。': 'Creating a UNIQUE index validates existing data; duplicates are rejected.',
+  '重建': 'Rebuild', '重建索引失败': 'Failed to rebuild index', '创建索引失败': 'Failed to create index',
+  '请输入索引名': 'Please enter an index name',
+  '索引名 {0} 已被占用(索引名为全库命名空间)': 'Index name {0} is already taken (index names are database-global)',
+  '正在创建索引 {0}…': 'Creating index {0}…',
+  '已创建索引 {0}({1}.{2})': 'Index {0} created ({1}.{2})',
+  '未修改任何内容': 'Nothing modified',
+  '正在重建索引 {0} → {1}…': 'Rebuilding index {0} → {1}…',
+  '新索引 {0} 已创建,但删除旧索引 {1} 失败:{2}': 'New index {0} created, but dropping old index {1} failed: {2}',
+  '已重建索引 {0} → {1}': 'Index {0} → {1} rebuilt',
+  '正在重建索引 {0}…': 'Rebuilding index {0}…',
+  '旧索引已删除,但新定义创建失败:{0}': 'Old index dropped, but creating the new definition failed: {0}',
+  '删除旧索引失败:{0}': 'Dropping the old index failed: {0}',
+  '已按新定义重建索引 {0}({1}.{2})': 'Index {0} rebuilt with the new definition ({1}.{2})',
+  '未找到该索引的定义,请刷新对象资源管理器后重试': 'Index definition not found; refresh Object Explorer and retry',
+  '删除索引': 'Drop Index', '输入索引名以确认': 'Type the index name to confirm',
+  '索引名不匹配': 'Index name does not match',
+  '已删除索引 {0}({1})': 'Index {0} dropped ({1})',
+  '编写索引脚本为 CREATE TO →': 'Script Index as CREATE →',
+  '复制名称': 'Copy Name', '已复制:{0}': 'Copied: {0}', '选择前 100 行': 'Select Top 100 Rows',
+  '-- 未找到索引 {0} 的定义': '-- Definition of index {0} not found',
+  '-- {0}:由表 {1} 的 {2} 约束自动创建(列 {3})。': '-- {0}: auto-created by the {2} constraint of table {1} (column {3}).',
+  '-- 随表定义创建与维护,不能单独创建、修改或删除;调整约束请编辑表定义。': '-- Created and maintained with the table definition; it cannot be created, altered or dropped independently. To change the constraint, edit the table definition.',
+  /* —— 查询页 —— */
+  '查询 {0}': 'Query {0}', '查询: {0}': 'Query: {0}', '系统表: {0}': 'System Table: {0}', '脚本: {0}': 'Script: {0}',
+  'Ctrl+F5 — 语法检查,不执行': 'Ctrl+F5 — syntax check only, nothing runs',
+  '仅执行选中文本': 'Execute selected text only', '执行所选': 'Execute Selection',
+  'F5 执行 · Ctrl+F5 分析 · 批量语句将依次执行并返回全部结果': 'F5 execute · Ctrl+F5 analyze · batch statements run in order and return all results',
+  '消息': 'Messages',  '没有可执行的 SQL': 'No SQL to execute', '正在执行查询…': 'Executing query…', '执行失败': 'Execution failed',
+  '结果 {0}({1} 行)': 'Result {0} ({1} rows)', '({0} 行)': '({0} rows)', ' — 结果 {0}': ' — result {0}',
+  '({0} 行受影响)': '({0} rows affected)', '错误:{0}': 'Error: {0}',
+  '批处理在语句 {0} 处停止:{1}': 'Batch stopped at statement {0}: {1}',
+  '总耗时: {0} ms': 'Total time: {0} ms',
+  '命令已成功完成。总耗时: {0} ms': 'Commands completed successfully. Total time: {0} ms',
+  '查询完成(有错误)· 耗时 {0} ms · {1} 行': 'Query finished (with errors) · {0} ms · {1} rows',
+  '查询已成功执行 · 耗时 {0} ms · {1} 行': 'Query executed successfully · {0} ms · {1} rows',
+  '没有可分析的 SQL': 'No SQL to analyze',
+  '分析完成: 未检测到语法错误。': 'Analysis complete: no syntax errors detected.',
+  '分析通过:无语法错误': 'Analysis passed: no syntax errors',
+  '分析失败: {0}': 'Analysis failed: {0}', '分析失败(见消息页)': 'Analysis failed (see Messages)',
+  /* —— 数据页 / 删表 —— */
+  '表: {0}': 'Table: {0}', '◀ 上一页': '◀ Prev', '下一页 ▶': 'Next ▶',
+  '编辑表结构(列编辑网格)': 'Edit table schema (column grid)', '编辑表…': 'Edit Table…',
+  '插入文档(JSON)': 'Insert document (JSON)', '插入文档…': 'Insert Document…',
+  '生成查询': 'Generate Query', '删除表…': 'Drop Table…',
+  '(空表)': '(empty table)', '第 {0}–{1} 行,共 {2} 行': 'Rows {0}–{1} of {2}',
+  '正在加载 {0}…': 'Loading {0}…',
+  '编辑此行(按主键 UPDATE)': 'Edit this row (UPDATE by primary key)',
+  '删除此行(按主键)': 'Delete this row (by primary key)',
+  '{0}:共 {1} 行': '{0}: {1} rows in total',
+  '删除表': 'Drop Table', '输入表名以确认': 'Type the table name to confirm',
+  '表名不匹配': 'Table name does not match', '已删除表 {0}': 'Table {0} dropped',
+  '选择前 1000 行': 'Select Top 1000 Rows', '查看数据(编辑前 200 行)': 'View Data (edit first 200 rows)',
+  '新建索引…': 'New Index…', '修改索引…': 'Modify Index…', '删除索引 {0}…': 'Drop Index {0}…',
+  '编写表脚本为 CREATE TO →': 'Script Table as CREATE →', '编写表脚本为 DROP TO →': 'Script Table as DROP →',
+  '删除表 {0}…': 'Drop Table {0}…',
+  '-- 删除表 {0}': '-- Drop table {0}',
+  '-- 表 {0}({1} 行,{2} 页)': '-- Table {0} ({1} rows, {2} pages)',
+  /* —— 仪表盘 —— */
+  'DocSQL 服务器仪表盘': 'DocSQL Server Dashboard',
+  '统计对象为节点 {0}(写在该节点上执行并按其集群配置扇出)': 'Statistics target node {0} (writes run there and fan out per its cluster configuration)',
+  '统计对象为默认管理节点 {0}(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v{1}': 'Statistics target the default management node {0} (see "View → Cluster Status" for the cluster) · Document storage + SQL · v{1}',
+  '统计对象为默认管理节点(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v{0}': 'Statistics target the default management node (see "View → Cluster Status" for the cluster) · Document storage + SQL · v{0}',
+  '节点不可用': 'Node unavailable',
+  '用户表': 'User Tables', '表数据总行数': 'Total Rows Across Tables',
+  '索引(含主键/唯一约束)': 'Indexes (incl. PK/UNIQUE constraints)', '已分配页': 'Allocated Pages',
+  '数据文件 / WAL': 'Data File / WAL', '服务运行时长 · 版本': 'Uptime · Version',
+  /* —— 集群状态 —— */
+  'DOCSQL_PEERS 对等节点 · 只读探测(PING 存活 + STATUS 状态报告),不影响集群数据': 'DOCSQL_PEERS peers · read-only probing (PING liveness + STATUS report); does not affect cluster data',
+  '立即刷新': 'Refresh Now', '每 5 秒自动刷新': 'Auto-refresh every 5s', '正在探测节点…': 'Probing nodes…',
+  '单机模式': 'Standalone Mode',
+  '未配置,请在启动参数或 DOCSQL_UPSTREAM 指定': 'not configured; set it via the startup argument or DOCSQL_UPSTREAM',
+  '未配置集群(DOCSQL_PEERS 为空),控制台管理默认节点{0},可在「视图 → 服务器仪表盘」查看其状态。集群部署时为 web 服务设置 DOCSQL_PEERS(逗号分隔的节点地址,如 node-a:7600,node-b:7600),即可在此监控各节点。': 'No cluster configured (DOCSQL_PEERS is empty); the console manages the default node{0} — see "View → Server Dashboard" for its status. For cluster deployments, set DOCSQL_PEERS on the web service (comma-separated node addresses, e.g. node-a:7600,node-b:7600) to monitor nodes here.',
+  '配置节点': 'Configured Nodes', '在线(可达)': 'Online (reachable)', '离线(不可达)': 'Offline (unreachable)',
+  '集群表数(节点最大值)': 'Cluster Tables (max across nodes)', '集群总行数(节点最大值)': 'Cluster Rows (max across nodes)',
+  '行数一致的节点': 'Nodes with Matching Row Counts', '只读节点(PROMOTE 可提升)': 'Read-only Nodes (promotable via PROMOTE)',
+  '在线': 'Online', '离线': 'Offline', '只读': 'Read-only', '事务中': 'In Tx', '数据 / WAL': 'Data / WAL',
+  '节点本机 WAL 写入位置;checkpoint 或重启后回绕,不作跨节点比较': 'Node-local WAL write position; wraps on checkpoint/restart, not comparable across nodes',
+  '上次刷新 {0}': 'Last refresh {0}', '集群状态刷新失败:{0}': 'Failed to refresh cluster status: {0}',
+  /* —— 用户与角色 —— */
+  '数据库级访问控制 · 变更经默认管理节点执行并随集群复制 · 详见 README「数据库用户与角色」': 'Database-level access control · changes run through the default management node and replicate with the cluster · see README "Database Users & Roles"',
+  '新建用户': 'New User', '新建角色': 'New Role', '正在读取用户与角色…': 'Loading users & roles…',
+  '更新于 {0}': 'Updated {0}', '无法读取用户与角色': 'Cannot read users & roles',
+  '该节点已启用数据库用户:为 Web 服务与节点配置一致的 <b>DOCSQL_TOKEN</b>(管理员凭据)后即可在此管理。': 'This node has database users enabled: configure the same <b>DOCSQL_TOKEN</b> (admin credentials) for the web service and the node to manage them here.',
+  '数据库用户': 'Database Users', '角色(含内置 3 个)': 'Roles (3 built-in)', '自定义角色': 'Custom Roles',
+  '尚无数据库用户:节点处于开放模式(或仅 token 认证)。创建第一个用户后,新的匿名连接将被拒绝 —— 建议先为节点与 Web 服务配置一致的 DOCSQL_TOKEN。': 'No database users yet: the node is in open mode (or token-only auth). After the first user is created, new anonymous connections are rejected — configure a matching DOCSQL_TOKEN for the node and web service first.',
+  '表级权限': 'Table Grants', '无(仅直授权限)': 'None (direct grants only)',
+  '改密码': 'Password', '表权限': 'Grants',
+  '全部权限(DDL/用户管理/备份/恢复/PROMOTE)': 'All permissions (DDL/user management/backup/restore/PROMOTE)',
+  '全部表 DML + PUBLISH/TRIM': 'All table DML + PUBLISH/TRIM', '全部表 SELECT': 'All table SELECT',
+  '自定义角色(表级权限)': 'Custom role (table grants)',
+  '删除用户 {0}': 'Delete User {0}', '输入用户名以确认': 'Type the username to confirm',
+  '用户名不一致': 'Username does not match', '已删除用户 {0}': 'User {0} deleted',
+  '删除角色 {0}': 'Delete Role {0}', '输入角色名以确认': 'Type the role name to confirm',
+  '角色名不一致': 'Role name does not match', '已删除角色 {0}': 'Role {0} deleted',
+  '字母开头,可含数字/_/$': 'Starts with a letter; digits/_/$ allowed', '至少 8 位': 'At least 8 characters',
+  '请输入用户名': 'Please enter a username', '已创建用户 {0}': 'User {0} created',
+  '如 reporting': 'e.g. reporting', '请输入角色名': 'Please enter a role name', '已创建角色 {0}': 'Role {0} created',
+  '修改 {0} 的密码': 'Change Password for {0}', '修改': 'Change', '已修改 {0} 的密码': 'Password changed for {0}',
+  '管理角色 {0} 的成员': 'Manage Members of Role {0}', '管理用户 {0} 的角色': 'Manage Roles of User {0}',
+  '成员(用户)': 'Member (user)',
+  '移除 = REVOKE 该用户的此角色。': 'Remove = REVOKE this role from the user.',
+  '移除 = REVOKE 该角色;立即生效(其已有连接的下一条语句起)。': 'Remove = REVOKE the role; effective immediately (from the next statement on its existing connections).',
+  '已更新': 'Updated', '表 {0} 上的权限': 'Grants on table {0}',
+  '没有可授权的表(先建表)': 'No tables to grant on (create tables first)',
+  '表级权限 — {0}': 'Table Grants — {0}', '(角色)': '(role)',
+  '此处编辑直接授予的表级权限;用户通过角色获得的权限请在「角色」区管理(它们不在此显示)。': 'Edit directly granted table permissions here; permissions obtained through roles are managed in the "Roles" section (not shown here).',
+  '角色的表级权限对其全部成员生效。': 'A role\'s table grants apply to all of its members.',
+  '表级权限已更新': 'Table grants updated',
+  /* —— 备份管理 —— */
+  '自动备份为逻辑 SQL 快照(整库一致点,含全部表结构与数据)· 文件在节点的数据卷内(/data/backups)': 'Automatic backups are logical SQL snapshots (a whole-database consistent point, including all table schemas and data) · files live in the node\'s data volume (/data/backups)',
+  '立即备份': 'Back Up Now', '正在读取备份状态…': 'Loading backup status…',
+  '备份触发失败:{0}': 'Failed to trigger backup: {0}', '备份已开始': 'Backup started',
+  '恢复备份 {0} → {1}': 'Restore Backup {0} → {1}',
+  '输入 {0} 确认恢复到节点 {1}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。': 'Type {0} to confirm restoring to node {1}. The node replays this snapshot over the whole database: tables with the same name are reset to the backup point and every node in the cluster converges to that state; tables created after the backup are unaffected.',
+  '确认恢复': 'Confirm Restore', '输入与备份文件名不一致': 'Input does not match the backup file name',
+  '恢复已开始({0})': 'Restore started ({0})', '恢复触发失败:{0}': 'Failed to trigger restore: {0}',
+  '节点不可达或拒绝请求,可切换节点后重试': 'The node is unreachable or rejected the request; switch nodes and retry',
+  '尚无备份': 'No backups yet',
+  '自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)': 'Auto-backup Interval (DOCSQL_BACKUP_INTERVAL_SECS)',
+  '保留份数(DOCSQL_BACKUP_KEEP)': 'Retained Copies (DOCSQL_BACKUP_KEEP)',
+  '现有备份': 'Existing Backups', '最近一次': 'Latest', '进行中…': 'In progress…',
+  '恢复进行中': 'Restore in progress', '恢复完成': 'Restore completed', '恢复失败': 'Restore failed',
+  '{0} 条语句': '{0} statements',
+  '集群已验证收敛': 'cluster convergence verified', '集群收敛未验证': 'cluster convergence not verified',
+  '暂无备份': 'No Backups Yet',
+  '节点尚未产生备份文件(目录:{0})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。备份是完整的 SQL 快照(DROP + CREATE + INSERT);恢复时整库重放该快照,同名表还原为备份时点并扇出到集群全网。': 'The node has no backup files yet (directory: {0}). Automatic backups run once a day by default (0 disables); you can also click "Back Up Now" to trigger one manually. A backup is a complete SQL snapshot (DROP + CREATE + INSERT); restoring replays it over the whole database — same-name tables return to the backup point and the result fans out to the entire cluster.',
+  '备份文件': 'Backup File', '备份状态读取失败:{0}': 'Failed to read backup status: {0}',
+  /* —— 日志 —— */
+  '写扇出': 'Write fan-out', '发布扇出': 'Publish fan-out', 'TRIM 扇出': 'TRIM fan-out',
+  '节点加入': 'Node join', '备份': 'Backup',
+  '全部': 'All', '数据日志': 'Data Log', '同步日志': 'Sync Log', '仅错误': 'Errors Only',
+  '全部来源': 'All sources', '日志来源': 'Log source', '过滤:语句 / 错误 / 目标': 'Filter: statement / error / target',
+  '每来源拉取条数': 'Entries to fetch per source',
+  '100 条': '100', '200 条': '200', '500 条': '500', '5s 自动刷新': '5s auto-refresh',
+  '共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}': '{0} entries · data {1} · sync {2} · errors {3}',
+  '离线节点 {0} 个({1})': '{0} offline node(s) ({1})',
+  '没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。': 'No matching log entries. The "Console" source collects statements submitted by this console; cluster deployments aggregate statement and sync logs from all nodes.',
+  '来自对等节点扇出的复制应用': 'Replicated apply from a peer fan-out',
+  '日志刷新失败:{0}': 'Failed to refresh logs: {0}',
+  /* —— 对象资源管理器 —— */
+  '远程节点': 'Remote node',
+  '远程节点 — 控制台经协议代理,写在该节点上执行并按其集群配置扇出': 'Remote node — the console proxies over the protocol; writes run on that node and fan out per its cluster configuration',
+  '系统表': 'System Tables', '系统视图': 'System Views',
+  '(无表)': '(no tables)', '(无索引)': '(no indexes)', '(无键)': '(no keys)', '(无系统表)': '(no system tables)',
+  '仅见于数据,未在表定义中声明;SELECT * 会返回它': 'Seen only in data, not declared in the table definition; SELECT * returns it',
+  '声明 {0} / 实测 {1}': 'declared {0} / observed {1}',
+  '声明 {0} 列,数据中实测 {1} 个顶层字段': '{0} declared columns; {1} top-level fields observed in the data',
+  '{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除': '{0} constraint auto-index: created and maintained with the table definition; cannot be created, altered or dropped independently',
+  '唯一索引': 'Unique index',
+  '引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据': 'Engine-internal storage (catch-up journal/position/node identity/pub-sub); read-only, double-click to view data',
+  '表清单(名称/页数)': 'Table list (name/pages)', '列清单(可空性/类型)': 'Column list (nullability/type)',
+  'SQLite 兼容视图': 'SQLite compatibility view',
+  '节点 {0} 不可用:': 'Node {0} unavailable: ', '节点 {0} · 不可用': 'Node {0} · unavailable',
+  '对象资源管理器刷新失败': 'Object Explorer refresh failed', '刷新失败:{0}': 'Refresh failed: {0}',
+  '全部折叠': 'Collapse All', '新建表': 'New Table', '＋表': '+ Table',
+};
+
+// 翻译 + {0}{1}… 占位符替换。EN 缺键回退中文原文。
+const T = (s, ...args) => {
+  let out = LANG === 'en' && EN[s] !== undefined ? EN[s] : s;
+  for (let i = 0; i < args.length; i++) out = out.split('{' + i + '}').join(String(args[i]));
+  return out;
+};
+// 把静态 HTML 里的 data-i18n(文本)/ data-i18n-title(提示)/ data-i18n-ph
+// (占位符)按当前语言重排;首次执行时把中文原文缓存进 data-src* 属性,
+// 之后按缓存键翻译(元素被整体重建时重新捕获)。
+function applyI18n(root) {
+  root = root || document;
+  $$('[data-i18n]', root).forEach(el => {
+    if (!el.dataset.src) el.dataset.src = el.textContent.trim();
+    el.textContent = T(el.dataset.src);
+  });
+  $$('[data-i18n-title]', root).forEach(el => {
+    if (!el.dataset.srcTitle) el.dataset.srcTitle = el.getAttribute('title') || '';
+    el.setAttribute('title', T(el.dataset.srcTitle));
+  });
+  $$('[data-i18n-ph]', root).forEach(el => {
+    if (!el.dataset.srcPh) el.dataset.srcPh = el.getAttribute('placeholder') || '';
+    el.setAttribute('placeholder', T(el.dataset.srcPh));
+  });
+}
+
 const fmtBytes = (n) => { if (!n) return '0 B'; const u = ['B','KB','MB','GB']; let i = 0;
   while (n >= 1024 && i < u.length-1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
 const fmtDur = (ms) => { const s = Math.floor(ms/1000), d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
-  return d ? `${d}天${h}时${m}分` : h ? `${h}时${m}分` : m ? `${m}分${s%60}秒` : `${s}秒`; };
+  return d ? T('{0}天{1}时{2}分', d, h, m) : h ? T('{0}时{1}分', h, m) : m ? T('{0}分{1}秒', m, s%60) : T('{0}秒', s); };
 // 控制台自身版本(与数据库节点版本无关;展示于仪表盘与「关于」)。
-const CONSOLE_VERSION = '1.1';
+const CONSOLE_VERSION = '1.2';
 
 /* ================= 图标(内联 SVG)================= */
 // 填充/描边颜色不用硬编码:走 .if-* 类(CSS 变量按主题解析),
@@ -511,13 +842,20 @@ const ICONS = {
   log: SVG(`<path class="if-page" d="M3 2h7l3 3v9H3z" stroke="#8a6db8" stroke-width="1.1"/><path d="M5.5 6.5h5M5.5 9h5M5.5 11.5h3" stroke="#8a6db8" stroke-width="1"/>`),
   sun: SVG(`<circle cx="8" cy="8" r="3.1" fill="#e8a33d"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke="#e8a33d" stroke-width="1.2" stroke-linecap="round"/>`),
   moon: SVG(`<path d="M13.2 9.6A5.6 5.6 0 1 1 6.4 2.8a4.6 4.6 0 0 0 6.8 6.8z" fill="#e8a33d"/>`),
+  globe: SVG(`<circle cx="8" cy="8" r="5.6" fill="none"/><ellipse cx="8" cy="8" rx="2.6" ry="5.6" fill="none"/><path d="M2.4 8h11.2" fill="none"/>`),
 };
 $$('[data-ico]').forEach(el => { el.innerHTML = ICONS[el.dataset.ico] || ''; });
+$('#lang-ico').innerHTML = SVG(`<circle class="if-acc-s" cx="8" cy="8" r="5.6" stroke-width="1.1" fill="none"/><ellipse class="if-acc-s" cx="8" cy="8" rx="2.6" ry="5.6" stroke-width="1" fill="none"/><path class="if-acc-s" d="M2.4 8h11.2" stroke-width="1" fill="none"/>`);
 // 菜单栏品牌徽标:数据库柱面线稿,描边随主题(品牌蓝)。
 $('#brand-glyph').innerHTML =
   `<svg class="brand-svg" width="15" height="15" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">` +
   `<ellipse cx="8" cy="3.6" rx="5.7" ry="2.2"/><path d="M2.3 3.6v8.8c0 1.22 2.55 2.2 5.7 2.2s5.7-.98 5.7-2.2V3.6"/>` +
   `<path d="M2.3 8c0 1.22 2.55 2.2 5.7 2.2s5.7-.98 5.7-2.2"/></svg>`;
+
+// 界面语言:首帧前重排静态文本(本脚本是解析阻塞的,不会看到中文闪变)。
+applyI18n();
+document.title = T('DocSQL Studio — 管理控制台');
+$('#lang-label').textContent = LANG === 'zh' ? 'EN' : '中';
 
 /* ================= API 层 ================= */
 // 浏览器不持有节点凭据:控制台与节点通信一律使用 Web 进程环境变量
@@ -543,11 +881,11 @@ const api = {
       ui.connState('unauth');
       // 账号门激活时会话过期/未登录:弹回登录遮罩。
       if (authGate.active) authGate.show('login');
-      throw new Error(authGate.active ? '会话已过期,请重新登录' : '未授权:请求被拒绝');
+      throw new Error(authGate.active ? T('会话已过期,请重新登录') : T('未授权:请求被拒绝'));
     }
     let body;
     try { body = await r.json(); }
-    catch { throw new Error('响应不是有效 JSON(HTTP ' + r.status + ')'); }
+    catch { throw new Error(T('响应不是有效 JSON(HTTP {0})', r.status)); }
     ui.connState(r.ok ? 'ok' : 'down');
     // In-band 错误约定:数据端点对配置缺失/节点选择失败回 HTTP 200 +
     // {"error": …}。归一成标准错误形状,写路径才不会把它当成功 —— 同时
@@ -593,33 +931,37 @@ const authGate = {
     if (username) this.lastUser = username;
     $('#auth-ov').style.display = 'flex';
     $('#auth-confirm-row').style.display = mode === 'setup' ? '' : 'none';
-    $('#auth-title').textContent = mode === 'setup' ? '初始设置 — 创建控制台账号' : '登录 DocSQL Studio';
-    $('#auth-hint').textContent = mode === 'setup'
-      ? '首次使用:设置控制台的用户名与密码(至少 8 位)。账号保存在控制台凭据文件中,数据本身仍全部位于数据库节点。'
-      : ('请以 ' + (this.lastUser || '控制台账号') + ' 登录');
+    this.renderTexts();
     $('#auth-user').value = mode === 'login' ? (this.lastUser || '') : '';
     $('#auth-pass').value = '';
     $('#auth-confirm').value = '';
     $('#auth-err').textContent = '';
-    $('#auth-ok').textContent = mode === 'setup' ? '创建账号并进入' : '登录';
     setTimeout(() => { $(mode === 'login' && this.lastUser ? '#auth-pass' : '#auth-user').focus(); }, 60);
+  },
+  // 只刷文案不动输入值:语言切换时登录遮罩若在前面,不丢已输入的密码。
+  renderTexts() {
+    $('#auth-title').textContent = this.mode === 'setup' ? T('初始设置 — 创建控制台账号') : T('登录 DocSQL Studio');
+    $('#auth-hint').textContent = this.mode === 'setup'
+      ? T('首次使用:设置控制台的用户名与密码(至少 8 位)。账号保存在控制台凭据文件中,数据本身仍全部位于数据库节点。')
+      : T('请以 {0} 登录', this.lastUser || T('控制台账号'));
+    $('#auth-ok').textContent = this.mode === 'setup' ? T('创建账号并进入') : T('登录');
   },
   async submit() {
     const u = $('#auth-user').value.trim(), p = $('#auth-pass').value;
     const err = (m) => { $('#auth-err').textContent = m; };
-    if (!u || !p) return err('请输入用户名与密码');
-    if (this.mode === 'setup' && p !== $('#auth-confirm').value) return err('两次输入的密码不一致');
+    if (!u || !p) return err(T('请输入用户名与密码'));
+    if (this.mode === 'setup' && p !== $('#auth-confirm').value) return err(T('两次输入的密码不一致'));
     const path = this.mode === 'setup' ? '/api/auth/setup' : '/api/auth/login';
     try {
       const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
                                    body: JSON.stringify({username: u, password: p})});
       const out = await r.json();
-      if (!r.ok) return err(out.error || ('失败(' + r.status + ')'));
+      if (!r.ok) return err(out.error || T('失败({0})', r.status));
       this.lastUser = out.username || u;
       $('#auth-ov').style.display = 'none';
       this.active = true;
       startApp();
-    } catch (e) { err('请求失败:' + e.message); }
+    } catch (e) { err(T('请求失败:{0}', e.message)); }
   }
 };
 
@@ -629,33 +971,33 @@ const authGate = {
 // 留空 = 只改用户名。密码不做 trim(口令前后空格有效)。
 function accountDialog() {
   if (!authGate.active) return;
-  const ov = showModal(`<div class="dialog" style="min-width:380px"><h3>修改控制台账号</h3><div class="body">
-    <div class="row"><label>当前密码</label><input type="password" id="acc-cur" autocomplete="current-password"></div>
-    <div class="row"><label>新用户名</label><input type="text" id="acc-user" value="${esc(authGate.lastUser || '')}" autocomplete="username"></div>
-    <div class="row"><label>新密码</label><input type="password" id="acc-pass" placeholder="留空则不修改密码" autocomplete="new-password"></div>
-    <div class="row"><label>确认新密码</label><input type="password" id="acc-confirm" autocomplete="new-password"></div>
-    <div class="hint">修改密码后,其他已登录的会话将全部退出,当前浏览器会话保持不变。账号保存在控制台凭据文件中,与数据库用户无关。</div>
+  const ov = showModal(`<div class="dialog" style="min-width:380px"><h3>${T('修改控制台账号')}</h3><div class="body">
+    <div class="row"><label>${T('当前密码')}</label><input type="password" id="acc-cur" autocomplete="current-password"></div>
+    <div class="row"><label>${T('新用户名')}</label><input type="text" id="acc-user" value="${esc(authGate.lastUser || '')}" autocomplete="username"></div>
+    <div class="row"><label>${T('新密码')}</label><input type="password" id="acc-pass" placeholder="${esc(T('留空则不修改密码'))}" autocomplete="new-password"></div>
+    <div class="row"><label>${T('确认新密码')}</label><input type="password" id="acc-confirm" autocomplete="new-password"></div>
+    <div class="hint">${T('修改密码后,其他已登录的会话将全部退出,当前浏览器会话保持不变。账号保存在控制台凭据文件中,与数据库用户无关。')}</div>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`,
+    <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`,
     '#acc-cur');
   $('[data-ok]', ov).onclick = async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m || ''; };
     const cur = $('#acc-cur', ov).value;
     const u = $('#acc-user', ov).value.trim();
     const p = $('#acc-pass', ov).value, pc = $('#acc-confirm', ov).value;
-    if (!cur) return err('请输入当前密码');
-    if (!u) return err('请输入新用户名');
-    if (p && p.length < 8) return err('新密码至少 8 个字符');
-    if (p && p !== pc) return err('两次输入的新密码不一致');
+    if (!cur) return err(T('请输入当前密码'));
+    if (!u) return err(T('请输入新用户名'));
+    if (p && p.length < 8) return err(T('新密码至少 8 个字符'));
+    if (p && p !== pc) return err(T('两次输入的新密码不一致'));
     try {
       const r = await fetch('/api/auth/change', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                    body: JSON.stringify({current_password: cur, username: u, password: p})});
       const out = await r.json();
-      if (!r.ok) return err(out.error || ('失败(' + r.status + ')'));
+      if (!r.ok) return err(out.error || T('失败({0})', r.status));
       authGate.lastUser = out.username || u;
       closeModal();
-      ui.toast('账号已更新');
-    } catch (e) { err('请求失败:' + e.message); }
+      ui.toast(T('账号已更新'));
+    } catch (e) { err(T('请求失败:{0}', e.message)); }
   };
   ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
 }
@@ -667,81 +1009,82 @@ function accountDialog() {
 function aboutDialog() {
   const m = explorer.meta;
   const target = api.node
-    ? `节点 ${esc(api.node)}`
-    : (nodes.default ? `默认节点(${esc(nodes.default)})` : '默认节点(未配置)');
+    ? T('节点 {0}', esc(api.node))
+    : (nodes.default ? T('默认节点({0})', esc(nodes.default)) : T('默认节点(未配置)'));
   const targetPlain = api.node
-    ? `节点 ${api.node}`
-    : (nodes.default ? `默认节点(${nodes.default})` : '默认节点(未配置)');
+    ? T('节点 {0}', api.node)
+    : (nodes.default ? T('默认节点({0})', nodes.default) : T('默认节点(未配置)'));
   const server = m
-    ? `DocSQL v${esc(m.server.version)} · ${esc(m.totals.tables)} 表 · ${esc(m.totals.rows)} 行`
-    : '<span class="null">未知(对象资源管理器尚未刷新)</span>';
+    ? `DocSQL v${esc(m.server.version)} · ${T('{0} 表', esc(m.totals.tables))} · ${T('{0} 行', esc(m.totals.rows))}`
+    : `<span class="null">${T('未知(对象资源管理器尚未刷新)')}</span>`;
   const serverPlain = m
-    ? `DocSQL v${m.server.version} · ${m.totals.tables} 表 · ${m.totals.rows} 行`
-    : '未知';
-  const caps = ['对象资源管理器', '查询工作台', '数据网格', '表结构编辑', 'JSON 插入',
-    '仪表盘', '集群状态', '日志', '备份恢复', '用户与角色'];
+    ? `DocSQL v${m.server.version} · ${T('{0} 表', m.totals.tables)} · ${T('{0} 行', m.totals.rows)}`
+    : T('未知');
+  const caps = [T('对象资源管理器'), T('查询工作台'), T('数据网格'), T('表结构编辑'), T('JSON 插入'),
+    T('仪表盘'), T('集群状态'), T('日志'), T('备份恢复'), T('用户与角色')];
   // 描边颜色交给 .about-logo svg *(随主题取 --accent),这里只定形状。
   const logo = SVG(`<ellipse cx="8" cy="4" rx="6" ry="2.3" stroke-width="1.2"/>
     <path d="M2 4v8c0 1.27 2.7 2.3 6 2.3s6-1.03 6-2.3V4" stroke-width="1.2"/>
     <path d="M2 8c0 1.27 2.7 2.3 6 2.3S14 9.27 14 8" stroke-width="1.2"/>`);
   const ov = showModal(`<div class="dialog about-dialog" style="min-width:470px;max-width:560px">
-    <h3>关于 DocSQL Studio</h3>
+    <h3>${T('关于 DocSQL Studio')}</h3>
     <div class="body about">
       <div class="about-hero">
         <div class="about-logo">${logo}</div>
         <div>
           <div class="about-name">DocSQL Studio</div>
-          <div class="about-ver">文档数据库管理控制台 v${CONSOLE_VERSION}</div>
+          <div class="about-ver">${T('文档数据库管理控制台 v{0}', CONSOLE_VERSION)}</div>
         </div>
       </div>
-      <p class="about-desc">DocSQL 是 Rust 原生文档数据库:JSON 文档整体存储、完整 SQL、对称集群复制
-        与持久化发布订阅。本控制台是纯管理工具、自身零存储 —— 全部操作以数据库客户端身份连接管理节点执行。</p>
+      <p class="about-desc">${T('DocSQL 是 Rust 原生文档数据库:JSON 文档整体存储、完整 SQL、对称集群复制与持久化发布订阅。本控制台是纯管理工具、自身零存储 —— 全部操作以数据库客户端身份连接管理节点执行。')}</p>
       <div>
-        <div class="about-sec-title">主要能力</div>
+        <div class="about-sec-title">${T('主要能力')}</div>
         <div class="chips">${caps.map(c => `<span class="chip">${c}</span>`).join('')}</div>
       </div>
       <div class="about-info">
-        <div class="about-sec-title">连接与版本</div>
-        <div class="kv"><span class="k">管理目标</span><span class="v">${target}</span></div>
-        <div class="kv"><span class="k">服务端</span><span class="v">${server}</span></div>
-        <div class="kv"><span class="k">控制台</span><span class="v">v${CONSOLE_VERSION} · 零存储 ·
-          <a href="https://github.com/wjw1-Evan/docsql" target="_blank" rel="noopener">项目主页</a></span></div>
+        <div class="about-sec-title">${T('连接与版本')}</div>
+        <div class="kv"><span class="k">${T('管理目标')}</span><span class="v">${target}</span></div>
+        <div class="kv"><span class="k">${T('服务端')}</span><span class="v">${server}</span></div>
+        <div class="kv"><span class="k">${T('控制台')}</span><span class="v">v${CONSOLE_VERSION} · ${T('零存储')} ·
+          <a href="https://github.com/wjw1-Evan/docsql" target="_blank" rel="noopener">${T('项目主页')}</a></span></div>
       </div>
     </div>
     <div class="foot">
-      <button data-copy>复制诊断信息</button>
-      <button class="primary" data-cancel>确定</button>
+      <button data-copy>${T('复制诊断信息')}</button>
+      <button class="primary" data-cancel>${T('确定')}</button>
     </div></div>`, 'button[data-cancel]');
   $('[data-copy]', ov).onclick = () => {
     const text = [
       `DocSQL Studio v${CONSOLE_VERSION}`,
-      `管理目标: ${targetPlain}`,
-      `服务端: ${serverPlain}`,
-      `页面: ${location.href}`,
-      `浏览器: ${navigator.userAgent}`,
+      T('管理目标: {0}', targetPlain),
+      T('服务端: {0}', serverPlain),
+      T('页面: {0}', location.href),
+      T('浏览器: {0}', navigator.userAgent),
     ].join('\n');
-    if (!navigator.clipboard || !navigator.clipboard.writeText) { ui.toast('复制失败:浏览器不支持剪贴板', true); return; }
+    if (!navigator.clipboard || !navigator.clipboard.writeText) { ui.toast(T('复制失败:浏览器不支持剪贴板'), true); return; }
     navigator.clipboard.writeText(text)
-      .then(() => ui.toast('诊断信息已复制到剪贴板'))
-      .catch(e => ui.toast('复制失败:' + e.message, true));
+      .then(() => ui.toast(T('诊断信息已复制到剪贴板')))
+      .catch(e => ui.toast(T('复制失败:{0}', e.message), true));
   };
 }
 
 /* ================= UI 反馈 ================= */
 const ui = {
+  conn: 'down',
   connState(state) {
+    this.conn = state;
     const dot = $('#conn-dot'), bar = $('#st-conn'), sb = $('#statusbar');
     dot.classList.toggle('ok', state === 'ok');
-    if (state === 'ok') { bar.textContent = '已连接 ' + location.host; sb.className = ''; }
-    else if (state === 'unauth') { bar.textContent = '未授权'; sb.className = 'err'; }
-    else { bar.textContent = '未连接'; sb.className = ''; }
+    if (state === 'ok') { bar.textContent = T('已连接 {0}', location.host); sb.className = ''; }
+    else if (state === 'unauth') { bar.textContent = T('未授权'); sb.className = 'err'; }
+    else { bar.textContent = T('未连接'); sb.className = ''; }
   },
   status(text, cls) {
     const sb = $('#statusbar');
     sb.className = cls || '';
     $('#st-last').style.display = text ? '' : 'none';
     if (text) $('#st-last').textContent = text;
-    $('#st-ready').textContent = text ? '' : '就绪';
+    $('#st-ready').textContent = text ? '' : T('就绪');
   },
   toast(msg, isErr) {
     const el = document.createElement('div');
@@ -766,7 +1109,7 @@ const theme = {
     document.documentElement.dataset.theme = next;
     try { localStorage.setItem('docsql.theme', next); } catch (e) {}
     this.icon();
-    ui.toast(next === 'dark' ? '已切换到深色主题' : '已切换到浅色主题');
+    ui.toast(next === 'dark' ? T('已切换到深色主题') : T('已切换到浅色主题'));
   },
   follow() {
     // 未手动选择过主题时跟随系统变化(存储被禁用等异常一律忽略)。
@@ -805,7 +1148,7 @@ const nodes = {
     sel.style.display = '';
     // 集群页每 5s 轮询都会走到这里;内容没变就不重建 DOM,避免打断正在
     // 展开的下拉框。
-    const def = this.default ? `默认节点 (${esc(this.default)})` : '默认节点';
+    const def = this.default ? T('默认节点 ({0})', esc(this.default)) : T('默认节点');
     const html = `<option value="">${def}</option>` +
       this.known.map(n => `<option value="${esc(n.addr)}">${n.reachable ? '● ' : '○ '}${esc(n.addr)}</option>`).join('');
     if (sel.innerHTML !== html) sel.innerHTML = html;
@@ -817,7 +1160,10 @@ const nodes = {
     if (api.node === addr) return;
     api.node = addr;
     localStorage.setItem('docsql.node', addr);
-    $('#st-server').textContent = addr ? `节点 ${addr}` : (this.default ? `默认 ${this.default}` : 'DocSQL');
+    // 切换目标后旧 meta 立即失效:标签先落到「节点 x」,等刷新回包再补版本。
+    explorer.meta = null;
+    explorer.unreachable = false;
+    updateServerLabel();
     explorer.refresh();
     // 已打开的仪表盘/数据页/备份页跟随切换到新目标节点。
     tabs.byKind('dash').forEach(t => t.load && t.load());
@@ -833,10 +1179,25 @@ const nodes = {
     catch (e) { /* 首次探测失败(未授权/网络):选择器保持隐藏 */ }
   }
 };
+// 工具栏右侧的目标节点标签(节点/版本/表数;语言切换后按状态重算)。
+function updateServerLabel() {
+  const el = $('#st-server');
+  if (explorer.meta && explorer.meta.server)
+    el.textContent = `${api.node ? api.node + ' · ' : ''}DocSQL v${explorer.meta.server.version} · ${T('{0} 表', explorer.meta.totals.tables)}`;
+  else if (explorer.unreachable)
+    el.textContent = api.node ? T('节点 {0} · 不可用', api.node) : 'DocSQL';
+  else if (api.node)
+    el.textContent = T('节点 {0}', api.node);
+  else if (nodes.default)
+    el.textContent = `${T('默认')} ${nodes.default}`;
+  else el.textContent = 'DocSQL';
+}
+
 $('#nodesel').onchange = (e) => {
   const addr = e.target.value;
   nodes.apply(addr);
-  ui.toast(addr ? `已切换到节点 ${addr},对象资源管理器已刷新` : `已切换到默认节点${nodes.default ? ` ${nodes.default}` : ''}`);
+  ui.toast(addr ? T('已切换到节点 {0},对象资源管理器已刷新', addr)
+                : (nodes.default ? T('已切换到默认节点 {0}', nodes.default) : T('已切换到默认节点')));
 };
 
 /* ================= 右键菜单 ================= */
@@ -870,7 +1231,7 @@ function showModal(html, focusSel) {
 function dialog(title, fields, okText, onOk) {
   const ov = showModal(`<div class="dialog"><h3>${esc(title)}</h3><div class="body">` +
     fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="${esc(f.type||'text')}" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
-    `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`,
+    `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`,
     'input[data-f]');
   $('[data-ok]', ov).onclick = async () => {
     const vals = {};
@@ -885,24 +1246,24 @@ function dialog(title, fields, okText, onOk) {
 const COL_TYPES = ['ANY', 'INT', 'TEXT', 'REAL', 'BOOLEAN', 'GUID'];
 function newTableDialog() {
   const colRow = (c) => `<tr data-col>
-    <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="列名"></td>
+    <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="${esc(T('列名'))}"></td>
     <td><select data-c="type">${COL_TYPES.map(t => `<option${t === (c.type || 'ANY') ? ' selected' : ''}>${t}</option>`).join('')}</select></td>
-    <td><input type="text" data-c="dflt" value="${esc(c.dflt || '')}" placeholder="如 'abc'、7、true" title="DEFAULT:SQL 字面量,字符串需带单引号;留空表示无默认值"></td>
+    <td><input type="text" data-c="dflt" value="${esc(c.dflt || '')}" placeholder="${esc(T("如 'abc'、7、true"))}" title="${esc(T('DEFAULT:SQL 字面量,字符串需带单引号;留空表示无默认值'))}"></td>
     <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}></td>
     <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}></td>
     <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}></td>
-    <td><button class="delcol" data-delcol title="删除此列">✕</button></td></tr>`;
-  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>新建表</h3><div class="body">
-    <div class="row"><label>表名</label><input type="text" data-t="name" placeholder="如 users"></div>
+    <td><button class="delcol" data-delcol title="${esc(T('删除此列'))}">✕</button></td></tr>`;
+  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>${T('新建表')}</h3><div class="body">
+    <div class="row"><label>${T('表名')}</label><input type="text" data-t="name" placeholder="${esc(T('如 users'))}"></div>
     <div>
-      <table class="colgrid"><thead><tr><th style="width:30%">列名</th><th style="width:16%">类型</th><th style="width:26%">默认值</th>
-        <th title="主键">PK</th><th title="非空">NOT NULL</th><th title="自增">AUTO</th><th></th></tr></thead>
+      <table class="colgrid"><thead><tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
+        <th title="${esc(T('主键'))}">PK</th><th title="${esc(T('非空'))}">NOT NULL</th><th title="${esc(T('自增'))}">AUTO</th><th></th></tr></thead>
       <tbody data-cols>${colRow({name: 'id', type: 'INT', pk: true, nn: true})}${colRow({})}</tbody></table>
-      <div style="margin-top:6px"><button data-addcol>+ 添加列</button></div>
+      <div style="margin-top:6px"><button data-addcol>${T('+ 添加列')}</button></div>
     </div>
-    <div class="hint">GUID + AUTO:主键自动生成时序有序 UUIDv7(INSERT 省略即可);INT + AUTO 为自增整数。其余类型仅作文档用途(无模式文档存储,类型不被强制);PK 不隐含 NOT NULL,勾选 PK 会自动勾上 NOT NULL。默认值填 SQL 字面量(字符串需带引号,如 'n/a';数字/布尔直接写),INSERT 省略该列时自动填入。</div>
+    <div class="hint">${T('GUID + AUTO:主键自动生成时序有序 UUIDv7(INSERT 省略即可);INT + AUTO 为自增整数。其余类型仅作文档用途(无模式文档存储,类型不被强制);PK 不隐含 NOT NULL,勾选 PK 会自动勾上 NOT NULL。默认值填 SQL 字面量(字符串需带引号,如 \'n/a\';数字/布尔直接写),INSERT 省略该列时自动填入。')}</div>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>创建</button></div></div>`,
+    <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('创建')}</button></div></div>`,
     '[data-t="name"]');
   const readCols = () => $$('tr[data-col]', ov).map(tr => ({
     name: $('[data-c="name"]', tr).value.trim(),
@@ -936,13 +1297,13 @@ function newTableDialog() {
   $('[data-ok]', ov).onclick = async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
     const name = $('[data-t="name"]', ov).value.trim();
-    if (!name) return err('请输入表名');
+    if (!name) return err(T('请输入表名'));
     const cols = readCols();
-    if (!cols.length) return err('至少需要一列');
+    if (!cols.length) return err(T('至少需要一列'));
     const names = new Set();
     for (const c of cols) {
-      if (!c.name) return err('存在空列名');
-      if (names.has(c.name)) return err(`列名重复:${c.name}`);
+      if (!c.name) return err(T('存在空列名'));
+      if (names.has(c.name)) return err(T('列名重复:{0}', c.name));
       names.add(c.name);
     }
     let sql = `CREATE TABLE "${qident(name)}" (\n` + cols.map(c => {
@@ -953,12 +1314,12 @@ function newTableDialog() {
       if (c.dflt) s += ` DEFAULT ${c.dflt}`;
       return s;
     }).join(',\n') + '\n);';
-    ui.status(`正在创建表 ${name}…`, 'busy');
+    ui.status(T('正在创建表 {0}…', name), 'busy');
     let r;
     try { r = await api.post('/api/sql', {sql}); }
-    catch (e) { ui.status('创建失败', 'err'); return err(e.message); }
-    if (r.kind === 'error') { ui.status('创建失败', 'err'); return err(r.message); }
-    ui.toast(`已创建表 ${name}`);
+    catch (e) { ui.status(T('创建失败'), 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status(T('创建失败'), 'err'); return err(r.message); }
+    ui.toast(T('已创建表 {0}', name));
     explorer.refreshSoon();
     closeModal();
   };
@@ -974,21 +1335,21 @@ function newTableDialog() {
 // (ADD COLUMN 以默认值回填存量行;NOT NULL 必须带 DEFAULT),不支持
 // PK/UNIQUE/自增。
 function editTableDialog(tableName, meta, after) {
-  if (!meta || !meta.columns) { ui.toast('没有表元数据,先刷新对象资源管理器', true); return; }
+  if (!meta || !meta.columns) { ui.toast(T('没有表元数据,先刷新对象资源管理器'), true); return; }
   const colRow = (c, orig) => {
     const ex = !!orig; // 已有列:锁定类型/约束/默认值,可改名/删除
-    const lock = ex ? ' disabled title="已有列的类型/约束/默认值不可在线修改(引擎不支持 ALTER COLUMN SET DEFAULT;如需变更请重建表)"' : '';
+    const lock = ex ? ` disabled title="${esc(T('已有列的类型/约束/默认值不可在线修改(引擎不支持 ALTER COLUMN SET DEFAULT;如需变更请重建表)'))}"` : '';
     // 新增列:PK/自增在 ADD COLUMN 上不可用;NOT NULL 配默认值可用。
-    const pkLock = ex ? lock : ' disabled title="ADD COLUMN 不支持主键"';
-    const aiLock = ex ? lock : ' disabled title="ADD COLUMN 不支持自增"';
-    const dfltPh = ex ? '' : ' placeholder="如 \'abc\'、7、true"';
+    const pkLock = ex ? lock : ` disabled title="${esc(T('ADD COLUMN 不支持主键'))}"`;
+    const aiLock = ex ? lock : ` disabled title="${esc(T('ADD COLUMN 不支持自增'))}"`;
+    const dfltPh = ex ? '' : ` placeholder="${esc(T("如 'abc'、7、true"))}"`;
     const delBtn = ex && c.pk
-      ? '<button class="delcol" disabled title="主键列不能删除">✕</button>'
-      : '<button class="delcol" data-delcol title="删除此列">✕</button>';
+      ? `<button class="delcol" disabled title="${esc(T('主键列不能删除'))}">✕</button>`
+      : `<button class="delcol" data-delcol title="${esc(T('删除此列'))}">✕</button>`;
     return `<tr data-col${ex ? ` data-orig="${esc(orig)}"` : ''}>
-    <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="列名"></td>
+    <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="${esc(T('列名'))}"></td>
     <td><select data-c="type"${lock}>${COL_TYPES.map(t => `<option${t === (c.type || 'ANY') ? ' selected' : ''}>${t}</option>`).join('')}</select></td>
-    <td><input type="text" data-c="dflt" value="${esc(c.dflt || '')}"${ex ? ' disabled' : ''}${dfltPh} title="DEFAULT:SQL 字面量,字符串需带单引号;已有列的默认值不可在线修改"></td>
+    <td><input type="text" data-c="dflt" value="${esc(c.dflt || '')}"${ex ? ' disabled' : ''}${dfltPh} title="${esc(T('DEFAULT:SQL 字面量,字符串需带单引号;已有列的默认值不可在线修改'))}"></td>
     <td style="text-align:center"><input type="checkbox" data-c="pk"${c.pk ? ' checked' : ''}${pkLock}></td>
     <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}${lock}></td>
     <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}${aiLock}></td>
@@ -998,17 +1359,17 @@ function editTableDialog(tableName, meta, after) {
     name: c.name, type: c.data_type || 'ANY', pk: c.primary_key,
     nn: !c.nullable, ai: c.autoinc, dflt: c.default || '',
   }, c.name)).join('');
-  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>编辑表 — ${esc(tableName)}</h3><div class="body">
-    <div class="row"><label>表名</label><input type="text" value="${esc(tableName)}" disabled title="重命名表请使用 ALTER TABLE ... RENAME TO"></div>
+  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>${T('编辑表 — {0}', esc(tableName))}</h3><div class="body">
+    <div class="row"><label>${T('表名')}</label><input type="text" value="${esc(tableName)}" disabled title="${esc(T('重命名表请使用 ALTER TABLE ... RENAME TO'))}"></div>
     <div>
-      <table class="colgrid"><thead><tr><th style="width:30%">列名</th><th style="width:16%">类型</th><th style="width:26%">默认值</th>
-        <th title="主键">PK</th><th title="非空">NOT NULL</th><th title="自增">AUTO</th><th></th></tr></thead>
+      <table class="colgrid"><thead><tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
+        <th title="${esc(T('主键'))}">PK</th><th title="${esc(T('非空'))}">NOT NULL</th><th title="${esc(T('自增'))}">AUTO</th><th></th></tr></thead>
       <tbody data-cols>${rowsHTML}</tbody></table>
-      <div style="margin-top:6px"><button data-addcol>+ 添加列</button></div>
+      <div style="margin-top:6px"><button data-addcol>${T('+ 添加列')}</button></div>
     </div>
-    <div class="hint">已有列可改名与删除(主键列除外),类型/约束/默认值不可在线修改;新增列支持类型 + 默认值 + NOT NULL(带默认值时自动回填存量行,NOT NULL 必须带默认值;ADD COLUMN 不支持 PK/UNIQUE/自增)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。</div>
+    <div class="hint">${T('已有列可改名与删除(主键列除外),类型/约束/默认值不可在线修改;新增列支持类型 + 默认值 + NOT NULL(带默认值时自动回填存量行,NOT NULL 必须带默认值;ADD COLUMN 不支持 PK/UNIQUE/自增)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。')}</div>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`);
+    <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`);
   $('[data-addcol]', ov).onclick = () => {
     $('[data-cols]', ov).insertAdjacentHTML('beforeend', colRow({}));
     const rows = $$('tr[data-col]', ov);
@@ -1027,10 +1388,10 @@ function editTableDialog(tableName, meta, after) {
       nn: $('[data-c="nn"]', tr).checked,
       orig: tr.dataset.orig || null,
     }));
-    if (cols.some(c => !c.name)) return err('存在空列名');
+    if (cols.some(c => !c.name)) return err(T('存在空列名'));
     const names = new Set();
     for (const c of cols) {
-      if (names.has(c.name)) return err(`列名重复:${c.name}`);
+      if (names.has(c.name)) return err(T('列名重复:{0}', c.name));
       names.add(c.name);
     }
     const qt = `"${qident(tableName)}"`;
@@ -1048,24 +1409,24 @@ function editTableDialog(tableName, meta, after) {
     // 3) 新增(类型 + 默认值 + NOT NULL;NN 必须带 DEFAULT,引擎以默认值回填存量行)
     for (const c of cols) {
       if (!c.orig) {
-        if (c.nn && !c.dflt) return err(`新增 NOT NULL 列 ${c.name} 必须填默认值`);
+        if (c.nn && !c.dflt) return err(T('新增 NOT NULL 列 {0} 必须填默认值', c.name));
         stmts.push(`ALTER TABLE ${qt} ADD COLUMN "${qident(c.name)}" ${c.type}${c.nn ? ' NOT NULL' : ''}${c.dflt ? ` DEFAULT ${c.dflt}` : ''}`);
       }
     }
-    if (!stmts.length) return err('没有变更');
-    ui.status(`正在更新表 ${tableName}…`, 'busy');
+    if (!stmts.length) return err(T('没有变更'));
+    ui.status(T('正在更新表 {0}…', tableName), 'busy');
     let r;
     try { r = await api.post('/api/sql', {sql: stmts.join(';\n') + ';'}); }
-    catch (e) { ui.status('保存失败', 'err'); return err(e.message); }
-    if (r.kind === 'error') { ui.status('保存失败', 'err'); return err(r.message); }
+    catch (e) { ui.status(T('保存失败'), 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status(T('保存失败'), 'err'); return err(r.message); }
     if (r.kind === 'batch' && r.error) {
       // 批次顺序执行,出错前的语句已生效——刷新树并指出失败语句。
       explorer.refreshSoon();
       if (after) after();
-      ui.status('部分保存', 'err');
-      return err(`第 ${r.error.statement + 1} 条失败:${r.error.message}(其前的语句已生效)`);
+      ui.status(T('部分保存'), 'err');
+      return err(T('第 {0} 条失败:{1}(其前的语句已生效)', r.error.statement + 1, r.error.message));
     }
-    ui.toast(`已更新表 ${tableName}`);
+    ui.toast(T('已更新表 {0}', tableName));
     explorer.refreshSoon();
     if (after) after();
     closeModal();
@@ -1105,33 +1466,33 @@ function fmtCell(v) {
 function insertDocDialog(tableName, meta, after) {
   const cols = meta && meta.columns ? meta.columns.filter(c => !c.autoinc) : [];
   const tpl = JSON.stringify(Object.fromEntries(cols.map(c => [c.name, c.primary_key || !c.nullable ? 1 : ''])), null, 2) || '{}';
-  const ov = showModal(`<div class="dialog" style="min-width:540px;max-width:680px"><h3>插入文档 — ${esc(tableName)}</h3><div class="body">
-    <div class="hint">输入 JSON 文档:对象插入一行,数组批量插入多行。允许包含未在表结构中声明的字段(文档式存储)。</div>
+  const ov = showModal(`<div class="dialog" style="min-width:540px;max-width:680px"><h3>${T('插入文档 — {0}', esc(tableName))}</h3><div class="body">
+    <div class="hint">${T('输入 JSON 文档:对象插入一行,数组批量插入多行。允许包含未在表结构中声明的字段(文档式存储)。')}</div>
     <textarea class="json-edit" data-t="doc" spellcheck="false">${esc(tpl)}</textarea>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><span class="hint" style="margin-right:auto">Ctrl+Enter 插入</span><button data-cancel>取消</button><button class="primary" data-ok>插入</button></div></div>`,
+    <div class="foot"><span class="hint" style="margin-right:auto">${T('Ctrl+Enter 插入')}</span><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('插入')}</button></div></div>`,
     'textarea.json-edit');
   const submit = async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
     let doc;
     try { doc = JSON.parse($('textarea[data-t="doc"]', ov).value); }
-    catch (e) { return err('JSON 解析失败:' + e.message); }
+    catch (e) { return err(T('JSON 解析失败:{0}', e.message)); }
     const docs = Array.isArray(doc) ? doc : [doc];
-    if (!docs.length) return err('数组为空');
-    if (docs.some(d => !d || typeof d !== 'object' || Array.isArray(d))) return err('需要 JSON 对象(或对象数组)');
+    if (!docs.length) return err(T('数组为空'));
+    if (docs.some(d => !d || typeof d !== 'object' || Array.isArray(d))) return err(T('需要 JSON 对象(或对象数组)'));
     const stmts = docs.map(d => {
       const ks = Object.keys(d);
       if (!ks.length) return null;
       return `INSERT INTO "${qident(tableName)}" (${ks.map(k => `"${qident(k)}"`).join(', ')}) VALUES (${ks.map(k => sqlLiteral(d[k])).join(', ')})`;
     });
-    if (stmts.includes(null)) return err('存在空对象 {}');
-    ui.status(`正在插入 ${docs.length} 行到 ${tableName}…`, 'busy');
+    if (stmts.includes(null)) return err(T('存在空对象 {}'));
+    ui.status(T('正在插入 {0} 行到 {1}…', docs.length, tableName), 'busy');
     let r;
     try { r = await api.post('/api/sql', {sql: stmts.join(';\n') + ';'}); }
-    catch (e) { ui.status('插入失败', 'err'); return err(e.message); }
-    if (r.kind === 'error') { ui.status('插入失败', 'err'); return err(r.message); }
-    if (r.kind === 'batch' && r.error) { ui.status('插入失败', 'err'); return err(`第 ${r.error.statement + 1} 条:${r.error.message}`); }
-    ui.toast(`已插入 ${docs.length} 行到 ${tableName}`);
+    catch (e) { ui.status(T('插入失败'), 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status(T('插入失败'), 'err'); return err(r.message); }
+    if (r.kind === 'batch' && r.error) { ui.status(T('插入失败'), 'err'); return err(T('第 {0} 条:{1}', r.error.statement + 1, r.error.message)); }
+    ui.toast(T('已插入 {0} 行到 {1}', docs.length, tableName));
     explorer.refreshSoon();
     closeModal();
     if (after) after();
@@ -1163,7 +1524,7 @@ function rowWhere(tableName, keys, cols, row) {
 // 行单元格控件:布尔→select,数值→number,其余→text;NULL 由独立复选框表达。
 function rowFieldCell(name, value, readonly) {
   if (readonly)
-    return `<input type="text" value="${esc(value === null ? '' : fmtCell(value))}" disabled title="自增列不可在线修改">`;
+    return `<input type="text" value="${esc(value === null ? '' : fmtCell(value))}" disabled title="${esc(T('自增列不可在线修改'))}">`;
   if (value === true || value === false)
     return `<select data-v="1" data-type="bool">
       <option value="true"${value === true ? ' selected' : ''}>true</option>
@@ -1177,22 +1538,22 @@ function rowFieldCell(name, value, readonly) {
 async function editRowDialog(tableName, meta, cols, row, after) {
   const keys = tableKeys(meta);
   const where = rowWhere(tableName, keys, cols, row);
-  if (!where) { ui.toast('无法定位该行:主键列不在查询结果中', true); return; }
+  if (!where) { ui.toast(T('无法定位该行:主键列不在查询结果中'), true); return; }
   const mcol = (n) => (meta && meta.columns ? meta.columns.find(c => c.name === n) : null);
   const trs = cols.map((n, i) => {
     const mc = mcol(n);
     const ro = !!mc && mc.autoinc;
-    const badge = (mc && mc.primary_key ? ' <span class="tag">PK</span>' : '') + (ro ? ' <span class="tag">自增</span>' : '');
+    const badge = (mc && mc.primary_key ? ' <span class="tag">PK</span>' : '') + (ro ? ` <span class="tag">${T('自增')}</span>` : '');
     return `<tr data-field-col="${i}"><td class="lbl">${esc(n)}${badge}</td>
       <td>${rowFieldCell(n, row[i], ro)}</td>
-      <td style="text-align:center"><input type="checkbox" data-null="1"${row[i] === null ? ' checked' : ''}${ro ? ' disabled title="自增列不可修改"' : ''} title="值为 NULL"></td></tr>`;
+      <td style="text-align:center"><input type="checkbox" data-null="1"${row[i] === null ? ' checked' : ''}${ro ? ` disabled title="${esc(T('自增列不可修改'))}"` : ''} title="${esc(T('值为 NULL'))}"></td></tr>`;
   }).join('');
-  const ov = showModal(`<div class="dialog" style="min-width:560px;max-width:660px"><h3>编辑行 — ${esc(tableName)}</h3><div class="body">
-    <table class="colgrid"><thead><tr><th style="width:34%">列</th><th>值</th><th style="width:12%">NULL</th></tr></thead>
+  const ov = showModal(`<div class="dialog" style="min-width:560px;max-width:660px"><h3>${T('编辑行 — {0}', esc(tableName))}</h3><div class="body">
+    <table class="colgrid"><thead><tr><th style="width:34%">${T('列')}</th><th>${T('值')}</th><th style="width:12%">NULL</th></tr></thead>
       <tbody>${trs}</tbody></table>
-    <div class="hint">按主键定位该行并执行 UPDATE(集群按写路径扇出)。勾选 NULL 的值保存为 NULL;自增列只读。</div>
+    <div class="hint">${T('按主键定位该行并执行 UPDATE(集群按写路径扇出)。勾选 NULL 的值保存为 NULL;自增列只读。')}</div>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`,
+    <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`,
     'input[data-v="1"],select[data-v="1"]');
   $$('[data-null]', ov).forEach(chk => {
     const sync = () => {
@@ -1218,23 +1579,23 @@ async function editRowDialog(tableName, meta, cols, row, after) {
         if (ctrl.dataset.type === 'bool') v = ctrl.value === 'true';
         else if (ctrl.dataset.type === 'num') {
           const t = ctrl.value.trim();
-          if (t === '') return err(`列 ${n}:需要数值(或勾选 NULL)`);
+          if (t === '') return err(T('列 {0}:需要数值(或勾选 NULL)', n));
           const num = Number(t);
-          if (!Number.isFinite(num)) return err(`列 ${n}:不是有效数值`);
+          if (!Number.isFinite(num)) return err(T('列 {0}:不是有效数值', n));
           v = num;
         }
         else v = ctrl.value;
       }
       setParts.push(`"${qident(n)}" = ${isNull ? 'NULL' : sqlLiteral(v)}`);
     }
-    if (!setParts.length) return err('没有可修改的列');
+    if (!setParts.length) return err(T('没有可修改的列'));
     const sql = `UPDATE "${qident(tableName)}" SET ${setParts.join(', ')} WHERE ${where}`;
-    ui.status(`正在更新 ${tableName}…`, 'busy');
+    ui.status(T('正在更新 {0}…', tableName), 'busy');
     let r;
     try { r = await api.post('/api/sql', {sql}); }
-    catch (e) { ui.status('更新失败', 'err'); return err(e.message); }
-    if (r.kind === 'error') { ui.status('更新失败', 'err'); return err(r.message); }
-    ui.toast('已更新该行');
+    catch (e) { ui.status(T('更新失败'), 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status(T('更新失败'), 'err'); return err(r.message); }
+    ui.toast(T('已更新该行'));
     closeModal();
     if (after) after();
   };
@@ -1245,21 +1606,21 @@ async function editRowDialog(tableName, meta, cols, row, after) {
 
 function deleteRowDialog(tableName, meta, cols, row, after) {
   const where = rowWhere(tableName, tableKeys(meta), cols, row);
-  if (!where) { ui.toast('无法定位该行:主键列不在查询结果中', true); return; }
+  if (!where) { ui.toast(T('无法定位该行:主键列不在查询结果中'), true); return; }
   const sql = `DELETE FROM "${qident(tableName)}" WHERE ${where}`;
-  const ov = showModal(`<div class="dialog"><h3>删除行</h3><div class="body">
-    <div class="hint">执行并沿集群写路径扇出,不可撤销:</div>
+  const ov = showModal(`<div class="dialog"><h3>${T('删除行')}</h3><div class="body">
+    <div class="hint">${T('执行并沿集群写路径扇出,不可撤销:')}</div>
     <pre style="white-space:pre-wrap;word-break:break-all;margin:6px 0;font-family:var(--mono);font-size:12px;color:var(--txt2);background:var(--chrome2);border:1px solid var(--border);padding:8px;border-radius:3px">${esc(sql)}</pre>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><button data-cancel>取消</button><button class="primary danger" data-ok>删除该行</button></div></div>`);
+    <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary danger" data-ok>${T('删除该行')}</button></div></div>`);
   $('[data-ok]', ov).onclick = async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
-    ui.status('正在删除…', 'busy');
+    ui.status(T('正在删除…'), 'busy');
     let r;
     try { r = await api.post('/api/sql', {sql}); }
-    catch (e) { ui.status('删除失败', 'err'); return err(e.message); }
-    if (r.kind === 'error') { ui.status('删除失败', 'err'); return err(r.message); }
-    ui.toast('已删除该行');
+    catch (e) { ui.status(T('删除失败'), 'err'); return err(e.message); }
+    if (r.kind === 'error') { ui.status(T('删除失败'), 'err'); return err(r.message); }
+    ui.toast(T('已删除该行'));
     closeModal();
     if (after) after();
   };
@@ -1280,9 +1641,9 @@ function autoIndexScript(tableName, name, d) {
   const m = explorer.tableMeta(tableName);
   const pkCol = m && (m.columns.find(c => c.primary_key) || {}).name;
   const kind = d.column === pkCol ? 'PRIMARY KEY' : 'UNIQUE';
-  openQueryTab(`脚本: ${name}`,
-    `-- ${name}:由表 ${tableName} 的 ${kind} 约束自动创建(列 ${d.column})。\n` +
-    `-- 随表定义创建与维护,不能单独创建、修改或删除;调整约束请编辑表定义。`);
+  openQueryTab(() => T('脚本: {0}', name),
+    T('-- {0}:由表 {1} 的 {2} 约束自动创建(列 {3})。', name, tableName, kind, d.column) + '\n' +
+    T('-- 随表定义创建与维护,不能单独创建、修改或删除;调整约束请编辑表定义。'));
 }
 
 // 索引名是库级命名空间(任一表占用即全库不可用)。
@@ -1301,7 +1662,7 @@ async function duplicateCheck(tableName, col, err) {
   catch (e) { err(e.message); return false; }
   if (r.kind === 'error') { err(r.message); return false; }
   if (r.kind === 'rows' && r.rows.length) {
-    err(`列 ${col} 存在重复值(如 ${r.rows[0][0]}),无法创建 UNIQUE 索引`);
+    err(T('列 {0} 存在重复值(如 {1}),无法创建 UNIQUE 索引', col, r.rows[0][0]));
     return false;
   }
   return true;
@@ -1312,56 +1673,56 @@ function indexDialog(tableName, def, oldName) {
   const editing = !!oldName;
   const m = explorer.tableMeta(tableName);
   const cols = m && m.columns ? m.columns.map(c => c.name) : [];
-  if (!cols.length) { ui.toast(`表 ${tableName} 没有声明列,无法管理索引`, true); return; }
-  const ov = showModal(`<div class="dialog"><h3>${editing ? '修改索引' : '新建索引'} — ${esc(tableName)}</h3><div class="body">
-    <div class="row"><label>索引名</label><input type="text" data-f="name" value="${esc(def.name || '')}" placeholder="如 idx_${esc(def.column || 'col')}"></div>
-    <div class="row"><label>列</label><select data-f="col" style="flex:1">${cols.map(c => `<option${c === def.column ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
-    <div class="row"><label>唯一索引</label><label style="display:inline-flex;align-items:center;gap:5px;color:var(--txt);cursor:pointer">
-      <input type="checkbox" data-f="uniq"${def.unique ? ' checked' : ''}>UNIQUE(拒绝重复值;NULL 不算重复)</label></div>
-    <div class="hint">仅支持单列索引。${editing
-      ? '修改按新定义重建:改名时先建新索引再删旧的(建新失败则原索引保持不变);同名修改先校验数据,再以「删旧 → 建新」重建。'
-      : 'UNIQUE 索引创建时会校验既有数据,存在重复值将被拒绝。'}</div>
+  if (!cols.length) { ui.toast(T('表 {0} 没有声明列,无法管理索引', tableName), true); return; }
+  const ov = showModal(`<div class="dialog"><h3>${editing ? T('修改索引') : T('新建索引')} — ${esc(tableName)}</h3><div class="body">
+    <div class="row"><label>${T('索引名')}</label><input type="text" data-f="name" value="${esc(def.name || '')}" placeholder="${esc(T('如 idx_{0}', esc(def.column || 'col')))}"></div>
+    <div class="row"><label>${T('列')}</label><select data-f="col" style="flex:1">${cols.map(c => `<option${c === def.column ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
+    <div class="row"><label>${T('唯一索引')}</label><label style="display:inline-flex;align-items:center;gap:5px;color:var(--txt);cursor:pointer">
+      <input type="checkbox" data-f="uniq"${def.unique ? ' checked' : ''}>${T('UNIQUE(拒绝重复值;NULL 不算重复)')}</label></div>
+    <div class="hint">${T('仅支持单列索引。')}${editing
+      ? T('修改按新定义重建:改名时先建新索引再删旧的(建新失败则原索引保持不变);同名修改先校验数据,再以「删旧 → 建新」重建。')
+      : T('UNIQUE 索引创建时会校验既有数据,存在重复值将被拒绝。')}</div>
     <div class="err-line" data-err></div></div>
-    <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>${editing ? '重建' : '创建'}</button></div></div>`,
+    <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${editing ? T('重建') : T('创建')}</button></div></div>`,
     'input[data-f="name"]');
-  const fail = (msg) => { ui.status(editing ? '重建索引失败' : '创建索引失败', 'err'); $('[data-err]', ov).textContent = msg; };
+  const fail = (msg) => { ui.status(editing ? T('重建索引失败') : T('创建索引失败'), 'err'); $('[data-err]', ov).textContent = msg; };
   $('[data-ok]', ov).onclick = async () => {
     const err = (msg) => { $('[data-err]', ov).textContent = msg || ''; };
     const name = $('input[data-f="name"]', ov).value.trim();
     const col = $('select[data-f="col"]', ov).value;
     const uniq = $('[data-f="uniq"]', ov).checked;
-    if (!name) return err('请输入索引名');
+    if (!name) return err(T('请输入索引名'));
     if (indexNameTaken(name, tableName) || (!editing || name !== oldName) && indexDef(tableName, name)) {
-      return err(`索引名 ${name} 已被占用(索引名为全库命名空间)`);
+      return err(T('索引名 {0} 已被占用(索引名为全库命名空间)', name));
     }
     try {
       if (!editing) {
-        ui.status(`正在创建索引 ${name}…`, 'busy');
+        ui.status(T('正在创建索引 {0}…', name), 'busy');
         const r = await api.post('/api/sql', {sql: indexCreateSql(tableName, name, col, uniq) + ';'});
         if (r.kind === 'error') return fail(r.message);
-        ui.toast(`已创建索引 ${name}(${tableName}.${col})`);
+        ui.toast(T('已创建索引 {0}({1}.{2})', name, tableName, col));
       } else {
-        if (name === oldName && col === def.column && uniq === !!def.unique) return err('未修改任何内容');
+        if (name === oldName && col === def.column && uniq === !!def.unique) return err(T('未修改任何内容'));
         if (name !== oldName) {
           // 改名重建:先建新(失败则旧索引原样保留),成功后再删旧。
-          ui.status(`正在重建索引 ${oldName} → ${name}…`, 'busy');
+          ui.status(T('正在重建索引 {0} → {1}…', oldName, name), 'busy');
           let r = await api.post('/api/sql', {sql: indexCreateSql(tableName, name, col, uniq) + ';'});
           if (r.kind === 'error') return fail(r.message);
           r = await api.post('/api/sql', {sql: `DROP INDEX "${qident(oldName)}";`});
-          if (r.kind === 'error') ui.toast(`新索引 ${name} 已创建,但删除旧索引 ${oldName} 失败:${r.message}`, true);
-          else ui.toast(`已重建索引 ${oldName} → ${name}`);
+          if (r.kind === 'error') ui.toast(T('新索引 {0} 已创建,但删除旧索引 {1} 失败:{2}', name, oldName, r.message), true);
+          else ui.toast(T('已重建索引 {0} → {1}', oldName, name));
         } else {
           // 同名重建:先查重挡掉必然失败,再按「删旧 → 建新」顺序重建。
           if (uniq && !(await duplicateCheck(tableName, col, err))) return;
-          ui.status(`正在重建索引 ${name}…`, 'busy');
+          ui.status(T('正在重建索引 {0}…', name), 'busy');
           const r = await api.post('/api/sql', {sql: `DROP INDEX "${qident(oldName)}";\n${indexCreateSql(tableName, name, col, uniq)};`});
           if (r.kind === 'error') return fail(r.message);
           if (r.kind === 'batch' && r.error) {
             return fail(r.error.statement === 1
-              ? `旧索引已删除,但新定义创建失败:${r.error.message}`
-              : `删除旧索引失败:${r.error.message}`);
+              ? T('旧索引已删除,但新定义创建失败:{0}', r.error.message)
+              : T('删除旧索引失败:{0}', r.error.message));
           }
-          ui.toast(`已按新定义重建索引 ${name}(${tableName}.${col})`);
+          ui.toast(T('已按新定义重建索引 {0}({1}.{2})', name, tableName, col));
         }
       }
       ui.status('');
@@ -1377,22 +1738,22 @@ function indexDialog(tableName, def, oldName) {
 function newIndexDialog(tableName) {
   const m = explorer.tableMeta(tableName);
   const cols = m && m.columns ? m.columns.map(c => c.name) : [];
-  if (!cols.length) { ui.toast(`表 ${tableName} 没有声明列,无法创建索引`, true); return; }
+  if (!cols.length) { ui.toast(T('表 {0} 没有声明列,无法创建索引', tableName), true); return; }
   indexDialog(tableName, {name: '', column: cols[0], unique: false}, null);
 }
 
 function editIndexDialog(tableName, indexName) {
   const d = indexDef(tableName, indexName);
-  if (!d) { ui.toast('未找到该索引的定义,请刷新对象资源管理器后重试', true); explorer.refreshSoon(); return; }
+  if (!d) { ui.toast(T('未找到该索引的定义,请刷新对象资源管理器后重试'), true); explorer.refreshSoon(); return; }
   indexDialog(tableName, {name: d.name, column: d.column, unique: !!d.unique}, indexName);
 }
 
 function dropIndex(tableName, indexName) {
-  dialog('删除索引', [{name: 'name', label: '索引名', value: indexName, ph: '输入索引名以确认'}], '删除', async (v, err) => {
-    if (v.name !== indexName) { err('索引名不匹配'); throw new Error('cancel'); }
+  dialog(T('删除索引'), [{name: 'name', label: T('索引名'), value: indexName, ph: T('输入索引名以确认')}], T('删除'), async (v, err) => {
+    if (v.name !== indexName) { err(T('索引名不匹配')); throw new Error('cancel'); }
     const r = await api.post('/api/sql', {sql: `DROP INDEX "${qident(indexName)}";`});
     if (r.kind === 'error') { ui.toast(r.message, true); return; }
-    ui.toast(`已删除索引 ${indexName}(${tableName})`);
+    ui.toast(T('已删除索引 {0}({1})', indexName, tableName));
     explorer.refreshSoon();
   });
 }
@@ -1443,7 +1804,7 @@ const layout = {
       this.expW = 0;
       localStorage.removeItem('docsql.ui.explorerW');
       this.applyExplorer();
-      ui.toast('对象资源管理器宽度已恢复默认');
+      ui.toast(T('对象资源管理器宽度已恢复默认'));
     });
   },
 
@@ -1483,7 +1844,7 @@ const layout = {
       this.editorRatio = this.EDITOR_DEFAULT;
       localStorage.removeItem('docsql.ui.editorRatio');
       this.applyEditorAll();
-      ui.toast('编辑器高度已恢复默认比例');
+      ui.toast(T('编辑器高度已恢复默认比例'));
     });
   },
 
@@ -1516,7 +1877,7 @@ const tabs = {
     const t = { id: ++this.seq, kind, key, title };
     const stripEl = document.createElement('div');
     stripEl.className = 'tab';
-    stripEl.innerHTML = `<span class="tb-ico" style="display:inline-flex">${ICONS[tabs.kindIcon(kind)]||''}</span><span class="t">${esc(title)}</span><span class="x" title="关闭">×</span>`;
+    stripEl.innerHTML = `<span class="tb-ico" style="display:inline-flex">${ICONS[tabs.kindIcon(kind)]||''}</span><span class="t">${esc(title)}</span><span class="x" title="${esc(T('关闭'))}">×</span>`;
     stripEl.onclick = () => this.activate(t);
     stripEl.onmousedown = (e) => { if (e.button === 1) this.close(t); };
     $('.x', stripEl).onclick = (e) => { e.stopPropagation(); this.close(t); };
@@ -1527,6 +1888,7 @@ const tabs = {
     t.stripEl = stripEl; t.el = docEl;
     this.list.push(t);
     build(t);
+    applyI18n(t.el); // 模板里的 data-i18n 骨架按当前语言重排(T() 文本无需此步)
     this.activate(t);
     return t;
   },
@@ -1664,22 +2026,27 @@ function renderGrid(container, cols, rows, opts) {
 
 /* ================= 查询标签页 ================= */
 let querySeq = 0;
+// title 可传函数(语言切换后可重算的动态标题,如 () => T('查询: {0}', name))
+// 或字符串(固定标题);不传则「查询 N」。
 function openQueryTab(title, sql, autoRun) {
   querySeq++;
-  return tabs.open('query', 'q' + querySeq, title || `查询 ${querySeq}`, (t) => {
+  const seq = querySeq;
+  const titleOf = () => (typeof title === 'function' ? title() : (title || T('查询 {0}', seq)));
+  return tabs.open('query', 'q' + seq, titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.el.innerHTML = `<div class="doc-bar">
-        <button data-do="exec" class="primary" title="F5"><span class="tb-ico">${ICONS.run}</span>执行</button>
-        <button data-do="parse" title="Ctrl+F5 — 语法检查,不执行">分析</button>
-        <button data-do="execsel" title="仅执行选中文本">执行所选</button>
+        <button data-do="exec" class="primary" title="F5"><span class="tb-ico">${ICONS.run}</span><span data-i18n>执行</span></button>
+        <button data-do="parse" data-i18n-title title="Ctrl+F5 — 语法检查,不执行"><span data-i18n>分析</span></button>
+        <button data-do="execsel" data-i18n-title title="仅执行选中文本"><span data-i18n>执行所选</span></button>
         <div class="sep"></div>
-        <span class="meta">F5 执行 · Ctrl+F5 分析 · 批量语句将依次执行并返回全部结果</span>
+        <span class="meta" data-i18n>F5 执行 · Ctrl+F5 分析 · 批量语句将依次执行并返回全部结果</span>
       </div>
       <div class="q-wrap"><div class="ed-host" style="flex:1.2;display:flex;min-height:90px;flex-direction:column"></div>
-      <div class="splitter h" title="拖动调整编辑器与结果区高度,双击恢复默认"></div>
+      <div class="splitter h" data-i18n-title title="拖动调整编辑器与结果区高度,双击恢复默认"></div>
       <div class="res-wrap">
         <div class="res-tabs">
-          <div class="res-tab active" data-rt="results">结果</div>
-          <div class="res-tab" data-rt="messages">消息</div>
+          <div class="res-tab active" data-rt="results"><span data-i18n>结果</span></div>
+          <div class="res-tab" data-rt="messages"><span data-i18n>消息</span></div>
         </div>
         <div class="res-pane active" data-rp="results"></div>
         <div class="res-pane" data-rp="messages"><div class="msg-list"></div></div>
@@ -1711,85 +2078,87 @@ function openQueryTab(title, sql, autoRun) {
 
 async function execQuery(t, selectedOnly) {
   const sql = (selectedOnly ? t.editor.selectedText() : t.editor.value).trim();
-  if (!sql) { ui.toast('没有可执行的 SQL'); return; }
+  if (!sql) { ui.toast(T('没有可执行的 SQL')); return; }
   t.clearOutput();
-  ui.status('正在执行查询…', 'busy');
+  ui.status(T('正在执行查询…'), 'busy');
   const t0 = performance.now();
   let data;
   try { data = await api.post('/api/sql', {sql}); }
-  catch (e) { t.msg(e.message, 'err'); ui.status('执行失败', 'err'); return; }
+  catch (e) { t.msg(e.message, 'err'); ui.status(T('执行失败'), 'err'); return; }
   const ms = Math.max(1, Math.round(performance.now() - t0));
   const results = $('[data-rp="results"]', t.el);
   const renderOutcome = (o, idx) => {
     if (o.kind === 'rows') {
       if (idx !== undefined) { const lab = document.createElement('div'); lab.className = 'grid-label';
-        lab.textContent = `结果 ${idx + 1}(${o.rows.length} 行)`; results.appendChild(lab); }
+        lab.textContent = T('结果 {0}({1} 行)', idx + 1, o.rows.length); results.appendChild(lab); }
       renderGrid(results, o.columns, o.rows);
-      t.msg(`(${o.rows.length} 行)` + (idx === undefined ? '' : ` — 结果 ${idx + 1}`), 'info');
+      t.msg(T('({0} 行)', o.rows.length) + (idx === undefined ? '' : T(' — 结果 {0}', idx + 1)), 'info');
     } else if (o.kind === 'affected') {
-      t.msg(`(${o.count} 行受影响)`, 'ok');
+      t.msg(T('({0} 行受影响)', o.count), 'ok');
     } else if (o.kind === 'error') {
-      t.msg(`错误:${o.message}`, 'err');
+      t.msg(T('错误:{0}', o.message), 'err');
     }
   };
   if (data.kind === 'batch') {
     data.results.forEach((o, i) => renderOutcome(o, data.results.some(x => x.kind === 'rows') ? i : undefined));
-    if (data.error) t.msg(`批处理在语句 ${data.error.statement + 1} 处停止:${data.error.message}`, 'err');
-    t.msg(`总耗时: ${ms} ms`, 'info');
+    if (data.error) t.msg(T('批处理在语句 {0} 处停止:{1}', data.error.statement + 1, data.error.message), 'err');
+    t.msg(T('总耗时: {0} ms', ms), 'info');
   } else {
     renderOutcome(data);
-    if (data.kind !== 'error') t.msg(`命令已成功完成。总耗时: ${ms} ms`, 'ok');
-    else t.msg(`总耗时: ${ms} ms`, 'info');
+    if (data.kind !== 'error') t.msg(T('命令已成功完成。总耗时: {0} ms', ms), 'ok');
+    else t.msg(T('总耗时: {0} ms', ms), 'info');
   }
   const rowCount = data.kind === 'rows' ? data.rows.length :
     data.kind === 'batch' ? data.results.reduce((n, o) => n + (o.rows ? o.rows.length : 0), 0) : 0;
   const hasErr = data.kind === 'error' || (data.kind === 'batch' && data.error);
-  if (hasErr) ui.status(`查询完成(有错误)· 耗时 ${ms} ms · ${rowCount} 行`, 'err');
-  else ui.status(`查询已成功执行 · 耗时 ${ms} ms · ${rowCount} 行`);
+  if (hasErr) ui.status(T('查询完成(有错误)· 耗时 {0} ms · {1} 行', ms, rowCount), 'err');
+  else ui.status(T('查询已成功执行 · 耗时 {0} ms · {1} 行', ms, rowCount));
   t.showResults();
 }
 
 async function parseQuery(t) {
   const sql = t.editor.value.trim();
-  if (!sql) { ui.toast('没有可分析的 SQL'); return; }
+  if (!sql) { ui.toast(T('没有可分析的 SQL')); return; }
   try {
     const r = await api.post('/api/parse', {sql});
-    if (r.ok) { t.msg('分析完成: 未检测到语法错误。', 'ok'); ui.toast('分析通过:无语法错误'); }
-    else { t.msg('分析失败: ' + r.message, 'err'); ui.toast('分析失败(见消息页)', true); }
+    if (r.ok) { t.msg(T('分析完成: 未检测到语法错误。'), 'ok'); ui.toast(T('分析通过:无语法错误')); }
+    else { t.msg(T('分析失败: {0}', r.message), 'err'); ui.toast(T('分析失败(见消息页)'), true); }
   } catch (e) { t.msg(e.message, 'err'); }
 }
 
 /* ================= 表数据查看 ================= */
 async function dropTable(tableName, after) {
-  dialog('删除表', [{name: 'name', label: '表名', value: tableName, ph: '输入表名以确认'}], '删除', async (v, err) => {
-    if (v.name !== tableName) { err('表名不匹配'); throw new Error('cancel'); }
+  dialog(T('删除表'), [{name: 'name', label: T('表名'), value: tableName, ph: T('输入表名以确认')}], T('删除'), async (v, err) => {
+    if (v.name !== tableName) { err(T('表名不匹配')); throw new Error('cancel'); }
     const r = await api.post('/api/sql', {sql: `DROP TABLE "${qident(tableName)}"`});
     if (r.kind === 'error') { ui.toast(r.message, true); return; }
-    ui.toast(`已删除表 ${tableName}`);
+    ui.toast(T('已删除表 {0}', tableName));
     explorer.refreshSoon();
     if (after) after();
   });
 }
 
 function openDataTab(tableName, meta) {
-  tabs.open('data', 'data:' + tableName, `表: ${tableName}`, (t) => {
+  const titleOf = () => T('表: {0}', tableName);
+  tabs.open('data', 'data:' + tableName, titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.offset = 0; t.limit = 200; t.selected = null;
     t.el.innerHTML = `<div class="doc-bar">
         <span class="title">${esc(tableName)}</span>
-        <button data-do="refresh">刷新</button>
-        <button data-do="prev">◀ 上一页</button>
-        <button data-do="next">下一页 ▶</button>
+        <button data-do="refresh" data-i18n-title title="刷新"><span data-i18n>刷新</span></button>
+        <button data-do="prev"><span data-i18n>◀ 上一页</span></button>
+        <button data-do="next"><span data-i18n>下一页 ▶</span></button>
         <span class="meta" data-range></span>
         <div class="spacer"></div>
-        <button data-do="edit" title="编辑表结构(列编辑网格)">编辑表…</button>
-        <button data-do="insert" class="primary" title="插入文档(JSON)">插入文档…</button>
-        <button data-do="query">生成查询</button>
-        <button data-do="drop" class="danger">删除表…</button>
+        <button data-do="edit" data-i18n-title title="编辑表结构(列编辑网格)"><span data-i18n>编辑表…</span></button>
+        <button data-do="insert" class="primary" data-i18n-title title="插入文档(JSON)"><span data-i18n>插入文档…</span></button>
+        <button data-do="query"><span data-i18n>生成查询</span></button>
+        <button data-do="drop" class="danger"><span data-i18n>删除表…</span></button>
       </div><div class="res-wrap"><div class="res-pane active grid-host" style="display:block"></div></div>`;
     t.host = $('.grid-host', t.el);
-    const range = () => { $('[data-range]', t.el).textContent = t.offset === 0 && t.total === 0 ? '(空表)' : `第 ${t.offset + 1}–${Math.min(t.offset + t.limit, t.total)} 行,共 ${t.total} 行`; };
+    const range = () => { $('[data-range]', t.el).textContent = t.offset === 0 && t.total === 0 ? T('(空表)') : T('第 {0}–{1} 行,共 {2} 行', t.offset + 1, Math.min(t.offset + t.limit, t.total), t.total); };
     t.load = async () => {
-      ui.status(`正在加载 ${tableName}…`, 'busy');
+      ui.status(T('正在加载 {0}…', tableName), 'busy');
       try {
         const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${qident(tableName)}"`});
         t.total = count.kind === 'rows' ? +count.rows[0][0] : 0;
@@ -1800,12 +2169,12 @@ function openDataTab(tableName, meta) {
         renderGrid(t.host, r.columns, r.rows, keys.length ? {
           onRowClick: row => { t.selected = row; },
           btns: row => [
-            {label: '编辑', title: '编辑此行(按主键 UPDATE)', act: () => editRowDialog(tableName, meta, r.columns, row, t.load)},
-            {label: '删除', cls: 'danger', title: '删除此行(按主键)', act: () => deleteRowDialog(tableName, meta, r.columns, row, t.load)},
+            {label: T('编辑'), title: T('编辑此行(按主键 UPDATE)'), act: () => editRowDialog(tableName, meta, r.columns, row, t.load)},
+            {label: T('删除'), cls: 'danger', title: T('删除此行(按主键)'), act: () => deleteRowDialog(tableName, meta, r.columns, row, t.load)},
           ],
         } : {});
         range();
-        ui.status(`${tableName}:共 ${t.total} 行`);
+        ui.status(T('{0}:共 {1} 行', tableName, t.total));
         $('[data-do="prev"]', t.el).disabled = t.offset <= 0;
         $('[data-do="next"]', t.el).disabled = t.offset + t.limit >= t.total;
       } catch (e) { ui.toast(e.message, true); }
@@ -1815,7 +2184,7 @@ function openDataTab(tableName, meta) {
     $('[data-do="next"]', t.el).onclick = () => { t.offset += t.limit; t.load(); };
     $('[data-do="edit"]', t.el).onclick = () => editTableDialog(tableName, explorer.tableMeta(tableName) || meta, t.load);
     $('[data-do="insert"]', t.el).onclick = () => insertDocDialog(tableName, meta, t.load);
-    $('[data-do="query"]', t.el).onclick = () => openQueryTab(`查询: ${tableName}`, `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
+    $('[data-do="query"]', t.el).onclick = () => openQueryTab(() => T('查询: {0}', tableName), `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
     $('[data-do="drop"]', t.el).onclick = () => dropTable(tableName, () => tabs.close(t));
     t.load();
   });
@@ -1823,13 +2192,15 @@ function openDataTab(tableName, meta) {
 
 /* ================= 仪表盘 ================= */
 function openDashboard() {
-  tabs.open('dash', 'dash', '服务器仪表盘', (t) => {
+  const titleOf = () => T('服务器仪表盘');
+  tabs.open('dash', 'dash', titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.el.innerHTML = `<div class="dash">
-      <h2>DocSQL 服务器仪表盘</h2>
+      <h2 data-i18n>DocSQL 服务器仪表盘</h2>
       <div class="sub"></div>
       <div class="dash-actions">
-        <button class="primary" data-do="newq">新建查询</button>
-        <button data-do="refresh">刷新</button>
+        <button class="primary" data-do="newq"><span data-i18n>新建查询</span></button>
+        <button data-do="refresh"><span data-i18n>刷新</span></button>
       </div>
       <div class="cards" data-cards></div>
     </div>`;
@@ -1838,13 +2209,15 @@ function openDashboard() {
     t.load = async () => {
       // 统计对象随节点选择器切换:默认管理节点或其它集群节点。
       $('.sub', t.el).textContent = api.node
-        ? `统计对象为节点 ${api.node}(写在该节点上执行并按其集群配置扇出)`
-        : `统计对象为默认管理节点${nodes.default ? ` ${nodes.default}` : ''}(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v${CONSOLE_VERSION}`;
+        ? T('统计对象为节点 {0}(写在该节点上执行并按其集群配置扇出)', api.node)
+        : (nodes.default
+          ? T('统计对象为默认管理节点 {0}(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v{1}', nodes.default, CONSOLE_VERSION)
+          : T('统计对象为默认管理节点(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v{0}', CONSOLE_VERSION));
       try {
         const m = await api.get('/api/meta');
         if (m && m.error) {
           $('[data-cards]', t.el).innerHTML =
-            `<div class="card" style="max-width:520px"><div class="v" style="font-size:15px;color:var(--err)">节点不可用</div><div class="k">${esc(m.error)}</div></div>`;
+            `<div class="card" style="max-width:520px"><div class="v" style="font-size:15px;color:var(--err)">${T('节点不可用')}</div><div class="k">${esc(m.error)}</div></div>`;
           return;
         }
         const s = m.storage, sv = m.server;
@@ -1854,12 +2227,12 @@ function openDashboard() {
           : (m.tables || []).reduce((n, t) => n + (t.indexes || []).length, 0);
         // 节点返回的 meta 载荷不受控制台控制,所有字段过 esc 再进 innerHTML。
         const cards = [
-          [`${esc(m.totals.tables)}<small> 张</small>`, '用户表'],
-          [`${esc(m.totals.rows)}<small> 行</small>`, '表数据总行数'],
-          [`${esc(idxN)}<small> 个</small>`, '索引(含主键/唯一约束)'],
-          [`${esc(s.num_pages)}<small> 页 × ${esc(s.page_size / 1024)}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, '已分配页'],
-          [`${fmtBytes(s.db_bytes)}<small> / WAL ${fmtBytes(s.wal_bytes)}</small>`, '数据文件 / WAL'],
-          [`${fmtDur(sv.uptime_ms)}<small> · v${esc(sv.version)}</small>`, '服务运行时长 · 版本'],
+          [`${esc(m.totals.tables)}<small> ${T('张')}</small>`, T('用户表')],
+          [`${esc(m.totals.rows)}<small> ${T('行')}</small>`, T('表数据总行数')],
+          [`${esc(idxN)}<small> ${T('个')}</small>`, T('索引(含主键/唯一约束)')],
+          [`${esc(s.num_pages)}<small> ${T('页')} × ${esc(s.page_size / 1024)}KB = ${fmtBytes(s.num_pages * s.page_size)}</small>`, T('已分配页')],
+          [`${fmtBytes(s.db_bytes)}<small> / WAL ${fmtBytes(s.wal_bytes)}</small>`, T('数据文件 / WAL')],
+          [`${fmtDur(sv.uptime_ms)}<small> · v${esc(sv.version)}</small>`, T('服务运行时长 · 版本')],
         ];
         $('[data-cards]', t.el).innerHTML = cards.map(c => `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('');
       } catch (e) { ui.toast(e.message, true); }
@@ -1870,18 +2243,20 @@ function openDashboard() {
 
 /* ================= 集群状态 ================= */
 function openClusterTab() {
-  tabs.open('cluster', 'cluster', '集群状态', (t) => {
+  const titleOf = () => T('集群状态');
+  tabs.open('cluster', 'cluster', titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.auto = true;
     t.el.innerHTML = `<div class="dash">
-      <h2>集群状态</h2>
-      <div class="sub">DOCSQL_PEERS 对等节点 · 只读探测(PING 存活 + STATUS 状态报告),不影响集群数据</div>
+      <h2 data-i18n>集群状态</h2>
+      <div class="sub" data-i18n>DOCSQL_PEERS 对等节点 · 只读探测(PING 存活 + STATUS 状态报告),不影响集群数据</div>
       <div class="dash-actions">
-        <button class="primary" data-do="refresh">立即刷新</button>
+        <button class="primary" data-do="refresh"><span data-i18n>立即刷新</span></button>
         <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
-          <input type="checkbox" data-do="auto" checked>每 5 秒自动刷新</label>
+          <input type="checkbox" data-do="auto" checked><span data-i18n>每 5 秒自动刷新</span></label>
         <span class="meta" data-at style="color:var(--txt3)"></span>
       </div>
-      <div data-body><div class="msg-list" style="color:var(--txt3)">正在探测节点…</div></div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在探测节点…</div></div>
     </div>`;
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
     $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
@@ -1889,11 +2264,10 @@ function openClusterTab() {
       const body = $('[data-body]', t.el);
       const nodes = data.nodes || [];
       if (!nodes.length) {
+        const defPart = data.default ? ` <b>${esc(data.default)}</b>` : `(${T('未配置,请在启动参数或 DOCSQL_UPSTREAM 指定')})`;
         body.innerHTML = `<div class="card" style="max-width:600px">
-          <div class="v" style="font-size:15px">单机模式</div>
-          <div class="k" style="line-height:1.7">未配置集群(DOCSQL_PEERS 为空),控制台管理默认节点${data.default ? ` <b>${esc(data.default)}</b>` : '(未配置,请在启动参数或 DOCSQL_UPSTREAM 指定)'},
-          可在「视图 → 服务器仪表盘」查看其状态。集群部署时为 web 服务设置
-          DOCSQL_PEERS(逗号分隔的节点地址,如 node-a:7600,node-b:7600),即可在此监控各节点。</div></div>`;
+          <div class="v" style="font-size:15px">${T('单机模式')}</div>
+          <div class="k" style="line-height:1.7">${T('未配置集群(DOCSQL_PEERS 为空),控制台管理默认节点{0},可在「视图 → 服务器仪表盘」查看其状态。集群部署时为 web 服务设置 DOCSQL_PEERS(逗号分隔的节点地址,如 node-a:7600,node-b:7600),即可在此监控各节点。', defPart)}</div></div>`;
         return;
       }
       const reachable = nodes.filter(n => n.reachable).length;
@@ -1906,33 +2280,33 @@ function openClusterTab() {
       const consistent = st.filter(n => (n.status.totals && n.status.totals.rows) === maxRows).length;
       const ro = st.filter(n => n.status.read_only).length;
       const cards = [
-        [`${nodes.length}<small> 个</small>`, '配置节点'],
-        [`${reachable}<small> / ${nodes.length}</small>`, '在线(可达)'],
-        [`${down}<small> 个</small>`, '离线(不可达)', down ? ' style="color:var(--err)"' : ''],
-        [`${maxTables}<small> 张</small>`, '集群表数(节点最大值)'],
-        [`${maxRows}<small> 行</small>`, '集群总行数(节点最大值)'],
-        [`${consistent}<small> / ${st.length}</small>`, '行数一致的节点'],
-        [ro ? `${ro}<small> 个</small>` : '无', '只读节点(PROMOTE 可提升)'],
+        [`${nodes.length}<small> ${T('个')}</small>`, T('配置节点')],
+        [`${reachable}<small> / ${nodes.length}</small>`, T('在线(可达)')],
+        [`${down}<small> ${T('个')}</small>`, T('离线(不可达)'), down ? ' style="color:var(--err)"' : ''],
+        [`${maxTables}<small> ${T('张')}</small>`, T('集群表数(节点最大值)')],
+        [`${maxRows}<small> ${T('行')}</small>`, T('集群总行数(节点最大值)')],
+        [`${consistent}<small> / ${st.length}</small>`, T('行数一致的节点')],
+        [ro ? `${ro}<small> ${T('个')}</small>` : T('无'), T('只读节点(PROMOTE 可提升)')],
       ];
       let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
         `<div class="card"><div class="v"${c[2] || ''}>${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
       html += `<table class="grid"><thead><tr>
-        <th>节点</th><th>状态</th><th>延迟</th><th>只读</th><th>事务中</th><th>表</th><th>行数</th>
-        <th>数据 / WAL</th><th title="节点本机 WAL 写入位置;checkpoint 或重启后回绕,不作跨节点比较">WAL LSN</th><th>运行时长</th><th>Peers</th><th>备注</th></tr></thead><tbody>`;
+        <th>${T('节点')}</th><th>${T('状态')}</th><th>${T('延迟')}</th><th>${T('只读')}</th><th>${T('事务中')}</th><th>${T('表')}</th><th>${T('行数')}</th>
+        <th>${T('数据 / WAL')}</th><th title="${esc(T('节点本机 WAL 写入位置;checkpoint 或重启后回绕,不作跨节点比较'))}">WAL LSN</th><th>${T('运行时长')}</th><th>Peers</th><th>${T('备注')}</th></tr></thead><tbody>`;
       const dash = '<span class="null">—</span>';
       for (const n of nodes) {
         const s = n.status;
         let state;
-        if (!n.reachable) state = '<span style="color:var(--err);font-weight:600">● 离线</span>';
-        else if (!s) state = '<span style="color:var(--warn);font-weight:600">● 在线</span>';
-        else if (s.read_only) state = '<span style="color:var(--warn);font-weight:600">● 只读</span>';
-        else state = '<span style="color:var(--ok);font-weight:600">● 在线</span>';
+        if (!n.reachable) state = `<span style="color:var(--err);font-weight:600">● ${T('离线')}</span>`;
+        else if (!s) state = `<span style="color:var(--warn);font-weight:600">● ${T('在线')}</span>`;
+        else if (s.read_only) state = `<span style="color:var(--warn);font-weight:600">● ${T('只读')}</span>`;
+        else state = `<span style="color:var(--ok);font-weight:600">● ${T('在线')}</span>`;
         html += `<tr>
           <td style="font-family:var(--mono)">${esc(n.addr)}</td>
           <td>${state}</td>
           <td>${n.latency_ms === null || n.latency_ms === undefined ? dash : esc(n.latency_ms.toFixed(1)) + ' ms'}</td>
-          <td>${s ? (s.read_only ? '是' : '否') : dash}</td>
-          <td>${s ? (s.in_transaction ? '<span style="color:var(--warn)">是</span>' : '否') : dash}</td>
+          <td>${s ? (s.read_only ? T('是') : T('否')) : dash}</td>
+          <td>${s ? (s.in_transaction ? `<span style="color:var(--warn)">${T('是')}</span>` : T('否')) : dash}</td>
           <td>${s && s.totals ? esc(s.totals.tables) : dash}</td>
           <td>${s && s.totals ? esc(s.totals.rows) : dash}</td>
           <td>${s && s.storage ? fmtBytes(s.storage.db_bytes) + ' / ' + fmtBytes(s.storage.wal_bytes) : dash}</td>
@@ -1950,8 +2324,8 @@ function openClusterTab() {
         const data = await api.get('/api/cluster');
         nodes.sync(data.nodes || []); // 顺带刷新节点切换器的在线状态
         t.render(data);
-        $('[data-at]', t.el).textContent = '上次刷新 ' + new Date().toTimeString().slice(0, 8);
-      } catch (e) { ui.toast('集群状态刷新失败:' + e.message, true); }
+        $('[data-at]', t.el).textContent = T('上次刷新 {0}', new Date().toTimeString().slice(0, 8));
+      } catch (e) { ui.toast(T('集群状态刷新失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生探测流量。
     t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
@@ -1966,17 +2340,19 @@ function openClusterTab() {
 // (节点要求认证、权限不足等)整卡显示;每个成功动作后整页刷新。
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
 function openUsersTab() {
-  tabs.open('users', 'users', '用户与角色', (t) => {
+  const titleOf = () => T('用户与角色');
+  tabs.open('users', 'users', titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.el.innerHTML = `<div class="dash">
-      <h2>用户与角色</h2>
-      <div class="sub">数据库级访问控制 · 变更经默认管理节点执行并随集群复制 · 详见 README「数据库用户与角色」</div>
+      <h2 data-i18n>用户与角色</h2>
+      <div class="sub" data-i18n>数据库级访问控制 · 变更经默认管理节点执行并随集群复制 · 详见 README「数据库用户与角色」</div>
       <div class="dash-actions">
-        <button class="primary" data-do="newuser">新建用户</button>
-        <button data-do="newrole">新建角色</button>
-        <button data-do="refresh">刷新</button>
+        <button class="primary" data-do="newuser"><span data-i18n>新建用户</span></button>
+        <button data-do="newrole"><span data-i18n>新建角色</span></button>
+        <button data-do="refresh"><span data-i18n>刷新</span></button>
         <span class="meta" data-at style="color:var(--txt3)"></span>
       </div>
-      <div data-body><div class="msg-list" style="color:var(--txt3)">正在读取用户与角色…</div></div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在读取用户与角色…</div></div>
     </div>`;
     $('[data-do="newuser"]', t.el).onclick = () => usersPage.newUserDialog(t);
     $('[data-do="newrole"]', t.el).onclick = () => usersPage.newRoleDialog(t);
@@ -1992,7 +2368,7 @@ function openUsersTab() {
         }
       } catch (e) { data = {error: e.message}; }
       t.render(data);
-      $('[data-at]', t.el).textContent = '更新于 ' + new Date().toLocaleTimeString();
+      $('[data-at]', t.el).textContent = T('更新于 {0}', new Date().toLocaleTimeString());
     };
     t.load();
   });
@@ -2006,56 +2382,56 @@ const usersPage = {
     const keys = Object.keys(grants || {});
     if (!keys.length) return '<span class="null">—</span>';
     return keys.sort().map(tbl =>
-      `<span class="grant-chip" title="表 ${esc(tbl)} 上的权限">${esc(tbl)}: ${esc((grants[tbl]||[]).sort().join(', '))}</span>`).join(' ');
+      `<span class="grant-chip" title="${esc(T('表 {0} 上的权限', tbl))}">${esc(tbl)}: ${esc((grants[tbl]||[]).sort().join(', '))}</span>`).join(' ');
   },
   render(t, data) {
     const body = $('[data-body]', t.el);
     if (data.error) {
       const needAuth = /authentication required/.test(data.error);
       body.innerHTML = `<div class="card" style="max-width:640px">
-        <div class="v" style="font-size:15px;color:var(--err)">无法读取用户与角色</div>
-        <div class="k" style="line-height:1.7">${esc(data.error)}${needAuth ? '<br>该节点已启用数据库用户:为 Web 服务与节点配置一致的 <b>DOCSQL_TOKEN</b>(管理员凭据)后即可在此管理。' : ''}</div></div>`;
+        <div class="v" style="font-size:15px;color:var(--err)">${T('无法读取用户与角色')}</div>
+        <div class="k" style="line-height:1.7">${esc(data.error)}${needAuth ? '<br>' + T('该节点已启用数据库用户:为 Web 服务与节点配置一致的 <b>DOCSQL_TOKEN</b>(管理员凭据)后即可在此管理。') : ''}</div></div>`;
       return;
     }
     const users = data.users || [], roles = data.roles || [];
     const cards = [
-      [`${users.length}<small> 个</small>`, '数据库用户'],
-      [`${roles.length}<small> 个</small>`, '角色(含内置 3 个)'],
-      [`${roles.filter(r => !r.builtin).length}<small> 个</small>`, '自定义角色'],
+      [`${users.length}<small> ${T('个')}</small>`, T('数据库用户')],
+      [`${roles.length}<small> ${T('个')}</small>`, T('角色(含内置 3 个)')],
+      [`${roles.filter(r => !r.builtin).length}<small> ${T('个')}</small>`, T('自定义角色')],
     ];
     let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
       `<div class="card"><div class="v">${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
-    html += `<h3 style="margin:10px 0 6px">用户</h3>`;
+    html += `<h3 style="margin:10px 0 6px">${T('用户')}</h3>`;
     if (!users.length) {
-      html += `<div class="k" style="color:var(--txt3)">尚无数据库用户:节点处于开放模式(或仅 token 认证)。创建第一个用户后,新的匿名连接将被拒绝 —— 建议先为节点与 Web 服务配置一致的 DOCSQL_TOKEN。</div>`;
+      html += `<div class="k" style="color:var(--txt3)">${T('尚无数据库用户:节点处于开放模式(或仅 token 认证)。创建第一个用户后,新的匿名连接将被拒绝 —— 建议先为节点与 Web 服务配置一致的 DOCSQL_TOKEN。')}</div>`;
     } else {
-      html += `<table class="grid"><thead><tr><th>用户名</th><th>角色</th><th>表级权限</th><th style="width:290px">操作</th></tr></thead><tbody>`;
+      html += `<table class="grid"><thead><tr><th>${T('用户名')}</th><th>${T('角色')}</th><th>${T('表级权限')}</th><th style="width:290px">${T('操作')}</th></tr></thead><tbody>`;
       for (const u of users) {
         html += `<tr>
           <td style="font-family:var(--mono)">${esc(u.name)}</td>
-          <td>${(u.roles||[]).map(r => this.badge(r)).join(' ') || '<span class="null">无(仅直授权限)</span>'}</td>
+          <td>${(u.roles||[]).map(r => this.badge(r)).join(' ') || `<span class="null">${T('无(仅直授权限)')}</span>`}</td>
           <td>${this.grantChips(u.grants)}</td>
           <td>
-            <button data-act="pw" data-name="${esc(u.name)}">改密码</button>
-            <button data-act="role" data-name="${esc(u.name)}">角色</button>
-            <button data-act="tgrants" data-name="${esc(u.name)}" data-kind="user">表权限</button>
-            <button data-act="drop" data-name="${esc(u.name)}" class="danger">删除</button>
+            <button data-act="pw" data-name="${esc(u.name)}">${T('改密码')}</button>
+            <button data-act="role" data-name="${esc(u.name)}">${T('角色')}</button>
+            <button data-act="tgrants" data-name="${esc(u.name)}" data-kind="user">${T('表权限')}</button>
+            <button data-act="drop" data-name="${esc(u.name)}" class="danger">${T('删除')}</button>
           </td></tr>`;
       }
       html += `</tbody></table>`;
     }
-    html += `<h3 style="margin:16px 0 6px">角色</h3><table class="grid"><thead><tr><th>角色</th><th>说明</th><th>成员</th><th>表级权限</th><th style="width:230px">操作</th></tr></thead><tbody>`;
-    const DESC = {admin: '全部权限(DDL/用户管理/备份/恢复/PROMOTE)', readwrite: '全部表 DML + PUBLISH/TRIM', readonly: '全部表 SELECT'};
+    html += `<h3 style="margin:16px 0 6px">${T('角色')}</h3><table class="grid"><thead><tr><th>${T('角色')}</th><th>${T('说明')}</th><th>${T('成员')}</th><th>${T('表级权限')}</th><th style="width:230px">${T('操作')}</th></tr></thead><tbody>`;
+    const DESC = {admin: T('全部权限(DDL/用户管理/备份/恢复/PROMOTE)'), readwrite: T('全部表 DML + PUBLISH/TRIM'), readonly: T('全部表 SELECT')};
     for (const r of roles) {
       html += `<tr>
         <td style="font-family:var(--mono)">${this.badge(r.name, r.builtin)}</td>
-        <td class="k">${r.builtin ? esc(DESC[r.name] || '') : '自定义角色(表级权限)'}</td>
+        <td class="k">${r.builtin ? esc(DESC[r.name] || '') : T('自定义角色(表级权限)')}</td>
         <td>${(r.members||[]).map(m => esc(m)).join(', ') || '<span class="null">—</span>'}</td>
         <td>${this.grantChips(r.grants)}</td>
         <td>
-          <button data-act="role" data-name="${esc(r.name)}" data-asrole="1">成员</button>
-          <button data-act="tgrants" data-name="${esc(r.name)}" data-kind="role">表权限</button>
-          ${r.builtin ? '' : `<button data-act="droprole" data-name="${esc(r.name)}" class="danger">删除</button>`}
+          <button data-act="role" data-name="${esc(r.name)}" data-asrole="1">${T('成员')}</button>
+          <button data-act="tgrants" data-name="${esc(r.name)}" data-kind="role">${T('表权限')}</button>
+          ${r.builtin ? '' : `<button data-act="droprole" data-name="${esc(r.name)}" class="danger">${T('删除')}</button>`}
         </td></tr>`;
     }
     html += `</tbody></table>`;
@@ -2069,55 +2445,55 @@ const usersPage = {
     if (act === 'role') return this.roleDialog(t, name, !!b.dataset.asrole, data);
     if (act === 'tgrants') return this.tableGrantsDialog(t, name, b.dataset.kind, data);
     if (act === 'drop') {
-      return dialog(`删除用户 ${name}`, [{name: 'name', label: '输入用户名以确认', value: '', ph: name}], '删除', async (v, err) => {
-        if (v.name !== name) return err('用户名不一致');
+      return dialog(T('删除用户 {0}', name), [{name: 'name', label: T('输入用户名以确认'), value: '', ph: name}], T('删除'), async (v, err) => {
+        if (v.name !== name) return err(T('用户名不一致'));
         const r = await api.post('/api/users', {action: 'drop_user', name});
         if (r.error) return err(r.error);
-        ui.toast(`已删除用户 ${name}`); t.load();
+        ui.toast(T('已删除用户 {0}', name)); t.load();
       });
     }
     if (act === 'droprole') {
-      return dialog(`删除角色 ${name}`, [{name: 'name', label: '输入角色名以确认', value: '', ph: name}], '删除', async (v, err) => {
-        if (v.name !== name) return err('角色名不一致');
+      return dialog(T('删除角色 {0}', name), [{name: 'name', label: T('输入角色名以确认'), value: '', ph: name}], T('删除'), async (v, err) => {
+        if (v.name !== name) return err(T('角色名不一致'));
         const r = await api.post('/api/users', {action: 'drop_role', name});
         if (r.error) return err(r.error);
-        ui.toast(`已删除角色 ${name}`); t.load();
+        ui.toast(T('已删除角色 {0}', name)); t.load();
       });
     }
   },
 
   newUserDialog(t) {
-    dialog('新建用户', [
-      {name: 'name', label: '用户名', ph: '字母开头,可含数字/_/$'},
-      {name: 'password', label: '密码', type: 'password', ph: '至少 8 位'},
-      {name: 'confirm', label: '确认密码', type: 'password'},
-    ], '创建', async (v, err) => {
-      if (!v.name) return err('请输入用户名');
-      if (v.password !== v.confirm) return err('两次输入的密码不一致');
+    dialog(T('新建用户'), [
+      {name: 'name', label: T('用户名'), ph: T('字母开头,可含数字/_/$')},
+      {name: 'password', label: T('密码'), type: 'password', ph: T('至少 8 位')},
+      {name: 'confirm', label: T('确认密码'), type: 'password'},
+    ], T('创建'), async (v, err) => {
+      if (!v.name) return err(T('请输入用户名'));
+      if (v.password !== v.confirm) return err(T('两次输入的密码不一致'));
       const r = await api.post('/api/users', {action: 'create_user', name: v.name, password: v.password});
       if (r.error) return err(r.error);
-      ui.toast(`已创建用户 ${v.name}`); t.load();
+      ui.toast(T('已创建用户 {0}', v.name)); t.load();
     });
   },
 
   newRoleDialog(t) {
-    dialog('新建角色', [{name: 'name', label: '角色名', ph: '如 reporting'}], '创建', async (v, err) => {
-      if (!v.name) return err('请输入角色名');
+    dialog(T('新建角色'), [{name: 'name', label: T('角色名'), ph: T('如 reporting')}], T('创建'), async (v, err) => {
+      if (!v.name) return err(T('请输入角色名'));
       const r = await api.post('/api/users', {action: 'create_role', name: v.name});
       if (r.error) return err(r.error);
-      ui.toast(`已创建角色 ${v.name}`); t.load();
+      ui.toast(T('已创建角色 {0}', v.name)); t.load();
     });
   },
 
   passwordDialog(t, name) {
-    dialog(`修改 ${name} 的密码`, [
-      {name: 'password', label: '新密码', type: 'password', ph: '至少 8 位'},
-      {name: 'confirm', label: '确认新密码', type: 'password'},
-    ], '修改', async (v, err) => {
-      if (v.password !== v.confirm) return err('两次输入的密码不一致');
+    dialog(T('修改 {0} 的密码', name), [
+      {name: 'password', label: T('新密码'), type: 'password', ph: T('至少 8 位')},
+      {name: 'confirm', label: T('确认新密码'), type: 'password'},
+    ], T('修改'), async (v, err) => {
+      if (v.password !== v.confirm) return err(T('两次输入的密码不一致'));
       const r = await api.post('/api/users', {action: 'alter_password', name, password: v.password});
       if (r.error) return err(r.error);
-      ui.toast(`已修改 ${name} 的密码`); t.load();
+      ui.toast(T('已修改 {0} 的密码', name)); t.load();
     });
   },
 
@@ -2126,13 +2502,13 @@ const usersPage = {
     const options = asRole
       ? (data.users || []).map(u => u.name)
       : (data.roles || []).map(r => r.name);
-    const ov = showModal(`<div class="dialog"><h3>${asRole ? `管理角色 ${esc(name)} 的成员` : `管理用户 ${esc(name)} 的角色`}</h3><div class="body">
-      <div class="row"><label>${asRole ? '成员(用户)' : '角色'}</label>
+    const ov = showModal(`<div class="dialog"><h3>${asRole ? T('管理角色 {0} 的成员', esc(name)) : T('管理用户 {0} 的角色', esc(name))}</h3><div class="body">
+      <div class="row"><label>${asRole ? T('成员(用户)') : T('角色')}</label>
         <select data-f="target" style="flex:1">${options.map(o => `<option>${esc(o)}</option>`).join('')}</select>
-        <button data-remove style="margin-left:6px;color:var(--err)">移除</button></div>
-      <div class="hint">${asRole ? '移除 = REVOKE 该用户的此角色。' : '移除 = REVOKE 该角色;立即生效(其已有连接的下一条语句起)。'}</div>
+        <button data-remove style="margin-left:6px;color:var(--err)">${T('移除')}</button></div>
+      <div class="hint">${asRole ? T('移除 = REVOKE 该用户的此角色。') : T('移除 = REVOKE 该角色;立即生效(其已有连接的下一条语句起)。')}</div>
       <div class="err-line" data-err></div></div>
-      <div class="foot"><button data-cancel>关闭</button><button class="primary" data-ok>授予</button></div></div>`,
+      <div class="foot"><button data-cancel>${T('关闭')}</button><button class="primary" data-ok>${T('授予')}</button></div></div>`,
       'select[data-f="target"]');
     const target = () => $('select[data-f="target"]', ov).value;
     const run = async (action, err) => {
@@ -2141,7 +2517,7 @@ const usersPage = {
         : {action, role: target(), name};
       const r = await api.post('/api/users', body);
       if (r.error) return err(r.error);
-      ui.toast('已更新'); closeModal(); t.load();
+      ui.toast(T('已更新')); closeModal(); t.load();
     };
     $('[data-ok]', ov).onclick = () => run('grant_role', m => $('[data-err]', ov).textContent = m || '');
     $('[data-remove]', ov).onclick = () => run('revoke_role', m => $('[data-err]', ov).textContent = m || '');
@@ -2158,18 +2534,18 @@ const usersPage = {
     const current = (src && (kind === 'user' ? src.direct : src.grants)) || {};
     const tables = data.tables || [];
     if (!tables.length) {
-      ui.toast('没有可授权的表(先建表)', true); return;
+      ui.toast(T('没有可授权的表(先建表)'), true); return;
     }
     const row = (tbl) => `<tr>
       <td style="font-family:var(--mono)">${esc(tbl)}</td>
       ${PRIVS.map(p => `<td style="text-align:center"><input type="checkbox" data-t="${esc(tbl)}" data-p="${p}"${(current[tbl] || []).includes(p) ? ' checked' : ''}></td>`).join('')}
     </tr>`;
-    const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:760px"><h3>表级权限 — ${esc(name)}${kind === 'role' ? '(角色)' : ''}</h3><div class="body">
-      <table class="colgrid"><thead><tr><th style="width:34%">表</th>${PRIVS.map(p => `<th>${p}</th>`).join('')}</tr></thead>
+    const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:760px"><h3>${T('表级权限 — {0}', esc(name))}${kind === 'role' ? T('(角色)') : ''}</h3><div class="body">
+      <table class="colgrid"><thead><tr><th style="width:34%">${T('表')}</th>${PRIVS.map(p => `<th>${p}</th>`).join('')}</tr></thead>
       <tbody>${tables.map(row).join('')}</tbody></table>
-      <div class="hint">${kind === 'user' ? '此处编辑直接授予的表级权限;用户通过角色获得的权限请在「角色」区管理(它们不在此显示)。' : '角色的表级权限对其全部成员生效。'}</div>
+      <div class="hint">${kind === 'user' ? T('此处编辑直接授予的表级权限;用户通过角色获得的权限请在「角色」区管理(它们不在此显示)。') : T('角色的表级权限对其全部成员生效。')}</div>
       <div class="err-line" data-err></div></div>
-      <div class="foot"><button data-cancel>取消</button><button class="primary" data-ok>保存</button></div></div>`,
+      <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`,
       'input[type="checkbox"]');
     $('[data-ok]', ov).onclick = async () => {
       const err = $('[data-err]', ov);
@@ -2191,7 +2567,7 @@ const usersPage = {
         const r = await api.post('/api/users', Object.assign({name}, op));
         if (r.error) { err.textContent = r.error; return; }
       }
-      ui.toast('表级权限已更新'); closeModal(); t.load();
+      ui.toast(T('表级权限已更新')); closeModal(); t.load();
     };
   },
 };
@@ -2204,28 +2580,30 @@ const usersPage = {
 // 时点;同名表被覆盖,备份之后新建的表不受影响。恢复/备份均异步执行,
 // 状态与进度经 5 秒轮询回显。
 function openBackupTab() {
-  tabs.open('backup', 'backup', '备份管理', (t) => {
+  const titleOf = () => T('备份管理');
+  tabs.open('backup', 'backup', titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.auto = true;
     t.el.innerHTML = `<div class="dash">
-      <h2>备份管理</h2>
-      <div class="sub">自动备份为逻辑 SQL 快照(整库一致点,含全部表结构与数据)· 文件在节点的数据卷内(/data/backups)</div>
+      <h2 data-i18n>备份管理</h2>
+      <div class="sub" data-i18n>自动备份为逻辑 SQL 快照(整库一致点,含全部表结构与数据)· 文件在节点的数据卷内(/data/backups)</div>
       <div class="dash-actions">
-        <button class="primary" data-do="trigger">立即备份</button>
-        <button data-do="refresh">刷新</button>
+        <button class="primary" data-do="trigger"><span data-i18n>立即备份</span></button>
+        <button data-do="refresh"><span data-i18n>刷新</span></button>
         <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
-          <input type="checkbox" data-do="auto" checked>每 5 秒自动刷新</label>
+          <input type="checkbox" data-do="auto" checked><span data-i18n>每 5 秒自动刷新</span></label>
         <span class="meta" data-at style="color:var(--txt3)"></span>
       </div>
-      <div data-body><div class="msg-list" style="color:var(--txt3)">正在读取备份状态…</div></div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在读取备份状态…</div></div>
     </div>`;
     $('[data-do="trigger"]', t.el).onclick = async (e) => {
       const b = e.target;
       b.disabled = true;
       try {
         const r = await api.post('/api/backup');
-        if (r.error) ui.toast('备份触发失败:' + r.error, true);
-        else { ui.toast('备份已开始'); t.load(); }
-      } catch (err) { ui.toast('备份触发失败:' + err.message, true); }
+        if (r.error) ui.toast(T('备份触发失败:{0}', r.error), true);
+        else { ui.toast(T('备份已开始')); t.load(); }
+      } catch (err) { ui.toast(T('备份触发失败:{0}', err.message), true); }
       b.disabled = false;
     };
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
@@ -2236,39 +2614,40 @@ function openBackupTab() {
     // 节点会让「确认的对象」和「执行的对象」变成两台机器。
     const doRestore = (name) => {
       const targetNode = api.node;
-      const targetLabel = targetNode || '默认节点';
-      dialog(`恢复备份 ${name} → ${targetLabel}`, [
-        {name: 'confirm', label: `输入 ${name} 确认恢复到节点 ${targetLabel}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。`, ph: name, value: ''},
-      ], '确认恢复', async (vals, err) => {
-        if (vals.confirm !== name) { err('输入与备份文件名不一致'); throw new Error('mismatch'); }
+      const targetLabel = targetNode || T('默认节点');
+      dialog(T('恢复备份 {0} → {1}', name, targetLabel), [
+        {name: 'confirm', label: T('输入 {0} 确认恢复到节点 {1}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。', name, targetLabel), ph: name, value: ''},
+      ], T('确认恢复'), async (vals, err) => {
+        if (vals.confirm !== name) { err(T('输入与备份文件名不一致')); throw new Error('mismatch'); }
         try {
           const r = await api.post('/api/backup/restore', {file: name, confirm: name, node: targetNode});
           if (r.error) { err(r.error); throw new Error(r.error); }
-          ui.toast(`恢复已开始(${targetLabel})`);
+          ui.toast(T('恢复已开始({0})', targetLabel));
           t.load();
-        } catch (e) { if (e.message !== 'mismatch') ui.toast('恢复触发失败:' + e.message, true); throw e; }
+        } catch (e) { if (e.message !== 'mismatch') ui.toast(T('恢复触发失败:{0}', e.message), true); throw e; }
       });
     };
     t.render = (v) => {
       const body = $('[data-body]', t.el);
       if (v.error) {
-        body.innerHTML = `<div class="card" style="max-width:600px"><div class="v" style="color:var(--err);font-size:14px">${esc(v.error)}</div><div class="k">节点不可达或拒绝请求,可切换节点后重试</div></div>`;
+        body.innerHTML = `<div class="card" style="max-width:600px"><div class="v" style="color:var(--err);font-size:14px">${esc(v.error)}</div><div class="k">${T('节点不可达或拒绝请求,可切换节点后重试')}</div></div>`;
         return;
       }
       const dash = '<span class="null">—</span>';
       const last = v.last;
-      const lastHtml = !last ? '<span class="null">尚无备份</span>'
+      const lastHtml = !last ? `<span class="null">${T('尚无备份')}</span>`
         : (last.ok
-          ? `<span style="color:var(--ok)">● 成功</span> <span style="font-family:var(--mono)">${esc(last.file || '')}</span>${last.ts_ms ? ' · ' + esc(new Date(last.ts_ms).toLocaleString()) : ''}`
-          : `<span style="color:var(--err)">● 失败</span> ${esc(last.error || '')}`);
+          ? `<span style="color:var(--ok)">● ${T('成功')}</span> <span style="font-family:var(--mono)">${esc(last.file || '')}</span>${last.ts_ms ? ' · ' + esc(new Date(last.ts_ms).toLocaleString()) : ''}`
+          : `<span style="color:var(--err)">● ${T('失败')}</span> ${esc(last.error || '')}`);
       const iv = +v.interval_secs || 0;
-      const ivHtml = !iv ? '<span class="null">关闭</span>'
-        : (iv % 86400 === 0 ? `${iv / 86400}<small> 天</small>` : `${iv}<small> 秒</small>`);
+      // 「间隔关闭」与按钮「关闭」同形异义:这里指未启用,英文是 Off 而非 Close。
+      const ivHtml = !iv ? `<span class="null">${LANG === 'en' ? 'Off' : '关闭'}</span>`
+        : (iv % 86400 === 0 ? `${iv / 86400}<small> ${T('天')}</small>` : `${iv}<small> ${T('秒')}</small>`);
       const cards = [
-        [ivHtml, '自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)'],
-        [`${esc(v.keep === undefined ? dash : v.keep)}<small> 份</small>`, '保留份数(DOCSQL_BACKUP_KEEP)'],
-        [`${esc(v.count || 0)}<small> 份</small>`, '现有备份'],
-        [v.running ? '<span style="color:var(--warn)">进行中…</span>' : lastHtml, '最近一次'],
+        [ivHtml, T('自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)')],
+        [`${esc(v.keep === undefined ? dash : v.keep)}<small> ${T('份')}</small>`, T('保留份数(DOCSQL_BACKUP_KEEP)')],
+        [`${esc(v.count || 0)}<small> ${T('份')}</small>`, T('现有备份')],
+        [v.running ? `<span style="color:var(--warn)">${T('进行中…')}</span>` : lastHtml, T('最近一次')],
       ];
       let html = `<div class="cards" style="margin-bottom:14px">` + cards.map(c =>
         `<div class="card"><div class="v"${c[2] || ''}>${c[0]}</div><div class="k">${c[1]}</div></div>`).join('') + `</div>`;
@@ -2277,28 +2656,27 @@ function openBackupTab() {
       $('[data-do="trigger"]', t.el).disabled = !!(rst && rst.running);
       if (rst) {
         const rs = rst.running
-          ? `<span style="color:var(--warn)">● 恢复进行中</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span>${rst.total ? ` · <span data-rprog>${esc(rst.applied)}/${esc(rst.total)}</span> 条语句` : ''}`
+          ? `<span style="color:var(--warn)">● ${T('恢复进行中')}</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span>${rst.total ? ` · <span data-rprog>${esc(rst.applied)}/${esc(rst.total)}</span> ${T('条语句')}` : ''}`
           : (rst.ok
-            ? `<span style="color:var(--ok)">● 恢复完成</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span> · ${esc(rst.applied)} 条语句${rst.ts_ms ? ' · ' + esc(new Date(rst.ts_ms).toLocaleString()) : ''}` +
-              (rst.converged === true ? ' · <span style="color:var(--ok)">集群已验证收敛</span>' : '') +
-              (rst.converged === false ? ' · <span style="color:var(--warn)">集群收敛未验证</span>' : '') +
+            ? `<span style="color:var(--ok)">● ${T('恢复完成')}</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span> · ${T('{0} 条语句', esc(rst.applied))}${rst.ts_ms ? ' · ' + esc(new Date(rst.ts_ms).toLocaleString()) : ''}` +
+              (rst.converged === true ? ` · <span style="color:var(--ok)">${T('集群已验证收敛')}</span>` : '') +
+              (rst.converged === false ? ` · <span style="color:var(--warn)">${T('集群收敛未验证')}</span>` : '') +
               (rst.note ? `<div class="k" style="color:var(--txt3);margin-top:4px">${esc(rst.note)}</div>` : '')
-            : `<span style="color:var(--err)">● 恢复失败</span> <span style="font-family:var(--mono)">${esc(rst.file || '')}</span> ${esc(rst.error || '')}`);
+            : `<span style="color:var(--err)">● ${T('恢复失败')}</span> <span style="font-family:var(--mono)">${esc(rst.file || '')}</span> ${esc(rst.error || '')}`);
         html += `<div class="card" style="margin-bottom:14px;padding:10px 14px"><div class="v" style="font-size:13px;font-weight:400">${rs}</div></div>`;
       }
       const files = v.files || [];
       if (!files.length) {
         html += `<div class="card" style="max-width:680px">
-          <div class="v" style="font-size:15px">暂无备份</div>
-          <div class="k" style="line-height:1.7">节点尚未产生备份文件(目录:${esc(v.dir || dash)})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。
-          备份是完整的 SQL 快照(DROP + CREATE + INSERT);恢复时整库重放该快照,同名表还原为备份时点并扇出到集群全网。</div></div>`;
+          <div class="v" style="font-size:15px">${T('暂无备份')}</div>
+          <div class="k" style="line-height:1.7">${T('节点尚未产生备份文件(目录:{0})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。备份是完整的 SQL 快照(DROP + CREATE + INSERT);恢复时整库重放该快照,同名表还原为备份时点并扇出到集群全网。', esc(v.dir || dash))}</div></div>`;
       } else {
-        html += `<table class="grid"><thead><tr><th>备份文件</th><th>大小</th><th>时间</th><th>操作</th></tr></thead><tbody>` +
+        html += `<table class="grid"><thead><tr><th>${T('备份文件')}</th><th>${T('大小')}</th><th>${T('时间')}</th><th>${T('操作')}</th></tr></thead><tbody>` +
           files.map(f => `<tr>
             <td style="font-family:var(--mono)">${esc(f.name)}</td>
             <td>${fmtBytes(f.bytes)}</td>
             <td>${f.ts_ms ? esc(new Date(f.ts_ms).toLocaleString()) : dash}</td>
-            <td><button data-restore="${esc(f.name)}"${rst && rst.running ? ' disabled' : ''}>恢复</button></td>
+            <td><button data-restore="${esc(f.name)}"${rst && rst.running ? ' disabled' : ''}>${T('恢复')}</button></td>
           </tr>`).join('') + `</tbody></table>`;
       }
       body.innerHTML = html;
@@ -2308,8 +2686,8 @@ function openBackupTab() {
       try {
         const v = await api.get('/api/backup');
         t.render(v);
-        $('[data-at]', t.el).textContent = '上次刷新 ' + new Date().toTimeString().slice(0, 8);
-      } catch (e) { ui.toast('备份状态读取失败:' + e.message, true); }
+        $('[data-at]', t.el).textContent = T('上次刷新 {0}', new Date().toTimeString().slice(0, 8));
+      } catch (e) { ui.toast(T('备份状态读取失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生请求。
     t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
@@ -2330,20 +2708,22 @@ const fmtTs = (ms) => { const d = new Date(ms), p = (n, w) => String(n).padStart
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`; };
 
 function openLogsTab() {
-  tabs.open('logs', 'logs', '日志', (t) => {
+  const titleOf = () => T('日志');
+  tabs.open('logs', 'logs', titleOf(), (t) => {
+    t.titleFn = titleOf;
     t.cat = 'all'; t.src = 'all'; t.q = ''; t.limit = 200; t.auto = true;
     t.rows = []; t.offline = [];
     const CATS = [['all', '全部'], ['data', '数据日志'], ['sync', '同步日志'], ['err', '仅错误']];
     t.el.innerHTML = `<div class="doc-bar">
-        <span class="title">日志</span>
-        <span data-cats>${CATS.map(([id, label]) => `<button class="catbtn${id === 'all' ? ' on' : ''}" data-cat="${id}">${label}</button>`).join('')}</span>
-        <select data-do="src" title="日志来源" style="max-width:170px"><option value="all">全部来源</option></select>
-        <input type="text" data-do="q" placeholder="过滤:语句 / 错误 / 目标" style="width:160px">
-        <select data-do="limit" title="每来源拉取条数"><option value="100">100 条</option><option value="200" selected>200 条</option><option value="500">500 条</option></select>
+        <span class="title" data-i18n>日志</span>
+        <span data-cats>${CATS.map(([id, label]) => `<button class="catbtn${id === 'all' ? ' on' : ''}" data-cat="${id}"><span data-i18n>${label}</span></button>`).join('')}</span>
+        <select data-do="src" data-i18n-title title="日志来源" style="max-width:170px"><option value="all" data-i18n>全部来源</option></select>
+        <input type="text" data-do="q" data-i18n-ph placeholder="过滤:语句 / 错误 / 目标" style="width:160px">
+        <select data-do="limit" data-i18n-title title="每来源拉取条数"><option value="100" data-i18n>100 条</option><option value="200" selected data-i18n>200 条</option><option value="500" data-i18n>500 条</option></select>
         <div class="spacer"></div>
-        <button class="primary" data-do="refresh">刷新</button>
+        <button class="primary" data-do="refresh"><span data-i18n>刷新</span></button>
         <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
-          <input type="checkbox" data-do="auto" checked>5s 自动刷新</label>
+          <input type="checkbox" data-do="auto" checked><span data-i18n>5s 自动刷新</span></label>
       </div>
       <div class="res-wrap"><div class="res-pane active" data-body style="display:block;padding:0"></div></div>`;
     $$('[data-cat]', t.el).forEach(b => b.onclick = () => {
@@ -2374,25 +2754,25 @@ function openLogsTab() {
         }
         return true;
       });
-      let html = `<div style="padding:5px 10px;color:var(--txt3)">共 ${t.rows.length} 条 · 数据 ${counts.data} · 同步 ${counts.sync} · 错误 ${counts.err}`
-        + (t.offline.length ? ` · <span style="color:var(--err)">离线节点 ${t.offline.length} 个(${t.offline.map(n => esc(n.addr)).join(', ')})</span>` : '') + '</div>';
+      let html = `<div style="padding:5px 10px;color:var(--txt3)">${T('共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}', t.rows.length, counts.data, counts.sync, counts.err)}`
+        + (t.offline.length ? ` · <span style="color:var(--err)">${T('离线节点 {0} 个({1})', t.offline.length, t.offline.map(n => esc(n.addr)).join(', '))}</span>` : '') + '</div>';
       if (!rows.length) {
-        html += '<div class="msg-list" style="color:var(--txt3)">没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。</div>';
+        html += `<div class="msg-list" style="color:var(--txt3)">${T('没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。')}</div>`;
       } else {
-        html += `<table class="grid"><thead><tr><th style="width:104px">时间</th><th>来源</th><th>类别</th><th>内容</th><th>结果</th></tr></thead><tbody>`;
+        html += `<table class="grid"><thead><tr><th style="width:104px">${T('时间')}</th><th>${T('来源')}</th><th>${T('类别')}</th><th>${T('内容')}</th><th>${T('结果')}</th></tr></thead><tbody>`;
         for (const r of rows) {
           const isData = r.cat === 'data';
           const cat = isData
-            ? `<span style="color:var(--accent-dk)">数据</span>${r.replicated ? '<span class="tag" title="来自对等节点扇出的复制应用">复制</span>' : ''}`
-            : `<span style="color:var(--ok)">同步</span>`;
+            ? `<span style="color:var(--accent-dk)">${T('数据')}</span>${r.replicated ? `<span class="tag" title="${esc(T('来自对等节点扇出的复制应用'))}">${T('复制')}</span>` : ''}`
+            : `<span style="color:var(--ok)">${T('同步')}</span>`;
           const content = isData
             ? esc(r.text)
-            : `<b style="font-weight:600">${esc(SYNC_EVENTS[r.event] || r.event)}</b>${r.target ? ` → <span style="font-family:var(--mono)">${esc(r.target)}</span>` : ''}${r.text ? ` · ${esc(r.text)}` : ''}`;
+            : `<b style="font-weight:600">${esc(T(SYNC_EVENTS[r.event] || r.event))}</b>${r.target ? ` → <span style="font-family:var(--mono)">${esc(r.target)}</span>` : ''}${r.text ? ` · ${esc(r.text)}` : ''}`;
           const result = !r.ok
-            ? `<span style="color:var(--err)" title="${esc(r.error || '')}">${esc((r.error || '失败').slice(0, 80))}</span>`
+            ? `<span style="color:var(--err)" title="${esc(r.error || '')}">${esc((r.error || T('失败')).slice(0, 80))}</span>`
             : isData
-              ? `${r.ms != null ? r.ms.toFixed(1) + ' ms' : ''}${r.affected != null ? (r.ms != null ? ' · ' : '') + r.affected + ' 行' : ''}` || '成功'
-              : '成功';
+              ? `${r.ms != null ? r.ms.toFixed(1) + ' ms' : ''}${r.affected != null ? (r.ms != null ? ' · ' : '') + T('{0} 行', r.affected) : ''}` || T('成功')
+              : T('成功');
           html += `<tr>
             <td style="font-family:var(--mono)">${esc(fmtTs(r.ts))}</td>
             <td>${esc(r.src)}</td>
@@ -2414,9 +2794,9 @@ function openLogsTab() {
           ok: !e.error, ms: e.ms, affected: e.affected, error: e.error || null,
           replicated: !!e.replicated,
         }));
-        pushQuery(data.local && data.local.query, '控制台', 'local');
+        pushQuery(data.local && data.local.query, T('控制台'), 'local');
         const srcSel = $('[data-do="src"]', t.el);
-        const opts = ['<option value="all">全部来源</option>', '<option value="local"' + (t.src === 'local' ? ' selected' : '') + '>控制台</option>'];
+        const opts = [`<option value="all">${T('全部来源')}</option>`, `<option value="local"${t.src === 'local' ? ' selected' : ''}>${T('控制台')}</option>`];
         for (const n of data.nodes || []) {
           if (!n.reachable || !n.logs) continue;
           const hit = (n.logs.query || []).length + (n.logs.sync || []).length;
@@ -2437,7 +2817,7 @@ function openLogsTab() {
         t.rows = rows;
         t.offline = (data.nodes || []).filter(n => !n.reachable);
         t.render();
-      } catch (e) { ui.toast('日志刷新失败:' + e.message, true); }
+      } catch (e) { ui.toast(T('日志刷新失败:{0}', e.message), true); }
     };
     // 与集群页同策略:仅在 tab 激活时轮询。
     t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
@@ -2448,7 +2828,7 @@ function openLogsTab() {
 
 /* ================= 对象资源管理器 ================= */
 const explorer = {
-  meta: null, expanded: new Set(['tables']), selPath: null,
+  meta: null, expanded: new Set(['tables']), selPath: null, unreachable: false,
   _timer: null,
   async refresh() {
     try {
@@ -2456,15 +2836,17 @@ const explorer = {
       // 远程节点代理失败(不可达/拒绝认证)走 in-band error,不点亮整页。
       if (meta && meta.error) {
         this.meta = null;
-        $('#tree').innerHTML = `<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:var(--err)">${api.node ? `节点 ${esc(api.node)} 不可用:` : ''}${esc(meta.error)}</span></div>`;
-        $('#st-server').textContent = api.node ? `节点 ${api.node} · 不可用` : 'DocSQL';
-        ui.status('对象资源管理器刷新失败', 'err');
+        this.unreachable = true;
+        $('#tree').innerHTML = `<div class="tnode"><span class="twist"></span><span class="tlabel" style="color:var(--err)">${api.node ? T('节点 {0} 不可用:', api.node) : ''}${esc(meta.error)}</span></div>`;
+        updateServerLabel();
+        ui.status(T('对象资源管理器刷新失败'), 'err');
         return;
       }
       this.meta = meta;
+      this.unreachable = false;
       this.render();
-      $('#st-server').textContent = `${api.node ? esc(api.node) + ' · ' : ''}DocSQL v${this.meta.server.version} · ${this.meta.totals.tables} 表`;
-    } catch (e) { ui.toast('刷新失败:' + e.message, true); }
+      updateServerLabel();
+    } catch (e) { ui.toast(T('刷新失败:{0}', e.message), true); }
   },
   refreshSoon() { clearTimeout(this._timer); this._timer = setTimeout(() => this.refresh(), 250); },
 
@@ -2482,28 +2864,28 @@ const explorer = {
     const host = api.node || (location.host || 'localhost');
     const branch = [];
     branch.push(['server', ICONS.server, api.node
-      ? `<b>${esc(host)}</b> <span class="cnt" title="远程节点 — 控制台经协议代理,写在该节点上执行并按其集群配置扇出">远程节点</span>`
+      ? `<b>${esc(host)}</b> <span class="cnt" title="${esc(T('远程节点 — 控制台经协议代理,写在该节点上执行并按其集群配置扇出'))}">${T('远程节点')}</span>`
       : `<b>${esc(host)}</b> <span class="cnt">DocSQL v${esc(m.server.version)}</span>`, {}]);
 
     // 表
     const tablesInner = m.tables.map(t =>
       this.node('table:' + t.name, ICONS.table, `${esc(t.name)} <span class="cnt">(${esc(t.row_count)})</span>`,
         {kind: 'table', name: t.name, more: t.row_count, children: true}));
-    branch.push(['tables', ICONS.folder, `表 <span class="cnt">(${esc(m.totals.tables)})</span>`, {kind: 'tables', children: true}]);
+    branch.push(['tables', ICONS.folder, `${T('表')} <span class="cnt">(${esc(m.totals.tables)})</span>`, {kind: 'tables', children: true}]);
 
     // 系统表(引擎内部存储,只读;双击以普通 SELECT 结果查看)
     const sysTables = m.system_tables || [];
-    branch.push(['systables', ICONS.folder, `系统表 <span class="cnt">(${esc(sysTables.length)})</span>`, {kind: 'systables', children: true}]);
+    branch.push(['systables', ICONS.folder, `${T('系统表')} <span class="cnt">(${esc(sysTables.length)})</span>`, {kind: 'systables', children: true}]);
 
     // 系统视图
-    branch.push(['sys', ICONS.folder, '系统视图', {kind: 'sys', children: true}]);
+    branch.push(['sys', ICONS.folder, T('系统视图'), {kind: 'sys', children: true}]);
 
     const tree = $('#tree');
     tree.innerHTML = branch.map(([path, icon, label, opts]) => this.node(path, icon, label, opts)).join('');
 
     // 填充已展开分支
     if (this.expanded.has('tables')) {
-      $(`[data-ch="tables"]`, tree).innerHTML = tablesInner.join('') || '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无表)</span></div>';
+      $(`[data-ch="tables"]`, tree).innerHTML = tablesInner.join('') || `<div class="tnode"><span class="twist"></span><span class="tlabel dim">${T('(无表)')}</span></div>`;
       m.tables.forEach(t => {
         const p = 'table:' + t.name;
         if (!this.expanded.has(p)) return;
@@ -2518,10 +2900,10 @@ const explorer = {
         const declared = new Set(t.columns.map(c => c.name));
         const obsCols = (t.observed || []).filter(n => !declared.has(n)).map(n =>
           this.node('col:' + t.name + '.' + n, ICONS.column,
-            `<span class="obs-col">${esc(n)}</span><span class="badge obs" title="仅见于数据,未在表定义中声明;SELECT * 会返回它">数据</span>`,
+            `<span class="obs-col">${esc(n)}</span><span class="badge obs" title="${esc(T('仅见于数据,未在表定义中声明;SELECT * 会返回它'))}">${T('数据')}</span>`,
             {kind: 'column', name: n, more: t.name})).join('');
         const obsN = (t.observed || []).length;
-        const colLabel = obsN !== t.columns.length ? `声明 ${t.columns.length} / 实测 ${obsN}` : `${t.columns.length}`;
+        const colLabel = obsN !== t.columns.length ? T('声明 {0} / 实测 {1}', t.columns.length, obsN) : `${t.columns.length}`;
         const defOf = (n) => (t.index_defs || []).find(d => d.name === n);
         const pkCol = (t.columns.find(c => c.primary_key) || {}).name;
         const idxs = t.indexes.length ? t.indexes.map(i => {
@@ -2529,21 +2911,21 @@ const explorer = {
           // 约束自动索引:随 PRIMARY KEY/UNIQUE 声明创建,只读展示。
           const label = d && d.auto
             ? `${esc(i)} <span class="cnt">(${esc(d.column)})</span>` +
-              `<span class="badge${d.column === pkCol ? ' pk' : ''}" title="${d.column === pkCol ? 'PRIMARY KEY' : 'UNIQUE'} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除">${d.column === pkCol ? 'PK' : 'UQ'}</span>`
+              `<span class="badge${d.column === pkCol ? ' pk' : ''}" title="${esc(T('{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除', d.column === pkCol ? 'PRIMARY KEY' : 'UNIQUE'))}">${d.column === pkCol ? 'PK' : 'UQ'}</span>`
             : d
-            ? `${esc(i)} <span class="cnt">(${esc(d.column)})</span>${d.unique ? '<span class="badge" title="唯一索引">UQ</span>' : ''}`
+            ? `${esc(i)} <span class="cnt">(${esc(d.column)})</span>${d.unique ? `<span class="badge" title="${esc(T('唯一索引'))}">UQ</span>` : ''}`
             : esc(i);
           return this.node('idx:' + t.name + '.' + i, ICONS.index, label, {kind: 'index', name: i, more: t.name});
         }).join('')
-          : '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无索引)</span></div>';
+          : `<div class="tnode"><span class="twist"></span><span class="tlabel dim">${T('(无索引)')}</span></div>`;
         const keys = t.keys.length ? t.keys.map(kk =>
           this.node('key:' + t.name + '.' + kk, ICONS.key, esc(kk), {kind: 'key', name: kk, more: t.name})).join('')
-          : '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无键)</span></div>';
+          : `<div class="tnode"><span class="twist"></span><span class="tlabel dim">${T('(无键)')}</span></div>`;
         const el = $(`[data-ch="${CSS.escape(p)}"]`, tree);
         if (el) el.innerHTML =
-          this.node(p + '/columns', ICONS.folder, `列 <span class="cnt" title="声明 ${t.columns.length} 列,数据中实测 ${(t.observed || []).length} 个顶层字段">(${colLabel})</span>`, {children: true}) +
-          this.node(p + '/indexes', ICONS.folder, `索引 <span class="cnt">(${t.indexes.length})</span>`, {kind: 'indexes', name: t.name, children: true}) +
-          this.node(p + '/keys', ICONS.folder, `键 <span class="cnt">(${t.keys.length})</span>`, {children: true});
+          this.node(p + '/columns', ICONS.folder, `${T('列')} <span class="cnt" title="${esc(T('声明 {0} 列,数据中实测 {1} 个顶层字段', t.columns.length, (t.observed || []).length))}">(${colLabel})</span>`, {children: true}) +
+          this.node(p + '/indexes', ICONS.folder, `${T('索引')} <span class="cnt">(${t.indexes.length})</span>`, {kind: 'indexes', name: t.name, children: true}) +
+          this.node(p + '/keys', ICONS.folder, `${T('键')} <span class="cnt">(${t.keys.length})</span>`, {children: true});
         const cEl = $(`[data-ch="${CSS.escape(p + '/columns')}"]`, tree); if (cEl) cEl.innerHTML = cols + obsCols;
         const iEl = $(`[data-ch="${CSS.escape(p + '/indexes')}"]`, tree); if (iEl) iEl.innerHTML = idxs;
         const kEl = $(`[data-ch="${CSS.escape(p + '/keys')}"]`, tree); if (kEl) kEl.innerHTML = keys;
@@ -2553,15 +2935,15 @@ const explorer = {
       const el = $('[data-ch="systables"]', tree);
       if (el) el.innerHTML = sysTables.map(t =>
         this.node('systable:' + t.name, ICONS.table,
-          `${esc(t.name)} <span class="cnt" title="引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据">(${esc(t.row_count)})</span>`,
+          `${esc(t.name)} <span class="cnt" title="${esc(T('引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据'))}">(${esc(t.row_count)})</span>`,
           {kind: 'systable', name: t.name, more: t.row_count})).join('')
-        || '<div class="tnode"><span class="twist"></span><span class="tlabel dim">(无系统表)</span></div>';
+        || `<div class="tnode"><span class="twist"></span><span class="tlabel dim">${T('(无系统表)')}</span></div>`;
     }
     if (this.expanded.has('sys')) {
       const sysViews = [
-        ['information_schema.tables', '表清单(名称/页数)'],
-        ['information_schema.columns', '列清单(可空性/类型)'],
-        ['sqlite_master', 'SQLite 兼容视图'],
+        ['information_schema.tables', T('表清单(名称/页数)')],
+        ['information_schema.columns', T('列清单(可空性/类型)')],
+        ['sqlite_master', T('SQLite 兼容视图')],
       ];
       const el = $('[data-ch="sys"]', tree);
       if (el) el.innerHTML = sysViews.map(([n, d]) =>
@@ -2600,8 +2982,8 @@ const explorer = {
         if (d && d.auto) autoIndexScript(node.dataset.more, name, d);
         else editIndexDialog(node.dataset.more, name);
       }
-      else if (kind === 'sysview') openQueryTab(`查询: ${name}`, `SELECT * FROM ${name} LIMIT 100;`, true);
-      else if (kind === 'systable') openQueryTab(`系统表: ${name}`, `SELECT * FROM "${qident(name)}" LIMIT 1000;`, true);
+      else if (kind === 'sysview') openQueryTab(() => T('查询: {0}', name), `SELECT * FROM ${name} LIMIT 100;`, true);
+      else if (kind === 'systable') openQueryTab(() => T('系统表: {0}', name), `SELECT * FROM "${qident(name)}" LIMIT 1000;`, true);
       else if (hasChildren(node)) toggle(node);
     });
     tree.addEventListener('contextmenu', (e) => {
@@ -2619,18 +3001,18 @@ const explorer = {
       const m = this.tableMeta(name);
       const ddl = m ? this.createScript(m) : '';
       ctx.open([
-        {id: 'newq', label: '新建查询', kbd: 'Ctrl+N', act: () => openQueryTab(`查询: ${name}`)},
-        {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, `查询: ${name}`)},
-        {id: 'data', label: '查看数据(编辑前 200 行)', act: () => openDataTab(name, m)},
-        {id: 'edittable', label: '编辑表…', act: () => editTableDialog(name, m)},
-        {id: 'insertdoc', label: '插入文档…', act: () => insertDocDialog(name, m)},
-        {id: 'newidx', label: '新建索引…', act: () => newIndexDialog(name)},
+        {id: 'newq', label: T('新建查询'), kbd: 'Ctrl+N', act: () => openQueryTab(() => T('查询: {0}', name))},
+        {id: 'top', label: T('选择前 1000 行'), act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, () => T('查询: {0}', name))},
+        {id: 'data', label: T('查看数据(编辑前 200 行)'), act: () => openDataTab(name, m)},
+        {id: 'edittable', label: T('编辑表…'), act: () => editTableDialog(name, m)},
+        {id: 'insertdoc', label: T('插入文档…'), act: () => insertDocDialog(name, m)},
+        {id: 'newidx', label: T('新建索引…'), act: () => newIndexDialog(name)},
         '-',
-        {id: 'creategen', label: '编写表脚本为 CREATE TO →', act: () => openQueryTab(`脚本: ${name}`, ddl)},
-        {id: 'dropgen', label: '编写表脚本为 DROP TO →', act: () => openQueryTab(`脚本: ${name}`, `-- 删除表 ${name}\nDROP TABLE IF EXISTS "${qident(name)}";`)},
+        {id: 'creategen', label: T('编写表脚本为 CREATE TO →'), act: () => openQueryTab(() => T('脚本: {0}', name), ddl)},
+        {id: 'dropgen', label: T('编写表脚本为 DROP TO →'), act: () => openQueryTab(() => T('脚本: {0}', name), T('-- 删除表 {0}', name) + `\nDROP TABLE IF EXISTS "${qident(name)}";`)},
         '-',
-        {id: 'drop', label: `删除表 ${name}…`, act: () => dropTable(name)},
-        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+        {id: 'drop', label: T('删除表 {0}…', name), act: () => dropTable(name)},
+        {id: 'refresh', label: T('刷新'), act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'index') {
       const tname = more; // 宿主表名
@@ -2638,56 +3020,56 @@ const explorer = {
       if (d && d.auto) {
         // 约束自动索引:只读,不提供修改/删除。
         ctx.open([
-          {id: 'idxgen', label: '编写索引脚本为 CREATE TO →', act: () => autoIndexScript(tname, name, d)},
+          {id: 'idxgen', label: T('编写索引脚本为 CREATE TO →'), act: () => autoIndexScript(tname, name, d)},
           '-',
-          {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
+          {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
         ], x, y);
         return;
       }
       ctx.open([
-        {id: 'editidx', label: '修改索引…', act: () => editIndexDialog(tname, name)},
-        {id: 'dropidx', label: `删除索引 ${name}…`, act: () => dropIndex(tname, name)},
-        {id: 'idxgen', label: '编写索引脚本为 CREATE TO →', act: () => {
+        {id: 'editidx', label: T('修改索引…'), act: () => editIndexDialog(tname, name)},
+        {id: 'dropidx', label: T('删除索引 {0}…', name), act: () => dropIndex(tname, name)},
+        {id: 'idxgen', label: T('编写索引脚本为 CREATE TO →'), act: () => {
           const d = indexDef(tname, name);
-          openQueryTab(`脚本: ${name}`, d ? indexCreateSql(tname, name, d.column, !!d.unique) + ';' : `-- 未找到索引 ${name} 的定义`);
+          openQueryTab(() => T('脚本: {0}', name), d ? indexCreateSql(tname, name, d.column, !!d.unique) + ';' : T('-- 未找到索引 {0} 的定义', name));
         }},
         '-',
-        {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
+        {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
       ], x, y);
     } else if (kind === 'indexes') {
       ctx.open([
-        {id: 'newidx', label: '新建索引…', act: () => newIndexDialog(name)},
-        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+        {id: 'newidx', label: T('新建索引…'), act: () => newIndexDialog(name)},
+        {id: 'refresh', label: T('刷新'), act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'systable') {
       // 引擎内部表:只读,不提供编辑/删除入口。
       ctx.open([
-        {id: 'top', label: '选择前 1000 行', act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, `系统表: ${name}`)},
+        {id: 'top', label: T('选择前 1000 行'), act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, () => T('系统表: {0}', name))},
         '-',
-        {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
-        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+        {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
+        {id: 'refresh', label: T('刷新'), act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'column' || kind === 'key' || kind === 'sysview') {
       ctx.open([
-        {id: 'copy', label: '复制名称', act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast('已复制:' + name); }},
-        ...(kind === 'sysview' ? [{id: 'sel', label: '选择前 100 行', act: () => q(`SELECT * FROM ${name} LIMIT 100;`, `查询: ${name}`)}] : []),
+        {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
+        ...(kind === 'sysview' ? [{id: 'sel', label: T('选择前 100 行'), act: () => q(`SELECT * FROM ${name} LIMIT 100;`, () => T('查询: {0}', name))}] : []),
       ], x, y);
     } else if (kind === 'tables') {
       ctx.open([
-        {id: 'newtable', label: '新建表…', act: () => newTableDialog()},
-        {id: 'newq', label: '新建查询', act: () => openQueryTab()},
-        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+        {id: 'newtable', label: T('新建表…'), act: () => newTableDialog()},
+        {id: 'newq', label: T('新建查询'), act: () => openQueryTab()},
+        {id: 'refresh', label: T('刷新'), act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'server') {
       ctx.open([
-        {id: 'newtable', label: '新建表…', act: () => newTableDialog()},
-        {id: 'dash', label: '服务器仪表盘', act: () => openDashboard()},
-        {id: 'users', label: '用户与角色', act: () => openUsersTab()},
-        {id: 'cluster', label: '集群状态', act: () => openClusterTab()},
-        {id: 'logs', label: '日志', act: () => openLogsTab()},
-        {id: 'backup', label: '备份管理', act: () => openBackupTab()},
-        {id: 'newq', label: '新建查询', act: () => openQueryTab()},
-        {id: 'refresh', label: '刷新', act: () => this.refresh()},
+        {id: 'newtable', label: T('新建表…'), act: () => newTableDialog()},
+        {id: 'dash', label: T('服务器仪表盘'), act: () => openDashboard()},
+        {id: 'users', label: T('用户与角色'), act: () => openUsersTab()},
+        {id: 'cluster', label: T('集群状态'), act: () => openClusterTab()},
+        {id: 'logs', label: T('日志'), act: () => openLogsTab()},
+        {id: 'backup', label: T('备份管理'), act: () => openBackupTab()},
+        {id: 'newq', label: T('新建查询'), act: () => openQueryTab()},
+        {id: 'refresh', label: T('刷新'), act: () => this.refresh()},
       ], x, y);
     }
   },
@@ -2702,7 +3084,7 @@ const explorer = {
       if (c.default) s += ` DEFAULT ${c.default}`;
       return s;
     }).join(',\n');
-    let s = `-- 表 ${m.name}(${m.row_count} 行,${m.pages} 页)\nCREATE TABLE ${m.name} (\n${cols}\n);`;
+    let s = T('-- 表 {0}({1} 行,{2} 页)', m.name, m.row_count, m.pages) + `\nCREATE TABLE ${m.name} (\n${cols}\n);`;
     // 索引 DDL 用 index_defs 还原列与唯一性(仅名字不足以重建)。
     const defs = m.index_defs || [];
     for (const i of m.indexes) {
@@ -2713,8 +3095,42 @@ const explorer = {
   }
 };
 
+/* ================= 界面语言切换(中文 / English)================= */
+// 切换即时生效、不刷新页面:静态骨架 data-i18n 重排;打开中的标签页按
+// 各自形态处理——查询页仅重排壳层(编辑器内容原样保留),数据/管理页
+// 重排壳层后走 load() 重拉重渲染;标签页标题经 titleFn 重算。
+const lang = {
+  toggle() {
+    const next = LANG === 'zh' ? 'en' : 'zh';
+    try { localStorage.setItem('docsql.lang', next); } catch (e) {}
+    document.documentElement.lang = next;
+    LANG = next;
+    this.apply();
+  },
+  apply() {
+    $('#lang-label').textContent = LANG === 'zh' ? 'EN' : '中';
+    document.title = T('DocSQL Studio — 管理控制台');
+    applyI18n();
+    authGate.renderTexts();
+    for (const tb of tabs.list.slice()) {
+      applyI18n(tb.el);
+      if (tb.load) tb.load();
+      const label = $('.t', tb.stripEl);
+      if (label) label.textContent = esc(tb.titleFn ? tb.titleFn() : tb.title);
+      const x = $('.x', tb.stripEl);
+      if (x) x.title = T('关闭');
+    }
+    if (explorer.meta) explorer.render();
+    nodes.sync(nodes.known); // 节点下拉框的「默认节点」标签按新语言重建
+    ui.connState(ui.conn || 'down');
+    $('#st-ready').textContent = $('#st-last').style.display === 'none' ? T('就绪') : '';
+    updateServerLabel();
+  },
+};
+$('#btn-lang').onclick = () => lang.toggle();
+
 /* ================= 全局事件 ================= */
-function execActive() { const t = tabs.activeQuery(); if (t) execQuery(t); else ui.toast('当前没有查询窗口'); }
+function execActive() { const t = tabs.activeQuery(); if (t) execQuery(t); else ui.toast(T('当前没有查询窗口')); }
 function parseActive() { const t = tabs.activeQuery(); if (t) parseQuery(t); }
 
 document.addEventListener('keydown', (e) => {
