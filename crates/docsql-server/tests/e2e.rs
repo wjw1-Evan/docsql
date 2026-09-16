@@ -1615,6 +1615,88 @@ async fn pubsub_persist_and_replay_earliest() {
     );
 }
 
+/// A replay running concurrently with publishes must lose nothing and
+/// duplicate nothing: the registry lock is released between replay chunks
+/// (a `from earliest` backlog used to stall every PUBLISH), and each round
+/// arms the dedup filter + samples the watermark atomically under that lock.
+/// A slow consumer may still hit the server's try_send budget mid-replay
+/// (the documented at-least-once contract: the delivered prefix stays armed,
+/// the rest is resumable by id), so the test resumes from the first gap.
+#[tokio::test]
+async fn pubsub_replay_concurrent_with_publish_loses_nothing() {
+    let (_dir, addr) = start_server(None).await;
+    let mut publisher = Client::connect(&addr).await;
+    for i in 0..300 {
+        publisher.publish("c", &format!("backlog-{i}")).await;
+    }
+    let mut sub = Client::connect(&addr).await;
+    let r = sub.subscribe("c", "earliest").await;
+    assert_eq!(affected_u64(&r), 1);
+
+    async fn drain(sub: &mut Client, seen: &mut Vec<i64>) {
+        while let Some(f) = recv_timeout(sub, 5).await {
+            if f.frame_type != proto::RESP_PUSH {
+                continue;
+            }
+            let m: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            seen.push(m["id"].as_i64().unwrap());
+        }
+    }
+    // First missing id in the contiguous prefix (1, 2, …): live pushes can
+    // outrun a stalled replay, so the resume cursor must follow the gap.
+    fn next_wanted(seen: &[i64]) -> i64 {
+        let mut sorted = seen.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut want = 1i64;
+        for id in sorted {
+            if id == want {
+                want += 1;
+            } else if id > want {
+                break;
+            }
+        }
+        want
+    }
+
+    let mut seen: Vec<i64> = Vec::new();
+    for i in 0..200 {
+        publisher.publish("c", &format!("live-{i}")).await;
+        drain(&mut sub, &mut seen).await;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() >= 500 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        let want = next_wanted(&seen);
+        let from = if want <= 1 {
+            "earliest".to_string()
+        } else {
+            (want - 1).to_string()
+        };
+        let r = sub.subscribe("c", &from).await;
+        assert_eq!(affected_u64(&r), 1);
+        drain(&mut sub, &mut seen).await;
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    let before_dedup = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        sorted,
+        (1..=500).collect::<Vec<i64>>(),
+        "every message exactly once, in order (got {before_dedup} frames)"
+    );
+    assert!(
+        sorted.windows(2).all(|w| w[0] < w[1]),
+        "ids must be strictly increasing"
+    );
+}
+
 /// Cursor resume: disconnect, miss a publish, re-subscribe from the last
 /// seen id and receive exactly the missed message (at-least-once).
 #[tokio::test]

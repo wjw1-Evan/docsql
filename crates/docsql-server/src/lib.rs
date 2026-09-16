@@ -3426,18 +3426,15 @@ async fn handle_subscribe(
             return;
         }
     };
-    // Watermark under the same registry hold: publishes committing after
-    // this point notify this subscription live with id > watermark;
-    // earlier ones are covered by the replay below.
-    let watermark = {
+    let mut watermark = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         pubsub::query_max_id(&mut db)
     };
     // Confirmation and replay use try_send: a subscriber that stopped
-    // draining its socket must not park this task while it holds the
-    // registry lock (every PUBLISH waits on that lock under write_order).
-    // Losing frames to a slow subscriber is the documented at-least-once
-    // contract — delivery resumes by re-subscribing from the last id.
+    // draining its socket must not park this task (each PUBLISH needs the
+    // registry lock under write_order). Losing frames to a slow subscriber
+    // is the documented at-least-once contract — delivery resumes by
+    // re-subscribing from the last id.
     let _ = tx.try_send(Frame::new(
         proto::RESP_AFFECTED,
         count.to_le_bytes().to_vec(),
@@ -3445,63 +3442,81 @@ async fn handle_subscribe(
     // skip-through tracks replay progress, not the raw watermark: only
     // messages the subscriber actually received are suppressed from the
     // live stream, so an interrupted replay leaves a resumable gap.
+    //
+    // The replay itself runs WITHOUT the registry lock (the old code held
+    // it end to end, so a `from earliest` backlog stalled every publish —
+    // and every write behind write_order — for the whole replay). The
+    // ordering contract is kept by arming and sampling atomically: each
+    // round arms the filter at `progress` and reads the watermark under
+    // the SAME registry lock, so every message ≤ the sample was dropped
+    // from the live stream (filter not yet armed when it was published) and
+    // is replayed by this round's delta, while every later id is delivered
+    // live and never replayed. No gap, no duplicate.
+    drop(inner);
     // Chunked replay: each window is one short engine read sized by
     // [`pubsub::ReplayWindow`] (row cap 512, byte budget ~1 MB), so memory
-    // stays proportional to a window instead of the whole history. The
-    // registry lock is held throughout — the module-header ordering
-    // contract (replay and live pushes never interleave or gap) depends
-    // on it — which means a `from earliest` replay of an enormous backlog
-    // delays publish notifications for as long as the requested replay
-    // spans. That is the replay guarantee's own cost; the historical
-    // whole-history Vec materialization on top of it was pure memory
-    // amplification and is gone.
+    // stays proportional to a window instead of the whole history.
     let mut progress = after_id.unwrap_or(watermark);
     let mut cursor = progress;
     let mut window = pubsub::ReplayWindow::new();
-    while cursor < watermark {
-        let chunk = {
-            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-            pubsub::query_history_chunk(&mut db, cursor, watermark, window.limit())
-        };
-        if chunk.is_empty() {
-            break;
-        }
-        let rows = chunk.len();
-        let chunk_bytes = chunk
-            .iter()
-            .map(|m| m.channel.len() + m.payload.len())
-            .sum();
-        let chunk_max_row = chunk
-            .iter()
-            .map(|m| m.channel.len() + m.payload.len())
-            .max()
-            .unwrap_or(0);
-        cursor = chunk.last().map(|m| m.id).unwrap_or(cursor);
-        let mut stalled = false;
-        for m in &chunk {
-            let hit = match kind {
-                pubsub::SubKind::Channel => m.channel == name,
-                pubsub::SubKind::Pattern => pubsub::pattern_matches(&name, &m.channel),
+    let mut stalled = false;
+    loop {
+        while cursor < watermark {
+            let chunk = {
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                pubsub::query_history_chunk(&mut db, cursor, watermark, window.limit())
             };
-            if !hit {
-                continue;
-            }
-            let pattern = (kind == pubsub::SubKind::Pattern).then_some(name.as_str());
-            let f = pubsub::push_frame(pattern, &m.channel, m.id, m.ts, &m.payload);
-            if tx.try_send(f).is_err() {
-                // Channel full or connection gone: stop replaying — the
-                // delivered prefix stays armed, the rest is resumable by id.
-                stalled = true;
+            if chunk.is_empty() {
                 break;
             }
-            progress = m.id;
+            let rows = chunk.len();
+            let chunk_bytes = chunk
+                .iter()
+                .map(|m| m.channel.len() + m.payload.len())
+                .sum();
+            let chunk_max_row = chunk
+                .iter()
+                .map(|m| m.channel.len() + m.payload.len())
+                .max()
+                .unwrap_or(0);
+            cursor = chunk.last().map(|m| m.id).unwrap_or(cursor);
+            for m in &chunk {
+                let hit = match kind {
+                    pubsub::SubKind::Channel => m.channel == name,
+                    pubsub::SubKind::Pattern => pubsub::pattern_matches(&name, &m.channel),
+                };
+                if !hit {
+                    continue;
+                }
+                let pattern = (kind == pubsub::SubKind::Pattern).then_some(name.as_str());
+                let f = pubsub::push_frame(pattern, &m.channel, m.id, m.ts, &m.payload);
+                if tx.try_send(f).is_err() {
+                    // Channel full or connection gone: stop replaying — the
+                    // delivered prefix stays armed, the rest is resumable by
+                    // id. Live pushes above `progress` still flow.
+                    stalled = true;
+                    break;
+                }
+                progress = m.id;
+            }
+            window.advance(rows, chunk_bytes, chunk_max_row);
+            if stalled || cursor >= watermark {
+                break;
+            }
         }
-        window.advance(rows, chunk_bytes, chunk_max_row);
+        // Atomic arm + sample (see above). Re-sampling catches the messages
+        // published while the replay held no lock.
+        let mut inner = state.pubsub.lock().await;
+        inner.arm_filter(conn, kind, &name, progress);
+        watermark = {
+            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+            pubsub::query_max_id(&mut db)
+        };
+        drop(inner);
         if stalled || cursor >= watermark {
             break;
         }
     }
-    inner.arm_filter(conn, kind, &name, progress);
 }
 
 /// REQ_UNSUBSCRIBE / REQ_PUNSUBSCRIBE: JSON array of names, empty = all.

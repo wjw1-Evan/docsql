@@ -6,13 +6,15 @@
 //! push frames reach them.
 //!
 //! Ordering contract (no gap, no duplicate between replay and live):
-//! every PUBLISH persists before it notifies, and SUBSCRIBE holds the
-//! registry lock across register → snapshot watermark → replay → arm the
-//! dedup filter. A publish that committed before the snapshot is covered
-//! by the replay (its live push is dropped: `id <= skip_through`); one
-//! that commits later passes the filter. Publishes serialize on the
-//! server's `write_order`, so per-connection push frames arrive in id
-//! order.
+//! every PUBLISH persists before it notifies. SUBSCRIBE registers (live
+//! pushes dropped while `skip_through` is `i64::MAX`), then replays the
+//! backlog WITHOUT the registry lock — a large `from earliest` replay must
+//! not stall publishes (and the writes behind `write_order`). Each round
+//! re-arms the dedup filter and samples the watermark atomically under the
+//! lock: messages at or below the sample were dropped from the live stream
+//! and are replayed by that round's delta; later ids pass the filter.
+//! Publishes serialize on the server's `write_order`, so per-connection
+//! push frames arrive in id order.
 //!
 //! Delivery is best-effort per message: each connection has a bounded
 //! writer channel; a connection that stops draining loses live pushes and
