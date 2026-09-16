@@ -2,7 +2,11 @@
 //!
 //! Every page modification is logged before the data file is touched.
 //! A transaction's frames only become durable at `commit`, which appends a
-//! Commit frame and fsyncs. Recovery replays Commit-marked transactions in
+//! Commit frame and fsyncs. Statements inside an explicit SQL transaction
+//! use [`Wal::commit_deferred`]: they append a *deferred* commit frame and
+//! are replayed on recovery only when a later [`Wal::fence`] (the SQL
+//! COMMIT boundary) is present — so a crash mid-transaction can never
+//! resurrect a prefix of it. Recovery replays committed transactions in
 //! LSN order and discards the rest.
 //!
 //! Frame layout (little-endian):
@@ -14,12 +18,22 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 pub const KIND_BEGIN: u8 = 1;
 pub const KIND_WRITE: u8 = 2;
 pub const KIND_COMMIT: u8 = 3;
 pub const KIND_ABORT: u8 = 4;
+/// Commit of a single statement inside an explicit SQL transaction: the
+/// transaction is still open, so recovery must not replay it unless a
+/// later [`KIND_FENCE`] (the SQL COMMIT's durable boundary) covers it.
+pub const KIND_COMMIT_DEFERRED: u8 = 5;
+/// Durable-boundary marker appended by the pager's `sync_wal` before its
+/// fsync: every deferred commit before it belongs to a committed SQL
+/// transaction; deferred commits after it (open transaction) must be
+/// dropped by recovery.
+pub const KIND_FENCE: u8 = 6;
 
 const HEADER: &[u8; 8] = b"DOCSWAL1";
 
@@ -86,6 +100,10 @@ pub struct Wal {
     /// In-memory log size (bytes, header included). Appends and checkpoints
     /// are the only size changes, so `file_len` needs no `fstat` per commit.
     appended: u64,
+    /// Number of deferred commit frames appended since the last fence.
+    /// [`Wal::fence`] is a no-op when this is zero, so an ordinary commit
+    /// batch does not pay an extra frame + fsync cycle.
+    deferred_since_fence: u64,
     /// Checkpoint generation: LSNs restart at 1 after every checkpoint, so a
     /// snapshot's LSN is only meaningful within its epoch (MVCC stage B).
     /// Monotonic across checkpoints for the lifetime of the process.
@@ -111,6 +129,7 @@ impl Wal {
                 last_commit_lsn: 0,
                 durable_lsn: 0,
                 appended: HEADER.len() as u64,
+                deferred_since_fence: 0,
                 epoch: 0,
             });
         }
@@ -132,22 +151,35 @@ impl Wal {
         let mut durable = 0u64;
         let mut good_end = HEADER.len() as u64;
         let mut open_tx: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut deferred: Vec<(u64, u64)> = Vec::new(); // (lsn, txid)
+        let mut last_fence_lsn = 0u64;
         let mut reader = FrameReader::open(path)?;
         while let Some(rec) = reader.next() {
-            // A gap is a corrupt tail to the opener (it truncates there);
-            // replay callers get the same error from `FrameReader`.
-            let Ok(rec) = rec else { break };
+            let rec = rec?;
             good_end = reader.valid_end();
             match rec.kind {
                 KIND_BEGIN => {
                     open_tx.insert(rec.txid);
                 }
-                KIND_COMMIT if open_tx.remove(&rec.txid) => durable = rec.lsn,
+                KIND_COMMIT if open_tx.remove(&rec.txid) => durable = durable.max(rec.lsn),
+                KIND_COMMIT_DEFERRED if open_tx.contains(&rec.txid) => {
+                    deferred.push((rec.lsn, rec.txid));
+                }
+                KIND_FENCE => last_fence_lsn = last_fence_lsn.max(rec.lsn),
                 _ => {}
             }
             next_lsn = rec.lsn + 1;
         }
         drop(reader);
+        // A deferred commit is only durable when a later fence (the SQL
+        // COMMIT boundary) made it to disk. Without the fence the explicit
+        // transaction never committed — dropping it is what keeps recovery
+        // atomic.
+        for (lsn, _txid) in deferred {
+            if lsn < last_fence_lsn {
+                durable = durable.max(lsn);
+            }
+        }
         file.set_len(good_end)?;
         file.seek(SeekFrom::End(0))?;
         Ok(Wal {
@@ -157,6 +189,7 @@ impl Wal {
             last_commit_lsn: durable,
             durable_lsn: durable,
             appended: good_end,
+            deferred_since_fence: 0,
             epoch: 0,
         })
     }
@@ -194,8 +227,19 @@ impl Wal {
         frame.extend_from_slice(payload);
         let crc = crc32(&frame[8..]);
         frame.extend_from_slice(&crc.to_le_bytes());
-        self.file.write_all(&frame)?;
+        // Positional append at the tracked end: a failed write (ENOSPC/EIO)
+        // must not leave the file cursor inside the frame, or the next
+        // append would start after a partial frame and recovery would stop
+        // there — silently discarding every later committed transaction.
+        // On failure truncate the partial bytes so the retry overwrites.
+        if let Err(e) = self.file.write_all_at(&frame, self.appended) {
+            let _ = self.file.set_len(self.appended);
+            return Err(e.into());
+        }
         self.appended += frame.len() as u64;
+        if kind == KIND_COMMIT_DEFERRED {
+            self.deferred_since_fence += 1;
+        }
         self.next_lsn += 1;
         Ok(lsn)
     }
@@ -211,9 +255,18 @@ impl Wal {
     }
 
     /// Commit: append Commit frame and fsync. After this call returns Ok,
-    /// the transaction survives any crash.
+    /// the transaction survives any crash. Unlike [`Wal::commit_deferred`]
+    /// this is an immediately durable transaction (autocommit path).
+    ///
+    /// A fence is appended first when deferred commits are outstanding: this
+    /// fsync makes them durable, so they must become recoverable too — a
+    /// leaked write unit's pages are flushed to the data file by this same
+    /// commit, and dropping their redo would roll the data file back to an
+    /// older image on recovery.
     pub fn commit(&mut self, txid: u64) -> Result<u64> {
-        let lsn = self.commit_deferred(txid)?;
+        self.fence()?;
+        let lsn = self.append(KIND_COMMIT, txid, &[])?;
+        self.last_commit_lsn = self.last_commit_lsn.max(lsn);
         self.sync()?;
         Ok(lsn)
     }
@@ -221,8 +274,31 @@ impl Wal {
     /// Commit without fsync — durability arrives with the next `sync`
     /// (used to batch an explicit BEGIN..COMMIT into one flush). Only the
     /// appended commit LSN moves here; `durable_lsn` follows in `sync`.
+    ///
+    /// The frame is a *deferred* commit: recovery only counts it once a
+    /// later [`Wal::fence`] is present, so a crash mid-transaction drops the
+    /// whole prefix instead of replaying it.
     pub fn commit_deferred(&mut self, txid: u64) -> Result<u64> {
-        let lsn = self.append(KIND_COMMIT, txid, &[])?;
+        let lsn = self.append(KIND_COMMIT_DEFERRED, txid, &[])?;
+        self.last_commit_lsn = self.last_commit_lsn.max(lsn);
+        Ok(lsn)
+    }
+
+    /// Append the durable-boundary marker for the deferred commits written
+    /// since the last fence. Called by the pager's `sync_wal` immediately
+    /// before its fsync: once the fsync succeeds, every deferred commit
+    /// before the fence survives a crash; anything after it belongs to a
+    /// still-open transaction and recovery drops it. A no-op (returns 0)
+    /// when no deferred commit is outstanding, so autocommit batches don't
+    /// grow an extra frame per fsync.
+    pub fn fence(&mut self) -> Result<u64> {
+        if self.deferred_since_fence == 0 {
+            return Ok(0);
+        }
+        let lsn = self.append(KIND_FENCE, 0, &[])?;
+        self.deferred_since_fence = 0;
+        // The fence is a visible commit head too: snapshots begun after the
+        // SQL COMMIT must include the deferred commits it covers.
         self.last_commit_lsn = self.last_commit_lsn.max(lsn);
         Ok(lsn)
     }
@@ -280,11 +356,14 @@ impl Wal {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(HEADER)?;
-        self.file.sync_data()?;
+        // sync_all (not sync_data): the size change must be durable too, and
+        // a checkpoint is rare enough that the metadata flush costs nothing.
+        self.file.sync_all()?;
         self.durable_lsn = 0;
         self.last_commit_lsn = 0;
         self.next_lsn = 1;
         self.appended = HEADER.len() as u64;
+        self.deferred_since_fence = 0;
         self.epoch += 1;
         Ok(())
     }
@@ -301,17 +380,21 @@ pub struct FrameReader {
     reader: io::BufReader<File>,
     next: Option<u64>,
     pos: u64,
+    file_len: u64,
     done: bool,
 }
 
 impl FrameReader {
     pub fn open(path: &Path) -> Result<FrameReader> {
-        let mut reader = io::BufReader::with_capacity(64 * 1024, File::open(path)?);
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = io::BufReader::with_capacity(64 * 1024, file);
         reader.seek(SeekFrom::Start(HEADER.len() as u64))?;
         Ok(FrameReader {
             reader,
             next: None,
             pos: HEADER.len() as u64,
+            file_len,
             done: false,
         })
     }
@@ -331,10 +414,15 @@ impl FrameReader {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
+        let lsn = u64::from_le_bytes(head[0..8].try_into().unwrap());
         let len = u32::from_le_bytes(head[17..21].try_into().unwrap()) as usize;
         if len > MAX_FRAME_PAYLOAD {
-            return Ok(None); // corrupt length: torn tail, not an allocation
+            // Garbage length: cannot know where the frame would end, so it
+            // is indistinguishable from a torn tail. Stop (the opener
+            // truncates here); never allocate on the strength of it.
+            return Ok(None);
         }
+        let frame_end = self.pos + (HEAD_LEN as u64) + (len as u64) + 4;
         let mut frame = vec![0u8; HEAD_LEN + len + 4];
         frame[..HEAD_LEN].copy_from_slice(&head);
         match self.reader.read_exact(&mut frame[HEAD_LEN..]) {
@@ -342,7 +430,18 @@ impl FrameReader {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
-        parse_frame(&frame, self.next)
+        match parse_frame(&frame, self.next) {
+            Ok(Some((rec, adv))) => Ok(Some((rec, adv))),
+            // A torn/corrupt frame is only tolerable as the file tail. With
+            // valid bytes after it (frame_end < file_len) the damage is
+            // mid-log: silently truncating here would discard every later
+            // committed transaction, so fail loudly instead.
+            Ok(None) | Err(_) if frame_end < self.file_len => {
+                Err(WalError::Corrupt(lsn, "corrupt frame mid-log"))
+            }
+            Ok(None) => Ok(None),
+            Err(_e) => Ok(None),
+        }
     }
 }
 
@@ -484,7 +583,11 @@ mod tests {
     }
 
     #[test]
-    fn checksum_corruption_stops_replay() {
+    fn checksum_corruption_mid_log_fails_open_loudly() {
+        // A bad frame with valid frames after it is real corruption, not a
+        // torn tail: truncating there would silently discard every later
+        // committed transaction. The open must fail so an operator can see
+        // it (recovery must never paper over mid-log damage).
         let (_dir, path) = wal_dir();
         {
             let mut w = Wal::open(&path).unwrap();
@@ -492,17 +595,39 @@ mod tests {
             w.log_write(1, b"payload!").unwrap();
             w.commit(1).unwrap();
         }
-        // Flip a payload byte in the WRITE frame.
         let mut data = std::fs::read(&path).unwrap();
         let idx = data.iter().position(|&b| b == b'!').unwrap();
         data[idx] ^= 0xff;
         std::fs::write(&path, data).unwrap();
 
+        let err = match Wal::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("corrupt mid-log frame must fail the open"),
+        };
+        assert!(matches!(err, WalError::Corrupt(_, _)), "{err:?}");
+    }
+
+    #[test]
+    fn checksum_corruption_at_tail_is_truncated() {
+        // A corrupt *last* frame is indistinguishable from a torn write and
+        // is truncated like before.
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.log_write(1, b"payload!").unwrap();
+            w.commit(1).unwrap();
+        }
+        let mut data = std::fs::read(&path).unwrap();
+        // Flip a byte in the COMMIT frame's txid (last frame, tail).
+        let n = data.len();
+        data[n - 10] ^= 0xff;
+        std::fs::write(&path, data).unwrap();
+
         let w = Wal::open(&path).unwrap();
-        // Only BEGIN survives; WRITE is corrupt, so COMMIT... also valid frame
-        // but its txid never saw its write applied. durable_lsn only counts
-        // full scan of valid frames; corruption truncates at WRITE frame.
-        assert!(w.records().unwrap().len() < 3);
+        // BEGIN + WRITE survive; the corrupt tail frame is dropped.
+        assert_eq!(w.records().unwrap().len(), 2);
+        assert_eq!(w.durable_lsn, 0);
     }
 
     #[test]
@@ -576,10 +701,10 @@ mod tests {
         let mut reader = Wal::frames(&path).unwrap();
         assert_eq!(reader.next().unwrap().unwrap().kind, KIND_BEGIN);
         assert_eq!(reader.next().unwrap().unwrap().kind, KIND_WRITE);
-        assert!(matches!(
-            reader.next(),
-            Some(Err(WalError::Corrupt(_, "lsn gap")))
-        ));
+        // A gap at the very tail is treated like a torn write: the scan
+        // stops (and `open` truncates there). A gap with valid bytes after
+        // it (tested separately) is a hard error instead.
+        assert!(reader.next().is_none());
         // 打开器把断号处当尾部截断,只保留前缀。
         let w = Wal::open(&path).unwrap();
         assert_eq!(w.durable_lsn, 0);

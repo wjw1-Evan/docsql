@@ -76,12 +76,19 @@ fn set_count(page: &mut [u8], n: usize) {
 /// surface as an error, not as a slice panic.
 fn validate_page(page: &[u8], pid: u32) -> Result<()> {
     let n = count_of(page);
-    if HEADER_FIXED + n * SLOT_SIZE > page.len() {
+    let dir_end = HEADER_FIXED + n * SLOT_SIZE;
+    if dir_end > page.len() {
         return Err(HeapError::Page(pid, "slot directory overflows page"));
     }
     for i in 0..n {
         let (off, len) = slot(page, i);
-        if len > 0 && (off < HEADER_FIXED || off + len > page.len()) {
+        if len == 0 {
+            continue;
+        }
+        // Live regions must start after the slot directory (a region
+        // overlapping it would make `free_space` underflow) and stay inside
+        // the page.
+        if off < dir_end || off + len > page.len() {
             return Err(HeapError::Page(pid, "document region out of bounds"));
         }
     }
@@ -97,11 +104,14 @@ fn push_slot(page: &mut [u8], off: usize, len: usize) {
 }
 
 /// Free space = gap between the slot directory (front) and the packed
-/// document content (back, grows toward the front of the page).
+/// document content (back, grows toward the front of the page). Saturating:
+/// a corrupt page image must not wrap (and a wrapped value would make the
+/// next insert compute an out-of-page destination).
 fn free_space(page: &[u8]) -> usize {
     let n = count_of(page);
     let content_start = content_start(page);
-    content_start - (HEADER_FIXED + n * SLOT_SIZE)
+    let dir_end = HEADER_FIXED + n * SLOT_SIZE;
+    content_start.saturating_sub(dir_end)
 }
 
 /// Lowest document offset (documents pack from the page end toward the front).
@@ -185,6 +195,15 @@ fn slot_document_bytes<'a>(
         return Err(HeapError::Page(page_id, "overflow slot truncated"));
     }
     let total = u32::from_le_bytes(content[1..5].try_into().expect("4 bytes")) as usize;
+    // The write path enforces MAX_DOC_SIZE; the read path must too, or a
+    // corrupt/hostile slot can drive a multi-GB allocation and a chain walk
+    // sized by attacker-controlled `total`.
+    if total > MAX_DOC_SIZE {
+        return Err(HeapError::Page(
+            page_id,
+            "overflow chain corrupt (total exceeds max document size)",
+        ));
+    }
     let mut next = u32::from_le_bytes(content[5..9].try_into().expect("4 bytes"));
     let mut out = content[OVERFLOW_SLOT_HEADER..].to_vec();
     let min_chunk = PAGE_SIZE - CHAIN_HEADER;

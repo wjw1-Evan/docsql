@@ -185,10 +185,104 @@ fn main() {
     }
 }
 
+/// True when the buffer ends with a top-level `;` and every quote/comment
+/// it opened is closed: only then is it safe to split and execute. A `;`
+/// inside a string literal or a quoted identifier must not terminate the
+/// statement (the old `line.ends_with(';')` check executed a truncated
+/// `VALUES ('line1;` and reported a parse error).
+fn statements_ready(sql: &str) -> bool {
+    #[derive(PartialEq)]
+    enum S {
+        Code,
+        Single,
+        Double,
+        Backtick,
+        Line,
+        Block,
+    }
+    let b = sql.as_bytes();
+    let mut st = S::Code;
+    let mut last_semi = false;
+    let mut i = 0;
+    while i < b.len() {
+        match st {
+            S::Code => match b[i] {
+                b'\'' => st = S::Single,
+                b'"' => st = S::Double,
+                b'`' => st = S::Backtick,
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    st = S::Line;
+                    i += 1;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    st = S::Block;
+                    i += 1;
+                }
+                b';' => last_semi = true,
+                c if !c.is_ascii_whitespace() => last_semi = false,
+                _ => {}
+            },
+            S::Single => {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        st = S::Code;
+                    }
+                }
+            }
+            S::Double => {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 1;
+                    } else {
+                        st = S::Code;
+                    }
+                }
+            }
+            S::Backtick => {
+                if b[i] == b'`' {
+                    if b.get(i + 1) == Some(&b'`') {
+                        i += 1;
+                    } else {
+                        st = S::Code;
+                    }
+                }
+            }
+            S::Line => {
+                if b[i] == b'\n' {
+                    st = S::Code;
+                }
+            }
+            S::Block => {
+                if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    st = S::Code;
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    // A line comment is terminated by end-of-input just like by a newline;
+    // any other open state means the statement is incomplete.
+    matches!(st, S::Code | S::Line) && last_semi
+}
+
+/// Split a complete buffer into executable statements (quote/comment aware).
+/// A split failure returns the buffer as one chunk so the engine reports the
+/// real parse error.
+fn split_ready(buf: &str) -> Vec<String> {
+    match docsql_core::stmt::split_statements(buf) {
+        Ok(parts) => parts.into_iter().filter(|p| !p.trim().is_empty()).collect(),
+        Err(_) => vec![buf.trim().to_string()],
+    }
+}
+
 /// Statement loop shared by interactive stdin and `-f` script files: lines
-/// accumulate until a `;`-terminated line, then execute. In script mode an
-/// SQL error fails fast (exit 1) and a dangling trailing statement without
-/// `;` still executes.
+/// accumulate until a complete `;`-terminated statement, then execute. In
+/// script mode an SQL error fails fast (exit 1); interactive sessions report
+/// the error and keep their normal exit status. A dangling trailing
+/// statement without `;` still executes at EOF.
 fn run_embedded(
     db: &mut Database,
     format: Format,
@@ -227,16 +321,18 @@ fn run_embedded(
         }
         stmt.push_str(&line);
         stmt.push('\n');
-        if !trimmed.ends_with(';') {
+        if !statements_ready(&stmt) {
             continue;
         }
-        match db.execute(stmt.trim()) {
-            Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
-            Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
-            Err(e) => {
-                eprintln!("error: {e}");
-                if !interactive {
-                    std::process::exit(1);
+        for part in split_ready(&stmt) {
+            match db.execute(&part) {
+                Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
+                Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    if !interactive {
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -244,13 +340,15 @@ fn run_embedded(
     }
     // Scripts tolerate a missing final `;`.
     if !done && !stmt.trim().is_empty() {
-        match db.execute(stmt.trim()) {
-            Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
-            Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
-            Err(e) => {
-                eprintln!("error: {e}");
-                if !interactive {
-                    std::process::exit(1);
+        for part in split_ready(&stmt) {
+            match db.execute(&part) {
+                Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
+                Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    if !interactive {
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -696,37 +794,43 @@ fn remote_shell(
         }
         stmt.push_str(&line);
         stmt.push('\n');
-        if !trimmed.ends_with(';') {
+        if !statements_ready(&stmt) {
             continue;
         }
-        let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(stmt.trim()).unwrap());
-        let f = match remote.round_trip(&frame) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("{e}");
+        for part in split_ready(&stmt) {
+            let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&part).unwrap());
+            let f = match remote.round_trip(&frame) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+            if !print_frame(&f, format) && !interactive {
                 std::process::exit(1);
             }
-        };
-        if !print_frame(&f, format) && !interactive {
-            std::process::exit(1);
+            stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
         }
-        stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
         stmt.clear();
     }
     // Scripts tolerate a missing final `;`.
     if !stmt.trim().is_empty() {
-        let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(stmt.trim()).unwrap());
-        match remote.round_trip(&frame) {
-            Ok(f) => {
-                if !print_frame(&f, format) && !interactive {
-                    std::process::exit(1);
+        for part in split_ready(&stmt) {
+            let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&part).unwrap());
+            match remote.round_trip(&frame) {
+                Ok(f) => {
+                    if !print_frame(&f, format) && !interactive {
+                        std::process::exit(1);
+                    }
+                    stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
                 }
-                stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
+                Err(e) => eprintln!("{e}"),
             }
-            Err(e) => eprintln!("{e}"),
         }
     }
-    if stmt_failed {
+    // Interactive sessions end normally even after earlier SQL errors;
+    // scripts surface the failure in their exit status.
+    if stmt_failed && !interactive {
         std::process::exit(1);
     }
 }
@@ -1399,5 +1503,41 @@ mod tests {
                 .to_vec(),
         ));
         print_push(&Frame::new(proto::RESP_PUSH, b"plain".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod statement_ready_tests {
+    use super::{split_ready, statements_ready};
+
+    #[test]
+    fn semicolons_inside_literals_do_not_terminate() {
+        assert!(!statements_ready("INSERT INTO d VALUES ('line1;"));
+        assert!(statements_ready("INSERT INTO d VALUES ('line1; line2');"));
+        assert!(!statements_ready("SELECT 'a''b;"));
+        assert!(statements_ready("SELECT 'a''b;';"));
+        assert!(!statements_ready("SELECT \"ready?;"));
+        assert!(statements_ready("SELECT \"ready?;\";"));
+    }
+
+    #[test]
+    fn comments_and_whitespace_after_semicolon() {
+        assert!(statements_ready("SELECT 1;"));
+        assert!(statements_ready("SELECT 1; -- done"));
+        assert!(statements_ready("SELECT 1; /* done */"));
+        assert!(!statements_ready("SELECT 1 -- not done yet"));
+        assert!(!statements_ready("SELECT 1"));
+        assert!(!statements_ready("SELECT 1 /* ; */"));
+    }
+
+    #[test]
+    fn split_ready_handles_multi_statement_lines_and_bad_sql() {
+        assert_eq!(split_ready("SELECT 1; SELECT 2;").len(), 2);
+        // A parse failure comes back as one chunk so the engine reports it.
+        assert_eq!(
+            split_ready("SELEC bogus;"),
+            vec!["SELEC bogus;".to_string()]
+        );
+        assert!(split_ready("SELECT 1; -- trailing\n").len() == 1);
     }
 }

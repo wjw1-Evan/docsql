@@ -22,7 +22,7 @@
 //! sit behind interior locks. The engine's write lock still serializes all
 //! writers; the locks here only separate writers from readers.
 
-use crate::wal::{Wal, WalError, KIND_COMMIT, KIND_WRITE};
+use crate::wal::{Wal, WalError, KIND_COMMIT, KIND_COMMIT_DEFERRED, KIND_FENCE, KIND_WRITE};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
@@ -409,11 +409,28 @@ impl Pager {
     /// holding any page images in memory.
     fn recover(&self) -> Result<()> {
         let wal_path = wal_path_for(&self.path);
+        // Pass 1: decide which transactions are committed. A normal commit
+        // counts directly; a deferred commit (a statement inside an explicit
+        // SQL transaction) only counts when a later fence — the SQL COMMIT
+        // boundary — is present in the valid prefix. A crash mid-transaction
+        // therefore drops the whole prefix instead of replaying part of it.
         let mut committed = std::collections::HashSet::new();
+        let mut deferred: Vec<(u64, u64)> = Vec::new();
+        let mut last_fence_lsn = 0u64;
         for rec in Wal::frames(&wal_path)? {
             let rec = rec?;
-            if rec.kind == KIND_COMMIT {
-                committed.insert(rec.txid);
+            match rec.kind {
+                KIND_COMMIT => {
+                    committed.insert(rec.txid);
+                }
+                KIND_COMMIT_DEFERRED => deferred.push((rec.lsn, rec.txid)),
+                KIND_FENCE => last_fence_lsn = last_fence_lsn.max(rec.lsn),
+                _ => {}
+            }
+        }
+        for (lsn, txid) in deferred {
+            if lsn < last_fence_lsn {
+                committed.insert(txid);
             }
         }
         let mut applied = false;
@@ -477,6 +494,12 @@ impl Pager {
     /// several MVCC stage-A readers run concurrently. Same visibility rules
     /// (pool → pending deferred writes → data file). Returns an owned copy
     /// because the pool is behind a mutex.
+    ///
+    /// The file-read path is version-guarded (seqlock against `page_lsn` +
+    /// WAL epoch): a commit + flush can otherwise complete between the file
+    /// read and the pool insert, and inserting the pre-commit image would
+    /// pin a stale page in the pool until eviction — silently rolling back
+    /// a committed write for every later reader.
     pub fn read_page_shared(&self, id: u32) -> Result<Vec<u8>> {
         if id == 0 {
             return Err(PagerError::OutOfRange(0, self.num_pages()));
@@ -487,40 +510,77 @@ impl Pager {
         if id >= self.num_pages() {
             return Err(PagerError::OutOfRange(id, self.num_pages()));
         }
-        // Cold miss: read the file outside the pool lock — holding it across
-        // disk IO would serialize every other reader and stall the commit
-        // path (which takes this lock inside its WAL critical section).
-        // Positional read (`FileExt`): no shared file cursor.
-        let (file_img, file_err) = {
-            let file = lock(&self.file);
-            let mut buf = vec![0u8; PAGE_SIZE];
-            match file.read_exact_at(&mut buf, id as u64 * PAGE_SIZE as u64) {
-                Ok(()) => (Some(buf), None),
-                // Beyond EOF is fine while a deferred image sits in
-                // `pending_writes` (not yet flushed); any real error
-                // propagates when pending cannot supply the page.
-                Err(e) => (None, Some(e)),
+        for _ in 0..64 {
+            // Version before any observation: must be re-checked after the
+            // file read, since a commit + flush in between is invisible in
+            // the file image but reflected in the version.
+            let v0 = self.page_version(id);
+            // Deferred images are always the newest committed version and
+            // are never torn — prefer them over reading the file at all.
+            if let Some(p) = lock(&self.pending_writes).get(&id).cloned() {
+                return Ok(p);
             }
-        };
-        // Insert under the pool lock together with the pending check:
-        // commits hold pool + pending in one critical section, so once this
-        // lock is held the pending verdict cannot race a commit, and a newer
-        // committed image in pending wins over the possibly-stale file copy.
-        let mut st = lock(&self.pool);
-        if let Some(data) = st.touch(id) {
-            return Ok(data);
+            // Cold miss: read the file outside the pool lock — holding it
+            // across disk IO would serialize every other reader and stall
+            // the commit path (which takes this lock inside its WAL critical
+            // section). Positional read (`FileExt`): no shared file cursor.
+            let (file_img, file_err) = {
+                let file = lock(&self.file);
+                let mut buf = vec![0u8; PAGE_SIZE];
+                match file.read_exact_at(&mut buf, id as u64 * PAGE_SIZE as u64) {
+                    Ok(()) => (Some(buf), None),
+                    // Beyond EOF is fine while a deferred image sits in
+                    // `pending_writes` (not yet flushed); any real error
+                    // propagates when pending cannot supply the page.
+                    Err(e) => (None, Some(e)),
+                }
+            };
+            // Insert under the pool lock together with the pending +
+            // version check: commits hold pool + pending + page_lsn in one
+            // critical section, so once this lock is held the verdicts
+            // cannot race a commit.
+            let mut st = lock(&self.pool);
+            if let Some(data) = st.touch(id) {
+                return Ok(data);
+            }
+            let data = match (
+                lock(&self.pending_writes).get(&id).cloned(),
+                file_img,
+                file_err,
+            ) {
+                (Some(p), _, _) => p,
+                (None, Some(f), _) if self.page_version(id) == v0 => f,
+                // A commit+flush landed during the file read: the file image
+                // is pre-commit. Retry (the pending map now has the newer
+                // image, or the file has been rewritten).
+                (None, Some(_), _) => {
+                    drop(st);
+                    continue;
+                }
+                (None, None, Some(e)) => return Err(e.into()),
+                (None, None, None) => unreachable!("read_exact_at either succeeds or errors"),
+            };
+            while st.map.len() >= self.max_pool && st.evict_one() {}
+            st.ticket += 1;
+            let ticket = st.ticket;
+            st.order.push_back((id, ticket));
+            st.map.insert(id, Page { data, ticket });
+            return Ok(st.map.get(&id).unwrap().data.clone());
         }
-        let data = match (lock(&self.pending_writes).get(&id).cloned(), file_img) {
-            (Some(p), _) => p,
-            (None, Some(f)) => f,
-            (None, None) => return Err(file_err.expect("one of the two is set").into()),
-        };
-        while st.map.len() >= self.max_pool && st.evict_one() {}
-        st.ticket += 1;
-        let ticket = st.ticket;
-        st.order.push_back((id, ticket));
-        st.map.insert(id, Page { data, ticket });
-        Ok(st.map.get(&id).unwrap().data.clone())
+        Err(PagerError::Io(io::Error::other(format!(
+            "page {id} kept being rewritten while reading; retry the statement"
+        ))))
+    }
+
+    /// Version stamp for the seqlock in [`Pager::read_page_shared`]:
+    /// `(epoch, latest commit LSN)`. Both components only change under the
+    /// WAL lock (commit apply / truncation), and a truncation bumps the
+    /// epoch, so `None → None` across a checkpoint is still detected.
+    fn page_version(&self, id: u32) -> (u64, Option<u64>) {
+        (
+            self.epoch.load(Ordering::Acquire),
+            lock(&self.page_lsn).get(&id).copied(),
+        )
     }
 
     /// Allocate a new page, zero-filled (visible only after commit).
@@ -585,10 +645,16 @@ impl Pager {
         self.commit_tx_inner(tx, false)
     }
 
-    /// Make every deferred commit durable: fsync the WAL first (write-ahead
-    /// rule), then flush its page images to the data file.
+    /// Make every deferred commit durable: append the SQL-COMMIT fence to
+    /// the WAL, fsync it (so the fence is the atomic durable boundary — a
+    /// crash before it drops the whole open transaction), then flush its
+    /// page images to the data file.
     pub fn sync_wal(&self) -> Result<()> {
-        lock(&self.wal).sync().map_err(PagerError::Wal)?;
+        {
+            let mut wal = lock(&self.wal);
+            wal.fence()?;
+            wal.sync().map_err(PagerError::Wal)?;
+        }
         self.flush_pending()?;
         self.maybe_checkpoint()
     }
@@ -650,6 +716,12 @@ impl Pager {
     /// idle gap starts from a clean log when the background sync already
     /// covered everything.
     fn try_free_truncate(&self) -> Result<()> {
+        // Never truncate while page images are queued for the data file:
+        // their WAL frames are the only redo for pages that are not durable
+        // yet (see `CkptState::covered_len`).
+        if !lock(&self.pending_writes).is_empty() {
+            return Ok(());
+        }
         let len = lock(&self.wal).file_len()?;
         if len < self.ckpt_soft {
             return Ok(());
@@ -737,6 +809,14 @@ impl Pager {
     /// snapshots; the hard limit does not (writes are flow-controlled, the
     /// snapshots fail loudly on their next as-of read instead).
     fn maybe_checkpoint(&self) -> Result<()> {
+        // Central guard for the `covered_len` invariant: a data-file fsync
+        // request may only be recorded when no page image is still queued
+        // for the data file. Otherwise the background thread would report
+        // covering WAL bytes whose images never reached the file, and the
+        // next truncation would drop their only redo.
+        if !lock(&self.pending_writes).is_empty() {
+            return Ok(());
+        }
         let len = lock(&self.wal).file_len()?;
         if len < self.ckpt_soft {
             return Ok(());
@@ -910,11 +990,29 @@ impl Pager {
         // fully written before it began, and a torn tail only stops the scan
         // early.
         let wal_path = wal_path_for(&self.path);
+        // Fence-aware committed set: a deferred commit only counts when a
+        // fence at or before the snapshot's LSN covers it (SQL-committed);
+        // an open transaction's statements must stay invisible.
         let mut committed: HashMap<u64, u64> = HashMap::new();
+        let mut deferred: Vec<(u64, u64)> = Vec::new();
+        let mut last_fence = 0u64;
         for rec in Wal::frames(&wal_path)? {
             let r = rec?;
-            if r.kind == KIND_COMMIT && r.lsn <= snap.lsn {
-                committed.insert(r.txid, r.lsn);
+            if r.lsn > snap.lsn {
+                break;
+            }
+            match r.kind {
+                KIND_COMMIT => {
+                    committed.insert(r.txid, r.lsn);
+                }
+                KIND_COMMIT_DEFERRED => deferred.push((r.lsn, r.txid)),
+                KIND_FENCE => last_fence = last_fence.max(r.lsn),
+                _ => {}
+            }
+        }
+        for (lsn, txid) in deferred {
+            if lsn < last_fence {
+                committed.insert(txid, lsn);
             }
         }
         let mut cache: HashMap<u32, Vec<u8>> = HashMap::new();
@@ -1305,6 +1403,45 @@ mod tests {
         let page = pager.read_page(page_id).unwrap().to_vec();
         assert_eq!(&page[..magic.len()], magic);
         assert_eq!(&page[20..26], b"APPEND");
+    }
+
+    #[test]
+    fn deferred_commits_without_fence_are_dropped_on_reopen() {
+        // An explicit SQL transaction that never reached COMMIT must not
+        // resurrect after a process crash: its statements are deferred
+        // commits and only a fence (the SQL COMMIT boundary) makes them
+        // durable. Dropping the pager simulates kill -9 (no graceful sync).
+        let (_dir, path) = tmp_db("nofence.db");
+        {
+            let pager = Pager::open(&path).unwrap();
+            let mut tx = pager.begin_tx();
+            let p = pager.allocate_page(&mut tx).unwrap();
+            pager.write_page(&mut tx, p, 0, b"uncommitted").unwrap();
+            pager.commit_tx_deferred(tx).unwrap();
+            // no sync_wal: the transaction is still open
+        }
+        let pager = Pager::open(&path).unwrap();
+        assert!(
+            pager.read_page(1).is_err(),
+            "open transaction must not survive recovery"
+        );
+    }
+
+    #[test]
+    fn deferred_commits_survive_reopen_after_fence() {
+        let (_dir, path) = tmp_db("fence.db");
+        let page_id;
+        {
+            let pager = Pager::open(&path).unwrap();
+            let mut tx = pager.begin_tx();
+            let p = pager.allocate_page(&mut tx).unwrap();
+            page_id = p;
+            pager.write_page(&mut tx, p, 0, b"sql commit").unwrap();
+            pager.commit_tx_deferred(tx).unwrap();
+            pager.sync_wal().unwrap(); // SQL COMMIT: fence + fsync
+        }
+        let pager = Pager::open(&path).unwrap();
+        assert_eq!(&pager.read_page(page_id).unwrap()[..10], b"sql commit");
     }
 
     #[test]

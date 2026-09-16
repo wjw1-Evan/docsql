@@ -51,13 +51,28 @@ public sealed class DocsqlDatabaseCreator(
         return true;
     }
 
-    public bool EnsureDeleted() => false;
-    public Task<bool> EnsureDeletedAsync(CancellationToken ct = default) => Task.FromResult(false);
+    public bool EnsureDeleted() =>
+        throw new NotSupportedException("DocSQL: 请用 DROP TABLE 管理对象");
+    public Task<bool> EnsureDeletedAsync(CancellationToken ct = default) =>
+        throw new NotSupportedException("DocSQL: 请用 DROP TABLE 管理对象");
 
     public bool CanConnect()
     {
-        try { connection.Open(); return true; }
-        catch { return false; }
+        // Close on BOTH paths: a probe that leaves the pooled connection
+        // checked out pins a pool slot until the context is disposed.
+        try
+        {
+            connection.Open();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            try { connection.Close(); } catch { /* best effort */ }
+        }
     }
 
     public Task<bool> CanConnectAsync(CancellationToken ct = default)

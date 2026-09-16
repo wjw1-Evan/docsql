@@ -98,18 +98,17 @@ impl Value {
             (Value::Int(x), Value::Decimal(y)) => Decimal::from(*x).cmp(y),
             (Value::Decimal(x), Value::Float(y)) => cmp_decimal_f64(x, *y),
             (Value::Float(x), Value::Decimal(y)) => cmp_decimal_f64(y, *x).reverse(),
-            (Value::Float(_), Value::Float(_))
-            | (Value::Int(_), Value::Float(_))
-            | (Value::Float(_), Value::Int(_)) => {
+            (Value::Int(i), Value::Float(f)) => cmp_int_f64(*i, *f),
+            (Value::Float(f), Value::Int(i)) => cmp_int_f64(*i, *f).reverse(),
+            (Value::Float(x), Value::Float(y)) => {
                 // NaN needs a deterministic rank (above all finite numbers)
                 // or cmp_values would not be a total order — sort and unique
                 // checks rely on that.
-                let (x, y) = (num_as_f64(a), num_as_f64(b));
                 match (x.is_nan(), y.is_nan()) {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Greater,
                     (false, true) => Ordering::Less,
-                    (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                    (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
                 }
             }
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -164,11 +163,39 @@ fn cmp_decimal_f64(d: &Decimal, f: f64) -> std::cmp::Ordering {
     }
 }
 
-fn num_as_f64(v: &Value) -> f64 {
-    match v {
-        Value::Int(i) => *i as f64,
-        Value::Float(f) => *f,
-        _ => 0.0,
+/// Integer ↔ f64 order without the lossy `as f64` round-trip: above 2^53 the
+/// cast maps distinct integers onto the same float and equality stops being
+/// transitive across Int/Float/Decimal, which breaks every binary search and
+/// sort that relies on `cmp_values` being a total order. NaN ranks above all
+/// finite numbers (matching Float/Float).
+fn cmp_int_f64(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return Ordering::Less; // i < NaN
+    }
+    // 2^63 exactly; i64::MAX as f64 rounds up to this, so compare against the
+    // exact power of two instead.
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO_POW_63 {
+        return Ordering::Less;
+    }
+    if f < -TWO_POW_63 {
+        return Ordering::Greater;
+    }
+    let t = f.trunc();
+    let ti = t as i64; // exact: |t| < 2^63
+    match i.cmp(&ti) {
+        Ordering::Equal => {
+            let frac = f - t;
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        other => other,
     }
 }
 
@@ -265,6 +292,53 @@ mod tests {
             ("b".into(), Value::Array(vec![Value::Str("x".into())])),
         ]));
         assert_eq!(Value::cmp_values(&v, &v.clone()), Equal);
+    }
+
+    #[test]
+    fn mixed_numeric_ordering_is_transitive_above_2_53() {
+        use std::cmp::Ordering::*;
+        // The lossy `as f64` cast used to map 2^53+1 and 2^53+2 onto the same
+        // float, so Int/Float/Decimal equality was not transitive and B-tree
+        // searches could miss. Both directions must be exact now.
+        let i1 = Value::Int(9_007_199_254_740_993); // 2^53 + 1
+        let i2 = Value::Int(9_007_199_254_740_994); // 2^53 + 2
+        let f = Value::Float(9_007_199_254_740_992.0); // 2^53
+        assert_eq!(Value::cmp_values(&i1, &f), Greater);
+        assert_eq!(Value::cmp_values(&i2, &f), Greater);
+        assert_eq!(Value::cmp_values(&i1, &i1.clone()), Equal);
+        assert_eq!(Value::cmp_values(&f, &i1), Less);
+        // Equality still holds for exactly representable values.
+        assert_eq!(
+            Value::cmp_values(&Value::Int(9_007_199_254_740_992), &f),
+            Equal
+        );
+        // Boundary: 2^63 as f64 is i64::MAX + 1.
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Int(i64::MAX),
+                &Value::Float(9_223_372_036_854_775_808.0)
+            ),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Int(i64::MIN),
+                &Value::Float(-9_223_372_036_854_775_808.0)
+            ),
+            Equal
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Int(1), &Value::Float(f64::NAN)),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Int(1), &Value::Float(f64::NEG_INFINITY)),
+            Greater
+        );
+        // Transitivity over the triple that used to disagree.
+        let d = Value::Decimal(Decimal::new(9_007_199_254_740_992, 0));
+        assert_eq!(Value::cmp_values(&f, &d), Equal);
+        assert_eq!(Value::cmp_values(&i1, &d), Greater);
     }
 
     #[test]

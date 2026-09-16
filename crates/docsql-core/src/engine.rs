@@ -374,7 +374,21 @@ impl TableMeta {
     fn index_columns_of(&self, root_key: &str) -> Vec<String> {
         match self.index_defs.iter().find(|d| d.name == root_key) {
             Some(d) => d.columns.clone(),
-            None => vec![root_key.to_string()],
+            // Legacy/constraint single-column tree: the root key *is* the
+            // column. Any other key is an orphaned composite tree (its index
+            // was dropped, the def is gone): returning `[root_key]` would
+            // make it look like a scalar column tree and mix scalar keys
+            // into an Array-keyed tree.
+            None => {
+                if self.columns.iter().any(|c| c == root_key)
+                    || self.primary_key.as_deref() == Some(root_key)
+                    || self.unique.iter().any(|c| c == root_key)
+                {
+                    vec![root_key.to_string()]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -401,13 +415,13 @@ impl TableMeta {
         }
         for text in &self.checks {
             let e = parse_expr_text(text)?;
-            // SQL semantics: CHECK fails only when it evaluates to FALSE;
-            // NULL (unknown) passes. Our comparisons never return NULL, so
-            // treat any NULL-valued column reference as unknown.
-            if expr_has_null_ref(&e, doc) {
-                continue;
-            }
-            if let Value::Bool(false) = eval_expr(&e, doc)? {
+            // SQL three-valued CHECK semantics: only FALSE rejects; unknown
+            // (a NULL operand) passes. A syntactic "any NULL column ref"
+            // shortcut is wrong in both directions (`a BETWEEN …` with NULL
+            // was rejected, `a > 0 AND b > 0` with one NULL accepted a
+            // false conjunct), so the expression is evaluated with proper
+            // unknown propagation.
+            if matches!(check_expr_outcome(&e, doc)?, CheckOutcome::Fail) {
                 return err(format!("CHECK constraint failed: {text}"));
             }
         }
@@ -445,8 +459,152 @@ fn parse_expr_text(s: &str) -> Result<SqlExpr> {
         .map_err(|e| SqlError::Parse(e.to_string()))
 }
 
+/// Three-valued outcome of a CHECK predicate (SQL: FALSE rejects, TRUE and
+/// UNKNOWN pass).
+enum CheckOutcome {
+    Pass,
+    Fail,
+    Unknown,
+}
+
+/// Evaluate a CHECK predicate with SQL three-valued logic. Comparisons and
+/// boolean operators propagate UNKNOWN structurally; predicates the engine
+/// evaluates two-valued (BETWEEN/LIKE/IN/functions) fall back to the
+/// null-reference walker so a NULL operand stays unknown instead of being
+/// read as FALSE.
+fn check_expr_outcome(e: &SqlExpr, doc: &Object) -> Result<CheckOutcome> {
+    use CheckOutcome::*;
+    let eval_boolish = |e: &SqlExpr, doc: &Object| -> Result<CheckOutcome> {
+        // Generic fallback: NULL reference → unknown, else the engine's
+        // two-valued evaluation (non-boolean results keep the historical
+        // lenient pass).
+        if expr_has_null_ref(e, doc) {
+            return Ok(Unknown);
+        }
+        Ok(match eval_expr(e, doc)? {
+            Value::Bool(false) => Fail,
+            _ => Pass,
+        })
+    };
+    match e {
+        SqlExpr::Nested(inner) => check_expr_outcome(inner, doc),
+        SqlExpr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Not,
+            expr,
+        } => Ok(match check_expr_outcome(expr, doc)? {
+            Pass => Fail,
+            Fail => Pass,
+            Unknown => Unknown,
+        }),
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let l = check_expr_outcome(left, doc)?;
+            let r = check_expr_outcome(right, doc)?;
+            Ok(match (l, r) {
+                (Fail, _) | (_, Fail) => Fail,
+                (Pass, Pass) => Pass,
+                _ => Unknown,
+            })
+        }
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let l = check_expr_outcome(left, doc)?;
+            let r = check_expr_outcome(right, doc)?;
+            Ok(match (l, r) {
+                (Pass, _) | (_, Pass) => Pass,
+                (Fail, Fail) => Fail,
+                _ => Unknown,
+            })
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let l = eval_expr(left, doc)?;
+            let r = eval_expr(right, doc)?;
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Ok(Unknown);
+            }
+            Ok(match binop(l, op, r)? {
+                Value::Bool(false) => Fail,
+                Value::Bool(true) => Pass,
+                Value::Null => Unknown,
+                _ => Pass,
+            })
+        }
+        SqlExpr::IsNull(_)
+        | SqlExpr::IsNotNull(_)
+        | SqlExpr::IsDistinctFrom(..)
+        | SqlExpr::IsNotDistinctFrom(..) => Ok(match eval_expr(e, doc)? {
+            Value::Bool(false) => Fail,
+            _ => Pass,
+        }),
+        SqlExpr::Between { .. }
+        | SqlExpr::Like { .. }
+        | SqlExpr::ILike { .. }
+        | SqlExpr::InList { .. } => eval_boolish(e, doc),
+        _ => eval_boolish(e, doc),
+    }
+}
+
 /// True when any column reference in `e` resolves to NULL in `doc` (CHECK
 /// semantics: unknown, so the constraint passes).
+fn expr_references_ident(e: &SqlExpr, name: &str) -> bool {
+    match e {
+        SqlExpr::Identifier(i) => i.value == name,
+        SqlExpr::CompoundIdentifier(parts) => parts.last().is_some_and(|p| p.value == name),
+        SqlExpr::Nested(inner) => expr_references_ident(inner, name),
+        SqlExpr::UnaryOp { expr, .. } => expr_references_ident(expr, name),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_references_ident(left, name) || expr_references_ident(right, name)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_ident(expr, name)
+                || expr_references_ident(low, name)
+                || expr_references_ident(high, name)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            expr_references_ident(expr, name) || list.iter().any(|i| expr_references_ident(i, name))
+        }
+        SqlExpr::Cast { expr, .. } => expr_references_ident(expr, name),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_references_ident(o, name))
+                || conditions.iter().any(|w| {
+                    expr_references_ident(&w.condition, name)
+                        || expr_references_ident(&w.result, name)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|r| expr_references_ident(r, name))
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                list.args.iter().any(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) => expr_references_ident(inner, name),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn expr_has_null_ref(e: &SqlExpr, doc: &Object) -> bool {
     match e {
         SqlExpr::Identifier(i) => matches!(doc.get(&i.value), Some(Value::Null) | None),
@@ -466,6 +624,33 @@ fn expr_has_null_ref(e: &SqlExpr, doc: &Object) -> bool {
         }
         SqlExpr::UnaryOp { expr, .. } => expr_has_null_ref(expr, doc),
         SqlExpr::Nested(inner) => expr_has_null_ref(inner, doc),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_null_ref(expr, doc)
+                || expr_has_null_ref(low, doc)
+                || expr_has_null_ref(high, doc)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            expr_has_null_ref(expr, doc) || list.iter().any(|i| expr_has_null_ref(i, doc))
+        }
+        SqlExpr::Cast { expr, .. } => expr_has_null_ref(expr, doc),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_has_null_ref(o, doc))
+                || conditions.iter().any(|w| {
+                    expr_has_null_ref(&w.condition, doc) || expr_has_null_ref(&w.result, doc)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|r| expr_has_null_ref(r, doc))
+        }
         SqlExpr::Function(f) => {
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
                 list.args.iter().any(|a| match a {
@@ -1087,6 +1272,12 @@ impl<'a> ReadCx<'a> {
             }
         }
         let mut out: Vec<Vec<Value>> = Vec::new();
+        if let Some(having) = &select.having {
+            // Resolve references before evaluating: a bare column that is
+            // neither grouped nor projected would silently read NULL and drop
+            // every group instead of erroring.
+            check_having_refs(having, &all_exprs, &columns)?;
+        }
         for set in &grouping_sets {
             // Statement timeout reaches here too: the sets × rows × groups
             // loops below run outside the WHERE scan's own sampling.
@@ -1538,10 +1729,13 @@ impl<'a> ReadCx<'a> {
                     return err(format!("unsupported set operation: {op}"));
                 }
                 // Set operations combine whole result sets: strip per-arm
-                // ORDER BY/LIMIT so they apply to the combination only.
+                // ORDER BY/LIMIT/FETCH so they apply to the combination only.
+                // (Leaving `fetch` in applied `FETCH FIRST n ROWS ONLY` to
+                // each arm *and* the combination, truncating the result.)
                 let bare = Query {
                     order_by: None,
                     limit_clause: None,
+                    fetch: None,
                     ..query.clone()
                 };
                 let l = self.exec_query(Query {
@@ -2101,6 +2295,9 @@ impl<'a> ReadCx<'a> {
         {
             return Ok(None);
         }
+        if !plain_table_factor(&select.from[0].relation) {
+            return Ok(None);
+        }
         let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
             return Ok(None);
         };
@@ -2159,7 +2356,41 @@ impl<'a> ReadCx<'a> {
         }
         self.tables.get(&tname)
     }
+}
 
+/// True when a table factor is a plain `t` / `t AS x` relation with no
+/// per-factor clauses. The window/count fast paths test only the variant, so
+/// without this `SELECT COUNT(*) FROM t TABLESAMPLE (10)`, table functions
+/// (`FROM t(1)`), alias column lists and index hints would be silently
+/// ignored instead of rejected like the general path does.
+fn plain_table_factor(tf: &sqlparser::ast::TableFactor) -> bool {
+    let sqlparser::ast::TableFactor::Table {
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+        alias,
+        ..
+    } = tf
+    else {
+        return false;
+    };
+    args.is_none()
+        && with_hints.is_empty()
+        && version.is_none()
+        && !*with_ordinality
+        && partitions.is_empty()
+        && json_path.is_none()
+        && sample.is_none()
+        && index_hints.is_empty()
+        && alias.as_ref().is_none_or(|a| a.columns.is_empty())
+}
+
+impl<'a> ReadCx<'a> {
     /// Unindexed `ORDER BY <fields> LIMIT/OFFSET`: extract only the sort
     /// fields from each document's encoded bytes (no full decode), keep the
     /// best `skip+take` rows in a bounded heap, then materialize just those
@@ -2177,6 +2408,9 @@ impl<'a> ReadCx<'a> {
             || select.from.len() != 1
             || !select.from[0].joins.is_empty()
         {
+            return Ok(None);
+        }
+        if !plain_table_factor(&select.from[0].relation) {
             return Ok(None);
         }
         let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
@@ -2346,10 +2580,16 @@ impl<'a> ReadCx<'a> {
         if !base.joins.is_empty() {
             return Ok(None);
         }
+        if !plain_table_factor(&base.relation) {
+            return Ok(None);
+        }
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = &base.relation else {
             return Ok(None);
         };
         let tname = obj_name(name);
+        if is_compat_view(&tname) {
+            return Ok(None);
+        }
         let Some(meta) = self.tables.get(&tname) else {
             return Ok(None);
         };
@@ -2505,7 +2745,15 @@ impl Database {
             self.pending_sync = true;
             self.pager.commit_tx_deferred(tx).map_err(SqlError::from)
         } else {
-            self.pager.commit_tx(tx).map_err(SqlError::from)
+            // The synchronous commit fsyncs the WAL and flushes every page
+            // image queued before it, so earlier deferred commits are durable
+            // too — nothing is left pending. On failure the flag stays set:
+            // the earlier deferred commits may not be durable yet.
+            let result = self.pager.commit_tx(tx).map_err(SqlError::from);
+            if result.is_ok() {
+                self.pending_sync = false;
+            }
+            result
         }
     }
 
@@ -2544,6 +2792,13 @@ impl Database {
         if !self.pending_sync {
             return Ok(());
         }
+        if self.tx_snapshot.is_some() {
+            // Mid-transaction: these deferred commits belong to an open SQL
+            // transaction. Appending the durable fence now would make a
+            // crash replay a prefix of it; the transaction's own COMMIT
+            // fences the whole batch, ROLLBACK discards it.
+            return Ok(());
+        }
         self.pager.sync_wal().map_err(SqlError::from)?;
         self.pending_sync = false;
         Ok(())
@@ -2567,9 +2822,16 @@ impl Database {
             let total = u32::from_le_bytes(raw[8..12].try_into().expect("header fits")) as usize;
             let mut data = raw[CATALOG_HDR..].to_vec();
             let mut next = u32::from_le_bytes(raw[12..16].try_into().expect("header fits"));
+            // A cyclic chain of valid page ids would loop forever appending
+            // 4 KB per hop, so bound the walk by the page count.
+            let mut hops = 0usize;
             while next != 0 {
                 if next >= pager.num_pages() {
                     return err("catalog chain is corrupt (dangling overflow page)");
+                }
+                hops += 1;
+                if hops > pager.num_pages() as usize {
+                    return err("catalog chain is corrupt (cycle)");
                 }
                 let page = pager.read_page(next)?.to_vec();
                 if !page.starts_with(CATALOG_MAGIC) {
@@ -2781,20 +3043,27 @@ impl Database {
         roots: std::collections::BTreeMap<String, u32>,
         overflow_free: Vec<u32>,
     ) -> Result<()> {
-        let prev = self
-            .tables
-            .get(tname)
-            .map(|m| (m.pages.clone(), m.index_roots.clone()));
+        let prev = self.tables.get(tname).map(|m| {
+            (
+                m.pages.clone(),
+                m.index_roots.clone(),
+                m.overflow_free.clone(),
+            )
+        });
         if let Some(m) = self.catalog_mut(tname) {
             m.pages = pages;
             m.index_roots = roots;
             m.overflow_free = overflow_free;
         }
         if let Err(e) = self.save_catalog_into(tx) {
-            if let Some((pages, index_roots)) = prev {
+            if let Some((pages, index_roots, overflow_free)) = prev {
                 if let Some(m) = self.catalog_mut(tname) {
                     m.pages = pages;
                     m.index_roots = index_roots;
+                    // Restoring the free list matters as much as the page
+                    // list: leaving recycled chain pages in it would let a
+                    // later oversized insert overwrite live documents.
+                    m.overflow_free = overflow_free;
                 }
             }
             return Err(e);
@@ -3037,10 +3306,18 @@ impl Database {
     }
 
     /// SAVEPOINT name: snapshot the current transaction state so a later
-    /// ROLLBACK TO can restore it (the transaction stays open).
+    /// ROLLBACK TO can restore it (the transaction stays open). Capped: each
+    /// savepoint holds a whole-database copy, so an unbounded stack is a
+    /// one-connection memory bomb.
     fn savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
+        const MAX_SAVEPOINTS: usize = 64;
         if self.tx_snapshot.is_none() {
             return err("SAVEPOINT requires an active transaction");
+        }
+        if self.savepoints.len() >= MAX_SAVEPOINTS {
+            return err(format!(
+                "too many savepoints (max {MAX_SAVEPOINTS}); release or roll back some first"
+            ));
         }
         let snap = self.snapshot_all()?;
         self.savepoints.push((name.to_string(), snap));
@@ -3276,6 +3553,12 @@ impl Database {
             }
         }
         let parsed = Self::parse_classified_uncached(sql)?;
+        // User-management statements carry the plaintext password in the AST
+        // (the resolved hash rewrite happens at execution): caching them
+        // would pin credentials in process-wide memory beyond the statement
+        // and outlive the "plaintext never leaves the executing path"
+        // contract.
+        let cacheable = cacheable && !matches!(parsed.stmt, AnyStmt::UserAdmin(_));
         if cacheable {
             // Second-sight gate: pay the cache-write cost (an AST clone)
             // only for text seen before, so distinct-literal workloads —
@@ -3724,6 +4007,10 @@ impl Database {
     /// accounting (positions reset to the sampled heads) keeps valid.
     pub fn wipe_user_tables(&mut self) -> Result<()> {
         self.tables.retain(|name, _| is_system_table(name));
+        // Wiped tables may be recreated from a snapshot: drop their
+        // AUTOINCREMENT watermarks with them or the recreated table resumes
+        // from a stale counter (see DROP TABLE).
+        self.autoinc_cache.clear();
         self.save_catalog()
     }
 
@@ -4141,13 +4428,23 @@ impl Database {
                                 if let Some(pos) = meta.indexes.iter().position(|i| i == &iname) {
                                     meta.indexes.remove(pos);
                                     // The B+ tree itself stays in index_roots:
-                                    // non-unique lookups still benefit from it.
+                                    // non-unique lookups still benefit from
+                                    // it — but only for single-column trees
+                                    // (keyed by the column itself). A
+                                    // composite tree is keyed by the index
+                                    // *name*; with the definition gone
+                                    // nothing can address it, and leaving it
+                                    // behind would let a column that shares
+                                    // the name look like a scalar tree.
                                     if let Some(dpos) = meta
                                         .index_defs
                                         .iter()
                                         .position(|d| d.name == iname.as_str())
                                     {
                                         let def = meta.index_defs.remove(dpos);
+                                        if def.columns.len() > 1 {
+                                            meta.index_roots.remove(&iname);
+                                        }
                                         // Lift UNIQUE only when this index was
                                         // the sole source: table-declared
                                         // constraints and other unique indexes
@@ -4228,6 +4525,11 @@ impl Database {
                 }
                 for name in &dropping {
                     self.tables.remove(name);
+                    // A recreated table must start its AUTOINCREMENT counter
+                    // from its own rows (max+1), not inherit the dropped
+                    // table's watermark — replicas that restarted compute a
+                    // different value and the nodes diverge.
+                    self.autoinc_cache.remove(name);
                 }
                 self.save_catalog()?;
                 Ok(ExecOutcome::Affected(0))
@@ -4327,6 +4629,10 @@ impl Database {
                             .get(&name)
                             .map(|a| a.as_ref().clone())
                             .unwrap_or_default();
+                        // TRUNCATE is a full-table DELETE: child rows must not
+                        // be orphaned silently (same guard as DELETE).
+                        let removed = self.table_docs_cx(&name)?;
+                        self.check_fk_parent_delete(&name, &removed, &[])?;
                         self.rewrite_table(&name, &mut meta, Vec::new())?;
                     }
                 }
@@ -4475,6 +4781,12 @@ impl Database {
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = table.relation else {
             return err("only simple table names in UPDATE");
         };
+        // MySQL-style `UPDATE t JOIN u ON … SET …` parses with the join in
+        // `table.joins`; ignoring it would update every row of `t` with
+        // values evaluated without `u`. Reject loudly instead.
+        if !table.joins.is_empty() {
+            return err("UPDATE ... JOIN is not supported (use UPDATE ... FROM)");
+        }
         let tname = obj_name(&name);
         let tkey = alias
             .as_ref()
@@ -4690,6 +5002,11 @@ impl Database {
             let (loc, new_doc) = (updates[i].0, updates[i].2.clone());
             let page = crate::heap::unpack_loc(loc).0;
             let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
+            // Locators of the rows not yet processed *before* the repack
+            // fixup below mutates them: a survivor move naming one of these
+            // slots is the pending row's own image, and repointing it would
+            // resurrect the old-key entry pass 1 just removed.
+            let pending_locs: Vec<u64> = updates.iter().skip(i + 1).map(|(l, _, _)| *l).collect();
             let out = heap.replace(&self.pager, &mut tx, loc, &new_doc)?;
             // An in-page re-pack moved this page's survivors: pending locators
             // must follow, or a later update would target whatever document
@@ -4702,11 +5019,12 @@ impl Database {
                 }
             }
             for (old_l, new_l) in &out.moved {
-                // Updated rows had their entries removed in pass 1 and
-                // receive their new-image entries in their own iteration;
-                // repointing them here would resurrect the removed old-key
-                // entry at the new locator.
-                if *old_l == loc || updates.iter().any(|(l, _, _)| l == old_l) {
+                // Current row: entries removed in pass 1, new entry lands at
+                // `out.placed` below. Pending row: same, in its own
+                // iteration. Already-processed rows (and untouched rows)
+                // must be repointed — their new/current image is what sat in
+                // that slot, and skipping them leaves a stale index entry.
+                if *old_l == loc || pending_locs.contains(old_l) {
                     continue;
                 }
                 if let Err(e) = reindex_repoint(
@@ -4795,6 +5113,12 @@ impl Database {
         };
         if tables.len() != 1 {
             return err("DELETE from exactly one table");
+        }
+        // `DELETE t FROM t JOIN u …` / `DELETE FROM t JOIN u …` parse with
+        // the join in `tables[0].joins`; dropping it would delete every row
+        // regardless of the join condition. Reject loudly (use USING).
+        if !tables[0].joins.is_empty() {
+            return err("DELETE ... JOIN is not supported (use DELETE ... USING)");
         }
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = tables[0].relation.clone()
         else {
@@ -5130,6 +5454,37 @@ impl Database {
                         if meta.primary_key.as_deref() == Some(name.as_str()) {
                             return err("cannot drop a PRIMARY KEY column");
                         }
+                        // A CHECK text still naming the column would read it
+                        // as NULL afterwards and silently stop enforcing
+                        // (the rename path already guards against this).
+                        if let Some(bad) = meta.checks.iter().find(|c| {
+                            parse_expr_text(c)
+                                .map(|e| expr_references_ident(&e, &name))
+                                .unwrap_or(true)
+                        }) {
+                            return err(format!(
+                                "cannot drop column {name}: CHECK constraint {bad} references it"
+                            ));
+                        }
+                        // Another table's (or this table's own) FK pointing
+                        // at the column would leave every future child insert
+                        // failing with a dangling reference.
+                        let referencing: Vec<String> = self
+                            .tables
+                            .iter()
+                            .filter(|(_, m)| {
+                                m.foreign_keys
+                                    .iter()
+                                    .any(|(_, rt, rc)| rt == &tname && rc == &name)
+                            })
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        if !referencing.is_empty() {
+                            return err(format!(
+                                "cannot drop column {tname}.{name}: referenced by FOREIGN KEY in {}",
+                                referencing.join(", ")
+                            ));
+                        }
                         meta.columns.retain(|c| c != &name);
                         meta.unique.retain(|c| c != &name);
                         meta.constraint_unique.retain(|c| c != &name);
@@ -5289,6 +5644,9 @@ impl Database {
                     }
                     let docs = self.table_docs_cx(&tname)?;
                     self.tables.remove(&tname);
+                    // The old name must not keep a stale AUTOINCREMENT
+                    // watermark for a table created under it later.
+                    self.autoinc_cache.remove(&tname);
                     self.rewrite_table(&new_name, &mut meta, docs)?;
                     return Ok(ExecOutcome::Affected(0));
                 }
@@ -5313,9 +5671,15 @@ impl Database {
                 continue; // NULL passes (MATCH SIMPLE semantics)
             }
             let ref_docs = self.table_docs_cx(rtable)?;
-            let found = ref_docs
-                .iter()
-                .any(|rd| rd.get(rcol).map(|rv| rv == v).unwrap_or(false));
+            // cmp_values (not PartialEq): the engine's comparison semantics
+            // treat Int(1)/Float(1.0)/Decimal(1) as equal; a join would
+            // match them, so the FK must not reject what the rest of the
+            // engine considers the same key.
+            let found = ref_docs.iter().any(|rd| {
+                rd.get(rcol)
+                    .map(|rv| Value::cmp_values(rv, v) == Ordering::Equal)
+                    .unwrap_or(false)
+            });
             if !found {
                 return err(format!(
                     "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
@@ -5366,9 +5730,11 @@ impl Database {
         for doc in removed_docs {
             for rc in &parent_cols {
                 if let Some(v) = doc.get(rc.as_str()) {
-                    let kept = replacement_docs
-                        .iter()
-                        .any(|d| d.get(rc.as_str()).map(|rv| rv == v).unwrap_or(false));
+                    let kept = replacement_docs.iter().any(|d| {
+                        d.get(rc.as_str())
+                            .map(|rv| Value::cmp_values(rv, v) == Ordering::Equal)
+                            .unwrap_or(false)
+                    });
                     if !matches!(v, Value::Null) && !kept && !lost.contains(&v) {
                         lost.push(v);
                     }
@@ -5382,7 +5748,12 @@ impl Database {
             let child_docs = self.table_docs_cx(child_table)?;
             let offender = child_docs.iter().any(|cd| {
                 cd.get(child_col)
-                    .map(|cv| !matches!(cv, Value::Null) && lost.contains(&cv))
+                    .map(|cv| {
+                        !matches!(cv, Value::Null)
+                            && lost
+                                .iter()
+                                .any(|lv| Value::cmp_values(cv, lv) == Ordering::Equal)
+                    })
                     .unwrap_or(false)
             });
             if offender {
@@ -5420,6 +5791,33 @@ impl Database {
                 return Ok(ExecOutcome::Affected(0));
             }
             return err(format!("table {name} already exists"));
+        }
+        // Clause-level guard: a CREATE TABLE shape the engine cannot honor
+        // must be refused, not silently degraded (`LIKE` used to create a
+        // zero-column table; OR REPLACE ignored the replacement semantics).
+        if create.like.is_some() || create.clone.is_some() {
+            return err("CREATE TABLE ... LIKE/CLONE is not supported");
+        }
+        if create.or_replace {
+            return err("CREATE OR REPLACE TABLE is not supported (drop the table first)");
+        }
+        if create.external
+            || create.global.is_some()
+            || create.transient
+            || create.volatile
+            || create.iceberg
+            || !matches!(
+                create.table_options,
+                sqlparser::ast::CreateTableOptions::None
+            )
+            || create.cluster_by.is_some()
+            || create.partition_by.is_some()
+            || create.order_by.is_some()
+        {
+            return err("CREATE TABLE storage/partitioning options are not supported");
+        }
+        if create.strict || create.comment.is_some() {
+            return err("CREATE TABLE engine/comment options are not supported");
         }
         // CREATE TABLE ... AS SELECT: shape and rows come from the query.
         // (`temporary` is accepted and treated as a regular table.)
@@ -5866,6 +6264,19 @@ impl Database {
             for pid in affected {
                 before.extend(heap.page_docs(&PageReader::current(&self.pager), &tx, pid)?);
             }
+            // Rows displaced by OR REPLACE are parent-side deletions: their
+            // referenced keys must not vanish silently (same contract as
+            // DELETE). New rows that keep the same key are replacements.
+            let displaced_docs: Vec<Object> = displaced
+                .iter()
+                .filter_map(|loc| {
+                    before
+                        .iter()
+                        .find(|(l, _)| l == loc)
+                        .map(|(_, d)| d.clone())
+                })
+                .collect();
+            self.check_fk_parent_delete(&table, &displaced_docs, &new_docs)?;
             let moves = heap.remove_many(&self.pager, &mut tx, &displaced)?;
             for loc in &displaced {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
@@ -6191,6 +6602,10 @@ impl Database {
                     let v = eval_expr(&a.value, &row)?;
                     new_doc.insert(col, v);
                 }
+                // Same constraint gate as UPDATE: NOT NULL/CHECK and the
+                // child-side FK must hold for the merged image.
+                meta.check(&new_doc)?;
+                self.check_fks(&meta, &new_doc)?;
                 updates.push((*t_loc, t_doc.clone(), new_doc));
             }
             // Updated target rows must not orphan referenced parents.
@@ -6224,6 +6639,9 @@ impl Database {
             let (loc, new_doc) = (updates[i].0, updates[i].2.clone());
             let page = crate::heap::unpack_loc(loc).0;
             let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
+            // Pre-fixup pending locators; see the identical logic in the
+            // UPDATE fast path.
+            let pending_locs: Vec<u64> = updates.iter().skip(i + 1).map(|(l, _, _)| *l).collect();
             let out = heap.replace(&self.pager, &mut tx, loc, &new_doc)?;
             if !out.moved.is_empty() {
                 for pending in updates.iter_mut().skip(i + 1) {
@@ -6233,7 +6651,10 @@ impl Database {
                 }
             }
             for (old_l, new_l) in &out.moved {
-                if *old_l == loc || updates.iter().any(|(l, _, _)| l == old_l) {
+                // Same rule as the UPDATE fast path: pending rows were
+                // stripped in pass 1 and get their new entries in their own
+                // iteration; already-processed rows must follow the repack.
+                if *old_l == loc || pending_locs.contains(old_l) {
                     continue;
                 }
                 if let Err(e) = reindex_repoint(
@@ -6267,6 +6688,23 @@ impl Database {
         // inserted.
         let mut inserted = 0usize;
         if let Some((cols, exprs)) = &not_matched_ins {
+            // Auto-generated GUIDs are random: letting each node generate its
+            // own would silently diverge replicas (the INSERT path rewrites
+            // the statement with the values; a MERGE rewrite would have to
+            // rewrite the whole branching statement).
+            if meta.autoguid.is_some() {
+                return err(
+                    "MERGE ... WHEN NOT MATCHED THEN INSERT is not supported on \
+                     tables with an auto-generated GUID column",
+                );
+            }
+            let mut next_autoinc = if meta.autoinc.is_some() {
+                self.autoinc_next_for(&tname, &meta)?
+            } else {
+                0
+            };
+            let mut default_exprs: std::collections::HashMap<String, SqlExpr> =
+                std::collections::HashMap::new();
             for (si, s_doc) in src_rows.iter().enumerate() {
                 if s_consumed[si] {
                     continue;
@@ -6276,9 +6714,38 @@ impl Database {
                     let v = eval_expr(e, s_doc)?;
                     doc.insert(c.clone(), v);
                 }
+                // Same generation rules as INSERT: missing/NULL AUTOINCREMENT
+                // gets max+1, declared DEFAULTs fill omitted columns.
+                if let Some(col) = &meta.autoinc {
+                    if matches!(doc.get(col), Some(Value::Null) | None) {
+                        doc.insert(col.clone(), Value::Int(next_autoinc));
+                        next_autoinc = next_autoinc.saturating_add(1);
+                    }
+                }
+                for (col, text) in &meta.defaults {
+                    if !doc.contains_key(col) {
+                        let e = match default_exprs.get(col) {
+                            Some(e) => e,
+                            None => {
+                                let e = parse_expr_text(text)?;
+                                default_exprs.insert(col.clone(), e);
+                                default_exprs.get(col).expect("just inserted")
+                            }
+                        };
+                        doc.insert(col.clone(), eval_const(e)?);
+                    }
+                }
+                meta.check(&doc)?;
                 self.check_fks(&meta, &doc)?;
                 let loc = heap.insert(&self.pager, &mut tx, &doc)?;
                 reindex_insert(&self.pager, &mut tx, &idx_specs, &mut roots, &doc, loc)?;
+                if let Some(col) = &meta.autoinc {
+                    if let Some(Value::Int(i)) = doc.get(col) {
+                        let cur = self.last_insert_id.unwrap_or(i64::MIN);
+                        self.last_insert_id = Some(cur.max(*i));
+                    }
+                    self.autoinc_cache.insert(tname.clone(), next_autoinc);
+                }
                 inserted += 1;
             }
         }
@@ -7401,13 +7868,17 @@ fn value_literal(v: &Value) -> Result<String> {
         Value::Bool(b) => Ok(if *b { "TRUE" } else { "FALSE" }.into()),
         Value::Int(i) => Ok(i.to_string()),
         Value::Float(f) => {
-            // Non-finite floats have no SQL literal form — rendering "inf"/
-            // "NaN" would produce statements the peer cannot parse (cluster
-            // divergence) and dumps that cannot replay. Debug formatting
-            // keeps integral floats distinguishable from Int ("3.0" vs "3"),
-            // preserving the type across resolved-INSERT replay.
+            // Non-finite floats have no bare literal: CAST('NaN'/'inf' AS
+            // REAL) parses back to the same value, so a dump or replication
+            // rewrite round-trips instead of failing or degrading to Float.
+            // Debug formatting keeps integral floats distinguishable from Int
+            // ("3.0" vs "3"), preserving the type across resolved-INSERT
+            // replay.
             if !f.is_finite() {
-                return err("cannot render a non-finite FLOAT value as a SQL literal");
+                return Ok(format!(
+                    "CAST({} AS REAL)",
+                    crate::stmt::sql_string_literal(crate::json::float_marker_text(*f))
+                ));
             }
             Ok(format!("{f:?}"))
         }
@@ -7427,10 +7898,14 @@ fn value_literal(v: &Value) -> Result<String> {
             Ok(hex)
         }
         Value::Str(s) => Ok(crate::stmt::sql_string_literal(s)),
-        other => err(format!(
-            "cannot render a {} value as a SQL literal \
-             (replication and dump need scalar column values)",
-            other.type_name()
+        // Structured values (JSON_EXTRACT output, INSERT ... SELECT from a
+        // JSON function, etc.) have no literal syntax in this dialect: the
+        // engine's canonical JSON text wrapped in JSON_EXTRACT round-trips
+        // exactly (including `$dec`/`$bytes`/`$float` markers), so backups
+        // and join snapshots can carry them.
+        Value::Array(_) | Value::Object(_) => Ok(format!(
+            "JSON_EXTRACT({})",
+            crate::stmt::sql_string_literal(&crate::json::to_string(v))
         )),
     }
 }
@@ -7913,6 +8388,29 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
         SqlExpr::Cast {
             expr, data_type, ..
         } => cast_value(eval_const(expr)?, &data_type.to_string()),
+        // Pure scalar functions of constants: resolved replication rewrites
+        // and dump scripts render structured values and non-finite floats as
+        // JSON_EXTRACT(...)/CAST(...) expressions, which must evaluate back
+        // to the same value on replay. Only argument shapes the normal
+        // expression path accepts are allowed here.
+        SqlExpr::Function(f) => {
+            let name = f.name.to_string().to_uppercase();
+            if f.over.is_some() {
+                return err(format!("window functions (OVER) are not supported: {name}"));
+            }
+            let mut args = Vec::new();
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    match a {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) => args.push(eval_const(inner)?),
+                        _ => return err(format!("unsupported argument to {name}")),
+                    }
+                }
+            }
+            scalar_function(&name, &args)
+        }
         SqlExpr::Identifier(i) => err(format!("column {} not allowed here", i.value)),
         other => err(format!("unsupported expression: {other}")),
     }
@@ -9319,26 +9817,44 @@ fn order_walk_index(
 
 /// Resolve a column reference (bare or table/alias-qualified) to an indexed
 /// column of this table, if it has one.
+/// Resolve a column reference to an index root usable for a scalar probe.
+/// Only roots that are single-column trees for exactly that column qualify:
+/// a composite tree is keyed by the index *name* (or arbitrary root_key), so
+/// accepting `index_roots.contains_key(ident)` blindly made a column that
+/// shares a composite index's name probe an Array-keyed tree and silently
+/// return nothing.
 fn resolve_indexed_col(
     ident: &str,
     table: &str,
     alias: Option<&str>,
     meta: &TableMeta,
 ) -> Option<String> {
+    let scalar_root = |col: &str| -> Option<String> {
+        // The root must exist and name exactly this one column. Testing
+        // `index_columns_of` alone is not enough: for an unknown key it
+        // synthesizes `[key]`, which would accept any column name.
+        if !meta.index_roots.contains_key(col) {
+            return None;
+        }
+        let cols = meta.index_columns_of(col);
+        (cols.len() == 1 && cols[0] == col).then(|| col.to_string())
+    };
     if let Some(col) = ident.strip_prefix(&format!("{table}.")) {
-        if meta.index_roots.contains_key(col) {
-            return Some(col.to_string());
+        if let Some(c) = scalar_root(col) {
+            return Some(c);
         }
     }
     if let Some(a) = alias {
         if let Some(col) = ident.strip_prefix(&format!("{a}.")) {
-            if meta.index_roots.contains_key(col) {
-                return Some(col.to_string());
+            if let Some(c) = scalar_root(col) {
+                return Some(c);
             }
         }
     }
-    if !ident.contains('.') && meta.index_roots.contains_key(ident) {
-        return Some(ident.to_string());
+    if !ident.contains('.') {
+        if let Some(c) = scalar_root(ident) {
+            return Some(c);
+        }
     }
     None
 }
@@ -9363,6 +9879,10 @@ fn probe_plan(
     // All equality conjuncts: composite prefixes need every leading column's
     // value, not just the first one seen.
     let mut eq_map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    // `a = 1 AND a = 2`: a plan built from one of the values would return
+    // rows the other conjunct excludes, and `covered` sees a single map key
+    // so the plan would be declared exact. Refuse any index plan instead.
+    let mut eq_conflict = false;
     let mut eq: Option<(String, Value)> = None;
     let mut range: Option<(String, Vec<(BinaryOperator, Value)>)> = None;
     for c in conjuncts {
@@ -9407,6 +9927,11 @@ fn probe_plan(
                 // Composite prefixes match on declared column names, which
                 // need not be index_roots keys themselves — collect every
                 // equality (raw name), resolve the scalar path separately.
+                if let Some(prev) = eq_map.get(&name) {
+                    if Value::cmp_values(prev, &v) != Ordering::Equal {
+                        eq_conflict = true;
+                    }
+                }
                 if eq.is_none() {
                     if let Some(col) = resolve_indexed_col(&name, table, alias, meta) {
                         eq = Some((col, v.clone()));
@@ -9440,6 +9965,11 @@ fn probe_plan(
             cols.contains(&name) && seen.insert(name)
         })
     };
+    if eq_conflict {
+        // Two different constants constrain the same column: no index probe
+        // can be exact. Fall back to the full scan + residual filter.
+        return None;
+    }
     // Composite-index probe: longest equality prefix over the index columns
     // wins. Full-column equality is an exact key (Eq of the Array); a
     // partial prefix becomes a Prefix scan with a prefix retain. Non-leading
@@ -9569,10 +10099,15 @@ struct IdxSpec {
 fn idx_specs(meta: &TableMeta, roots: &std::collections::BTreeMap<String, u32>) -> Vec<IdxSpec> {
     roots
         .keys()
-        .map(|k| IdxSpec {
-            root_key: k.clone(),
-            cols: meta.index_columns_of(k),
-            unique: meta.root_key_unique(k),
+        .filter_map(|k| {
+            let cols = meta.index_columns_of(k);
+            // Orphaned tree (dropped composite index): no column list, so no
+            // maintenance key. Keep it out of every write path.
+            (!cols.is_empty()).then(|| IdxSpec {
+                root_key: k.clone(),
+                cols,
+                unique: meta.root_key_unique(k),
+            })
         })
         .collect()
 }
@@ -9596,10 +10131,16 @@ fn reindex_repoint(
         if let Some(key) = index_key_of(doc, &spec.cols) {
             let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
-            tree.delete_entry(pager, tx, &key, old_l)
+            let removed = tree
+                .delete_entry(pager, tx, &key, old_l)
                 .map_err(|e| index_err(&spec.root_key, e))?;
-            tree.insert(pager, tx, key, new_l, spec.unique)
-                .map_err(|e| index_err(&spec.root_key, e))?;
+            // Only repoint an entry that was actually there: inserting on a
+            // missed delete would add a second entry for the same document
+            // (and a unique tree would spuriously reject it).
+            if removed {
+                tree.insert(pager, tx, key, new_l, spec.unique)
+                    .map_err(|e| index_err(&spec.root_key, e))?;
+            }
             if tree.root != root {
                 roots.insert(spec.root_key.clone(), tree.root);
             }
@@ -9615,6 +10156,10 @@ fn reindex_repoint(
 /// `None` when any key column is missing or NULL — NULL does not enter
 /// indexes (composite rule: one NULL column skips the whole key).
 fn index_key_of(doc: &Object, cols: &[String]) -> Option<Value> {
+    if cols.is_empty() {
+        // Orphaned tree with no resolvable column list: no key belongs to it.
+        return None;
+    }
     if cols.len() == 1 {
         return match doc.get(&cols[0]) {
             Some(v) if !matches!(v, Value::Null) => Some(v.clone()),
@@ -9750,6 +10295,86 @@ fn check_group_refs(e: &SqlExpr, group_exprs: &[SqlExpr]) -> Result<()> {
             } else {
                 err(format!(
                     "column {name} must appear in GROUP BY or an aggregate"
+                ))
+            }
+        }
+        SqlExpr::Value(_) => Ok(()),
+        other => err(format!("unsupported aggregate expression: {other}")),
+    }
+}
+
+/// HAVING variant of [`check_group_refs`]: a bare identifier may also be one
+/// of the projection's output names (aliases resolve through the output row
+/// during evaluation). Without this check a column that is neither grouped
+/// nor aliased silently read NULL and the predicate dropped every group.
+fn check_having_refs(e: &SqlExpr, group_exprs: &[SqlExpr], out_columns: &[String]) -> Result<()> {
+    match e {
+        SqlExpr::Function(f) if is_agg_fn(f) => Ok(()),
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        check_having_refs(inner, group_exprs, out_columns)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Nested(inner) => check_having_refs(inner, group_exprs, out_columns),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            check_having_refs(left, group_exprs, out_columns)?;
+            check_having_refs(right, group_exprs, out_columns)
+        }
+        SqlExpr::UnaryOp { expr, .. } => check_having_refs(expr, group_exprs, out_columns),
+        SqlExpr::Cast { expr, .. } => check_having_refs(expr, group_exprs, out_columns),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                check_having_refs(o, group_exprs, out_columns)?;
+            }
+            for w in conditions {
+                check_having_refs(&w.condition, group_exprs, out_columns)?;
+                check_having_refs(&w.result, group_exprs, out_columns)?;
+            }
+            if let Some(r) = else_result {
+                check_having_refs(r, group_exprs, out_columns)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Identifier(i) => {
+            if out_columns.iter().any(|c| c == &i.value)
+                || group_exprs
+                    .iter()
+                    .any(|g| matches!(g, SqlExpr::Identifier(gi) if gi.value == i.value))
+            {
+                Ok(())
+            } else {
+                err(format!(
+                    "column {} must appear in GROUP BY, an aggregate, or the SELECT list",
+                    i.value
+                ))
+            }
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            let name = parts
+                .iter()
+                .map(|p| p.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            if out_columns.iter().any(|c| c == &name)
+                || group_exprs.iter().any(|g| expr_name(g) == name)
+            {
+                Ok(())
+            } else {
+                err(format!(
+                    "column {name} must appear in GROUP BY, an aggregate, or the SELECT list"
                 ))
             }
         }
@@ -9972,10 +10597,22 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             // Copy out so the inherent i64 checked_* methods win over the
             // num-traits impls imported for Decimal.
             let (a, b) = (*a, *b);
+            // Overflow yields NULL (SQLite/Decimal semantics) — the old
+            // wrapping arithmetic silently returned i64::MIN for
+            // `9223372036854775807 + 1` and replicated/backed it up as truth.
             Ok(match op {
-                Plus => Value::Int(a.wrapping_add(b)),
-                Minus => Value::Int(a.wrapping_sub(b)),
-                Multiply => Value::Int(a.wrapping_mul(b)),
+                Plus => match a.checked_add(b) {
+                    Some(v) => Value::Int(v),
+                    None => Value::Null,
+                },
+                Minus => match a.checked_sub(b) {
+                    Some(v) => Value::Int(v),
+                    None => Value::Null,
+                },
+                Multiply => match a.checked_mul(b) {
+                    Some(v) => Value::Int(v),
+                    None => Value::Null,
+                },
                 Divide if b == 0 => Value::Null,
                 // i64::MIN / -1 overflows (SIGFPE on some ISAs) — treat like
                 // division by zero and yield NULL instead of crashing.
@@ -10193,6 +10830,36 @@ mod tests {
         // and the failed UPDATE changed nothing
         let r = rows(&mut db, "SELECT name FROM t WHERE id = 4");
         assert_eq!(r.rows, vec![vec![Value::Str("u4".into())]]);
+    }
+
+    #[test]
+    fn fast_update_repoints_processed_rows_after_repack() {
+        // Heap order is insertion order; the index probe visits rows in key
+        // order. Inserting id=2 then id=1 makes the probe update the *later*
+        // slot first: B(id=1, slot 1) gets its new (in-place) image first,
+        // then A(id=2, slot 0) grows past the page and its re-pack shifts B
+        // down to slot 0. B is already processed, so its locator in
+        // `updates` is still the original (slot 1) — the old moved-locator
+        // filter saw that match and skipped repointing B's index entry,
+        // leaving it pointing at A's new image.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'b')").unwrap();
+        let big = "v".repeat(2200);
+        db.execute(&format!("UPDATE t SET v = '{big}' WHERE id > 0"))
+            .unwrap();
+        for id in [1i64, 2] {
+            let r = rows(&mut db, &format!("SELECT v FROM t WHERE id = {id}"));
+            assert_eq!(r.rows.len(), 1, "id={id} lost from the index: {r:?}");
+            assert_eq!(r.rows[0][0], Value::Str(big.clone()), "id={id} wrong row");
+        }
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        let ids: Vec<i64> = r.rows.iter().filter_map(|v| v[0].as_i64()).collect();
+        assert_eq!(ids, vec![1, 2]);
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t WHERE v IS NOT NULL");
+        assert_eq!(r.rows[0][0], Value::Int(2));
     }
 
     #[test]
@@ -12762,6 +13429,18 @@ mod tests {
             "SELECT dept FROM s GROUP BY dept HAVING COUNT(*) > 1",
         );
         assert_eq!(r.rows, vec![vec![Value::Str("eng".into())]]);
+        // A bare column that is neither grouped nor projected must error
+        // instead of silently reading NULL (which dropped every group).
+        let e = db
+            .execute("SELECT dept, COUNT(*) FROM s GROUP BY dept HAVING pay > 0")
+            .unwrap_err();
+        assert!(e.to_string().contains("must appear in GROUP BY"), "{e}");
+        // Aliases in HAVING still resolve through the output row.
+        let r = rows(
+            &mut db,
+            "SELECT dept AS d, COUNT(*) AS c FROM s GROUP BY dept HAVING c > 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("eng".into()), Value::Int(2)]]);
     }
 
     #[test]
@@ -15085,6 +15764,49 @@ mod tx_rollback_tests {
     }
 
     #[test]
+    fn uncommitted_transaction_does_not_survive_recovery() {
+        // Atomicity: statements inside BEGIN..COMMIT are deferred commits;
+        // a process crash before COMMIT (no fence) must drop the whole
+        // transaction, not replay an arbitrary prefix of it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-crash.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            db.execute("INSERT INTO t VALUES (2)").unwrap();
+            // no COMMIT: simulate kill -9 by dropping the Database
+        }
+        let mut db = Database::open(&path).unwrap();
+        let out = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert!(
+            matches!(&out, ExecOutcome::Rows(r) if r.rows[0][0].as_i64() == Some(0)),
+            "uncommitted transaction must not survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn committed_transaction_survives_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-commit.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            db.execute("INSERT INTO t VALUES (2)").unwrap();
+            db.execute("COMMIT").unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        let out = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert!(
+            matches!(&out, ExecOutcome::Rows(r) if r.rows[0][0].as_i64() == Some(2)),
+            "committed transaction must survive: {out:?}"
+        );
+    }
+
+    #[test]
     fn full_rollback_is_durable_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rb.db");
@@ -15452,6 +16174,36 @@ mod tx_rollback_tests {
         assert!(db2.execute("INSERT INTO ck2 VALUES (0, -1, 1, 1)").is_err());
         assert!(db2.execute("INSERT INTO ck2 VALUES (0, 0, 0, 1)").is_err());
         assert!(db2.execute("INSERT INTO ck2 VALUES (0, 0, 1, 5)").is_err());
+        // Three-valued CHECK: BETWEEN with NULL is unknown (passes); a FALSE
+        // conjunct must reject even when another conjunct is unknown
+        // (unknown AND false = false).
+        let mut db4 = Database::in_memory().unwrap();
+        run(
+            &mut db4,
+            "CREATE TABLE ck4 (a INT CHECK (a BETWEEN 1 AND 2), b INT, c INT, CHECK (c > 0 AND b > 0))",
+        );
+        run(&mut db4, "INSERT INTO ck4 (a) VALUES (NULL)");
+        run(&mut db4, "INSERT INTO ck4 (c, b) VALUES (1, 1)");
+        run(&mut db4, "INSERT INTO ck4 (c) VALUES (1)"); // b NULL: c>0 AND unknown = unknown
+        assert!(
+            db4.execute("INSERT INTO ck4 (c, b) VALUES (NULL, -1)")
+                .is_err(),
+            "unknown AND false must fail the CHECK"
+        );
+        assert!(
+            db4.execute("INSERT INTO ck4 (c, b) VALUES (-1, NULL)")
+                .is_err(),
+            "false AND unknown must fail the CHECK"
+        );
+        // IS NULL is two-valued: never unknown.
+        let mut db5 = Database::in_memory().unwrap();
+        run(
+            &mut db5,
+            "CREATE TABLE ck5 (a INT CHECK (a IS NULL OR a > 0))",
+        );
+        run(&mut db5, "INSERT INTO ck5 (a) VALUES (NULL)");
+        run(&mut db5, "INSERT INTO ck5 (a) VALUES (1)");
+        assert!(db5.execute("INSERT INTO ck5 (a) VALUES (0)").is_err());
     }
 
     #[test]
@@ -15972,6 +16724,34 @@ mod tx_rollback_tests {
         );
         run(&mut db, "COMMIT");
         db
+    }
+
+    #[test]
+    fn dump_script_roundtrips_structured_and_non_finite_values() {
+        // JSON functions can store Arrays/Objects and CAST can store
+        // non-finite floats; a dump (automatic backup / join snapshot) used
+        // to fail on them ("cannot render ... as a SQL literal").
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE j (id INT PRIMARY KEY, doc ANY, f REAL)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO j SELECT 1, JSON_EXTRACT('{\"items\":[1,2],\"name\":\"x\"}', '$'), CAST('NaN' AS REAL)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO j SELECT 2, JSON_EXTRACT('[true,{\"n\":null}]', '$'), CAST('inf' AS REAL)",
+        );
+        let script = db.dump_script().unwrap();
+        assert!(script.contains("JSON_EXTRACT("), "{script}");
+        assert!(script.contains("CAST('NaN' AS REAL)"), "{script}");
+        let mut restored = apply_dump(&script);
+        let before = rows(&mut db, "SELECT id, doc, f FROM j ORDER BY id");
+        let after = rows(&mut restored, "SELECT id, doc, f FROM j ORDER BY id");
+        // Debug rather than eq: NaN != NaN under Value's PartialEq.
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
     }
 
     #[test]
@@ -17195,6 +17975,54 @@ mod complex_query_tests {
     }
 
     #[test]
+    fn fast_paths_reject_unsupported_table_factor_clauses() {
+        // The count/order fast paths must not silently ignore per-factor
+        // clauses that the general path rejects (TABLESAMPLE/alias column
+        // lists/table functions).
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+        for sql in [
+            "SELECT COUNT(*) FROM t TABLESAMPLE (10)",
+            "SELECT * FROM t AS q(a) ORDER BY id LIMIT 2",
+            "SELECT * FROM t(1)",
+            "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1",
+        ] {
+            let out = db.execute(sql);
+            match out {
+                Err(_) => {}
+                Ok(o) => {
+                    // The plain ORDER BY window is legitimately supported;
+                    // only the clause-bearing shapes must be rejected.
+                    assert!(
+                        sql.contains("OFFSET"),
+                        "clause silently ignored: {sql} -> {o:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composite_index_name_shadowing_a_column_still_probes_the_column() {
+        // A composite index keyed by the index *name* must not hijack an
+        // equality probe on a column that happens to share that name.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (x INT NOT NULL, a INT, b INT)");
+        run(&mut db, "CREATE INDEX x ON t (a, b)");
+        run(&mut db, "INSERT INTO t VALUES (5, 1, 2)");
+        assert_eq!(
+            rows(&mut db, "SELECT a FROM t WHERE x = 5").rows,
+            vec![vec![Value::Int(1)]]
+        );
+        run(&mut db, "DROP INDEX x");
+        assert_eq!(
+            rows(&mut db, "SELECT a FROM t WHERE x = 5").rows,
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    #[test]
     fn composite_index_create_probe_unique_and_maintenance() {
         let mut db = Database::in_memory().unwrap();
         db.execute("CREATE TABLE t (a INT, b INT, tag TEXT)")
@@ -17230,6 +18058,27 @@ mod complex_query_tests {
         assert_eq!(
             rows(&mut db, "SELECT tag FROM t WHERE b = 10 ORDER BY a").rows,
             vec![vec![Value::Str("x".into())], vec![Value::Str("z".into())]]
+        );
+
+        // Conflicting equalities on the same column must not become an
+        // "exact" index window: `a = 1 AND a = 2` matches nothing, and a
+        // prefix plan built from one value would return rows the residual
+        // filter was skipped for.
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT a, b FROM t WHERE a = 1 AND a = 2 ORDER BY a, b LIMIT 1"
+            )
+            .rows,
+            Vec::<Vec<Value>>::new()
+        );
+        assert_eq!(
+            rows(
+                &mut db,
+                "SELECT tag FROM t WHERE a = 1 AND a = 1 ORDER BY a, b"
+            )
+            .rows,
+            vec![vec![Value::Str("x".into())], vec![Value::Str("y".into())]]
         );
 
         // Index maintenance through UPDATE and DELETE.
@@ -18024,9 +18873,7 @@ mod complex_query_tests {
 
     #[test]
     fn value_literal_rendering() {
-        // The resolved-SQL literal renderer: scalars round-trip with their
-        // type preserved and anything non-scalar or non-finite refuses to
-        // render (a peer would otherwise diverge on "inf"/"NaN" literals).
+        // The resolved-SQL literal renderer: every stored value round-trips.
         assert_eq!(value_literal(&Value::Null).unwrap(), "NULL");
         assert_eq!(value_literal(&Value::Bool(true)).unwrap(), "TRUE");
         assert_eq!(value_literal(&Value::Bool(false)).unwrap(), "FALSE");
@@ -18049,14 +18896,27 @@ mod complex_query_tests {
             value_literal(&Value::Bytes(vec![0xde, 0xad])).unwrap(),
             "x'dead'"
         );
-        for bad in [
-            Value::Float(f64::NAN),
-            Value::Float(f64::INFINITY),
-            Value::Float(f64::NEG_INFINITY),
-            Value::Array(vec![Value::Int(1)]),
-        ] {
-            let e = value_literal(&bad).unwrap_err();
-            assert!(e.to_string().contains("cannot render"), "{bad:?}: {e}");
+        // Non-finite floats and structured values render as replayable
+        // expressions (a dump/join of a table holding them used to fail).
+        assert_eq!(
+            value_literal(&Value::Float(f64::NAN)).unwrap(),
+            "CAST('NaN' AS REAL)"
+        );
+        assert_eq!(
+            value_literal(&Value::Float(f64::INFINITY)).unwrap(),
+            "CAST('inf' AS REAL)"
+        );
+        let arr = Value::Array(vec![Value::Int(1), Value::Str("x".into())]);
+        let lit = value_literal(&arr).unwrap();
+        assert!(lit.starts_with("JSON_EXTRACT('"), "{lit}");
+        assert_eq!(eval_const(&parse_expr_text(&lit).unwrap()).unwrap(), arr);
+        let obj = Value::Object(Object::from([("k".into(), Value::Float(f64::NAN))]));
+        let lit = value_literal(&obj).unwrap();
+        match eval_const(&parse_expr_text(&lit).unwrap()).unwrap() {
+            Value::Object(o) => {
+                assert!(matches!(o.get("k"), Some(Value::Float(f)) if f.is_nan()))
+            }
+            other => panic!("expected object, got {other:?}"),
         }
     }
 

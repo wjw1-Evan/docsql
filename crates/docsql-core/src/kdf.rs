@@ -264,6 +264,14 @@ fn effective_iterations() -> u32 {
     })
 }
 
+/// Iteration count for newly created credentials (see
+/// [`effective_iterations`]). Shared with the web console's own account so
+/// `DOCSQL_PBKDF2_ITERATIONS` applies to both; stored entries keep the
+/// count they were hashed with.
+pub fn iterations_for_new_credentials() -> u32 {
+    effective_iterations()
+}
+
 /// Hash a plaintext password into the stored form.
 pub fn hash_password(password: &str, salt_bytes: &[u8]) -> String {
     let iterations = effective_iterations();

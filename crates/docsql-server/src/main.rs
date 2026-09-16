@@ -132,7 +132,11 @@ fn config_from_env(
     }
     let max_conn = env_num("DOCSQL_MAX_CONN", 0, &getenv)?;
     let idle_timeout_secs = env_num("DOCSQL_IDLE_TIMEOUT", 0, &getenv)?;
-    let replicate_to = getenv("DOCSQL_REPLICATE_TO").filter(|s| !s.is_empty());
+    // Trim like DOCSQL_PEERS: a stray space makes every fan-out to the
+    // upstream fail (observed only as sync-log errors).
+    let replicate_to = getenv("DOCSQL_REPLICATE_TO")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let peers = getenv("DOCSQL_PEERS")
         .map(|v| {
             v.split(',')
@@ -364,8 +368,9 @@ mod tests {
         .unwrap();
         assert!(cfg.read_only);
         assert!(cfg.async_commit);
-        // Replicate-to is forwarded verbatim (no trim), like the legacy path.
-        assert_eq!(cfg.replicate_to.as_deref(), Some(" host:7 "));
+        // Replicate-to is trimmed like DOCSQL_PEERS: a stray space would
+        // make every fan-out to the upstream fail.
+        assert_eq!(cfg.replicate_to.as_deref(), Some("host:7"));
         let cfg = config_from_env(&[], env(&[("DOCSQL_READ_ONLY", "0")])).unwrap();
         assert!(!cfg.read_only);
     }

@@ -2369,8 +2369,13 @@ async fn backup_node_override_via_json_body_and_bare_trigger() {
     )
     .await;
 
-    // Bare trigger: no body at all → default managed node.
+    // A bodyless POST (an HTML form can send one cross-site without a CORS
+    // preflight) is refused: the body must be JSON.
     let res = http(&web, "POST", "/api/backup", Some("sekrit"), None).await;
+    assert_eq!(res.status, 415, "bodyless trigger must be rejected");
+
+    // Empty JSON body → default managed node.
+    let res = http(&web, "POST", "/api/backup", Some("sekrit"), Some("{}")).await;
     assert_eq!(res.status, 200);
     assert_eq!(res.json()["ok"], true);
 
@@ -2704,4 +2709,99 @@ async fn tls_listener_serves_https_and_rejects_plaintext() {
         !text.contains("HTTP/1.1 200"),
         "plaintext request got an HTTP answer on the TLS port: {text}"
     );
+}
+
+/// The hand-rolled hyper TLS path must inject `ConnectInfo` exactly like
+/// `axum::serve` does: the auth handlers (setup/login/change) extract the
+/// peer address for their lockout keys, and without it every HTTPS setup
+/// failed with 500 MissingExtension — the console was unusable over TLS.
+#[tokio::test]
+async fn tls_auth_endpoints_extract_peer_and_serve_setup() {
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.key_pair.serialize_pem()).unwrap();
+    let auth_file = dir.path().join("console-auth.json");
+
+    let addr = start_web_full(
+        Some("sekrit"),
+        Vec::new(),
+        None,
+        Some(auth_file.to_string_lossy().into_owned()),
+        Some((cert.display().to_string(), key.display().to_string())),
+    )
+    .await;
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ck.cert.der().clone()).unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+
+    let request = |method: &str, path: &str, body: Option<String>| {
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        if let Some(b) = &body {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+        req.push_str("\r\n");
+        if let Some(b) = body {
+            req.push_str(&b);
+        }
+        req
+    };
+    let send = |text: String| {
+        let connector = connector.clone();
+        let addr = addr.clone();
+        async move {
+            let stream = TcpStream::connect(&addr).await.unwrap();
+            let mut tls = connector
+                .connect("localhost".try_into().unwrap(), stream)
+                .await
+                .unwrap();
+            tls.write_all(text.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            tls.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    };
+
+    // Pre-setup state must answer over HTTPS (no ConnectInfo needed, but it
+    // proves the TLS path serves the API router).
+    let status = send(request("GET", "/api/auth/status", None)).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    assert!(status.contains("\"mode\":\"setup\""), "{status}");
+
+    // Setup extracts ConnectInfo: it used to 500 here.
+    let setup = send(request(
+        "POST",
+        "/api/auth/setup",
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#.to_string()),
+    ))
+    .await;
+    assert!(
+        setup.starts_with("HTTP/1.1 200"),
+        "setup over HTTPS failed: {setup}"
+    );
+    assert!(setup.contains("\"ok\":true"), "{setup}");
+
+    // Login over HTTPS works too (same extractor).
+    let login = send(request(
+        "POST",
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"s3cret-pw"}"#.to_string()),
+    ))
+    .await;
+    assert!(
+        login.starts_with("HTTP/1.1 200"),
+        "login over HTTPS failed: {login}"
+    );
+    assert!(login.to_lowercase().contains("set-cookie:"), "{login}");
 }

@@ -58,6 +58,12 @@ public sealed class DocsqlSubscriber : IDisposable
     private volatile bool _dead;
     private volatile string? _deadReason;
     private Frame? _pendingResp;
+    /// <summary>0/1: OnError fires at most once per connection. The timeout
+    /// path used to fire it, then the reader thread fired it again when the
+    /// socket finally died — a naive "dispose and reconnect" handler ran
+    /// twice per incident.</summary>
+    private int _errorFired;
+    private readonly System.Threading.Timer? _keepAlive;
 
     /// <summary>
     /// 连接断开或读取失败时触发(在后台读线程上,Dispose 主动关闭不触发)。
@@ -66,12 +72,60 @@ public sealed class DocsqlSubscriber : IDisposable
     /// </summary>
     public Action<Exception>? OnError { get; set; }
 
-    public DocsqlSubscriber(string connectionString)
+    /// <param name="keepAlive">PING cadence; must stay below the node's
+    /// DOCSQL_IDLE_TIMEOUT (the server resets its idle timer only on inbound
+    /// frames, so a subscriber on a quiet channel was disconnected every
+    /// interval and had to be rebuilt). Zero disables the keepalive.</param>
+    public DocsqlSubscriber(string connectionString, TimeSpan? keepAlive = null)
     {
         var b = new DocsqlConnectionStringBuilder { ConnectionString = connectionString };
         _proto = DocsqlConnection.ConnectAndAuth(b, null, b.ConnectTimeout * 1000);
         _reader = new Thread(ReadLoop) { IsBackground = true, Name = "docsql-subscriber" };
         _reader.Start();
+        var period = keepAlive ?? TimeSpan.FromSeconds(30);
+        if (period > TimeSpan.Zero)
+        {
+            _keepAlive = new System.Threading.Timer(
+                _ => SendKeepAlive(), null, period, period);
+        }
+    }
+
+    /// <summary>Best-effort PING: skipped while a control round-trip owns the
+    /// connection; a failed send just stops pinging (the reader's error path
+    /// reports it).</summary>
+    private void SendKeepAlive()
+    {
+        if (_dead || !_running)
+        {
+            return;
+        }
+        try
+        {
+            lock (_ctrlLock)
+            {
+                _proto.Write(new Frame(FrameType.ReqPing, 0, 0, Array.Empty<byte>()));
+            }
+        }
+        catch
+        {
+            // Connection gone; ReadLoop's error path is authoritative.
+        }
+    }
+
+    private void FireError(Exception ex)
+    {
+        if (Interlocked.Exchange(ref _errorFired, 1) != 0)
+        {
+            return;
+        }
+        try
+        {
+            OnError?.Invoke(ex);
+        }
+        catch
+        {
+            // 观察者异常不影响投毒流程
+        }
     }
 
     /// <summary>订阅频道;返回该连接的活跃订阅总数。</summary>
@@ -178,14 +232,7 @@ public sealed class DocsqlSubscriber : IDisposable
                 // 迟到的应答永远不会被错认成别的请求的确认。
                 _deadReason = "订阅请求超时;连接状态不可信,请重建连接";
                 _dead = true;
-                try
-                {
-                    OnError?.Invoke(new DocsqlException(_deadReason));
-                }
-                catch
-                {
-                    // 观察者异常不影响投毒流程
-                }
+                FireError(new DocsqlException(_deadReason));
                 throw new DocsqlException(_deadReason);
             }
             if (_dead && _pendingResp is null)
@@ -219,6 +266,10 @@ public sealed class DocsqlSubscriber : IDisposable
                 Dispatch(f);
                 continue;
             }
+            if (f.Type == FrameType.RespPong)
+            {
+                continue; // keepalive reply: never somebody's control response
+            }
             _pendingResp = f;
             _respReady.Set();
         }
@@ -235,14 +286,7 @@ public sealed class DocsqlSubscriber : IDisposable
         // 在途 RoundTrip 让它立即失败。
         _deadReason = fatal?.Message ?? "connection closed";
         _dead = true;
-        try
-        {
-            OnError?.Invoke(fatal ?? new System.IO.IOException("connection closed"));
-        }
-        catch
-        {
-            // 观察者异常不影响断线流程
-        }
+        FireError(fatal ?? new System.IO.IOException("connection closed"));
         _respReady.Set();
     }
 
@@ -289,7 +333,14 @@ public sealed class DocsqlSubscriber : IDisposable
     public void Dispose()
     {
         _running = false;
+        _keepAlive?.Dispose();
         _proto.Dispose(); // unblocks the reader's Receive
-        _reader.Join(TimeSpan.FromSeconds(2));
+        // Joining from the reader thread itself (OnError/message callback
+        // calling Dispose) would wait on the current thread until the
+        // timeout; skip it there.
+        if (!ReferenceEquals(Thread.CurrentThread, _reader))
+        {
+            _reader.Join(TimeSpan.FromSeconds(2));
+        }
     }
 }

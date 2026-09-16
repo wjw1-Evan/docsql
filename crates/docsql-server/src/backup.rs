@@ -794,7 +794,10 @@ fn next_stamp(dir: &Path, now: u64) -> String {
 /// Parse `YYYYMMDDTHHMMSSmmmZ` back to epoch milliseconds (inverse of
 /// `utc_stamp`, same civil algorithm).
 fn parse_stamp(s: &str) -> Option<u64> {
-    if s.len() != 19 || !s.ends_with('Z') {
+    // Byte-indexed slices below: a multibyte char in a 19-byte stem would
+    // panic on a non-char-boundary. Backup names are ASCII by construction;
+    // anything else is not a timestamp.
+    if s.len() != 19 || !s.is_ascii() || !s.ends_with('Z') {
         return None;
     }
     let num = |a: usize, b: usize| s[a..b].parse::<u64>().ok();

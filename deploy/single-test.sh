@@ -195,7 +195,7 @@ fi
 r=$(curl -s "$W/api/backup")
 echo "$r" | grep -q '"count"' && echo "$r" | grep -q 'backup-' \
   && ok "web backup list" || bad "web backup list: $r"
-r=$(curl -s -X POST "$W/api/backup")
+r=$(curl -s -X POST "$W/api/backup" -H 'Content-Type: application/json' -d '{}')
 echo "$r" | grep -q '"ok":true' && ok "web backup trigger" || bad "web backup trigger: $r"
 # 恢复演练:取一份含 sg 全部行的快照 → DROP 该表 → 重放备份 → 行数回来。
 sgbk=""

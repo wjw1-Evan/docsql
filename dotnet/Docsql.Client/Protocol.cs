@@ -100,6 +100,20 @@ public sealed class ProtocolConnection : IDisposable
     private readonly byte[]? _key;
 
     /// <summary>
+    /// Read budget per frame. A dead peer / black-holed NAT mapping leaves a
+    /// synchronous read blocked forever otherwise (the old code had no read
+    /// timeout at all: Open()'s pooled PING and every statement could hang
+    /// the caller permanently). Overridable per statement via
+    /// <see cref="SendAsync(Frame, CancellationToken, int)"/> and the ADO.NET
+    /// CommandTimeout. 0 = infinite (tests/diagnostics only).
+    /// </summary>
+    public int ReadTimeoutMs { get; set; } = 30_000;
+
+    /// <summary>True after a timeout/IO failure left the frame stream in an
+    /// unknown position: the connection must be discarded, never pooled.</summary>
+    public bool Broken { get; private set; }
+
+    /// <summary>
     /// 服务端 prepared statement 句柄缓存:模板 SQL → REQ_PREPARE 句柄。
     /// 句柄按物理连接隔离且随连接生死 —— 池化复用同一物理连接即缓存有效;
     /// 超过容量上限时逐个 REQ_CLOSE_STMT 后清空(服务器侧无自动逐出)。
@@ -130,6 +144,7 @@ public sealed class ProtocolConnection : IDisposable
             }
             _stream = _tcp.GetStream();
             _key = key;
+            _tcp.ReceiveTimeout = ReadTimeoutMs;
         }
         catch
         {
@@ -143,6 +158,7 @@ public sealed class ProtocolConnection : IDisposable
         _tcp = connected;
         _stream = connected.GetStream();
         _key = key;
+        _tcp.ReceiveTimeout = ReadTimeoutMs;
     }
 
     /// <summary>异步建连(真异步,不占线程):超时与外部取消共用一个令牌。
@@ -264,11 +280,28 @@ public sealed class ProtocolConnection : IDisposable
     /// <summary><see cref="Send"/> 的真异步形态。取消只到语句边界:一帧发到
     /// 一半作废会错位帧流(该连接只能弃用),语句级取消由服务端语句超时承担,
     /// ct 在发送前检查。</summary>
-    public async Task<Frame> SendAsync(Frame request, CancellationToken cancellationToken = default)
+    public async Task<Frame> SendAsync(
+        Frame request, CancellationToken cancellationToken = default, int readTimeoutMs = -1)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await WriteAsync(request).ConfigureAwait(false);
-        return await ReadFrameAsync().ConfigureAwait(false);
+        int budget = readTimeoutMs >= 0 ? readTimeoutMs : ReadTimeoutMs;
+        if (budget <= 0)
+        {
+            return await ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+        }
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(budget);
+        try
+        {
+            return await ReadFrameAsync(cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            Broken = true;
+            try { _tcp.Dispose(); } catch { /* already gone */ }
+            throw new TimeoutException($"statement read timed out after {budget} ms");
+        }
     }
 
     private Frame SealFrame(Frame request)
@@ -349,12 +382,12 @@ public sealed class ProtocolConnection : IDisposable
     }
 
     /// <summary><see cref="ReadFrame"/> 的真异步形态。</summary>
-    private async Task<Frame> ReadFrameAsync()
+    private async Task<Frame> ReadFrameAsync(CancellationToken cancellationToken = default)
     {
-        await ReadExactAsync(_header).ConfigureAwait(false);
+        await ReadExactAsync(_header, cancellationToken).ConfigureAwait(false);
         var (type, flags, topo, len) = ParseHeader(_header);
         var payload = new byte[len];
-        await ReadExactAsync(payload).ConfigureAwait(false);
+        await ReadExactAsync(payload, cancellationToken).ConfigureAwait(false);
         return Assemble(flags, type, topo, payload);
     }
 
@@ -403,12 +436,13 @@ public sealed class ProtocolConnection : IDisposable
         }
     }
 
-    private async Task ReadExactAsync(byte[] buf)
+    private async Task ReadExactAsync(byte[] buf, CancellationToken cancellationToken = default)
     {
         int off = 0;
         while (off < buf.Length)
         {
-            int n = await _stream.ReadAsync(buf.AsMemory(off, buf.Length - off)).ConfigureAwait(false);
+            int n = await _stream.ReadAsync(buf.AsMemory(off, buf.Length - off), cancellationToken)
+                .ConfigureAwait(false);
             if (n == 0)
             {
                 throw new IOException("connection closed");

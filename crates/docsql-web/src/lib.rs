@@ -102,6 +102,12 @@ pub struct AuthShared {
     store: Mutex<auth::AuthStore>,
     sessions: auth::Sessions,
     lockout: Mutex<auth::Lockout>,
+    /// Global cap on concurrent PBKDF2 derivations. Each login/setup/change
+    /// burns ~210k HMAC iterations; without a cap a burst of unauthenticated
+    /// requests occupies every blocking-pool thread for minutes of CPU
+    /// (trivial DoS, and the old lockout check ran before any failure was
+    /// recorded, so it did not bound the derivation count either).
+    derivations: Arc<tokio::sync::Semaphore>,
 }
 
 impl AuthShared {
@@ -110,6 +116,7 @@ impl AuthShared {
             store: Mutex::new(auth::AuthStore::open(std::path::Path::new(path))?),
             sessions: auth::Sessions::new(),
             lockout: Mutex::new(auth::Lockout::new()),
+            derivations: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
 
@@ -119,6 +126,13 @@ impl AuthShared {
 
     fn username(&self) -> Option<String> {
         self.store.lock().unwrap().username().map(String::from)
+    }
+
+    /// Snapshot the credentials for an off-lock verification: the store
+    /// mutex must not be held across the PBKDF2 derivation (every other
+    /// auth operation, including /api/auth/status, would queue behind it).
+    fn creds_snapshot(&self) -> Option<auth::Creds> {
+        self.store.lock().unwrap().creds_snapshot()
     }
 }
 
@@ -217,8 +231,16 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
                             // TokioIo adapter on top.
                             let service =
                                 hyper_util::service::TowerToHyperService::new(
-                                    tower::service_fn(move |req| {
+                                    tower::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                                         let app = app.clone();
+                                        // axum::serve installs ConnectInfo for
+                                        // the plain path; this hand-rolled
+                                        // hyper path must inject it or every
+                                        // handler extracting the peer address
+                                        // (setup/login/change → lockout keys)
+                                        // rejects with 500 MissingExtension.
+                                        req.extensions_mut()
+                                            .insert(axum::extract::ConnectInfo(peer));
                                         async move {
                                             use tower::ServiceExt;
                                             app.oneshot(req)
@@ -337,6 +359,22 @@ async fn count_requests(
     next: axum::middleware::Next,
 ) -> Response {
     let method = req.method().clone();
+    // Normalize the method too: `Method::from_bytes` accepts arbitrary
+    // extension tokens, so keying the map on the raw string let an
+    // unauthenticated client mint unbounded entries (`curl -X FOO123 …`)
+    // that never get evicted.
+    let method = match method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::CONNECT => "CONNECT",
+        axum::http::Method::TRACE => "TRACE",
+        _ => "other",
+    };
     let raw_path = req.uri().path().to_string();
     const KNOWN: [&str; 17] = [
         "/",
@@ -739,7 +777,16 @@ fn with_session_cookie(state: &WebState, resp: Response, token: &str) -> Respons
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
-    (status, Json(body)).into_response()
+    let mut resp = (status, Json(body)).into_response();
+    // API payloads carry credentials-adjacent data (user grants, audit
+    // text, query results): no shared/browser cache may retain them.
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
 }
 
 async fn auth_status(
@@ -791,11 +838,21 @@ async fn auth_setup(
         );
     }
     // setup() runs the PBKDF2 derivation (~tens of ms) — keep it off the
-    // async worker and out of the store mutex's critical section.
+    // async worker, under the global derivation permit.
+    let permit = match a.derivations.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": "认证繁忙,请稍后再试"}),
+            )
+        }
+    };
     let st = state.clone();
     let username = body.username.clone();
     let password = body.password.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let a = st.auth.as_ref().expect("checked at fn entry");
         a.store.lock().unwrap().setup(&username, &password)
     })
@@ -824,10 +881,15 @@ async fn auth_setup(
         Err(auth::SetupError::Invalid(msg)) => {
             json_response(StatusCode::BAD_REQUEST, json!({"error": msg}))
         }
-        Err(auth::SetupError::Io(msg)) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": format!("凭据写入失败:{msg}")}),
-        ),
+        Err(auth::SetupError::Io(msg)) => {
+            // The detailed error embeds host paths / mount layout; log it
+            // server-side, answer generically to the unauthenticated caller.
+            eprintln!("console credential write failed: {msg}");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "凭据写入失败,请检查控制台存储卷(详见服务端日志)"}),
+            )
+        }
     }
 }
 
@@ -850,15 +912,29 @@ async fn auth_login(
             json!({"error": "尝试次数过多,请一分钟后再试"}),
         );
     }
-    // verify() burns a PBKDF2 derivation — run it on the blocking pool so
-    // the async worker (and every other request behind the store mutex)
-    // is not stalled for the duration.
-    let st = state.clone();
+    // verify() burns a PBKDF2 derivation. Two protections: a global permit
+    // bounds concurrent derivations (a burst of unauthenticated requests
+    // must not occupy every blocking thread for minutes of CPU), and the
+    // credential snapshot is taken under a short lock so the derivation
+    // runs without holding the store mutex (which every other auth
+    // operation would otherwise queue behind).
+    let permit = match a.derivations.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": "认证繁忙,请稍后再试"}),
+            )
+        }
+    };
+    let creds = a.creds_snapshot();
     let username = body.username.clone();
     let password = body.password.clone();
     let ok = tokio::task::spawn_blocking(move || {
-        let a = st.auth.as_ref().expect("checked at fn entry");
-        a.store.lock().unwrap().verify(&username, &password)
+        let _permit = permit;
+        creds
+            .as_ref()
+            .is_some_and(|c| auth::verify_creds(c, &username, &password))
     })
     .await
     .unwrap_or(false);
@@ -941,11 +1017,21 @@ async fn auth_change(
     }
     let caller_session = session_from(&headers);
     // PBKDF2 verify/derive — same blocking-pool discipline as login/setup.
+    let permit = match a.derivations.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": "认证繁忙,请稍后再试"}),
+            )
+        }
+    };
     let st = state.clone();
     let cur_pw = body.current_password.clone();
     let new_user = body.username.clone();
     let new_pw = (!body.password.is_empty()).then(|| body.password.clone());
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let a = st.auth.as_ref().expect("checked at fn entry");
         a.store
             .lock()
@@ -1024,10 +1110,16 @@ fn record_console_sql(
     } else {
         out["error"]["message"].as_str().map(String::from)
     };
+    // Redact before anything observes the entry: the console's statement
+    // log feeds the UI's log tab and (when DOCSQL_LOG_FILE is set) the
+    // JSONL audit sink, and a `CREATE USER … PASSWORD 'secret'` typed into
+    // the SQL editor must not land there in cleartext (the server-side
+    // query log redacts through the same helper).
+    let redacted = docsql_core::useradmin::redact_sql(sql);
     log.push(LogEntry {
         ts_ms: now_ms(),
         peer: peer.into(),
-        sql: sql.chars().take(512).collect(),
+        sql: redacted.chars().take(512).collect(),
         ms,
         affected,
         error,
@@ -2022,19 +2114,20 @@ struct BackupTriggerBody {
 }
 
 /// Trigger one backup now on the managed node (`?node=` or JSON body).
+/// The body is REQUIRED (JSON content type): a plain HTML form can post
+/// `application/x-www-form-urlencoded` cross-site without a CORS preflight,
+/// so an optional body made this a CSRF trigger for a state-changing
+/// operation.
 async fn api_backup_trigger(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
     Query(params): Query<NodeParams>,
-    body: Option<Json<BackupTriggerBody>>,
+    Json(body): Json<BackupTriggerBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if let Some(code) = check_auth(&state, &headers) {
         return Err(code);
     }
-    let node = match body {
-        Some(Json(b)) => b.node.or(params.node),
-        None => params.node,
-    };
+    let node = body.node.or(params.node);
     match target_for(&state, &node) {
         Ok(addr) => Ok(Json(
             remote_backup(&addr, state.token.as_deref(), true).await,

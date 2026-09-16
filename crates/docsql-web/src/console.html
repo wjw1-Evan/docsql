@@ -550,11 +550,13 @@ const api = {
     catch { throw new Error('响应不是有效 JSON(HTTP ' + r.status + ')'); }
     ui.connState(r.ok ? 'ok' : 'down');
     // In-band 错误约定:数据端点对配置缺失/节点选择失败回 HTTP 200 +
-    // {"error": …}。归一成标准错误形状,写路径才不会把它当成功。
+    // {"error": …}。归一成标准错误形状,写路径才不会把它当成功 —— 同时
+    // 保留原始 `error` 字段:历史上有一半消费方检查 data.error,丢掉它
+    // 会让失败的用户/备份操作被当成成功(误报 toast、空列表)。
     if (body && typeof body === 'object' && !Array.isArray(body)
         && body.error !== undefined && body.kind === undefined
         && Object.keys(body).length === 1) {
-      return {kind: 'error', message: String(body.error), inBand: true};
+      return {kind: 'error', message: String(body.error), error: String(body.error), inBand: true};
     }
     return body;
   }
@@ -2275,7 +2277,7 @@ function openBackupTab() {
       $('[data-do="trigger"]', t.el).disabled = !!(rst && rst.running);
       if (rst) {
         const rs = rst.running
-          ? `<span style="color:var(--warn)">● 恢复进行中</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span>${rst.total ? ` · <span data-rprog>${rst.applied}/${rst.total}</span> 条语句` : ''}`
+          ? `<span style="color:var(--warn)">● 恢复进行中</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span>${rst.total ? ` · <span data-rprog>${esc(rst.applied)}/${esc(rst.total)}</span> 条语句` : ''}`
           : (rst.ok
             ? `<span style="color:var(--ok)">● 恢复完成</span> <span style="font-family:var(--mono)">${esc(rst.file)}</span> · ${esc(rst.applied)} 条语句${rst.ts_ms ? ' · ' + esc(new Date(rst.ts_ms).toLocaleString()) : ''}` +
               (rst.converged === true ? ' · <span style="color:var(--ok)">集群已验证收敛</span>' : '') +

@@ -33,11 +33,13 @@ internal static partial class SchemaSync
             if (column is null) continue;
             var type = p.GetColumnType() ?? "TEXT";
             modelColumns.Add((column, type));
-            // 单列值生成主键:整数自增;非空模型照常声明 NOT NULL
-            // (引擎的索引按序扫描要求键列 NOT NULL——索引树不存 NULL 键)。
+            // 单列值生成主键:仅整数类型自增 —— 引擎把 AUTOINCREMENT 视为
+            // 整数 max+1;给 TEXT/GUID 主键加上它会让维护脚本插入整数,
+            // EF 物化 Guid.Parse("1") 直接炸。GUID 主键改用引擎的 UUIDv7
+            // 自动生成路径(Guid 列本身按 TEXT 建列,不再带 AUTOINCREMENT)。
             if (pk is { Properties.Count: 1 } && pk.Properties[0] == p && p.IsPrimaryKey())
                 cols.Add(
-                    $"{Quote(column)} {type}{(p.IsNullable ? "" : " NOT NULL")} PRIMARY KEY AUTOINCREMENT");
+                    $"{Quote(column)} {type}{(p.IsNullable ? "" : " NOT NULL")} PRIMARY KEY{(IsIntegerClrType(p.ClrType) ? " AUTOINCREMENT" : "")}");
             else
                 cols.Add($"{Quote(column)} {type}{(p.IsNullable ? "" : " NOT NULL")}");
         }
@@ -192,4 +194,13 @@ internal static partial class SchemaSync
     // Embedded quotes escaped by doubling, same rule as the ADO.NET
     // layer's QuoteIdent; string.Format keeps the nesting readable.
     private static string Quote(string id) => string.Format("\"{0}\"", id.Replace("\"", "\"\""));
+
+    /// <summary>CLR 类型是否映射到引擎的整数自增语义(见调用处的列声明)。</summary>
+    private static bool IsIntegerClrType(Type t)
+    {
+        t = Nullable.GetUnderlyingType(t) ?? t;
+        return t == typeof(int) || t == typeof(long) || t == typeof(short)
+            || t == typeof(byte) || t == typeof(sbyte)
+            || t == typeof(uint) || t == typeof(ulong) || t == typeof(ushort);
+    }
 }

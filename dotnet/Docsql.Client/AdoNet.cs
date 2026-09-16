@@ -120,6 +120,11 @@ internal static class ConnectionPool
         public readonly int MaxSize;
         public readonly SemaphoreSlim Permits;
 
+        /// <summary>Set by ClearSlot/ClearAll: a borrowed connection returned
+        /// after the slot left the registry must be closed, not enqueued
+        /// into the now-unreachable queue (it would leak its socket).</summary>
+        public volatile bool Closed;
+
         public Slot(int maxSize)
         {
             MaxSize = Math.Max(1, maxSize);
@@ -132,9 +137,17 @@ internal static class ConnectionPool
     /// <summary>池命中 / 未命中(新建) / 丢弃(死连接、超容量裁剪) 计数,测试可断言。</summary>
     internal static long Hits, Misses, Discarded;
 
-    internal static string KeyOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
-        string.Join('\u0001', p.Host, p.Port, p.User, p.Password, p.Token,
-            keyOverride ?? p.Key, p.MaxPoolSize);
+    internal static string KeyOf(DocsqlConnectionStringBuilder p, string? keyOverride)
+    {
+        // The pool registry lives for the process lifetime: keying it on the
+        // plaintext password/token retains every credential ever used (and
+        // exposes it to memory dumps / telemetry enumerating pools). A
+        // SHA-256 digest identifies the session just as well.
+        var creds = string.Join('\u0001', p.User, p.Password, p.Token, keyOverride ?? p.Key);
+        var digest = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(creds)));
+        return string.Join('\u0001', p.Host, p.Port, digest, p.MaxPoolSize);
+    }
 
     internal static Slot SlotOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
         Pools.GetOrAdd(KeyOf(p, keyOverride), _ => new Slot(p.MaxPoolSize));
@@ -240,7 +253,7 @@ internal static class ConnectionPool
 
     internal static void Return(Slot? slot, ProtocolConnection proto)
     {
-        if (slot is null)
+        if (slot is null || slot.Closed)
         {
             Interlocked.Increment(ref Discarded);
             proto.Dispose();
@@ -269,6 +282,10 @@ internal static class ConnectionPool
     {
         foreach (var slot in Pools.Values)
         {
+            // Mark closed BEFORE draining: a connection borrowed right now
+            // will be disposed on Return instead of enqueued into a queue
+            // nobody owns.
+            slot.Closed = true;
             while (slot.Idle.TryDequeue(out var proto))
             {
                 proto.Dispose();
@@ -281,6 +298,7 @@ internal static class ConnectionPool
     {
         if (Pools.TryRemove(key, out var slot))
         {
+            slot.Closed = true;
             while (slot.Idle.TryDequeue(out var proto))
             {
                 proto.Dispose();
@@ -312,7 +330,7 @@ public sealed class DocsqlConnection : DbConnection
     public (string host, int port, string token)? EndpointOverride { get; set; }
 
     /// Optional explicit transport key (hex); wins over ConnectionString's
-    /// key= when EF rewrites the connection string.</summary>
+    /// key= when EF rewrites the connection string.
     public string? KeyOverride { get; set; }
 
     /// <summary>hex 密钥 → 32 字节;空串返回 null(明文模式)。</summary>
@@ -560,10 +578,11 @@ public sealed class DocsqlConnection : DbConnection
         {
             var proto = _proto;
             _proto = null;
-            if (InTransaction)
+            if (InTransaction || proto.Broken)
             {
                 // 事务未了结就 Close:物理断开(服务器断连自动 ROLLBACK)。
                 // 归还一个带着开放事务的连接,会把事务泄漏给下一个借出者。
+                // Broken 同理:读超时/IO 失败后帧流停在未知位置。
                 ConnectionPool.Discard(_poolSlot, proto);
             }
             else
@@ -641,6 +660,11 @@ public sealed class DocsqlCommand : DbCommand
 
     protected override DbParameterCollection DbParameterCollection => Parameters;
 
+    /// <summary>
+    /// ADO.NET 的 Cancel 语义在本客户端由语句超时承担:帧流是一问一答的
+    /// 二进制流,单方面中止读取会错位帧边界(连接只能作废)。设置
+    /// CommandTimeout 即可获得有界的语句执行时间。
+    /// </summary>
     public override void Cancel() { }
 
     public override int ExecuteNonQuery()
@@ -749,6 +773,9 @@ public sealed class DocsqlCommand : DbCommand
         {
             throw new InvalidOperationException("connection is not open");
         }
+        // CommandTimeout 驱动读取预算(0 = ADO.NET 默认无限制,这里落到连接
+        // 默认的 30s 读超时,而不是原来的永久阻塞)。
+        conn.Proto.ReadTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : 30_000;
         if (Parameters.Count == 0)
         {
             return conn.Proto.Send(SqlFrame());
@@ -769,14 +796,19 @@ public sealed class DocsqlCommand : DbCommand
         {
             throw new InvalidOperationException("connection is not open");
         }
+        int readTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : 30_000;
         if (Parameters.Count == 0)
         {
-            return await conn.Proto.SendAsync(SqlFrame(), cancellationToken).ConfigureAwait(false);
+            return await conn.Proto
+                .SendAsync(SqlFrame(), cancellationToken, readTimeoutMs)
+                .ConfigureAwait(false);
         }
         var (template, values) = RewriteParameters();
-        var (handle, _) = await conn.Proto.GetOrPrepareAsync(template, cancellationToken)
+        var (handle, _) = await conn.Proto
+            .GetOrPrepareAsync(template, cancellationToken)
             .ConfigureAwait(false);
-        return await conn.Proto.SendAsync(ExecuteBody(handle, values), cancellationToken)
+        return await conn.Proto
+            .SendAsync(ExecuteBody(handle, values), cancellationToken, readTimeoutMs)
             .ConfigureAwait(false);
     }
 
@@ -838,16 +870,19 @@ public sealed class DocsqlCommand : DbCommand
                 i = j;
                 continue;
             }
-            if (c == '"')
+            if (c == '"' || c == '`')
             {
                 // Quoted identifier: copy verbatim — an @-lookalike inside
-                // "some@ident" is part of the name, not a parameter.
+                // "some@ident" / `some@ident` is part of the name, not a
+                // parameter. (The server-side placeholder scanner skips the
+                // same contexts, so both scans agree.)
+                char quote = c;
                 int j = i + 1;
                 while (j < sql.Length)
                 {
-                    if (sql[j] == '"')
+                    if (sql[j] == quote)
                     {
-                        if (j + 1 < sql.Length && sql[j + 1] == '"')
+                        if (j + 1 < sql.Length && sql[j + 1] == quote)
                         {
                             j += 2;
                             continue;
@@ -968,8 +1003,17 @@ public sealed class DocsqlCommand : DbCommand
 
     private static string ErrorText(Frame f) => Encoding.UTF8.GetString(f.Payload);
 
-    internal static int DecodeAffected(byte[] payload) =>
-        payload.Length >= 8 ? BitConverter.ToInt32(payload, 0) : 0;
+    internal static int DecodeAffected(byte[] payload)
+    {
+        if (payload.Length < 8)
+        {
+            return 0;
+        }
+        // The server sends a u64 count; BitConverter.ToInt32 truncated
+        // counts above int.MaxValue into negative/garbage values.
+        ulong n = BitConverter.ToUInt64(payload, 0);
+        return n > int.MaxValue ? int.MaxValue : (int)n;
+    }
 
     /// <summary>预注册服务端 prepared statement(REQ_PREPARE,句柄按物理连接
     /// 缓存):命令首次执行即省一次注册往返。无参数命令为 no-op(不走绑定路径)。</summary>

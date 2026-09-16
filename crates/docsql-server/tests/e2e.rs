@@ -4368,6 +4368,9 @@ async fn anonymous_data_and_execute_frames_close_with_users() {
             proto::REQ_PUBLISH,
             b"{\"channel\":\"c\",\"payload\":\"x\"}".to_vec(),
         ),
+        Frame::new(proto::REQ_META, Vec::new()),
+        Frame::new(proto::REQ_LOGS, b"20".to_vec()),
+        Frame::new(proto::REQ_STATUS, Vec::new()),
     ] {
         let mut anon = Client::connect(&addr).await;
         anon.send(&frame).await;
@@ -4377,6 +4380,28 @@ async fn anonymous_data_and_execute_frames_close_with_users() {
             payload_str(&f).contains("authentication required"),
             "{}",
             payload_str(&f)
+        );
+    }
+
+    // FLAG_REPLICATION must not exempt client frames: the same anonymous
+    // socket used to execute SQL (or restore backups/freeze writes) by
+    // setting one bit on a data frame.
+    for (ft, payload) in [
+        (proto::REQ_SQL, proto::encode_sql("SELECT 1").unwrap()),
+        (proto::REQ_PROMOTE, Vec::new()),
+        (proto::REQ_BACKUP, b"{\"action\":\"list\"}".to_vec()),
+        (proto::REQ_PREPARE, proto::encode_sql("SELECT 1").unwrap()),
+    ] {
+        let mut anon = Client::connect(&addr).await;
+        let mut f = Frame::new(ft, payload);
+        f.flags = docsql_server::FLAG_REPLICATION;
+        anon.send(&f).await;
+        let resp = anon.recv().await;
+        assert_eq!(resp.frame_type, proto::RESP_ERROR, "{}", payload_str(&resp));
+        assert!(
+            payload_str(&resp).contains("authentication required"),
+            "{}",
+            payload_str(&resp)
         );
     }
 

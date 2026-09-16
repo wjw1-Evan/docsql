@@ -26,6 +26,12 @@ const INTERNAL: u8 = 2;
 /// A cell that cannot occupy at most half a page leaves no split point with
 /// both halves inside a page, so such keys are rejected up front.
 const HALF_PAGE: usize = PAGE_SIZE / 2;
+/// Maximum B+tree height. An internal node holds at least one cell, so a
+/// healthy tree never comes close (a 1 KiB key per cell still gives dozens
+/// of levels only for astronomically many rows). A corrupt page whose child
+/// pointer forms a cycle would recurse forever and overflow the stack; the
+/// depth guard turns that into a loud `Corrupt` error.
+const MAX_TREE_DEPTH: usize = 64;
 
 /// Serialized node size — `header` is 3 (leaf) or 7 (internal), `payload`
 /// the per-cell locator width (8 or 4). `scratch` is a caller-owned reuse
@@ -282,10 +288,19 @@ impl BTree {
 
     /// Exact lookup.
     pub fn get(&self, reader: &PageReader, tx: &Tx, key: &Value) -> Result<Option<u64>> {
-        Self::get_at(reader, tx, self.root, key)
+        Self::get_at(reader, tx, self.root, key, 0)
     }
 
-    fn get_at(reader: &PageReader, tx: &Tx, id: u32, key: &Value) -> Result<Option<u64>> {
+    fn get_at(
+        reader: &PageReader,
+        tx: &Tx,
+        id: u32,
+        key: &Value,
+        depth: usize,
+    ) -> Result<Option<u64>> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         match Self::read_node(reader, tx, id)? {
             // Leaves are kept sorted by cmp_values (insert uses
             // partition_point), so the first key >= `key` decides.
@@ -301,7 +316,7 @@ impl BTree {
             }
             Node::Internal { leftmost, cells } => {
                 for child in candidate_children(&cells, leftmost, key) {
-                    if let Some(v) = Self::get_at(reader, tx, child, key)? {
+                    if let Some(v) = Self::get_at(reader, tx, child, key, depth + 1)? {
                         return Ok(Some(v));
                     }
                 }
@@ -324,7 +339,7 @@ impl BTree {
             tx,
             scratch: Vec::new(),
         };
-        if let Some((mid, right)) = Self::insert_rec(&mut ctx, self.root, &key, val, unique)? {
+        if let Some((mid, right)) = Self::insert_rec(&mut ctx, self.root, &key, val, unique, 0)? {
             // Grow a new root above the split pair.
             let old_root = self.root;
             let new_root = ctx.pager.allocate_page(ctx.tx)?;
@@ -345,7 +360,11 @@ impl BTree {
         key: &Value,
         val: u64,
         unique: bool,
+        depth: usize,
     ) -> Result<Option<(Value, u32)>> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         match Self::read_node(&PageReader::current(ctx.pager), ctx.tx, id)? {
             Node::Leaf { mut cells } => {
                 // Insert after all keys <= key (rightmost of an equal run) so
@@ -384,7 +403,9 @@ impl BTree {
             } => {
                 let child = descend(&cells, leftmost, key);
                 let mut to_insert = None;
-                if let Some((mid, right)) = Self::insert_rec(ctx, child, key, val, unique)? {
+                if let Some((mid, right)) =
+                    Self::insert_rec(ctx, child, key, val, unique, depth + 1)?
+                {
                     to_insert = Some((mid, right));
                 }
                 if let Some((mid, right)) = to_insert {
@@ -455,7 +476,7 @@ impl BTree {
     ) -> Result<Vec<(Value, u64)>> {
         // Leaves are not chained in v0; walk the tree recursively.
         let mut out = Vec::new();
-        Self::scan_rec(reader, tx, self.root, max, &mut out)?;
+        Self::scan_rec(reader, tx, self.root, max, &mut out, 0)?;
         Ok(out)
     }
 
@@ -465,7 +486,11 @@ impl BTree {
         id: u32,
         max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         if max.is_some_and(|m| out.len() >= m) {
             return Ok(());
         }
@@ -479,12 +504,12 @@ impl BTree {
                 }
             }
             Node::Internal { leftmost, cells } => {
-                Self::scan_rec(reader, tx, leftmost, max, out)?;
+                Self::scan_rec(reader, tx, leftmost, max, out, depth + 1)?;
                 for (_, child) in cells {
                     if max.is_some_and(|m| out.len() >= m) {
                         break;
                     }
-                    Self::scan_rec(reader, tx, child, max, out)?;
+                    Self::scan_rec(reader, tx, child, max, out, depth + 1)?;
                 }
             }
         }
@@ -500,7 +525,7 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::scan_rev_rec(reader, tx, self.root, max, &mut out)?;
+        Self::scan_rev_rec(reader, tx, self.root, max, &mut out, 0)?;
         Ok(out)
     }
 
@@ -510,7 +535,11 @@ impl BTree {
         id: u32,
         max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         if max.is_some_and(|m| out.len() >= m) {
             return Ok(());
         }
@@ -528,9 +557,9 @@ impl BTree {
                     if max.is_some_and(|m| out.len() >= m) {
                         break;
                     }
-                    Self::scan_rev_rec(reader, tx, *child, max, out)?;
+                    Self::scan_rev_rec(reader, tx, *child, max, out, depth + 1)?;
                 }
-                Self::scan_rev_rec(reader, tx, leftmost, max, out)?;
+                Self::scan_rev_rec(reader, tx, leftmost, max, out, depth + 1)?;
             }
         }
         Ok(())
@@ -538,18 +567,22 @@ impl BTree {
 
     /// Remove a key. Returns whether it was present.
     pub fn delete(&mut self, pager: &Pager, tx: &mut Tx, key: &Value) -> Result<bool> {
-        Self::delete_rec(pager, tx, self.root, key, &|cells: &mut Vec<(
-            Value,
-            u64,
-        )>| {
-            match cells.binary_search_by(|(k, _)| Value::cmp_values(k, key)) {
+        Self::delete_rec(
+            pager,
+            tx,
+            self.root,
+            key,
+            &|cells: &mut Vec<(Value, u64)>| match cells
+                .binary_search_by(|(k, _)| Value::cmp_values(k, key))
+            {
                 Ok(i) => {
                     cells.remove(i);
                     true
                 }
                 Err(_) => false,
-            }
-        })
+            },
+            0,
+        )
     }
 
     /// Remove the exact `(key, locator)` pair. Needed for non-unique trees
@@ -562,34 +595,39 @@ impl BTree {
         key: &Value,
         loc: u64,
     ) -> Result<bool> {
-        Self::delete_rec(pager, tx, self.root, key, &|cells: &mut Vec<(
-            Value,
-            u64,
-        )>| {
-            // Cells are sorted by cmp_values (insert maintains the order;
-            // `delete` above already relies on binary search over them), so
-            // equal keys form one contiguous run: land on it with
-            // binary_search, then scan only that run for the locator — the
-            // old full-leaf scan was O(cells) on every index-entry removal.
-            match cells.binary_search_by(|(k, _)| Value::cmp_values(k, key)) {
-                Err(_) => false,
-                Ok(mut i) => {
-                    while i > 0 && Value::cmp_values(&cells[i - 1].0, key) == Ordering::Equal {
-                        i -= 1;
-                    }
-                    let mut j = i;
-                    while j < cells.len() && Value::cmp_values(&cells[j].0, key) == Ordering::Equal
-                    {
-                        if cells[j].1 == loc {
-                            cells.remove(j);
-                            return true;
+        Self::delete_rec(
+            pager,
+            tx,
+            self.root,
+            key,
+            &|cells: &mut Vec<(Value, u64)>| {
+                // Cells are sorted by cmp_values (insert maintains the order;
+                // `delete` above already relies on binary search over them), so
+                // equal keys form one contiguous run: land on it with
+                // binary_search, then scan only that run for the locator — the
+                // old full-leaf scan was O(cells) on every index-entry removal.
+                match cells.binary_search_by(|(k, _)| Value::cmp_values(k, key)) {
+                    Err(_) => false,
+                    Ok(mut i) => {
+                        while i > 0 && Value::cmp_values(&cells[i - 1].0, key) == Ordering::Equal {
+                            i -= 1;
                         }
-                        j += 1;
+                        let mut j = i;
+                        while j < cells.len()
+                            && Value::cmp_values(&cells[j].0, key) == Ordering::Equal
+                        {
+                            if cells[j].1 == loc {
+                                cells.remove(j);
+                                return true;
+                            }
+                            j += 1;
+                        }
+                        false
                     }
-                    false
                 }
-            }
-        })
+            },
+            0,
+        )
     }
 
     /// Shared recursion for the two delete shapes: the internal walk (via
@@ -601,10 +639,14 @@ impl BTree {
         id: u32,
         key: &Value,
         leaf_match: &F,
+        depth: usize,
     ) -> Result<bool>
     where
         F: Fn(&mut Vec<(Value, u64)>) -> bool,
     {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         match Self::read_node(&PageReader::current(pager), tx, id)? {
             Node::Leaf { mut cells } => {
                 if leaf_match(&mut cells) {
@@ -616,7 +658,7 @@ impl BTree {
             }
             Node::Internal { leftmost, cells } => {
                 for child in candidate_children(&cells, leftmost, key) {
-                    if Self::delete_rec(pager, tx, child, key, leaf_match)? {
+                    if Self::delete_rec(pager, tx, child, key, leaf_match, depth + 1)? {
                         return Ok(true);
                     }
                 }
@@ -663,7 +705,7 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_bounded_rec(reader, tx, self.root, lo, true, hi, max, &mut out)?;
+        Self::range_bounded_rec(reader, tx, self.root, lo, true, hi, max, &mut out, 0)?;
         Ok(out)
     }
 
@@ -679,7 +721,7 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_bounded_rec(reader, tx, self.root, lo, false, hi, max, &mut out)?;
+        Self::range_bounded_rec(reader, tx, self.root, lo, false, hi, max, &mut out, 0)?;
         Ok(out)
     }
 
@@ -713,7 +755,11 @@ impl BTree {
         hi: Option<(&Value, bool)>,
         max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         if max.is_some_and(|m| out.len() >= m) {
             return Ok(());
         }
@@ -745,7 +791,17 @@ impl BTree {
                     None => true,
                 };
                 if leftmost_upper_ge {
-                    Self::range_bounded_rec(reader, tx, leftmost, lo, lo_incl, hi, max, out)?;
+                    Self::range_bounded_rec(
+                        reader,
+                        tx,
+                        leftmost,
+                        lo,
+                        lo_incl,
+                        hi,
+                        max,
+                        out,
+                        depth + 1,
+                    )?;
                 }
                 for (i, (sep, child)) in cells.iter().enumerate() {
                     if max.is_some_and(|m| out.len() >= m) {
@@ -759,7 +815,17 @@ impl BTree {
                         None => true,
                     };
                     if upper_ge {
-                        Self::range_bounded_rec(reader, tx, *child, lo, lo_incl, hi, max, out)?;
+                        Self::range_bounded_rec(
+                            reader,
+                            tx,
+                            *child,
+                            lo,
+                            lo_incl,
+                            hi,
+                            max,
+                            out,
+                            depth + 1,
+                        )?;
                     }
                 }
             }
@@ -781,10 +847,11 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_rev_rec(reader, tx, self.root, lo, hi, max, &mut out)?;
+        Self::range_rev_rec(reader, tx, self.root, lo, hi, max, &mut out, 0)?;
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn range_rev_rec(
         reader: &PageReader,
         tx: &Tx,
@@ -793,7 +860,11 @@ impl BTree {
         hi: Option<(&Value, bool)>,
         max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
         if max.is_some_and(|m| out.len() >= m) {
             return Ok(());
         }
@@ -826,7 +897,7 @@ impl BTree {
                         if upper.is_some_and(|u| Self::below_lo(u, lo)) {
                             return Ok(());
                         }
-                        Self::range_rev_rec(reader, tx, cells[i].1, lo, hi, max, out)?;
+                        Self::range_rev_rec(reader, tx, cells[i].1, lo, hi, max, out, depth + 1)?;
                     }
                 }
                 if max.is_some_and(|m| out.len() >= m) {
@@ -836,7 +907,7 @@ impl BTree {
                 if upper.is_some_and(|u| Self::below_lo(u, lo)) {
                     return Ok(());
                 }
-                Self::range_rev_rec(reader, tx, leftmost, lo, hi, max, out)?;
+                Self::range_rev_rec(reader, tx, leftmost, lo, hi, max, out, depth + 1)?;
             }
         }
         Ok(())

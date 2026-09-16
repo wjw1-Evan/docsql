@@ -318,7 +318,20 @@ struct Sub {
 pub struct Inner {
     channels: HashMap<String, HashMap<ConnId, Sub>>,
     patterns: HashMap<String, HashMap<ConnId, Sub>>,
+    /// (channel, pattern) subscription counts per connection: O(1)
+    /// `conn_count` (the old version scanned every channel and pattern map
+    /// on every register/unregister under the global registry lock) and the
+    /// per-connection cap.
+    counts: HashMap<ConnId, (usize, usize)>,
+    /// Total live subscriptions across all connections.
+    total: usize,
 }
+
+/// Subscription limits: without them one authenticated connection could
+/// register millions of channel names (memory) or patterns (every PUBLISH
+/// then scans them all under the registry lock, stalling the write path).
+pub const MAX_SUBS_PER_CONN: usize = 4096;
+pub const MAX_SUBS_TOTAL: usize = 200_000;
 
 pub struct PubSub {
     next_conn: AtomicU64,
@@ -366,14 +379,45 @@ impl PubSub {
 
 impl Inner {
     /// Register (or replace) one subscription; returns how many
-    /// subscriptions the connection holds afterwards.
+    /// subscriptions the connection holds afterwards. Replacing an existing
+    /// (connection, name) pair does not consume a new slot.
     pub fn register(
         &mut self,
         conn: ConnId,
         kind: SubKind,
         name: &str,
         tx: mpsc::Sender<Frame>,
-    ) -> usize {
+    ) -> Result<usize, String> {
+        let already = match kind {
+            SubKind::Channel => self
+                .channels
+                .get(name)
+                .is_some_and(|m| m.contains_key(&conn)),
+            SubKind::Pattern => self
+                .patterns
+                .get(name)
+                .is_some_and(|m| m.contains_key(&conn)),
+        };
+        if !already {
+            let (held_c, held_p) = self.counts.get(&conn).copied().unwrap_or((0, 0));
+            let held = held_c + held_p;
+            if held >= MAX_SUBS_PER_CONN {
+                return Err(format!(
+                    "subscription limit reached ({MAX_SUBS_PER_CONN} per connection)"
+                ));
+            }
+            if self.total >= MAX_SUBS_TOTAL {
+                return Err(format!(
+                    "subscription limit reached ({MAX_SUBS_TOTAL} node-wide)"
+                ));
+            }
+            self.total += 1;
+            let entry = self.counts.entry(conn).or_default();
+            match kind {
+                SubKind::Channel => entry.0 += 1,
+                SubKind::Pattern => entry.1 += 1,
+            }
+        }
         let sub = Sub {
             tx,
             skip_through: i64::MAX,
@@ -383,15 +427,26 @@ impl Inner {
             SubKind::Pattern => &mut self.patterns,
         };
         map.entry(name.to_string()).or_default().insert(conn, sub);
-        self.conn_count(conn)
+        Ok(self.conn_count(conn))
     }
 
     pub fn conn_count(&self, conn: ConnId) -> usize {
-        self.channels
-            .values()
-            .chain(self.patterns.values())
-            .filter(|m| m.contains_key(&conn))
-            .count()
+        let (c, p) = self.counts.get(&conn).copied().unwrap_or((0, 0));
+        c + p
+    }
+
+    /// Drop one `(kind, conn)` subscription and keep the counters in sync.
+    fn dec(&mut self, kind: SubKind, conn: ConnId) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(entry) = self.counts.get_mut(&conn) {
+            match kind {
+                SubKind::Channel => entry.0 = entry.0.saturating_sub(1),
+                SubKind::Pattern => entry.1 = entry.1.saturating_sub(1),
+            }
+            if entry == &(0, 0) {
+                self.counts.remove(&conn);
+            }
+        }
     }
 
     /// Arm the replay dedup filter: live pushes with `id <= watermark`
@@ -409,32 +464,49 @@ impl Inner {
     /// Remove subscriptions by name (empty slice = all of that kind);
     /// returns the connection's remaining subscription count.
     pub fn unregister(&mut self, conn: ConnId, kind: SubKind, names: &[String]) -> usize {
+        let mut removed = 0usize;
         let map = match kind {
             SubKind::Channel => &mut self.channels,
             SubKind::Pattern => &mut self.patterns,
         };
         if names.is_empty() {
             for subs in map.values_mut() {
-                subs.remove(&conn);
+                if subs.remove(&conn).is_some() {
+                    removed += 1;
+                }
             }
         } else {
             for name in names {
                 if let Some(subs) = map.get_mut(name) {
-                    subs.remove(&conn);
+                    if subs.remove(&conn).is_some() {
+                        removed += 1;
+                    }
                 }
             }
         }
         map.retain(|_, subs| !subs.is_empty());
+        for _ in 0..removed {
+            self.dec(kind, conn);
+        }
         self.conn_count(conn)
     }
 
     pub fn remove_conn(&mut self, conn: ConnId) {
-        for map in [&mut self.channels, &mut self.patterns] {
-            for subs in map.values_mut() {
-                subs.remove(&conn);
+        let (mut ch, mut pat) = (0usize, 0usize);
+        for subs in self.channels.values_mut() {
+            if subs.remove(&conn).is_some() {
+                ch += 1;
             }
-            map.retain(|_, subs| !subs.is_empty());
         }
+        self.channels.retain(|_, subs| !subs.is_empty());
+        for subs in self.patterns.values_mut() {
+            if subs.remove(&conn).is_some() {
+                pat += 1;
+            }
+        }
+        self.patterns.retain(|_, subs| !subs.is_empty());
+        self.total = self.total.saturating_sub(ch + pat);
+        self.counts.remove(&conn);
     }
 
     fn notify(&mut self, channel: &str, id: i64, ts: i64, payload: &str) -> u64 {
@@ -482,21 +554,44 @@ impl Inner {
                 }
             }
         }
-        // Prune closed connections (their socket is gone).
-        if !dead_exact.is_empty() {
-            if let Some(subs) = self.channels.get_mut(channel) {
-                for conn in dead_exact {
-                    subs.remove(&conn);
+        // Prune closed connections (their socket is gone) and keep the
+        // per-connection counters in sync.
+        let mut dead_channel_conns: Vec<ConnId> = Vec::new();
+        if let Some(subs) = self.channels.get_mut(channel) {
+            for conn in dead_exact {
+                if subs.remove(&conn).is_some() {
+                    dead_channel_conns.push(conn);
                 }
             }
-            self.channels.retain(|_, subs| !subs.is_empty());
         }
+        self.channels.retain(|_, subs| !subs.is_empty());
+        for conn in dead_channel_conns {
+            self.total = self.total.saturating_sub(1);
+            if let Some(entry) = self.counts.get_mut(&conn) {
+                entry.0 = entry.0.saturating_sub(1);
+                if entry == &(0, 0) {
+                    self.counts.remove(&conn);
+                }
+            }
+        }
+        let mut dead_pattern_conns: Vec<ConnId> = Vec::new();
         for (name, conn) in dead_pattern {
             if let Some(subs) = self.patterns.get_mut(&name) {
-                subs.remove(&conn);
+                if subs.remove(&conn).is_some() {
+                    dead_pattern_conns.push(conn);
+                }
             }
         }
         self.patterns.retain(|_, subs| !subs.is_empty());
+        for conn in dead_pattern_conns {
+            self.total = self.total.saturating_sub(1);
+            if let Some(entry) = self.counts.get_mut(&conn) {
+                entry.1 = entry.1.saturating_sub(1);
+                if entry == &(0, 0) {
+                    self.counts.remove(&conn);
+                }
+            }
+        }
         reached.len() as u64
     }
 
@@ -837,14 +932,17 @@ mod tests {
         let (t2, mut r2) = tx();
         let (_t3, mut r3) = tx();
         let mut inner = ps.lock().await;
-        assert_eq!(inner.register(c1, SubKind::Channel, "news", t1), 1);
+        assert_eq!(inner.register(c1, SubKind::Channel, "news", t1).unwrap(), 1);
         // Same connection twice on the same channel replaces, not stacks.
         let (t1b, mut r1b) = tx();
-        assert_eq!(inner.register(c1, SubKind::Channel, "news", t1b), 1);
-        assert_eq!(inner.register(c2, SubKind::Channel, "news", t2), 1);
+        assert_eq!(
+            inner.register(c1, SubKind::Channel, "news", t1b).unwrap(),
+            1
+        );
+        assert_eq!(inner.register(c2, SubKind::Channel, "news", t2).unwrap(), 1);
         // c1 also matches via a pattern — still counted once.
         let (tp, _rp) = tx();
-        assert_eq!(inner.register(c1, SubKind::Pattern, "n*", tp), 2);
+        assert_eq!(inner.register(c1, SubKind::Pattern, "n*", tp).unwrap(), 2);
         // Arm the replay filters (live-only: watermark 0 passes every id).
         for (conn, kind, name) in [
             (c1, SubKind::Channel, "news"),
@@ -884,7 +982,7 @@ mod tests {
         let c1 = ps.next_conn_id();
         let (t1, mut r1) = tx();
         let mut inner = ps.lock().await;
-        inner.register(c1, SubKind::Channel, "news", t1);
+        inner.register(c1, SubKind::Channel, "news", t1).unwrap();
         // Replay arming: everything up to the watermark is a duplicate.
         inner.arm_filter(c1, SubKind::Channel, "news", 10);
         drop(inner);
@@ -904,8 +1002,8 @@ mod tests {
         let (t1, r1) = tx();
         let (t2, _r2) = tx();
         let mut inner = ps.lock().await;
-        inner.register(c1, SubKind::Channel, "news", t1);
-        inner.register(c2, SubKind::Channel, "news", t2);
+        inner.register(c1, SubKind::Channel, "news", t1).unwrap();
+        inner.register(c2, SubKind::Channel, "news", t2).unwrap();
         inner.arm_filter(c1, SubKind::Channel, "news", 0);
         inner.arm_filter(c2, SubKind::Channel, "news", 0);
         drop(inner);

@@ -27,6 +27,12 @@ internal static partial class SchemaSync
         var expectedTables = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         var expectedIndexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var expectedUniqueIndexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Index column lists (and owning table), in model order: with an
+        // explicit HasDatabaseName EF keeps the same index name when its
+        // definition changes, so a name-only check left the stale index
+        // (wrong columns / wrong uniqueness) enforced forever.
+        var expectedIndexColumns = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var expectedIndexTable = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entity in model.GetEntityTypes())
         {
             var table = entity.GetTableName();
@@ -38,12 +44,32 @@ internal static partial class SchemaSync
                 if (column is not null) columns.Add(column);
             }
             if (columns.Count == 0) continue;
-            expectedTables[table] = columns;
+            // Union, not overwrite: owned types (OwnsOne) and sibling entity
+            // types can map onto the same table, and the old assignment let
+            // one type's column set hide the other's — a property added to
+            // the owner was never detected and SyncModel never ran.
+            if (expectedTables.TryGetValue(table, out var existing))
+            {
+                existing.UnionWith(columns);
+            }
+            else
+            {
+                expectedTables[table] = columns;
+            }
             foreach (var index in entity.GetIndexes())
             {
                 if (index.GetDatabaseName() is not { } iname) continue;
                 expectedIndexes.Add(iname);
                 if (index.IsUnique) expectedUniqueIndexes.Add(iname);
+                var idxCols = new List<string>();
+                foreach (var p2 in index.Properties)
+                {
+                    var column = p2.GetColumnName(
+                        StoreObjectIdentifier.Table(table, entity.GetSchema()));
+                    if (column is not null) idxCols.Add(column);
+                }
+                expectedIndexColumns[iname] = idxCols;
+                expectedIndexTable[iname] = table;
             }
         }
         if (expectedTables.Count == 0) return true;
@@ -90,6 +116,18 @@ internal static partial class SchemaSync
             if (expectedUniqueIndexes.Contains(iname)
                 && !actual.Sql.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
                 return false;
+            // 表与列序漂移:同名索引换了表/列时 EF 视为同一索引,只有比较
+            // sqlite_master 的 SQL 才能发现(否则旧约束永远留着)。
+            if (expectedIndexTable.TryGetValue(iname, out var expectedTable)
+                && !string.Equals(actual.Table, expectedTable, StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (expectedIndexColumns.TryGetValue(iname, out var expectedCols))
+            {
+                var actualCols = ParseIndexColumns(actual.Sql);
+                if (actualCols is null
+                    || !actualCols.SequenceEqual(expectedCols, StringComparer.OrdinalIgnoreCase))
+                    return false;
+            }
         }
         // 模型已移除的 EF 命名索引是回收对象(SyncIndexes 只回收模型表上的
         // IX_ 前缀):留在库里即需要整场同步回收。
@@ -101,5 +139,19 @@ internal static partial class SchemaSync
                 return false;
         }
         return true;
+    }
+
+    /// <summary>Extract the column list from a `CREATE INDEX ... (a, b)` SQL
+    /// text, in order; null when the shape is unexpected.</summary>
+    private static List<string>? ParseIndexColumns(string sql)
+    {
+        int open = sql.LastIndexOf('(');
+        int close = sql.LastIndexOf(')');
+        if (open < 0 || close <= open) return null;
+        return sql[(open + 1)..close]
+            .Split(',')
+            .Select(c => c.Trim().Trim('"', '`').Trim())
+            .Where(c => c.Length > 0)
+            .ToList();
     }
 }

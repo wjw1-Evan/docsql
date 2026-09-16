@@ -22,11 +22,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const MIN_PASSWORD_LEN: usize = 8;
-/// PBKDF2 iterations — kept in step with the server's database-user
-/// hashing (`docsql_core::kdf::PBKDF2_ITERATIONS`); runs at login on the
-/// blocking pool, so a human-facing latency of tens of milliseconds is
-/// the ceiling.
-pub const PBKDF2_ITERATIONS: u32 = docsql_core::kdf::PBKDF2_ITERATIONS;
+/// PBKDF2 iterations for NEW credentials. The env-tunable value (default
+/// `docsql_core::kdf::PBKDF2_ITERATIONS`, lowerable via
+/// `DOCSQL_PBKDF2_ITERATIONS`) — test suites set it low so the auth path
+/// stays fast and the lockout window stays meaningful under
+/// instrumentation. Stored credentials carry their own count.
+pub fn pbkdf2_iterations() -> u32 {
+    docsql_core::kdf::iterations_for_new_credentials()
+}
 /// Login lockout, mirroring the server's REQ_AUTH behavior.
 pub const LOCK_THRESHOLD: usize = 10;
 pub const LOCK_WINDOW: Duration = Duration::from_secs(60);
@@ -103,30 +106,25 @@ impl AuthStore {
         let creds = Creds {
             username: username.to_string(),
             salt,
-            iterations: PBKDF2_ITERATIONS,
-            hash: derive_hash(password, &salt, PBKDF2_ITERATIONS),
+            iterations: pbkdf2_iterations(),
+            hash: derive_hash(password, &salt, pbkdf2_iterations()),
         };
         self.write(&creds).map_err(SetupError::Io)?;
         self.creds = Some(creds.clone());
         Ok(creds)
     }
 
+    /// Snapshot the stored credentials so callers can verify off-lock (the
+    /// PBKDF2 derivation must not run under the store mutex).
+    pub fn creds_snapshot(&self) -> Option<Creds> {
+        self.creds.clone()
+    }
+
     pub fn verify(&self, username: &str, password: &str) -> bool {
         let Some(creds) = &self.creds else {
             return false;
         };
-        // Constant-time compare via the same helper as the server's token
-        // check; username mismatch fails without deriving (the username is
-        // not secret, the response shape must not leak which one was wrong
-        // though — one generic error at the handler).
-        if !constant_time_eq(username.trim().as_bytes(), creds.username.as_bytes()) {
-            // Still burn a derivation so timing does not reveal that the
-            // username was the wrong part.
-            derive_hash(password, &creds.salt, creds.iterations);
-            return false;
-        }
-        let candidate = derive_hash(password, &creds.salt, creds.iterations);
-        constant_time_eq(&candidate, &creds.hash)
+        verify_creds(creds, username, password)
     }
 
     /// Change the account's username and/or password. The caller must prove
@@ -161,11 +159,12 @@ impl AuthStore {
                 // Fresh salt on re-key: the stored hash never rests on a
                 // (password, salt) pair an attacker may already hold.
                 let salt = random_salt();
+                let iterations = pbkdf2_iterations();
                 Creds {
                     username: new_username.to_string(),
                     salt,
-                    iterations: PBKDF2_ITERATIONS,
-                    hash: derive_hash(pw, &salt, PBKDF2_ITERATIONS),
+                    iterations,
+                    hash: derive_hash(pw, &salt, iterations),
                 }
             }
             None => Creds {
@@ -190,10 +189,14 @@ impl AuthStore {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        // Create with 0600 from the start: write-then-chmod leaves a
-        // world-readable window on the password hash, and a chmod that
-        // fails silently (non-chmod-able volume) would keep it readable
-        // forever — surface that failure instead.
+        // Atomic replace: write a sibling temp file with 0600 from the
+        // start, fsync it, then rename over the target. The old truncate-in-
+        // place write could leave an empty/partial file after a crash
+        // (AuthStore::open refuses to start on a corrupt file), bricking the
+        // console until an operator repairs the volume. Write-then-chmod is
+        // also avoided: it leaves a world-readable window on the hash.
+        let tmp = self.path.with_extension("tmp");
+        let bytes = serde_json::to_vec(&doc).map_err(|e| format!("encode creds: {e}"))?;
         #[cfg(unix)]
         {
             use std::io::Write;
@@ -203,14 +206,32 @@ impl AuthStore {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&self.path)
-                .map_err(|e| format!("cannot open {}: {e}", self.path.display()))?;
-            f.write_all(serde_json::to_vec(&doc).unwrap().as_slice())
-                .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
+                .open(&tmp)
+                .map_err(|e| format!("cannot open {}: {e}", tmp.display()))?;
+            f.write_all(&bytes)
+                .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+            f.sync_all()
+                .map_err(|e| format!("cannot sync {}: {e}", tmp.display()))?;
         }
         #[cfg(not(unix))]
-        std::fs::write(&self.path, serde_json::to_vec(&doc).unwrap())
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
+        {
+            std::fs::write(&tmp, &bytes)
+                .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
+            format!(
+                "cannot replace {} with {}: {e}",
+                self.path.display(),
+                tmp.display()
+            )
+        })?;
+        // Make the rename itself durable (best effort: some volumes refuse
+        // directory fsync; the rename is still atomic without it).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -254,7 +275,12 @@ fn parse_creds(bytes: &[u8]) -> Result<Creds, String> {
     let hash: [u8; 32] = hash
         .try_into()
         .map_err(|_| "corrupt credential file: hash len")?;
-    let iterations = v["iterations"].as_u64().unwrap_or(PBKDF2_ITERATIONS as u64) as u32;
+    // Missing count (hand-written file) defaults to the built-in default,
+    // not the env override: a stored entry's count is the one it was
+    // hashed with.
+    let iterations = v["iterations"]
+        .as_u64()
+        .unwrap_or(docsql_core::kdf::PBKDF2_ITERATIONS as u64) as u32;
     // A hand-edited 0 would hit pbkdf2_hmac_sha256's assert and panic the
     // login handler on every attempt; an astronomic value would turn each
     // login into a CPU burn — both are corrupt like any other tampering.
@@ -315,6 +341,18 @@ pub fn derive_hash(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations, &mut out);
     out
+}
+
+/// Verify a password against a credential snapshot. Constant-time compare
+/// via the same helper as the server's token check; a username mismatch
+/// still burns a derivation so timing does not reveal which part was wrong.
+pub fn verify_creds(creds: &Creds, username: &str, password: &str) -> bool {
+    if !constant_time_eq(username.trim().as_bytes(), creds.username.as_bytes()) {
+        derive_hash(password, &creds.salt, creds.iterations);
+        return false;
+    }
+    let candidate = derive_hash(password, &creds.salt, creds.iterations);
+    constant_time_eq(&candidate, &creds.hash)
 }
 
 fn random_salt() -> [u8; 16] {
@@ -541,7 +579,7 @@ mod tests {
             .into_bytes();
         assert_eq!(
             parse_creds(&no_iters).unwrap().iterations,
-            PBKDF2_ITERATIONS
+            docsql_core::kdf::PBKDF2_ITERATIONS
         );
         // A hand-edited 0 would panic the login handler downstream — refused.
         assert!(parse_creds(&creds("admin", &salt_hex, &hash_hex, json!(0))).is_err());

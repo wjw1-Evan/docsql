@@ -92,6 +92,15 @@ pub struct ServerState {
     /// the blocking pool, and unbounded concurrent derivations would let
     /// distributed auth floods starve every other blocking task.
     pub auth_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Per-origin serialization of sequenced replication applies. Two
+    /// in-flight writes from one origin (its first attempt timed out while
+    /// this node waited for a client transaction, then it sent the next)
+    /// could otherwise apply out of order once the transaction closes:
+    /// the older row image overwrites the newer one and the position jumps
+    /// to the newer seq, hiding the divergence until a restart.
+    pub apply_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
     /// Live connection budget (resource control). Acquired per accepted
     /// connection, released on close; None = unlimited.
     pub conn_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -190,11 +199,30 @@ pub struct ServerState {
 pub struct TxPending {
     pub writes: Vec<String>,
     marks: Vec<(String, usize)>,
+    bytes: usize,
 }
+
+/// Transaction buffer bounds: an authenticated connection could otherwise
+/// BEGIN and push writes forever (each buffered statement string retained
+/// until COMMIT) — a cheap OOM/hold-the-writer DoS.
+const MAX_TX_PENDING_WRITES: usize = 200_000;
+const MAX_TX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 impl TxPending {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Room for one more buffered statement?
+    pub fn check_room(&self, len: usize) -> bool {
+        self.writes.len() < MAX_TX_PENDING_WRITES
+            && self.bytes.saturating_add(len) <= MAX_TX_PENDING_BYTES
+    }
+
+    /// Buffer one write (the caller checked `check_room` first).
+    pub fn push(&mut self, sql: String) {
+        self.bytes = self.bytes.saturating_add(sql.len());
+        self.writes.push(sql);
     }
 
     /// SAVEPOINT name: remember the buffer length to roll back to.
@@ -208,6 +236,7 @@ impl TxPending {
             let (_, len) = self.marks[pos].clone();
             self.writes.truncate(len);
             self.marks.truncate(pos);
+            self.bytes = self.writes.iter().map(|w| w.len()).sum();
         }
     }
 
@@ -221,6 +250,7 @@ impl TxPending {
     pub fn clear(&mut self) {
         self.writes.clear();
         self.marks.clear();
+        self.bytes = 0;
     }
 }
 
@@ -443,6 +473,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         replicate_to: tokio::sync::Mutex::new(cfg.replicate_to),
         peers: tokio::sync::Mutex::new(peers),
         tx_pending: tokio::sync::Mutex::new(TxPending::new()),
+        apply_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         tx_owner: std::sync::Mutex::new(None),
         write_order: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         holds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -607,6 +638,22 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             }
         });
     }
+}
+
+/// Frame types spoken only by cluster nodes (sequenced writes, catch-up,
+/// digests, join sync/hold). In the token-less compatibility mode these stay
+/// answerable without credentials — the documented legacy contract — while
+/// client-facing frames close once users exist.
+fn is_node_frame(frame_type: u16) -> bool {
+    matches!(
+        frame_type,
+        proto::REQ_SQL_SEQ
+            | proto::REQ_CATCHUP
+            | proto::REQ_DIGEST
+            | proto::REQ_SYNC
+            | proto::REQ_HOLD
+            | proto::REQ_RELEASE
+    )
 }
 
 /// Resolve when the process is asked to terminate (SIGTERM / SIGINT).
@@ -1073,6 +1120,20 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 }
             }
             let authed = matches!(role, ConnRole::Client | ConnRole::Peer | ConnRole::ReadOnly);
+            // Trustworthy replication bit: a flag is not a credential. With a
+            // cluster token only Peer connections qualify; without one
+            // (legacy mode) a client-token connection, or a token-less and
+            // user-less deployment, may replicate. A user login or read-only
+            // token setting the bit used to skip the replica read-only gate,
+            // the system-table guard and the transaction-owner gate.
+            let replication_ok = frame.flags & FLAG_REPLICATION != 0
+                && (role == ConnRole::Peer
+                    || (state.cluster_token.is_none()
+                        && (token_authed
+                            || (state.auth_token.is_none()
+                                && !state
+                                    .has_users
+                                    .load(std::sync::atomic::Ordering::SeqCst)))));
             // Least-privilege gate: a read-only-token connection may read
             // and subscribe, but every durable write is refused here so
             // no handler can accidentally apply one.
@@ -1084,13 +1145,23 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 } else {
                     None
                 };
+                // Transaction control is state-changing too: BEGIN opens the
+                // single global transaction (blocking every other writer),
+                // SAVEPOINT deep-copies the whole database. A read-only
+                // token must not be able to start either.
+                let tx_control = |sql: &str| {
+                    docsql_core::engine::Database::parse_classified(sql)
+                        .map(|p| !matches!(p.tx, docsql_core::engine::TxControl::None))
+                        .unwrap_or(true)
+                };
                 let writes = frame.frame_type == proto::REQ_PUBLISH
                     || frame.frame_type == proto::REQ_PROMOTE
                     || sub.as_deref() == Some("trim")
-                    || (frame.frame_type == proto::REQ_SQL
-                        && docsql_core::engine::Database::is_write_statement(
-                            &proto::decode_sql(&frame.payload).unwrap_or_default(),
-                        ))
+                    || (frame.frame_type == proto::REQ_SQL && {
+                        let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
+                        docsql_core::engine::Database::is_write_statement(&sql)
+                            || tx_control(&sql)
+                    })
                     || (frame.frame_type == proto::REQ_EXECUTE && {
                         // The prepared template decides the statement kind —
                         // bound params cannot turn a SELECT into a write.
@@ -1103,6 +1174,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             .and_then(|h| prepared.get(&h))
                             .is_some_and(|tpl| {
                                 docsql_core::engine::Database::is_write_statement(tpl)
+                                    || tx_control(tpl)
                             })
                     });
                 if writes {
@@ -1137,26 +1209,41 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 user_epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
             }
             // Once at least one database user exists, legacy anonymous
-            // (token-less) access closes: data operations then require the
-            // client token (admin) or a REQ_AUTH_USER login. FLAG_REPLICATION
-            // frames stay exempt in the token-less compatibility mode —
-            // node-to-node fanout and join legitimately speak them with a
-            // vacuous AUTH — but REQ_EXECUTE has no replication meaning and
-            // used to be reachable by anonymous connections purely because
-            // it was missing from this list.
+            // (token-less) access closes: every client-facing data frame
+            // then requires the client token (admin) or a REQ_AUTH_USER
+            // login. The replication channel (node-only frames below) stays
+            // answerable to token-less peers — the documented compatibility
+            // mode when no cluster token is configured — but a flagged
+            // REQ_SQL/REQ_EXECUTE is *not* replication (see `replication_ok`
+            // below): the old version exempted anything carrying
+            // FLAG_REPLICATION and omitted META/STATUS/LOGS/PREPARE/
+            // SUBSCRIBE, so one bit let an anonymous socket execute SQL,
+            // dump the database, freeze writes or restore backups.
+            // A flagged REQ_STATUS is the peer status probe (compat-mode joins
+            // need it before any token exists); an unflagged one is a client
+            // asking for topology and stays gated.
+            let peer_probe = frame.frame_type == proto::REQ_STATUS
+                && frame.flags & FLAG_REPLICATION != 0;
             if role == ConnRole::Client
                 && !token_authed
                 && user.is_none()
                 && !anon_open
-                && frame.flags & FLAG_REPLICATION == 0
+                && !peer_probe
+                && !is_node_frame(frame.frame_type)
                 && matches!(
                     frame.frame_type,
                     proto::REQ_SQL
                         | proto::REQ_EXECUTE
+                        | proto::REQ_PREPARE
                         | proto::REQ_PUBLISH
                         | proto::REQ_PUBSUB
                         | proto::REQ_PROMOTE
                         | proto::REQ_BACKUP
+                        | proto::REQ_META
+                        | proto::REQ_STATUS
+                        | proto::REQ_LOGS
+                        | proto::REQ_SUBSCRIBE
+                        | proto::REQ_PSUBSCRIBE
                 )
             {
                 let _ = tx
@@ -1307,7 +1394,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // Topology, paths and journal windows are node-operational
                     // detail: user logins need the admin role for it (token
                     // connections are the operator's own credential).
-                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                    if role == ConnRole::ReadOnly
+                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    {
                         Some(Frame::new(
                             proto::RESP_ERROR,
                             err_payload("cluster status requires the admin role"),
@@ -1324,7 +1413,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // The statement audit log carries other users' data
                     // values (only PASSWORD literals are redacted): same
                     // admin rule as reading the user tables.
-                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                    if role == ConnRole::ReadOnly
+                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    {
                         Some(Frame::new(
                             proto::RESP_ERROR,
                             err_payload("the audit log requires the admin role"),
@@ -1344,7 +1435,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // Full catalog shape (tables, columns, row counts, paths):
                     // admin-only for user logins, same boundary as the audit
                     // log above.
-                    if user.as_ref().is_some_and(|u| !u.grants.admin) {
+                    if role == ConnRole::ReadOnly
+                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    {
                         Some(Frame::new(
                             proto::RESP_ERROR,
                             err_payload("catalog metadata requires the admin role"),
@@ -1388,7 +1481,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             // reject; rewritten statements execute with the
                             // system-table gate open. Replication frames are
                             // never rewritten.
-                            let is_replication = frame.flags & FLAG_REPLICATION != 0;
+                            // Replication semantics require a node-credentialed
+                            // connection, not merely the flag (see
+                            // `replication_ok` above).
+                            let is_replication = replication_ok;
                             // Join intake: while bootstrapping, replication
                             // writes queue and are acknowledged on the spot
                             // (see ServerState::sync_queue); they replay
@@ -1558,11 +1654,19 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                         .and_then(|v| v.as_array())
                         .map(|a| a.iter().map(json_param_to_value).collect())
                         .unwrap_or_default();
-                    let rendered = handle
-                        .and_then(|h| prepared.get(&h))
-                        .map(|tpl| bind_params(tpl, &params));
+                    // Audit/log text keeps the `?` template: rendering the
+                    // bound values into the statement log stored application
+                    // secrets (tokens, API keys) in cleartext. Execution still
+                    // uses the rendered statement.
+                    let (rendered, log_sql) = match handle.and_then(|h| prepared.get(&h)) {
+                        Some(tpl) => (
+                            bind_params(tpl, &params),
+                            format!("{tpl}  [{} bound parameter(s)]", params.len()),
+                        ),
+                        None => (Err("execute: unknown statement handle".to_string()), String::new()),
+                    };
                     match rendered {
-                        Some(Ok(sql)) => {
+                        Ok(sql) => {
                             let started = std::time::Instant::now();
                             let deadline = state
                                 .statement_timeout
@@ -1592,7 +1696,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                 querylog::record(
                                     &state,
                                     &peer,
-                                    &sql,
+                                    &log_sql,
                                     started.elapsed().as_secs_f64() * 1000.0,
                                     &resp,
                                     false,
@@ -1600,11 +1704,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             }
                             Some(resp)
                         }
-                        Some(Err(e)) => Some(Frame::new(proto::RESP_ERROR, err_payload(&e))),
-                        None => Some(Frame::new(
-                            proto::RESP_ERROR,
-                            err_payload("execute: unknown statement handle"),
-                        )),
+                        Err(e) => Some(Frame::new(proto::RESP_ERROR, err_payload(&e))),
                     }
                 }
                 proto::REQ_CLOSE_STMT if authed => {
@@ -1650,6 +1750,36 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                 // Audited later by the drain replay.
                                 Some(f) => Some(f),
                                 None => {
+                                    // Serialize per origin and skip frames the
+                                    // position already covers: out-of-order
+                                    // applies must never overwrite newer rows,
+                                    // and a retried frame must be idempotent.
+                                    let origin_lock = {
+                                        let mut locks = state.apply_locks.lock().await;
+                                        locks
+                                            .entry(node_id.clone())
+                                            .or_insert_with(|| {
+                                                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                                            })
+                                            .clone()
+                                    };
+                                    let _origin_guard = origin_lock.lock_owned().await;
+                                    let already_applied = {
+                                        let mut db = state
+                                            .db
+                                            .write()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        db.position_get(&node_id)
+                                            .ok()
+                                            .flatten()
+                                            .is_some_and(|pos| pos >= seq)
+                                    };
+                                    if already_applied {
+                                        Some(Frame::new(
+                                            proto::RESP_AFFECTED,
+                                            0u64.to_le_bytes().to_vec(),
+                                        ))
+                                    } else {
                                     let started = std::time::Instant::now();
                                     let resp = execute_sql(
                                         &state,
@@ -1673,6 +1803,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         true,
                                     );
                                     Some(resp)
+                                    }
                                 }
                             }
                         }
@@ -1701,7 +1832,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             .metrics
                             .publishes_total
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Some(handle_publish(&state, &frame).await)
+                        Some(handle_publish(&state, &frame, replication_ok).await)
                     }
                 }
                 proto::REQ_SUBSCRIBE if authed => {
@@ -1719,7 +1850,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     handle_unsubscribe(&state, conn_id, &frame, pubsub::SubKind::Pattern).await,
                 ),
                 proto::REQ_PUBSUB if authed => {
-                    Some(handle_pubsub_cmd(&state, &frame, user.as_ref()).await)
+                    Some(handle_pubsub_cmd(&state, &frame, user.as_ref(), replication_ok).await)
                 }
                 proto::REQ_BACKUP if authed => {
                     Some(backup::handle_backup(&state, role, &frame, user.as_ref()).await)
@@ -1772,7 +1903,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
             {
                 let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                 if db.in_transaction() {
-                    let _ = db.execute("ROLLBACK");
+                    rollback_or_abort(&mut db);
                 }
             }
             state.tx_pending.lock().await.clear();
@@ -1871,12 +2002,49 @@ fn bind_params(sql: &str, params: &[Value]) -> Result<String, String> {
     let bytes = sql.as_bytes();
     while i < bytes.len() {
         match bytes[i] {
-            // Literals are copied verbatim: a `?` inside one is data, not a
-            // placeholder.
+            // Literals/identifiers/comments are copied verbatim: a `?` inside
+            // one is data, not a placeholder. Skipping only single quotes
+            // made `SELECT "ready?"` or `-- ?` misbind.
             b'\'' => {
                 let (end, _) = docsql_core::stmt::sql_literal_end(sql, i);
                 out.push_str(&sql[i..end]);
                 i = end;
+            }
+            b'"' | b'`' => {
+                let quote = bytes[i];
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
             }
             b'?' => {
                 let Some(p) = params.get(next) else {
@@ -1965,10 +2133,21 @@ fn outcome_frame<E: std::fmt::Display>(outcome: std::result::Result<ExecOutcome,
                 "rows".into(),
                 Value::Array(r.rows.into_iter().map(Value::Array).collect()),
             );
-            Frame::new(
-                proto::RESP_ROWS,
-                docsql_core::json::to_string(&Value::Object(obj)).into_bytes(),
-            )
+            let payload = docsql_core::json::to_string(&Value::Object(obj)).into_bytes();
+            // The protocol and every client cap a frame at 64 MiB. Serializing
+            // past it used to emit a frame the client rejects as malformed —
+            // the connection then sat with an unread payload. Refuse with an
+            // actionable error instead of a protocol failure.
+            if payload.len() > 64 * 1024 * 1024 {
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload(
+                        "result set too large for one response (>64 MiB); \
+                         add LIMIT/OFFSET or select fewer columns",
+                    ),
+                );
+            }
+            Frame::new(proto::RESP_ROWS, payload)
         }
         Ok(ExecOutcome::Affected(n)) => Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec()),
         Err(e) => Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
@@ -2341,6 +2520,18 @@ async fn execute_sql_inner(
     // owner does not own — merging into the open transaction would let its
     // ROLLBACK silently drop a write that was already acknowledged to the
     // client. The deadline bounds both queues.
+    // Transaction buffer bound, checked BEFORE executing: an over-budget
+    // transaction must not apply a write locally and then fail to buffer it
+    // (peers would never see a write this node reported as applied).
+    if !is_replication && is_write && conn.is_some() {
+        let owned = *state.tx_owner.lock().unwrap() == conn;
+        if owned && !state.tx_pending.lock().await.check_room(sql.len()) {
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload("transaction buffer exceeded; COMMIT or ROLLBACK first"),
+            );
+        }
+    }
     let queues = !is_replication && matches!(tx_kind, TxControl::Begin);
     let deadline = tokio::time::Instant::now() + BEGIN_QUEUE_WAIT;
     // Journaling needs a fan-out target: a node without peers or upstream
@@ -2352,7 +2543,13 @@ async fn execute_sql_inner(
         && matches!(tx_kind, TxControl::None)
         && (!state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some());
     let (outcome, in_tx, _order_guard, resolved, journal_seq) = loop {
-        let foreign_tx = is_write && *state.tx_owner.lock().unwrap() != conn;
+        // Plain reads wait out a foreign transaction too: the engine applies
+        // a transaction's statements to the in-memory tables immediately, so
+        // reading while another connection holds BEGIN served uncommitted
+        // rows (a dirty read that a later ROLLBACK made vanish). Same-owner
+        // reads must pass — they see their own writes by design.
+        let plain_read = !is_write && matches!(tx_kind, TxControl::None);
+        let foreign_tx = (is_write || plain_read) && *state.tx_owner.lock().unwrap() != conn;
         if queues || foreign_tx {
             wait_engine_tx_free(state, deadline).await;
         }
@@ -2514,19 +2711,32 @@ async fn execute_sql_inner(
     // open transaction buffer until COMMIT (ROLLBACK discards them), so peers
     // never observe writes this node later undoes. COMMIT/EXEC drain the
     // buffer in execution order, mixing SQL and KV writes alike.
+    if !is_replication {
+        // Commit/rollback release the owner and buffer even when the
+        // statement failed: the engine discards its snapshot before the WAL
+        // fsync, so a kept owner would make the next COMMIT error with "no
+        // transaction in progress" while tx_pending could never drain —
+        // every later write then queues behind a transaction that no longer
+        // exists. A failed COMMIT clears the buffer without draining (the
+        // writes were never durably committed, so peers must not see them).
+        if matches!(tx_kind, TxControl::Commit) {
+            *state.tx_owner.lock().unwrap() = None;
+            if outcome.is_ok() {
+                drain_tx_pending(state).await;
+            } else {
+                state.tx_pending.lock().await.clear();
+            }
+        } else if matches!(tx_kind, TxControl::Rollback { savepoint: None }) {
+            *state.tx_owner.lock().unwrap() = None;
+            state.tx_pending.lock().await.clear();
+        }
+    }
     if !is_replication && outcome.is_ok() {
         match tx_kind {
             TxControl::Begin => {
                 *state.tx_owner.lock().unwrap() = conn;
             }
-            TxControl::Commit => {
-                *state.tx_owner.lock().unwrap() = None;
-                drain_tx_pending(state).await
-            }
-            TxControl::Rollback { savepoint: None } => {
-                *state.tx_owner.lock().unwrap() = None;
-                state.tx_pending.lock().await.clear()
-            }
+            TxControl::Commit | TxControl::Rollback { savepoint: None } => {}
             TxControl::Rollback {
                 savepoint: Some(name),
             } => state.tx_pending.lock().await.rollback_to(&name),
@@ -2540,12 +2750,7 @@ async fn execute_sql_inner(
                 // statement's write unit above (same fsync).
                 let forward = resolved.as_deref().unwrap_or(sql);
                 if in_tx {
-                    state
-                        .tx_pending
-                        .lock()
-                        .await
-                        .writes
-                        .push(forward.to_string());
+                    state.tx_pending.lock().await.push(forward.to_string());
                 } else {
                     forward_sql_all(state, forward, journal_seq).await;
                 }
@@ -2931,8 +3136,7 @@ async fn lock_engine_for_write(
 /// fsync unless DOCSQL_ASYNC_COMMIT), then push to local subscribers,
 /// then replicate to the peers so their stores and subscribers get it.
 /// Responds RESP_ROWS with columns [id, receivers].
-async fn handle_publish(state: &Arc<ServerState>, frame: &Frame) -> Frame {
-    let is_replication = frame.flags & FLAG_REPLICATION != 0;
+async fn handle_publish(state: &Arc<ServerState>, frame: &Frame, is_replication: bool) -> Frame {
     let v: serde_json::Value = match serde_json::from_slice(&frame.payload) {
         Ok(v) => v,
         Err(e) => {
@@ -3059,7 +3263,14 @@ async fn handle_subscribe(
         }
     };
     let mut inner = state.pubsub.lock().await;
-    let count = inner.register(conn, kind, &name, tx.clone());
+    let count = match inner.register(conn, kind, &name, tx.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            drop(inner);
+            let _ = tx.send(err(e)).await;
+            return;
+        }
+    };
     // Watermark under the same registry hold: publishes committing after
     // this point notify this subscription live with id > watermark;
     // earlier ones are covered by the replay below.
@@ -3177,8 +3388,8 @@ async fn handle_pubsub_cmd(
     state: &Arc<ServerState>,
     frame: &Frame,
     user: Option<&UserAuth>,
+    is_replication: bool,
 ) -> Frame {
-    let is_replication = frame.flags & FLAG_REPLICATION != 0;
     let v: serde_json::Value = match serde_json::from_slice(&frame.payload) {
         Ok(v) => v,
         Err(e) => {
@@ -3490,15 +3701,19 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
     }
     // Bound the write-path acquisition: two nodes serving joins for each
     // other would otherwise queue indefinitely; 5s keeps the stall visible
-    // and bounded, the joiner simply retries.
-    let order =
-        match tokio::time::timeout(SYNC_HOLD_TIMEOUT, state.write_order.clone().lock_owned()).await
-        {
-            Ok(g) => g,
-            Err(_) => {
-                return abort("sync: write path busy; retry later".into()).await;
-            }
-        };
+    // and bounded, the joiner simply retries. `lock_engine_for_write` (not
+    // a bare write_order lock) also waits out an open client transaction:
+    // its uncommitted rows live in the in-memory tables and would otherwise
+    // be serialized into the snapshot (and later vanish on ROLLBACK).
+    let order = match tokio::time::timeout(SYNC_HOLD_TIMEOUT, lock_engine_for_write(state)).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return abort("sync: write path busy; retry later".into()).await;
+        }
+        Err(_) => {
+            return abort("sync: write path busy; retry later".into()).await;
+        }
+    };
     let mut targets = state.peers.lock().await.clone();
     targets.sort();
     // Clear hold remnants of OUR prior attempts first: a REQ_HOLD whose
@@ -3776,6 +3991,18 @@ async fn handle_release(state: &Arc<ServerState>, frame: &Frame) -> Frame {
 /// answering holds its writes for the O(data) hashing — a startup-time
 /// cost, same class as serving a join dump.
 async fn handle_digest(state: &Arc<ServerState>) -> Frame {
+    // Same transaction quiesce as the dump: a digest that includes another
+    // connection's uncommitted rows can win a repair election and become
+    // the reference, or report convergence while the peer is only mid-tx.
+    let _order = match tokio::time::timeout(SYNC_HOLD_TIMEOUT, lock_engine_for_write(state)).await {
+        Ok(Some(g)) => g,
+        Ok(None) | Err(_) => {
+            return Frame::new(
+                proto::RESP_ERROR,
+                err_payload("digest: write path busy; retry later"),
+            );
+        }
+    };
     let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
     match db.digests() {
         Ok(list) => match serde_json::to_vec(&list) {
@@ -3836,6 +4063,21 @@ async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<S
     tokio::time::timeout(SYNC_ATTEMPT_TIMEOUT, attempt).await?
 }
 
+/// Roll an explicit transaction back, verifying it actually closed. A
+/// silently failed ROLLBACK leaves the global transaction open with no
+/// owner: every later client write waits out the 30s queue window and
+/// fails until restart. Refuse to limp in that state.
+fn rollback_or_abort(db: &mut docsql_core::engine::Database) {
+    let _ = db.execute("ROLLBACK");
+    if db.in_transaction() {
+        eprintln!(
+            "fatal: transaction could not be rolled back (I/O failure?); \
+             aborting instead of wedging every future write"
+        );
+        std::process::abort();
+    }
+}
+
 /// Replay the dump exactly like the join protocol prescribes: under the
 /// write path, only when still fresh, inside one transaction (a failure
 /// rolls back and leaves the node fresh for the next attempt). On success
@@ -3861,11 +4103,11 @@ async fn apply_sync(
         }
         let batch = db.execute_batch(script);
         if let Some(err) = batch.error {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("statement {}: {}", err.statement, err.message));
         }
         if let Err(e) = db.execute("COMMIT") {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("COMMIT: {e}"));
         }
     }
@@ -4100,7 +4342,16 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
         return;
     }
     let mut last_err = String::from("no peer answered");
-    for _round in 0..SYNC_ROUNDS {
+    // Once a peer is seen holding data, "serving fresh" is no longer a safe
+    // conclusion: an empty node would accept client writes while the data
+    // holders exist, and the user set never converges. Keep retrying (the
+    // sync gate stays open, so client writes queue within its budget)
+    // instead of giving up; only a mesh where no peer ever answered may
+    // conclude "serve fresh" after the rounds.
+    let mut ever_saw_data = false;
+    let mut round = 0usize;
+    loop {
+        round += 1;
         let mut saw_data = false;
         let mut saw_empty = false;
         let mut heads: Vec<(String, u64)> = Vec::new();
@@ -4151,6 +4402,60 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                 Some("born-empty cluster".into()),
             );
             return;
+        }
+        if saw_data {
+            ever_saw_data = true;
+        }
+        if round >= SYNC_ROUNDS {
+            if ever_saw_data {
+                // Local client writes may have arrived while the peer probe
+                // was retrying (SQL is never gated — only the snapshot is).
+                // If this node now holds data, it is no longer a joiner:
+                // serve and let fan-out (plus the peer's own rejoin repair)
+                // converge the mesh — retrying a snapshot would wipe the
+                // writes this node just acknowledged.
+                let local_has_data = {
+                    let db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                    has_user_tables(&db)
+                };
+                if local_has_data {
+                    eprintln!(
+                        "bootstrap sync: local writes arrived while peers hold data; \
+                         serving (fan-out keeps the mesh converged)"
+                    );
+                    drain_sync_queue(&state, false).await;
+                    querylog::sync_event(
+                        &state.sync_log,
+                        "bootstrap",
+                        "",
+                        None,
+                        false,
+                        Some("local data arrived during bootstrap".into()),
+                    );
+                    return;
+                }
+                // Data exists somewhere but no transfer succeeded: serving
+                // fresh would silently join an empty node into a live mesh.
+                // Retry with a slower cadence; the open gate queues client
+                // writes (bounded) and their errors say "joining" rather
+                // than accepting data a later snapshot would wipe.
+                eprintln!(
+                    "bootstrap sync: peers hold data but the join keeps failing \
+                     ({last_err}); still retrying — this node is NOT serving yet"
+                );
+                querylog::sync_event(
+                    &state.sync_log,
+                    "bootstrap",
+                    "",
+                    None,
+                    false,
+                    Some(format!("join failing, still retrying: {last_err}")),
+                );
+                round = 0;
+                tokio::time::sleep(SYNC_RETRY_DELAY * 10).await;
+                continue;
+            }
+            break;
         }
         tokio::time::sleep(SYNC_RETRY_DELAY).await;
     }
@@ -4425,7 +4730,7 @@ pub(crate) async fn catchup_plan(
             let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             db.position_get(&node_id).ok().flatten()
         }?;
-        if pos > head || pos + 1 < oldest {
+        if pos > head || pos.saturating_add(1) < oldest {
             return None;
         }
         if head > pos {
@@ -4517,33 +4822,14 @@ enum RepairDecision {
     Pull(String),
 }
 
-/// Election ordering key for one state: more rows first (a richer state
-/// beats a sparser one — the common rejoin shape is a node that is
-/// simply behind), ties by the serialized digests so every node computes
-/// the same order without comparing addresses across namespaces.
-fn digest_state_key(digests: &[TableDigest]) -> (u64, Vec<u8>) {
-    (
-        digests.iter().map(|t| t.rows).sum(),
-        serde_json::to_vec(digests).unwrap_or_default(),
-    )
-}
-
-/// `true` when `candidate` outranks `incumbent` under the election key.
-fn state_key_better(candidate: &(u64, Vec<u8>), incumbent: &(u64, Vec<u8>)) -> bool {
-    candidate.0 > incumbent.0 || (candidate.0 == incumbent.0 && candidate.1 < incumbent.1)
-}
-
 /// Decide what the rejoin repair should do (see `repair_sync` for the
 /// election rules). Every node runs the same rules over its own view, so
-/// the mesh converges on one reference without cross-node negotiation.
+/// the mesh converges on one reference without cross-node negotiation:
+/// the largest group of identical states wins (local counts itself as a
+/// member), ties go to the higher row count, then to the serialized-digest
+/// order. An empty group is never adopted over local data.
 fn decide_repair(local: &[TableDigest], reports: &[(String, Vec<TableDigest>)]) -> RepairDecision {
-    if reports.iter().any(|(_, d)| d == local) {
-        return RepairDecision::Converged;
-    }
-    // Group peers by identical report; a group of ≥2 agreeing peers is a
-    // surviving majority and always wins — unless it holds no data (never
-    // adopt emptiness: a lone remaining copy must survive the others'
-    // loss).
+    // Group the peer reports by identical state.
     let mut groups: Vec<(&Vec<TableDigest>, Vec<&str>)> = Vec::new();
     for (peer, digests) in reports {
         match groups.iter_mut().find(|(d, _)| *d == digests) {
@@ -4551,42 +4837,50 @@ fn decide_repair(local: &[TableDigest], reports: &[(String, Vec<TableDigest>)]) 
             None => groups.push((digests, vec![peer.as_str()])),
         }
     }
-    groups.sort_by(|a, b| {
-        b.1.len().cmp(&a.1.len()).then_with(|| {
-            let (ka, kb) = (digest_state_key(a.0), digest_state_key(b.0));
-            kb.0.cmp(&ka.0).then_with(|| ka.1.cmp(&kb.1))
-        })
-    });
-    if let Some((digests, members)) = groups.first() {
-        if members.len() >= 2 && digests.iter().map(|t| t.rows).sum::<u64>() > 0 {
-            // Any member serves the same snapshot; picking the smallest
-            // address is only for stable logs. Addresses come from this
-            // node's own peer config, so no cross-namespace comparison is
-            // needed.
-            return RepairDecision::Pull(members.iter().min().unwrap().to_string());
-        }
-    }
-    // Residue: no majority (every reachable state unique). Elect the
-    // reference over local + all reports; the winner serves, everyone
-    // else pulls.
-    let local_key = digest_state_key(local);
-    let mut best: Option<(&str, (u64, Vec<u8>))> = None;
-    for (peer, digests) in reports {
-        let key = digest_state_key(digests);
-        let better = match &best {
-            None => true,
-            Some((_, bk)) => state_key_better(&key, bk),
-        };
+    // The old "any peer agrees" shortcut let an even split (A,B | C,D)
+    // persist forever: each side agreed with one peer and declared
+    // convergence, so neither ever adopted the other's state. The local
+    // group must *win the election*, not merely exist.
+    let agreeing_peers = groups
+        .iter()
+        .find(|(d, _)| *d == local)
+        .map(|(_, m)| m.len())
+        .unwrap_or(0);
+    let local_rows: u64 = local.iter().map(|t| t.rows).sum();
+    let local_key = (local_rows, serde_json::to_vec(local).unwrap_or_default());
+    // (winner source peer, group size, state key, is_local)
+    let mut winner: (&str, usize, (u64, Vec<u8>), bool) =
+        ("", agreeing_peers + 1, local_key.clone(), true);
+    for (digests, members) in &groups {
+        let key = (
+            digests.iter().map(|t| t.rows).sum(),
+            serde_json::to_vec(digests).unwrap_or_default(),
+        );
+        let better = members.len() > winner.1
+            || (members.len() == winner.1
+                && (key.0 > winner.2 .0 || (key.0 == winner.2 .0 && key.1 < winner.2 .1)));
         if better {
-            best = Some((peer.as_str(), key));
+            winner = (members[0], members.len(), key, false);
         }
     }
-    match best {
-        Some((peer, key)) if state_key_better(&key, &local_key) => {
-            RepairDecision::Pull(peer.to_string())
-        }
-        _ => RepairDecision::Serve,
+    if winner.3 {
+        return if agreeing_peers > 0 {
+            RepairDecision::Converged
+        } else {
+            RepairDecision::Serve
+        };
     }
+    if winner.2 .0 == 0 {
+        // An empty group never wins over local rows (row count breaks the
+        // size tie only when local's group is as large; a larger empty group
+        // must still not wipe the last copy).
+        return if local_rows > 0 {
+            RepairDecision::Serve
+        } else {
+            RepairDecision::Converged
+        };
+    }
+    RepairDecision::Pull(winner.0.to_string())
 }
 
 /// Replace this node's whole user state with the cluster snapshot:
@@ -4615,12 +4909,12 @@ async fn apply_repair_sync(
             return JoinApply::Failed(format!("BEGIN: {e}"));
         }
         if let Err(e) = db.wipe_user_tables() {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("catalog wipe: {e}"));
         }
         let batch = db.execute_batch(script);
         if let Some(err) = batch.error {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("statement {}: {}", err.statement, err.message));
         }
         // The adopted snapshot replaces the state the old positions
@@ -4630,7 +4924,7 @@ async fn apply_repair_sync(
         // autocommit clear and the next restart would otherwise survive the
         // Converged digest exit, which never re-clears positions.
         if let Err(e) = db.positions_clear() {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("position reset: {e}"));
         }
         // The adjudication is final: this node's own journal entries the
@@ -4642,11 +4936,11 @@ async fn apply_repair_sync(
         // pull the voided range land on the digest re-check → snapshot,
         // which is where a resurrected range would have sent them anyway.
         if let Err(e) = db.journal_void_all() {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("journal void: {e}"));
         }
         if let Err(e) = db.execute("COMMIT") {
-            let _ = db.execute("ROLLBACK");
+            rollback_or_abort(&mut db);
             return JoinApply::Failed(format!("COMMIT: {e}"));
         }
     }
@@ -4923,7 +5217,7 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
     // data it never received (positions may lag, never lead). Detecting a
     // hole here turns the silent divergence into an explicit error the
     // requester answers with snapshot adoption.
-    let mut expected = after + 1;
+    let mut expected = after.saturating_add(1);
     let mut last_served = after;
     loop {
         let batch = {
@@ -5081,6 +5375,23 @@ mod security_tests {
             bind_params("SELECT 'a?b''c?' , ? FROM t", &[Value::Int(1)]).unwrap(),
             "SELECT 'a?b''c?' , 1 FROM t"
         );
+        // Quoted identifiers and comments too (the old scanner only knew
+        // single quotes, so these misbound or errored).
+        assert_eq!(
+            bind_params("SELECT \"ready?\" FROM t WHERE id = ?", &[Value::Int(2)]).unwrap(),
+            "SELECT \"ready?\" FROM t WHERE id = 2"
+        );
+        assert_eq!(
+            bind_params("SELECT ? -- set?\n+ ?", &[Value::Int(1), Value::Int(2)]).unwrap(),
+            "SELECT 1 -- set?\n+ 2"
+        );
+        assert_eq!(
+            bind_params("SELECT /* ? */ ?", &[Value::Int(3)]).unwrap(),
+            "SELECT /* ? */ 3"
+        );
+        // Unbalanced quotes/comments are copied without panicking.
+        assert_eq!(bind_params("SELECT '? ;", &[]).unwrap(), "SELECT '? ;");
+        assert_eq!(bind_params("SELECT \"x? ", &[]).unwrap(), "SELECT \"x? ");
         // Bytes render as hex literals.
         assert_eq!(
             bind_params(
@@ -5181,5 +5492,123 @@ mod sync_tests {
             start = end;
         }
         assert_eq!(out, s);
+    }
+}
+
+#[cfg(test)]
+mod repair_election_tests {
+    use super::{decide_repair, RepairDecision, TableDigest};
+
+    fn digests(rows: u64, tag: u64) -> Vec<TableDigest> {
+        vec![TableDigest {
+            name: "t".into(),
+            rows,
+            rows_hash: tag,
+            schema_hash: tag,
+        }]
+    }
+
+    fn reports(states: &[(&str, Vec<TableDigest>)]) -> Vec<(String, Vec<TableDigest>)> {
+        states
+            .iter()
+            .map(|(p, d)| (p.to_string(), d.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn even_split_does_not_declare_convergence() {
+        // A,B agree (state α); C,D agree (state β). The old "any peer
+        // agrees" shortcut made every node Converged and the split
+        // persisted forever. α has 2 rows, β has 1: both sides must pull α.
+        let alpha = digests(2, 1);
+        let beta = digests(1, 2);
+        let view_a = reports(&[
+            ("B", alpha.clone()),
+            ("C", beta.clone()),
+            ("D", beta.clone()),
+        ]);
+        // A's group (A,B) ties on size with (C,D); the row count elects α,
+        // and A already agrees with a winner — nothing to repair.
+        assert!(matches!(
+            decide_repair(&alpha, &view_a),
+            RepairDecision::Converged
+        ));
+        let view_c = reports(&[
+            ("A", alpha.clone()),
+            ("B", alpha.clone()),
+            ("D", beta.clone()),
+        ]);
+        assert!(matches!(decide_repair(&beta, &view_c), RepairDecision::Pull(p) if p == "A"));
+        // Once both sides hold α, they agree again.
+        let view_a2 = reports(&[("C", alpha.clone()), ("D", alpha.clone())]);
+        assert!(matches!(
+            decide_repair(&alpha, &view_a2),
+            RepairDecision::Converged
+        ));
+    }
+
+    #[test]
+    fn majority_agreement_converges_and_minority_pulls() {
+        let alpha = digests(5, 1);
+        let beta = digests(1, 2);
+        let peer_view = reports(&[("B", alpha.clone()), ("C", alpha.clone())]);
+        assert!(matches!(
+            decide_repair(&alpha, &peer_view),
+            RepairDecision::Converged
+        ));
+        assert!(matches!(decide_repair(&beta, &peer_view), RepairDecision::Pull(p) if p == "B"));
+    }
+
+    #[test]
+    fn empty_group_never_wipes_local_data() {
+        let empty = digests(0, 0);
+        let local = digests(3, 7);
+        // Three empty peers versus one non-empty local: size would elect the
+        // empty group, but the last copy must survive.
+        let peer_view = reports(&[
+            ("B", empty.clone()),
+            ("C", empty.clone()),
+            ("D", empty.clone()),
+        ]);
+        assert!(matches!(
+            decide_repair(&local, &peer_view),
+            RepairDecision::Serve
+        ));
+        // Local empty too: nothing to lose either way.
+        assert!(matches!(
+            decide_repair(&empty, &peer_view),
+            RepairDecision::Converged | RepairDecision::Serve
+        ));
+    }
+
+    #[test]
+    fn unique_states_elect_by_rows_then_digest_order() {
+        // Three unique states, no agreement anywhere: the richer state wins.
+        let small = digests(1, 1);
+        let mid = digests(3, 3);
+        let big = digests(9, 2);
+        let peer_view = reports(&[("B", small.clone()), ("C", big.clone())]);
+        assert!(matches!(decide_repair(&mid, &peer_view), RepairDecision::Pull(p) if p == "C"));
+        // Holding the elected state (and agreeing with C) is convergence.
+        assert!(matches!(
+            decide_repair(&big, &peer_view),
+            RepairDecision::Converged
+        ));
+        // Equal size and rows: the serialized-digest order breaks the tie
+        // identically on every node.
+        let t1 = digests(1, 1);
+        let t2 = digests(1, 2);
+        // A two-node disagreement: A holds t1 and sees B:t2, B mirrors it.
+        let a = decide_repair(&t1, &[("B".to_string(), t2.clone())]);
+        let b = decide_repair(&t2, &[("A".to_string(), t1.clone())]);
+        // Exactly one of the two states is the reference (the smaller
+        // serialized digest) and the other side pulls the same peer.
+        if serde_json::to_vec(&t1).unwrap() < serde_json::to_vec(&t2).unwrap() {
+            assert!(matches!(a, RepairDecision::Serve));
+            assert!(matches!(b, RepairDecision::Pull(p) if p == "A"));
+        } else {
+            assert!(matches!(a, RepairDecision::Pull(p) if p == "B"));
+            assert!(matches!(b, RepairDecision::Serve));
+        }
     }
 }

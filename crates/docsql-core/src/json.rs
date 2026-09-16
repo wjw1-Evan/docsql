@@ -33,6 +33,27 @@ pub fn to_string(v: &Value) -> String {
     s
 }
 
+/// Stable text for a non-finite float inside the `$float` marker.
+pub(crate) fn float_marker_text(f: f64) -> &'static str {
+    if f.is_nan() {
+        "NaN"
+    } else if f > 0.0 {
+        "inf"
+    } else {
+        "-inf"
+    }
+}
+
+/// Parse a `$float` marker payload back into a non-finite float.
+pub(crate) fn parse_float_marker(s: &str) -> Option<f64> {
+    match s {
+        "NaN" => Some(f64::NAN),
+        "inf" | "+inf" | "Infinity" => Some(f64::INFINITY),
+        "-inf" | "-Infinity" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
 fn write_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
@@ -44,7 +65,13 @@ fn write_value(out: &mut String, v: &Value) {
             if f.is_finite() {
                 let _ = write!(out, "{f}");
             } else {
-                out.push_str("null"); // JSON has no NaN/Inf
+                // JSON has no NaN/Inf: a marker object keeps the exact value
+                // losslessly (mirrors `$dec`/`$bytes`; `from_str` decodes it).
+                // Rendering `null` used to mutate stored data on every wire
+                // round-trip and made backups of such rows unreplayable.
+                out.push_str("{\"$float\":\"");
+                out.push_str(float_marker_text(*f));
+                out.push_str("\"}");
             }
         }
         Value::Decimal(d) => {
@@ -139,6 +166,11 @@ fn decode_marker(obj: Object) -> Value {
         if let Some(Value::Str(s)) = obj.get("$dec") {
             if let Ok(d) = s.parse::<crate::value::Decimal>() {
                 return Value::Decimal(d);
+            }
+        }
+        if let Some(Value::Str(s)) = obj.get("$float") {
+            if let Some(f) = parse_float_marker(s) {
+                return Value::Float(f);
             }
         }
         if let Some(Value::Array(items)) = obj.get("$bytes") {
@@ -440,9 +472,43 @@ mod tests {
     }
 
     #[test]
-    fn nan_inf_serialize_as_null() {
-        assert_eq!(to_string(&Value::Float(f64::NAN)), "null");
-        assert_eq!(to_string(&Value::Float(f64::INFINITY)), "null");
+    fn nan_inf_round_trip_via_float_marker() {
+        // JSON has no NaN/Inf, but silently writing `null` mutated stored
+        // data on every response and broke dump round-trips. The `$float`
+        // marker keeps them losslessly (symmetric with `$dec`/`$bytes`).
+        assert_eq!(to_string(&Value::Float(f64::NAN)), r#"{"$float":"NaN"}"#);
+        assert_eq!(
+            to_string(&Value::Float(f64::INFINITY)),
+            r#"{"$float":"inf"}"#
+        );
+        assert_eq!(
+            to_string(&Value::Float(f64::NEG_INFINITY)),
+            r#"{"$float":"-inf"}"#
+        );
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            match from_str(&to_string(&Value::Float(v))).unwrap() {
+                Value::Float(f) => {
+                    if v.is_nan() {
+                        assert!(f.is_nan());
+                    } else {
+                        assert_eq!(f, v);
+                    }
+                }
+                other => panic!("expected float, got {other:?}"),
+            }
+        }
+        // Nested values keep the marker through arrays/objects.
+        let arr = Value::Array(vec![Value::Float(f64::INFINITY), Value::Int(1)]);
+        assert_eq!(from_str(&to_string(&arr)).unwrap(), arr);
+        // A user object that merely looks like a marker for an unknown type
+        // stays an object.
+        assert_eq!(
+            from_str(r#"{"$float":"bogus"}"#).unwrap(),
+            Value::Object(Object::from([(
+                "$float".into(),
+                Value::Str("bogus".into())
+            )]))
+        );
     }
 
     #[test]
