@@ -1213,7 +1213,10 @@ mod tests {
         let path = dir.path().join("s.sql");
         std::fs::write(
             &path,
-            "CREATE TABLE t (id INT);\nINSERT INTO t VALUES (7)\n",
+            "CREATE TABLE t (id INT);\n\
+             INSERT INTO t VALUES (7);\n\
+             SELECT 1 AS one;\n\
+             SELECT COUNT(*) AS c FROM t\n",
         )
         .unwrap();
         let mut db = Database::in_memory().unwrap();
@@ -1601,6 +1604,40 @@ mod tests {
     }
 
     #[test]
+    fn reader_loop_exits_when_queue_or_stream_closes() {
+        // 主侧先关队列:下一帧的 tx.send 失败,线程收线。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let server = listener.accept().unwrap().0;
+        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        std::thread::spawn(move || reader_loop(server, tx));
+        drop(rx);
+        let mut client = client;
+        let f = Frame::new(proto::RESP_AFFECTED, 1u64.to_le_bytes().to_vec());
+        client.write_all(&f.encode().unwrap()).unwrap();
+        client.flush().unwrap();
+        // 线程退出后写端会观察到断连(等待即可,不强断言时序)。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // 帧头读了一半对端就关闭:read_exact 失败,线程收线不 panic。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener.local_addr().unwrap();
+        let client2 = std::net::TcpStream::connect(addr2).unwrap();
+        let server2 = listener.accept().unwrap().0;
+        let (tx2, rx2) = std::sync::mpsc::channel::<Frame>();
+        std::thread::spawn(move || reader_loop(server2, tx2));
+        let mut client2 = client2;
+        client2.write_all(&[0u8; 5]).unwrap(); // 半个帧头
+        client2.flush().unwrap();
+        drop(client2); // 然后断开
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(rx2
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+    }
+
+    #[test]
     fn reader_loop_exits_on_undecodable_frame() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1732,6 +1769,16 @@ mod statement_ready_tests {
         // 未闭合的块注释 / 未闭合反引号都不算就绪。
         assert!(!statements_ready("SELECT `open;"));
         assert!(!statements_ready("SELECT 1; /* still open"));
+    }
+
+    #[test]
+    fn quoted_identifiers_with_doubled_quotes_and_comment_newlines() {
+        // 双引号标识符内的成对双引号是转义。
+        assert!(statements_ready("SELECT \"a\"\"b;\" FROM t;"));
+        assert!(!statements_ready("SELECT \"a\"\"b;"));
+        // 行注释遇换行回到代码态,其后的分号照常终结。
+        assert!(statements_ready("SELECT 1 -- wait\n;"));
+        assert!(!statements_ready("SELECT 1 -- wait\nSELECT 2"));
     }
 
     #[test]

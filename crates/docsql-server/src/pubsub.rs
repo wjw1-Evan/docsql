@@ -1148,4 +1148,44 @@ mod tests {
             assert_eq!(inner.conn_count(conn), 0);
         }
     }
+
+    #[tokio::test]
+    async fn notify_prunes_dead_pattern_subscribers() {
+        // 模式订阅者掉线(接收端 drop):投递时清理订阅并同步计数,
+        // 幸存的精确订阅者照常收到。
+        let ps = PubSub::new();
+        let live = ps.next_conn_id();
+        let dead = ps.next_conn_id();
+        let (tl, mut rl) = tx();
+        let (td, rd) = tx();
+        {
+            let mut inner = ps.lock().await;
+            inner.register(live, SubKind::Channel, "news", tl).unwrap();
+            inner.register(dead, SubKind::Pattern, "n*", td).unwrap();
+            inner.arm_filter(live, SubKind::Channel, "news", 0);
+            inner.arm_filter(dead, SubKind::Pattern, "n*", 0);
+        }
+        drop(rd);
+        assert_eq!(ps.notify("news", 1, 0, "x").await, 1);
+        let f = rl.try_recv().unwrap();
+        assert_eq!(f.frame_type, docsql_core::proto::RESP_PUSH);
+        // 死掉的 pattern 订阅已被清理:计数与注册表都不再含它。
+        {
+            let inner = ps.lock().await;
+            assert_eq!(inner.numpat(), 0);
+            assert_eq!(inner.total, 1);
+        }
+    }
+
+    #[test]
+    fn glob_backtracking_after_partial_star_run() {
+        // 星号吸收一个字符后重试的回溯分支。
+        assert!(pattern_matches("*ab", "xaab"));
+        assert!(pattern_matches("a*b", "aXb"));
+        assert!(!pattern_matches("*ab", "abX"));
+        // 结尾星号可匹配零个或多个字符。
+        assert!(pattern_matches("ab*", "ab"));
+        assert!(pattern_matches("ab*", "abzzz"));
+        assert!(!pattern_matches("*c", "aaa"));
+    }
 }

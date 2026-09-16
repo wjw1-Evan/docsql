@@ -2381,6 +2381,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_endpoint_renders_prom_lines_for_live_and_dead_nodes() {
+        // 一个活节点(in-process)+ 一个不可达节点:up=1/0 两种行都渲染。
+        let dir = tempfile::tempdir().unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let addr = format!("127.0.0.1:{port}");
+        let cfg = docsql_server::ServerConfig {
+            db_path: dir.path().join("m.db"),
+            listen: addr.clone(),
+            auth_token: None,
+            read_token: None,
+            max_conn: 8,
+            idle_timeout_secs: 0,
+            auth_lock_threshold: 0,
+            cluster_token: None,
+            replicate_to: None,
+            peers: Vec::new(),
+            advertise: None,
+            read_only: false,
+            transport_key: None,
+            async_commit: false,
+            catchup_window: 0,
+            backup_interval_secs: 0,
+            backup_keep: 0,
+            backup_dir: None,
+            statement_timeout_ms: 0,
+        };
+        tokio::spawn(docsql_server::run(cfg));
+        let mut up = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(up, "node never came up");
+        let state = Arc::new(WebState {
+            upstream: Some(addr.clone()),
+            token: None,
+            peers: vec!["127.0.0.1:1".into()],
+            query_log: querylog::QueryLog::new(),
+            sync_log: querylog::SyncLog::new(1),
+            auth: None,
+            trust_proxy: false,
+            secure_cookie: false,
+            http_requests: Mutex::new(std::collections::HashMap::new()),
+        });
+        let res = build_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(text.contains("docsql_node_up"), "{text}");
+        assert!(
+            text.contains("docsql_node_up{node=\"127.0.0.1:1\"} 0"),
+            "{text}"
+        );
+        let up_line = text
+            .lines()
+            .find(|l| l.starts_with("docsql_node_up") && l.ends_with("} 1"))
+            .expect("live node must report up=1");
+        assert!(up_line.contains(&prom_escape(&addr)), "{up_line}");
+        // 活节点还带 info/uptime 等计数行。
+        assert!(text.contains("docsql_node_info"), "{text}");
+    }
+
+    #[tokio::test]
     async fn probe_unreachable_node_reports_offline() {
         // Loopback port 1 refuses immediately.
         let v = probe_node("127.0.0.1:1", None).await;
