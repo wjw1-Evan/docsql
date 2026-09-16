@@ -273,7 +273,7 @@ token(运行期持久化到 user secrets),`WithToken`/`WithClusterToken`/`WithEn
 | 口令/凭据复杂度 | 服务器启动时校验所有已配置凭据:长度不足 8 或单一字符重复即拒绝启动(进程退出码 2) |
 | 访问控制(最小权限) | `DOCSQL_READ_TOKEN` 只读身份:可查询、可订阅,一切持久化写在协议层拒绝;**数据库角色**:内置 `admin`/`readwrite`/`readonly` + 自定义角色表级 DML 授权(GRANT/REVOKE 即时生效,DDL 与管理操作仅 admin,读目标含子查询 fail-closed);存在任一用户后匿名连接关闭;副本模式 `DOCSQL_READ_ONLY=1` 整节点只读;Web 控制台独立 token 门禁 |
 | 安全审计 | 语句审计(`docsql_log` 环形缓冲,含语句文本/耗时/影响行数/是否复制/错误)、认证事件审计(成功与失败均记录,来源 IP + 授予身份/失败原因,web 控制台日志页可见)、`DOCSQL_LOG_FILE` 可同步落 JSONL 文件留存 |
-| 资源控制 | `DOCSQL_MAX_CONN` 并发连接数上限(超限立即拒绝不排队);`DOCSQL_IDLE_TIMEOUT` 空闲会话超时(服务端主动断开,订阅客户端需定期 PING 保活);`DOCSQL_STATEMENT_TIMEOUT_MS` 客户端语句墙钟预算(超时即报错回滚;复制 apply 与恢复重放不受限,慢节点不偏离已确认写入);单帧 64MB 上限;对端 IO 预算(连接 3s/读写 10s);TCP keepalive + NODELAY(NAT/防火墙后的长会话不被静默掐断);`DOCSQL_PBKDF2_ITERATIONS` 新建凭据哈希迭代数(默认 210000;存量凭据按各自存储值校验,非法值拒绝启动) |
+| 资源控制 | `DOCSQL_MAX_CONN` 并发连接数上限(默认 1024,超限立即拒绝不排队;0 = 不限);`DOCSQL_IDLE_TIMEOUT` 空闲会话超时(服务端主动断开,订阅客户端需定期 PING 保活);`DOCSQL_STATEMENT_TIMEOUT_MS` 客户端语句墙钟预算(超时即报错回滚;复制 apply 与恢复重放不受限,慢节点不偏离已确认写入);单帧 64MB 上限;对端 IO 预算(连接 3s/读写 10s);TCP keepalive + NODELAY(NAT/防火墙后的长会话不被静默掐断);`DOCSQL_PBKDF2_ITERATIONS` 新建凭据哈希迭代数(默认 210000;存量凭据按各自存储值校验,非法值拒绝启动) |
 | 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);绑定非回环地址且未配置 `DOCSQL_KEY` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1`;**Web 控制台原生 TLS**(`DOCSQL_WEB_TLS_CERT`/`DOCSQL_WEB_TLS_KEY`,rustls),或置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`) |
 | SQL 注入防护 | **ADO.NET/EF Core 默认服务端参数绑定**(REQ_PREPARE/REQ_EXECUTE:占位符在服务端引号感知绑定,字符串值翻倍转义,任何取值都无法逃逸字面量);服务端不拼接外部输入;系统表 `_pubsub_messages` 对 SQL 客户端隐藏 |
 | 数据完整性 | WAL 先写日志后落数据、崩溃恢复;节点间复制依赖独立集群凭据防伪造 |

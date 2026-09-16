@@ -15896,6 +15896,174 @@ mod tests {
         assert_eq!(r.rows, vec![vec![Value::Int(3), Value::Int(42)]]);
     }
 
+    // ---- 银行场景合规:账务语义端到端 ----
+
+    fn ledger_db() -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE accounts (id INT PRIMARY KEY, balance DECIMAL NOT NULL)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO accounts VALUES (1, CAST('1000.25' AS DECIMAL))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO accounts VALUES (2, CAST('500.75' AS DECIMAL))",
+        );
+        db
+    }
+
+    fn total(db: &mut Database) -> String {
+        let r = rows(db, "SELECT SUM(balance) FROM accounts");
+        match &r.rows[0][0] {
+            Value::Decimal(d) => d.to_string(),
+            other => panic!("expected decimal total, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bank_ledger_transfer_is_atomic_and_exact() {
+        let mut db = ledger_db();
+        assert_eq!(total(&mut db), "1501.00", "期初合计必须精确");
+        // 一笔转账:BEGIN 内两条 UPDATE,COMMIT 一次性落盘。
+        run(&mut db, "BEGIN");
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance - CAST('0.10' AS DECIMAL) WHERE id = 1",
+        );
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance + CAST('0.10' AS DECIMAL) WHERE id = 2",
+        );
+        run(&mut db, "COMMIT");
+        assert_eq!(total(&mut db), "1501.00", "转账后合计必须分毫不差");
+        let r = rows(&mut db, "SELECT balance FROM accounts WHERE id = 1");
+        assert!(
+            matches!(&r.rows[0][0], Value::Decimal(d) if d.to_string() == "1000.15"),
+            "借方余额必须精确: {:?}",
+            r.rows[0][0]
+        );
+    }
+
+    #[test]
+    fn bank_ledger_rollback_and_failed_statement_preserve_invariant() {
+        let mut db = ledger_db();
+        // 显式回滚:中途两条 UPDATE 后 ROLLBACK,合计与逐户余额原封不动。
+        run(&mut db, "BEGIN");
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance - CAST('250.005' AS DECIMAL) WHERE id = 1",
+        );
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance + CAST('250.005' AS DECIMAL) WHERE id = 2",
+        );
+        run(&mut db, "ROLLBACK");
+        assert_eq!(total(&mut db), "1501.00");
+        let r = rows(&mut db, "SELECT balance FROM accounts WHERE id = 1");
+        assert!(
+            matches!(&r.rows[0][0], Value::Decimal(d) if d.to_string() == "1000.25"),
+            "回滚后必须回到期初: {:?}",
+            r.rows[0][0]
+        );
+        // 语句中途失败(NOT NULL 违例)在事务内只回滚该语句,显式
+        // ROLLBACK 后整体原样 —— 不允许留下「转出一半」的状态。
+        run(&mut db, "BEGIN");
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance - CAST('1.00' AS DECIMAL) WHERE id = 1",
+        );
+        assert!(db
+            .execute("UPDATE accounts SET balance = NULL WHERE id = 2")
+            .is_err());
+        run(&mut db, "ROLLBACK");
+        assert_eq!(total(&mut db), "1501.00");
+    }
+
+    #[test]
+    fn snapshot_reader_never_sees_a_torn_transfer() {
+        // MVCC 一致性读:转账事务已提交后,此前建立的读快照必须看到
+        // 完整的旧状态(两户同为旧值),新读才看到新状态 —— 任何时刻
+        // 都不存在「转出已入账、转入未入账」的中间像。
+        let mut db = ledger_db();
+        let view = db.read_view();
+        run(&mut db, "BEGIN");
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance - CAST('400.00' AS DECIMAL) WHERE id = 1",
+        );
+        run(
+            &mut db,
+            "UPDATE accounts SET balance = balance + CAST('400.00' AS DECIMAL) WHERE id = 2",
+        );
+        run(&mut db, "COMMIT");
+
+        let old = match view.execute("SELECT id, balance FROM accounts ORDER BY id") {
+            Ok(ExecOutcome::Rows(r)) => r,
+            other => panic!("snapshot read failed: {other:?}"),
+        };
+        assert!(
+            matches!(&old.rows[0][1], Value::Decimal(d) if d.to_string() == "1000.25")
+                && matches!(&old.rows[1][1], Value::Decimal(d) if d.to_string() == "500.75"),
+            "旧快照必须看到转账前的完整状态: {old:?}"
+        );
+        let fresh = rows(&mut db, "SELECT balance FROM accounts WHERE id = 2");
+        assert!(
+            matches!(&fresh.rows[0][0], Value::Decimal(d) if d.to_string() == "900.75"),
+            "新读必须看到转账后状态: {:?}",
+            fresh.rows[0][0]
+        );
+        assert_eq!(total(&mut db), "1501.00");
+    }
+
+    #[test]
+    fn killed_before_commit_transfer_never_lands() {
+        // 崩溃原子性:BEGIN..COMMIT 之前的语句是 deferred 提交,进程被杀
+        // (丢掉 Database 即模拟)后恢复,绝不能重放出转账的任意一侧。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-crash.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(
+                &mut db,
+                "CREATE TABLE accounts (id INT PRIMARY KEY, balance DECIMAL NOT NULL)",
+            );
+            run(
+                &mut db,
+                "INSERT INTO accounts VALUES (1, CAST('1000.25' AS DECIMAL))",
+            );
+            run(
+                &mut db,
+                "INSERT INTO accounts VALUES (2, CAST('500.75' AS DECIMAL))",
+            );
+            run(&mut db, "BEGIN");
+            run(
+                &mut db,
+                "UPDATE accounts SET balance = balance - CAST('400.00' AS DECIMAL) WHERE id = 1",
+            );
+            run(
+                &mut db,
+                "UPDATE accounts SET balance = balance + CAST('400.00' AS DECIMAL) WHERE id = 2",
+            );
+            // no COMMIT — kill -9
+        }
+        let mut db = Database::open(&path).unwrap();
+        let r = rows(&mut db, "SELECT SUM(balance) FROM accounts");
+        assert!(
+            matches!(&r.rows[0][0], Value::Decimal(d) if d.to_string() == "1501.00"),
+            "恢复后合计必须原样: {:?}",
+            r.rows[0][0]
+        );
+        let r = rows(&mut db, "SELECT balance FROM accounts WHERE id = 1");
+        assert!(
+            matches!(&r.rows[0][0], Value::Decimal(d) if d.to_string() == "1000.25"),
+            "被杀事务的借记绝不能落盘: {:?}",
+            r.rows[0][0]
+        );
+    }
+
     #[test]
     fn float_precision_and_negative_sorting() {
         let mut db = Database::in_memory().unwrap();

@@ -63,9 +63,19 @@ internal static partial class SchemaSync
             AddMissingColumns(conn, table, modelColumns);
     }
 
-    /// <summary>表已存在,或连的是只读副本(表由复制通道创建)。</summary>
-    private static bool IsIgnorableDdlError(Exception ex) =>
-        ex.Message.Contains("already exists") || ex.Message.Contains("read-only");
+    /// <summary>表已存在,或连的是只读副本(表由复制通道创建)。
+    /// 锚定引擎的确切错误文本(table/index … already exists、read-only …),
+    /// 不做子串扫描 —— 任何恰好含这两个词的无关失败(权限、磁盘、语法)
+    /// 都曾被静默吞掉,让「建表失败」伪装成「表已存在」。</summary>
+    private static bool IsIgnorableDdlError(Exception ex)
+    {
+        var msg = ex.Message;
+        return (msg.StartsWith("table ", StringComparison.Ordinal)
+                && msg.EndsWith(" already exists", StringComparison.Ordinal))
+            || (msg.StartsWith("index ", StringComparison.Ordinal)
+                && msg.EndsWith(" already exists", StringComparison.Ordinal))
+            || msg.StartsWith("read-only", StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// 模型加字段免迁移(类似 EF MongoDB):对已存在的表补齐模型中新增的列,

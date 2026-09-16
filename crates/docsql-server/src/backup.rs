@@ -258,10 +258,18 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn verify_backup_checksum(dir: &Path, name: &str) -> Result<(), String> {
     let sidecar = dir.join(format!("{name}.sha256"));
     // Missing sidecar = legacy backup from before checksums existed:
-    // tolerated. Present-but-unreadable is an error, not a skip.
+    // tolerated, but loudly — an operator must be able to tell an
+    // integrity-verified restore from an unverifiable one (a missing
+    // sidecar is indistinguishable from a deleted one otherwise).
     let recorded = match std::fs::read_to_string(&sidecar) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "docsql-backup: {name} has no .sha256 sidecar (pre-checksum legacy \
+                 backup); integrity cannot be verified for this restore"
+            );
+            return Ok(());
+        }
         Err(e) => return Err(format!("checksum read: {e}")),
     };
     let recorded = recorded.split_whitespace().next().unwrap_or("");

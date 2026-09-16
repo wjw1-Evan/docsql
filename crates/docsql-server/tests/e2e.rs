@@ -1801,6 +1801,42 @@ async fn pubsub_publish_during_multiwindow_replay_never_duplicates() {
     );
 }
 
+/// 银行级审计在场:账务 DML 与 pub/sub 操作(PUBLISH/TRIM)必须全部留痕
+/// 于 docsql_log(含语句文本/操作),运维与合规可在库内直接检索。
+#[tokio::test]
+async fn audit_trail_covers_ledger_writes_and_pubsub_ops() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE ledger (id INT PRIMARY KEY, amount DECIMAL)")
+        .await;
+    c.sql("INSERT INTO ledger VALUES (1, CAST('100.50' AS DECIMAL))")
+        .await;
+    c.sql("UPDATE ledger SET amount = amount - CAST('0.50' AS DECIMAL) WHERE id = 1")
+        .await;
+    c.publish("alerts", "transfer-done").await;
+    let r = c
+        .pubsub_cmd(r#"{"sub":"trim","channel":"alerts","keep":1}"#)
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED);
+
+    let r = c.sql("SELECT sql FROM docsql_log LIMIT 500").await;
+    assert_eq!(
+        r.frame_type,
+        proto::RESP_ROWS,
+        "docsql_log is admin-visible"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.payload).unwrap();
+    let text = v["rows"].to_string();
+    for needle in [
+        "INSERT INTO ledger",
+        "UPDATE ledger SET amount",
+        "PUBLISH alerts",
+        "PUBSUB TRIM alerts KEEP 1",
+    ] {
+        assert!(text.contains(needle), "审计缺失 {needle}: {text}");
+    }
+}
+
 /// Cursor resume: disconnect, miss a publish, re-subscribe from the last
 /// seen id and receive exactly the missed message (at-least-once).
 #[tokio::test]

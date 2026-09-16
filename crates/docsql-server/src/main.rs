@@ -29,7 +29,8 @@
 //!                                     connections authenticated with it may
 //!                                     read and subscribe but not write
 //!     DOCSQL_MAX_CONN=<n>             max concurrent connections
-//!                                     (resource control; 0 = unlimited)
+//!                                     (resource control; default 1024,
+//!                                     0 = unlimited)
 //!     DOCSQL_IDLE_TIMEOUT=<secs>      close connections idle this long
 //!                                     (session timeout; 0 = unlimited;
 //!                                     subscription clients should send
@@ -130,7 +131,12 @@ fn config_from_env(
             docsql_server::check_token_strength(name, t).map_err(|e| e.to_string())?;
         }
     }
-    let max_conn = env_num("DOCSQL_MAX_CONN", 0, &getenv)?;
+    // Default finite: each connection is a tokio task with a read buffer
+    // budget and a writer channel — the old unlimited default left the one
+    // resource dimension with no ceiling at all (accept-until-fd-exhaustion
+    // under a connection flood). Explicit DOCSQL_MAX_CONN=0 restores
+    // unlimited.
+    let max_conn = env_num("DOCSQL_MAX_CONN", 1024, &getenv)?;
     let idle_timeout_secs = env_num("DOCSQL_IDLE_TIMEOUT", 0, &getenv)?;
     // Trim like DOCSQL_PEERS: a stray space makes every fan-out to the
     // upstream fail (observed only as sync-log errors).
@@ -258,7 +264,9 @@ mod tests {
         assert!(cfg.auth_token.is_none());
         assert!(cfg.read_token.is_none());
         assert!(cfg.cluster_token.is_none());
-        assert_eq!(cfg.max_conn, 0);
+        // Default finite (resource ceiling on tasks/buffers/fds); explicit
+        // DOCSQL_MAX_CONN=0 restores unlimited.
+        assert_eq!(cfg.max_conn, 1024);
         assert_eq!(cfg.catchup_window, 100_000);
         assert_eq!(cfg.backup_interval_secs, 86_400);
         assert_eq!(cfg.backup_keep, 7);
@@ -352,7 +360,8 @@ mod tests {
             assert!(err.contains("DOCSQL_MAX_CONN"), "{v:?}: err {err}");
         }
         let cfg = config_from_env(&[], env(&[("DOCSQL_MAX_CONN", "  ")])).unwrap();
-        assert_eq!(cfg.max_conn, 0);
+        // Whitespace falls back to the (finite) default, not unlimited.
+        assert_eq!(cfg.max_conn, 1024);
     }
 
     #[test]
