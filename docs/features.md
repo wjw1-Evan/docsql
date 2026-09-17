@@ -30,6 +30,7 @@ DocSQL 能力的完整清单与索引入口。语法细节见 [SQL 参考](sql-r
   | FLOAT | 64 位双精度 |
   | DECIMAL | 精确十进制,28~29 位有效数字;算术/聚合/比较按十进制语义,混合运算优先于 Float |
   | TEXT | 字符串(JSON 文档也按文本存储) |
+  | TIMESTAMP | 精确 UTC 毫秒时间:`TIMESTAMP '…'` 字面量、`NOW()`/`CURRENT_TIMESTAMP`、与字符串比较自动解析、`±` 毫秒算术;值域 0001..=9999 年 |
   | BLOB | 二进制,字面量 `x'hex'` |
   | ARRAY / OBJECT | 表达式层内部使用;SQL 层 JSON 字面量以文本入库 |
 
@@ -138,6 +139,7 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 | 字符串 | `UPPER/UCASE` `LOWER/LCASE` `LENGTH/LEN` `SUBSTR/SUBSTRING` `TRIM/LTRIM/RTRIM` `CONCAT` |
 | 数值 | `ABS` `ROUND`(DECIMAL 精确、四舍五入半离零;FLOAT 保持浮点) |
 | 空值/条件 | `COALESCE` `IFNULL` `NULLIF` `NVL` `NVL2` `DECODE` |
+| 时间 | `NOW()` `CURRENT_TIMESTAMP`(TIMESTAMP 值);`TIMESTAMP '…'` 字面量、`CAST(... AS TIMESTAMP)`、`±` 毫秒算术(见 SQL 参考 · 时间值) |
 | 类型/自省 | `TYPEOF` `CAST(expr AS INT/REAL/DECIMAL/TEXT/BOOL/BLOB/...)` |
 | JSON 点读 | `JSON_EXTRACT(doc,'$.a.b[0]')` `JSON_TYPE` `JSON_VALID`(坏文本/缺路径返回 NULL) |
 | JSON 数组 | `JSON_ARRAY_CONTAINS(json_text, value)` 数组成员判定(EF 实体集合 `Contains` 的翻译目标;非数组/坏 JSON → false,NULL 文本 → NULL) |
@@ -218,7 +220,12 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 - **自动备份**:每节点独立,默认每日一次(间隔/保留可调),整库逻辑快照
   `dump_script()`(DDL 在前,跳过系统表),写 `<db>/backups/backup-<UTCms>.sql`;
 - **校验和**:每份备份同名 `.sha256` sidecar,恢复前强校验(损坏/篡改直接拒绝;旧备份无 sidecar 容忍);
-- **手动触发**:控制台「备份管理」页 / `POST /api/backup` / REQ_BACKUP;
+- **PITR(恢复到时间点)**:期刊无条件记录(单节点也记);自动备份带 journal-seq 锚点,
+  `REQ_BACKUP restore` 请求带 `"to"`(ISO 时间戳或 UTC 毫秒)时重放
+  「基准备份 + 增量段 `incr-*.sql`(期刊条目 + 提交时间戳)」至目标时间点,增量链带连续性审计
+  (断号/裁剪洞显式报错,要求重拍全量);
+- **手动触发**:控制台「备份管理」页 / `POST /api/backup` / REQ_BACKUP(控制台/API 仅整份恢复,
+  时间点恢复走协议帧 `"to"` 参数);
 - **恢复**:逐条经正常写路径重放,整场持写路径,完成后增量补拉 + 逐 peer 摘要比对,
   状态暴露 `converged`/`note`;跨节点互斥(同时只允许一个恢复);只读连接拒绝;
 - **归档**:备份在数据卷内,`docker cp` 取出。
@@ -331,8 +338,9 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 完整清单见[已知边界](limitations.md),高频项:
 
 - 单写者引擎:全库写互斥(读不阻塞写);单文档 ≤16MiB;BLOB 无流式分块;
-- 精确 DECIMAL 有效数字 28~29 位;无 TIMESTAMP 精确类型(ISO-8601 文本约定);
+- 精确 DECIMAL 有效数字 28~29 位;TIMESTAMP 精确到毫秒(无 TIME/INTERVAL 类型,区间用毫秒整数);
 - 无行级合并:集群修复以多数派快照覆盖少数方独有写;修复由重启触发;
 - 无表达式/部分/JSON 路径索引;查询优化器为规则式(无 EXPLAIN/统计信息);
-- 备份为逻辑全量(无增量/PITR);无 TDE(部署加密卷替代);
+- 备份为逻辑全量 + 增量 PITR(PITR 窗口 = 本节点期刊保留;对称集群跨节点写不在本节点期刊);
+  无 TDE(部署加密卷替代);
 - 不支持 SQL 清单见 [SQL 参考 · 不支持](sql-reference.md#不支持)。

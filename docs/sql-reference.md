@@ -90,7 +90,7 @@ DocSQL 文档模型不强制 schema：**列声明类型仅作文档与自省用�
 
 ### 声明类型
 
-`INT`/`INTEGER`、`TEXT`/`CHAR`/`VARCHAR`/`STRING`、`BOOL`/`BOOLEAN`、`FLOAT`/`REAL`/`DOUBLE`、`DECIMAL`/`NUMERIC[(p,s)]`、`BLOB`/`BINARY`/`BYTES`、`GUID`/`UUID`/`UNIQUEIDENTIFIER`/`UUIDV7`（自动 UUIDv7 主键的触发器，见 [CREATE TABLE](#create-table)）。
+`INT`/`INTEGER`、`TEXT`/`CHAR`/`VARCHAR`/`STRING`、`BOOL`/`BOOLEAN`、`FLOAT`/`REAL`/`DOUBLE`、`DECIMAL`/`NUMERIC[(p,s)]`、`BLOB`/`BINARY`/`BYTES`、`TIMESTAMP`/`DATETIME`/`DATETIME2`、`GUID`/`UUID`/`UNIQUEIDENTIFIER`/`UUIDV7`（自动 UUIDv7 主键的触发器，见 [CREATE TABLE](#create-table)）。
 
 ### CAST
 
@@ -98,11 +98,27 @@ DocSQL 文档模型不强制 schema：**列声明类型仅作文档与自省用�
 CAST(expr AS type)
 ```
 
-支持的目标类型：`INT`、`CHAR`/`TEXT`/`STRING`、`BOOL`、`BIT`（T-SQL，映射 BOOL）、`REAL`/`DOUBLE`/`FLOAT`、`DECIMAL`/`NUMERIC`、`BLOB`/`BYTES`/`BINARY`（文本按 UTF-8 字节入库）。DECIMAL 的规范写法是 `CAST('123.45' AS DECIMAL)`；`DECIMAL(p,s)` 声明不做存储截断。其他目标类型（如 `DATE`/`DATETIME`/`NVARCHAR`）按**声明类型**处理，值保持不变（时间统一按文本约定）。
+支持的目标类型：`INT`、`CHAR`/`TEXT`/`STRING`、`BOOL`、`BIT`（T-SQL，映射 BOOL）、`REAL`/`DOUBLE`/`FLOAT`、`DECIMAL`/`NUMERIC`、`BLOB`/`BYTES`/`BINARY`（文本按 UTF-8 字节入库）、`TIMESTAMP`/`DATETIME`（Str 按任意可解析时间形解析、**坏文本显式报错**；Int 视为 UTC 毫秒并做值域检查；反向 `CAST(timestamp AS INT)` 得毫秒数）。DECIMAL 的规范写法是 `CAST('123.45' AS DECIMAL)`；`DECIMAL(p,s)` 声明不做存储截断。其他目标类型（如 `NVARCHAR`）按**声明类型**处理，值保持不变。
 
 ### 时间值
 
-无精确 `TIMESTAMP` 类型。时间按 **ISO-8601 文本**或**整数毫秒**约定存储，由应用层保持形状一致；`SYSDATE()` 返回当前 UTC 时间戳文本。
+时间类型为**精确 `TIMESTAMP`（UTC 毫秒）**，内部 64 位毫秒数；值域 0001..=9999 年，毫秒精度，超域显式报错（无规范文本形的值不可重放）。
+
+```sql
+SELECT TIMESTAMP '2026-01-01T00:00:00Z';        -- 字面量;坏文本显式报错
+SELECT DATETIME '2026-01-01 00:00:00', DATE '2026-01-01';   -- 同一解析
+SELECT NOW(), CURRENT_TIMESTAMP;                -- 当前 UTC 时间(TIMESTAMP 值)
+SELECT CAST('2026-01-01T08:30:00+08:00' AS TIMESTAMP);
+SELECT ts + 1500, ts - ts2 FROM t;              -- ± 毫秒整数 / 毫秒差(INT)
+```
+
+- **谓词提升**：`WHERE ts > '2026-…'` 与字符串比较按时间自动解析（不可解析 → NULL，不报错）；`BETWEEN`/`IN`/`CASE`/`IS DISTINCT FROM` 同语义。与字面量（报错）不同，这是对**列数据宽容**的读语义；
+- **索引**：索引探针自动把字符串边界提升为 Timestamp 边界（采样确认带内值全为 Timestamp 时），`WHERE ts > '2026-…'` 走索引；
+- **排序**：Timestamp 自成排序带，**不与 Str 混排**（`cmp_values` 的带序：数值 < Timestamp < Str < Bytes）；混合列请显式 `CAST` 统一；
+- **算术**：`TIMESTAMP ± INT`（毫秒）、`TIMESTAMP - TIMESTAMP`（毫秒差）；`TIMESTAMP + TIMESTAMP` 类型错误 → NULL；无独立 `TIME`/`INTERVAL` 类型（区间用毫秒整数表达）；
+- **wire 协议**：响应/参数用 `{"$ts": 毫秒}` 标记精确往返（.NET 客户端 `DateTime`/`DateTimeOffset` 参数默认走 `$ts`，`timestampformat=iso` 为旧服务器兼容开关）；
+- **`DEFAULT NOW()`**：定值在**插入时**并回写进复制扇出的语句（每个节点存同值，不随重放漂移）；`CHECK` 表达式与 `MERGE` 的 wall-clock DEFAULT 显式拒绝（无回写机制就不放行）；
+- `SYSDATE()` 返回当前 UTC 时间戳**文本**（Oracle 兼容；`NOW()` 返回 TIMESTAMP 值）。
 
 ## 运算符与谓词
 
@@ -760,7 +776,8 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 | 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`、`CONCAT(a, b, ...)` | 位置按字符计；TRIM 仅单参形式 |
 | 数值 | `ABS`、`ROUND(x [, digits])` | ROUND 对 DECIMAL 精确四舍五入（半离零），FLOAT 保持浮点 |
 | 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF` | |
-| 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`blob`/`array`/`object` |
+| 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`timestamp`/`blob`/`array`/`object` |
+| 时间 | `NOW()` / `CURRENT_TIMESTAMP` / `NOW_MS` | 当前 UTC 时间，返回 TIMESTAMP 值；`NOW_MS` 为别名 |
 | JSON | `JSON_EXTRACT(doc, '$.a.b[0]')`、`JSON_TYPE(doc, path)`、`JSON_VALID(text)`、`JSON_ARRAY_CONTAINS(json_text, needle)` | 坏文本/缺路径返回 NULL（不中断扫描）；`JSON_ARRAY_CONTAINS` 非数组为 FALSE |
 | Oracle 兼容 | `NVL(a,b)`、`NVL2(a,b,c)`、`DECODE(expr, s1, r1, ..., [default])`、`INSTR(str, sub)`、`LPAD/RPAD(str, len [, pad])`、`GREATEST/LEAST(...)`、`TO_NUMBER(text)`、`TO_CHAR(v)`、`SYSDATE()` | `DECODE` 用全序匹配（`NULL = NULL` 命中）；`TO_NUMBER` 解析失败显式报错；`TO_CHAR` 不支持格式掩码 |
 
