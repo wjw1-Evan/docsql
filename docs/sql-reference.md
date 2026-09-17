@@ -798,6 +798,33 @@ SELECT JSON_EXTRACT(doc, '$.user.name'), JSON_VALID('{"a":1}') FROM t;
 SELECT CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM t;
 ```
 
+### 窗口函数
+
+`… OVER ([PARTITION BY …] [ORDER BY …])`。窗口在 WHERE 之后、DISTINCT/ORDER BY/LIMIT 之前求值；
+PARTITION BY 按 `cmp_values` 编码分组，ORDER BY 语义与外层 `ORDER BY` 一致
+（同 `NULLS` 规则、稳定序，并列行保持扫描序）。
+
+| 类别 | 函数 |
+|---|---|
+| 排名 | `ROW_NUMBER()` `RANK()` `DENSE_RANK()` `NTILE(n)` |
+| 值 | `LAG(expr [, offset [, default]])` `LEAD(expr [, offset [, default]])` `FIRST_VALUE(expr)` `LAST_VALUE(expr)` |
+| 聚合 | `COUNT(*)` `COUNT(x)` `SUM` `AVG` `MIN` `MAX` `GROUP_CONCAT`/`STRING_AGG`，支持 `FILTER (WHERE …)`；无 ORDER BY 聚整个分区，有 ORDER BY 聚「分区首行 → 当前行及其并列行」（标准默认 RANGE 帧） |
+
+```sql
+SELECT name, salary,
+       ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn,
+       SUM(salary) OVER (PARTITION BY dept)        AS dept_total,   -- 整分区
+       SUM(salary) OVER (ORDER BY salary)          AS running,      -- 默认帧
+       LAG(salary, 1, 0) OVER (ORDER BY salary)    AS prev
+FROM emp;
+```
+
+- 窗口调用可出现在 SELECT 列表中（含包在算术/CASE 里的复合表达式）；WHERE/HAVING/ORDER BY 内的窗口调用显式报错；
+- 与 GROUP BY 或聚合投影**不可混用**（显式报错）；DISTINCT 在窗口之后求值；
+- 不支持（显式报错）：`WINDOW` 命名子句、`QUALIFY`、自定义窗口帧
+  （`ROWS/RANGE/GROUPS BETWEEN …`）、`IGNORE NULLS`；默认帧可显式拼写
+  （`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` 等价）。
+
 ## 系统视图与元数据
 
 ### information_schema
@@ -844,7 +871,8 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 主键与 NULL | `PRIMARY KEY` 不隐含 `NOT NULL` |
 | 主键类型 | 仅单列；复合唯一用 `CREATE UNIQUE INDEX` |
 | 相关子查询 | 不支持（显式报错） |
-| 窗口函数 / 递归 CTE | 不支持（显式报错） |
+| 窗口函数 | 已支持（见[窗口函数](#窗口函数)）；`WINDOW` 子句、`QUALIFY`、自定义窗口帧不支持 |
+| 递归 CTE | 不支持（显式报错） |
 | `SELECT t.*` | 不支持（用 `*`） |
 | `GROUP BY` 输出别名 | 不支持（显式报错）；`GROUP BY 1` 按常量 1 处理，无序号语义 |
 | 外键动作 | 仅 RESTRICT 式，`ON DELETE/UPDATE` 报错 |
@@ -874,7 +902,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 语句/过程 | `USE`、`SET`、`DECLARE`、`PRINT`、`EXEC`、`WAITFOR`、`IF`、`TRY/CATCH`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE` |
 | 函数 | `GETDATE`、`NEWID`、`DATEPART`、`DATEDIFF`、`CONVERT`/`TRY_CONVERT`、`IIF`、`CHARINDEX`、`REPLACE`、`LEFT`/`RIGHT`、`STRING_SPLIT`、`SERVERPROPERTY`、`OBJECT_ID`、`DB_NAME`、`HOST_NAME`、`SUSER_SNAME`、`SCOPE_IDENTITY` 等（均返回 `unknown function`） |
 
-窗口函数（`OVER`）、递归 CTE、`CROSS APPLY` 等结构性缺口见[不支持的语法](#不支持的语法)。
+`WINDOW` 子句、`QUALIFY`、递归 CTE、`CROSS APPLY` 等结构性缺口见[不支持的语法](#不支持的语法)。
 
 ## 不支持的语法
 
@@ -882,7 +910,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 
 | 类别 | 语法 |
 |---|---|
-| 窗口 | `OVER(...)`、`WINDOW` 子句、`QUALIFY` |
+| 窗口 | `WINDOW` 命名子句、`QUALIFY`、自定义窗口帧（`ROWS/RANGE/GROUPS BETWEEN …`） |
 | 查询结构 | `SELECT TOP`、`SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、`PIVOT`、表时态 `AS OF` |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |

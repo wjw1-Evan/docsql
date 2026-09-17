@@ -11,8 +11,8 @@ use crate::pager::{PageReader, Pager, PagerError, Snapshot, PAGE_SIZE};
 use crate::value::{Decimal, Object, Value};
 use num_traits::ToPrimitive;
 use sqlparser::ast::{
-    BinaryOperator, Expr as SqlExpr, LimitClause, ObjectName, ObjectNamePart, Query, SelectItem,
-    SetExpr, Statement, TableObject,
+    BinaryOperator, Expr as SqlExpr, Function, LimitClause, ObjectName, ObjectNamePart, Query,
+    SelectItem, SetExpr, Statement, TableObject,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1348,7 +1348,7 @@ impl<'a> ReadCx<'a> {
                 return err(format!("GROUPING argument {arg} must appear in GROUP BY"));
             }
             if is_agg_fn(f) {
-                let (op, inner, distinct, sep, filter) = agg_parts(f)?;
+                let (op, inner, distinct, sep, filter) = agg_parts(f, false)?;
                 return Ok(AggSpec::Agg {
                     op,
                     arg: inner,
@@ -1499,6 +1499,20 @@ impl<'a> ReadCx<'a> {
         };
 
         let mut docs = rows;
+        // SELECT-list window functions: compute over the filtered rowset
+        // (SQL window semantics — after WHERE, before DISTINCT/ORDER BY),
+        // then rewrite each call site into a reference of its private
+        // computed column so projection evaluation is plain column reads.
+        let win_calls = window_calls_of(&select.projection);
+        if !win_calls.is_empty() {
+            if pre_windowed {
+                return err("internal: window function reached the pre-windowed fast path");
+            }
+            self.compute_windows(&win_calls, &mut docs)?;
+            for (_, e) in project.iter_mut() {
+                rewrite_windows(e, &win_calls);
+            }
+        }
         let mut out: Vec<Vec<Value>> = Vec::new();
         for doc in &docs {
             if want_star {
@@ -1554,6 +1568,223 @@ impl<'a> ReadCx<'a> {
             columns: columns_out,
             rows: out,
         }))
+    }
+
+    /// Evaluate one SELECT list's window functions over the (already
+    /// WHERE-filtered) rows and inject the results as private `__w<i>$`
+    /// columns. Row order in `rows` is the stable scan order: it defines
+    /// the arbitrary-but-deterministic order when the OVER spec carries no
+    /// ORDER BY, and the tie order the stable sort preserves.
+    fn compute_windows(&self, calls: &[Function], rows: &mut [Object]) -> Result<()> {
+        for (ci, f) in calls.iter().enumerate() {
+            self.deadline.check()?;
+            let fname = f.name.to_string().to_uppercase();
+            let spec = validate_window_spec(f, &fname)?;
+            let ordered = !spec.order_by.is_empty();
+            // Partition keys per row: groups hash by encoded key, the same
+            // identity DISTINCT and GROUP BY use.
+            let mut groups: Vec<(Vec<u8>, Vec<usize>)> = Vec::new();
+            let mut part_index: std::collections::HashMap<Vec<u8>, usize> =
+                std::collections::HashMap::new();
+            for (i, doc) in rows.iter().enumerate() {
+                let mut key = Vec::with_capacity(spec.partition_by.len());
+                for p in &spec.partition_by {
+                    key.push(eval_expr(p, doc)?);
+                }
+                let kb = row_key(&key);
+                match part_index.get(&kb) {
+                    Some(&gi) => groups[gi].1.push(i),
+                    None => {
+                        part_index.insert(kb.clone(), groups.len());
+                        groups.push((kb, vec![i]));
+                    }
+                }
+            }
+            // Aggregates reuse the whole group-aggregate evaluator over each
+            // frame slice; scalar window functions are computed here.
+            let agg = if is_agg_name(f) {
+                let (op, arg, distinct, sep, filter) = agg_parts(f, true)?;
+                Some(AggSpec::Agg {
+                    op,
+                    arg,
+                    distinct,
+                    sep,
+                    filter,
+                })
+            } else {
+                None
+            };
+            let mut vals: Vec<Value> = vec![Value::Null; rows.len()];
+            for (_, idxs) in &groups {
+                self.deadline.check()?;
+                // Sorted order within the partition: the outer ORDER BY
+                // comparator (cmp_maybe_null + per-key ASC), stable so ties
+                // keep scan order. `keyed` pairs each row index with its
+                // order-key tuple; peer runs compare consecutive tuples.
+                let mut keyed: Vec<(usize, Vec<Value>)> = Vec::with_capacity(idxs.len());
+                for &i in idxs {
+                    let mut ks = Vec::with_capacity(spec.order_by.len());
+                    for o in &spec.order_by {
+                        ks.push(eval_expr(&o.expr, &rows[i])?);
+                    }
+                    keyed.push((i, ks));
+                }
+                if ordered {
+                    keyed.sort_by(|a, b| {
+                        for ((va, vb), o) in a.1.iter().zip(b.1.iter()).zip(&spec.order_by) {
+                            let ord = cmp_maybe_null(va, vb, o.options.nulls_first);
+                            if ord != Ordering::Equal {
+                                return if o.options.asc.unwrap_or(true) {
+                                    ord
+                                } else {
+                                    ord.reverse()
+                                };
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                }
+                let sorted: Vec<usize> = keyed.iter().map(|(i, _)| *i).collect();
+                let n = sorted.len();
+                // Peer runs: run_end[p] = last position of the run holding
+                // p (consecutive order-key tuples compare equal).
+                let mut run_end = vec![n - 1; n];
+                if ordered {
+                    let mut p = 0usize;
+                    while p < n {
+                        let mut q = p;
+                        while q + 1 < n {
+                            let equal = spec
+                                .order_by
+                                .iter()
+                                .zip(&keyed[p].1)
+                                .zip(&keyed[q + 1].1)
+                                .all(|((o, ka), kb)| {
+                                    cmp_maybe_null(ka, kb, o.options.nulls_first) == Ordering::Equal
+                                });
+                            if !equal {
+                                break;
+                            }
+                            q += 1;
+                        }
+                        run_end[p..=q].fill(q);
+                        p = q + 1;
+                    }
+                }
+                if let Some(agg) = &agg {
+                    // Aggregate OVER: default frame = partition start
+                    // through the current row's peer run (RANGE). Without
+                    // ORDER BY the frame is the whole partition.
+                    for (p, &ri) in sorted.iter().enumerate() {
+                        let end = if ordered { run_end[p] } else { n - 1 };
+                        let frame: Vec<&Object> =
+                            sorted[..=end].iter().map(|&i| &rows[i]).collect();
+                        vals[ri] = eval_agg(agg, &frame, &[], &[])?;
+                    }
+                } else {
+                    let args = fn_args(f);
+                    match fname.as_str() {
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
+                            if !args.is_empty() {
+                                return err(format!("function {fname} takes no arguments"));
+                            }
+                            let mut dense = 0i64;
+                            let mut p = 0usize;
+                            while p < n {
+                                let end = run_end[p];
+                                dense += 1;
+                                for r in p..=end {
+                                    vals[sorted[r]] = match fname.as_str() {
+                                        "ROW_NUMBER" => Value::Int(r as i64 + 1),
+                                        "RANK" => Value::Int(p as i64 + 1),
+                                        _ => Value::Int(dense),
+                                    };
+                                }
+                                p = end + 1;
+                            }
+                        }
+                        "NTILE" => {
+                            let buckets = match eval_const(args.first().ok_or_else(|| {
+                                SqlError::Message("function NTILE takes exactly 1 argument".into())
+                            })?)? {
+                                Value::Int(b) if b >= 1 => b as usize,
+                                other => {
+                                    return err(format!(
+                                        "NTILE buckets must be an integer >= 1, got {}",
+                                        other.type_name()
+                                    ));
+                                }
+                            };
+                            let q = n / buckets;
+                            let r = n % buckets;
+                            for (p, &ri) in sorted.iter().enumerate() {
+                                let b = if q == 0 {
+                                    p
+                                } else if p < r * (q + 1) {
+                                    p / (q + 1)
+                                } else {
+                                    r + (p - r * (q + 1)) / q
+                                };
+                                vals[ri] = Value::Int(b as i64 + 1);
+                            }
+                        }
+                        "LAG" | "LEAD" => {
+                            if args.is_empty() || args.len() > 3 {
+                                return err(format!(
+                                    "function {fname} takes 1 to 3 arguments, got {}",
+                                    args.len()
+                                ));
+                            }
+                            let offset = match args.get(1).map(eval_const).transpose()? {
+                                None => 1i64,
+                                Some(Value::Int(o)) if o >= 0 => o,
+                                Some(other) => {
+                                    return err(format!(
+                                        "{fname} offset must be a non-negative integer, got {}",
+                                        other.type_name()
+                                    ));
+                                }
+                            };
+                            for (p, &ri) in sorted.iter().enumerate() {
+                                let target: Option<usize> = if fname == "LAG" {
+                                    p.checked_sub(offset as usize)
+                                } else {
+                                    p.checked_add(offset as usize).filter(|&t| t < n)
+                                };
+                                vals[ri] = match target {
+                                    Some(t) => eval_expr(&args[0], &rows[sorted[t]])?,
+                                    None => match args.get(2) {
+                                        Some(d) => eval_expr(d, &rows[ri])?,
+                                        None => Value::Null,
+                                    },
+                                };
+                            }
+                        }
+                        "FIRST_VALUE" | "LAST_VALUE" => {
+                            if args.len() != 1 {
+                                return err(format!(
+                                    "function {fname} takes exactly 1 argument, got {}",
+                                    args.len()
+                                ));
+                            }
+                            for (p, &ri) in sorted.iter().enumerate() {
+                                let end = if ordered { run_end[p] } else { n - 1 };
+                                let target = if fname == "FIRST_VALUE" { 0 } else { end };
+                                vals[ri] = eval_expr(&args[0], &rows[sorted[target]])?;
+                            }
+                        }
+                        other => {
+                            return err(format!("unknown window function: {other}"));
+                        }
+                    }
+                }
+            }
+            let tmp = window_tmp_col(ci);
+            for (i, v) in vals.into_iter().enumerate() {
+                rows[i].insert(tmp.clone(), v);
+            }
+        }
+        Ok(())
     }
 
     /// Load a FROM list into merged rows: the base table plus its JOINs,
@@ -1771,6 +2002,16 @@ impl<'a> ReadCx<'a> {
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
         let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
         let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
+        // SELECT-list window functions (`… OVER (…)`) need the full
+        // filtered rowset: the ORDER BY+LIMIT fast paths below would hand
+        // them a truncated window, so they are gated off, and mixing with
+        // GROUP BY/aggregates is refused up front (window-over-groups is
+        // unsupported; refusals stay loud).
+        let has_window = !window_calls_of(&select.projection).is_empty();
+        if has_window && is_aggregate {
+            return err("window functions (OVER) are not supported combined with \
+                 GROUP BY or aggregate projections");
+        }
 
         // `SELECT COUNT(*) FROM t` without WHERE/GROUP BY: count live heap
         // slots instead of decoding every document.
@@ -1784,7 +2025,11 @@ impl<'a> ReadCx<'a> {
         // full heap scan and sort. Already filtered and windowed; the WHERE
         // pass below would be a no-op, so it is skipped too.
         let mut pre_windowed = false;
-        let mut rows = if !is_aggregate && !rownum_wanted && select.having.is_none() && distinct_all
+        let mut rows = if !is_aggregate
+            && !rownum_wanted
+            && select.having.is_none()
+            && distinct_all
+            && !has_window
         {
             match self.ordered_index_window(
                 &select.from,
@@ -8004,15 +8249,18 @@ enum AggSpec {
 /// Parse a scalar-aggregate call (`COUNT(*)`, `SUM(DISTINCT x)`, ...) into
 /// its operator, argument, DISTINCT flag and — for GROUP_CONCAT/STRING_AGG —
 /// the optional constant separator. `COUNT(*)` rewrites to a sentinel column
-/// so the executor counts rows instead of non-null values.
+/// so the executor counts rows instead of non-null values. The window
+/// aggregate path (`SUM(x) OVER (...)`) passes `for_window` to reuse the
+/// same argument parsing over a frame slice.
 #[allow(clippy::type_complexity)]
 fn agg_parts(
     f: &sqlparser::ast::Function,
+    for_window: bool,
 ) -> Result<(AggOp, SqlExpr, bool, Option<String>, Option<SqlExpr>)> {
     let fname = f.name.to_string().to_uppercase();
     // A window frame silently changes the result shape (one row per
     // partition); refusing is better than returning wrong numbers.
-    if f.over.is_some() {
+    if f.over.is_some() && !for_window {
         return err(format!(
             "window functions (OVER) are not supported: {fname}"
         ));
@@ -8904,14 +9152,20 @@ fn is_agg_item(item: &SelectItem) -> bool {
     contains_agg(e)
 }
 
+/// True for the aggregate functions the executor knows (`COUNT`/`SUM`/...),
+/// regardless of window usage: the window aggregate path reuses the same
+/// argument parsing.
+fn is_agg_name(f: &sqlparser::ast::Function) -> bool {
+    matches!(
+        f.name.to_string().to_uppercase().as_str(),
+        "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
+    )
+}
+
 /// True for the aggregate functions the executor knows (`COUNT`/`SUM`/...).
 /// Window forms (`OVER`) are never aggregates here.
 fn is_agg_fn(f: &sqlparser::ast::Function) -> bool {
-    !f.over.is_some()
-        && matches!(
-            f.name.to_string().to_uppercase().as_str(),
-            "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
-        )
+    !f.over.is_some() && is_agg_name(f)
 }
 
 fn contains_agg(e: &SqlExpr) -> bool {
@@ -8951,6 +9205,278 @@ fn contains_agg(e: &SqlExpr) -> bool {
         }
         _ => false,
     }
+}
+
+// ---------- Window functions (OVER …) ----------
+//
+// SELECT-list window computation: calls are collected in first-appearance
+// order (deduplicated by full text — two identical calls share one column),
+// evaluated per row right after WHERE (SQL semantics: windows see the
+// filtered rowset, before DISTINCT/ORDER BY/LIMIT), injected into the row
+// docs as private `__w<i>$` columns and each call site rewritten to a
+// reference of that column — DISTINCT / ORDER BY / LIMIT then run unchanged.
+// Frames other than the default (RANGE UNBOUNDED PRECEDING AND CURRENT ROW)
+// are refused explicitly, never silently narrowed.
+
+fn window_tmp_col(i: usize) -> String {
+    format!("__w{i}$")
+}
+
+/// Window functions in one SELECT's projection, first-appearance order.
+fn window_calls_of(items: &[SelectItem]) -> Vec<Function> {
+    let mut out: Vec<Function> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for item in items {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => continue,
+        };
+        scan_windows(e, &mut out, &mut seen);
+    }
+    out
+}
+
+/// Mirrors `subst_expr`'s recursion: descend into the composite expression
+/// shapes the executor evaluates, so a window call wrapped in arithmetic /
+/// CASE / COALESCE is still found. Subquery-shaped nodes are never descended
+/// into — `subst_expr` has already rewritten them, and anything surviving is
+/// a loud evaluation error, not a silently dropped window call.
+fn scan_windows(e: &SqlExpr, out: &mut Vec<Function>, seen: &mut Vec<String>) {
+    match e {
+        SqlExpr::Function(f) => {
+            if f.over.is_some() {
+                let key = format!("{f}");
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    out.push(f.clone());
+                }
+            }
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        scan_windows(inner, out, seen);
+                    }
+                }
+            }
+            if let Some(filter) = &f.filter {
+                scan_windows(filter, out, seen);
+            }
+        }
+        SqlExpr::Nested(inner) => scan_windows(inner, out, seen),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            scan_windows(left, out, seen);
+            scan_windows(right, out, seen);
+        }
+        SqlExpr::UnaryOp { expr, .. } => scan_windows(expr, out, seen),
+        SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::IsTrue(inner)
+        | SqlExpr::IsNotTrue(inner)
+        | SqlExpr::IsFalse(inner)
+        | SqlExpr::IsNotFalse(inner)
+        | SqlExpr::IsUnknown(inner)
+        | SqlExpr::IsNotUnknown(inner) => scan_windows(inner, out, seen),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            scan_windows(expr, out, seen);
+            scan_windows(low, out, seen);
+            scan_windows(high, out, seen);
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            scan_windows(l, out, seen);
+            scan_windows(r, out, seen);
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            scan_windows(expr, out, seen);
+            scan_windows(pattern, out, seen);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            scan_windows(expr, out, seen);
+            for item in list {
+                scan_windows(item, out, seen);
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                scan_windows(op, out, seen);
+            }
+            for w in conditions {
+                scan_windows(&w.condition, out, seen);
+                scan_windows(&w.result, out, seen);
+            }
+            if let Some(el) = else_result {
+                scan_windows(el, out, seen);
+            }
+        }
+        SqlExpr::Cast { expr, .. } => scan_windows(expr, out, seen),
+        _ => {}
+    }
+}
+
+/// Replace every window call with a reference to its computed column; the
+/// dedup key (full text) matches [`scan_windows`], so indices agree.
+fn rewrite_windows(e: &mut SqlExpr, calls: &[Function]) {
+    match e {
+        SqlExpr::Function(f) if f.over.is_some() => {
+            let key = format!("{f}");
+            if let Some(i) = calls.iter().position(|c| format!("{c}") == key) {
+                *e = SqlExpr::Identifier(sqlparser::ast::Ident::new(window_tmp_col(i)));
+            }
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        rewrite_windows(inner, calls);
+                    }
+                }
+            }
+            if let Some(filter) = &mut f.filter {
+                rewrite_windows(filter, calls);
+            }
+        }
+        SqlExpr::Nested(inner) => rewrite_windows(inner, calls),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_windows(left, calls);
+            rewrite_windows(right, calls);
+        }
+        SqlExpr::UnaryOp { expr, .. } => rewrite_windows(expr, calls),
+        SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::IsTrue(inner)
+        | SqlExpr::IsNotTrue(inner)
+        | SqlExpr::IsFalse(inner)
+        | SqlExpr::IsNotFalse(inner)
+        | SqlExpr::IsUnknown(inner)
+        | SqlExpr::IsNotUnknown(inner) => rewrite_windows(inner, calls),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_windows(expr, calls);
+            rewrite_windows(low, calls);
+            rewrite_windows(high, calls);
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            rewrite_windows(l, calls);
+            rewrite_windows(r, calls);
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            rewrite_windows(expr, calls);
+            rewrite_windows(pattern, calls);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            rewrite_windows(expr, calls);
+            for item in list {
+                rewrite_windows(item, calls);
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                rewrite_windows(op, calls);
+            }
+            for w in conditions {
+                rewrite_windows(&mut w.condition, calls);
+                rewrite_windows(&mut w.result, calls);
+            }
+            if let Some(el) = else_result {
+                rewrite_windows(el, calls);
+            }
+        }
+        SqlExpr::Cast { expr, .. } => rewrite_windows(expr, calls),
+        _ => {}
+    }
+}
+
+/// Unnamed-argument exprs of a function call (`LAG(v, 1, 0)` → `[v, 1, 0]`).
+fn fn_args(f: &Function) -> Vec<SqlExpr> {
+    match &f.args {
+        sqlparser::ast::FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    inner,
+                )) => Some(inner.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Supported window specification shape: no named window, no frame beyond
+/// the default, no IGNORE NULLS. Refusals stay explicit — an unsupported
+/// frame would silently change the result shape (one row per partition vs
+/// one value per row).
+fn validate_window_spec<'a>(
+    f: &'a Function,
+    fname: &str,
+) -> Result<&'a sqlparser::ast::WindowSpec> {
+    let spec = match &f.over {
+        Some(sqlparser::ast::WindowType::WindowSpec(s)) => s,
+        Some(sqlparser::ast::WindowType::NamedWindow(n)) => {
+            return err(format!(
+                "named window \"{}\" requires a WINDOW clause, which is not supported; \
+                 write the OVER (...) inline",
+                n.value
+            ));
+        }
+        None => return err("window call without OVER"),
+    };
+    if let Some(n) = &spec.window_name {
+        // `OVER (name)` references a WINDOW clause definition, which the
+        // engine refuses; anything else would silently ignore the name.
+        return err(format!(
+            "named window \"{}\" requires a WINDOW clause, which is not supported; \
+             write the OVER (...) inline",
+            n.value
+        ));
+    }
+    if let Some(frame) = &spec.window_frame {
+        // Both spellings of the standard default frame are accepted:
+        // `RANGE UNBOUNDED PRECEDING` (shorthand) and the explicit
+        // `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+        let is_default = matches!(frame.units, sqlparser::ast::WindowFrameUnits::Range)
+            && matches!(
+                frame.start_bound,
+                sqlparser::ast::WindowFrameBound::Preceding(None)
+            )
+            && matches!(
+                frame.end_bound,
+                None | Some(sqlparser::ast::WindowFrameBound::CurrentRow)
+            );
+        if !is_default {
+            return err(format!(
+                "window frames other than the default (ROWS/RANGE/GROUPS ...) \
+                 are not supported: {fname}"
+            ));
+        }
+    }
+    if matches!(
+        f.null_treatment,
+        Some(sqlparser::ast::NullTreatment::IgnoreNulls)
+    ) {
+        return err(format!("IGNORE NULLS is not supported: {fname}"));
+    }
+    Ok(spec)
 }
 
 /// Build a rows result from RETURNING items over the affected documents.
@@ -11764,7 +12290,7 @@ fn eval_group_expr(
 ) -> Result<Value> {
     match e {
         SqlExpr::Function(f) if is_agg_fn(f) => {
-            let (op, arg, distinct, sep, filter) = agg_parts(f)?;
+            let (op, arg, distinct, sep, filter) = agg_parts(f, false)?;
             eval_agg(
                 &AggSpec::Agg {
                     op,
@@ -19979,6 +20505,259 @@ mod tx_rollback_tests {
             rows(&mut db, "SELECT id FROM orders").rows[0][0],
             Value::Int(100)
         );
+    }
+}
+
+// ---- window functions (OVER) -----------------------------------------
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn run(db: &mut Database, sql: &str) -> ExecOutcome {
+        db.execute(sql)
+            .unwrap_or_else(|e| panic!("SQL failed: {sql}\n{e}"))
+    }
+
+    fn rows(db: &mut Database, sql: &str) -> QueryResult {
+        match run(db, sql) {
+            ExecOutcome::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn str_col(r: &QueryResult, c: usize) -> Vec<String> {
+        r.rows
+            .iter()
+            .map(|row| match &row[c] {
+                Value::Str(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    fn int_col(r: &QueryResult, c: usize) -> Vec<i64> {
+        r.rows
+            .iter()
+            .map(|row| match &row[c] {
+                Value::Int(i) => *i,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn win_db() -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE e (id INT PRIMARY KEY, dept TEXT, name TEXT, salary INT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO e VALUES (1,'a','x',30),(2,'a','y',20),(3,'a','z',20),\
+             (4,'b','p',10),(5,'b','q',40)",
+        );
+        db
+    }
+
+    #[test]
+    fn window_row_number_rank_dense_rank() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn, \
+             RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rk, \
+             DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS dk \
+             FROM e ORDER BY dept, rn",
+        );
+        assert_eq!(str_col(&r, 0), vec!["x", "y", "z", "q", "p"]);
+        assert_eq!(int_col(&r, 1), vec![1, 2, 3, 1, 2]);
+        // y/z tie: RANK shares 2 with a gap, DENSE_RANK shares 2 without one.
+        assert_eq!(int_col(&r, 2), vec![1, 2, 2, 1, 2]);
+        assert_eq!(int_col(&r, 3), vec![1, 2, 2, 1, 2]);
+    }
+
+    #[test]
+    fn window_ntile_uneven_buckets() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT name, NTILE(2) OVER (ORDER BY salary) AS b FROM e ORDER BY b, salary",
+        );
+        // 5 rows / 2 buckets: sizes 3+2.
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        assert_eq!(int_col(&r, 1), vec![1, 1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn window_aggregate_partition_and_running() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT name, salary, \
+             SUM(salary) OVER (PARTITION BY dept) AS dept_total, \
+             SUM(salary) OVER (ORDER BY salary) AS running \
+             FROM e ORDER BY salary",
+        );
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        assert_eq!(int_col(&r, 1), vec![10, 20, 20, 30, 40]);
+        // Whole-partition totals without ORDER BY.
+        assert_eq!(int_col(&r, 2), vec![50, 70, 70, 70, 50]);
+        // Default RANGE frame: running total includes the current peer run
+        // (y and z tie at 20 and share one total); the last row's frame is
+        // the whole partition.
+        assert_eq!(int_col(&r, 3), vec![10, 50, 50, 80, 120]);
+    }
+
+    #[test]
+    fn window_count_star_and_lag_lead() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT name, COUNT(*) OVER () AS all_rows, \
+             LAG(salary, 1, 0) OVER (ORDER BY salary) AS prev, \
+             LEAD(salary, 2) OVER (ORDER BY salary) AS next2 \
+             FROM e ORDER BY salary",
+        );
+        assert_eq!(int_col(&r, 1), vec![5, 5, 5, 5, 5]);
+        // LAG with default 0 at the first row; LEAD offset 2 over the end.
+        assert_eq!(int_col(&r, 2), vec![0, 10, 20, 20, 30]);
+        // LEAD offset 2 over the end of the last two rows.
+        let got: Vec<Option<i64>> = r
+            .rows
+            .iter()
+            .map(|row| match &row[3] {
+                Value::Int(i) => Some(*i),
+                Value::Null => None,
+                other => panic!("expected int or null, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![Some(20), Some(30), Some(40), None, None]);
+    }
+
+    #[test]
+    fn window_first_last_value() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT name, FIRST_VALUE(name) OVER (ORDER BY salary) AS fv, \
+             LAST_VALUE(name) OVER (ORDER BY salary) AS lv \
+             FROM e ORDER BY salary",
+        );
+        assert_eq!(str_col(&r, 1), vec!["p", "p", "p", "p", "p"]);
+        // Default frame ends at the current peer run: y/z share 'z'.
+        assert_eq!(str_col(&r, 2), vec!["p", "z", "z", "x", "q"]);
+    }
+
+    #[test]
+    fn window_in_expression_and_distinct() {
+        let mut db = win_db();
+        // Window call wrapped in arithmetic.
+        let r = rows(
+            &mut db,
+            "SELECT DISTINCT COUNT(*) OVER () + 100 AS c FROM e",
+        );
+        assert_eq!(int_col(&r, 0), vec![105]);
+        // DISTINCT applies after the window: ties dedup.
+        let r2 = rows(
+            &mut db,
+            "SELECT DISTINCT DENSE_RANK() OVER (ORDER BY salary) AS dk FROM e ORDER BY dk",
+        );
+        assert_eq!(int_col(&r2, 0), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn window_star_does_not_leak_private_columns() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM e WHERE id = 1",
+        );
+        assert!(r.columns.iter().all(|c| !c.ends_with('$')));
+        assert_eq!(r.columns.last().unwrap(), "rn");
+        assert_eq!(int_col(&r, 4), vec![1]);
+    }
+
+    #[test]
+    fn window_order_by_alias_of_window_column() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn FROM e ORDER BY rn LIMIT 2",
+        );
+        assert_eq!(int_col(&r, 0), vec![5, 1]);
+    }
+
+    #[test]
+    fn window_rejections_stay_loud() {
+        let mut db = win_db();
+        // In WHERE (row-local context cannot see other rows).
+        let e = db
+            .execute("SELECT id FROM e WHERE ROW_NUMBER() OVER () > 1")
+            .unwrap_err();
+        assert!(e.to_string().contains("window functions (OVER)"), "{e}");
+        // Combined with aggregates.
+        let e = db
+            .execute("SELECT dept, COUNT(*), ROW_NUMBER() OVER () FROM e GROUP BY dept")
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("not supported combined with GROUP BY"),
+            "{e}"
+        );
+        // Non-default frame.
+        let e = db
+            .execute(
+                "SELECT SUM(salary) OVER (ORDER BY salary \
+                 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM e",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("window frames"), "{e}");
+        // Named window (needs the WINDOW clause, which is refused).
+        let e = db.execute("SELECT RANK() OVER (w) FROM e").unwrap_err();
+        assert!(e.to_string().contains("WINDOW"), "{e}");
+        // Unknown window function.
+        let e = db.execute("SELECT FOO() OVER () FROM e").unwrap_err();
+        assert!(e.to_string().contains("unknown window function"), "{e}");
+        // IGNORE NULLS (standard position: after the argument list).
+        let e = db
+            .execute("SELECT FIRST_VALUE(name) IGNORE NULLS OVER (ORDER BY id) FROM e")
+            .unwrap_err();
+        assert!(e.to_string().contains("IGNORE NULLS"), "{e}");
+        // ORDER BY with a window call stays rejected by the row-local
+        // evaluator (windows are supported in the SELECT list only).
+        let e = db
+            .execute("SELECT id FROM e ORDER BY ROW_NUMBER() OVER ()")
+            .unwrap_err();
+        assert!(e.to_string().contains("window functions (OVER)"), "{e}");
+    }
+
+    #[test]
+    fn window_aggregate_filter_and_empty_input() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (v INT)");
+        // Zero rows: every window value is NULL/empty, never an error.
+        let r = rows(
+            &mut db,
+            "SELECT ROW_NUMBER() OVER (), SUM(v) OVER () FROM t",
+        );
+        assert!(r.rows.is_empty());
+        run(&mut db, "INSERT INTO t VALUES (1), (2), (3)");
+        let r = rows(
+            &mut db,
+            "SELECT v, SUM(v) FILTER (WHERE v > 1) OVER (ORDER BY v) FROM t",
+        );
+        // SUM over an empty frame is NULL, not 0.
+        let got: Vec<Option<i64>> = r
+            .rows
+            .iter()
+            .map(|row| match &row[1] {
+                Value::Int(i) => Some(*i),
+                Value::Null => None,
+                other => panic!("expected int or null, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![None, Some(2), Some(5)]);
     }
 }
 

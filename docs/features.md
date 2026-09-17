@@ -115,15 +115,20 @@ SELECT v > ANY (SELECT ...), v <> ALL (SELECT ...);      -- 量化比较(非相�
 SELECT a IS DISTINCT FROM b;                             -- NULL 安全比较
 SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(id, s);      -- 行值构造器
 SELECT CASE WHEN n > 0 THEN 'p' ELSE 'n' END FROM t;     -- CASE
+SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM t;   -- 窗口函数
+SELECT SUM(salary) OVER (PARTITION BY dept) FROM t;      -- 聚合窗口(默认帧)
 SELECT 'A' ILIKE 'a';                                    -- 大小写不敏感 LIKE
 SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉连接
 ```
 
 - 等值 JOIN 自动走 **hash join**(键按数值/编码归一化,索引只做超集、ON 逐候选终裁);
+- **窗口函数**:`ROW_NUMBER/RANK/DENSE_RANK/NTILE` + `LAG/LEAD/FIRST_VALUE/LAST_VALUE` +
+  聚合 OVER(默认 RANGE 帧,支持 FILTER);WHERE 后、DISTINCT/ORDER BY 前求值;
+  与 GROUP BY 混用、自定义帧、`WINDOW`/`QUALIFY` 显式报错;
 - 派生表(子查询作 FROM)、`SELECT *, expr`、`ROWNUM`、`DUAL` 支持;
 - **NULL / 软删语义**:`x != TRUE` 命中 NULL 与缺失字段(与 Mongo `$ne: true` 的软删过滤一致);
   单列 UNIQUE 允许多个 NULL,`CREATE UNIQUE INDEX` 复合唯一任一列 NULL 的行跳过整键(不判重);
-- 不支持(均显式报错,不静默吞掉):窗口函数(OVER)/`WINDOW`/`QUALIFY`、`DISTINCT ON`、
+- 不支持(均显式报错,不静默吞掉):`WINDOW`/`QUALIFY`、自定义窗口帧、`DISTINCT ON`、
   相关子查询、`WITH RECURSIVE`、`NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`/`SELECT TOP`、
   `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`;
@@ -140,6 +145,7 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 | 数值 | `ABS` `ROUND`(DECIMAL 精确、四舍五入半离零;FLOAT 保持浮点) |
 | 空值/条件 | `COALESCE` `IFNULL` `NULLIF` `NVL` `NVL2` `DECODE` |
 | 时间 | `NOW()` `CURRENT_TIMESTAMP`(TIMESTAMP 值);`TIMESTAMP '…'` 字面量、`CAST(... AS TIMESTAMP)`、`±` 毫秒算术(见 SQL 参考 · 时间值) |
+| 窗口 | `ROW_NUMBER RANK DENSE_RANK NTILE`;`LAG LEAD FIRST_VALUE LAST_VALUE`;聚合 OVER(`COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT/STRING_AGG`,支持 FILTER) |
 | 类型/自省 | `TYPEOF` `CAST(expr AS INT/REAL/DECIMAL/TEXT/BOOL/BLOB/...)` |
 | JSON 点读 | `JSON_EXTRACT(doc,'$.a.b[0]')` `JSON_TYPE` `JSON_VALID`(坏文本/缺路径返回 NULL) |
 | JSON 数组 | `JSON_ARRAY_CONTAINS(json_text, value)` 数组成员判定(EF 实体集合 `Contains` 的翻译目标;非数组/坏 JSON → false,NULL 文本 → NULL) |
