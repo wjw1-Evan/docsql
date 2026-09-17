@@ -58,14 +58,19 @@ ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'v'; -- 带 DEFAULT 时回填存量行;N
 ALTER TABLE t RENAME COLUMN a TO b;
 ALTER TABLE t DROP COLUMN c;                 -- 主键列不可删
 TRUNCATE TABLE [IF EXISTS] t;                -- 清空保留表结构
+TRUNCATE TABLE p CASCADE;                    -- 连带清空外键子表(传递闭包)
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON t (col);   -- 单列
 CREATE [UNIQUE] INDEX idx ON t (a, b);                  -- 复合(键按列序)
 DROP INDEX idx;
+CREATE [OR REPLACE] VIEW v AS SELECT ...;    -- 只读命名查询;SELECT 穿透
+DROP VIEW [IF EXISTS] v [CASCADE];           -- 引用检查;CASCADE 连带删依赖视图
 ```
 
-- 表级 `PRIMARY KEY` / `UNIQUE` / `CHECK` / `FOREIGN KEY` 均支持;`AUTOINCREMENT`/`AUTO_INCREMENT`;
+- 表级 `PRIMARY KEY` / `UNIQUE`(仅单列,复合请用 `CREATE UNIQUE INDEX`)/ `CHECK` / `FOREIGN KEY` 支持;`AUTOINCREMENT`/`AUTO_INCREMENT`;
 - PK 与表声明 UNIQUE 的 B+ 树**随建表自动创建**(`sqlite_autoindex_<表>_<n>`,派生展示);
-- `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;`CREATE VIEW`/`TRIGGER` 不支持(显式报错)。
+- `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;`CREATE TRIGGER`/`CREATE MATERIALIZED VIEW` 不支持(显式报错);
+- `CREATE TABLE ... INHERITS`/`WITHOUT ROWID` 等存储布局子句与 `DEFERRABLE`/`NULLS NOT DISTINCT`/`MATCH FULL` 等约束装饰显式报错,不静默忽略;
+- 删除基表/视图前做依赖检查(视图引用默认拒绝,`CASCADE` 连带删除);`DROP TABLE ... CASCADE` 移除引用子表的外键声明。
 
 ### 3.2 DML
 
@@ -92,7 +97,7 @@ SELECT [DISTINCT] *, expr AS alias
 FROM t
 LEFT JOIN u ON t.id = u.t_id            -- INNER/LEFT/RIGHT/FULL/CROSS;USING(col)
 WHERE a BETWEEN 1 AND 9 AND b IN (1,2) AND c LIKE 'x%' ESCAPE '!'
-GROUP BY dept HAVING COUNT(*) > 1        -- HAVING 必须配 GROUP BY
+GROUP BY dept HAVING COUNT(*) > 1        -- HAVING 配 GROUP BY 或聚合
 GROUP BY ROLLUP(dept), GROUPING SETS ((a), (b)), CUBE(a, b);   -- 分组扩展 + GROUPING()
 SELECT COUNT(*) FILTER (WHERE v > 2);    -- 聚合 FILTER
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]
@@ -116,9 +121,9 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 - 等值 JOIN 自动走 **hash join**(键按数值/编码归一化,索引只做超集、ON 逐候选终裁);
 - 派生表(子查询作 FROM)、`SELECT *, expr`、`ROWNUM`、`DUAL` 支持;
 - **NULL / 软删语义**:`x != TRUE` 命中 NULL 与缺失字段(与 Mongo `$ne: true` 的软删过滤一致);
-  单列 UNIQUE 允许多个 NULL,复合 UNIQUE 任一列 NULL 的行跳过整键(不判重);
+  单列 UNIQUE 允许多个 NULL,`CREATE UNIQUE INDEX` 复合唯一任一列 NULL 的行跳过整键(不判重);
 - 不支持(均显式报错,不静默吞掉):窗口函数(OVER)/`WINDOW`/`QUALIFY`、`DISTINCT ON`、
-  相关子查询、`WITH RECURSIVE`、无 GROUP BY 的 HAVING、`NATURAL JOIN`、`LATERAL`、
+  相关子查询、`WITH RECURSIVE`、`NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`/`SELECT TOP`、
   `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`;
   T-SQL 专有形式(变量 `@p`/`@@ROWCOUNT`、`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、
@@ -149,7 +154,22 @@ SAVEPOINT sp; ... ROLLBACK TO sp; ... RELEASE sp;
 - 事务内写不扇出,COMMIT 时整批作为一个写单元提交并复制;
 - `DOCSQL_ASYNC_COMMIT=1` 走组提交(约 2ms 丢失窗口);PUBLISH 推送前强制 fsync。
 
-### 3.6 并发读(MVCC 快照读)
+### 3.6 视图
+
+```sql
+CREATE [OR REPLACE] VIEW v AS SELECT ...;   -- 列清单不支持,给投影加别名
+DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 连带删
+```
+
+- 只读命名查询:SELECT 穿透(支持视图套视图、外层 WHERE/JOIN/GROUP BY 组合);
+  写语句(INSERT/UPDATE/DELETE/MERGE/TRUNCATE/ALTER/INDEX)对视图显式报错;
+- 建视图干跑校验(基表/列必须存在;自引用与传递闭包成环被拒);展开预算 16 层;
+- 授权按视图名发放:读视图只需视图授权(基表权限收口),写语句经视图读源需基表授权
+  (fail-closed 展开);删除视图同步清理授权记录;
+- 依赖完整性:删除基表/视图默认被依赖检查拒绝,`CASCADE` 连带删除依赖视图;
+- 备份/dump/join 快照按依赖拓扑序携带视图定义。
+
+### 3.7 并发读(MVCC 快照读)
 
 - SELECT 在读锁微秒级建立**无锁视图**后全程锁外执行:长查询不阻塞写入,写不阻塞读;
 - 快照依赖 WAL 历史;极端写压下快照被截断时读取**响亮报** `snapshot too old`(可重试),
@@ -164,7 +184,7 @@ SAVEPOINT sp; ... ROLLBACK TO sp; ... RELEASE sp;
 | 普通索引 | `CREATE INDEX` 单列;点查/范围探测走索引 |
 | 复合索引 | `CREATE INDEX idx ON t (a, b)`,键 = `Value::Array` 按列序;`a=? AND b=?` 点查、前导列前缀探测 |
 | 唯一索引 | `CREATE UNIQUE INDEX`;重复键在写入时拒绝 |
-| 约束唯一 | 表级 UNIQUE(含复合)由引擎判重;DECIMAL 按数值、Int/Float 跨类型数值比较 |
+| 约束唯一 | 表级单列 UNIQUE 与 `CREATE UNIQUE INDEX`(含复合)由引擎判重;DECIMAL 按数值、Int/Float 跨类型数值比较 |
 | 回收 | 模型/手工删索引即回收树;`DROP INDEX` 清理定义 |
 | 边界 | 无表达式索引、部分索引、JSON 路径索引;非前导列条件不走复合索引(结果仍正确) |
 

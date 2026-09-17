@@ -3780,6 +3780,44 @@ impl Database {
         Some(out)
     }
 
+    /// Views whose bodies directly read any of `targets` (one level).
+    /// Unparseable bodies contribute no edge — the CREATE would have
+    /// failed, and a corrupt catalog must not turn DROP into a panic.
+    fn direct_view_dependents(&self, targets: &[String]) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter(|(n, m)| m.is_view() && !targets.contains(n))
+            .filter(|(n, _)| {
+                self.view_base_tables(n)
+                    .is_some_and(|bases| bases.iter().any(|b| targets.contains(b)))
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Expand a DROP target list with dependent views. Without CASCADE a
+    /// dependent refuses the drop — the old code dropped the base object
+    /// and left the view dangling, failing only when someone SELECTed it.
+    /// With CASCADE the dependents join the drop set transitively (views
+    /// form a DAG), so restoring the schema order is never needed.
+    fn expand_view_dependents(&self, targets: &mut Vec<String>, cascade: bool) -> Result<()> {
+        loop {
+            let deps = self.direct_view_dependents(targets);
+            if deps.is_empty() {
+                return Ok(());
+            }
+            if !cascade {
+                return err(format!(
+                    "cannot drop {}: referenced by VIEW {} \
+                     (drop the view first or use CASCADE)",
+                    targets.join(", "),
+                    deps.join(", ")
+                ));
+            }
+            targets.extend(deps);
+        }
+    }
+
     /// Tables a statement READS (authorization input for user connections):
     /// every table referenced in a query's FROM/JOINs (derived tables and
     /// subqueries included — inside CTE bodies, projections and predicates
@@ -4939,6 +4977,24 @@ impl Database {
         self.pager.durable_lsn()
     }
 
+    /// Table/view grants for a dropped object are garbage: delete them
+    /// before the catalog change (recreating the same name must not
+    /// resurrect the old privileges). Autocommit statements; replay order
+    /// on peers is identical.
+    fn delete_grants_for(&mut self, names: &[String]) {
+        for name in names {
+            if !is_internal_table(name) {
+                let lit_name = crate::stmt::sql_string_literal(name);
+                self.execute(&format!(
+                    "DELETE FROM {} WHERE tbl = {}",
+                    crate::useradmin::GRANTS_TABLE,
+                    lit_name
+                ))
+                .ok();
+            }
+        }
+    }
+
     fn exec_stmt(&mut self, stmt: Statement) -> Result<ExecOutcome> {
         match stmt {
             Statement::CreateTable(create) => self.exec_create(create),
@@ -4947,8 +5003,16 @@ impl Database {
                 object_type,
                 names,
                 if_exists,
+                cascade,
+                purge,
                 ..
             } => {
+                if purge {
+                    // Hive's PURGE has no meaning for a database that always
+                    // reclaims storage; accepting it would imply a recycle
+                    // bin this engine does not have.
+                    return err("DROP ... PURGE is not supported");
+                }
                 if object_type == sqlparser::ast::ObjectType::Index {
                     // Composites roots removed below release their tree in
                     // the same catalog transaction; pages staged here never
@@ -5050,12 +5114,12 @@ impl Database {
                     return Ok(ExecOutcome::Affected(0));
                 }
                 if object_type == sqlparser::ast::ObjectType::View {
-                    // Views have no storage: drop the catalog entry only.
+                    // Views have no storage: drop the catalog entries only.
                     // DROP TABLE on a view errors (wrong-kind mismatch), and
                     // so does DROP VIEW on a table. Validate the whole list
                     // before touching the catalog — a mid-list failure must
                     // not leave earlier names already dropped and committed.
-                    let dropping: Vec<String> = names.iter().map(obj_name).collect();
+                    let mut dropping: Vec<String> = names.iter().map(obj_name).collect();
                     for name in &dropping {
                         match self.tables.get(name) {
                             None if if_exists => {}
@@ -5068,6 +5132,10 @@ impl Database {
                             Some(_) => {}
                         }
                     }
+                    // A dependent view left behind used to fail only at the
+                    // next SELECT; refuse without CASCADE, join with it.
+                    self.expand_view_dependents(&mut dropping, cascade)?;
+                    self.delete_grants_for(&dropping);
                     let mut tx = self.pager.begin_tx();
                     for name in &dropping {
                         self.tables.remove(name);
@@ -5091,47 +5159,77 @@ impl Database {
                 // only, and dropping a table other tables still reference
                 // leaves dangling FKs (their inserts fail and the join
                 // snapshot can never replay).
-                let dropping: Vec<String> = names.iter().map(obj_name).collect();
-                for name in &dropping {
+                let mut dropping: Vec<String> = names.iter().map(obj_name).collect();
+                // Dependent views: refuse without CASCADE (the dangling view
+                // used to fail only at SELECT time), join the drop set with
+                // it. Views are catalog-only, so they never hit the FK or
+                // storage paths below. Missing targets (IF EXISTS) cannot
+                // block a drop — their legacy dangling views join a CASCADE
+                // instead.
+                if cascade {
+                    self.expand_view_dependents(&mut dropping, true)?;
+                } else {
+                    let mut existing: Vec<String> = dropping
+                        .iter()
+                        .filter(|n| self.tables.contains_key(*n))
+                        .cloned()
+                        .collect();
+                    self.expand_view_dependents(&mut existing, false)?;
+                }
+                let view_dropping: Vec<String> = dropping
+                    .iter()
+                    .filter(|n| self.tables.get(*n).is_some_and(|m| m.is_view()))
+                    .cloned()
+                    .collect();
+                let table_dropping: Vec<String> = dropping
+                    .iter()
+                    .filter(|n| !self.tables.get(*n).is_some_and(|m| m.is_view()))
+                    .cloned()
+                    .collect();
+                let drop_set: std::collections::BTreeSet<&str> =
+                    table_dropping.iter().map(|s| s.as_str()).collect();
+                let mut fk_removals: Vec<String> = Vec::new();
+                for name in &table_dropping {
                     if !self.tables.contains_key(name) {
                         if if_exists {
                             continue;
                         }
                         return err(format!("table {name} does not exist"));
                     }
-                    let referencing: Vec<&str> = self
+                    let referencing: Vec<String> = self
                         .tables
                         .iter()
                         .filter(|(t, m)| {
                             t.as_str() != name.as_str()
-                                && !dropping.iter().any(|d| d == t.as_str())
+                                && !drop_set.contains(t.as_str())
                                 && m.foreign_keys.iter().any(|(_, rt, _)| rt == name)
                         })
-                        .map(|(t, _)| t.as_str())
+                        .map(|(t, _)| t.clone())
                         .collect();
                     if !referencing.is_empty() {
-                        return err(format!(
-                            "cannot drop table {name}: referenced by FOREIGN KEY in {}",
-                            referencing.join(", ")
-                        ));
+                        if !cascade {
+                            return err(format!(
+                                "cannot drop table {name}: referenced by FOREIGN KEY in {}",
+                                referencing.join(", ")
+                            ));
+                        }
+                        fk_removals.extend(referencing);
                     }
                 }
-                // Table grants for a dropped table are garbage: clean them
-                // before the catalog change (autocommit statements; replay
-                // order on peers is identical).
-                for name in &dropping {
-                    if !is_internal_table(name) {
-                        let lit_name = crate::stmt::sql_string_literal(name);
-                        self.execute(&format!(
-                            "DELETE FROM {} WHERE tbl = {}",
-                            crate::useradmin::GRANTS_TABLE,
-                            lit_name
-                        ))
-                        .ok();
-                    }
-                }
+                fk_removals.sort();
+                fk_removals.dedup();
+                self.delete_grants_for(&dropping);
                 let mut tx = self.pager.begin_tx();
-                for name in &dropping {
+                // CASCADE drops the referencing FK declarations along with
+                // the table (PostgreSQL semantics): the child table stays,
+                // its constraint on the vanished parent goes.
+                for child in &fk_removals {
+                    if let Some(meta) = self.catalog_mut(child) {
+                        meta.foreign_keys
+                            .retain(|(_, rt, _)| !drop_set.contains(rt.as_str()));
+                    }
+                }
+                for name in &table_dropping {
                     if let Some(meta) = self.tables.get(name) {
                         self.free_table_storage(&mut tx, meta)?;
                     }
@@ -5141,6 +5239,9 @@ impl Database {
                     // table's watermark — replicas that restarted compute a
                     // different value and the nodes diverge.
                     self.autoinc_cache.remove(name);
+                }
+                for name in &view_dropping {
+                    self.tables.remove(name);
                 }
                 self.save_catalog_into(&mut tx)?;
                 self.commit_pager_tx(tx)?;
@@ -5238,8 +5339,44 @@ impl Database {
                 // earlier tables already emptied and committed while the
                 // failed statement never reaches the journal — replicas
                 // would keep rows the origin lost.
-                let targets: Vec<String> =
+                if tr.partitions.is_some() || tr.on_cluster.is_some() {
+                    return err("TRUNCATE partitions/ON CLUSTER are not supported");
+                }
+                if tr.identity == Some(sqlparser::ast::TruncateIdentityOption::Continue) {
+                    // The AUTOINCREMENT watermark is derived from the live
+                    // rows, so truncation necessarily restarts it; honoring
+                    // CONTINUE IDENTITY would require a sequence store the
+                    // engine does not have.
+                    return err("TRUNCATE ... CONTINUE IDENTITY is not supported");
+                }
+                let mut targets: Vec<String> =
                     tr.table_names.iter().map(|t| obj_name(&t.name)).collect();
+                for t in &tr.table_names {
+                    if t.only {
+                        return err("TRUNCATE ... ONLY is not supported (no inheritance)");
+                    }
+                }
+                // CASCADE used to be accepted and ignored (the FK guard then
+                // rejected the truncate whenever child rows existed). Honor
+                // it: referencing tables join the target list transitively,
+                // PostgreSQL-style; RESTRICT/no clause keeps the old guard.
+                if tr.cascade == Some(sqlparser::ast::CascadeOption::Cascade) {
+                    loop {
+                        let referencing: Vec<String> = self
+                            .tables
+                            .iter()
+                            .filter(|(t, m)| {
+                                !targets.contains(t)
+                                    && m.foreign_keys.iter().any(|(_, rt, _)| targets.contains(rt))
+                            })
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        if referencing.is_empty() {
+                            break;
+                        }
+                        targets.extend(referencing);
+                    }
+                }
                 for name in &targets {
                     if !self.tables.contains_key(name) && !tr.if_exists {
                         return err(format!("table {name} does not exist"));
@@ -6658,6 +6795,32 @@ impl Database {
         if create.strict || create.comment.is_some() {
             return err("CREATE TABLE engine/comment options are not supported");
         }
+        // Storage/layout clauses the GenericDialect parses but the engine
+        // cannot honor. They used to be dropped silently (same red-line
+        // class as the options above): inheriting columns, rowid layout,
+        // Hive/Redshift placement and partition bounds all change what the
+        // statement means, so refusing loudly is the only honest answer.
+        if create.inherits.is_some()
+            || create.without_rowid
+            || create.on_commit.is_some()
+            || create.on_cluster.is_some()
+            || create.partition_of.is_some()
+            || create.for_values.is_some()
+            || create.location.is_some()
+            || create.file_format.is_some()
+            || create.clustered_by.is_some()
+            || !matches!(
+                create.hive_distribution,
+                sqlparser::ast::HiveDistributionStyle::NONE
+            )
+            || create.hive_formats.is_some()
+            || create.diststyle.is_some()
+            || create.distkey.is_some()
+            || create.sortkey.is_some()
+            || create.backup.is_some()
+        {
+            return err("CREATE TABLE storage/partitioning options are not supported");
+        }
         // CREATE TABLE ... AS SELECT: shape and rows come from the query.
         // (`temporary` is accepted and treated as a regular table.)
         if let Some(q) = &create.query {
@@ -6688,8 +6851,22 @@ impl Database {
         for col in &create.columns {
             for opt in &col.options {
                 match &opt.option {
-                    CO::PrimaryKey { .. } => meta.primary_key = Some(col.name.value.clone()),
-                    CO::Unique { .. } => {
+                    CO::PrimaryKey(pk) => {
+                        reject_constraint_decorations(
+                            "PRIMARY KEY",
+                            pk.characteristics.as_ref(),
+                            None,
+                            None,
+                        )?;
+                        meta.primary_key = Some(col.name.value.clone());
+                    }
+                    CO::Unique(u) => {
+                        reject_constraint_decorations(
+                            "UNIQUE",
+                            u.characteristics.as_ref(),
+                            Some(&u.nulls_distinct),
+                            None,
+                        )?;
                         meta.unique.push(col.name.value.clone());
                         meta.constraint_unique.push(col.name.value.clone());
                     }
@@ -6708,6 +6885,12 @@ impl Database {
                         meta.checks.push(format!("{}", c.expr))
                     }
                     CO::ForeignKey(fk) => {
+                        reject_constraint_decorations(
+                            "FOREIGN KEY",
+                            fk.characteristics.as_ref(),
+                            None,
+                            fk.match_kind.as_ref(),
+                        )?;
                         if fk.on_delete.is_some() || fk.on_update.is_some() {
                             return err(
                                 "FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
@@ -6752,6 +6935,12 @@ impl Database {
             use sqlparser::ast::TableConstraint as TC;
             match c {
                 TC::Unique(u) => {
+                    reject_constraint_decorations(
+                        "UNIQUE",
+                        u.characteristics.as_ref(),
+                        Some(&u.nulls_distinct),
+                        None,
+                    )?;
                     // A multi-column constraint would need a composite unique
                     // tree; declaring it as per-column uniques silently
                     // changes the semantics (any single column becomes
@@ -6769,6 +6958,12 @@ impl Database {
                     }
                 }
                 TC::PrimaryKey(pk) => {
+                    reject_constraint_decorations(
+                        "PRIMARY KEY",
+                        pk.characteristics.as_ref(),
+                        None,
+                        None,
+                    )?;
                     // DocSQL has single-column primary keys; a composite key
                     // must not silently degrade to its first column.
                     if pk.columns.len() != 1 {
@@ -6788,6 +6983,12 @@ impl Database {
                     meta.checks.push(format!("{}", chk.expr))
                 }
                 TC::ForeignKey(fk) => {
+                    reject_constraint_decorations(
+                        "FOREIGN KEY",
+                        fk.characteristics.as_ref(),
+                        None,
+                        fk.match_kind.as_ref(),
+                    )?;
                     if fk.on_delete.is_some() || fk.on_update.is_some() {
                         return err("FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
                              (declare the constraint and keep parent keys stable)");
@@ -8754,10 +8955,12 @@ fn contains_agg(e: &SqlExpr) -> bool {
 
 /// Build a rows result from RETURNING items over the affected documents.
 fn project_returning(items: &[SelectItem], docs: &[Object]) -> Result<ExecOutcome> {
+    let mut want_star = false;
     let mut columns = Vec::new();
     let mut exprs = Vec::new();
     for item in items {
         match item {
+            SelectItem::Wildcard(_) => want_star = true,
             SelectItem::UnnamedExpr(e) => {
                 columns.push(expr_name(e));
                 exprs.push(e.clone());
@@ -8769,9 +8972,25 @@ fn project_returning(items: &[SelectItem], docs: &[Object]) -> Result<ExecOutcom
             _ => return err("unsupported RETURNING item"),
         }
     }
+    // `RETURNING *` projects like `SELECT *`: the returned documents' field
+    // union, ordered, missing fields as NULL. It used to be documented but
+    // rejected here because only the expression arms were wired up.
+    if want_star {
+        let mut star_cols = union_of_fields(docs);
+        star_cols.extend(columns);
+        columns = star_cols;
+    }
+    let base = columns.len() - exprs.len();
     let mut rows = Vec::new();
     for doc in docs {
-        let mut row = Vec::with_capacity(exprs.len());
+        let mut row = Vec::with_capacity(columns.len());
+        if want_star {
+            row.extend(
+                columns[..base]
+                    .iter()
+                    .map(|c| doc.get(c).cloned().unwrap_or(Value::Null)),
+            );
+        }
         for e in &exprs {
             row.push(eval_expr(e, doc)?);
         }
@@ -8795,6 +9014,51 @@ fn str_list(m: &Object, key: &str) -> Vec<String> {
 fn is_guid_type(dt: &sqlparser::ast::DataType) -> bool {
     let t = dt.to_string().trim().to_uppercase();
     matches!(t.as_str(), "GUID" | "UUID" | "UNIQUEIDENTIFIER" | "UUIDV7")
+}
+
+/// Reject constraint decorations the engine cannot honor instead of silently
+/// dropping them (house red line). `DEFERRABLE` / `INITIALLY DEFERRED`
+/// promise check-at-commit, `NOT ENFORCED` promises no checking, `NULLS NOT
+/// DISTINCT` changes duplicate handling and `MATCH FULL/PARTIAL` changes null
+/// treatment — all semantics this engine does not implement, so accepting
+/// them would lie about what the constraint does. No-op spellings that
+/// describe the existing behavior (`NOT DEFERRABLE`, `INITIALLY IMMEDIATE`,
+/// `ENFORCED`, `MATCH SIMPLE`, `NULLS DISTINCT`) stay accepted.
+fn reject_constraint_decorations(
+    what: &str,
+    characteristics: Option<&sqlparser::ast::ConstraintCharacteristics>,
+    nulls_distinct: Option<&sqlparser::ast::NullsDistinctOption>,
+    match_kind: Option<&sqlparser::ast::ConstraintReferenceMatchKind>,
+) -> Result<()> {
+    use sqlparser::ast::{
+        ConstraintReferenceMatchKind as MatchKind, DeferrableInitial, NullsDistinctOption,
+    };
+    if let Some(ch) = characteristics {
+        if ch.deferrable == Some(true) {
+            return err(format!(
+                "{what}: DEFERRABLE constraints are not supported (checks are immediate)"
+            ));
+        }
+        if ch.initially == Some(DeferrableInitial::Deferred) {
+            return err(format!(
+                "{what}: INITIALLY DEFERRED constraints are not supported (checks are immediate)"
+            ));
+        }
+        if ch.enforced == Some(false) {
+            return err(format!(
+                "{what}: NOT ENFORCED constraints are not supported (checks always run)"
+            ));
+        }
+    }
+    if matches!(nulls_distinct, Some(NullsDistinctOption::NotDistinct)) {
+        return err(format!("{what}: NULLS NOT DISTINCT is not supported"));
+    }
+    if matches!(match_kind, Some(MatchKind::Full) | Some(MatchKind::Partial)) {
+        return err(format!(
+            "{what}: MATCH FULL/PARTIAL is not supported (MATCH SIMPLE semantics)"
+        ));
+    }
+    Ok(())
 }
 
 /// SQL literal for a value carried over into a replicated statement.
@@ -14123,6 +14387,37 @@ mod tests {
     }
 
     #[test]
+    fn returning_star_projects_changed_documents() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, v TEXT)");
+        let r = rows(&mut db, "INSERT INTO t VALUES (1, 'a') RETURNING *");
+        assert_eq!(r.columns, vec!["id".to_string(), "v".to_string()]);
+        assert_eq!(r.rows, vec![vec![Value::Int(1), Value::Str("a".into())]]);
+        // Schemaless docs: the changed set's field union picks the columns;
+        // `RETURNING *, expr` appends the explicit projection after the star.
+        run(&mut db, "INSERT INTO t (id, extra) VALUES (2, 'x')");
+        let r = rows(
+            &mut db,
+            "UPDATE t SET v = 'b' WHERE id = 1 RETURNING *, v AS twice",
+        );
+        assert_eq!(
+            r.columns,
+            vec!["id".to_string(), "v".to_string(), "twice".to_string()]
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                Value::Int(1),
+                Value::Str("b".into()),
+                Value::Str("b".into())
+            ]]
+        );
+        let r = rows(&mut db, "DELETE FROM t WHERE id = 2 RETURNING *");
+        assert_eq!(r.columns, vec!["extra".to_string(), "id".to_string()]);
+        assert_eq!(r.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
+    }
+
+    #[test]
     fn information_schema_lists_tables_and_columns() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE alpha (x INT NOT NULL, y TEXT)");
@@ -15979,6 +16274,46 @@ mod tests {
     }
 
     #[test]
+    fn create_table_rejects_ignored_layout_clauses() {
+        // These parsed and were dropped on the floor before (the same red
+        // line the storage/partitioning guard exists for): inheriting
+        // columns, rowid layout, Hive/Redshift placement/partitioning and
+        // constraint decorations all change what the statement means.
+        let mut db = Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE t (a INT) INHERITS (base)",
+            "CREATE TABLE t (a INT) WITHOUT ROWID",
+            "CREATE TABLE t (a INT) ON COMMIT DROP",
+            "CREATE TABLE t (a INT) LOCATION '/x'",
+            "CREATE TABLE t (a INT) STORED AS PARQUET",
+            "CREATE TABLE t (a INT) CLUSTERED BY (a) INTO 4 BUCKETS",
+            "CREATE TABLE t (a INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY ','",
+            "CREATE TABLE t (a INT, UNIQUE NULLS NOT DISTINCT (a))",
+            "CREATE TABLE t (a INT UNIQUE DEFERRABLE)",
+            "CREATE TABLE t (a INT UNIQUE NOT ENFORCED)",
+            "CREATE TABLE t (a INT PRIMARY KEY DEFERRABLE)",
+            "CREATE TABLE t (a INT, PRIMARY KEY (a) INITIALLY DEFERRED)",
+        ] {
+            assert!(db.execute(sql).is_err(), "accepted silently: {sql}");
+        }
+        assert!(db.execute("SELECT * FROM t").is_err());
+        run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+        let e = db
+            .execute("CREATE TABLE c (pid INT REFERENCES p(id) MATCH FULL)")
+            .unwrap_err();
+        assert!(e.to_string().contains("MATCH FULL"), "{e}");
+        // No-op spellings describe the behavior the engine already has.
+        run(
+            &mut db,
+            "CREATE TABLE ok (a INT UNIQUE NOT DEFERRABLE, b INT, UNIQUE NULLS DISTINCT (b))",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE ok2 (a INT, PRIMARY KEY (a) INITIALLY IMMEDIATE)",
+        );
+    }
+
+    #[test]
     fn qualified_wildcard_rejected() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE t (a INT)");
@@ -16228,6 +16563,97 @@ mod tests {
         run(&mut db, "INSERT INTO t VALUES (1, 'again')");
         let e = db.execute("INSERT INTO t VALUES (1, 'clash')").unwrap_err();
         assert!(e.to_string().contains("UNIQUE"), "{e}");
+    }
+
+    #[test]
+    fn drop_refuses_dangling_views_and_cascade_cleans_up() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "CREATE VIEW v AS SELECT * FROM t");
+        run(&mut db, "CREATE VIEW v2 AS SELECT * FROM v");
+        // Without CASCADE the drop refuses instead of leaving broken views.
+        let e = db.execute("DROP TABLE t").unwrap_err();
+        assert!(e.to_string().contains("referenced by VIEW"), "{e}");
+        let e = db.execute("DROP VIEW v").unwrap_err();
+        assert!(e.to_string().contains("referenced by VIEW"), "{e}");
+        // Sanity: nothing was dropped by the refused statements.
+        run(&mut db, "SELECT * FROM v2");
+        run(&mut db, "DROP TABLE t CASCADE");
+        assert!(db.execute("SELECT * FROM v").is_err());
+        assert!(db.execute("SELECT * FROM v2").is_err());
+        // View-of-view cascade drops the whole chain.
+        run(&mut db, "CREATE TABLE u (a INT)");
+        run(&mut db, "CREATE VIEW w1 AS SELECT * FROM u");
+        run(&mut db, "CREATE VIEW w2 AS SELECT * FROM w1");
+        run(&mut db, "DROP VIEW w1 CASCADE");
+        assert!(db.execute("SELECT * FROM w2").is_err());
+        // IF EXISTS with a missing name is not blocked by anything.
+        run(&mut db, "DROP TABLE IF EXISTS missing CASCADE");
+    }
+
+    #[test]
+    fn drop_table_cascade_removes_referencing_fks() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+        run(&mut db, "CREATE TABLE c (pid INT REFERENCES p(id))");
+        let e = db.execute("DROP TABLE p").unwrap_err();
+        assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+        assert!(db.execute("DROP TABLE p PURGE").is_err());
+        run(&mut db, "DROP TABLE p CASCADE");
+        // The child table stays; only its constraint on the vanished
+        // parent goes (PostgreSQL CASCADE semantics).
+        run(&mut db, "INSERT INTO c VALUES (99)");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM c").rows[0][0],
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn truncate_cascade_truncates_referencing_tables() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+        run(&mut db, "CREATE TABLE c (pid INT REFERENCES p(id))");
+        run(&mut db, "CREATE TABLE g (cpid INT REFERENCES c(pid))");
+        run(&mut db, "INSERT INTO p VALUES (1)");
+        run(&mut db, "INSERT INTO c VALUES (1)");
+        // Plain TRUNCATE still refuses to orphan child rows.
+        assert!(db.execute("TRUNCATE TABLE p").is_err());
+        run(&mut db, "TRUNCATE TABLE p CASCADE");
+        for t in ["p", "c", "g"] {
+            assert_eq!(
+                rows(&mut db, &format!("SELECT COUNT(*) FROM {t}")).rows[0][0],
+                Value::Int(0),
+                "{t}"
+            );
+        }
+        // Explicitly written options the engine cannot honor refuse loudly.
+        assert!(db.execute("TRUNCATE TABLE p CONTINUE IDENTITY").is_err());
+        assert!(db.execute("TRUNCATE TABLE ONLY p").is_err());
+        assert!(db.execute("TRUNCATE TABLE p PARTITION (x)").is_err());
+        assert!(db.execute("TRUNCATE TABLE p ON CLUSTER c").is_err());
+        assert!(db.execute("TRUNCATE TABLE p RESTART IDENTITY").is_ok());
+        run(&mut db, "TRUNCATE TABLE p, c"); // comma list still supported
+    }
+
+    #[test]
+    fn drop_view_cleans_stale_grants() {
+        // A grant on a dropped view must not survive to a later view of the
+        // same name (privilege persistence across DROP/CREATE).
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "CREATE VIEW v AS SELECT * FROM t");
+        run(&mut db, "CREATE USER u PASSWORD 'pw123456'");
+        run(&mut db, "GRANT SELECT ON v TO u");
+        let count = |db: &mut Database| -> i64 {
+            match rows(db, "SELECT COUNT(*) FROM docsql_grants WHERE tbl = 'v'").rows[0][0] {
+                Value::Int(n) => n,
+                ref other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(count(&mut db), 1);
+        run(&mut db, "DROP VIEW v");
+        assert_eq!(count(&mut db), 0);
     }
 
     // ---- SQL completeness: predicates & expressions -------------------
@@ -17526,10 +17952,10 @@ mod tests {
                 "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id > 0",
             );
             run(&mut db, "INSERT INTO t VALUES (1, 'a')");
-            run(&mut db, "DROP TABLE t");
-            // 视图指向已删表:SELECT 响亮报错(SQLite 语义),dump 时该视图
-            // 的 CREATE 会因基表缺失而失败——生产路径应先 DROP VIEW;
-            // 本测试转而在删除表之前导出。
+            // 视图指向的表不带 CASCADE 删除会被拒绝;CASCADE 连带删视图。
+            let e = db.execute("DROP TABLE t").unwrap_err();
+            assert!(e.to_string().contains("referenced by VIEW"), "{e}");
+            run(&mut db, "DROP TABLE t CASCADE");
             assert!(db.execute("SELECT * FROM v").is_err());
             run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
             run(

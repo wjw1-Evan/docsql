@@ -5,6 +5,33 @@
 
 ## [未发布]
 
+### 功能缺口审查修复(2026-09-17)
+
+#### 修复
+
+- **`RETURNING *` 落地**:SQL 参考与功能总览一直声明支持,DML 实现却只认
+  表达式/别名,INSERT/UPDATE/DELETE 带 `*` 一律报「unsupported RETURNING
+  item」。现按 `SELECT *` 的动态投影展开(变更文档的字段并集、按名排序,
+  `RETURNING *, expr` 把显式投影追加在星号列之后);
+- **子句级静默忽略清零**:`CREATE TABLE ... INHERITS`/`WITHOUT ROWID`/
+  `ON COMMIT`/`LOCATION`/`STORED AS`/`CLUSTERED BY`/Hive-Redshift 分布与分区、
+  列/表级 `DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/
+  `NULLS NOT DISTINCT`/`MATCH FULL|PARTIAL` 此前被解析后丢弃,现全部显式报错;
+  等价的空操作写法(`NOT DEFERRABLE`/`INITIALLY IMMEDIATE`/`ENFORCED`/
+  `MATCH SIMPLE`/`NULLS DISTINCT`)继续接受;
+- **删除/清空的依赖完整性**:`DROP TABLE`/`DROP VIEW` 此前会留下指向已删对象的
+  悬空视图(下次 SELECT 才报错),现在默认拒绝并列出依赖视图,`CASCADE` 连带
+  删除(含视图套视图);`DROP TABLE ... CASCADE` 同时从引用子表移除指向该表的
+  外键声明(子表保留);`TRUNCATE ... CASCADE` 现在真正连带清空外键子表
+  (传递闭包;此前 CASCADE 被忽略、仍按 RESTRICT 报错);删除视图同步清理其
+  授权记录(同名重建不再继承旧权限);`DROP ... PURGE`、
+  `TRUNCATE ... CONTINUE IDENTITY`/`ONLY`/分区/`ON CLUSTER` 显式报错
+  (此前部分被忽略);
+- **文档同步**:SQL 参考补上缺失的 CREATE VIEW / DROP VIEW 章节、TRUNCATE/DROP
+  依赖与 CASCADE 语义、CREATE TABLE 拒绝清单;修正「DROP VIEW / CREATE VIEW
+  不支持」等过期描述与功能总览中表级复合 PK/UNIQUE、无 GROUP BY 的 HAVING
+  等漂移条目。
+
 ### MVCC 快照跨纪元历史补全(2026-09-17)
 
 #### 修复

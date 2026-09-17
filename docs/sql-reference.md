@@ -17,6 +17,7 @@ DocSQL 的 SQL 方言以 **SQL 标准**为基准，并兼容 SQLite（`sqlite_ma
 - [CREATE TABLE](#create-table)
 - [ALTER TABLE](#alter-table)
 - [TRUNCATE TABLE / DROP TABLE](#truncate-table--drop-table)
+- [CREATE VIEW / DROP VIEW](#create-view--drop-view)
 - [CREATE INDEX / DROP INDEX](#create-index--drop-index)
 - [事务语句](#事务语句)
 - [用户与角色语句](#用户与角色语句)
@@ -483,6 +484,14 @@ CREATE TABLE [ IF NOT EXISTS ] table_name AS SELECT ...
 
 - 主键与 UNIQUE 约束的 B+ 树随建表创建，`sqlite_master` 以 `sqlite_autoindex_<表>_<n>` 派生展示（不落 catalog，不可 `DROP INDEX`）。
 - `docsql_users`/`docsql_roles`/`docsql_role_members`/`docsql_grants` 为保留表名，普通 DDL/DML 拒绝。
+- 存储/布局子句（`INHERITS`、`WITHOUT ROWID`、`ON COMMIT`、`LOCATION`、`STORED AS`、
+  `CLUSTERED BY`、Hive/Redshift 分布与分区等）显式报错，不静默忽略。
+- 约束装饰（`DEFERRABLE`、`INITIALLY DEFERRED`、`NOT ENFORCED`、
+  `NULLS NOT DISTINCT`、`MATCH FULL/PARTIAL`）显式报错；等价的空操作写法
+  （`NOT DEFERRABLE`、`INITIALLY IMMEDIATE`、`ENFORCED`、`MATCH SIMPLE`、
+  `NULLS DISTINCT`）接受。
+- `TEMPORARY` 关键字被接受：引擎没有会话级临时表，一律按普通持久表处理
+  （与 CTAS 的 `TEMPORARY` 一致）。
 
 ### CREATE TABLE 示例
 
@@ -543,21 +552,76 @@ ALTER TABLE users RENAME TO members;
 
 ```sql
 TRUNCATE TABLE [ IF EXISTS ] table_name [ , ...n ]
-DROP TABLE [ IF EXISTS ] table_name [ , ...n ]
+    [ RESTART IDENTITY | CONTINUE IDENTITY ] [ CASCADE | RESTRICT ]
+DROP TABLE [ IF EXISTS ] table_name [ , ...n ] [ CASCADE | RESTRICT ]
 ```
 
 ### 备注
 
 - `TRUNCATE` 清空数据、保留表结构与索引，可一次指定多张表。
+- `TRUNCATE ... CASCADE`：引用目标表的外键子表（传递闭包）一并清空；
+  默认/`RESTRICT` 在子表仍有引用行时报错。`CONTINUE IDENTITY` 显式报错
+  （`AUTOINCREMENT` 水位由现存行推导，清空后必然重置）；分区 / `ON CLUSTER` /
+  `ONLY` 同样显式报错。
 - `DROP TABLE` 删除前会校验外键引用：仍被其他表引用时报错；多表删除先整体校验再应用。
-- 其他对象类型不支持（`DROP VIEW`/`DROP TRIGGER` 报错）。
+  `DROP TABLE ... CASCADE` 连带删除依赖它的视图，并从引用子表移除指向该表的外键声明
+  （子表本身保留）。
+- `DROP ... PURGE` 显式报错。删除被视图引用的表请先 `DROP VIEW` 或用 `CASCADE`。
 
 ### 示例
 
 ```sql
 TRUNCATE TABLE staging, staging2;
+TRUNCATE TABLE parent CASCADE;      -- 连带清空外键子表
 DROP TABLE IF EXISTS staging2;
+DROP TABLE parent CASCADE;          -- 连带删依赖视图/移除子表外键声明
+DROP VIEW IF EXISTS active_users;
 ```
+
+## CREATE VIEW / DROP VIEW
+
+把一条 SELECT 存为只读命名查询。
+
+### 语法
+
+```sql
+CREATE [ OR REPLACE ] VIEW view_name AS SELECT ...
+DROP VIEW [ IF EXISTS ] view_name [ , ...n ] [ CASCADE | RESTRICT ]
+```
+
+### 参数
+
+| 参数 | 说明 |
+|---|---|
+| `OR REPLACE` | 同名视图已存在时整体替换定义；同名对象是表时显式报错 |
+| `AS SELECT` | 建视图时干跑校验：基表/列必须存在，自引用与传递闭包成环被拒；`SELECT` 展开预算 16 层 |
+| 列清单 | 不支持（给投影加别名即可） |
+| `MATERIALIZED` / `SECURE` / `WITH NO SCHEMA BINDING` | 显式报错 |
+
+### 备注
+
+- 视图只存定义、不占存储；SELECT 穿透视图执行（支持视图套视图与外层
+  WHERE/JOIN/GROUP BY 组合），外层写语句对视图显式报错
+  （INSERT/UPDATE/DELETE/MERGE/TRUNCATE/ALTER/INDEX）。
+- 授权按视图名发放：读视图只需视图授权（基表权限被收口），写语句经视图读源
+  需要基表授权（fail-closed 展开）。
+- `dump_script()`/备份/join 快照按依赖拓扑序携带视图；`sqlite_master`
+  只列 `type='view'` 定义。
+- 删除基表或视图前做依赖检查，默认拒绝；`CASCADE` 连带删除依赖视图；
+  删除视图时同步清理其授权记录。
+
+### 示例
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY NOT NULL, name TEXT);
+
+CREATE VIEW active_users AS SELECT id, name FROM users WHERE id > 0;
+CREATE OR REPLACE VIEW active_users AS SELECT id FROM users;
+
+SELECT * FROM active_users WHERE id = 1;   -- 外层过滤穿透视图
+DROP VIEW active_users;
+```
+
 
 ## CREATE INDEX / DROP INDEX
 
@@ -790,7 +854,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | DML | `OUTPUT INSERTED/DELETED...`（用 `RETURNING`）、`MERGE ... OUTPUT`、`MERGE WHEN MATCHED THEN DELETE`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` 多表删除（用 `DELETE ... USING`） |
 | DDL | `#temp`/`##temp` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
 | 目录 | `sys.*`/`sysobjects`（报错并指向 `information_schema`/`sqlite_master`） |
-| 语句/过程 | `USE`、`SET`、`DECLARE`、`PRINT`、`EXEC`、`WAITFOR`、`IF`、`TRY/CATCH`、`DENY`、`CREATE PROCEDURE/TRIGGER/VIEW/SCHEMA/SEQUENCE` |
+| 语句/过程 | `USE`、`SET`、`DECLARE`、`PRINT`、`EXEC`、`WAITFOR`、`IF`、`TRY/CATCH`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE` |
 | 函数 | `GETDATE`、`NEWID`、`DATEPART`、`DATEDIFF`、`CONVERT`/`TRY_CONVERT`、`IIF`、`CHARINDEX`、`REPLACE`、`LEFT`/`RIGHT`、`STRING_SPLIT`、`SERVERPROPERTY`、`OBJECT_ID`、`DB_NAME`、`HOST_NAME`、`SUSER_SNAME`、`SCOPE_IDENTITY` 等（均返回 `unknown function`） |
 
 窗口函数（`OVER`）、递归 CTE、`CROSS APPLY` 等结构性缺口见[不支持的语法](#不支持的语法)。
@@ -808,7 +872,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 子查询/CTE | 相关子查询、`WITH RECURSIVE` |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
-| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE VIEW`、`CREATE TRIGGER`、`ALTER TABLE` 的改约束/改类型 |
+| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
 | T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、`@` 变量/参数、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`N'...'`、`[方括号]` 标识符、`'a' + 'b'`（用 `\|\|`）、`CROSS/OUTER APPLY`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |
