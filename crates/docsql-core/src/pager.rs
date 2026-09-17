@@ -14,7 +14,12 @@
 //! defers to active read snapshots (MVCC stage B): their as-of page history
 //! exists only in the WAL until read. At the hard limit flow control wins
 //! and the truncation proceeds anyway — snapshots that lose their history
-//! fail loudly ("snapshot too old") instead of stalling writes.
+//! fail loudly ("snapshot too old") instead of stalling writes. Within an
+//! epoch the history is complete: a commit that overwrites a page with no
+//! frame in the current epoch first stashes the old image into every active
+//! same-epoch snapshot (the image would otherwise exist nowhere — see
+//! `commit_tx_inner`), so an as-of read never fails with a false "history
+//! predates the retention window" while its epoch survives.
 //!
 //! Every mutating method takes `&self`: the pager is shared by the engine's
 //! write path and (stage B) guardless snapshot readers, so the WAL, the
@@ -1059,6 +1064,66 @@ impl Pager {
             } else {
                 wal.commit_deferred(tx.id)?
             };
+            // Pre-epoch image preservation (MVCC stage B): a staged page
+            // with no `page_lsn` entry has no frame in the current epoch,
+            // so for EVERY snapshot registered in this epoch its as-of
+            // image is the current read-surface image — the one this
+            // commit is about to overwrite. Once overwritten, that history
+            // exists nowhere in this epoch's WAL and the snapshot's scan
+            // could only fail with a false "history predates the retention
+            // window". Stash the old image into those snapshots' caches
+            // first. Registration is atomic with the commit-head read
+            // under this same WAL lock (`begin_snapshot`), so every
+            // snapshot that can still need these images is in the registry
+            // right now; a page that already gained a `page_lsn` entry was
+            // preserved by the commit that wrote it. A capture failure must
+            // NOT fail a WAL-durable commit: the page just degrades to the
+            // old loud SnapshotTooOld behavior.
+            {
+                let mut st = lock(&self.snaps); // wal → snaps (see begin_snapshot)
+                if !st.active.is_empty() {
+                    let epoch_now = wal.epoch();
+                    let mut targets = Vec::new();
+                    for (id, (epoch, _, _)) in st.active.iter() {
+                        if *epoch == epoch_now {
+                            targets.push(*id);
+                        }
+                    }
+                    if !targets.is_empty() {
+                        let preserve: Vec<(u32, Vec<u8>)> = {
+                            let page_lsn = lock(&self.page_lsn);
+                            let pool = lock(&self.pool);
+                            let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+                            for id in tx.staged.keys() {
+                                if page_lsn.contains_key(id) {
+                                    continue;
+                                }
+                                // Current image = pool, else a not-yet-flushed
+                                // committed image, else the data file. No
+                                // commit can interleave (we hold the WAL lock),
+                                // so the surfaces are stable wrt writes.
+                                let image = pool
+                                    .map
+                                    .get(id)
+                                    .map(|p| p.data.clone())
+                                    .or_else(|| lock(&self.pending_writes).get(id).cloned())
+                                    .or_else(|| self.read_file_page(*id).ok());
+                                if let Some(image) = image {
+                                    out.push((*id, image));
+                                }
+                            }
+                            out
+                        };
+                        for id in targets {
+                            if let Some((_, _, entry)) = st.active.get_mut(&id) {
+                                for (page, image) in &preserve {
+                                    entry.cache.insert(*page, image.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // WAL durable — now apply to the read surfaces while still
             // holding the WAL lock: a snapshot's begin reads the commit head
             // under the same lock, so it can never observe an LSN whose page
@@ -1214,15 +1279,21 @@ impl Pager {
     /// is held across commit fsyncs, so a view created while a commit is
     /// mid-fsync waits that one fsync out; only creation pays it — the
     /// as-of reads themselves run without the WAL lock.
+    ///
+    /// Registration happens atomically with the head read UNDER the WAL
+    /// lock (wal → snaps): the commit path's pre-epoch history stash (see
+    /// `commit_tx_inner`) iterates the registry while holding the WAL lock,
+    /// so every snapshot whose head predates a committing write is already
+    /// registered when that write preserves the images it can still need.
     pub fn begin_snapshot(&self) -> Snapshot {
+        let wal = lock(&self.wal);
+        let (epoch, lsn) = (wal.epoch(), wal.last_commit_lsn());
         let mut st = lock(&self.snaps);
-        let (epoch, lsn) = {
-            let wal = lock(&self.wal);
-            (wal.epoch(), wal.last_commit_lsn())
-        };
         st.next_id += 1;
         let id = st.next_id;
         st.active.insert(id, (epoch, lsn, SnapEntry::default()));
+        drop(st);
+        drop(wal);
         Snapshot { id, epoch, lsn }
     }
 
@@ -1341,22 +1412,29 @@ impl Pager {
         // A concurrent hard checkpoint may have truncated the log mid-scan;
         // what was read is then the wrong epoch's history. Re-validate under
         // the WAL lock (mutual exclusion with `checkpoint`) before trusting
-        // it. Lock order matches `begin_snapshot`: snaps → wal.
-        let mut st = lock(&self.snaps);
-        {
-            let wal = lock(&self.wal);
-            if wal.epoch() != snap.epoch {
-                return Err(PagerError::SnapshotTooOld(
-                    "the WAL was checkpointed while the read was running; retry the query".into(),
-                ));
-            }
+        // it. Lock order wal → snaps matches `begin_snapshot` and the
+        // commit path's stash; the reverse nesting (snaps held while
+        // waiting on wal) would deadlock against them. The install MERGES
+        // into the cache instead of replacing it: pages stashed by the
+        // commit path (pre-epoch images) never appear in the WAL scan, and
+        // a replace would wipe exactly the entries this snapshot depends on.
+        let wal = lock(&self.wal);
+        if wal.epoch() != snap.epoch {
+            return Err(PagerError::SnapshotTooOld(
+                "the WAL was checkpointed while the read was running; retry the query".into(),
+            ));
         }
+        let mut st = lock(&self.snaps);
         if let Some(entry) = st.active.get_mut(&snap.id) {
             if !entry.2.materialized {
-                entry.2.cache = cache;
+                for (page, image) in cache {
+                    entry.2.cache.insert(page, image);
+                }
                 entry.2.materialized = true;
             }
         }
+        drop(st);
+        drop(wal);
         Ok(())
     }
 }
@@ -1942,6 +2020,68 @@ mod tests {
         assert_eq!(&pager.read_page_as_of(&snap, p).unwrap()[..8], b"version1");
         assert_eq!(&pager.read_page_shared(p).unwrap()[..8], b"version3");
         pager.end_snapshot(snap);
+    }
+
+    #[test]
+    fn snapshot_read_survives_epoch_boundary_overwrite() {
+        // The MVCC stage-B gap this guards: after a WAL truncation (epoch
+        // bump), a snapshot begun in the FRESH epoch used to fail with a
+        // false SnapshotTooOld when a page last written before the
+        // truncation got overwritten during the snapshot — that page's
+        // as-of image existed only in the read surfaces, which the
+        // overwrite destroyed. The commit path now stashes the pre-epoch
+        // image into every active same-epoch snapshot before applying.
+        let (_dir, path) = tmp_db("snap-epoch.db");
+        let mut pager = Pager::open(&path).unwrap();
+        pager.ckpt_soft = 32 * 1024;
+        pager.ckpt_hard = u64::MAX;
+        let mut page = None;
+        for round in 0..40u8 {
+            let mut tx = pager.begin_tx();
+            let p = match page {
+                Some(p) => p,
+                None => {
+                    let p = pager.allocate_page(&mut tx).unwrap();
+                    page = Some(p);
+                    p
+                }
+            };
+            pager.write_page(&mut tx, p, 0, &[round; 64]).unwrap();
+            pager.commit_tx_deferred(tx).unwrap();
+        }
+        // Drive the background checkpoint until the log truncates.
+        let start_epoch = pager.epoch.load(std::sync::atomic::Ordering::Acquire);
+        for _ in 0..500 {
+            pager.sync_wal().unwrap();
+            if lock(&pager.wal).file_len().unwrap() < 32 * 1024 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pager.epoch.load(std::sync::atomic::Ordering::Acquire) > start_epoch,
+            "test setup must cross an epoch (truncation)"
+        );
+        let p = page.unwrap();
+        // The truncation cleared page_lsn: the page has no frame this epoch.
+        assert!(lock(&pager.page_lsn).get(&p).is_none());
+
+        let snap = pager.begin_snapshot();
+        let mut tx = pager.begin_tx();
+        pager.write_page(&mut tx, p, 0, b"version2").unwrap();
+        pager.commit_tx(tx).unwrap();
+
+        // As-of read must see the pre-epoch image — this used to be the
+        // false "history predates the WAL retention window" error.
+        assert_eq!(&pager.read_page_as_of(&snap, p).unwrap()[..8], &[39u8; 8]);
+        assert_eq!(&pager.read_page_shared(p).unwrap()[..8], b"version2");
+        pager.end_snapshot(snap);
+
+        // A snapshot begun AFTER the overwrite takes the fast path and sees
+        // the new image (the stash must not leak into younger snapshots).
+        let snap2 = pager.begin_snapshot();
+        assert_eq!(&pager.read_page_as_of(&snap2, p).unwrap()[..8], b"version2");
+        pager.end_snapshot(snap2);
     }
 
     #[test]
