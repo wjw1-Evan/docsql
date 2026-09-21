@@ -13722,6 +13722,170 @@ mod tests {
         }
     }
 
+    #[test]
+    fn create_index_root_key_collisions_are_loud() {
+        // `index_roots` is a mixed pool (column-named trees + index-name
+        // composite trees); a differently-shaped collision must refuse —
+        // the old `append` silently replaced the tree and broke PK/UNIQUE
+        // enforcement. Same-column indexes share the tree instead.
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (e INT PRIMARY KEY, c INT, d INT, v INT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 10, 100, 5), (2, 20, 200, 6)",
+        );
+        // Composite index named exactly like the PK column.
+        let e = db.execute("CREATE INDEX e ON t (c, d)").unwrap_err();
+        assert!(e.to_string().contains("root key"), "{e}");
+        // The PK still enforces after the refused collision.
+        assert!(db.execute("INSERT INTO t VALUES (1, 1, 1, 1)").is_err());
+        // Same-column second index reuses the tree: both names work.
+        run(&mut db, "CREATE INDEX iv ON t (v)");
+        run(&mut db, "CREATE INDEX iv2 ON t (v)");
+        let r = rows(&mut db, "SELECT e FROM t WHERE v = 6");
+        assert_eq!(r.rows.len(), 1);
+        // And the catalog round-trips through a dump replay.
+        let script = db.dump_script().unwrap();
+        let mut db2 = Database::in_memory().unwrap();
+        for stmt in script.split(';').filter(|s| !s.trim().is_empty()) {
+            db2.execute(stmt).unwrap();
+        }
+        let r = db2.execute("SELECT e FROM t WHERE v = 6").unwrap();
+        assert!(matches!(r, ExecOutcome::Rows(_)));
+    }
+
+    #[test]
+    fn drop_column_reclaims_index_tree_pages() {
+        // A composite index over a dropped column dies with it; its tree
+        // pages must return to the reusable pool. Discriminator: two
+        // identical databases, one carries the doomed composite index.
+        // After DROP COLUMN both reinsert enough rows to exhaust the
+        // non-index pool share — with the reclaim, the indexed variant
+        // covers part of the demand from the freed tree pages and the file
+        // ends smaller; with the pre-fix leak both ended identical (the
+        // dead tree's pages were lost for good).
+        let pad = "b".repeat(200);
+        let build = |with_index: bool| -> Database {
+            let mut db = Database::in_memory().unwrap();
+            run(
+                &mut db,
+                "CREATE TABLE t (id INT PRIMARY KEY, b TEXT, c INT)",
+            );
+            if with_index {
+                run(&mut db, "CREATE INDEX ibc ON t (b, c)");
+            }
+            for i in 0..300 {
+                run(
+                    &mut db,
+                    &format!("INSERT INTO t VALUES ({i}, '{pad}', {i})"),
+                );
+            }
+            db
+        };
+        // Sized past BOTH pool shares: each variant then grows by
+        // (demand - its pool), so the growth difference equals the dead
+        // tree's page share — the reclaim, made observable.
+        let reinsert = |db: &mut Database| {
+            for chunk in 0..12 {
+                let mut v = String::from("INSERT INTO t VALUES ");
+                for i in 300 + chunk * 500..300 + (chunk + 1) * 500 {
+                    if i > 300 + chunk * 500 {
+                        v.push(',');
+                    }
+                    v.push_str(&format!("({i}, {i})"));
+                }
+                run(db, &v);
+            }
+        };
+        let mut indexed = build(true);
+        run(&mut indexed, "ALTER TABLE t DROP COLUMN b");
+        let indexed_at_drop = indexed.num_pages();
+        reinsert(&mut indexed);
+        // The freed tree pages (plus the rewrite's other frees) must cover
+        // the whole reinsert: `num_pages` is a high-water mark, so zero
+        // growth is the observable form of the reclaim. Pre-fix, the dead
+        // tree's pages never entered the pool and this grew.
+        let indexed_growth = indexed.num_pages() - indexed_at_drop;
+        // Control: the identical demand against the pool WITHOUT the tree
+        // share genuinely grows the file — the demand sits above H+T_id
+        // and below H+T_id+T_ibc, which is what makes the zero above
+        // meaningful.
+        let mut plain = build(false);
+        run(&mut plain, "ALTER TABLE t DROP COLUMN b");
+        let plain_at_drop = plain.num_pages();
+        reinsert(&mut plain);
+        let plain_growth = plain.num_pages() - plain_at_drop;
+        // Pre-fix both grew identically (the dead tree never entered the
+        // pool); with the reclaim the indexed variant grows by strictly
+        // less — by roughly the tree's own page share.
+        assert!(
+            indexed_growth + 8 <= plain_growth,
+            "DROP COLUMN must reclaim the dead index tree into the pool \
+             (indexed growth {indexed_growth} vs plain growth {plain_growth})"
+        );
+        assert!(plain_growth > 0);
+        // And the surviving single-column lookups still work.
+        let q = "SELECT COUNT(*) FROM t WHERE c < 100";
+        assert_eq!(rows(&mut indexed, q).rows[0][0].as_i64().unwrap(), 100);
+    }
+
+    #[test]
+    fn timestamp_literals_outside_domain_are_rejected() {
+        // A UTC offset can push an in-range calendar date outside the
+        // 0001..=9999 instant domain; such values have no round-trippable
+        // text and must be refused at every string constructor (one such
+        // value in a table used to make the whole dump fail).
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, ts TIMESTAMP)");
+        for bad in ["9999-12-31T23:59:59.999-23:59", "0001-01-01T00:00:00+23:59"] {
+            let e = db
+                .execute(&format!("INSERT INTO t VALUES (1, TIMESTAMP '{bad}')"))
+                .unwrap_err();
+            assert!(e.to_string().to_lowercase().contains("timestamp"), "{e}");
+            let e = db
+                .execute(&format!(
+                    "INSERT INTO t VALUES (2, CAST('{bad}' AS TIMESTAMP))"
+                ))
+                .unwrap_err();
+            assert!(e.to_string().to_lowercase().contains("timestamp"), "{e}");
+        }
+        // Domain boundaries themselves parse and dump cleanly.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (3, TIMESTAMP '0001-01-01T00:00:00.000Z')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (4, TIMESTAMP '9999-12-31T23:59:59.999Z')",
+        );
+        let script = db.dump_script().unwrap();
+        assert!(script.contains("0001-01-01"), "{script}");
+    }
+
+    #[test]
+    fn float_literal_inlining_keeps_float_type() {
+        // Scalar-subquery inlining used to render Float(3.0) via Display
+        // ("3"), re-parsing as Int and silently changing the type.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (x INT)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let r = rows(&mut db, "SELECT TYPEOF((SELECT 3.0))");
+        assert!(
+            matches!(&r.rows[0][0], Value::Str(s) if s == "float"),
+            "{r:?}"
+        );
+        // Distinctness follows encoding: 3.0 (float) and 3 (int) stay two
+        // values instead of collapsing.
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM (SELECT 3.0 AS v UNION ALL SELECT 3))",
+        );
+        assert_eq!(r.rows[0][0].as_i64().unwrap(), 2);
+    }
+
     // ---- index-backed engine paths ----
 
     fn idx_db() -> Database {
@@ -21825,6 +21989,151 @@ mod window_tests {
         );
         assert_eq!(r.rows.len(), 3);
     }
+
+    #[test]
+    fn window_unsupported_clauses_are_loud() {
+        // Silent-ignore red line: every clause the window evaluator does
+        // not implement must refuse the statement, never narrow it.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE e (id INT, name TEXT, salary INT)");
+        run(&mut db, "INSERT INTO e VALUES (1, 'a', 10), (2, 'b', 20)");
+        let mut refuses = |sql: &str, needle: &str| {
+            let e = db.execute(sql).unwrap_err();
+            assert!(e.to_string().contains(needle), "{sql} -> {e}");
+        };
+        // FILTER on a scalar window function is not defined.
+        refuses(
+            "SELECT RANK() FILTER (WHERE salary > 15) OVER (ORDER BY salary) FROM e",
+            "FILTER",
+        );
+        // ORDER BY inside the aggregate's own argument list.
+        refuses(
+            "SELECT GROUP_CONCAT(name, ',' ORDER BY salary) FROM e",
+            "ORDER BY inside aggregate",
+        );
+        refuses(
+            "SELECT GROUP_CONCAT(name, ',' ORDER BY salary) OVER () FROM e",
+            "ORDER BY inside aggregate",
+        );
+        // Unknown columns in window keys: silently NULL keys would collapse
+        // the whole computation (RANK all 1s, totals over the partition).
+        refuses(
+            "SELECT RANK() OVER (ORDER BY salry) FROM e",
+            "column salry does not exist",
+        );
+        refuses(
+            "SELECT RANK() OVER (PARTITION BY dept) FROM e",
+            "column dept does not exist",
+        );
+        refuses(
+            "SELECT LAG(nmae) OVER (ORDER BY id) FROM e",
+            "column nmae does not exist",
+        );
+    }
+
+    #[test]
+    fn window_private_column_does_not_clobber_user_field() {
+        // The `__w<i>$` injection used to overwrite a user column literally
+        // named like the private one; the name is now collision-checked.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (\"__w0$\" INT, v INT)");
+        run(&mut db, "INSERT INTO t VALUES (7, 10), (8, 20)");
+        let r = rows(&mut db, "SELECT * , ROW_NUMBER() OVER (ORDER BY v) FROM t");
+        // Column order: user fields first, the window result appended last.
+        assert!(matches!(&r.rows[0][0], Value::Int(7)), "{r:?}");
+        assert!(matches!(&r.rows[1][0], Value::Int(8)), "{r:?}");
+        assert!(matches!(&r.rows[0][2], Value::Int(1)), "{r:?}");
+        assert!(matches!(&r.rows[1][2], Value::Int(2)), "{r:?}");
+    }
+
+    #[test]
+    fn window_aggregate_incremental_matches_batch_semantics() {
+        // RunningAgg folds each frame incrementally; this dataset exercises
+        // every tricky equivalence: mixed numeric types, NULLs, DISTINCT,
+        // peer runs, the AVG exact-decimal mode flip, MIN ties and
+        // STRING_AGG with an empty-string element.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (k INT, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, NULL), (2, 2), (2, 2), (3, 5), (4, 9)",
+        );
+        // Peer run (k=2) shares one cumulative value.
+        let r = rows(&mut db, "SELECT SUM(v) OVER (ORDER BY k) FROM t");
+        let got: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Null => "null".into(),
+                Value::Int(i) => i.to_string(),
+                Value::Float(f) => format!("{f:?}"),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec!["null", "4", "4", "9", "18"], "{r:?}");
+        // DISTINCT: duplicate 2 counts once from its first appearance.
+        let r = rows(&mut db, "SELECT COUNT(DISTINCT v) OVER (ORDER BY k) FROM t");
+        let got: Vec<i64> = r.rows.iter().map(|row| row[0].as_i64().unwrap()).collect();
+        assert_eq!(got, vec![0, 1, 1, 2, 3], "{r:?}");
+        // AVG flips into exact-decimal mode when a Decimal arrives later
+        // in the frame: the buffered prefix converts once, exactly.
+        run(&mut db, "CREATE TABLE d (k INT, v DECIMAL)");
+        run(
+            &mut db,
+            "INSERT INTO d VALUES (1, 1), (2, 2), (3, CAST('1.5' AS DECIMAL))",
+        );
+        let r = rows(&mut db, "SELECT AVG(v) OVER (ORDER BY k) FROM d");
+        let got: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Float(f) => format!("{f:?}"),
+                Value::Decimal(d) => d.to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec!["1.0", "1.5", "1.5"], "{r:?}");
+        // MIN keeps the FIRST value on ties (batch reduce semantics).
+        run(&mut db, "CREATE TABLE m (k INT, v INT)");
+        run(&mut db, "INSERT INTO m VALUES (1, 5), (2, 3), (3, 3)");
+        let r = rows(&mut db, "SELECT MIN(v) OVER (ORDER BY k) FROM m");
+        assert!(matches!(&r.rows[2][0], Value::Int(3)));
+        // GROUP_CONCAT: an empty-string element still consumes a separator.
+        run(&mut db, "CREATE TABLE g (k INT, v TEXT)");
+        run(&mut db, "INSERT INTO g VALUES (1, 'a'), (2, ''), (3, 'b')");
+        let r = rows(
+            &mut db,
+            "SELECT GROUP_CONCAT(v, '-') OVER (ORDER BY k) FROM g",
+        );
+        assert!(
+            matches!(&r.rows[2][0], Value::Str(x) if x == "a--b"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn window_query_respects_statement_deadline() {
+        // The window loops sample the cooperative deadline (every 1024
+        // ticks); an armed past deadline must abort a windowed SELECT over
+        // a few thousand rows instead of running to completion.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE big (v INT)");
+        let mut vals = String::from("INSERT INTO big VALUES (0)");
+        for i in 1..3000 {
+            vals.push_str(&format!(", ({i})"));
+        }
+        run(&mut db, &vals);
+        db.set_statement_deadline(Some(std::time::Instant::now()));
+        let e = db
+            .execute("SELECT SUM(v) OVER (ORDER BY v) FROM big")
+            .unwrap_err();
+        assert!(e.to_string().contains("statement timeout"), "{e}");
+        // The deadline is per statement: cleared afterwards the same query
+        // runs to completion.
+        db.set_statement_deadline(None);
+        let r = rows(&mut db, "SELECT SUM(v) OVER (ORDER BY v) FROM big");
+        assert_eq!(r.rows.len(), 3000);
+    }
 }
 
 // ---- complex query combinations -------------------------------------
@@ -24386,6 +24695,44 @@ mod read_view_tests {
             ExecOutcome::Rows(r) => r.rows[0][0].as_i64().unwrap(),
             _ => panic!("expected rows"),
         }
+    }
+
+    /// A snapshot whose head lands on an UNFENCED deferred commit (created
+    /// between two statements of an open explicit transaction) must serve
+    /// that statement's effects from both paths: the fast path from the
+    /// pool, and — once a later write pushes the page off it — the slow
+    /// path from the WAL. The slow path used to require a covering fence
+    /// and failed such snapshots with a false "history predates the
+    /// retention window".
+    #[test]
+    fn snapshot_across_open_transaction_reads_consistently() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE items (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10), (2, 20)")
+            .unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO items VALUES (3, 30)").unwrap(); // deferred, unfenced
+        let view = db.read_view(); // head includes the deferred commit
+        assert_eq!(view_count(&view, "SELECT COUNT(*) FROM items"), 3);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM items"), 3);
+
+        // Push the same pages past the snapshot: the next read takes the
+        // slow path and must reconstruct the as-of image (count 3, the
+        // pre-UPDATE values) — not error, not the newer image.
+        db.execute("UPDATE items SET v = v + 100").unwrap();
+        assert_eq!(view_count(&view, "SELECT COUNT(*) FROM items"), 3);
+        let vs = view.execute("SELECT v FROM items WHERE id = 2").unwrap();
+        match vs {
+            ExecOutcome::Rows(r) => {
+                assert_eq!(r.rows[0][0].as_i64().unwrap(), 20, "as-of image");
+            }
+            other => panic!("snapshot read failed: {other:?}"),
+        }
+        db.execute("COMMIT").unwrap();
+        // After the transaction closes, fresh reads see the final state.
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM items"), 3);
     }
 
     #[test]

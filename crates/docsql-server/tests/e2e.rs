@@ -108,6 +108,176 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
     panic!("server did not come up");
 }
 
+/// Explicit-transaction writes must reach `_cluster_log` on a node with no
+/// peers: the journal is the PITR source, so a lone node journals
+/// unconditionally. The drain used to gate on a fan-out target and silently
+/// dropped every BEGIN..COMMIT from point-in-time restore.
+#[tokio::test]
+async fn explicit_transaction_journals_on_single_node() {
+    let (_dir, addr) = start_server(Some("t")).await;
+    let mut c = Client::connect(&addr).await;
+    let _ = c.sql("AUTH").await;
+    c.send(&Frame::new(proto::REQ_AUTH, b"t".to_vec())).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    c.sql("CREATE TABLE jt (id INT)").await;
+    c.sql("BEGIN").await;
+    c.sql("INSERT INTO jt VALUES (1)").await;
+    c.sql("INSERT INTO jt VALUES (2)").await;
+    c.sql("COMMIT").await;
+    let mut ok = false;
+    for _ in 0..100 {
+        let f = c.sql("SELECT COUNT(*) FROM _cluster_log").await;
+        // CREATE TABLE journals too (autocommit DDL), so the two
+        // explicit-transaction INSERTs land the count at exactly three;
+        // pre-fix the transaction writes never journaled and it stayed at
+        // one.
+        if payload_str(&f).contains("[[3]]") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        ok,
+        "explicit transaction writes must journal on a peerless node"
+    );
+}
+
+/// Pre-auth PING is allowed only within a small budget: the web console's
+/// cluster probe pings once before sending credentials, but an
+/// unauthenticated socket must not keep its slot alive forever with
+/// periodic pings.
+#[tokio::test]
+async fn preauth_ping_budget() {
+    let (_dir, addr) = start_server(Some("tok")).await;
+    let mut c = Client::connect(&addr).await;
+    for _ in 0..4 {
+        c.send(&Frame::new(proto::REQ_PING, vec![])).await;
+        let f = c.recv().await;
+        assert_eq!(f.frame_type, proto::RESP_PONG, "{}", payload_str(&f));
+    }
+    c.send(&Frame::new(proto::REQ_PING, vec![])).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("authentication required"),
+        "{}",
+        payload_str(&f)
+    );
+}
+
+/// Keyed transport: the inbound replay guard rejects a byte-identical
+/// re-send of an already-accepted sealed frame (GCM would decrypt it fine;
+/// the nonce counter is what catches the replay).
+#[tokio::test]
+async fn keyed_transport_rejects_replayed_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("e2e.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let key = docsql_server::crypto::parse_key_hex(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    )
+    .unwrap();
+    let cfg = docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: Some("tok".into()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 0,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: Some(key),
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        statement_timeout_ms: 0,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    async fn seal_send(
+        key: &docsql_server::crypto::TransportKey,
+        stream: &mut TcpStream,
+        frame_type: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut f = Frame::new(frame_type, payload.to_vec());
+        f.flags |= docsql_server::crypto::FLAG_ENCRYPTED;
+        f.payload = docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload);
+        let bytes = f.encode().unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+        bytes
+    }
+
+    async fn recv_open(
+        key: &docsql_server::crypto::TransportKey,
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> Frame {
+        loop {
+            if let Ok((f, n)) = Frame::decode(buf) {
+                buf.drain(..n);
+                assert!(
+                    f.flags & docsql_server::crypto::FLAG_ENCRYPTED != 0,
+                    "response must be sealed"
+                );
+                let pt = docsql_server::crypto::open(key, f.frame_type, f.flags, &f.payload)
+                    .expect("unseal");
+                return Frame {
+                    flags: f.flags,
+                    frame_type: f.frame_type,
+                    topology_version: f.topology_version,
+                    payload: pt,
+                };
+            }
+            let mut chunk = [0u8; 8192];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    let mut buf = Vec::new();
+    seal_send(&key, &mut stream, proto::REQ_AUTH, b"tok").await;
+    let f = recv_open(&key, &mut stream, &mut buf).await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+
+    let sealed = seal_send(
+        &key,
+        &mut stream,
+        proto::REQ_SQL,
+        &proto::encode_sql("SELECT 1").unwrap(),
+    )
+    .await;
+    let f = recv_open(&key, &mut stream, &mut buf).await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS);
+
+    // Byte-identical replay of the accepted frame.
+    stream.write_all(&sealed).await.unwrap();
+    stream.flush().await.unwrap();
+    let f = recv_open(&key, &mut stream, &mut buf).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(payload_str(&f).contains("replayed"), "{}", payload_str(&f));
+}
+
 struct Client {
     stream: TcpStream,
     buf: Vec<u8>,

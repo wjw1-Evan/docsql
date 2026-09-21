@@ -1321,6 +1321,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalidate_incremental_exports_removes_only_the_incr_chain() {
+        // A snapshot adoption voids the journal, but exported incrementals
+        // carry the discarded writes verbatim — they must go (sidecars
+        // included) while full backups and unrelated files stay.
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "backup-1.sql",
+            "backup-1.sql.sha256",
+            "incr-1.sql",
+            "incr-1.sql.sha256",
+            "incr-2.sql",
+            "incr-2.sql.sha256",
+            "incr-notes.txt",
+            "backup-2.sql.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        super::invalidate_incremental_exports(dir.path());
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                String::from("backup-1.sql"),
+                String::from("backup-1.sql.sha256"),
+                String::from("backup-2.sql.tmp"),
+                String::from("incr-notes.txt"),
+            ]
+        );
+    }
+
+    #[test]
     fn backup_names_are_validated_for_restore() {
         assert!(valid_backup_name("backup-20260910T081530123Z.sql"));
         assert!(valid_backup_name("backup-1.sql"));
