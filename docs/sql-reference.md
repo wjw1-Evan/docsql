@@ -2,7 +2,7 @@
 
 本参考按 Transact-SQL 参考（MSDN）的组织方式编写：每条语句给出**语法**、**参数**、**备注**与**示例**。
 
-DocSQL 的 SQL 方言以 **SQL 标准**为基准，并兼容 SQLite（`sqlite_master`、`LIMIT` 变体、`REPLACE INTO`）、Oracle（`DUAL`、`ROWNUM`、`NVL` 函数族、字典视图、`MERGE`）与 SQL Server/EF 生态（`information_schema`、`x != TRUE` 软删语义、`JSON_ARRAY_CONTAINS`）。未实现的语法一律在解析/执行层**显式报错**，不静默忽略；完整清单见[不支持的语法](#不支持的语法)。
+DocSQL 的 SQL 方言以 **SQL 标准**为基准，并兼容 SQLite（`sqlite_master`、`LIMIT` 变体、`REPLACE INTO`）、Oracle（`DUAL`、`ROWNUM`、`NVL` 函数族、字典视图、`MERGE`）与 SQL Server/EF 生态（`information_schema`、`x != TRUE` 软删语义、`JSON_ARRAY_CONTAINS`、T-SQL 表达式层——函数族/`TOP`/方括号/`CONVERT` 等见 [T-SQL 兼容面](#tsql-sql-server兼容面)）。未实现的语法一律在解析/执行层**显式报错**，不静默忽略；完整清单见[不支持的语法](#不支持的语法)。
 
 ## 目录
 
@@ -130,7 +130,7 @@ SELECT ts + 1500, ts - ts2 FROM t;              -- ± 毫秒整数 / 毫秒差(I
 | 连接 | `\|\|` | 字符串连接（NULL 传播为 NULL） |
 | 范围 | `BETWEEN a AND b` | 闭区间 |
 | 集合 | `IN (v1, v2, ...)` / `NOT IN (...)` | |
-| 模式 | `LIKE pat [ESCAPE 'c']`、`ILIKE pat` | `%`、`_` 通配；ILIKE 大小写不敏感；用 `ESCAPE` 指定转义字符 |
+| 模式 | `LIKE pat [ESCAPE 'c']`、`ILIKE pat` | `%`、`_` 通配与 T-SQL 字符类 `[a-z]`/`[^…]`；ILIKE 大小写不敏感；用 `ESCAPE` 指定转义字符 |
 | 空值 | `IS NULL`、`IS NOT NULL` | |
 | NULL 安全比较 | `IS DISTINCT FROM`、`IS NOT DISTINCT FROM` | 全序下的安全等价比较 |
 | 存在量词 | `EXISTS (SELECT ...)`、`IN (SELECT ...)`、`ANY/SOME/ALL (SELECT ...)` | 仅支持**非相关**子查询 |
@@ -156,7 +156,7 @@ SELECT v FROM t WHERE v <> ALL (SELECT v FROM t);
 
 ```sql
 [ WITH cte_name [(col, ...)] AS ( SELECT ... ) [ , ...n ] ]
-SELECT [ DISTINCT | ALL ] { * | expr [ [ AS ] alias ] } [ , ...n ]
+SELECT [ DISTINCT | ALL ] [ TOP (n) [ WITH TIES ] ] { * | expr [ [ AS ] alias ] } [ , ...n ]
 [ FROM table_source [ , ...n ] ]
 [ WHERE condition ]
 [ GROUP BY { expr | ROLLUP ( expr [ , ...n ] ) | CUBE ( expr [ , ...n ] )
@@ -773,7 +773,7 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 
 | 分类 | 函数 | 说明 |
 |---|---|---|
-| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`、`CONCAT(a, b, ...)` | 位置按字符计；TRIM 仅单参形式 |
+| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`（LEN 不计尾随空格）、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`（另支持 `TRIM('ab' FROM x)` 字符集形式）、`CONCAT(a, b, ...)`（NULL 当空串;`\|\|` 仍传染） | 位置按字符计;T-SQL 字符串函数族（LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT）见[T-SQL 兼容面](#tsql-sql-server兼容面) |
 | 数值 | `ABS`、`ROUND(x [, digits])` | ROUND 对 DECIMAL 精确四舍五入（半离零），FLOAT 保持浮点 |
 | 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF` | |
 | 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`timestamp`/`blob`/`array`/`object` |
@@ -887,20 +887,38 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 
 ### T-SQL（SQL Server）兼容面
 
-**已支持**：`COUNT_BIG`、`ISNULL`、`LEN`、`CAST(... AS BIT)`、`INFORMATION_SCHEMA.*`（大小写不敏感）、`sqlite_master`（大小写不敏感）、`UPDATE ... FROM`、`DELETE ... USING`、`MERGE`（受限）、`ORDER BY (SELECT 1)`（EF Core Skip/Take 形状）、`x != TRUE` 命中 NULL/缺失字段（软删过滤）、`JSON_ARRAY_CONTAINS`（实体原始集合 Contains）；`BIT`/`DATETIME2`/`NVARCHAR(MAX)` 等类型名按声明类型接受（值模型不变）。
+**已支持**（表达式/查询/记号层，实现见 `core/tsql.rs`）：
+
+| 类别 | 内容 |
+|---|---|
+| 查询 | `COUNT_BIG`、`SELECT TOP n` / `TOP (n)` / `TOP n WITH TIES`（改写为 LIMIT/FETCH；`PERCENT` 报错）、`dbo.` 前缀容忍（取末段）、`ORDER BY (SELECT 1)`（EF Skip/Take）、`x != TRUE` 软删语义 |
+| 记号 | `N'...'` 字面量、`[方括号]` 标识符（`]]` 转义）、字符串 `+` 拼接（与数字混合按隐式数值转换，失败报错）、位运算 `& \| ^ ~`（64 位整数） |
+| 模式匹配 | `LIKE '[a-z]'` / `[^…]` 字符类（`]` 前置为字面成员、未闭合 `[` 为字面括号；`%`/`_`/`ESCAPE` 语义不变） |
+| 日期时间 | `GETDATE/GETUTCDATE/SYSDATETIME/SYSUTCDATETIME`（引擎仅 UTC）、`DATEADD/DATEDIFF/DATEDIFF_BIG`（边界跨越语义、月末钳制）、`DATEPART/DATENAME`（全部 datepart 缩写）、`YEAR/MONTH/DAY/DAYOFYEAR`、`EOMONTH`、`DATEFROMPARTS` 与 `*FROMPARTS` 族、`ISDATE/ISNUMERIC` |
+| 字符串 | `LEFT/RIGHT`、`CHARINDEX`、`REPLACE`、`REPLICATE`、`REVERSE`、`SPACE`、`STR`、`QUOTENAME`、`ASCII/CHAR/NCHAR/UNICODE`、`CONCAT_WS`、`TRANSLATE`、`STUFF`、`STRING_ESCAPE`（json）、`FORMAT`（常用数字/日期 token，未知 token 报错） |
+| 数学 | `FLOOR/CEILING/POWER/SQRT/SQUARE/EXP/LOG/LOG10/SIGN/PI` 与三角函数族 |
+| 转换 | `CONVERT(type, value[, style])`（常用日期 style 双向：23/101/112/120/121/126 等；未知 style 报错）、`TRY_CAST/TRY_CONVERT/PARSE/TRY_PARSE`（失败 → NULL；PARSE 文化仅 en-US） |
+| 逻辑 | `IIF`、`CHOOSE`、`ISNULL` |
+| 标识/元数据 | `NEWID/NEWSEQUENTIALID`（UUIDv7；**仅 SELECT/INSERT** —— INSERT 走回写把生成值作为字面量扇出，UPDATE/DELETE/MERGE 显式报错）、`DB_NAME/DB_ID/SERVERPROPERTY`、`CHECKSUM/BINARY_CHECKSUM`、`HASHBYTES`（MD5/SHA1/SHA2_256） |
+| 表值函数 | `FROM STRING_SPLIT(s, sep[, 1]) AS t`、`FROM GENERATE_SERIES(a, b[, step]) AS t`、`FROM OPENJSON(json) AS t`（默认 key/value/type 形状；`WITH` 子句报错） |
+| 会话垫片 | `SET <已知选项> ON/OFF`、`USE <db>`、`PRINT <字面量>`、`GO` 批分隔（CLI/控制台多语句）—— 与 PRAGMA 同通道**接受并忽略** |
+| 语义对齐 | `CONCAT` 把 NULL 当空串（`\|\|` 仍 NULL 传染）、`LEN` 不计尾随空格（`LENGTH` 计）、`TRIM('ab' FROM x)` 字符集裁剪、`ROUND(x, -n)` 负位数（十位/百位） |
+| 复制确定性 | 写语句中的 `GETDATE()` 族在写入节点折叠成时间戳字面量（与 `DEFAULT NOW()` 同红线）；`DEFAULT NEWID()` 按行定值回写 |
+| 其他 | `CAST(... AS BIT)`、`INFORMATION_SCHEMA.*`/`sqlite_master`（大小写不敏感）、`UPDATE ... FROM`、`DELETE ... USING`、`MERGE`（受限）、`JSON_ARRAY_CONTAINS`；`BIT`/`DATETIME2`/`NVARCHAR(MAX)` 等类型名按声明类型接受（值模型不变） |
 
 **显式报错**（不静默、不降级）：
 
 | 类别 | 语法 |
 |---|---|
-| SELECT | `TOP [n]`、`INTO`、`FOR XML/JSON`、`OPTION (...)`、`FOR SYSTEM_TIME` |
-| 运算符/变量 | `@@ROWCOUNT`/`@@VERSION` 等 `@@` 系统变量、`@param` 变量与 `SELECT @x = 1` 赋值、`N'...'` 字面量、`[bracket]` 标识符、`'a' + 'b'` 字符串加法（用 `\|\|`） |
-| FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`CROSS/OUTER APPLY`、`PIVOT`/`UNPIVOT`、表函数、`TABLESAMPLE` |
+| SELECT | `INTO`、`FOR XML/JSON`、`OPTION (...)`、`FOR SYSTEM_TIME`、`TOP ... PERCENT` |
+| 运算符/变量 | `@@ROWCOUNT`/`@@VERSION` 等 `@@` 系统变量、`@param` 变量与 `SELECT @x = 1` 赋值（用参数绑定）、`RAND()`（无写路径回写通道，拒绝） |
+| FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`CROSS/OUTER APPLY`、`PIVOT`/`UNPIVOT`、未知表函数、`TABLESAMPLE` |
 | DML | `OUTPUT INSERTED/DELETED...`（用 `RETURNING`）、`MERGE ... OUTPUT`、`MERGE WHEN MATCHED THEN DELETE`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` 多表删除（用 `DELETE ... USING`） |
-| DDL | `#temp`/`##temp` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
-| 目录 | `sys.*`/`sysobjects`（报错并指向 `information_schema`/`sqlite_master`） |
-| 语句/过程 | `USE`、`SET`、`DECLARE`、`PRINT`、`EXEC`、`WAITFOR`、`IF`、`TRY/CATCH`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE` |
-| 函数 | `GETDATE`、`NEWID`、`DATEPART`、`DATEDIFF`、`CONVERT`/`TRY_CONVERT`、`IIF`、`CHARINDEX`、`REPLACE`、`LEFT`/`RIGHT`、`STRING_SPLIT`、`SERVERPROPERTY`、`OBJECT_ID`、`DB_NAME`、`HOST_NAME`、`SUSER_SNAME`、`SCOPE_IDENTITY` 等（均返回 `unknown function`） |
+| DDL | `#temp`/`##temp` 临时表、`IDENTITY(1,1)`（用 `AUTOINCREMENT`）、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
+| 目录 | `sys.*`/`sysobjects`（报错并指向 `information_schema`/`sqlite_master`）、`OBJECT_ID` |
+| 语句/过程 | `DECLARE`、`EXEC`、`WAITFOR`、`IF`、`WHILE`、`TRY/CATCH`、`THROW`、`RAISERROR`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE`（过程编程层整体是架构边界） |
+| 函数 | `SCOPE_IDENTITY`、`HOST_NAME`/`SUSER_SNAME`/`APP_NAME`/`USER_NAME`/`SESSION_USER` 等会话身份函数（引擎无逐连接身份状态）、`HASHBYTES` 的 `SHA2_512`/`MD2`、`TIMEFROMPARTS`（无 TIME 类型） |
+| 会话垫片边界 | 未知 `SET` 选项、`GO <n>` 重复次数、非字面量 `PRINT`（PRAGMA 值语法装不下表达式） |
 
 `WINDOW` 子句、`QUALIFY`、递归 CTE、`CROSS APPLY` 等结构性缺口见[不支持的语法](#不支持的语法)。
 
@@ -911,14 +929,14 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 类别 | 语法 |
 |---|---|
 | 窗口 | `WINDOW` 命名子句、`QUALIFY`、自定义窗口帧（`ROWS/RANGE/GROUPS BETWEEN …`） |
-| 查询结构 | `SELECT TOP`、`SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
+| 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、`PIVOT`、表时态 `AS OF` |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |
 | 子查询/CTE | 相关子查询、`WITH RECURSIVE` |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
 | DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
-| T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、`@` 变量/参数、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`N'...'`、`[方括号]` 标识符、`'a' + 'b'`（用 `\|\|`）、`CROSS/OUTER APPLY`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` |
+| T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、`@` 变量/参数、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`CROSS/OUTER APPLY`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT`、`RAND()` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |
 
