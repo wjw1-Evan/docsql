@@ -108,21 +108,12 @@ public sealed class DocsqlMemberTranslator(
 
     private SqlExpression? TranslateString(SqlExpression instance, string name)
     {
-        switch (name)
+        // Length 是属性;ToUpper/ToLower/Trim 是方法(方法翻译器负责)。
+        if (name == nameof(string.Length))
         {
-            case nameof(string.Length):
-                return Fn1("LENGTH", instance, typeof(int));
-            case nameof(string.ToUpper):
-            case nameof(string.ToUpperInvariant):
-                return Fn1("UPPER", instance, typeof(string));
-            case nameof(string.ToLower):
-            case nameof(string.ToLowerInvariant):
-                return Fn1("LOWER", instance, typeof(string));
-            case nameof(string.Trim):
-                return Fn1("TRIM", instance, typeof(string));
-            default:
-                return null;
+            return Fn1("LENGTH", instance, typeof(int));
         }
+        return null;
     }
 
     private SqlExpression Fn(string name, Type returnType)

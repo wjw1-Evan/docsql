@@ -152,6 +152,15 @@ public sealed class DocsqlTsqlMethodTranslator : IMethodCallTranslator
     {
         switch (method.Name)
         {
+            // 参数零个的大小写/裁剪方法是实例方法(属性翻译器只管 Length)。
+            case nameof(string.ToUpper) when arguments.Count == 0:
+            case nameof(string.ToUpperInvariant) when arguments.Count == 0:
+                return Fn("UPPER", typeof(string), instance);
+            case nameof(string.ToLower) when arguments.Count == 0:
+            case nameof(string.ToLowerInvariant) when arguments.Count == 0:
+                return Fn("LOWER", typeof(string), instance);
+            case nameof(string.Trim) when arguments.Count == 0:
+                return Fn("TRIM", typeof(string), instance);
             case nameof(string.Replace) when arguments.Count == 2:
                 return Fn("REPLACE", typeof(string), instance, arguments[0], arguments[1]);
             case nameof(string.Substring) when arguments.Count == 1:
