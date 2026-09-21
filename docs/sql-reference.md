@@ -901,7 +901,10 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 逻辑 | `IIF`、`CHOOSE`、`ISNULL` |
 | 标识/元数据 | `NEWID/NEWSEQUENTIALID`（UUIDv7；**仅 SELECT/INSERT** —— INSERT 走回写把生成值作为字面量扇出，UPDATE/DELETE/MERGE 显式报错）、`DB_NAME/DB_ID/SERVERPROPERTY`、`CHECKSUM/BINARY_CHECKSUM`、`HASHBYTES`（MD5/SHA1/SHA2_256） |
 | 表值函数 | `FROM STRING_SPLIT(s, sep[, 1]) AS t`、`FROM GENERATE_SERIES(a, b[, step]) AS t`、`FROM OPENJSON(json) AS t`（默认 key/value/type 形状；`WITH` 子句报错） |
-| 批/变量 | `DECLARE @x [类型] [= 初值]`、`SET @x = 表达式`、`SELECT @a = e1, @b = e2 [FROM …]`（取扫描末行，空扫描保持原值）、`IF … ELSE`、`BEGIN…END` 嵌套块、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@VERSION`、`PRINT 表达式`（CLI 打印消息）；变量是**逐连接会话状态**（GO 结束批次即清空），替换经 `value_literal` 渲染，写语句只以字面量形式进入日志/复制 |
+| 批/变量 | `DECLARE @x [类型] [= 初值]`、`SET @x = 表达式`、`SELECT @a = e1, @b = e2 [FROM …]`（取扫描末行，空扫描保持原值）、`IF … ELSE`、`BEGIN…END` 嵌套块、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@ERROR`/`@@VERSION`、`PRINT 表达式`（CLI 打印消息）；变量是**逐连接会话状态**（GO 结束批次即清空），替换经 `value_literal` 渲染，写语句只以字面量形式进入日志/复制 |
+| 错误处理 | `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`（捕获后批继续；CATCH 内 `ERROR_MESSAGE()`/`ERROR_NUMBER()` 读被捕获错误，CATCH 外为 NULL）；`THROW [code, 'msg', state]`（CATCH 内裸 `THROW` 重抛原错误）、`RAISERROR('msg', sev, state)`；CATCH 内的错误继续上抛，TRY 内的 BREAK/CONTINUE 穿透到外层 WHILE |
+| 递归 CTE | `WITH [RECURSIVE] c(n) AS (锚点 UNION [ALL] 递归臂)`：半朴素迭代（每轮只见上一轮行，SQL Server 工作表语义）；`UNION` 按编码字节去重可收敛循环图、`UNION ALL` 循环在 100 轮/10 万行预算处响亮报错；T-SQL 无关键字拼写（自引用 UNION 体即递归）同样识别 |
+| APPLY | `CROSS APPLY 表函数 AS t` / `OUTER APPLY …`（STRING_SPLIT/GENERATE_SERIES/OPENJSON）：**逐左行求值**的相关化表函数——实参引用左表列，OUTER 空行集保留左行（右列读 NULL）；支持别名列改名与连续 APPLY；APPLY 子查询仍显式报错（相关子查询边界） |
 | 会话身份 | `SUSER_SNAME()`/`ORIGINAL_LOGIN()`/`SYSTEM_USER`/`SESSION_USER`/`USER_NAME()`/`APP_NAME()`/`HOST_NAME()` —— 经连接身份上下文替换（服务端为登录用户，无上下文时报错） |
 | 会话垫片 | `SET <已知选项> ON/OFF`、`USE <db>`、`PRINT <字面量>`、`GO` 批分隔（CLI/控制台多语句）—— 与 PRAGMA 同通道**接受并忽略** |
 | 语义对齐 | `CONCAT` 把 NULL 当空串（`\|\|` 仍 NULL 传染）、`LEN` 不计尾随空格（`LENGTH` 计）、`TRIM('ab' FROM x)` 字符集裁剪、`ROUND(x, -n)` 负位数（十位/百位） |
@@ -913,12 +916,13 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 类别 | 语法 |
 |---|---|
 | SELECT | `INTO`、`FOR XML/JSON`、`OPTION (...)`、`FOR SYSTEM_TIME`、`TOP ... PERCENT` |
+| CTE/连接 | `WITH RECURSIVE` 已支持（见上表）；递归体必须是 `锚点 UNION [ALL] 递归臂`（其他集合形状报错） |
 | 运算符/变量 | `@@ROWCOUNT`/`@@VERSION` 之外的 `@@` 系统变量、`RAND()`（无写路径回写通道，拒绝） |
-| FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`CROSS/OUTER APPLY`、`PIVOT`/`UNPIVOT`、未知表函数、`TABLESAMPLE` |
+| FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`APPLY` 子查询形式、`PIVOT`/`UNPIVOT`、未知表函数、`TABLESAMPLE` |
 | DML | `OUTPUT INSERTED/DELETED...`（用 `RETURNING`）、`MERGE ... OUTPUT`、`MERGE WHEN MATCHED THEN DELETE`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` 多表删除（用 `DELETE ... USING`） |
 | DDL | `#temp`/`##temp` 临时表、`IDENTITY(1,1)`（用 `AUTOINCREMENT`）、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
 | 目录 | `sys.*`/`sysobjects`（报错并指向 `information_schema`/`sqlite_master`）、`OBJECT_ID` |
-| 语句/过程 | `EXEC`、`WAITFOR`、`RETURN`、`GOTO`、`TRY/CATCH`、`THROW`、`RAISERROR`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE`（存储过程/游标层整体是架构边界；`DECLARE`/`SET @x`/`IF`/`WHILE`/`BEGIN…END` 批控制流已支持，见上表） |
+| 语句/过程 | `EXEC`、`WAITFOR`、`RETURN`、`GOTO`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE`（存储过程/游标层整体是架构边界；`DECLARE`/`SET @x`/`IF`/`WHILE`/`BEGIN…END`/`TRY…CATCH`/`THROW`/`RAISERROR` 批控制流已支持，见上表） |
 | 函数 | `SCOPE_IDENTITY`、`HASHBYTES` 的 `SHA2_512`/`MD2`、`TIMEFROMPARTS`（无 TIME 类型）；会话身份函数无连接上下文时报错（有上下文时替换，见上表） |
 | 会话垫片边界 | 未知 `SET` 选项、`GO <n>` 重复次数、非字面量 `PRINT`（PRAGMA 值语法装不下表达式） |
 
@@ -934,7 +938,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、`PIVOT`、表时态 `AS OF` |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |
-| 子查询/CTE | 相关子查询、`WITH RECURSIVE` |
+| 子查询/CTE | 相关子查询（`APPLY` 子查询形式同此边界） |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
 | DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |

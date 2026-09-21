@@ -1141,6 +1141,76 @@ mod tests {
     use super::*;
     use docsql_core::engine::Database;
 
+    /// The session-aware chunk executor: T-SQL batches route through the
+    /// interpreter (PRINT collected, last outcome printed), plain chunks
+    /// keep the direct engine path, and errors respect the interactive /
+    /// fail-fast split (the fail-fast exit is exercised by script-mode
+    /// tests elsewhere; here the interactive flag keeps errors live).
+    #[test]
+    fn run_embedded_chunk_routes_batches_and_plain() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (v INT)").unwrap();
+        let mut tsql = docsql_core::tsql_batch::TsqlSession::new();
+        // Plain single statement: direct path.
+        run_embedded_chunk(
+            &mut db,
+            &mut tsql,
+            "INSERT INTO t VALUES (1)",
+            Format::Table,
+            true,
+        );
+        // T-SQL batch: DECLARE/WHILE/PRINT flow through the interpreter.
+        run_embedded_chunk(
+            &mut db,
+            &mut tsql,
+            "DECLARE @i INT = 0\nWHILE @i < 3\nBEGIN\n  SET @i = @i + 1\n  INSERT INTO t VALUES (@i)\nEND\nPRINT 'done ' + CAST(@i AS TEXT)",
+            Format::Table,
+            true,
+        );
+        // run_embedded_chunk drains PRINT into stdout itself; the batch
+        // effect (three loop inserts) is the observable here.
+        let r = db.execute("SELECT COUNT(*) AS c FROM t").unwrap();
+        match r {
+            docsql_core::engine::ExecOutcome::Rows(r) => {
+                assert_eq!(r.rows[0][0], Value::Int(4));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Variables persist across chunks on the same session.
+        run_embedded_chunk(&mut db, &mut tsql, "SET @i = @i * 2", Format::Table, true);
+        run_embedded_chunk(
+            &mut db,
+            &mut tsql,
+            "INSERT INTO t VALUES (@i)",
+            Format::Table,
+            true,
+        );
+        let r = db.execute("SELECT COUNT(*) AS c FROM t").unwrap();
+        match r {
+            docsql_core::engine::ExecOutcome::Rows(r) => {
+                assert_eq!(r.rows[0][0], Value::Int(5));
+            }
+            other => panic!("{other:?}"),
+        }
+        // An interactive error prints and keeps the session alive.
+        run_embedded_chunk(
+            &mut db,
+            &mut tsql,
+            "SELECT @undeclared",
+            Format::Table,
+            true,
+        );
+        // A multi-statement plain batch also routes through the
+        // interpreter (needs_interpretation: >1 statement).
+        run_embedded_chunk(
+            &mut db,
+            &mut tsql,
+            "INSERT INTO t VALUES (99)\nSELECT COUNT(*) AS c FROM t",
+            Format::Table,
+            true,
+        );
+    }
+
     #[test]
     fn render_rows_empty_and_populated() {
         let empty = QueryResult {

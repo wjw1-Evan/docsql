@@ -78,6 +78,11 @@ pub struct TsqlSession {
     rowcount: u64,
     prints: Vec<String>,
     last_result: Option<ExecResult>,
+    /// Inside CATCH: the caught error (number, message) — the source for
+    /// ERROR_MESSAGE()/ERROR_NUMBER() and re-THROW.
+    error_ctx: Option<(i64, String)>,
+    /// @@ERROR: the last statement's error number (0 = success).
+    last_error: i64,
     /// Filled by the owning layer; see [`SessionContext`].
     pub ctx: SessionContext,
 }
@@ -160,7 +165,14 @@ impl TsqlSession {
         match stmt {
             Stmt::Plain(sql) => {
                 let rendered = self.substitute(&sql)?;
-                let out = exec.execute(&rendered).await?;
+                let out = match exec.execute(&rendered).await {
+                    Ok(out) => out,
+                    Err(e) => {
+                        self.last_error = error_number(&e);
+                        return Err(e);
+                    }
+                };
+                self.last_error = 0;
                 self.rowcount = match &out {
                     ExecResult::Affected(n) => *n,
                     ExecResult::Rows(r) => r.rows.len() as u64,
@@ -250,6 +262,42 @@ impl TsqlSession {
             }
             Stmt::Break => Ok(Some(Flow::Break)),
             Stmt::Continue => Ok(Some(Flow::Continue)),
+            Stmt::Throw(args) => {
+                // Bare THROW inside CATCH re-raises the caught error.
+                let (code, message) = match args {
+                    Some((c, m)) => (c, m.clone()),
+                    None => match self.error_ctx.take() {
+                        Some((c, m)) => (c, m),
+                        None => (50000, "error raised by batch".into()),
+                    },
+                };
+                self.last_error = code;
+                err(format!("{message} (error {code})"))
+            }
+            Stmt::TryCatch { try_, catch_ } => {
+                self.error_ctx = None;
+                match self.run_stmts(try_, exec, budget, depth).await {
+                    Ok(flow) => {
+                        // BREAK/CONTINUE inside TRY still propagates to the
+                        // enclosing WHILE.
+                        if let Some(f) = flow {
+                            return Ok(Some(f));
+                        }
+                        self.last_error = 0;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // The catch gets the message; flow control raised
+                        // inside the failed try body does not survive.
+                        self.error_ctx = Some((error_number(&e), e.to_string()));
+                        self.last_error = error_number(&e);
+                        let out = self.run_stmts(catch_, exec, budget, depth).await;
+                        self.error_ctx = None;
+                        out.map(|_| ())
+                    }
+                }
+                .map(|_: ()| None)
+            }
         }
     }
 
@@ -353,6 +401,7 @@ impl TsqlSession {
                         }
                         match &lb[start + 2..j] {
                             b"rowcount" => out.push_str(&self.rowcount.to_string()),
+                            b"error" => out.push_str(&self.last_error.to_string()),
                             b"version" => {
                                 out.push_str(&format!("'DocSQL {}'", env!("CARGO_PKG_VERSION")))
                             }
@@ -392,6 +441,35 @@ impl TsqlSession {
                         j += 1;
                     }
                     if b.get(j) == Some(&b'(') && b.get(j + 1) == Some(&b')') {
+                        // CATCH diagnostics: message/number of the caught
+                        // error (NULL outside CATCH, like T-SQL).
+                        match lb[start..i].as_ref() {
+                            b"error_message" => match self.error_ctx.as_ref() {
+                                Some((_, m)) => {
+                                    out.push_str(&format!(
+                                        "NULLIF({}, NULL)",
+                                        engine::value_literal(&Value::Str(m.clone()))?
+                                    ));
+                                    i = j + 2;
+                                    continue;
+                                }
+                                None => {
+                                    out.push_str("NULL");
+                                    i = j + 2;
+                                    continue;
+                                }
+                            },
+                            b"error_number" => {
+                                let n = self.error_ctx.as_ref().map(|(n, _)| *n);
+                                match n {
+                                    Some(n) => out.push_str(&n.to_string()),
+                                    None => out.push_str("NULL"),
+                                }
+                                i = j + 2;
+                                continue;
+                            }
+                            _ => {}
+                        }
                         let literal = match lb[start..i].as_ref() {
                             b"suser_sname" | b"original_login" | b"system_user"
                             | b"session_user" | b"user_name" => self.ctx.user.as_ref(),
@@ -439,6 +517,20 @@ impl Flow {
             Flow::Continue => "CONTINUE",
         }
     }
+}
+
+/// Numeric code for an arbitrary engine error: 50000 (generic user
+/// range) unless the text already carries a `(error NNNNN)` tail.
+fn error_number(e: &SqlError) -> i64 {
+    let text = e.to_string();
+    if let Some(idx) = text.rfind("(error ") {
+        if let Some(end) = text[idx + 7..].find(')') {
+            if let Ok(n) = text[idx + 7..idx + 7 + end].parse::<i64>() {
+                return n;
+            }
+        }
+    }
+    50000
 }
 
 fn batch_budget_hit() -> SqlError {
@@ -507,6 +599,13 @@ enum Stmt {
     },
     Break,
     Continue,
+    /// THROW [code, 'msg', state] / RAISERROR('msg', sev, state).
+    Throw(Option<(i64, String)>),
+    /// BEGIN TRY … END TRY BEGIN CATCH … END CATCH.
+    TryCatch {
+        try_: Vec<Stmt>,
+        catch_: Vec<Stmt>,
+    },
 }
 
 /// Words that begin a new statement. A plain statement ends at a top-level
@@ -542,6 +641,8 @@ const STATEMENT_STARTERS: &[&str] = &[
     "release",
     "waitfor",
     "return",
+    "throw",
+    "raiserror",
 ];
 
 /// Clause openers that end a `SELECT @a = …` assignment list.
@@ -674,6 +775,34 @@ impl<'a> Parser<'a> {
                     self.i += 5;
                     out.push(self.parse_while(depth)?);
                 }
+                b"begin" if self.peek_word_after_begin_is(b"try") => {
+                    self.i += 5;
+                    self.skip_trivia();
+                    self.i += 3; // TRY
+                    let try_ = self.parse_block(depth)?;
+                    // parse_block consumed the END of "END TRY"; swallow
+                    // the trailing marker word.
+                    self.skip_trivia();
+                    if self.peek_word() == Some(b"try") {
+                        self.i += 3;
+                    }
+                    self.skip_trivia();
+                    // Expect BEGIN CATCH
+                    if self.peek_word() != Some(b"begin")
+                        || !self.peek_word_after_begin_is(b"catch")
+                    {
+                        return err("BEGIN TRY requires a matching BEGIN CATCH");
+                    }
+                    self.i += 5;
+                    self.skip_trivia();
+                    self.i += 5; // CATCH
+                    let catch_ = self.parse_block(depth)?;
+                    self.skip_trivia();
+                    if self.peek_word() == Some(b"catch") {
+                        self.i += 5;
+                    }
+                    out.push(Stmt::TryCatch { try_, catch_ });
+                }
                 b"begin" if self.begin_opens_block() => {
                     self.i += 5;
                     out.extend(self.parse_block(depth)?);
@@ -691,6 +820,16 @@ impl<'a> Parser<'a> {
                         "{} is not supported in DocSQL batches",
                         String::from_utf8_lossy(&word)
                     ))
+                }
+                b"throw" => {
+                    self.i += 5;
+                    let args = self.read_plain();
+                    out.push(parse_throw(&args, None));
+                }
+                b"raiserror" => {
+                    self.i += 9;
+                    let args = self.read_plain();
+                    out.push(parse_throw(&args, Some(50000)));
                 }
                 b"select" if self.select_has_assignment() => {
                     self.i += 6;
@@ -775,6 +914,16 @@ impl<'a> Parser<'a> {
             }
         }
         false
+    }
+
+    /// Word immediately after the BEGIN at the cursor (skipping ws).
+    fn peek_word_after_begin_is(&self, want: &[u8]) -> bool {
+        let mut j = self.i + 5;
+        while j < self.b.len() && self.b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let lb = self.lb();
+        self.b.len() >= j + want.len() && &lb[j..j + want.len()] == want
     }
 
     fn starts_with_var_ahead(&self) -> bool {
@@ -1152,7 +1301,8 @@ impl<'a> Parser<'a> {
             return self.parse_block(depth);
         }
         // `IF … BREAK` / `WHILE … CONTINUE` govern the flow statements
-        // themselves, not a plain run spelling the keyword.
+        // themselves, not a plain run spelling the keyword; the same goes
+        // for a governed THROW/RAISERROR.
         self.skip_trivia();
         match self.peek_word() {
             Some(b"break") => {
@@ -1162,6 +1312,16 @@ impl<'a> Parser<'a> {
             Some(b"continue") => {
                 self.i += 8;
                 return Ok(vec![Stmt::Continue]);
+            }
+            Some(b"throw") => {
+                self.i += 5;
+                let args = self.read_plain();
+                return Ok(vec![parse_throw(&args, None)]);
+            }
+            Some(b"raiserror") => {
+                self.i += 9;
+                let args = self.read_plain();
+                return Ok(vec![parse_throw(&args, Some(50000))]);
             }
             _ => {}
         }
@@ -1222,6 +1382,60 @@ impl<'a> Parser<'a> {
             self.i += 1;
         }
         err("BEGIN without a matching END")
+    }
+}
+
+/// THROW / RAISERROR argument shapes:
+/// `THROW` (re-raise), `THROW 50000, 'msg', 1`,
+/// `RAISERROR('msg', 16, 1)`. The default code backs a bare RAISERROR.
+fn parse_throw(args: &str, raiserror_default: Option<i64>) -> Stmt {
+    let text = args.trim().trim_end_matches(';').trim();
+    if text.is_empty() {
+        return Stmt::Throw(None);
+    }
+    // Split top-level commas.
+    let b = text.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = stmt::sql_literal_end(text, i);
+                i = end;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(text[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(text[start..].trim());
+    let code = parts
+        .first()
+        .and_then(|p| p.parse::<i64>().ok())
+        .or(raiserror_default);
+    let message = parts
+        .get(1)
+        .map(|p| unquote_literal(p))
+        .or_else(|| parts.first().map(|p| unquote_literal(p)))
+        .unwrap_or_else(|| "error raised by batch".into());
+    Stmt::Throw(code.zip(Some(message)))
+}
+
+/// Strip one layer of single quotes; anything else returns as-is.
+fn unquote_literal(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        t[1..t.len() - 1].replace("''", "'")
+    } else {
+        t.to_string()
     }
 }
 
@@ -1461,8 +1675,11 @@ mod tests {
         // @@VERSION substitutes as a literal string.
         let out = run_script(&mut s, &mut db, "SELECT @@VERSION LIKE 'DocSQL%' AS v").unwrap();
         assert_eq!(rows_of(&out)[0][0], Value::Bool(true));
-        // Unknown @@var is loud.
-        let e = run_script(&mut s, &mut db, "SELECT @@ERROR").unwrap_err();
+        // @@ERROR is now supported (last statement's error number, 0 on
+        // success); unknown @@vars stay loud.
+        let out = run_script(&mut s, &mut db, "SELECT @@ERROR AS e").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(0));
+        let e = run_script(&mut s, &mut db, "SELECT @@FETCH_STATUS").unwrap_err();
         assert!(e.to_string().contains("not supported"), "{e}");
         // PRINT errors on a bad expression.
         assert!(run_script(&mut s, &mut db, "PRINT UPPER(1,2)").is_err());
@@ -1778,6 +1995,85 @@ mod tests {
         assert!(!needs_interpretation("SELECT [@x] FROM t"));
         assert!(!needs_interpretation("SELECT \"@x\""));
         assert!(!needs_interpretation("GO"));
+    }
+
+    /// THROW / RAISERROR / TRY...CATCH: catch swallows the try error and
+    /// reads it through ERROR_MESSAGE()/ERROR_NUMBER()/@@ERROR; errors in
+    /// the catch propagate; THROW re-raises.
+    #[test]
+    fn try_catch_and_throw() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE t (v INT)").unwrap();
+        // TRY error → CATCH runs → batch continues.
+        run_script(
+            &mut s,
+            &mut db,
+            "BEGIN TRY\n  INSERT INTO missing VALUES (1)\nEND TRY\nBEGIN CATCH\n  INSERT INTO t VALUES (ERROR_NUMBER())\nEND CATCH\nSELECT COUNT(*) AS c FROM t",
+        )
+        .unwrap();
+        // Non-existent table error → generic 50000.
+        let out = run_script(&mut s, &mut db, "SELECT v FROM t").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(50000));
+        // ERROR_MESSAGE carries the caught text; @@ERROR inside CATCH is
+        // the caught number, and clears to 0 after a good statement.
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @msg TEXT, @num INT\nBEGIN TRY\n  INSERT INTO no_such_table VALUES (1)\nEND TRY\nBEGIN CATCH\n  SET @msg = ERROR_MESSAGE()\n  SET @num = @@ERROR\nEND CATCH\nSELECT @msg LIKE '%no_such_table%' AS hit, @num AS n",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Bool(true));
+        assert_eq!(rows_of(&out)[0][1], Value::Int(50000));
+        let out = run_script(&mut s, &mut db, "SELECT @@ERROR AS e").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(0));
+        // THROW with arguments raises; the batch fails loudly.
+        let e =
+            run_script(&mut s, &mut db, "IF 1 = 1 THROW 51000, 'custom failure', 1").unwrap_err();
+        assert!(e.to_string().contains("custom failure"), "{e}");
+        assert!(e.to_string().contains("51000"), "{e}");
+        // RAISERROR message form.
+        let e = run_script(&mut s, &mut db, "RAISERROR('raised', 16, 1)").unwrap_err();
+        assert!(e.to_string().contains("raised"), "{e}");
+        // Re-THROW inside CATCH propagates the original message.
+        let e = run_script(
+            &mut s,
+            &mut db,
+            "BEGIN TRY\n  THROW 52000, 'original', 1\nEND TRY\nBEGIN CATCH\n  THROW\nEND CATCH",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("original"), "{e}");
+        // Bare THROW outside CATCH uses the default message.
+        let e = run_script(&mut s, &mut db, "THROW").unwrap_err();
+        assert!(e.to_string().contains("error raised by batch"), "{e}");
+        // Errors inside CATCH propagate (not swallowed twice).
+        let e = run_script(
+            &mut s,
+            &mut db,
+            "BEGIN TRY\n  THROW 1, 'first', 1\nEND TRY\nBEGIN CATCH\n  THROW 2, 'second', 1\nEND CATCH",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("second"), "{e}");
+        // BREAK inside TRY propagates to the enclosing WHILE.
+        run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @i INT = 0\nWHILE 1 = 1\nBEGIN\n  SET @i = @i + 1\n  BEGIN TRY\n    IF @i = 3 BREAK\n  END TRY\n  BEGIN CATCH\n  END CATCH\nEND\nSELECT @i AS v",
+        )
+        .unwrap();
+        let out = run_script(&mut s, &mut db, "SELECT @i AS v").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(3));
+        // BEGIN TRY without BEGIN CATCH refuses.
+        assert!(run_script(&mut s, &mut db, "BEGIN TRY\nSELECT 1\nEND TRY").is_err());
+        // Outside CATCH, ERROR_MESSAGE()/ERROR_NUMBER() read as NULL/0.
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "SELECT ERROR_MESSAGE() AS m, ERROR_NUMBER() AS n",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Null);
+        assert_eq!(rows_of(&out)[0][1], Value::Null);
     }
 
     #[test]

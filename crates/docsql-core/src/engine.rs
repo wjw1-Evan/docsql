@@ -25638,6 +25638,38 @@ mod tsql_compat_tests {
         assert!(db.execute("SELECT RAND()").is_err());
     }
 
+    /// Error-path and multi-column-join coverage over FROM/join shapes.
+    #[test]
+    fn from_factor_and_join_edge_coverage() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT, k1 INT, k2 INT)");
+        run(&mut db, "CREATE TABLE b (id INT, k1 INT, k2 INT)");
+        run(&mut db, "INSERT INTO a VALUES (1, 10, 100)");
+        run(&mut db, "INSERT INTO b VALUES (1, 10, 100), (2, 10, 200)");
+        // Multi-column USING builds a compound ON across both columns.
+        let r = rows(&mut db, "SELECT a.id, b.id FROM a JOIN b USING (k1, k2)");
+        assert_eq!(r.rows.len(), 1);
+        // LATERAL table functions refuse; WITH ORDINALITY refuses; an
+        // unknown FROM function names itself.
+        assert!(db
+            .execute("SELECT * FROM LATERAL STRING_SPLIT('a', ',') AS s")
+            .is_err());
+        assert!(db
+            .execute("SELECT * FROM STRING_SPLIT('a', ',') AS s WITH ORDINALITY")
+            .is_err());
+        assert!(db.execute("SELECT * FROM some_tvf(1) AS t").is_err());
+        // Failed ALTER/CREATE INDEX rolls the catalog back (the table
+        // still works under its old shape afterwards).
+        // ALTER on a missing table rolls back cleanly.
+        assert!(db.execute("ALTER TABLE no_such ADD COLUMN x INT").is_err());
+        let r = rows(&mut db, "SELECT id, k1 FROM a");
+        assert_eq!(r.rows.len(), 1);
+        assert!(db.execute("CREATE INDEX ix ON no_such (col)").is_err());
+        assert!(db.execute("CREATE INDEX ix ON a (no_such)").is_err());
+        let r = rows(&mut db, "SELECT id FROM a");
+        assert_eq!(r.rows.len(), 1);
+    }
+
     #[test]
     fn cross_and_outer_apply_table_functions() {
         let mut db = Database::in_memory().unwrap();
