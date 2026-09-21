@@ -80,10 +80,17 @@ public sealed class DocsqlLoggingDefinitions : RelationalLoggingDefinitions;
 // DocsqlConventionSetBuilder 见 DocsqlJsonDictionaryConvention.cs(挂字典→JSON 文本约定)。
 
 /// <summary>字符串方法 LINQ 翻译(StartsWith/EndsWith/Contains → LIKE)。</summary>
-public sealed class DocsqlMethodCallTranslatorPlugin : IMethodCallTranslatorPlugin
+public sealed class DocsqlMethodCallTranslatorPlugin(
+    ISqlExpressionFactory sqlExpressionFactory,
+    IRelationalTypeMappingSource typeMappingSource)
+    : IMethodCallTranslatorPlugin
 {
     public IEnumerable<IMethodCallTranslator> Translators { get; } =
-        new IMethodCallTranslator[] { new DocsqlStringMethodTranslator() };
+        new IMethodCallTranslator[]
+        {
+            new DocsqlStringMethodTranslator(),
+            new DocsqlTsqlMethodTranslator(sqlExpressionFactory, typeMappingSource),
+        };
 }
 
 public sealed class DocsqlStringMethodTranslator : IMethodCallTranslator

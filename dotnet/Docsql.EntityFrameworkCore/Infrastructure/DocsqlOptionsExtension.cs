@@ -107,7 +107,10 @@ internal static class DocsqlServiceCollectionExtensions
         services.TryAddSingleton<ISqlGenerationHelper, DocsqlSqlGenerationHelper>();
         services.TryAddSingleton<IRelationalTypeMappingSource, DocsqlTypeMappingSource>();
         services.TryAddScoped<IQuerySqlGeneratorFactory, DocsqlQuerySqlGeneratorFactory>();
-        services.TryAddSingleton<IMethodCallTranslatorPlugin, DocsqlMethodCallTranslatorPlugin>();
+        services.TryAddScoped<IMethodCallTranslatorPlugin, DocsqlMethodCallTranslatorPlugin>();
+        // 成员翻译:DateTime/string 成员与静态 GETDATE/GETUTCDATE/NEWID 映射到
+        // 引擎 T-SQL 函数族(YEAR/MONTH/DAY/DATEPART/LENGTH/UPPER/LOWER/TRIM)。
+        services.TryAddScoped<IMemberTranslatorPlugin, DocsqlMemberTranslatorPlugin>();
         services.TryAddScoped<IUpdateSqlGenerator, DocsqlUpdateSqlGenerator>();
         services.TryAddScoped<IModificationCommandBatchFactory, DocsqlModificationCommandBatchFactory>();
         // EF Migrations 不提供:注册显式报错桩,Database.Migrate() 直接失败
