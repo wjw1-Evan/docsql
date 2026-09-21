@@ -1,13 +1,26 @@
 //! Transport encryption for the DSQ1 wire protocol.
 //!
 //! Pre-shared-key mode (`DOCSQL_KEY`, 32 bytes hex): every frame payload is
-//! sealed with AES-256-GCM using a fresh random 96-bit nonce —
+//! sealed with AES-256-GCM using a structured nonce — a per-process random
+//! 4-byte prefix plus a process-wide monotonic 64-bit counter —
 //! `payload' = nonce[12] || ciphertext+tag[16]`. The frame header (type,
 //! length, flags) stays plaintext so routing stays cheap; everything
 //! application-visible (SQL text, KV args, AUTH token, rows) is encrypted.
 //! The header fields are bound into the GCM tag as associated data: a MITM
 //! flipping a flag (clearing FLAG_ENCRYPTED, setting FLAG_REPLICATION)
 //! invalidates the frame instead of re-routing it.
+//!
+//! Nonce construction: a fully random 96-bit nonce per frame carries the
+//! NIST SP 800-38D birthday bound of 2^32 encryptions per key — a busy
+//! fan-out cluster (one short-lived connection per write per target)
+//! passes that in days. prefix ‖ counter instead never repeats inside a
+//! process (u64 counter) and collides across processes only when two
+//! processes draw the same 32-bit prefix AND the same counter — negligible
+//! for realistic process counts. The structure also gives receivers a
+//! replay guard ([`ReplayGuard`]): frames from one peer share its prefix
+//! and carry strictly increasing counters (TCP ordering), so a captured
+//! frame replayed into the stream fails the monotonic check even though it
+//! would decrypt fine.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -49,10 +62,63 @@ pub fn aad(frame_type: u16, flags: u16) -> [u8; 4] {
     out
 }
 
+/// Per-process nonce material (see the module doc): one random 4-byte
+/// prefix for the process lifetime, one shared strictly-monotonic counter.
+static NONCE_PREFIX: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
+static NONCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_nonce() -> [u8; 12] {
+    let prefix = NONCE_PREFIX.get_or_init(rand::random);
+    let counter = NONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(prefix);
+    nonce[4..].copy_from_slice(&counter.to_le_bytes());
+    nonce
+}
+
+/// Inbound replay guard for one connection direction. Sealed frames from
+/// one peer share that peer's process prefix and carry strictly increasing
+/// counters (TCP delivers in order), so anything non-increasing — or a
+/// prefix change mid-connection — is a replay or an injection and is
+/// rejected before decryption.
+#[derive(Default)]
+pub struct ReplayGuard {
+    prefix: Option<[u8; 4]>,
+    last: u64,
+}
+
+impl ReplayGuard {
+    /// Validate the nonce of an inbound sealed payload (12-byte prefix).
+    pub fn check(&mut self, sealed: &[u8]) -> Result<(), String> {
+        if sealed.len() < 12 {
+            return Err("sealed payload too short".into());
+        }
+        let mut prefix = [0u8; 4];
+        prefix.copy_from_slice(&sealed[..4]);
+        let counter = u64::from_le_bytes(sealed[4..12].try_into().expect("12-byte slice"));
+        match self.prefix {
+            None => {
+                self.prefix = Some(prefix);
+                self.last = counter;
+                Ok(())
+            }
+            Some(p) if p == prefix => {
+                if counter > self.last {
+                    self.last = counter;
+                    Ok(())
+                } else {
+                    Err("replayed or reordered encrypted frame rejected".into())
+                }
+            }
+            Some(_) => Err("encrypted frame nonce prefix changed mid-connection".into()),
+        }
+    }
+}
+
 /// Seal one frame payload: nonce ‖ ciphertext+tag. `flags` must be the
 /// flags as transmitted (i.e. with [`FLAG_ENCRYPTED`] already set).
 pub fn seal(key: &TransportKey, frame_type: u16, flags: u16, plaintext: &[u8]) -> Vec<u8> {
-    let nonce: [u8; 12] = rand::random();
+    let nonce = next_nonce();
     let cipher = Aes256Gcm::new(key.into());
     let ct = cipher
         .encrypt(
@@ -135,6 +201,34 @@ mod tests {
         assert_eq!(open(&k, 0x0102, 0x0004, &sealed).unwrap(), pt.to_vec());
         // fresh nonce each seal
         assert_ne!(seal(&k, 0x0102, 0x0004, pt), seal(&k, 0x0102, 0x0004, pt));
+    }
+
+    #[test]
+    fn replay_guard_rejects_replayed_and_reordered_frames() {
+        let k = key();
+        let first = seal(&k, 0x0102, 0x0004, b"one");
+        let second = seal(&k, 0x0102, 0x0004, b"two");
+        let mut g = ReplayGuard::default();
+        assert!(g.check(&first).is_ok());
+        assert!(g.check(&second).is_ok());
+        // replay of the first frame: same (or lower) counter
+        assert!(g.check(&first).is_err());
+        assert!(g.check(&second).is_err());
+        // prefix change mid-connection is an injection
+        let mut foreign = first.clone();
+        foreign[0] ^= 0xff;
+        assert!(g.check(&foreign).is_err());
+        assert!(g.check(b"short").is_err());
+    }
+
+    #[test]
+    fn nonces_share_prefix_and_increase() {
+        let a = seal(&key(), 1, FLAG_ENCRYPTED, b"x");
+        let b = seal(&key(), 1, FLAG_ENCRYPTED, b"x");
+        assert_eq!(a[..4], b[..4]);
+        let ca = u64::from_le_bytes(a[4..12].try_into().unwrap());
+        let cb = u64::from_le_bytes(b[4..12].try_into().unwrap());
+        assert!(cb > ca);
     }
 
     #[test]

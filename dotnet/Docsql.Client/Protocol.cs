@@ -138,6 +138,11 @@ public sealed class ProtocolConnection : IDisposable
     /// 超过容量上限时逐个 REQ_CLOSE_STMT 后清空(服务器侧无自动逐出)。
     /// </summary>
     private readonly Dictionary<string, ulong> _prepared = new();
+
+    // 入向重放闸(与服务端 ReplayGuard 对称):同连接的加密帧必须共享对端
+    // 进程前缀且计数器严格递增;重放/乱序帧虽可解密但在此拒绝。
+    private byte[]? _peerPrefix;
+    private long _peerLastCounter;
     private const int PreparedCapacity = 96;
 
     public ProtocolConnection(
@@ -389,11 +394,29 @@ public sealed class ProtocolConnection : IDisposable
     /// <summary>仅接收一帧(已解密);阻塞直至一帧完整到达。</summary>
     public Frame Receive() => ReadFrame();
 
-    /// <summary>AES-256-GCM:nonce(12) ‖ 密文 ‖ tag(16),头部字段作为 AAD。</summary>
+    /// <summary>进程级 nonce 素材,与服务端 crypto.rs 对称:随机 4 字节前缀 +
+    /// 进程级单调 64 位计数器。纯随机 96 位 nonce 受 NIST SP 800-38D 生日界
+    /// (每密钥 2^32 次加密)约束,高吞吐扇出集群数天即越界;前缀+计数器在进程内
+    /// 永不重复,跨进程仅在「同前缀且同计数器」时碰撞,概率可忽略。计数器结构
+    /// 同时让接收端可做重放判定(同连接内计数器必须严格递增)。</summary>
+    private static readonly byte[] NoncePrefix = CreateNoncePrefix();
+    private static long _nonceCounter;
+
+    private static byte[] CreateNoncePrefix()
+    {
+        var prefix = new byte[4];
+        RandomNumberGenerator.Fill(prefix);
+        return prefix;
+    }
+
+    /// <summary>AES-256-GCM:nonce(12)=前缀(4)+计数器(8,LE) ‖ 密文 ‖ tag(16),
+    /// 头部字段作为 AAD。</summary>
     private static byte[] Seal(byte[] key, FrameType type, ushort flags, byte[] plaintext)
     {
         var nonce = new byte[12];
-        RandomNumberGenerator.Fill(nonce);
+        NoncePrefix.CopyTo(nonce, 0);
+        BinaryPrimitives.WriteInt64LittleEndian(nonce.AsSpan(4, 8),
+            Interlocked.Increment(ref _nonceCounter));
         using var gcm = new AesGcm(key, 16);
         var ct = new byte[plaintext.Length];
         var tag = new byte[16];
@@ -470,9 +493,29 @@ public sealed class ProtocolConnection : IDisposable
         {
             if (_key is null)
                 throw new DocsqlException("服务端返回加密帧但客户端未配置 key");
+            CheckReplay(payload);
             payload = Unseal(_key, type, flags, payload);
         }
         return new Frame(type, flags, topo, payload);
+    }
+
+    /// <summary>校验入向密封帧的 nonce(前缀 + 计数器)满足重放约束。</summary>
+    private void CheckReplay(byte[] sealed_)
+    {
+        if (sealed_.Length < 12)
+            throw new DocsqlException("加密载荷过短");
+        var counter = BinaryPrimitives.ReadInt64LittleEndian(sealed_.AsSpan(4, 8));
+        if (_peerPrefix is null)
+        {
+            _peerPrefix = sealed_[..4];
+            _peerLastCounter = counter;
+            return;
+        }
+        if (!sealed_.AsSpan(0, 4).SequenceEqual(_peerPrefix))
+            throw new DocsqlException("加密帧 nonce 前缀在连接中途改变");
+        if (counter <= _peerLastCounter)
+            throw new DocsqlException("拒绝重放或乱序的加密帧");
+        _peerLastCounter = counter;
     }
 
     private void ReadExact(byte[] buf)

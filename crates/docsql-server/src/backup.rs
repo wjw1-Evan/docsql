@@ -198,8 +198,11 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
         return Err("backup timed out waiting for the open transaction".into());
     };
     // Block scope: the engine guard drops before any further await (the
-    // dump itself is synchronous, O(data) in memory).
-    let script = {
+    // dump itself is synchronous, O(data) in memory). Header and body stay
+    // separate Strings: concatenating them here used to double the peak
+    // (two full-library copies) while write_order and the engine write
+    // lock were held.
+    let (header, body) = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         // PITR anchor: the journal position this dump covers. A restore to
         // a timestamp T replays journal entries with seq > this and
@@ -208,10 +211,9 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
         // its seq <= N_head — no replication-lag ambiguity.
         let head = db.journal_head().map_err(|e| format!("backup dump: {e}"))?;
         let dump = db.dump_script().map_err(|e| format!("backup dump: {e}"))?;
-        format!(
-            "-- docsql-backup v2 journal-seq={head} ts={}\n{}",
-            now_ms(),
-            dump
+        (
+            format!("-- docsql-backup v2 journal-seq={head} ts={}\n", now_ms()),
+            dump,
         )
     };
     drop(_order);
@@ -221,14 +223,15 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     let name = format!("backup-{}.sql", next_stamp(&state.backup_dir, now_ms()));
     std::fs::create_dir_all(&state.backup_dir).map_err(|e| format!("backup dir: {e}"))?;
     let tmp = state.backup_dir.join(format!("{name}.tmp"));
-    write_private(&tmp, script.as_bytes()).map_err(|e| format!("backup write: {e}"))?;
+    write_private_two(&tmp, header.as_bytes(), body.as_bytes())
+        .map_err(|e| format!("backup write: {e}"))?;
     std::fs::rename(&tmp, state.backup_dir.join(&name))
         .map_err(|e| format!("backup rename: {e}"))?;
     // Integrity sidecar (sha256sum format: "<hex>  <name>"), written
     // alongside the file it covers. Restore verifies it before replaying —
     // a corrupted dump must be caught at the door, not halfway through a
     // whole-cluster replay.
-    let digest = docsql_core::kdf::sha256(script.as_bytes());
+    let digest = docsql_core::kdf::sha256_parts(&[header.as_bytes(), body.as_bytes()]);
     let sidecar = state.backup_dir.join(format!("{name}.sha256"));
     let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
     write_private(
@@ -244,6 +247,31 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
 /// Write bytes with owner-only permissions. A backup is the entire
 /// database — documents plus the PBKDF2 password hashes — in plain SQL;
 /// the default 0644 made it readable by every local account.
+/// Like [`write_private`] over two byte slices without concatenating them
+/// (the backup header + the dump body are written back to back).
+fn write_private_two(path: &Path, a: &[u8], b: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(a)?;
+        f.write_all(b)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut joined = Vec::with_capacity(a.len() + b.len());
+        joined.extend_from_slice(a);
+        joined.extend_from_slice(b);
+        std::fs::write(path, joined)
+    }
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -580,6 +608,27 @@ fn read_incr_files(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// A snapshot adoption re-adjudicates the node's whole write history: the
+/// journal is voided inside the adoption transaction, but incrementals
+/// already exported to `incr-*.sql` still carry the discarded writes' texts
+/// verbatim — restoring an older base plus those files would resurrect
+/// exactly the writes the void exists to bury. Delete the exported chain
+/// (sidecars included); PITR restarts from the next full backup. Best
+/// effort by nature (files are not transactional), but it runs before the
+/// adoption is reported Applied.
+pub(crate) fn invalidate_incremental_exports(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("incr-") && (name.ends_with(".sql") || name.ends_with(".sql.sha256")) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn next_incr_stamp(dir: &Path, now: u64) -> String {

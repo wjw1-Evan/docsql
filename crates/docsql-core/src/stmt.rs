@@ -49,9 +49,16 @@ pub fn sql_literal_end(sql: &str, open: usize) -> (usize, bool) {
 /// scan over the lowercase copy indexes the original safely (the Unicode
 /// `to_lowercase` panic class is off the table). The name alone (no `(`)
 /// catches `NOW ()` / `SYSDATE\n()`, which parse identically to `NOW()`.
+/// The T-SQL GETDATE family folds with the same one-instant rule.
 pub fn mentions_wall_clock(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
-    lower.contains("now") || lower.contains("sysdate") || lower.contains("current_timestamp")
+    lower.contains("now")
+        || lower.contains("sysdate")
+        || lower.contains("current_timestamp")
+        || lower.contains("getdate")
+        || lower.contains("getutcdate")
+        || lower.contains("sysdatetime")
+        || lower.contains("sysutcdatetime")
 }
 
 /// Fold wall-clock functions in a WRITE statement into literals stamped with
@@ -165,6 +172,20 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                     // Bare keyword form.
                     out.push_str(&ts_lit);
                     folded = true;
+                } else if matches!(
+                    word,
+                    b"getdate"
+                        | b"getutcdate"
+                        | b"sysdatetime"
+                        | b"sysutcdatetime"
+                        | b"sysdatetimeoffset"
+                ) && empty_call
+                {
+                    // T-SQL clock family: same one-instant rule (all forms
+                    // are UTC here — the engine has no local-time zone).
+                    out.push_str(&ts_lit);
+                    folded = true;
+                    i = close + 1;
                 } else {
                     out.push_str(&sql[start..i]);
                 }
@@ -200,11 +221,19 @@ fn utf8_len(b: u8) -> usize {
 /// quoted identifiers, `--` line comments and `/* */` block comments never
 /// split. Needed because user-management statements are hand-parsed and
 /// cannot ride the sqlparser AST (their grammar is not accepted).
+///
+/// T-SQL batches: a line holding only `GO` (case-insensitive, optional
+/// trailing `;`) is a batch separator like `;` — the line itself is
+/// dropped. `GO <count>` repeats stay verbatim so the parser reports them
+/// (repeat counts are not supported).
 fn text_chunks(sql: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
     let chars: Vec<char> = sql.chars().collect();
     let mut i = 0;
+    // Char index in `cur` where the current output line began (GO can only
+    // appear on a line of its own, outside literals and comments).
+    let mut line_begin = 0usize;
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' || c == '"' {
@@ -253,11 +282,42 @@ fn text_chunks(sql: &str) -> Vec<String> {
         }
         if c == ';' {
             chunks.push(std::mem::take(&mut cur));
+            line_begin = 0;
+            i += 1;
+            continue;
+        }
+        if c == '\n' {
+            let line = cur[line_begin..].trim();
+            let bare = line.strip_suffix(';').unwrap_or(line).trim();
+            if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
+                // The whole line is the separator: drop it and close the
+                // batch before it (trailing whitespace belongs to the
+                // separator's line, not the statement).
+                cur.truncate(line_begin);
+                while cur.ends_with(char::is_whitespace) {
+                    cur.pop();
+                }
+                chunks.push(std::mem::take(&mut cur));
+                line_begin = 0;
+                i += 1;
+                continue;
+            }
+            cur.push(c);
+            line_begin = cur.len();
             i += 1;
             continue;
         }
         cur.push(c);
         i += 1;
+    }
+    // Trailing GO line without a newline ends the final batch the same way.
+    let line = cur[line_begin..].trim();
+    let bare = line.strip_suffix(';').unwrap_or(line).trim();
+    if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
+        cur.truncate(line_begin);
+        while cur.ends_with(char::is_whitespace) {
+            cur.pop();
+        }
     }
     chunks.push(cur);
     chunks
@@ -283,15 +343,21 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, String> {
     if chunks.len() == 1 {
         // Single statement: validate parseability (malformed input must
         // error like before), then return the original text verbatim so
-        // execution never depends on AST rendering.
+        // execution never depends on AST rendering. Exception: when the
+        // splitter itself dropped a trailing GO separator, the chunk —
+        // not the original — is the statement text.
         if crate::useradmin::parse(&chunks[0]).is_some() {
             return Ok(vec![sql.trim().to_string()]);
         }
-        let stmts = Parser::parse_sql(&GenericDialect {}, &chunks[0]).map_err(|e| e.to_string())?;
+        let stmts = Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&chunks[0]))
+            .map_err(|e| e.to_string())?;
         if stmts.is_empty() {
             return Err("empty statement".into());
         }
-        return Ok(vec![sql.trim().to_string()]);
+        if chunks[0].trim() == sql.trim() {
+            return Ok(vec![sql.trim().to_string()]);
+        }
+        return Ok(vec![chunks[0].trim().to_string()]);
     }
     let mut out = Vec::with_capacity(chunks.len());
     for chunk in chunks {
@@ -299,7 +365,8 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, String> {
             out.push(chunk.trim().to_string());
             continue;
         }
-        let stmts = Parser::parse_sql(&GenericDialect {}, &chunk).map_err(|e| e.to_string())?;
+        let stmts = Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&chunk))
+            .map_err(|e| e.to_string())?;
         for s in stmts {
             out.push(format!("{s};"));
         }
@@ -313,6 +380,48 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_clock_fold_tsql_and_identifier_edges() {
+        // The GETDATE family folds with the same one-instant rule.
+        let folded =
+            fold_wall_clocks("INSERT INTO t VALUES (GETDATE())", 0).expect("getdate folded");
+        assert!(folded.contains("CAST("), "{folded}");
+        // CURRENT_TIMESTAMP's empty-call and bare-keyword forms.
+        let folded = fold_wall_clocks("UPDATE t SET a = CURRENT_TIMESTAMP()", 0)
+            .expect("current_timestamp() folded");
+        assert!(folded.contains("CAST("), "{folded}");
+        let folded = fold_wall_clocks("UPDATE t SET a = CURRENT_TIMESTAMP", 0)
+            .expect("bare current_timestamp folded");
+        assert!(folded.contains("CAST("), "{folded}");
+        // Quoted-identifier doubling and non-ASCII bytes inside a foldable
+        // statement pass through untouched.
+        let folded = fold_wall_clocks("UPDATE \"t\"\"x\" SET 消息 = GETDATE()", 0).expect("folded");
+        assert!(folded.contains('"'), "{folded}");
+        assert!(folded.contains("消息"), "{folded}");
+        // Non-folding text is None.
+        assert!(fold_wall_clocks("SELECT 1", 0).is_none());
+    }
+
+    #[test]
+    fn go_lines_split_batches_like_semicolons() {
+        let v = split_statements("SELECT 1\nGO\nSELECT 2").unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v[0].contains("SELECT 1"));
+        assert!(v[1].contains("SELECT 2"));
+        // Lowercase, trailing ; and CRLF forms all separate.
+        let v = split_statements("SELECT 1\ngo;\r\nSELECT 2").unwrap();
+        assert_eq!(v.len(), 2);
+        // GO inside a string literal is data, not a separator.
+        let v = split_statements("SELECT 'go' AS v; SELECT 2").unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v[0].contains("'go'"));
+        // A trailing GO closes the batch without an empty statement.
+        let v = split_statements("SELECT 1\nGO").unwrap();
+        assert_eq!(v, vec!["SELECT 1"]);
+        // GO <count> repeats are not supported: loud parse error.
+        assert!(split_statements("SELECT 1\nGO 5").is_err());
+    }
 
     #[test]
     fn single_statement_returns_original_text() {

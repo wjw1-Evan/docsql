@@ -92,6 +92,17 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     h.finish()
 }
 
+/// SHA-256 over several byte slices without concatenating them (callers
+/// hash header + body of large artifacts instead of doubling them in
+/// memory to build one contiguous input).
+pub fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finish()
+}
+
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
     for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {

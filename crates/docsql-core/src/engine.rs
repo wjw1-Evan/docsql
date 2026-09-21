@@ -113,7 +113,7 @@ pub type Result<T> = std::result::Result<T, SqlError>;
 /// (MVCC stage A concurrent readers).
 type Ctes = std::collections::BTreeMap<String, Vec<Object>>;
 
-fn err<T>(msg: impl Into<String>) -> Result<T> {
+pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(SqlError::Message(msg.into()))
 }
 
@@ -488,16 +488,29 @@ fn parse_expr_text(s: &str) -> Result<SqlExpr> {
         .map_err(|e| SqlError::Parse(e.to_string()))
 }
 
-/// True when the expression calls a wall-clock function (NOW/SYSDATE/
-/// CURRENT_TIMESTAMP, any case): its value differs between nodes and
-/// instants, so a stored DEFAULT carrying it must be resolved per row on
-/// the writing node and shipped as a literal (red line: non-deterministic
-/// generated values are fixed by the writer).
+/// True when the expression calls a non-deterministic function — the
+/// wall-clock family (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/…) or the
+/// random-id family (NEWID/NEWSEQUENTIALID): its value differs between
+/// nodes and instants, so a stored DEFAULT or CHECK carrying it must be
+/// resolved per row on the writing node and shipped as a literal (red
+/// line: non-deterministic generated values are fixed by the writer).
 fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
             let n = f.name.to_string().to_ascii_lowercase();
-            if n == "now" || n == "sysdate" || n == "current_timestamp" {
+            if matches!(
+                n.as_str(),
+                "now"
+                    | "sysdate"
+                    | "current_timestamp"
+                    | "getdate"
+                    | "getutcdate"
+                    | "sysdatetime"
+                    | "sysutcdatetime"
+                    | "sysdatetimeoffset"
+                    | "newid"
+                    | "newsequentialid"
+            ) {
                 return true;
             }
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
@@ -1088,10 +1101,110 @@ impl<'a> ReadCx<'a> {
                     .unwrap_or_default();
                 return Ok(("@derived".into(), Some(alias), docs));
             }
+            // Bare function call in FROM: `FROM STRING_SPLIT('a,b', ',') AS s`
+            // parses here, not into TableFactor::Table's args.
+            if let sqlparser::ast::TableFactor::Function {
+                lateral,
+                name,
+                args,
+                with_ordinality,
+                alias,
+            } = tf
+            {
+                if *lateral {
+                    return err("LATERAL table functions are not supported");
+                }
+                if *with_ordinality {
+                    return err("WITH ORDINALITY is not supported");
+                }
+                let fname = obj_name(name).to_uppercase();
+                if !matches!(
+                    fname.as_str(),
+                    "STRING_SPLIT" | "GENERATE_SERIES" | "OPENJSON"
+                ) {
+                    return err("table functions or FROM hints are not supported");
+                }
+                let mut vals = Vec::new();
+                for a in args {
+                    match a {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => vals.push(eval_const(e)?),
+                        _ => return err("table function arguments must be values"),
+                    }
+                }
+                let Some(alias_obj) = alias else {
+                    return err(format!(
+                        "{fname} requires a table alias (FROM {fname}(...) AS t)"
+                    ));
+                };
+                let docs = match crate::tsql::table_function(&fname, &vals) {
+                    Some(Ok(rows)) => rows,
+                    Some(Err(e)) => return Err(e),
+                    None => return err(format!("unknown table function {fname}")),
+                };
+                return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
+            }
+            // `OPENJSON(x)` parses into a dedicated factor (WITH shapes and
+            // path arguments are not supported — default key/value/type
+            // rows only).
+            if let sqlparser::ast::TableFactor::OpenJsonTable {
+                json_expr,
+                json_path,
+                columns,
+                alias,
+            } = tf
+            {
+                if !columns.is_empty() || json_path.is_some() {
+                    return err("OPENJSON WITH (...) and path arguments are not supported");
+                }
+                let val = eval_const(json_expr)?;
+                let Some(alias_obj) = alias else {
+                    return err("OPENJSON requires a table alias (FROM OPENJSON(...) AS j)");
+                };
+                let docs = match crate::tsql::table_function("OPENJSON", &[val]) {
+                    Some(Ok(rows)) => rows,
+                    Some(Err(e)) => return Err(e),
+                    None => return err("unknown table function OPENJSON"),
+                };
+                return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
+            }
             return err("unsupported FROM item (expected a table, derived table or VALUES)");
         };
-        if args.is_some() {
-            return err("table functions or FROM hints are not supported");
+        if let Some(args) = &args {
+            // T-SQL/standard table-valued functions with a fixed, known
+            // output shape (STRING_SPLIT, GENERATE_SERIES, OPENJSON):
+            // constant arguments only — they materialize once per query.
+            // Everything else keeps the loud table-function error.
+            let fname = obj_name(name).to_uppercase();
+            if !matches!(
+                fname.as_str(),
+                "STRING_SPLIT" | "GENERATE_SERIES" | "OPENJSON"
+            ) {
+                return err("table functions or FROM hints are not supported");
+            }
+            let list = &args.args;
+            let mut vals = Vec::new();
+            for a in list {
+                match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) => vals.push(eval_const(e)?),
+                    _ => return err("table function arguments must be values"),
+                }
+            }
+            let Some(alias_obj) = &alias else {
+                return err(format!(
+                    "{fname} requires a table alias (FROM {fname}(...) AS t)"
+                ));
+            };
+            let alias = alias_obj.name.value.clone();
+            let docs = match crate::tsql::table_function(&fname, &vals) {
+                Some(Ok(rows)) => rows,
+                Some(Err(e)) => return Err(e),
+                None => return err(format!("unknown table function {fname}")),
+            };
+            return Ok(("@tablefn".into(), Some(alias), docs));
         }
         if sample.is_some() {
             return err("TABLESAMPLE is not supported");
@@ -1508,9 +1621,19 @@ impl<'a> ReadCx<'a> {
             if pre_windowed {
                 return err("internal: window function reached the pre-windowed fast path");
             }
-            self.compute_windows(&win_calls, &mut docs)?;
+            // Declared columns of the FROM tables: a column ADDed without a
+            // DEFAULT never appears in stored rows, so the row-key universe
+            // alone would misjudge its window references as unknown.
+            let mut from_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for twj in &select.from {
+                collect_factor_columns(&twj.relation, self.tables, &mut from_cols);
+                for j in &twj.joins {
+                    collect_factor_columns(&j.relation, self.tables, &mut from_cols);
+                }
+            }
+            let win_tmps = self.compute_windows(&win_calls, &mut docs, &from_cols)?;
             for (_, e) in project.iter_mut() {
-                rewrite_windows(e, &win_calls);
+                rewrite_windows(e, &win_calls, &win_tmps);
             }
         }
         let mut out: Vec<Vec<Value>> = Vec::new();
@@ -1574,12 +1697,60 @@ impl<'a> ReadCx<'a> {
     /// WHERE-filtered) rows and inject the results as private `__w<i>$`
     /// columns. Row order in `rows` is the stable scan order: it defines
     /// the arbitrary-but-deterministic order when the OVER spec carries no
-    /// ORDER BY, and the tie order the stable sort preserves.
-    fn compute_windows(&self, calls: &[Function], rows: &mut [Object]) -> Result<()> {
+    /// ORDER BY, and the tie order the stable sort preserves. Returns the
+    /// private column chosen per call (collision-free against the rows' own
+    /// fields) for the projection rewrite to reference.
+    fn compute_windows(
+        &self,
+        calls: &[Function],
+        rows: &mut [Object],
+        from_cols: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>> {
+        // Column universe for the unknown-column guard below, doubling as
+        // the name pool the private `__w<i>$` columns must not collide with.
+        // Row keys carry the JOIN-qualified names; `from_cols` adds the
+        // tables' declared columns (present in meta even when no stored row
+        // carries them yet).
+        let mut occupied: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in rows.iter() {
+            for k in r.keys() {
+                occupied.insert(k.clone());
+                cols.insert(k.clone());
+            }
+        }
+        for c in from_cols {
+            occupied.insert(c.clone());
+            cols.insert(c.clone());
+        }
+        let mut tmp_names: Vec<String> = Vec::with_capacity(calls.len());
         for (ci, f) in calls.iter().enumerate() {
             self.deadline.check()?;
             let fname = f.name.to_string().to_uppercase();
-            let spec = validate_window_spec(f, &fname)?;
+            let aggregate = is_agg_name(f);
+            let spec = validate_window_spec(f, &fname, aggregate)?;
+            // Unknown columns evaluate to NULL on every row, which for a
+            // window key silently collapses the whole computation (RANK all
+            // 1s, running totals over the entire partition) — refuse the
+            // statement instead. Resolution mirrors `lookup_col`: the exact
+            // key, or any joined "alias.col" key with a matching leaf. An
+            // EMPTY rowset carries no column universe — skip (there is
+            // nothing to compute anyway) rather than rejecting everything.
+            if !rows.is_empty() {
+                for e in spec
+                    .partition_by
+                    .iter()
+                    .chain(spec.order_by.iter().map(|o| &o.expr))
+                {
+                    check_window_columns(e, &cols)?;
+                }
+                for a in fn_args(f) {
+                    check_window_columns(&a, &cols)?;
+                }
+                if let Some(flt) = &f.filter {
+                    check_window_columns(flt, &cols)?;
+                }
+            }
             let ordered = !spec.order_by.is_empty();
             // Partition keys per row: groups hash by encoded key, the same
             // identity DISTINCT and GROUP BY use.
@@ -1587,6 +1758,7 @@ impl<'a> ReadCx<'a> {
             let mut part_index: std::collections::HashMap<Vec<u8>, usize> =
                 std::collections::HashMap::new();
             for (i, doc) in rows.iter().enumerate() {
+                self.deadline.check()?;
                 let mut key = Vec::with_capacity(spec.partition_by.len());
                 for p in &spec.partition_by {
                     key.push(eval_expr(p, doc)?);
@@ -1600,17 +1772,11 @@ impl<'a> ReadCx<'a> {
                     }
                 }
             }
-            // Aggregates reuse the whole group-aggregate evaluator over each
-            // frame slice; scalar window functions are computed here.
-            let agg = if is_agg_name(f) {
+            // Aggregates fold incrementally over the growing default frame
+            // (RunningAgg below); scalar window functions are computed here.
+            let agg = if aggregate {
                 let (op, arg, distinct, sep, filter) = agg_parts(f, true)?;
-                Some(AggSpec::Agg {
-                    op,
-                    arg,
-                    distinct,
-                    sep,
-                    filter,
-                })
+                Some((op, arg, distinct, sep, filter))
             } else {
                 None
             };
@@ -1623,6 +1789,7 @@ impl<'a> ReadCx<'a> {
                 // order-key tuple; peer runs compare consecutive tuples.
                 let mut keyed: Vec<(usize, Vec<Value>)> = Vec::with_capacity(idxs.len());
                 for &i in idxs {
+                    self.deadline.check()?;
                     let mut ks = Vec::with_capacity(spec.order_by.len());
                     for o in &spec.order_by {
                         ks.push(eval_expr(&o.expr, &rows[i])?);
@@ -1671,15 +1838,50 @@ impl<'a> ReadCx<'a> {
                         p = q + 1;
                     }
                 }
-                if let Some(agg) = &agg {
+                if let Some((op, arg, distinct, sep, filter)) = &agg {
                     // Aggregate OVER: default frame = partition start
                     // through the current row's peer run (RANGE). Without
-                    // ORDER BY the frame is the whole partition.
-                    for (p, &ri) in sorted.iter().enumerate() {
-                        let end = if ordered { run_end[p] } else { n - 1 };
-                        let frame: Vec<&Object> =
-                            sorted[..=end].iter().map(|&i| &rows[i]).collect();
-                        vals[ri] = eval_agg(agg, &frame, &[], &[])?;
+                    // ORDER BY the frame is the whole partition. Every
+                    // frame is a PREFIX of the partition, so one
+                    // left-to-right fold reproduces the batch `eval_agg`
+                    // over each frame exactly (same evaluation order, same
+                    // NULL/DISTINCT/FILTER and tie rules) in O(n)
+                    // evaluations instead of re-folding each frame O(n²).
+                    let count_star =
+                        matches!(arg, SqlExpr::Identifier(i) if i.value == "__count__");
+                    // FILTER first, argument second — exactly the batch
+                    // order in eval_agg: an argument expression that only
+                    // errors on filtered-out rows (e.g. a bitwise op on a
+                    // text row) must not fail the whole window.
+                    let mut passes: Vec<bool> = Vec::with_capacity(n);
+                    let mut argvals: Vec<Option<Value>> = Vec::with_capacity(n);
+                    for &i in &sorted {
+                        self.deadline.check()?;
+                        let kept = match filter {
+                            Some(flt) => matches!(eval_expr(flt, &rows[i])?, Value::Bool(true)),
+                            None => true,
+                        };
+                        passes.push(kept);
+                        argvals.push(if kept {
+                            Some(eval_expr(arg, &rows[i])?)
+                        } else {
+                            None
+                        });
+                    }
+                    let mut run = RunningAgg::new(op.clone(), sep.clone(), *distinct, count_star);
+                    let mut pushed = 0usize; // sorted rows [0..pushed) are folded in
+                    let mut p = 0usize;
+                    while p < n {
+                        let end = run_end[p];
+                        while pushed <= end {
+                            run.push_row(passes[pushed], argvals[pushed].as_ref())?;
+                            pushed += 1;
+                        }
+                        let v = run.snapshot();
+                        for r in p..=end {
+                            vals[sorted[r]] = v.clone();
+                        }
+                        p = end + 1;
                     }
                 } else {
                     let args = fn_args(f);
@@ -1691,6 +1893,7 @@ impl<'a> ReadCx<'a> {
                             let mut dense = 0i64;
                             let mut p = 0usize;
                             while p < n {
+                                self.deadline.check()?;
                                 let end = run_end[p];
                                 dense += 1;
                                 for r in p..=end {
@@ -1718,6 +1921,7 @@ impl<'a> ReadCx<'a> {
                             let q = n / buckets;
                             let r = n % buckets;
                             for (p, &ri) in sorted.iter().enumerate() {
+                                self.deadline.check()?;
                                 let b = if q == 0 {
                                     p
                                 } else if p < r * (q + 1) {
@@ -1746,6 +1950,7 @@ impl<'a> ReadCx<'a> {
                                 }
                             };
                             for (p, &ri) in sorted.iter().enumerate() {
+                                self.deadline.check()?;
                                 let target: Option<usize> = if fname == "LAG" {
                                     p.checked_sub(offset as usize)
                                 } else {
@@ -1768,6 +1973,7 @@ impl<'a> ReadCx<'a> {
                                 ));
                             }
                             for (p, &ri) in sorted.iter().enumerate() {
+                                self.deadline.check()?;
                                 let end = if ordered { run_end[p] } else { n - 1 };
                                 let target = if fname == "FIRST_VALUE" { 0 } else { end };
                                 vals[ri] = eval_expr(&args[0], &rows[sorted[target]])?;
@@ -1779,12 +1985,23 @@ impl<'a> ReadCx<'a> {
                     }
                 }
             }
-            let tmp = window_tmp_col(ci);
+            // Private column name: never collide with a user field — a
+            // user column literally named `__w0$` would otherwise be
+            // silently overwritten by the injected window value.
+            let mut k = ci;
+            let tmp = loop {
+                let cand = window_tmp_col(k);
+                if occupied.insert(cand.clone()) {
+                    break cand;
+                }
+                k += 1;
+            };
+            tmp_names.push(tmp.clone());
             for (i, v) in vals.into_iter().enumerate() {
                 rows[i].insert(tmp.clone(), v);
             }
         }
-        Ok(())
+        Ok(tmp_names)
     }
 
     /// Load a FROM list into merged rows: the base table plus its JOINs,
@@ -2087,6 +2304,7 @@ impl<'a> ReadCx<'a> {
     /// Execute the query body (no WITH: it was materialized by the caller
     /// into `ctes`).
     fn exec_query_body(&self, query: Query, ctes: &Ctes) -> Result<ExecOutcome> {
+        let query = rewrite_tsql_top(query)?;
         reject_unsupported_query_clauses(&query)?;
         let body = query.body.clone();
         match *body {
@@ -4218,7 +4436,14 @@ impl Database {
             Some(Err(m)) => return err(m),
             None => {}
         }
-        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)
+        // T-SQL notations the generic parser cannot express ([brackets],
+        // CONVERT/PARSE argument order, SET/USE/PRINT shims) are rewritten
+        // on a text copy; `source` keeps the original text so journals and
+        // logs carry what the user wrote (the rewrite is deterministic and
+        // re-applies on every replay).
+        let parsed_sql = crate::tsql::preprocess(sql);
+        let parsed_sql = parsed_sql.as_str();
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, parsed_sql)
             .map_err(|e| SqlError::Parse(e.to_string()))?;
         let stmt = match stmts.len() {
             0 => return err("empty statement"),
@@ -4410,6 +4635,22 @@ impl Database {
                 }
             }
         }
+        // NEWID()/NEWSEQUENTIALID() in writes: only INSERT has the canonical
+        // per-row rewrite that ships generated ids as literals (exec_insert).
+        // UPDATE/DELETE/MERGE journal their original text, so a random id
+        // there would be re-rolled on every replaying peer — refuse loudly.
+        // AST-level: a substring scan over the source would match the words
+        // inside string literals ('x-newid-y') and unrelated identifiers
+        // (a column named newid), rejecting perfectly legal writes.
+        if parsed.is_write {
+            if let AnyStmt::Sql(stmt) = &parsed.stmt {
+                if stmt_calls_newid(stmt) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID() are only supported in SELECT and INSERT",
+                    );
+                }
+            }
+        }
         match parsed.stmt {
             AnyStmt::Sql(stmt) => self.exec_stmt(*stmt),
             AnyStmt::UserAdmin(ua) => self.exec_user_admin(&ua),
@@ -4422,7 +4663,7 @@ impl Database {
         match crate::useradmin::parse(sql) {
             Some(Ok(_)) => Ok(()),
             Some(Err(m)) => Err(m),
-            None => match Parser::parse_sql(&GenericDialect {}, sql) {
+            None => match Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(sql)) {
                 Ok(stmts) if !stmts.is_empty() => Ok(()),
                 Ok(_) => Err("empty statement".into()),
                 Err(e) => Err(e.to_string()),
@@ -5544,20 +5785,29 @@ impl Database {
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Commit { .. } => {
-                if self.tx_snapshot.take().is_none() {
+                if self.tx_snapshot.is_none() {
                     return err("no transaction in progress");
                 }
+                // Durability FIRST, teardown after: consuming the undo
+                // journal and catalog snapshot before the fsync used to
+                // leave a failed COMMIT unrecoverable — the transaction's
+                // deferred frames sat unfenced with no undo left, and the
+                // NEXT unrelated commit's fence would silently persist the
+                // "failed" transaction while the client retried it. With
+                // this order a failed fsync keeps the transaction open
+                // (rollback and retry both still possible); the teardown
+                // only runs once the boundary is durable (async-commit
+                // mode defers that to the background flusher).
+                if !self.async_commit {
+                    self.pager.sync_wal().map_err(SqlError::from)?;
+                    self.pending_sync = false;
+                }
+                let _ = self.tx_snapshot.take();
                 // The page undo journal dies with the transaction.
                 self.pager.end_undo();
                 // Savepoints die with their transaction: a stale mark must
                 // not be reachable from a later transaction's ROLLBACK TO.
                 self.savepoints.clear();
-                // One WAL fsync for every statement in the transaction
-                // (async-commit mode leaves it to the background flusher).
-                if !self.async_commit {
-                    self.pager.sync_wal().map_err(SqlError::from)?;
-                    self.pending_sync = false;
-                }
                 Ok(ExecOutcome::Affected(0))
             }
             Statement::Rollback {
@@ -5674,7 +5924,24 @@ impl Database {
         meta: &mut TableMeta,
         docs: Vec<Object>,
     ) -> Result<()> {
-        self.rewrite_table_inner(table, meta, docs, true)
+        self.rewrite_table_with_dead(table, meta, docs, Vec::new())
+    }
+
+    /// Like [`Self::rewrite_table`], but also releases the page trees of
+    /// indexes that were removed from `meta` BEFORE this rebuild (DROP
+    /// COLUMN): their roots are no longer in `meta.index_roots`, so the
+    /// generic free loop below would skip them and the pages would leak for
+    /// good — nothing else ever references them. Freed in the SAME write
+    /// unit as the catalog switch, so a crash can never leave a committed
+    /// catalog pointing at recycled pages.
+    fn rewrite_table_with_dead(
+        &mut self,
+        table: &str,
+        meta: &mut TableMeta,
+        docs: Vec<Object>,
+        dead_trees: Vec<(String, u32)>,
+    ) -> Result<()> {
+        self.rewrite_table_inner(table, meta, docs, true, dead_trees)
     }
 
     fn rewrite_table_inner(
@@ -5683,6 +5950,7 @@ impl Database {
         meta: &mut TableMeta,
         docs: Vec<Object>,
         free_old: bool,
+        dead_trees: Vec<(String, u32)>,
     ) -> Result<()> {
         let mut heap = Heap {
             pages: Vec::new(),
@@ -5702,6 +5970,14 @@ impl Database {
             }
             for (root_key, &root) in &meta.index_roots {
                 for p in BTree::open(root)
+                    .collect_pages(&PageReader::current(&self.pager), &tx)
+                    .map_err(|e| index_err(root_key, e))?
+                {
+                    self.pager.free_page(&mut tx, p)?;
+                }
+            }
+            for (root_key, root) in &dead_trees {
+                for p in BTree::open(*root)
                     .collect_pages(&PageReader::current(&self.pager), &tx)
                     .map_err(|e| index_err(root_key, e))?
                 {
@@ -6417,6 +6693,38 @@ impl Database {
             }
             cols.push(col);
         }
+        let root_key = if cols.len() > 1 {
+            iname.clone()
+        } else {
+            cols[0].clone()
+        };
+        // root_key collision guard: `index_roots` is a mixed pool — column-
+        // named constraint/single-column trees plus index-name-keyed
+        // composite trees — and `BTreeMap::append` silently OVERWRITES an
+        // existing key. A collision with a DIFFERENTLY-keyed tree (an index
+        // named exactly like the PK column, a single-column index on a
+        // column whose root holds a composite tree) would replace a live
+        // tree: uniqueness enforcement would probe a tree keyed with a
+        // different shape, old and new rows would mix key types in one
+        // tree, and the overwritten tree's pages would leak — refuse.
+        // The one benign case REUSES the existing tree instead: a second
+        // index over exactly the same single column (e.g. UNIQUE INDEX on a
+        // constraint column). Both indexes read the same tree; single-
+        // column uniqueness is enforced through `meta.unique` (pushed
+        // below), never through tree-level rejection. `IF NOT EXISTS` does
+        // not apply: it is about the index NAME, and the colliding index
+        // is a different one.
+        let mut reuse_root: Option<u32> = None;
+        if let Some(&root) = meta.index_roots.get(&root_key) {
+            if meta.index_columns_of(&root_key) == cols {
+                reuse_root = Some(root);
+            } else {
+                return err(format!(
+                    "index root key {root_key} is already in use by another index or \
+                     constraint; choose a different index name or column"
+                ));
+            }
+        }
         // Single-column UNIQUE INDEX rides the constraint machinery: the
         // column joins meta.unique, so inserts/updates enforce duplicates
         // from here on. Composite unique indexes cannot use the per-column
@@ -6430,30 +6738,55 @@ impl Database {
         // Build the B+ tree over the existing rows. Single-column trees are
         // non-unique at the tree level (duplicates allowed, lookups collect
         // every match); composite UNIQUE trees enforce duplicates on insert.
-        let pairs = self.table_pairs_cx(&table)?;
         let mut tx = self.pager.begin_tx();
-        let root_key = if composite {
-            iname.clone()
-        } else {
-            cols[0].clone()
-        };
-        let mut roots = self.build_trees(
-            &mut tx,
-            &pairs,
-            std::slice::from_ref(&root_key),
-            &[cols.clone()],
-            &[idx.unique],
-        )?;
-        self.commit_pager_tx(tx)?;
-        meta.index_roots.append(&mut roots);
+        match reuse_root {
+            // Same-semantics reuse: no tree build, the existing root stays
+            // authoritative for both indexes.
+            Some(root) => {
+                meta.index_roots.insert(root_key.clone(), root);
+            }
+            None => {
+                let pairs = self.table_pairs_cx(&table)?;
+                let mut roots = self.build_trees(
+                    &mut tx,
+                    &pairs,
+                    std::slice::from_ref(&root_key),
+                    &[cols.clone()],
+                    &[idx.unique],
+                )?;
+                meta.index_roots.append(&mut roots);
+            }
+        }
         meta.index_defs.push(IndexDef {
             name: iname.clone(),
             columns: cols,
             unique: idx.unique,
         });
         meta.indexes.push(iname);
-        self.tables.insert(table, std::sync::Arc::new(meta));
-        self.save_catalog()?;
+        let prev_meta = self.tables.get(&table).cloned();
+        self.tables.insert(table.clone(), std::sync::Arc::new(meta));
+        // The catalog rides the SAME write unit as the tree pages: committing
+        // the tree first and saving the catalog in a second transaction left
+        // a crash window holding a committed tree no catalog references (the
+        // pages would leak for good — nothing would ever free them).
+        let persisted = self
+            .save_catalog_into(&mut tx)
+            .and_then(|()| self.commit_pager_tx(tx));
+        if let Err(e) = persisted {
+            // The tx dropped without committing: its staged tree pages went
+            // back to the reusable pool. The in-memory entry must not keep
+            // pointing at them — a later write would land index entries on
+            // pages a concurrent allocation may hand to someone else.
+            match prev_meta {
+                Some(old) => {
+                    self.tables.insert(table, old);
+                }
+                None => {
+                    self.tables.remove(&table);
+                }
+            }
+            return Err(e);
+        }
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -6467,6 +6800,9 @@ impl Database {
         // rewrite_table persists the catalog in its own transaction; only
         // metadata-only ALTERs (plain ADD COLUMN) need the tail save.
         let mut rewrote = false;
+        // Trees detached from `meta.index_roots` by DROP COLUMN below; freed
+        // inside the rebuild's write unit (see rewrite_table_with_dead).
+        let mut dead_trees: Vec<(String, u32)> = Vec::new();
         for op in &alter.operations {
             match op {
                 Op::AddColumn { column_def, .. } => {
@@ -6583,7 +6919,13 @@ impl Database {
                         meta.not_null.retain(|c| c != &name);
                         meta.defaults.retain(|(c, _)| c != &name);
                         meta.foreign_keys.retain(|(c, _, _)| c != &name);
-                        meta.index_roots.remove(&name);
+                        if let Some(root) = meta.index_roots.remove(&name) {
+                            // Capture the tree BEFORE dropping it from the
+                            // map: the rebuild below only frees trees still
+                            // listed in `index_roots`, so these roots must
+                            // ride `dead_trees` or their pages leak forever.
+                            dead_trees.push((name.clone(), root));
+                        }
                         if meta.autoinc.as_deref() == Some(name.as_str()) {
                             meta.autoinc = None;
                         }
@@ -6602,6 +6944,11 @@ impl Database {
                         for n in &dead {
                             meta.indexes.retain(|i| i != n);
                         }
+                        for (k, root) in meta.index_roots.iter() {
+                            if dead.contains(k) {
+                                dead_trees.push((k.clone(), *root));
+                            }
+                        }
                         meta.index_roots.retain(|k, _| !dead.contains(k));
                         meta.index_defs.retain(|d| !dead.contains(&d.name));
                     }
@@ -6615,7 +6962,12 @@ impl Database {
                             d
                         })
                         .collect();
-                    self.rewrite_table(&tname, &mut meta, stripped)?;
+                    self.rewrite_table_with_dead(
+                        &tname,
+                        &mut meta,
+                        stripped,
+                        std::mem::take(&mut dead_trees),
+                    )?;
                     rewrote = true;
                 }
                 Op::RenameColumn {
@@ -7299,7 +7651,7 @@ impl Database {
         } else {
             insert.columns.iter().map(obj_name).collect()
         };
-        let Some(source) = insert.source else {
+        let Some(source) = &insert.source else {
             return err("INSERT requires VALUES");
         };
         let rows: Vec<Vec<Value>> = match &*source.body {
@@ -7465,8 +7817,14 @@ impl Database {
         // wall-clock DEFAULT. Emit a canonical INSERT carrying the generated
         // ids / resolved instants explicitly — with the conflict clause
         // preserved so peers resolve the same conflicts against identical
-        // state.
-        if guid_filled || default_clock_filled {
+        // state. NEWID()/NEWSEQUENTIALID() in the source (VALUES or SELECT)
+        // are the same class: the writing node rolls the ids and ships the
+        // literal values.
+        let source_calls_newid = insert.source.as_ref().is_some_and(|s| {
+            let text = s.to_string().to_ascii_lowercase();
+            text.contains("newid") || text.contains("newsequentialid")
+        });
+        if guid_filled || default_clock_filled || source_calls_newid {
             let policy = if replace {
                 "OR REPLACE "
             } else if do_nothing {
@@ -8209,6 +8567,7 @@ impl Drop for WriteUnit<'_> {
     }
 }
 
+#[derive(Clone)]
 enum AggOp {
     Count,
     Sum,
@@ -8263,6 +8622,26 @@ fn agg_parts(
     if f.over.is_some() && !for_window {
         return err(format!(
             "window functions (OVER) are not supported: {fname}"
+        ));
+    }
+    // ORDER BY inside the aggregate's own argument list (e.g.
+    // STRING_AGG(x, ',' ORDER BY y)) is only meaningful for order-sensitive
+    // aggregates; dropping it silently would concatenate in scan order.
+    // WITHIN GROUP is the same request spelled as a clause.
+    let arg_order = match &f.args {
+        sqlparser::ast::FunctionArguments::List(list) => list.clauses.iter().any(|c| {
+            matches!(
+                c,
+                sqlparser::ast::FunctionArgumentClause::OrderBy(_)
+                    | sqlparser::ast::FunctionArgumentClause::Limit(_)
+                    | sqlparser::ast::FunctionArgumentClause::OnOverflow(_)
+            )
+        }),
+        _ => false,
+    };
+    if arg_order || !f.within_group.is_empty() {
+        return err(format!(
+            "ORDER BY inside aggregate arguments is not supported: {fname}"
         ));
     }
     let (distinct, inner, second) = match &f.args {
@@ -9168,6 +9547,137 @@ fn is_agg_fn(f: &sqlparser::ast::Function) -> bool {
     !f.over.is_some() && is_agg_name(f)
 }
 
+/// True when the expression calls NEWID()/NEWSEQUENTIALID() at any depth.
+/// Mirrors the expression shapes `rewrite_windows`/`walk_expr` cover.
+fn calls_newid(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Function(f) => {
+            let n = f.name.to_string().to_uppercase();
+            if n == "NEWID" || n == "NEWSEQUENTIALID" {
+                return true;
+            }
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                if list.args.iter().any(|a| {
+                    matches!(
+                        a,
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) if calls_newid(inner)
+                    )
+                }) {
+                    return true;
+                }
+            }
+            f.filter.as_ref().is_some_and(|flt| calls_newid(flt))
+        }
+        SqlExpr::Nested(inner) => calls_newid(inner),
+        SqlExpr::BinaryOp { left, right, .. } => calls_newid(left) || calls_newid(right),
+        SqlExpr::UnaryOp { expr, .. } => calls_newid(expr),
+        SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::IsTrue(inner)
+        | SqlExpr::IsNotTrue(inner)
+        | SqlExpr::IsFalse(inner)
+        | SqlExpr::IsNotFalse(inner)
+        | SqlExpr::IsUnknown(inner)
+        | SqlExpr::IsNotUnknown(inner) => calls_newid(inner),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => calls_newid(expr) || calls_newid(low) || calls_newid(high),
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            calls_newid(l) || calls_newid(r)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            calls_newid(expr) || calls_newid(pattern)
+        }
+        SqlExpr::InList { expr, list, .. } => calls_newid(expr) || list.iter().any(calls_newid),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(calls_newid)
+                || conditions
+                    .iter()
+                    .any(|w| calls_newid(&w.condition) || calls_newid(&w.result))
+                || else_result.as_deref().is_some_and(calls_newid)
+        }
+        SqlExpr::Cast { expr, .. } => calls_newid(expr),
+        _ => false,
+    }
+}
+
+/// NEWID()/NEWSEQUENTIALID() anywhere in an UPDATE/DELETE/MERGE statement
+/// (assignments, predicates, join conditions, MERGE clause actions).
+fn stmt_calls_newid(stmt: &Statement) -> bool {
+    use sqlparser::ast::{FromTable, JoinConstraint, JoinOperator};
+    let join_ons = |twj: &sqlparser::ast::TableWithJoins| -> bool {
+        twj.joins.iter().any(|j| {
+            matches!(
+                &j.join_operator,
+                JoinOperator::Join(c)
+                    | JoinOperator::Inner(c)
+                    | JoinOperator::Left(c)
+                    | JoinOperator::LeftOuter(c)
+                    | JoinOperator::Right(c)
+                    | JoinOperator::RightOuter(c)
+                    | JoinOperator::FullOuter(c)
+                    if matches!(c, JoinConstraint::On(e) if calls_newid(e))
+            )
+        })
+    };
+    match stmt {
+        Statement::Update(u) => {
+            u.assignments.iter().any(|a| calls_newid(&a.value))
+                || u.selection.as_ref().is_some_and(calls_newid)
+                || join_ons(&u.table)
+                || u.from.as_ref().is_some_and(|f| match f {
+                    sqlparser::ast::UpdateTableFromKind::BeforeSet(twjs)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(twjs) => {
+                        twjs.iter().any(join_ons)
+                    }
+                })
+        }
+        Statement::Delete(d) => {
+            d.selection.as_ref().is_some_and(calls_newid)
+                || d.using
+                    .as_ref()
+                    .is_some_and(|twjs| twjs.iter().any(join_ons))
+                || match &d.from {
+                    FromTable::WithFromKeyword(twjs) | FromTable::WithoutKeyword(twjs) => {
+                        twjs.iter().any(join_ons)
+                    }
+                }
+        }
+        Statement::Merge(m) => {
+            calls_newid(&m.on)
+                || m.clauses.iter().any(|c| {
+                    c.predicate.as_ref().is_some_and(calls_newid)
+                        || match &c.action {
+                            sqlparser::ast::MergeAction::Insert(ins) => {
+                                ins.insert_predicate.as_ref().is_some_and(calls_newid)
+                                    || match &ins.kind {
+                                        sqlparser::ast::MergeInsertKind::Values(v) => v
+                                            .rows
+                                            .iter()
+                                            .any(|row| row.content.iter().any(calls_newid)),
+                                        _ => false,
+                                    }
+                            }
+                            sqlparser::ast::MergeAction::Update(up) => {
+                                up.assignments.iter().any(|a| calls_newid(&a.value))
+                                    || up.update_predicate.as_ref().is_some_and(calls_newid)
+                                    || up.delete_predicate.as_ref().is_some_and(calls_newid)
+                            }
+                            sqlparser::ast::MergeAction::Delete { .. } => false,
+                        }
+                })
+        }
+        _ => false,
+    }
+}
+
 fn contains_agg(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
@@ -9220,6 +9730,310 @@ fn contains_agg(e: &SqlExpr) -> bool {
 
 fn window_tmp_col(i: usize) -> String {
     format!("__w{i}$")
+}
+
+/// Running (prefix-frame) fold for aggregate OVER with the default frame.
+/// Mirrors `eval_agg`'s Agg arm exactly — same left-to-right evaluation
+/// order, same FILTER/NULL/DISTINCT handling, same tie rules, same AVG
+/// decimal-mode selection — so each snapshot equals the batch aggregate
+/// evaluated over the frame ending at the current peer run, while the whole
+/// partition costs O(n) evaluations instead of O(n²) re-folds.
+struct RunningAgg {
+    op: AggOp,
+    sep: Option<String>,
+    distinct: bool,
+    seen: std::collections::BTreeSet<Vec<u8>>,
+    /// COUNT(*): the arg is the `__count__` sentinel — count rows, not
+    /// non-null arg values.
+    count_star: bool,
+    /// Rows passing FILTER (COUNT(*) counts them even when the arg is NULL).
+    kept: i64,
+    /// Non-null, post-DISTINCT argument values (COUNT(x); SUM/AVG empty).
+    nonnull: i64,
+    sum: Option<Value>,
+    /// AVG exact-decimal mode flips on permanently at the first Decimal
+    /// input (batch AVG picks its mode from the whole frame); the pre-flip
+    /// prefix stays buffered for the one-time exact conversion.
+    avg_dec_mode: bool,
+    avg_vals: Vec<Value>,
+    avg_dec: Decimal,
+    avg_f64: f64,
+    min: Option<Value>,
+    max: Option<Value>,
+    concat: String,
+    concat_any: bool,
+}
+
+impl RunningAgg {
+    fn new(op: AggOp, sep: Option<String>, distinct: bool, count_star: bool) -> Self {
+        Self {
+            op,
+            sep,
+            distinct,
+            seen: std::collections::BTreeSet::new(),
+            count_star,
+            kept: 0,
+            nonnull: 0,
+            sum: None,
+            avg_dec_mode: false,
+            avg_vals: Vec::new(),
+            avg_dec: Decimal::ZERO,
+            avg_f64: 0.0,
+            min: None,
+            max: None,
+            concat: String::new(),
+            concat_any: false,
+        }
+    }
+
+    /// Fold one partition row (in frame order) into the running state.
+    /// `argval` is None for FILTER-excluded rows (their argument was never
+    /// evaluated, matching the batch evaluator's filter-first order).
+    fn push_row(&mut self, kept: bool, argval: Option<&Value>) -> Result<()> {
+        if kept {
+            self.kept += 1;
+        }
+        let Some(argval) = argval else {
+            return Ok(());
+        };
+        if matches!(argval, Value::Null) {
+            return Ok(());
+        }
+        if self.distinct
+            && !self
+                .seen
+                .insert(encode::encode_to_vec(argval).map_err(SqlError::Encode)?)
+        {
+            return Ok(());
+        }
+        self.nonnull += 1;
+        match self.op {
+            AggOp::Count => {}
+            AggOp::Sum => {
+                let next = match self.sum.take() {
+                    None => argval.clone(),
+                    Some(s) => add_values(s, argval.clone())?,
+                };
+                self.sum = Some(next);
+            }
+            AggOp::Avg => match argval {
+                Value::Decimal(d) => {
+                    if !self.avg_dec_mode {
+                        self.avg_dec_mode = true;
+                        self.avg_dec = Decimal::ZERO;
+                        for v in std::mem::take(&mut self.avg_vals) {
+                            self.avg_dec = self
+                                .avg_dec
+                                .checked_add(as_decimal(&v)?)
+                                .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                        }
+                    }
+                    self.avg_dec = self
+                        .avg_dec
+                        .checked_add(*d)
+                        .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                }
+                other => {
+                    if self.avg_dec_mode {
+                        self.avg_dec = self
+                            .avg_dec
+                            .checked_add(as_decimal(other)?)
+                            .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                    } else {
+                        self.avg_vals.push(other.clone());
+                        self.avg_f64 += match other {
+                            Value::Int(i) => *i as f64,
+                            Value::Float(f) => *f,
+                            _ => return err("AVG of non-numeric"),
+                        };
+                    }
+                }
+            },
+            AggOp::Min => match &self.min {
+                // Ties keep the first value, exactly like the batch reduce.
+                Some(m) if Value::cmp_values(m, argval) != std::cmp::Ordering::Greater => {}
+                _ => self.min = Some(argval.clone()),
+            },
+            AggOp::Max => match &self.max {
+                Some(m) if Value::cmp_values(m, argval) != std::cmp::Ordering::Less => {}
+                _ => self.max = Some(argval.clone()),
+            },
+            AggOp::GroupConcat => {
+                // The separator must precede every element after the FIRST
+                // pushed one (an element rendering as "" still counts).
+                if self.concat_any {
+                    self.concat.push_str(self.sep.as_deref().unwrap_or(","));
+                } else {
+                    self.concat_any = true;
+                }
+                self.concat.push_str(&value_to_text(argval));
+            }
+        }
+        Ok(())
+    }
+
+    /// Value of the aggregate over everything folded so far — the frame
+    /// ending at the current peer run.
+    fn snapshot(&self) -> Value {
+        match self.op {
+            AggOp::Count => Value::Int(if self.count_star {
+                self.kept
+            } else {
+                self.nonnull
+            }),
+            AggOp::Sum => self.sum.clone().unwrap_or(Value::Null),
+            AggOp::Avg => {
+                if self.nonnull == 0 {
+                    Value::Null
+                } else if self.avg_dec_mode {
+                    match self.avg_dec.checked_div(Decimal::from(self.nonnull)) {
+                        Some(d) => Value::Decimal(d),
+                        None => Value::Null,
+                    }
+                } else {
+                    Value::Float(self.avg_f64 / self.nonnull as f64)
+                }
+            }
+            AggOp::Min => self.min.clone().unwrap_or(Value::Null),
+            AggOp::Max => self.max.clone().unwrap_or(Value::Null),
+            AggOp::GroupConcat => Value::Str(self.concat.clone()),
+        }
+    }
+}
+
+/// Declared column names of a real-table table factor (views and CTEs have
+/// no meta columns — their rows carry the keys already).
+fn collect_factor_columns(
+    factor: &sqlparser::ast::TableFactor,
+    catalog: &std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    if let sqlparser::ast::TableFactor::Table { name, .. } = factor {
+        let tname = obj_name(name);
+        if let Some(meta) = catalog.get(&tname) {
+            if !meta.is_view() {
+                out.extend(meta.columns.iter().cloned());
+            }
+        }
+    }
+}
+
+/// Refuse unknown columns inside window PARTITION BY / ORDER BY / arguments:
+/// `eval_expr` resolves a missing column to NULL, which silently collapses
+/// the whole window computation (see compute_windows). Resolution mirrors
+/// `lookup_col` (exact key or joined "alias.col" leaf). Walks the shapes
+/// `rewrite_windows` knows; anything else keeps the legacy NULL behavior
+/// rather than risking a false reject.
+fn check_window_columns(e: &SqlExpr, cols: &std::collections::HashSet<String>) -> Result<()> {
+    let resolvable = |leaf: &str| -> bool {
+        if cols.contains(leaf) {
+            return true;
+        }
+        let suffix = format!(".{leaf}");
+        cols.iter().any(|k| k.ends_with(&suffix))
+    };
+    match e {
+        // `__count__` is the COUNT(*) sentinel (never a real column); T-SQL
+        // `@var` names get their own loud refusal inside eval_expr.
+        SqlExpr::Identifier(i) if i.value != "__count__" && !i.value.starts_with('@') => {
+            if resolvable(&i.value) {
+                Ok(())
+            } else {
+                err(format!("column {} does not exist", i.value))
+            }
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            let leaf = parts.last().map(|p| p.value.as_str()).unwrap_or("");
+            if resolvable(leaf) {
+                Ok(())
+            } else {
+                err(format!("column {leaf} does not exist"))
+            }
+        }
+        SqlExpr::Nested(inner) => check_window_columns(inner, cols),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            check_window_columns(left, cols)?;
+            check_window_columns(right, cols)
+        }
+        SqlExpr::UnaryOp { expr, .. } => check_window_columns(expr, cols),
+        SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::IsTrue(inner)
+        | SqlExpr::IsNotTrue(inner)
+        | SqlExpr::IsFalse(inner)
+        | SqlExpr::IsNotFalse(inner)
+        | SqlExpr::IsUnknown(inner)
+        | SqlExpr::IsNotUnknown(inner) => check_window_columns(inner, cols),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            check_window_columns(expr, cols)?;
+            check_window_columns(low, cols)?;
+            check_window_columns(high, cols)
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            check_window_columns(l, cols)?;
+            check_window_columns(r, cols)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            check_window_columns(expr, cols)?;
+            check_window_columns(pattern, cols)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            check_window_columns(expr, cols)?;
+            for item in list {
+                check_window_columns(item, cols)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                check_window_columns(op, cols)?;
+            }
+            for w in conditions {
+                check_window_columns(&w.condition, cols)?;
+                check_window_columns(&w.result, cols)?;
+            }
+            if let Some(el) = else_result {
+                check_window_columns(el, cols)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Cast { expr, .. } => check_window_columns(expr, cols),
+        SqlExpr::Function(f) => {
+            // Mirror `eval_fn_arg`: the datepart family's FIRST argument is
+            // a bare datepart keyword (`DATEDIFF(day, a, b)`), never a
+            // column reference — validating it as a column would reject
+            // every windowed DATEDIFF/DATEADD.
+            let fname = f.name.to_string().to_uppercase();
+            let skip_first = takes_datepart_name(&fname);
+            let mut first_unnamed = true;
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        let skip = skip_first && first_unnamed;
+                        first_unnamed = false;
+                        if !skip {
+                            check_window_columns(inner, cols)?;
+                        }
+                    }
+                }
+            }
+            if let Some(flt) = &f.filter {
+                check_window_columns(flt, cols)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Window functions in one SELECT's projection, first-appearance order.
@@ -9325,12 +10139,14 @@ fn scan_windows(e: &SqlExpr, out: &mut Vec<Function>, seen: &mut Vec<String>) {
 
 /// Replace every window call with a reference to its computed column; the
 /// dedup key (full text) matches [`scan_windows`], so indices agree.
-fn rewrite_windows(e: &mut SqlExpr, calls: &[Function]) {
+fn rewrite_windows(e: &mut SqlExpr, calls: &[Function], names: &[String]) {
     match e {
         SqlExpr::Function(f) if f.over.is_some() => {
             let key = format!("{f}");
             if let Some(i) = calls.iter().position(|c| format!("{c}") == key) {
-                *e = SqlExpr::Identifier(sqlparser::ast::Ident::new(window_tmp_col(i)));
+                *e = SqlExpr::Identifier(sqlparser::ast::Ident::new(
+                    names.get(i).cloned().unwrap_or_else(|| window_tmp_col(i)),
+                ));
             }
         }
         SqlExpr::Function(f) => {
@@ -9340,20 +10156,20 @@ fn rewrite_windows(e: &mut SqlExpr, calls: &[Function]) {
                         sqlparser::ast::FunctionArgExpr::Expr(inner),
                     ) = a
                     {
-                        rewrite_windows(inner, calls);
+                        rewrite_windows(inner, calls, names);
                     }
                 }
             }
             if let Some(filter) = &mut f.filter {
-                rewrite_windows(filter, calls);
+                rewrite_windows(filter, calls, names);
             }
         }
-        SqlExpr::Nested(inner) => rewrite_windows(inner, calls),
+        SqlExpr::Nested(inner) => rewrite_windows(inner, calls, names),
         SqlExpr::BinaryOp { left, right, .. } => {
-            rewrite_windows(left, calls);
-            rewrite_windows(right, calls);
+            rewrite_windows(left, calls, names);
+            rewrite_windows(right, calls, names);
         }
-        SqlExpr::UnaryOp { expr, .. } => rewrite_windows(expr, calls),
+        SqlExpr::UnaryOp { expr, .. } => rewrite_windows(expr, calls, names),
         SqlExpr::IsNull(inner)
         | SqlExpr::IsNotNull(inner)
         | SqlExpr::IsTrue(inner)
@@ -9361,26 +10177,26 @@ fn rewrite_windows(e: &mut SqlExpr, calls: &[Function]) {
         | SqlExpr::IsFalse(inner)
         | SqlExpr::IsNotFalse(inner)
         | SqlExpr::IsUnknown(inner)
-        | SqlExpr::IsNotUnknown(inner) => rewrite_windows(inner, calls),
+        | SqlExpr::IsNotUnknown(inner) => rewrite_windows(inner, calls, names),
         SqlExpr::Between {
             expr, low, high, ..
         } => {
-            rewrite_windows(expr, calls);
-            rewrite_windows(low, calls);
-            rewrite_windows(high, calls);
+            rewrite_windows(expr, calls, names);
+            rewrite_windows(low, calls, names);
+            rewrite_windows(high, calls, names);
         }
         SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
-            rewrite_windows(l, calls);
-            rewrite_windows(r, calls);
+            rewrite_windows(l, calls, names);
+            rewrite_windows(r, calls, names);
         }
         SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
-            rewrite_windows(expr, calls);
-            rewrite_windows(pattern, calls);
+            rewrite_windows(expr, calls, names);
+            rewrite_windows(pattern, calls, names);
         }
         SqlExpr::InList { expr, list, .. } => {
-            rewrite_windows(expr, calls);
+            rewrite_windows(expr, calls, names);
             for item in list {
-                rewrite_windows(item, calls);
+                rewrite_windows(item, calls, names);
             }
         }
         SqlExpr::Case {
@@ -9390,17 +10206,17 @@ fn rewrite_windows(e: &mut SqlExpr, calls: &[Function]) {
             ..
         } => {
             if let Some(op) = operand {
-                rewrite_windows(op, calls);
+                rewrite_windows(op, calls, names);
             }
             for w in conditions {
-                rewrite_windows(&mut w.condition, calls);
-                rewrite_windows(&mut w.result, calls);
+                rewrite_windows(&mut w.condition, calls, names);
+                rewrite_windows(&mut w.result, calls, names);
             }
             if let Some(el) = else_result {
-                rewrite_windows(el, calls);
+                rewrite_windows(el, calls, names);
             }
         }
-        SqlExpr::Cast { expr, .. } => rewrite_windows(expr, calls),
+        SqlExpr::Cast { expr, .. } => rewrite_windows(expr, calls, names),
         _ => {}
     }
 }
@@ -9429,7 +10245,16 @@ fn fn_args(f: &Function) -> Vec<SqlExpr> {
 fn validate_window_spec<'a>(
     f: &'a Function,
     fname: &str,
+    aggregate: bool,
 ) -> Result<&'a sqlparser::ast::WindowSpec> {
+    // FILTER is meaningful only for aggregate window functions (it rides the
+    // frame); for the scalar family it is not defined (Postgres/SQLite both
+    // refuse) and silently ignoring it would return unfiltered numbers.
+    if f.filter.is_some() && !aggregate {
+        return err(format!(
+            "FILTER is not supported for non-aggregate window functions: {fname}"
+        ));
+    }
     let spec = match &f.over {
         Some(sqlparser::ast::WindowType::WindowSpec(s)) => s,
         Some(sqlparser::ast::WindowType::NamedWindow(n)) => {
@@ -9588,7 +10413,7 @@ fn reject_constraint_decorations(
 }
 
 /// SQL literal for a value carried over into a replicated statement.
-fn value_literal(v: &Value) -> Result<String> {
+pub(crate) fn value_literal(v: &Value) -> Result<String> {
     match v {
         Value::Null => Ok("NULL".into()),
         Value::Bool(b) => Ok(if *b { "TRUE" } else { "FALSE" }.into()),
@@ -10183,6 +11008,8 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
                 }
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
                 (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
+                // T-SQL bitwise NOT (~x): two's-complement on 64-bit ints.
+                (sqlparser::ast::UnaryOperator::BitwiseNot, Value::Int(i)) => Ok(Value::Int(!i)),
                 _ => err("unsupported unary operand"),
             }
         }
@@ -10192,11 +11019,24 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
             binop(l, op, r)
         }
         SqlExpr::Nested(e) => eval_const(e),
+        SqlExpr::Floor { expr, .. } => scalar_function("FLOOR", &[eval_const(expr)?]),
+        SqlExpr::Ceil { expr, .. } => scalar_function("CEILING", &[eval_const(expr)?]),
         // CAST of a constant (bound decimal/blob parameters render as
         // CAST/hex literals; resolved INSERT replay re-evaluates them).
         SqlExpr::Cast {
-            expr, data_type, ..
-        } => cast_value(eval_const(expr)?, &data_type.to_string()),
+            kind,
+            expr,
+            data_type,
+            ..
+        } => {
+            let v = cast_value(eval_const(expr)?, &data_type.to_string());
+            // T-SQL TRY_CAST: a failed conversion yields NULL, not an error.
+            if matches!(kind, sqlparser::ast::CastKind::TryCast) {
+                v.or(Ok(Value::Null))
+            } else {
+                v
+            }
+        }
         // Pure scalar functions of constants: resolved replication rewrites
         // and dump scripts render structured values and non-finite floats as
         // JSON_EXTRACT(...)/CAST(...) expressions, which must evaluate back
@@ -10213,7 +11053,17 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
                     match a {
                         sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(inner),
-                        ) => args.push(eval_const(inner)?),
+                        ) => {
+                            // Datepart names are bare identifiers, not
+                            // columns (see `eval_fn_arg`).
+                            if args.is_empty() && takes_datepart_name(&name) {
+                                if let SqlExpr::Identifier(i) = inner {
+                                    args.push(Value::Str(i.value.clone()));
+                                    continue;
+                                }
+                            }
+                            args.push(eval_const(inner)?)
+                        }
                         _ => return err(format!("unsupported argument to {name}")),
                     }
                 }
@@ -10245,6 +11095,9 @@ fn sql_value(v: &sqlparser::ast::Value) -> Result<Value> {
             }
         }
         V::SingleQuotedString(s) | V::DoubleQuotedString(s) => Value::Str(s.clone()),
+        // T-SQL national strings: the engine has one UTF-8 text type, so the
+        // prefix only selects the literal form.
+        V::NationalStringLiteral(s) => Value::Str(s.clone()),
         V::Boolean(b) => Value::Bool(*b),
         V::Null => Value::Null,
         // x'deadbeef' — the canonical BLOB literal (params, dumps, replays).
@@ -10285,6 +11138,27 @@ fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
         .find(|(k, _)| k.ends_with(&suffix))
         .map(|(_, v)| v.clone())
         .unwrap_or(Value::Null))
+}
+
+/// True for the T-SQL datepart family whose FIRST argument is a bare
+/// datepart name (`DATEPART(day, d)`) — never a column reference.
+fn takes_datepart_name(name: &str) -> bool {
+    matches!(
+        name,
+        "DATEADD" | "DATEDIFF" | "DATEDIFF_BIG" | "DATEPART" | "DATENAME"
+    )
+}
+
+/// Evaluate one function argument for the Function arm of [`eval_expr`]:
+/// the leading identifier of the datepart family rides through as the
+/// datepart name itself.
+fn eval_fn_arg(e: &SqlExpr, name: &str, first: bool, doc: &Object) -> Result<Value> {
+    if first && takes_datepart_name(name) {
+        if let SqlExpr::Identifier(i) = e {
+            return Ok(Value::Str(i.value.clone()));
+        }
+    }
+    eval_expr(e, doc)
 }
 
 /// Evaluate an expression against a document row.
@@ -10342,6 +11216,8 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                 (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
+                // T-SQL bitwise NOT (~x): two's-complement on 64-bit ints.
+                (sqlparser::ast::UnaryOperator::BitwiseNot, Value::Int(i)) => Ok(Value::Int(!i)),
                 _ => err("unsupported unary operand"),
             }
         }
@@ -10454,8 +11330,19 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             }
         }
         SqlExpr::Cast {
-            expr, data_type, ..
-        } => cast_value(eval_expr(expr, doc)?, &data_type.to_string()),
+            kind,
+            expr,
+            data_type,
+            ..
+        } => {
+            let v = cast_value(eval_expr(expr, doc)?, &data_type.to_string());
+            // T-SQL TRY_CAST: a failed conversion yields NULL, not an error.
+            if matches!(kind, sqlparser::ast::CastKind::TryCast) {
+                v.or(Ok(Value::Null))
+            } else {
+                v
+            }
+        }
         // SUBSTR/SUBSTRING parses to a dedicated node, not a Function call.
         SqlExpr::Substring {
             expr,
@@ -10494,15 +11381,45 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             ..
         } => {
             let base = eval_expr(expr, doc)?;
+            // With a character set (T-SQL `TRIM('ab' FROM x)` / the
+            // LEADING/TRAILING/BOTH forms) strip exactly those characters
+            // from the chosen side; without one this is the classic
+            // whitespace TRIM/LTRIM/RTRIM.
+            if let Some(what) = trim_what {
+                let chars = match eval_expr(what, doc)? {
+                    Value::Null => return Ok(Value::Null),
+                    v => value_to_text(&v).chars().collect::<Vec<char>>(),
+                };
+                let strip = |s: &str, head: bool, tail: bool| -> String {
+                    if head {
+                        s.trim_start_matches(|c| chars.contains(&c))
+                    } else {
+                        s
+                    }
+                    .trim_end_matches(|c| tail && chars.contains(&c))
+                    .to_string()
+                };
+                let text = value_to_text(&base);
+                return Ok(Value::Str(match trim_where {
+                    Some(sqlparser::ast::TrimWhereField::Leading) => strip(&text, true, false),
+                    Some(sqlparser::ast::TrimWhereField::Trailing) => strip(&text, false, true),
+                    _ => strip(&text, true, true),
+                }));
+            }
             let name = match trim_where {
                 Some(sqlparser::ast::TrimWhereField::Leading) => "LTRIM",
                 Some(sqlparser::ast::TrimWhereField::Trailing) => "RTRIM",
                 _ => "TRIM",
             };
-            if trim_what.is_some() {
-                return err("TRIM with a custom character set is not supported");
-            }
             scalar_function(name, &[base])
+        }
+        // FLOOR/CEILING parse into dedicated nodes on some paths; route
+        // them onto the scalar library.
+        SqlExpr::Floor { expr, .. } => {
+            scalar_function("FLOOR", &[eval_expr(expr, doc)?])
+        }
+        SqlExpr::Ceil { expr, .. } => {
+            scalar_function("CEILING", &[eval_expr(expr, doc)?])
         }
         SqlExpr::Function(f) => {
             let name = f.name.to_string().to_uppercase();
@@ -10511,7 +11428,8 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             }
             if matches!(
                 name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
+                "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
+                    | "STRING_AGG" | "GROUPING"
             ) {
                 return err(format!(
                     "aggregate function {name} is not allowed in this context"
@@ -10523,7 +11441,7 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                     match a {
                         sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => args.push(eval_expr(e, doc)?),
+                        ) => args.push(eval_fn_arg(e, &name, args.is_empty(), doc)?),
                         _ => return err(format!("unsupported argument to {name}")),
                     }
                 }
@@ -10593,46 +11511,11 @@ fn typed_string_value(ts: &sqlparser::ast::TypedString) -> Result<Value> {
     ))
 }
 
-/// SQL LIKE with `%` (any run) and `_` (one char); backtracking matcher.
+/// SQL LIKE: `%` (any run), `_` (one char), `ESCAPE`, and the T-SQL
+/// `[abc]`/`[^a-z]` character classes. The matcher lives in `tsql` and is
+/// pinned by its own known-answer tests.
 fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
-    let s: Vec<char> = s.chars().collect();
-    let p: Vec<char> = pat.chars().collect();
-    let (mut si, mut pi) = (0usize, 0usize);
-    let (mut star, mut mark) = (usize::MAX, 0usize);
-    while si < s.len() {
-        let escaped = esc.is_some() && pi + 1 < p.len() && p[pi] == esc.unwrap();
-        if escaped {
-            if s[si] == p[pi + 1] {
-                si += 1;
-                pi += 2;
-                continue;
-            }
-        } else if pi < p.len() && p[pi] == '_' {
-            si += 1;
-            pi += 1;
-            continue;
-        } else if pi < p.len() && p[pi] == '%' {
-            star = pi;
-            mark = si;
-            pi += 1;
-            continue;
-        } else if pi < p.len() && s[si] == p[pi] {
-            si += 1;
-            pi += 1;
-            continue;
-        }
-        if star != usize::MAX {
-            pi = star + 1;
-            mark += 1;
-            si = mark;
-            continue;
-        }
-        return false;
-    }
-    while pi < p.len() && p[pi] == '%' {
-        pi += 1;
-    }
-    pi == p.len()
+    crate::tsql::like_match(s, pat, esc)
 }
 
 /// `(skip, take)` when LIMIT/OFFSET are integer constants. `None` means the
@@ -10787,7 +11670,7 @@ fn refs_rownum(e: &SqlExpr) -> bool {
     }
 }
 
-fn value_to_text(v: &Value) -> String {
+pub(crate) fn value_to_text(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
         Value::Int(i) => i.to_string(),
@@ -10810,7 +11693,7 @@ fn value_to_text(v: &Value) -> String {
 }
 
 /// Best-effort CAST across the schemaless value model.
-fn cast_value(v: Value, type_name: &str) -> Result<Value> {
+pub(crate) fn cast_value(v: Value, type_name: &str) -> Result<Value> {
     let t = type_name.to_uppercase();
     Ok(match v {
         Value::Null => Value::Null,
@@ -10957,7 +11840,14 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         "LENGTH" | "LEN" => {
             exact_arity(name, args, 1)?;
             Value::Int(match arg(args, 0, name)? {
-                Value::Str(s) => s.chars().count() as i64,
+                Value::Str(s) => {
+                    if name == "LEN" {
+                        // T-SQL LEN: trailing blanks are not counted.
+                        s.trim_end_matches(' ').chars().count() as i64
+                    } else {
+                        s.chars().count() as i64
+                    }
+                }
                 Value::Bytes(b) => b.len() as i64,
                 other => value_to_text(other).chars().count() as i64,
             })
@@ -10982,16 +11872,30 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             if null_prop(arg(args, 0, name)?) {
                 Value::Null
             } else if let Value::Decimal(d) = arg(args, 0, name)? {
-                // Exact rounding: half away from zero (SQL Server semantics),
-                // digits clamped to the decimal scale range.
+                // Exact rounding: half away from zero (SQL Server semantics).
+                // A negative length rounds to tens/hundreds (T-SQL); the
+                // decimal crate only rounds toward positive scale, so
+                // pre-scale by the magnitude, round at scale 0, scale back.
                 let digits = match args.get(1) {
-                    Some(Value::Int(d)) => (*d).clamp(0, 28) as u32,
+                    Some(Value::Int(d)) => *d,
                     _ => 0,
                 };
-                Value::Decimal(d.round_dp_with_strategy(
-                    digits,
-                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-                ))
+                if digits >= 0 {
+                    Value::Decimal(d.round_dp_with_strategy(
+                        (digits as u32).min(28),
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    ))
+                } else {
+                    let shift_i64 = 10i64
+                        .checked_pow(((-digits).min(15)) as u32)
+                        .unwrap_or(1_000_000_000_000_000);
+                    let shift = Decimal::from(shift_i64);
+                    let shifted = (d / shift).round_dp_with_strategy(
+                        0,
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    ) * shift;
+                    Value::Decimal(shifted)
+                }
             } else {
                 let x = as_f64(arg(args, 0, name)?)?;
                 let digits = match args.get(1) {
@@ -11060,11 +11964,21 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             })
         }
         "CONCAT" => {
-            if args.iter().any(null_prop) {
-                Value::Null
-            } else {
-                Value::Str(args.iter().map(value_to_text).collect())
-            }
+            // T-SQL CONCAT: NULL arguments are treated as empty strings
+            // (only an all-NULL argument list yields the empty string).
+            // `||` keeps NULL propagation — the two are deliberately
+            // different operators.
+            Value::Str(
+                args.iter()
+                    .map(|v| {
+                        if matches!(v, Value::Null) {
+                            String::new()
+                        } else {
+                            value_to_text(v)
+                        }
+                    })
+                    .collect(),
+            )
         }
         "TYPEOF" => {
             exact_arity(name, args, 1)?;
@@ -11333,7 +12247,14 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 target
             }
         }
-        other => return err(format!("unknown function: {other}")),
+        // T-SQL function families live in their own module; None means the
+        // name is genuinely unknown to the whole engine.
+        other => {
+            return match crate::tsql::scalar(other, args) {
+                Some(res) => res,
+                None => err(format!("unknown function: {other}")),
+            }
+        }
     })
 }
 
@@ -11583,6 +12504,53 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<()> {
     Ok(())
 }
 
+/// T-SQL `SELECT TOP (n) [WITH TIES]`: the generic parser carries the
+/// clause in `Select.top`; translate it onto the standard LIMIT/FETCH
+/// machinery so the executor sees one pagination path (and the ORDER BY
+/// requirement of WITH TIES is enforced by the FETCH branch). PERCENT has
+/// no pre-count pass to size it and stays a loud error. Set-operation
+/// arms re-enter `exec_query_body`, so TOP inside a UNION arm scopes to
+/// that arm — SQL Server semantics.
+fn rewrite_tsql_top(mut query: Query) -> Result<Query> {
+    let top = match query.body.as_mut() {
+        SetExpr::Select(select) => select.top.take(),
+        _ => None,
+    };
+    let Some(top) = top else {
+        return Ok(query);
+    };
+    if top.percent {
+        return err("SELECT TOP ... PERCENT is not supported (use LIMIT)");
+    }
+    let n = match top.quantity {
+        Some(sqlparser::ast::TopQuantity::Constant(n)) => {
+            SqlExpr::Value(sqlparser::ast::Value::Number(n.to_string(), false).into())
+        }
+        Some(sqlparser::ast::TopQuantity::Expr(e)) => e,
+        None => return err("SELECT TOP requires a row count"),
+    };
+    if top.with_ties {
+        if query.fetch.is_some() {
+            return err("TOP WITH TIES cannot be combined with FETCH");
+        }
+        query.fetch = Some(sqlparser::ast::Fetch {
+            with_ties: true,
+            percent: false,
+            quantity: Some(n),
+        });
+    } else {
+        if query.limit_clause.is_some() {
+            return err("TOP cannot be combined with LIMIT");
+        }
+        query.limit_clause = Some(LimitClause::LimitOffset {
+            limit: Some(n),
+            offset: None,
+            limit_by: vec![],
+        });
+    }
+    Ok(query)
+}
+
 /// Inline a computed Value as a literal expression node (subquery
 /// substitution rewrites results into the row-local expression tree).
 fn value_to_literal(v: Value) -> Result<SqlExpr> {
@@ -11591,7 +12559,10 @@ fn value_to_literal(v: Value) -> Result<SqlExpr> {
         Value::Null => SqlExpr::Value(V::Null.into()),
         Value::Bool(b) => SqlExpr::Value(V::Boolean(b).into()),
         Value::Int(i) => SqlExpr::Value(V::Number(i.to_string(), false).into()),
-        Value::Float(f) => SqlExpr::Value(V::Number(format!("{f}"), false).into()),
+        // Debug formatting keeps integral floats distinguishable from Int
+        // (`3.0` prints "3" via Display and would re-parse as Int(3)); same
+        // rule value_literal applies to dumps.
+        Value::Float(f) => SqlExpr::Value(V::Number(format!("{f:?}"), false).into()),
         Value::Str(s) => SqlExpr::Value(V::SingleQuotedString(s).into()),
         // Exact/exotic scalars ride as subquery-independent expressions the
         // same way value_literal renders them for dumps — a bare number or
@@ -12368,15 +13339,26 @@ fn eval_group_expr(
                 (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
+                // T-SQL bitwise NOT (~x): two's-complement on 64-bit ints.
+                (sqlparser::ast::UnaryOperator::BitwiseNot, Value::Int(i)) => Ok(Value::Int(!i)),
                 _ => err("unsupported unary operand"),
             }
         }
         SqlExpr::Nested(inner) => eval_group_expr(inner, out, docs, group_exprs),
         SqlExpr::Cast {
-            expr, data_type, ..
+            kind,
+            expr,
+            data_type,
+            ..
         } => {
             let v = eval_group_expr(expr, out, docs, group_exprs)?;
-            cast_value(v, &data_type.to_string())
+            let out = cast_value(v, &data_type.to_string());
+            // T-SQL TRY_CAST: a failed conversion yields NULL, not an error.
+            if matches!(kind, sqlparser::ast::CastKind::TryCast) {
+                out.or(Ok(Value::Null))
+            } else {
+                out
+            }
         }
         SqlExpr::Case {
             operand,
@@ -12417,7 +13399,47 @@ fn eval_group_expr(
 fn binop(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     use BinaryOperator::*;
     Ok(match op {
+        // T-SQL `+` concatenates when both operands are text (NULL
+        // propagates through `arith` when either side is NULL); a
+        // string/number mix falls through to numeric addition, where the
+        // string must convert to a number (SQL Server implicit conversion)
+        // or the statement errors loudly. These arms must precede the
+        // generic arith arm — `Plus` matches it first otherwise.
+        Plus if matches!(l, Value::Str(_)) && matches!(r, Value::Str(_)) => {
+            Value::Str(format!("{}{}", value_to_text(&l), value_to_text(&r)))
+        }
+        Plus if matches!(l, Value::Str(_)) || matches!(r, Value::Str(_)) => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                Value::Null
+            } else {
+                let num = |v: Value| -> Result<Value> {
+                    match &v {
+                        Value::Str(s) => {
+                            if let Ok(i) = s.trim().parse::<i64>() {
+                                Ok(Value::Int(i))
+                            } else {
+                                s.trim()
+                                    .parse::<Decimal>()
+                                    .map(Value::Decimal)
+                                    .map_err(|_| {
+                                        SqlError::Message(format!(
+                                            "cannot convert {s:?} to a number for '+'"
+                                        ))
+                                    })
+                            }
+                        }
+                        other => Ok(other.clone()),
+                    }
+                };
+                arith(num(l)?, op, num(r)?)?
+            }
+        }
         Plus | Minus | Multiply | Divide | Modulo => arith(l, op, r)?,
+        // T-SQL bitwise operators: 64-bit two's complement, integers (and
+        // bools as T-SQL BIT) only.
+        BitwiseOr => bitwise(l, r, |a, b| a | b)?,
+        BitwiseAnd => bitwise(l, r, |a, b| a & b)?,
+        BitwiseXor => bitwise(l, r, |a, b| a ^ b)?,
         StringConcat => match (l, r) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             (a, b) => Value::Str(format!("{}{}", value_to_text(&a), value_to_text(&b))),
@@ -12453,6 +13475,25 @@ fn binop(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         },
         other => return err(format!("unsupported operator: {other}")),
     })
+}
+
+/// T-SQL bitwise operators (`& | ^`): integers only; BOOLs coerce like
+/// T-SQL BIT (1/0) and the result is an integer.
+fn bitwise(l: Value, r: Value, f: impl Fn(i64, i64) -> i64) -> Result<Value> {
+    let as_int = |v: &Value| -> Option<i64> {
+        match v {
+            Value::Int(i) => Some(*i),
+            Value::Bool(b) => Some(i64::from(*b)),
+            _ => None,
+        }
+    };
+    match (&l, &r) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        _ => match (as_int(&l), as_int(&r)) {
+            (Some(a), Some(b)) => Ok(Value::Int(f(a, b))),
+            _ => err("bitwise operators require integer operands"),
+        },
+    }
 }
 
 /// Comparison-side TIMESTAMP coercion: a string operand against a TIMESTAMP
@@ -16142,13 +17183,16 @@ mod tests {
             ("SELECT * FROM t FOR UPDATE", "FOR UPDATE"),
             ("SELECT * FROM t FOR SHARE", "FOR UPDATE"),
             ("SELECT * INTO x FROM t", "SELECT INTO"),
-            ("SELECT TOP 1 * FROM t", "SELECT TOP"),
+            // SELECT TOP is supported now (rewritten onto LIMIT/FETCH);
+            // TOP ... PERCENT keeps its loud error.
+            ("SELECT TOP 50 PERCENT * FROM t", "PERCENT"),
             ("SELECT * FROM t TABLESAMPLE BERNOULLI (10)", "TABLESAMPLE"),
             ("SELECT * FROM t NATURAL JOIN t AS u", "NATURAL JOIN"),
             ("SELECT * FROM t, LATERAL (SELECT 1) AS l", "LATERAL"),
             ("SELECT v FROM t WINDOW w AS (ORDER BY v)", "WINDOW"),
             ("SELECT v FROM t QUALIFY v = 1", "QUALIFY"),
-            ("SELECT * FROM generate_series(1, 3)", "table functions"),
+            // Known table functions work; unknown ones still refuse.
+            ("SELECT * FROM make_interval(1)", "table functions"),
             ("SELECT v FROM t GROUP BY v SETTINGS x = 1", "SETTINGS"),
             (
                 "SELECT v FROM t GROUP BY v WITH ROLLUP",
@@ -19887,14 +20931,23 @@ mod tx_rollback_tests {
         assert!(db
             .execute("SELECT SUBSTR(s, id + 0.5) FROM fn WHERE id = 1")
             .is_err());
-        // TRIM 带字符集(即使单空格)显式报错:不支持的语法不静默吞掉
-        assert!(db.execute("SELECT TRIM(LEADING ' ' FROM '  x ')").is_err());
-        assert!(db.execute("SELECT TRIM(TRAILING ' ' FROM '  x ')").is_err());
-        assert!(db.execute("SELECT TRIM(BOTH ' ' FROM '  x ')").is_err());
-        // CONCAT NULL 传染 / LENGTH NULL
+        // TRIM 带字符集(即使单空格)按 T-SQL 语义裁剪指定字符集
+        assert_eq!(
+            rows(&mut db, "SELECT TRIM(LEADING ' ' FROM '  x ')").rows[0][0],
+            Value::Str("x ".into())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT TRIM(TRAILING ' ' FROM '  x ')").rows[0][0],
+            Value::Str("  x".into())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT TRIM(BOTH ' ' FROM '  x ')").rows[0][0],
+            Value::Str("x".into())
+        );
+        // CONCAT 按 T-SQL 语义把 NULL 当空串(|| 仍 NULL 传染,见上)
         assert_eq!(
             rows(&mut db, "SELECT CONCAT(s, 'x') FROM fn WHERE id = 2").rows[0][0],
-            Value::Null
+            Value::Str("x".into())
         );
         assert_eq!(
             rows(&mut db, "SELECT LENGTH(s) FROM fn WHERE id = 2").rows[0][0],
@@ -20758,6 +21811,19 @@ mod window_tests {
             })
             .collect();
         assert_eq!(got, vec![None, Some(2), Some(5)]);
+        // FILTER excludes the row BEFORE its argument is evaluated (the
+        // batch order): a bitwise op that only errors on text rows must
+        // not fail the window — GROUP BY form succeeds, so must OVER.
+        run(&mut db, "CREATE TABLE w (txt TEXT, n INT)");
+        run(
+            &mut db,
+            "INSERT INTO w VALUES ('text-row', 1), ('2', 4), ('3', 8)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT SUM(n & 1) FILTER (WHERE n > 1) OVER (ORDER BY n) FROM w",
+        );
+        assert_eq!(r.rows.len(), 3);
     }
 }
 
@@ -23384,5 +24450,427 @@ mod read_view_tests {
             _ => panic!("expected rows"),
         }
         assert_eq!(count(&db, "SELECT COUNT(id) FROM t"), 119);
+    }
+}
+
+/// End-to-end T-SQL compatibility: everything `tsql.rs` promises, driven
+/// through the public `execute` path (preprocess → parse → executor).
+#[cfg(test)]
+mod tsql_compat_tests {
+    use super::*;
+
+    fn run(db: &mut Database, sql: &str) -> ExecOutcome {
+        db.execute(sql)
+            .unwrap_or_else(|e| panic!("SQL failed: {sql}\n{e}"))
+    }
+
+    fn rows(db: &mut Database, sql: &str) -> QueryResult {
+        match run(db, sql) {
+            ExecOutcome::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn one(db: &mut Database, sql: &str) -> Value {
+        rows(db, sql).rows[0][0].clone()
+    }
+
+    #[test]
+    fn top_limits_and_ties() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 10), (2, 30), (3, 30), (4, 20)",
+        );
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT COUNT(*) FROM (SELECT TOP 2 id FROM t) AS x"
+            ),
+            Value::Int(2)
+        );
+        let r = rows(&mut db, "SELECT TOP 2 id FROM t ORDER BY v DESC");
+        assert_eq!(r.rows.len(), 2);
+        // WITH TIES extends the window over the boundary row's tie run.
+        let r = rows(
+            &mut db,
+            "SELECT TOP (2) WITH TIES id FROM t ORDER BY v DESC",
+        );
+        assert_eq!(r.rows.len(), 2); // both kept rows tie on v = 30
+        let r = rows(
+            &mut db,
+            "SELECT TOP (3) WITH TIES id FROM t ORDER BY v DESC",
+        );
+        assert_eq!(r.rows.len(), 3); // 30, 30, 20 — no further 20s
+                                     // TOP scopes to a UNION arm.
+        let r = rows(
+            &mut db,
+            "SELECT TOP 1 v FROM t WHERE id = 1 UNION ALL SELECT v FROM t WHERE id = 2",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert!(db.execute("SELECT TOP 50 PERCENT id FROM t").is_err());
+        assert!(db.execute("SELECT TOP 1 id FROM t LIMIT 2").is_err());
+        // TOP inside a derived table.
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT COUNT(*) FROM (SELECT TOP 1 id FROM t) AS d"
+            ),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn brackets_national_strings_and_concat() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE [My Table] ([Order Id] INT, [name] TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO [My Table] ([Order Id], [name]) VALUES (1, N'ann')",
+        );
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT [name] FROM [My Table] WHERE [Order Id] = 1"
+            ),
+            Value::Str("ann".into())
+        );
+        // T-SQL '+' concatenation; || keeps NULL propagation.
+        assert_eq!(
+            one(&mut db, "SELECT 'a' + 'b' + 'c'"),
+            Value::Str("abc".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT [name] + '!' FROM [My Table]"),
+            Value::Str("ann!".into())
+        );
+        assert_eq!(one(&mut db, "SELECT '5' + 1"), Value::Int(6));
+        assert!(db.execute("SELECT 'x' + 1").is_err());
+        // NULL + string still propagates.
+        assert_eq!(one(&mut db, "SELECT NULL + 'a'"), Value::Null);
+    }
+
+    #[test]
+    fn bitwise_operators() {
+        let mut db = Database::in_memory().unwrap();
+        assert_eq!(one(&mut db, "SELECT 5 & 3"), Value::Int(1));
+        assert_eq!(one(&mut db, "SELECT 5 | 3"), Value::Int(7));
+        assert_eq!(one(&mut db, "SELECT 5 ^ 3"), Value::Int(6));
+        assert_eq!(one(&mut db, "SELECT ~5"), Value::Int(!5));
+        assert!(db.execute("SELECT (1 << 1)").is_err()); // no << in T-SQL
+        assert!(db.execute("SELECT 'a' & 1").is_err());
+    }
+
+    #[test]
+    fn like_character_classes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (s TEXT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES ('abc'), ('a2c'), ('a-c'), ('xyz')",
+        );
+        let r = rows(&mut db, "SELECT s FROM t WHERE s LIKE 'a[bd2]c' ORDER BY s");
+        assert_eq!(r.rows.len(), 2);
+        let r = rows(&mut db, "SELECT s FROM t WHERE s LIKE 'a[^0-9]c'");
+        assert_eq!(r.rows.len(), 2);
+        let r = rows(&mut db, "SELECT s FROM t WHERE s NOT LIKE '[ax]%'");
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
+    fn convert_parse_try_cast() {
+        let mut db = Database::in_memory().unwrap();
+        assert_eq!(one(&mut db, "SELECT CONVERT(INT, '42')"), Value::Int(42));
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT CONVERT(VARCHAR, TIMESTAMP '2026-09-21T00:00:00Z', 23)"
+            ),
+            Value::Str("2026-09-21".into())
+        );
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT CONVERT(DATETIME, '09/21/2026', 101) = TIMESTAMP '2026-09-21T00:00:00Z'"
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(one(&mut db, "SELECT TRY_CONVERT(INT, 'nope')"), Value::Null);
+        assert!(db.execute("SELECT CONVERT(INT, 'nope')").is_err());
+        assert_eq!(
+            one(&mut db, "SELECT PARSE('1.5' AS DECIMAL)"),
+            Value::Decimal("1.5".parse::<Decimal>().unwrap())
+        );
+        assert_eq!(one(&mut db, "SELECT TRY_PARSE('x' AS INT)"), Value::Null);
+        assert_eq!(one(&mut db, "SELECT TRY_CAST('x' AS INT)"), Value::Null);
+        assert!(db.execute("SELECT CAST('x' AS INT)").is_err());
+        assert_eq!(
+            one(&mut db, "SELECT CONVERT(DECIMAL, '1.5') + 1"),
+            Value::Decimal("2.5".parse::<Decimal>().unwrap())
+        );
+    }
+
+    #[test]
+    fn date_functions_end_to_end() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (d TIMESTAMP)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (TIMESTAMP '2026-09-21T13:45:06.250Z')",
+        );
+        assert_eq!(one(&mut db, "SELECT YEAR(d) FROM t"), Value::Int(2026));
+        assert_eq!(
+            one(&mut db, "SELECT DATEPART(quarter, d) FROM t"),
+            Value::Int(3)
+        );
+        assert_eq!(
+            one(&mut db, "SELECT DATENAME(month, d) FROM t"),
+            Value::Str("September".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT DATEADD(day, 1, d) FROM t"),
+            Value::Timestamp(crate::value::parse_timestamp_ms("2026-09-22T13:45:06.250Z").unwrap())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT DATEDIFF(day, '2026-09-20', d) FROM t"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT DATEADD(month, 1, TIMESTAMP '2026-01-31T00:00:00Z')"
+            ),
+            Value::Timestamp(crate::value::parse_timestamp_ms("2026-02-28T00:00:00Z").unwrap())
+        );
+        // GETDATE family folds into a literal on the write path.
+        run(&mut db, "CREATE TABLE g (id INT, at TIMESTAMP)");
+        run(&mut db, "INSERT INTO g VALUES (1, GETDATE())");
+        let resolved = db.take_resolved_sql().expect("GETDATE resolved");
+        assert!(!resolved.to_lowercase().contains("getdate"), "{resolved}");
+    }
+
+    #[test]
+    fn table_functions_in_from() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(&mut db, "SELECT value FROM STRING_SPLIT('a,b,c', ',') AS s");
+        assert_eq!(r.rows.len(), 3);
+        let r = rows(
+            &mut db,
+            "SELECT value, ordinal FROM STRING_SPLIT('a,b', ',', 1) AS s WHERE ordinal = 2",
+        );
+        assert_eq!(r.rows.len(), 1);
+        let r = rows(&mut db, "SELECT value FROM GENERATE_SERIES(1, 4) AS g");
+        assert_eq!(r.rows.len(), 4);
+        let r = rows(&mut db, "SELECT [key] FROM OPENJSON('[10,20]') AS j");
+        assert_eq!(r.rows.len(), 2);
+        assert!(db
+            .execute("SELECT * FROM STRING_SPLIT('a,b', ',')")
+            .is_err());
+        assert!(db.execute("SELECT * FROM SOME_TVF(1)").is_err());
+    }
+
+    #[test]
+    fn session_shims_and_variables_boundary() {
+        let mut db = Database::in_memory().unwrap();
+        // SET/USE/PRINT ride the PRAGMA channel: accepted and ignored.
+        run(&mut db, "SET NOCOUNT ON");
+        run(&mut db, "USE master");
+        run(&mut db, "PRINT 'hello'");
+        run(&mut db, "SET QUOTED_IDENTIFIER OFF");
+        run(&mut db, "SET ANSI_NULLS ON");
+        // @variables keep their loud error.
+        let e = db.execute("SELECT @x").unwrap_err();
+        assert!(e.to_string().contains("variables"), "{e}");
+        let e = db.execute("SET @x = 1").unwrap_err();
+        assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn newid_write_paths() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, uid TEXT)");
+        // SELECT context: a fresh UUIDv7 string.
+        match one(&mut db, "SELECT NEWID()") {
+            Value::Str(s) => assert_eq!(s.as_bytes()[14], b'7'),
+            other => panic!("{other:?}"),
+        }
+        // INSERT ... VALUES: the generated id ships as a literal.
+        run(&mut db, "INSERT INTO t VALUES (1, NEWID())");
+        let resolved = db
+            .take_resolved_sql()
+            .expect("NEWID resolved")
+            .to_lowercase();
+        assert!(!resolved.contains("newid"), "{resolved}");
+        // INSERT ... SELECT: one fresh id per row, all literalized.
+        run(&mut db, "CREATE TABLE base (id INT)");
+        run(&mut db, "INSERT INTO base VALUES (10), (20)");
+        run(&mut db, "INSERT INTO t SELECT id, NEWID() AS uid FROM base");
+        // Claim the rewrite before any later statement clears it.
+        let resolved = db
+            .take_resolved_sql()
+            .expect("NEWID resolved")
+            .to_lowercase();
+        assert!(!resolved.contains("newid"), "{resolved}");
+        let r = rows(&mut db, "SELECT uid FROM t WHERE id > 1 ORDER BY id");
+        assert_eq!(r.rows.len(), 2);
+        assert_ne!(r.rows[0][0], r.rows[1][0]);
+        // UPDATE/DELETE/MERGE refuse (replay would re-roll the id).
+        let e = db
+            .execute("UPDATE t SET uid = NEWID() WHERE id = 1")
+            .unwrap_err();
+        assert!(e.to_string().contains("NEWID"), "{e}");
+        // The refusal is AST-level: the words "newid" inside a string
+        // literal or used as a plain column name must NOT trip it (the old
+        // substring scan rejected these legal writes).
+        run(&mut db, "UPDATE t SET uid = 'x-newid-y' WHERE id = 1");
+        assert_eq!(
+            one(&mut db, "SELECT uid FROM t WHERE id = 1"),
+            Value::Str("x-newid-y".into())
+        );
+        // The literal in the predicate must not trip the guard either; it
+        // is a real delete, so assert the row is gone afterwards.
+        run(
+            &mut db,
+            "DELETE FROM t WHERE id = 1 AND 'newsequentialid' <> 'x'",
+        );
+        assert!(rows(&mut db, "SELECT uid FROM t WHERE id = 1")
+            .rows
+            .is_empty());
+        run(&mut db, "CREATE TABLE newid (v INT)");
+        run(&mut db, "INSERT INTO newid VALUES (7)");
+        run(&mut db, "UPDATE newid SET v = 8");
+        assert_eq!(one(&mut db, "SELECT v FROM newid"), Value::Int(8));
+    }
+
+    #[test]
+    fn len_concat_trim_and_round_semantics() {
+        let mut db = Database::in_memory().unwrap();
+        assert_eq!(one(&mut db, "SELECT LEN('ab  ')"), Value::Int(2));
+        assert_eq!(one(&mut db, "SELECT LENGTH('ab  ')"), Value::Int(4));
+        assert_eq!(
+            one(&mut db, "SELECT CONCAT('a', NULL, 'b')"),
+            Value::Str("ab".into())
+        );
+        assert_eq!(one(&mut db, "SELECT 'a' || NULL || 'b'"), Value::Null);
+        assert_eq!(
+            one(&mut db, "SELECT TRIM('xy' FROM 'xxaxx')"),
+            Value::Str("a".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT TRIM(LEADING 'x' FROM 'xxaxx')"),
+            Value::Str("axx".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT ROUND(CAST('123.45' AS DECIMAL), -1)"),
+            Value::Decimal(Decimal::from(120))
+        );
+        assert_eq!(
+            one(&mut db, "SELECT ROUND(CAST('123.45' AS DECIMAL), 1)"),
+            Value::Decimal("123.5".parse::<Decimal>().unwrap())
+        );
+    }
+
+    #[test]
+    fn string_and_math_functions_end_to_end() {
+        let mut db = Database::in_memory().unwrap();
+        assert_eq!(
+            one(&mut db, "SELECT LEFT('hello', 2)"),
+            Value::Str("he".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT RIGHT('hello', 2)"),
+            Value::Str("lo".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT CHARINDEX('l', 'hello')"),
+            Value::Int(3)
+        );
+        assert_eq!(
+            one(&mut db, "SELECT REPLACE('aXbX', 'X', '-')"),
+            Value::Str("a-b-".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT REVERSE('abc')"),
+            Value::Str("cba".into())
+        );
+        assert_eq!(one(&mut db, "SELECT ASCII('A')"), Value::Int(65));
+        assert_eq!(one(&mut db, "SELECT CHAR(65)"), Value::Str("A".into()));
+        assert_eq!(one(&mut db, "SELECT NCHAR(8364)"), Value::Str("€".into()));
+        assert_eq!(one(&mut db, "SELECT UNICODE('€')"), Value::Int(8364));
+        assert_eq!(
+            one(&mut db, "SELECT CONCAT_WS(',', 'a', NULL, 'b')"),
+            Value::Str("a,b".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT TRANSLATE('abc', 'ab', 'xy')"),
+            Value::Str("xyc".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT STUFF('abcdef', 2, 3, 'XY')"),
+            Value::Str("aXYef".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT STR(123.456)"),
+            Value::Str("       123".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT QUOTENAME('a]b')"),
+            Value::Str("[a]]b]".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT IIF(1 > 0, 'y', 'n')"),
+            Value::Str("y".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT CHOOSE(2, 'a', 'b')"),
+            Value::Str("b".into())
+        );
+        assert_eq!(one(&mut db, "SELECT FLOOR(1.7)"), Value::Float(1.0));
+        assert_eq!(one(&mut db, "SELECT CEILING(1.2)"), Value::Float(2.0));
+        assert_eq!(one(&mut db, "SELECT POWER(2, 10)"), Value::Int(1024));
+        match one(&mut db, "SELECT SQRT(9)") {
+            Value::Float(x) => assert!((x - 3.0).abs() < 1e-12),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(one(&mut db, "SELECT SIGN(-5)"), Value::Int(-1));
+        assert_eq!(one(&mut db, "SELECT ISNULL(NULL, -1)"), Value::Int(-1));
+        assert_eq!(one(&mut db, "SELECT ISDATE('2026-09-21')"), Value::Int(1));
+        assert_eq!(one(&mut db, "SELECT ISNUMERIC('$1,234')"), Value::Int(1));
+        assert_eq!(
+            one(&mut db, "SELECT DB_NAME()"),
+            Value::Str("docsql".into())
+        );
+        match one(&mut db, "SELECT HASHBYTES('MD5', 'abc')") {
+            Value::Bytes(b) => {
+                assert_eq!(crate::tsql::hex(&b), "900150983cd24fb0d6963f7d28e17f72")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Session functions refuse loudly.
+        assert!(db.execute("SELECT SUSER_SNAME()").is_err());
+        assert!(db.execute("SELECT RAND()").is_err());
+    }
+
+    #[test]
+    fn format_and_hashbytes_end_to_end() {
+        let mut db = Database::in_memory().unwrap();
+        assert_eq!(
+            one(
+                &mut db,
+                "SELECT FORMAT(TIMESTAMP '2026-09-21T13:45:06Z', 'yyyy-MM-dd HH:mm:ss')"
+            ),
+            Value::Str("2026-09-21 13:45:06".into())
+        );
+        assert_eq!(
+            one(&mut db, "SELECT FORMAT(1234.5, 'N2')"),
+            Value::Str("1,234.50".into())
+        );
+        assert!(db
+            .execute("SELECT FORMAT(TIMESTAMP '2026-01-01T00:00:00Z', 'gg')")
+            .is_err());
     }
 }

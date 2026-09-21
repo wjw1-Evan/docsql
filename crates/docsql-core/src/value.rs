@@ -14,7 +14,7 @@ pub type Object = BTreeMap<String, Value>;
 
 /// Days since epoch ← days-from-civil (Howard Hinnant). Inverse of the
 /// engine's `civil_from_days`; both are pinned by known-answer tests.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
@@ -198,7 +198,16 @@ pub fn parse_timestamp_ms(text: &str) -> Option<i64> {
     }
     let days = days_from_civil(y, mo as u32, d as u32);
     let secs = days * 86_400 + hh * 3600 + mm * 60 + ss;
-    Some(secs * 1000 + ms - offset_min * 60_000)
+    let ms_total = secs * 1000 + ms - offset_min * 60_000;
+    // The calendar fields are each in range, but a UTC offset can still push
+    // the instant outside 0001..=9999 (e.g. 0001-01-01T00:00+23:59 lands
+    // before the domain floor). Such a value has no canonical text form —
+    // `value_literal` cannot replay it, so the whole dump/backup would fail.
+    // Reject here, at the single string→instant exit every caller shares.
+    if !is_valid_timestamp_ms(ms_total) {
+        return None;
+    }
+    Some(ms_total)
 }
 
 #[derive(Debug, Clone, PartialEq)]

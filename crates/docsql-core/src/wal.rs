@@ -108,6 +108,15 @@ pub struct Wal {
     /// snapshot's LSN is only meaningful within its epoch (MVCC stage B).
     /// Monotonic across checkpoints for the lifetime of the process.
     epoch: u64,
+    /// Set when the on-disk file has diverged from the in-memory counters in
+    /// a way appends cannot recover from: `checkpoint` truncated the file
+    /// but could not rewrite (or sync) the header. Appending after that
+    /// would positional-write at the stale offset into a zero hole, and the
+    /// log would reopen as `Corrupt(0, "bad header")` — a crash loop only a
+    /// human can fix. Instead every later append fails loudly; the data
+    /// file was already fully synced before the truncation (checkpoint
+    /// precondition), so a restart rebuilds a fresh, valid, empty log.
+    poisoned: Option<String>,
 }
 
 impl Wal {
@@ -131,6 +140,7 @@ impl Wal {
                 appended: HEADER.len() as u64,
                 deferred_since_fence: 0,
                 epoch: 0,
+                poisoned: None,
             });
         }
         // Validate the header, then stream the valid prefix: the log can be
@@ -191,6 +201,7 @@ impl Wal {
             appended: good_end,
             deferred_since_fence: 0,
             epoch: 0,
+            poisoned: None,
         })
     }
 
@@ -218,6 +229,9 @@ impl Wal {
     }
 
     fn append(&mut self, kind: u8, txid: u64, payload: &[u8]) -> Result<u64> {
+        if let Some(reason) = &self.poisoned {
+            return Err(WalError::Io(std::io::Error::other(reason.clone())));
+        }
         let lsn = self.next_lsn;
         let mut frame = Vec::with_capacity(9 + 1 + 8 + 4 + payload.len() + 4);
         frame.extend_from_slice(&lsn.to_le_bytes());
@@ -355,16 +369,30 @@ impl Wal {
     pub fn checkpoint(&mut self) -> Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(HEADER)?;
-        // sync_all (not sync_data): the size change must be durable too, and
-        // a checkpoint is rare enough that the metadata flush costs nothing.
-        self.file.sync_all()?;
+        // Rewrite the header before the counters reset: if the truncation
+        // landed but the header (or its sync) failed, the file on disk no
+        // longer matches `appended`/`next_lsn` — poison the log so no later
+        // append positional-writes into the zero hole (see `poisoned`).
+        if let Err(e) = self
+            .file
+            .write_all(HEADER)
+            .and_then(|()| self.file.sync_all())
+        {
+            self.poisoned =
+                Some("checkpoint truncated the WAL but could not rewrite its header".into());
+            return Err(e.into());
+        }
         self.durable_lsn = 0;
         self.last_commit_lsn = 0;
         self.next_lsn = 1;
         self.appended = HEADER.len() as u64;
         self.deferred_since_fence = 0;
         self.epoch += 1;
+        // A retry that got this far rewrote and synced a valid header over
+        // the truncated file with the counters reset to match — the file
+        // and the in-memory state are consistent again, so a previous
+        // poison no longer applies.
+        self.poisoned = None;
         Ok(())
     }
 }

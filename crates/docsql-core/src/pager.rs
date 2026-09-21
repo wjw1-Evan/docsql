@@ -409,14 +409,19 @@ impl Pager {
     /// Open (creating if needed) a database at `path` with WAL at `path.wal`,
     /// running crash recovery first.
     pub fn open(path: &Path) -> Result<Pager> {
-        let wal_path = wal_path_for(path);
-        let wal = Wal::open(&wal_path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false) // never clobber an existing database
             .open(path)?;
+        // No exclusive-open guard here on purpose: same-process concurrent
+        // handles on one database file are a supported pattern (tests open a
+        // second read-side Database; flock cannot tell that apart from a
+        // foreign process). Production opens exactly one Pager per file —
+        // the engine owns serialization.
+        let wal_path = wal_path_for(path);
+        let wal = Wal::open(&wal_path)?;
 
         let num_pages = if file.metadata()?.len() == 0 {
             file.write_all_at(&encode_header(1), 0)?; // page 0 only
@@ -659,10 +664,17 @@ impl Pager {
     /// WAL lock (commit apply / truncation), and a truncation bumps the
     /// epoch, so `None → None` across a checkpoint is still detected.
     fn page_version(&self, id: u32) -> (u64, Option<u64>) {
-        (
-            self.epoch.load(Ordering::Acquire),
-            lock(&self.page_lsn).get(&id).copied(),
-        )
+        // Sample page_lsn BEFORE the epoch: truncation publishes in the
+        // opposite order (clear page_lsn under its lock, then store the new
+        // epoch), so this order can only yield a consistent pre-truncation
+        // pair (both old — nothing changed yet) or a new epoch, which every
+        // consumer treats as "changed". Sampling epoch first could observe
+        // (old epoch, cleared page_lsn) across a truncation and pass a
+        // stale file image off as unchanged — exactly what the seqlock
+        // double-check exists to prevent.
+        let lsn = lock(&self.page_lsn).get(&id).copied();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        (epoch, lsn)
     }
 
     /// Allocate a zero-filled page, preferring one released by an earlier
@@ -1090,30 +1102,48 @@ impl Pager {
                         }
                     }
                     if !targets.is_empty() {
-                        let preserve: Vec<(u32, Vec<u8>)> = {
-                            let page_lsn = lock(&self.page_lsn);
+                        // Lock order must match `read_page_shared` /
+                        // commit-apply (pool → pending → page_lsn): a cold
+                        // reader holds pool (+pending) while it samples
+                        // page_lsn via `page_version`, so taking page_lsn
+                        // before pool here could ABBA-deadlock the writer
+                        // against that reader while both sit inside the WAL
+                        // critical section.
+                        let (mut preserve, need_file): (Vec<(u32, Vec<u8>)>, Vec<u32>) = {
                             let pool = lock(&self.pool);
-                            let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+                            let pending = lock(&self.pending_writes);
+                            let page_lsn = lock(&self.page_lsn);
+                            let mut have: Vec<(u32, Vec<u8>)> = Vec::new();
+                            let mut need_file: Vec<u32> = Vec::new();
                             for id in tx.staged.keys() {
                                 if page_lsn.contains_key(id) {
                                     continue;
                                 }
                                 // Current image = pool, else a not-yet-flushed
-                                // committed image, else the data file. No
-                                // commit can interleave (we hold the WAL lock),
-                                // so the surfaces are stable wrt writes.
-                                let image = pool
-                                    .map
-                                    .get(id)
-                                    .map(|p| p.data.clone())
-                                    .or_else(|| lock(&self.pending_writes).get(id).cloned())
-                                    .or_else(|| self.read_file_page(*id).ok());
-                                if let Some(image) = image {
-                                    out.push((*id, image));
+                                // committed image. No commit can interleave
+                                // (we hold the WAL lock), so these surfaces
+                                // are stable wrt writes.
+                                if let Some(p) = pool.map.get(id) {
+                                    have.push((*id, p.data.clone()));
+                                } else if let Some(p) = pending.get(id) {
+                                    have.push((*id, p.clone()));
+                                } else {
+                                    need_file.push(*id);
                                 }
                             }
-                            out
+                            (have, need_file)
                         };
+                        // Cold pages come from the data file OUTSIDE the
+                        // pool/pending/page_lsn guards: a slow disk must not
+                        // stretch those critical sections (the reader path
+                        // likewise does its file IO before taking the pool
+                        // lock). The WAL lock is still held, so no commit
+                        // can swap the image underneath us.
+                        for id in need_file {
+                            if let Ok(image) = self.read_file_page(id) {
+                                preserve.push((id, image));
+                            }
+                        }
                         for id in targets {
                             if let Some((_, _, entry)) = st.active.get_mut(&id) {
                                 for (page, image) in &preserve {
@@ -1258,7 +1288,13 @@ impl Pager {
         if !tx.staged.is_empty() {
             self.ckpt.appends.fetch_add(1, Ordering::Relaxed);
             lock(&self.wal).abort(tx.id)?;
-            self.maybe_checkpoint()?;
+            // The ABORT frame is durable — the rollback already happened as
+            // far as the log is concerned, so a checkpoint hiccup must not
+            // fail the caller's ROLLBACK (commit and sync_wal log-and-retry
+            // the same call; the next writer retries the checkpoint).
+            if let Err(e) = self.maybe_checkpoint() {
+                eprintln!("docsql-pager: post-abort checkpoint failed (will retry): {e}");
+            }
         }
         // Frees never took effect; reuse ids popped from the pool go back.
         self.return_reused(std::mem::take(&mut tx.reused));
@@ -1329,9 +1365,16 @@ impl Pager {
             // image and the page LSN in one WAL-locked section (the pool
             // lock is released last), so if the LSN is still within the
             // snapshot after the read, no commit could have swapped in a
-            // post-snapshot version between the two observations.
-            let still = lock(&self.page_lsn).get(&id).copied();
-            if still.is_none_or(|lsn| lsn <= snap.lsn) {
+            // post-snapshot version between the two observations. The epoch
+            // must be re-checked too: a hard-threshold truncation CLEARS
+            // page_lsn and bumps the epoch, so an LSN-only recheck would
+            // let the freshly-read post-snapshot image pass as `None` and
+            // silently violate the snapshot. Re-checking the full version
+            // (epoch + LSN) degrades that window to the slow path, which
+            // re-verifies the epoch under the WAL lock and reports
+            // SnapshotTooOld loudly.
+            let still = self.page_version(id);
+            if still.0 == snap.epoch && still.1.is_none_or(|lsn| lsn <= snap.lsn) {
                 return Ok(image);
             }
         }
@@ -1368,14 +1411,37 @@ impl Pager {
         // fully written before it began, and a torn tail only stops the scan
         // early.
         let wal_path = wal_path_for(&self.path);
-        // Fence-aware committed set: a deferred commit only counts when a
-        // fence at or before the snapshot's LSN covers it (SQL-committed);
-        // an open transaction's statements must stay invisible.
+        // Committed set: sync commits count as-is, and a DEFERRED commit
+        // counts whenever its frame is at or before the snapshot's LSN. The
+        // head sampler (`begin_snapshot` ← `Wal::last_commit_lsn`)
+        // deliberately includes deferred commits — their page images are
+        // applied to the read surfaces atomically with the head under the
+        // WAL lock — so the fast path serves those images from the pool.
+        // Counting only fence-covered deferred here would make the two
+        // paths disagree on the same snapshot: a page written by an open
+        // transaction reads fine off the fast path, then fails with a false
+        // "history predates the retention window" once a later write pushes
+        // it onto the slow path. Fence coverage stays the rule for CRASH
+        // RECOVERY (a torn transaction must not replay); a live snapshot may
+        // observe statements the single writer already applied, exactly like
+        // the write-locked read paths do.
         let mut committed: HashMap<u64, u64> = HashMap::new();
-        let mut deferred: Vec<(u64, u64)> = Vec::new();
-        let mut last_fence = 0u64;
         for rec in Wal::frames(&wal_path)? {
-            let r = rec?;
+            // A hard error mid-scan is usually a truncation racing us (the
+            // epoch moved under the scan, e.g. an "lsn gap" at the boundary):
+            // prefer the SnapshotTooOld verdict over a misleading
+            // "log corrupt" panic signal for operators. The epoch re-check
+            // below still has the final say for clean scans.
+            let r = rec.map_err(|e| {
+                if self.epoch.load(Ordering::Acquire) != snap.epoch {
+                    PagerError::SnapshotTooOld(
+                        "the WAL was checkpointed while the read was running; retry the query"
+                            .into(),
+                    )
+                } else {
+                    e.into()
+                }
+            })?;
             if r.lsn > snap.lsn {
                 break;
             }
@@ -1383,19 +1449,26 @@ impl Pager {
                 KIND_COMMIT => {
                     committed.insert(r.txid, r.lsn);
                 }
-                KIND_COMMIT_DEFERRED => deferred.push((r.lsn, r.txid)),
-                KIND_FENCE => last_fence = last_fence.max(r.lsn),
+                KIND_COMMIT_DEFERRED => {
+                    committed.insert(r.txid, r.lsn);
+                }
                 _ => {}
-            }
-        }
-        for (lsn, txid) in deferred {
-            if lsn < last_fence {
-                committed.insert(txid, lsn);
             }
         }
         let mut cache: HashMap<u32, Vec<u8>> = HashMap::new();
         for rec in Wal::frames(&wal_path)? {
-            let r = rec?;
+            // Same epoch-first mapping as the first pass: a scan error here
+            // is almost always a truncation racing us, not log corruption.
+            let r = rec.map_err(|e| {
+                if self.epoch.load(Ordering::Acquire) != snap.epoch {
+                    PagerError::SnapshotTooOld(
+                        "the WAL was checkpointed while the read was running; retry the query"
+                            .into(),
+                    )
+                } else {
+                    e.into()
+                }
+            })?;
             if r.kind != KIND_WRITE {
                 continue;
             }

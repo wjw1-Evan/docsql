@@ -625,8 +625,21 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                         proto::RESP_ERROR,
                         err_payload("too many connections; retry later"),
                     );
+                    // Seal like any other frame on a keyed transport: the
+                    // client requires encryption both directions and would
+                    // drop a plaintext rejection as a bad frame.
+                    let bytes = match &state.transport_key {
+                        Some(k) => {
+                            let mut sealed = msg;
+                            sealed.flags |= crypto::FLAG_ENCRYPTED;
+                            sealed.payload =
+                                crypto::seal(k, sealed.frame_type, sealed.flags, &sealed.payload);
+                            sealed.encode().unwrap_or_default()
+                        }
+                        None => msg.encode().unwrap_or_default(),
+                    };
                     use tokio::io::AsyncWriteExt;
-                    let _ = s.write_all(&msg.encode().unwrap_or_default()).await;
+                    let _ = s.write_all(&bytes).await;
                     continue;
                 }
             },
@@ -785,6 +798,13 @@ impl Conn {
             match Frame::decode(&self.buf) {
                 Ok((f, n)) => {
                     self.buf.drain(..n);
+                    // One oversized frame used to pin this connection's
+                    // buffer capacity until it closed (a 64 MB frame ×
+                    // max_conn connections stays resident). Give a drained
+                    // buffer back to a sane floor.
+                    if self.buf.is_empty() && self.buf.capacity() > 256 * 1024 {
+                        self.buf.shrink_to(64 * 1024);
+                    }
                     return Ok(Some(f));
                 }
                 // Truncated is the only recoverable case: read more bytes.
@@ -1033,6 +1053,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let mut token_authed = false;
     let mut user: Option<UserAuth> = None;
     let mut user_epoch = 0u64;
+    // Inbound replay guard for keyed transports (see crypto::ReplayGuard):
+    // per connection, validated before every decrypt.
+    let mut inbound_replay = crypto::ReplayGuard::default();
+    // Bounded pre-auth PING budget (see the REQ_PING arm).
+    let mut pre_auth_pings = 0u32;
     // Server-side prepared statements (REQ_PREPARE/REQ_EXECUTE): handle →
     // template SQL with `?` placeholders. Per connection, dies with it.
     let mut prepared: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
@@ -1120,6 +1145,10 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                             err_payload("transport encrypted; client must send encrypted frames"),
                         ))
                         .await;
+                    break;
+                }
+                if let Err(e) = inbound_replay.check(&frame.payload) {
+                    let _ = tx.send(Frame::new(proto::RESP_ERROR, err_payload(&e))).await;
                     break;
                 }
                 match crypto::open(&k, frame.frame_type, frame.flags, &frame.payload) {
@@ -1280,6 +1309,12 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
             // asking for topology and stays gated.
             let peer_probe = frame.frame_type == proto::REQ_STATUS
                 && frame.flags & FLAG_REPLICATION != 0;
+            // The data plane closes with the anonymous era; the replication
+            // channel (REQ_SQL_SEQ/REQ_DIGEST/REQ_SYNC/…) deliberately does
+            // NOT — token-less peers' AUTH is vacuous and join/fanout depend
+            // on that compat mode (pinned by the e2e suite). Operators who
+            // create users on a token-less node accept the open replication
+            // channel; configuring any token closes it.
             if role == ConnRole::Client
                 && !token_authed
                 && user.is_none()
@@ -1345,6 +1380,24 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
             // None = the handler already sent everything (subscribe
             // confirmation + replay) straight through the writer.
             let resp = match frame.frame_type {
+                // PING is a keep-alive for authenticated sessions, but a
+                // bounded number is allowed pre-auth: the web console's
+                // cluster probe pings a node BEFORE sending credentials
+                // (reachability first, auth second). Unbounded pre-auth
+                // pings would let a socket hold its task, buffer and
+                // connection slot forever — hence the counter, not the
+                // blanket refusal that broke the probe.
+                proto::REQ_PING if !authed => {
+                    pre_auth_pings += 1;
+                    if pre_auth_pings > 4 {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("authentication required before PING"),
+                        ))
+                    } else {
+                        Some(Frame::new(proto::RESP_PONG, vec![]))
+                    }
+                }
                 proto::REQ_PING => Some(Frame::new(proto::RESP_PONG, vec![])),
                 proto::REQ_AUTH => {
                     // Payload is the raw token. Priority: cluster token
@@ -2694,6 +2747,29 @@ async fn execute_sql_inner(
         let foreign_tx = (is_write || plain_read) && *state.tx_owner.lock().unwrap() != conn;
         if queues || foreign_tx {
             wait_engine_tx_free(state, deadline).await;
+            // A plain read that waited must re-check before executing: the
+            // engine applies an open transaction's statements immediately,
+            // so reading past a still-open transaction serves uncommitted
+            // rows a later ROLLBACK would make vanish — the dirty read this
+            // wait exists to prevent. Writes and replication applies
+            // re-check inside their write_order branches below; without
+            // this, only the plain read fell through on timeout.
+            if plain_read && !is_replication && !order_held {
+                let busy = {
+                    let in_tx = state
+                        .db
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .in_transaction();
+                    in_tx && *state.tx_owner.lock().unwrap() != conn
+                };
+                if busy {
+                    return Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("timed out waiting for the transaction on another connection"),
+                    );
+                }
+            }
         }
         let guard = if order_held {
             // Caller already holds write_order (cluster-join drain, backup
@@ -2815,10 +2891,14 @@ async fn execute_sql_inner(
         }
         // Lost the race for the engine transaction between the wait and the
         // locks: requeue until the deadline, then let the error through.
+        // Skip the requeue when THIS connection already owns the open
+        // transaction (its own duplicate BEGIN): the error cannot clear,
+        // so waiting would only spin out the full 30s budget.
         if queues
             && out
                 .as_ref()
                 .is_err_and(|e| e.to_string().contains("transaction already in progress"))
+            && *state.tx_owner.lock().unwrap() != conn
             && tokio::time::Instant::now() < deadline
         {
             drop(guard);
@@ -2910,9 +2990,10 @@ pub(crate) const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub(crate) const RECV_CAP: usize = 64 * 1024 * 1024;
 
 /// Read one response frame from an outbound connection.
-async fn read_response_frame(
+async fn read_response_frame_with_guard(
     stream: &mut TcpStream,
     key: Option<&crypto::TransportKey>,
+    replay: &mut crypto::ReplayGuard,
 ) -> std::io::Result<Frame> {
     let mut header = [0u8; proto::HEADER_LEN];
     tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut header)).await??;
@@ -2939,6 +3020,7 @@ async fn read_response_frame(
                     f.frame_type
                 )));
             }
+            replay.check(&f.payload).map_err(std::io::Error::other)?;
             f.payload = crypto::open(k, f.frame_type, f.flags, &f.payload)
                 .map_err(std::io::Error::other)?;
         }
@@ -2966,7 +3048,8 @@ async fn auth_on(
         frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload);
     }
     write_frame_on(stream, &frame).await?;
-    let resp = read_response_frame(stream, key).await?;
+    let mut replay = crypto::ReplayGuard::default();
+    let resp = read_response_frame_with_guard(stream, key, &mut replay).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "peer rejected AUTH: {}",
@@ -3023,7 +3106,8 @@ async fn send_frame_on(
 ) -> std::io::Result<(Frame, TcpStream)> {
     let frame = replication_frame(frame_type, payload.to_vec(), key);
     write_frame_on(&mut stream, &frame).await?;
-    let resp = read_response_frame(&mut stream, key).await?;
+    let mut replay = crypto::ReplayGuard::default();
+    let resp = read_response_frame_with_guard(&mut stream, key, &mut replay).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "replica rejected: {}",
@@ -3111,7 +3195,8 @@ async fn forward_frame_raw(
     let mut stream = open_peer_conn(target, key, auth).await?;
     let frame = replication_frame(frame_type, payload.to_vec(), key);
     write_frame_on(&mut stream, &frame).await?;
-    read_response_frame(&mut stream, key).await
+    let mut replay = crypto::ReplayGuard::default();
+    read_response_frame_with_guard(&mut stream, key, &mut replay).await
 }
 
 /// Credential fan-out presents to peers: the cluster token when
@@ -3124,11 +3209,14 @@ pub(crate) fn fanout_auth(state: &ServerState) -> Option<&str> {
 }
 
 /// Append one locally-committed write to the catch-up journal, trimming the
-/// bounded window on the amortized cadence. Callers gate this on the node
-/// having a fan-out target (peers or upstream): a lone node's journal can
-/// never be pulled, and appending is an engine write of its own. Runs
-/// inside the caller's fused write unit when there is one, so the journal
-/// entry shares the statement's fsync. Returns the journal seq, or None
+/// bounded window on the amortized cadence. Journaling is UNCONDITIONAL for
+/// originated writes (autocommit and explicit-transaction drains alike):
+/// beyond catch-up the journal is the PITR source, so a node without peers
+/// still journals. Only replicated applies are excluded (foreign ops live
+/// in the ORIGIN's journal; re-journaling them here would re-broadcast them
+/// to third nodes with this node's origin). Runs inside the caller's fused
+/// write unit when there is one, so the journal entry shares the
+/// statement's fsync. Returns the journal seq, or None
 /// when journaling failed — peers then cannot place the op in the origin's
 /// journal and fall back to snapshot repair on divergence.
 /// Byte cap for the catch-up journal (`_cluster_log`), alongside the count
@@ -3324,14 +3412,18 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u6
 /// The whole batch's journal appends land in ONE fused write unit — one WAL
 /// fsync for N entries instead of N — before any fan-out starts (durable
 /// before peers see it, same as single writes).
+///
+/// Journaling is unconditional for originated writes (same rule as the
+/// autocommit path): beyond catch-up the journal is the PITR source, so a
+/// node without peers still journals — an explicit transaction's writes
+/// must not silently vanish from point-in-time restore. Only the FAN-OUT
+/// below depends on having a target.
 pub async fn drain_tx_pending(state: &Arc<ServerState>) {
     let mut pending = state.tx_pending.lock().await;
     let writes = std::mem::take(&mut pending.writes);
     pending.marks.clear();
     drop(pending);
-    let has_target =
-        !state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some();
-    let seqs = if has_target && !writes.is_empty() {
+    let seqs: Vec<Option<u64>> = if !writes.is_empty() {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         let mut unit = db.write_unit();
         let seqs: Vec<Option<u64>> = writes
@@ -3354,11 +3446,15 @@ pub async fn drain_tx_pending(state: &Arc<ServerState>) {
     } else {
         Vec::new()
     };
-    for (sql, seq) in writes
-        .iter()
-        .zip(seqs.iter().chain(std::iter::repeat(&None)))
-    {
-        forward_sql_all(state, sql, *seq).await;
+    let has_target =
+        !state.peers.lock().await.is_empty() || state.replicate_to.lock().await.is_some();
+    if has_target {
+        for (sql, seq) in writes
+            .iter()
+            .zip(seqs.iter().chain(std::iter::repeat(&None)))
+        {
+            forward_sql_all(state, sql, *seq).await;
+        }
     }
 }
 
@@ -3658,14 +3754,27 @@ async fn handle_subscribe(
         };
         if cursor >= watermark {
             // Catch-up complete: everything ≤ the sampled watermark was
-            // replayed. Sampling and arming inside ONE registry lock closes
-            // the handoff — a message committed before the sample was
-            // replayed, a message committed after it flows live once this
-            // arm lands (see the block comment above).
+            // replayed. The SAMPLE must happen inside the registry lock
+            // (registry → engine, the same nesting registration uses):
+            // sampling before taking the lock leaves a window where a
+            // message commits after the sample but before the arm — its
+            // notify is dropped by the still-max skip_through and the
+            // replay loop has already exited, losing it for good. With the
+            // sample inside the lock, notify either runs before us (its
+            // message id ≤ the sample, so it was replayed — cursor already
+            // ≥ it) or after the arm (id > watermark, flows live).
             let mut inner = state.pubsub.lock().await;
-            inner.arm_filter(conn, kind, &name, watermark);
-            drop(inner);
-            break;
+            let sampled = {
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                pubsub::query_max_id(&mut db)
+            };
+            if cursor >= sampled {
+                inner.arm_filter(conn, kind, &name, sampled);
+                drop(inner);
+                break;
+            }
+            watermark = sampled;
+            continue;
         }
     }
 }
@@ -4021,9 +4130,11 @@ async fn hold_peer(
     }
     // The peer accepted the connection: if it now fails to answer in time
     // it is busy (alive, writes possibly in flight) — never "unreachable".
-    let resp = read_response_frame(&mut stream, state.transport_key.as_ref())
-        .await
-        .map_err(|e| HoldFail::Busy(format!("no hold answer: {e}")))?;
+    let mut replay = crypto::ReplayGuard::default();
+    let resp =
+        read_response_frame_with_guard(&mut stream, state.transport_key.as_ref(), &mut replay)
+            .await
+            .map_err(|e| HoldFail::Busy(format!("no hold answer: {e}")))?;
     match resp.frame_type {
         proto::RESP_AFFECTED if resp.payload.len() == 8 => {
             Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
@@ -4460,8 +4571,14 @@ async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<S
         );
         write_frame_on(&mut stream, &frame).await?;
         let mut script = String::new();
+        let mut replay = crypto::ReplayGuard::default();
         loop {
-            let f = read_response_frame(&mut stream, state.transport_key.as_ref()).await?;
+            let f = read_response_frame_with_guard(
+                &mut stream,
+                state.transport_key.as_ref(),
+                &mut replay,
+            )
+            .await?;
             match f.frame_type {
                 proto::RESP_SYNC => {
                     script.push_str(&proto::decode_sql(&f.payload).map_err(std::io::Error::other)?);
@@ -5395,6 +5512,9 @@ async fn apply_repair_sync(
             return JoinApply::Failed(format!("COMMIT: {e}"));
         }
     }
+    // The voided journal text lives on in any exported incrementals; they
+    // must not survive the adoption (see invalidate_incremental_exports).
+    crate::backup::invalidate_incremental_exports(&state.backup_dir);
     // Probe-round floor before the drain, fresh heads after — same order
     // and same reasoning as the join path (see finish_snapshot_adopt).
     finish_snapshot_adopt(
@@ -5460,7 +5580,8 @@ async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::i
     let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
     let frame = replication_frame(frame_type, vec![], state.transport_key.as_ref());
     write_frame_on(&mut stream, &frame).await?;
-    read_response_frame(&mut stream, state.transport_key.as_ref()).await
+    let mut replay = crypto::ReplayGuard::default();
+    read_response_frame_with_guard(&mut stream, state.transport_key.as_ref(), &mut replay).await
 }
 
 /// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
@@ -5820,10 +5941,15 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
             state.transport_key.as_ref(),
         );
         write_frame_on(&mut stream, &frame).await?;
+        let mut replay = crypto::ReplayGuard::default();
         loop {
             let f = tokio::time::timeout(
                 IO_TIMEOUT,
-                read_response_frame(&mut stream, state.transport_key.as_ref()),
+                read_response_frame_with_guard(
+                    &mut stream,
+                    state.transport_key.as_ref(),
+                    &mut replay,
+                ),
             )
             .await??;
             match f.frame_type {
