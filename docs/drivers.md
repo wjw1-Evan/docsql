@@ -52,7 +52,7 @@ await using var reader = await cmd.ExecuteReaderAsync();
 - `RETURNING` 可直接 `ExecuteScalar/ExecuteReader`;
 - 持久化 pub/sub:`conn.Publish(channel, payload)` 返回 `(id, receivers)`;
   `DocsqlSubscriber` 专用连接 + 专职读线程(订阅必须独占连接),断线按最后 id 续传;
-- 服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM。
+- 服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM。**版本配套**:启用了传输加密的部署要求客户端与服务端同版本——每条加密连接以服务端随机挑战(RESP_HELLO)开头并绑定进 GCM AAD(防跨连接重放),跨版本连接会显式失败;升级时先升到同版本再滚动重启。
 
 ### 参数绑定:服务端 prepared statements(默认路径)
 

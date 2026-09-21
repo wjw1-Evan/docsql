@@ -418,8 +418,19 @@ impl Pager {
                 // Owner-only: the file holds every document plus the user
                 // table's PBKDF2 hashes — the same content backups already
                 // create 0600 (see backup.rs write_private); the default
-                // 0644 made it readable by every local account.
-                opts.mode(0o600).open(path)?
+                // 0644 made it readable by every local account. Pre-existing
+                // files (created before this rule) are tightened on open —
+                // the mode() above only applies at creation.
+                let f = opts.mode(0o600).open(path)?;
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    if let Ok(m) = f.metadata() {
+                        if m.permissions().mode() & 0o777 != 0o600 {
+                            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                        }
+                    }
+                }
+                f
             }
             #[cfg(not(unix))]
             {

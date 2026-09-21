@@ -328,7 +328,44 @@ async fn shutdown_signal() {
 /// `json_response` already sets no-store on the auth endpoints — this
 /// covers the data endpoints that returned bare `Json` bodies, so no
 /// shared or heuristic browser cache can retain them.
-async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+async fn security_headers(
+    State(state): State<Arc<WebState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // The X-Docsql-Token bypass must not be guessable at line rate: a
+    // present-but-wrong token participates in the same per-IP lockout as
+    // the login form, and a locked source is cut here before any handler
+    // (or PBKDF2 budget) runs. This one choke point is used because it
+    // needs the socket peer, which only the middleware reliably carries.
+    if let Some(auth) = &state.auth {
+        if let Some(expect) = &state.token {
+            if let Some(got) = req
+                .headers()
+                .get("X-Docsql-Token")
+                .and_then(|v| v.to_str().ok())
+            {
+                let peer = req
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|c| c.0)
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+                let key = lockout_key(&state, req.headers(), peer);
+                let mut lockout = auth.lockout.lock().unwrap();
+                if lockout.check(key) {
+                    drop(lockout);
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "too many failed attempts; locked".to_string(),
+                    )
+                        .into_response();
+                }
+                if !constant_time_eq(got.as_bytes(), expect.as_bytes()) {
+                    lockout.record_failure(key);
+                }
+            }
+        }
+    }
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -362,8 +399,11 @@ fn build_router(state: Arc<WebState>) -> Router {
             state.clone(),
             count_requests,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .with_state(state)
-        .layer(axum::middleware::from_fn(security_headers))
 }
 
 /// HTTP request accounting middleware feeding

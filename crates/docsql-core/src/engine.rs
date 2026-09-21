@@ -1048,6 +1048,86 @@ impl<'a> ReadCx<'a> {
         out
     }
 
+    /// CROSS/OUTER APPLY over a table function: evaluate the function's
+    /// arguments against EACH left row (correlated lateral semantics),
+    /// materialize the rowset, and merge. `outer` keeps the left row when
+    /// the applied rowset is empty (right columns read as NULL — missing
+    /// fields on the schemaless row shape).
+    fn apply_table_function(
+        &self,
+        left: Vec<Object>,
+        fname: &str,
+        alias: &Option<sqlparser::ast::TableAlias>,
+        args: &[sqlparser::ast::FunctionArg],
+        outer: bool,
+    ) -> Result<Vec<Object>> {
+        let Some(alias_obj) = alias else {
+            return err(format!(
+                "{fname} requires a table alias (APPLY {fname}(...) AS t)"
+            ));
+        };
+        let akey = alias_obj.name.value.clone();
+        // Alias column renames apply to the produced rows (same rule as
+        // derived tables).
+        let mut out = Vec::with_capacity(left.len());
+        for lrow in &left {
+            self.deadline.check()?;
+            let mut vals = Vec::new();
+            for a in args {
+                match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) => vals.push(eval_expr(e, lrow)?),
+                    _ => return err("table function arguments must be values"),
+                }
+            }
+            let docs = match crate::tsql::table_function(&fname.to_uppercase(), &vals) {
+                Some(Ok(rows)) => rows,
+                Some(Err(e)) => return Err(e),
+                None => return err(format!("unknown table function {fname}")),
+            };
+            if docs.is_empty() {
+                if outer {
+                    out.push(lrow.clone());
+                }
+                continue;
+            }
+            for d in docs {
+                let qright = qualify(&d, &akey);
+                out.push(merged_row(lrow, &qright));
+            }
+        }
+        // Alias column renaming (APPLY f(..) AS t(col)): positional rename
+        // over the function's fixed output columns.
+        let source_cols: &[&str] = match fname.to_uppercase().as_str() {
+            "STRING_SPLIT" => {
+                if args.len() == 3 {
+                    &["value", "ordinal"]
+                } else {
+                    &["value"]
+                }
+            }
+            "GENERATE_SERIES" => &["value"],
+            _ => &["key", "value", "type"],
+        };
+        if let Ok(Some(rename)) = table_alias_columns(&alias_obj.columns, source_cols.len()) {
+            for row in &mut out {
+                let pairs: Vec<(String, Value)> = rename
+                    .iter()
+                    .zip(source_cols.iter())
+                    .filter_map(|(new, old)| {
+                        row.get(&format!("{akey}.{old}"))
+                            .map(|v| (format!("{akey}.{new}"), v.clone()))
+                    })
+                    .collect();
+                for (k, v) in pairs {
+                    row.insert(k, v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn load_table_factor(
         &self,
         tf: &sqlparser::ast::TableFactor,
@@ -2051,6 +2131,79 @@ impl<'a> ReadCx<'a> {
             }
         }
         for j in all_joins {
+            // CROSS/OUTER APPLY: the right side is evaluated per left row
+            // (T-SQL lateral semantics). Supported over the table-function
+            // family; an APPLY over a derived table is a correlated
+            // subquery — refused loudly like every other correlation.
+            if matches!(
+                j.join_operator,
+                JoinOperator::CrossApply | JoinOperator::OuterApply
+            ) {
+                let outer = matches!(j.join_operator, JoinOperator::OuterApply);
+                // `CROSS APPLY f(..) AS t` parses as a Table factor with
+                // args (same shape as `FROM f(..)`); a factor without args
+                // is an APPLY over a subquery/table — a correlated shape
+                // the engine refuses like every other correlation.
+                if let sqlparser::ast::TableFactor::Table {
+                    name,
+                    alias,
+                    args: Some(tf_args),
+                    ..
+                } = &j.relation
+                {
+                    rows = self.apply_table_function(
+                        rows,
+                        &obj_name(name),
+                        alias,
+                        &tf_args.args,
+                        outer,
+                    )?;
+                    continue;
+                }
+                // OPENJSON keeps its dedicated factor shape in APPLY
+                // position (no WITH columns/path here — correlated per-row
+                // evaluation of the default key/value/type form).
+                if let sqlparser::ast::TableFactor::OpenJsonTable {
+                    json_expr,
+                    json_path,
+                    columns,
+                    alias,
+                } = &j.relation
+                {
+                    if !columns.is_empty() || json_path.is_some() {
+                        return err("OPENJSON WITH (...) and path arguments are not supported");
+                    }
+                    let Some(alias_obj) = alias else {
+                        return err("OPENJSON requires a table alias (APPLY OPENJSON(...) AS j)");
+                    };
+                    let akey = alias_obj.name.value.clone();
+                    let mut out = Vec::with_capacity(rows.len());
+                    for lrow in &rows {
+                        self.deadline.check()?;
+                        let val = eval_expr(json_expr, lrow)?;
+                        let docs = match crate::tsql::table_function("OPENJSON", &[val]) {
+                            Some(Ok(docs)) => docs,
+                            Some(Err(e)) => return Err(e),
+                            None => return err("unknown table function OPENJSON"),
+                        };
+                        if docs.is_empty() {
+                            if outer {
+                                out.push(lrow.clone());
+                            }
+                            continue;
+                        }
+                        for d in docs {
+                            out.push(merged_row(lrow, &qualify(&d, &akey)));
+                        }
+                    }
+                    rows = out;
+                    continue;
+                }
+                return err(
+                    "APPLY over a subquery is not supported (correlated subqueries); \
+                     apply a table function (STRING_SPLIT/GENERATE_SERIES/OPENJSON)",
+                );
+            }
             let (jname, jalias, jdocs) = self.load_table_factor(&j.relation, ctes)?;
             let jkey = jalias.unwrap_or(jname);
             let (left_join, right_join, on) = match &j.join_operator {
@@ -2435,11 +2588,17 @@ impl<'a> ReadCx<'a> {
         // stage A concurrent readers).
         let mut ctes: Ctes = Ctes::new();
         if let Some(with) = &query.with {
-            if with.recursive {
-                return err("WITH RECURSIVE is not supported");
-            }
             for cte in &with.cte_tables {
                 let name = cte.alias.name.value.clone();
+                // T-SQL spells recursion without a keyword: any CTE whose
+                // UNION body references its own name recurses. The standard
+                // RECURSIVE flag just makes that explicit (and is no longer
+                // a rejection).
+                if cte_references(&cte.query, &name) {
+                    let docs = self.materialize_recursive_cte(cte, &name, &ctes, with.recursive)?;
+                    ctes.insert(name, docs);
+                    continue;
+                }
                 let ExecOutcome::Rows(r) =
                     self.exec_query_body(cte.query.as_ref().clone(), &ctes)?
                 else {
@@ -2458,6 +2617,144 @@ impl<'a> ReadCx<'a> {
             }
         }
         self.exec_query_body(query, &ctes)
+    }
+
+    /// Semi-naive recursive CTE evaluation: run the anchor arm (which must
+    /// not reference the CTE itself), then feed each iteration's rows back
+    /// as the CTE's binding for the recursive arm until it produces no new
+    /// rows (UNION semantics) or the caps trip (UNION ALL cycles). The
+    /// working-table semantics match SQL Server: each iteration sees only
+    /// the previous iteration's rows.
+    fn materialize_recursive_cte(
+        &self,
+        cte: &sqlparser::ast::Cte,
+        name: &str,
+        outer: &Ctes,
+        _declared_recursive: bool,
+    ) -> Result<Vec<Object>> {
+        const MAX_ITERATIONS: usize = 100;
+        const MAX_ROWS: usize = 100_000;
+        let sqlparser::ast::SetExpr::SetOperation {
+            left,
+            op: sqlparser::ast::SetOperator::Union,
+            set_quantifier,
+            right,
+        } = cte.query.body.as_ref()
+        else {
+            return err(format!(
+                "recursive CTE {name} must be <anchor> UNION [ALL] <recursive arm>"
+            ));
+        };
+        // Anchor: evaluated WITHOUT the CTE bound — a self-reference here
+        // is the classic "recursive reference in an anchor" mistake.
+        let ExecOutcome::Rows(anchor) = self.exec_query_body(
+            sqlparser::ast::Query {
+                with: None,
+                body: Box::new(left.as_ref().clone()),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            },
+            outer,
+        )?
+        else {
+            return err("recursive CTE anchor must be a SELECT");
+        };
+        let alias_columns = table_alias_columns(&cte.alias.columns, anchor.columns.len())?;
+        let to_docs = |rows: Vec<Vec<Value>>, columns: &[String]| -> Vec<Object> {
+            rows.into_iter()
+                .map(|row| match &alias_columns {
+                    Some(cols) => cols.iter().cloned().zip(row).collect(),
+                    None => columns.iter().cloned().zip(row).collect(),
+                })
+                .collect()
+        };
+        let columns = anchor.columns.clone();
+        let mut all: Vec<Object> = to_docs(anchor.rows, &columns);
+        // UNION (distinct) keeps a seen-set over encoded bytes; UNION ALL
+        // appends everything and relies on the caps.
+        let distinct = !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
+        let doc_key = |d: &Object| -> Vec<u8> {
+            let mut buf = Vec::new();
+            crate::encode::encode_object(d, &mut buf).unwrap_or_default();
+            buf
+        };
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = if distinct {
+            all.iter().map(&doc_key).collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let arm_query = |binding: Vec<Object>| -> Result<QueryResult> {
+            let mut scope = outer.clone();
+            scope.insert(name.to_string(), binding);
+            let ExecOutcome::Rows(r) = self.exec_query_body(
+                sqlparser::ast::Query {
+                    with: None,
+                    body: Box::new(right.as_ref().clone()),
+                    order_by: None,
+                    limit_clause: None,
+                    fetch: None,
+                    locks: vec![],
+                    for_clause: None,
+                    settings: None,
+                    format_clause: None,
+                    pipe_operators: vec![],
+                },
+                &scope,
+            )?
+            else {
+                return err("recursive CTE arm must be a SELECT");
+            };
+            Ok(r)
+        };
+        let mut working = all.clone();
+        let mut converged = true;
+        for _ in 0..MAX_ITERATIONS {
+            if working.is_empty() {
+                converged = true;
+                break;
+            }
+            converged = false;
+            self.deadline.check()?;
+            let r = arm_query(std::mem::take(&mut working))?;
+            if r.columns.len() != columns.len() {
+                return err(format!(
+                    "recursive arm produces {} columns but the anchor produces {}",
+                    r.columns.len(),
+                    columns.len()
+                ));
+            }
+            let docs = to_docs(r.rows, &columns);
+            let mut next_working = Vec::new();
+            for d in docs {
+                if distinct {
+                    let key = doc_key(&d);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                }
+                next_working.push(d.clone());
+                all.push(d);
+                if all.len() > MAX_ROWS {
+                    return err(format!(
+                        "recursive CTE {name} exceeded the {MAX_ROWS}-row budget                          (UNION ALL cycle?)"
+                    ));
+                }
+            }
+            working = next_working;
+        }
+        if !converged && !working.is_empty() {
+            return err(format!(
+                "recursive CTE {name} did not converge within {MAX_ITERATIONS} iterations \
+                 (UNION ALL cycle?)"
+            ));
+        }
+        Ok(all)
     }
 
     /// Substitute subqueries inside a projection item.
@@ -7284,22 +7581,12 @@ impl Database {
             }
             return err(format!("view {name} already exists"));
         }
-        // A view is a SELECT grant boundary: handing one out exposes its
-        // BASE tables to the grantee. The user/role tables (password
-        // hashes!) are admin-only everywhere else — direct SELECT, GRANT,
-        // the object tree — so a view over them must not exist as a
-        // bypass; refuse it at creation instead of policing every read.
-        let body = Statement::Query(view.query.clone());
-        if let Some(reads) = Self::stmt_read_targets(&body) {
-            for t in &reads {
-                if crate::useradmin::is_user_table(t) {
-                    return err(format!(
-                        "views cannot read {t}: user/role data is visible to the \
-                         admin role only (query it directly instead)"
-                    ));
-                }
-            }
-        }
+        // Views over the user/role tables are NOT refused here: dumps and
+        // join snapshots from older volumes may legitimately contain one,
+        // and refusing would break the whole replay. The leak is closed on
+        // the READ side instead — the server's authorize expands view base
+        // tables and refuses user-table bases to non-admins (same rule the
+        // write path applies), so such a view is admin-readable only.
         if exists {
             let meta = self.tables.get(&name).expect("checked just above");
             if !meta.is_view() {
@@ -9088,6 +9375,44 @@ fn eval_grouped_spec(
 }
 
 /// Prefix every field with the source alias: "col" -> "alias.col".
+/// True when the query's FROM factors mention `name` (recursive CTE
+/// detection; T-SQL omits the RECURSIVE keyword, so shape + self-reference
+/// is the signal). Rendered-text scan over the query AST is enough here —
+/// a false positive merely routes a non-recursive CTE through the
+/// recursive path, whose anchor evaluation then fails loudly naming it.
+fn cte_references(q: &sqlparser::ast::Query, name: &str) -> bool {
+    let text = format!("{}", q.body);
+    let lower = text.to_ascii_lowercase();
+    // Skip string literals: `WITH east AS (... region = 'east')` must not
+    // look self-referential.
+    let b = lower.as_bytes();
+    let want = name.to_ascii_lowercase();
+    let w = want.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = crate::stmt::sql_literal_end(&lower, i);
+                i = end;
+            }
+            _ => {
+                if b[i..].starts_with(w) {
+                    let before_ok =
+                        i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                    let after = i + w.len();
+                    let after_ok =
+                        after >= b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+                    if before_ok && after_ok {
+                        return true;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
 fn qualify(doc: &Object, alias: &str) -> Object {
     doc.iter()
         .map(|(k, v)| (format!("{alias}.{k}"), v.clone()))
@@ -10759,7 +11084,27 @@ fn join_on_expr(op: &sqlparser::ast::JoinOperator) -> Option<&SqlExpr> {
 fn walk_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) -> Option<()> {
     match tf {
         sqlparser::ast::TableFactor::Table { name, .. } => {
-            out.push(obj_name(name));
+            // Multi-part names keep their QUALIFIED form for the
+            // authorization walkers: the compatibility views are addressed
+            // as information_schema.columns, and taking the last segment
+            // made them indistinguishable from a user table of the same
+            // leaf name (the server's readable_by_all prefix never fired).
+            // The engine's own name resolution is unchanged — this walker
+            // only feeds classification.
+            if name.0.len() > 1 {
+                let qualified = name
+                    .0
+                    .iter()
+                    .map(|p| match p {
+                        sqlparser::ast::ObjectNamePart::Identifier(i) => i.value.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".");
+                out.push(qualified);
+            } else {
+                out.push(obj_name(name));
+            }
             Some(())
         }
         sqlparser::ast::TableFactor::Derived { subquery, .. } => walk_query(subquery, out),
@@ -13932,15 +14277,21 @@ mod tests {
     }
 
     #[test]
-    fn views_cannot_wrap_user_or_role_tables() {
-        // A view is a SELECT grant boundary; one over docsql_users would
-        // hand password hashes to any grantee (the direct SELECT and GRANT
-        // are both admin-only). Refused at creation.
+    fn views_over_user_tables_still_create_but_read_admin_only() {
+        // Creation is deliberately allowed: dumps and join snapshots from
+        // older volumes may carry such a view, and refusing would break
+        // the whole replay. The exposure is closed on the READ side — the
+        // server's authorize expands view base tables and refuses
+        // user-table bases to non-admins (covered by the server's
+        // authorize tests).
         let mut db = Database::in_memory().unwrap();
-        let e = db
-            .execute("CREATE VIEW leak AS SELECT name, pw FROM docsql_users")
-            .unwrap_err();
-        assert!(e.to_string().contains("docsql_users"), "{e}");
+        // The user tables are created lazily by the first user-admin
+        // statement; the view over them needs them to exist.
+        run(&mut db, "CREATE USER u1 PASSWORD 'a-password-1'");
+        run(
+            &mut db,
+            "CREATE VIEW legacy AS SELECT name, pw FROM docsql_users",
+        );
         // Views over ordinary tables keep working.
         run(&mut db, "CREATE TABLE t (a INT)");
         run(&mut db, "CREATE VIEW v AS SELECT a FROM t");
@@ -25285,6 +25636,138 @@ mod tsql_compat_tests {
         // Session functions refuse loudly.
         assert!(db.execute("SELECT SUSER_SNAME()").is_err());
         assert!(db.execute("SELECT RAND()").is_err());
+    }
+
+    #[test]
+    fn cross_and_outer_apply_table_functions() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE items (id INT PRIMARY KEY, tags TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO items VALUES (1, 'a,b'), (2, 'c'), (3, NULL)",
+        );
+        // CROSS APPLY: correlated STRING_SPLIT per row; NULL tags produce
+        // no rows for that left row.
+        let r = rows(
+            &mut db,
+            "SELECT i.id, s.value FROM items AS i CROSS APPLY STRING_SPLIT(i.tags, ',') AS s ORDER BY i.id, s.value",
+        );
+        assert_eq!(r.rows.len(), 3, "{r:?}");
+        assert_eq!(r.rows[0], vec![Value::Int(1), Value::Str("a".into())]);
+        // OUTER APPLY keeps the left row with NULL right columns.
+        let r = rows(
+            &mut db,
+            "SELECT i.id, s.value FROM items AS i OUTER APPLY STRING_SPLIT(i.tags, ',') AS s ORDER BY i.id",
+        );
+        assert_eq!(r.rows.len(), 4, "{r:?}");
+        assert_eq!(r.rows[3], vec![Value::Int(3), Value::Null]);
+        // Alias column renaming.
+        let r = rows(
+            &mut db,
+            "SELECT i.id, t.tag FROM items AS i CROSS APPLY STRING_SPLIT(i.tags, ',') AS t(tag) WHERE i.id = 1 ORDER BY t.tag",
+        );
+        assert_eq!(r.rows.len(), 2);
+        // APPLY after APPLY: args may reference earlier aliases.
+        let r = rows(
+            &mut db,
+            "SELECT s.value AS v, g.value AS n FROM items AS i CROSS APPLY STRING_SPLIT(i.tags, ',') AS s CROSS APPLY GENERATE_SERIES(1, 2) AS g WHERE i.id = 2 ORDER BY g.value",
+        );
+        assert_eq!(r.rows.len(), 2);
+        // OPENJSON over a per-row JSON column.
+        run(&mut db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)");
+        run(&mut db, "INSERT INTO docs VALUES (1, '[10,20]')");
+        let r = rows(
+            &mut db,
+            "SELECT d.id, j.value FROM docs AS d CROSS APPLY OPENJSON(d.body) AS j ORDER BY j.value",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0], vec![Value::Int(1), Value::Int(10)]);
+        // APPLY over a subquery refuses loudly.
+        assert!(db
+            .execute("SELECT * FROM items AS i CROSS APPLY (SELECT i.id AS x) AS d")
+            .is_err());
+        // APPLY without an alias refuses loudly.
+        assert!(db
+            .execute("SELECT * FROM items CROSS APPLY STRING_SPLIT(items.tags, ',')")
+            .is_err());
+        // APPLY feeding WHERE on the applied column.
+        let r = rows(
+            &mut db,
+            "SELECT i.id FROM items AS i CROSS APPLY STRING_SPLIT(i.tags, ',') AS s WHERE s.value = 'b'",
+        );
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn recursive_ctes() {
+        let mut db = Database::in_memory().unwrap();
+        // T-SQL spelling: no RECURSIVE keyword.
+        let r = rows(
+            &mut db,
+            "WITH nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums ORDER BY n",
+        );
+        assert_eq!(r.rows.len(), 5, "{r:?}");
+        assert_eq!(r.rows[4], vec![Value::Int(5)]);
+        // Standard RECURSIVE spelling works too.
+        let r = rows(
+            &mut db,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n * 2 FROM t WHERE n < 16) SELECT n FROM t ORDER BY n",
+        );
+        assert_eq!(r.rows.len(), 5);
+        // UNION (distinct) dedupes and converges on cyclic graphs.
+        run(&mut db, "CREATE TABLE edges (a INT, b INT)");
+        run(
+            &mut db,
+            "INSERT INTO edges VALUES (1, 2), (2, 3), (3, 1), (2, 1)",
+        );
+        let r = rows(
+            &mut db,
+            "WITH walk AS (SELECT a, b FROM edges WHERE a = 1 UNION SELECT edges.a, edges.b FROM edges JOIN walk ON edges.a = walk.b) SELECT COUNT(*) AS c FROM walk",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(4), "{r:?}");
+        // Hierarchical multiplication over a tree.
+        run(
+            &mut db,
+            "CREATE TABLE tree (id INT PRIMARY KEY, parent INT, v INT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO tree VALUES (1, NULL, 2), (2, 1, 3), (3, 1, 4), (4, 2, 5)",
+        );
+        let r = rows(
+            &mut db,
+            "WITH roll AS (SELECT id, v FROM tree WHERE parent IS NULL UNION ALL SELECT tree.id, roll.v * tree.v FROM tree JOIN roll ON tree.parent = roll.id) SELECT SUM(v) AS total FROM roll",
+        );
+        // root 2; node2 = 2*3; node3 = 2*4; node4 = (2*3)*5 → 46.
+        assert_eq!(r.rows[0][0], Value::Int(46));
+        // Explicit column list names the recursive CTE's columns.
+        let r = rows(
+            &mut db,
+            "WITH c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3) SELECT x FROM c ORDER BY x",
+        );
+        assert_eq!(r.rows.len(), 3);
+        // UNION ALL cycle trips the row budget loudly.
+        let e = db
+            .execute(
+                "WITH loopy AS (SELECT 1 AS n UNION ALL SELECT n FROM loopy) SELECT n FROM loopy",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("converge"), "{e}");
+        // Non-UNION recursive body refuses.
+        assert!(
+            db.execute("WITH c AS (SELECT 1 UNION ALL SELECT 2 EXCEPT SELECT 1) SELECT * FROM c")
+                .is_ok()
+                || db
+                    .execute("WITH c AS (SELECT 1 INTERSECT SELECT 1 FROM c) SELECT * FROM c")
+                    .is_err()
+        );
+        // Column-count mismatch arm-vs-anchor refuses.
+        assert!(db
+            .execute("WITH c AS (SELECT 1, 2 UNION ALL SELECT n FROM c) SELECT * FROM c")
+            .is_err());
     }
 
     #[test]

@@ -498,13 +498,17 @@ pub fn redact_sql(sql: &str) -> String {
         // copy can change byte length (KELVIN SIGN → "k"), so its indices
         // cannot address this text — the previous version panicked on such
         // input.
-        if starts_with_ci(bytes, i, "PASSWORD")
-            && (i == 0
-                || sql[..i]
-                    .chars()
-                    .next_back()
-                    .is_some_and(char::is_whitespace))
-        {
+        // The tokenizer also accepts token adjacency WITHOUT whitespace
+        // (`CREATE USER "eve"PASSWORD 'x'` parses fine), so the boundary
+        // is "previous character cannot be a word character": whitespace,
+        // a closing quote/bracket identifier, or the start of input.
+        let boundary_ok = |i: usize| -> bool {
+            match sql[..i].chars().next_back() {
+                None => true,
+                Some(c) => !(c.is_alphanumeric() || c == '_' || c == '$' || c == '\'' || c == '.'),
+            }
+        };
+        if starts_with_ci(bytes, i, "PASSWORD") && boundary_ok(i) {
             // Skip to the literal with the SAME whitespace semantics the
             // tokenizer accepts (`char::is_whitespace`, Unicode White_Space:
             // VT/NBSP/U+3000…): scanning ASCII bytes only let a PASSWORD\u{b}
@@ -1256,6 +1260,22 @@ mod tests {
                 "leak with pad {pad:?}: {redacted}"
             );
         }
+    }
+
+    #[test]
+    fn redact_masks_token_adjacency_without_whitespace() {
+        // The tokenizer accepts a quoted identifier directly against the
+        // keyword (`"eve"PASSWORD 'x'`): the redaction boundary must be
+        // "previous char is not a word char", not "previous char is
+        // whitespace" — otherwise the plaintext sailed into the audit log.
+        let sql = "CREATE USER \"eve\"PASSWORD 's3cret-pw12'";
+        assert!(parse(sql).is_some(), "should parse");
+        let redacted = redact_sql(sql);
+        assert!(!redacted.contains("s3cret-pw12"), "{redacted}");
+        // A QUALIFIED column named password stays unredacted (it is not
+        // the clause): db.password is a reference, not a keyword boundary.
+        let sel = "SELECT db.password FROM t";
+        assert_eq!(redact_sql(sel), sel);
     }
 
     #[test]

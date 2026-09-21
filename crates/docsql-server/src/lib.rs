@@ -2659,6 +2659,35 @@ fn authorize_statement(
                         "this statement shape cannot be authorized for user connections".into(),
                     );
                 };
+                // A view is a SELECT permission boundary on the READ path
+                // too: expand its base tables (fail-closed, chain capped)
+                // exactly like the write path does. Without this, a view
+                // over docsql_users left on a pre-upgrade volume handed
+                // password hashes to any readonly/readwrite connection —
+                // and the create-time refusal cannot help there (dumps
+                // from old volumes must keep replaying).
+                let targets = {
+                    let mut queue = targets;
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut out: Vec<String> = Vec::new();
+                    let mut depth = 0usize;
+                    while let Some(t) = queue.pop() {
+                        if !seen.insert(t.clone()) {
+                            continue;
+                        }
+                        match db.and_then(|d| d.view_base_tables(&t)) {
+                            Some(bases) => {
+                                depth += 1;
+                                if depth > 16 {
+                                    return Err("view chain too deep to authorize".into());
+                                }
+                                queue.extend(bases);
+                            }
+                            None => out.push(t),
+                        }
+                    }
+                    out
+                };
                 for t in &targets {
                     if docsql_core::useradmin::is_user_table(t) {
                         return Err("user/role data is visible to the admin role only".into());
@@ -6559,6 +6588,66 @@ mod security_tests {
         assert_eq!(db.position_get("node-a").unwrap(), Some(7 + 3));
         advance_position(&mut db, "node-a", 12);
         assert_eq!(db.position_get("node-a").unwrap(), Some(12));
+    }
+
+    #[test]
+    fn view_reads_expand_base_tables_for_authorization() {
+        // A legacy view over the user tables (created before the read gate,
+        // replayed from an old dump) must not hand password hashes to a
+        // readonly connection: the READ path expands view base tables
+        // exactly like the write path.
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        // The user tables are created lazily by the first user-admin
+        // statement; the view over them needs them to exist.
+        db.execute("CREATE USER u1 PASSWORD 'a-password-1'")
+            .unwrap();
+        db.execute("CREATE VIEW legacy AS SELECT name FROM docsql_users")
+            .unwrap();
+        db.execute("CREATE TABLE t (a INT)").unwrap();
+        db.execute("CREATE VIEW ok_v AS SELECT a FROM t").unwrap();
+        let parse = |sql: &str| docsql_core::engine::Database::parse_classified(sql).unwrap();
+        let mut g = docsql_core::useradmin::UserGrants {
+            admin: false,
+            ..Default::default()
+        };
+        g.readonly = true;
+        // Ordinary view over a readable base: fine for readonly.
+        let p = parse("SELECT * FROM ok_v");
+        assert!(authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &g).is_ok());
+        // View over the user tables: refused on the READ path (the create
+        // itself is admin-only DDL, so only legacy/dump views get here).
+        let p = parse("SELECT * FROM legacy");
+        let e = authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &g).unwrap_err();
+        assert!(e.contains("admin role only"), "{e}");
+        // Admin still reads it.
+        let p = parse("SELECT * FROM legacy");
+        let mut admin = docsql_core::useradmin::UserGrants {
+            admin: true,
+            ..Default::default()
+        };
+        admin.readonly = true;
+        assert!(authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &admin).is_ok());
+    }
+
+    #[test]
+    fn compat_view_reads_yield_qualified_targets() {
+        // The walker must keep the qualified name so readable_by_all's
+        // information_schema. prefix actually fires — taking the last
+        // segment made the EF SchemaSync probes ("columns") collide with
+        // user-table authorization for custom-role users.
+        let p = docsql_core::engine::Database::parse_classified(
+            "SELECT * FROM information_schema.columns",
+        )
+        .unwrap();
+        let docsql_core::engine::AnyStmt::Sql(stmt) = &p.stmt else {
+            panic!("expected a SQL statement");
+        };
+        let targets = docsql_core::engine::Database::stmt_read_targets(stmt).unwrap();
+        assert!(
+            targets.contains(&"information_schema.columns".to_string()),
+            "{targets:?}"
+        );
+        assert!(readable_by_all("information_schema.columns"));
     }
 
     #[test]

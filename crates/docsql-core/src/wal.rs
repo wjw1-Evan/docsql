@@ -129,8 +129,18 @@ impl Wal {
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
                 // Owner-only, same rationale as the data file: the WAL is
-                // a strict superset of a backup's sensitive content.
-                opts.mode(0o600).open(path)?
+                // a strict superset of a backup's sensitive content, and
+                // pre-existing files are tightened on open.
+                let f = opts.mode(0o600).open(path)?;
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    if let Ok(m) = f.metadata() {
+                        if m.permissions().mode() & 0o777 != 0o600 {
+                            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                        }
+                    }
+                }
+                f
             }
             #[cfg(not(unix))]
             {
