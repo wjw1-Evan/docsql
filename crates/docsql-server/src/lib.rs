@@ -2377,6 +2377,13 @@ struct BatchPipeExec<'a> {
 }
 
 impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
+    fn last_identity(&mut self) -> Option<docsql_core::Value> {
+        // The engine records the last autoinc id per INSERT; read it under
+        // the same write-tier lock the statement just ran under.
+        let db = self.state.db.read().unwrap_or_else(|p| p.into_inner());
+        db.last_insert_id().map(docsql_core::Value::Int)
+    }
+
     fn execute(&mut self, sql: &str) -> docsql_core::tsql_batch::ExecFuture<'_> {
         let state = self.state;
         let user = self.user;

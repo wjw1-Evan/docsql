@@ -146,7 +146,10 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
   会话身份函数替换(`SUSER_SNAME()` 族,经连接上下文);变量替换走 `value_literal`,
   写语句只以字面量进入日志/复制;GO 清空批次变量;预算封顶防失控循环;
 - **CROSS/OUTER APPLY 表函数**(逐左行相关化求值)与**递归 CTE**(`UNION [ALL]` 半朴素迭代,
-  去重收敛/预算封顶,T-SQL 无关键字拼写同样识别)。
+  去重收敛/预算封顶,T-SQL 无关键字拼写同样识别);
+- **PIVOT/UNPIVOT**(`FROM src PIVOT (SUM(x) FOR col IN (…))`/`UNPIVOT (val FOR col IN (…))`,
+  隐式分组/行集展开,单聚合,空单元格 NULL)、**SCOPE_IDENTITY()/@@IDENTITY**(逐连接)与
+  **RAND()**(读路径可用;INSERT 字面量化回写,UPDATE/DELETE/MERGE 拒绝——复制安全同 NEWID)。
 
 ### 3.4 函数
 

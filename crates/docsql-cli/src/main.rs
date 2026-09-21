@@ -400,6 +400,10 @@ struct EmbeddedBatchExec<'a> {
 }
 
 impl docsql_core::tsql_batch::BatchExecutor for EmbeddedBatchExec<'_> {
+    fn last_identity(&mut self) -> Option<Value> {
+        self.db.last_insert_id().map(Value::Int)
+    }
+
     fn execute(&mut self, sql: &str) -> docsql_core::tsql_batch::ExecFuture<'_> {
         let out = match self.db.execute(sql) {
             Ok(ExecOutcome::Rows(r)) => Ok(docsql_core::tsql_batch::ExecResult::Rows(r)),

@@ -49,6 +49,14 @@ pub type ExecFuture<'a> =
 /// callers through `Database::execute`.
 pub trait BatchExecutor: Send {
     fn execute(&mut self, sql: &str) -> ExecFuture<'_>;
+
+    /// The engine's last-insert auto id, captured right after `execute`
+    /// ran an INSERT (None when the executor has no identity source).
+    /// The server reads it under the engine lock; embedded callers read
+    /// `Database::last_insert_id`.
+    fn last_identity(&mut self) -> Option<Value> {
+        None
+    }
 }
 
 /// Identity context the owning connection fills in (server: the
@@ -83,6 +91,9 @@ pub struct TsqlSession {
     error_ctx: Option<(i64, String)>,
     /// @@ERROR: the last statement's error number (0 = success).
     last_error: i64,
+    /// SCOPE_IDENTITY()/@@IDENTITY: the last INSERT's auto-generated id
+    /// (autoinc value; None = no insert yet on this connection).
+    last_identity: Option<Value>,
     /// Filled by the owning layer; see [`SessionContext`].
     pub ctx: SessionContext,
 }
@@ -165,6 +176,10 @@ impl TsqlSession {
         match stmt {
             Stmt::Plain(sql) => {
                 let rendered = self.substitute(&sql)?;
+                let is_insert = {
+                    let t = rendered.trim_start();
+                    t.len() >= 6 && t[..6].eq_ignore_ascii_case("INSERT")
+                };
                 let out = match exec.execute(&rendered).await {
                     Ok(out) => out,
                     Err(e) => {
@@ -172,6 +187,9 @@ impl TsqlSession {
                         return Err(e);
                     }
                 };
+                if is_insert {
+                    self.last_identity = exec.last_identity();
+                }
                 self.last_error = 0;
                 self.rowcount = match &out {
                     ExecResult::Affected(n) => *n,
@@ -402,6 +420,10 @@ impl TsqlSession {
                         match &lb[start + 2..j] {
                             b"rowcount" => out.push_str(&self.rowcount.to_string()),
                             b"error" => out.push_str(&self.last_error.to_string()),
+                            b"identity" => match &self.last_identity {
+                                Some(v) => out.push_str(&engine::value_literal(v)?),
+                                None => out.push_str("NULL"),
+                            },
                             b"version" => {
                                 out.push_str(&format!("'DocSQL {}'", env!("CARGO_PKG_VERSION")))
                             }
@@ -444,6 +466,14 @@ impl TsqlSession {
                         // CATCH diagnostics: message/number of the caught
                         // error (NULL outside CATCH, like T-SQL).
                         match lb[start..i].as_ref() {
+                            b"scope_identity" | b"ident_current" => {
+                                match &self.last_identity {
+                                    Some(v) => out.push_str(&engine::value_literal(v)?),
+                                    None => out.push_str("NULL"),
+                                }
+                                i = j + 2;
+                                continue;
+                            }
                             b"error_message" => match self.error_ctx.as_ref() {
                                 Some((_, m)) => {
                                     out.push_str(&format!(
@@ -1530,6 +1560,10 @@ mod tests {
     }
 
     impl BatchExecutor for DbExec {
+        fn last_identity(&mut self) -> Option<Value> {
+            self.db.last_insert_id().map(Value::Int)
+        }
+
         fn execute(&mut self, sql: &str) -> ExecFuture<'_> {
             let out = match self.db.execute(sql) {
                 Ok(engine::ExecOutcome::Rows(r)) => Ok(ExecResult::Rows(r)),
@@ -1995,6 +2029,42 @@ mod tests {
         assert!(!needs_interpretation("SELECT [@x] FROM t"));
         assert!(!needs_interpretation("SELECT \"@x\""));
         assert!(!needs_interpretation("GO"));
+    }
+
+    #[test]
+    fn identity_functions_track_last_insert() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        db.db
+            .execute("CREATE TABLE t (id INT AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        // No insert yet: NULL.
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "SELECT SCOPE_IDENTITY() AS i, @@IDENTITY AS j",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Null);
+        assert_eq!(rows_of(&out)[0][1], Value::Null);
+        // After an INSERT (id auto-filled): SCOPE_IDENTITY()/@@IDENTITY.
+        run_script(&mut s, &mut db, "INSERT INTO t (v) VALUES ('a')").unwrap();
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "SELECT SCOPE_IDENTITY() AS i, @@IDENTITY AS j",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(1));
+        assert_eq!(rows_of(&out)[0][1], Value::Int(1));
+        // Multiple rows: the last row's id.
+        run_script(&mut s, &mut db, "INSERT INTO t (v) VALUES ('b'), ('c')").unwrap();
+        let out = run_script(&mut s, &mut db, "SELECT @@IDENTITY AS j").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(3));
+        // A non-INSERT statement does not clear it (T-SQL keeps the value).
+        run_script(&mut s, &mut db, "SELECT 1").unwrap();
+        let out = run_script(&mut s, &mut db, "SELECT @@IDENTITY AS j").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(3));
     }
 
     /// THROW / RAISERROR / TRY...CATCH: catch swallows the try error and

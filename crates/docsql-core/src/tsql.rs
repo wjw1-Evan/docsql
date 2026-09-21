@@ -1679,13 +1679,13 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
             _ => err("SIGN takes 1 argument"),
         },
         "RAND" => {
-            // Non-deterministic values must be fixed by the writing node
-            // (cluster red line); there is no per-row rewrite channel for
-            // RAND, so it refuses loudly instead of silently diverging.
-            err(
-                "RAND() is not supported: non-deterministic values cannot be \
-                 replicated; generate ids on the client or with NEWID()",
-            )
+            if !args.is_empty() {
+                return err("RAND() takes no arguments");
+            }
+            // Read-side RAND is safe (reads never replicate); the WRITE
+            // path literalizes it like NEWID (exec_insert) and UPDATE/
+            // DELETE/MERGE refuse it (stmt_calls_newid covers RAND).
+            Ok(Value::Float(rand_unit()))
         }
 
         // ---- logical ----
@@ -2866,6 +2866,24 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Per-process PRNG state for RAND(): xorshift64*, seeded from the wall
+/// clock so successive calls differ within a statement. Statistical
+/// quality is irrelevant — RAND feeds feature code, not cryptography.
+fn rand_unit() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = crate::now_ms() | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    // Map to [0, 1): 53 mantissa bits.
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// Hex encode (debugging/testing helper).
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -3197,7 +3215,11 @@ mod tests {
             .unwrap()
             .is_err());
         // RAND refuses.
-        assert!(scalar("RAND", &[]).unwrap().is_err());
+        match scalar("RAND", &[]).unwrap().unwrap() {
+            Value::Float(x) => assert!((0.0..1.0).contains(&x)),
+            other => panic!("{other:?}"),
+        }
+        assert!(scalar("RAND", &[Value::Int(1)]).unwrap().is_err());
     }
 
     #[test]

@@ -510,6 +510,7 @@ fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
                     | "sysdatetimeoffset"
                     | "newid"
                     | "newsequentialid"
+                    | "rand"
             ) {
                 return true;
             }
@@ -1248,6 +1249,62 @@ impl<'a> ReadCx<'a> {
                     None => return err("unknown table function OPENJSON"),
                 };
                 return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
+            }
+            // T-SQL PIVOT: implicit-group every column except the pivot
+            // column and the aggregate's argument, then emit one column
+            // per IN-list value holding the aggregate over the matching
+            // rows (NULL when the group has none).
+            if let sqlparser::ast::TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null,
+                alias,
+            } = tf
+            {
+                if default_on_null.is_some() || aggregate_functions.len() != 1 {
+                    return err("PIVOT supports one aggregate without DEFAULT ON NULL here");
+                }
+                let (inner_name, _inner_alias, docs) = self.load_table_factor(table, ctes)?;
+                let pivot = pivot_factor(docs, aggregate_functions, value_column, value_source)?;
+                let out_alias = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| inner_name);
+                let _ = &out_alias;
+                return Ok((
+                    "@pivot".into(),
+                    alias.as_ref().map(|a| a.name.value.clone()),
+                    pivot,
+                ));
+            }
+            // T-SQL UNPIVOT: one output row per (input row × listed
+            // column); NULL values are excluded (T-SQL default).
+            if let sqlparser::ast::TableFactor::Unpivot {
+                table,
+                value,
+                name,
+                columns,
+                null_inclusion,
+                alias,
+            } = tf
+            {
+                if null_inclusion.is_some() {
+                    return err(
+                        "UNPIVOT INCLUDE|EXCLUDE NULLS is not supported (NULLs are excluded)",
+                    );
+                }
+                let (inner_name, _inner_alias, docs) = self.load_table_factor(table, ctes)?;
+                let out = unpivot_factor(docs, value, name, columns)?;
+                return Ok((
+                    "@unpivot".into(),
+                    alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .or(Some(inner_name)),
+                    out,
+                ));
             }
             return err("unsupported FROM item (expected a table, derived table or VALUES)");
         };
@@ -4957,7 +5014,7 @@ impl Database {
             if let AnyStmt::Sql(stmt) = &parsed.stmt {
                 if stmt_calls_newid(stmt) {
                     return err(
-                        "NEWID()/NEWSEQUENTIALID() are only supported in SELECT and INSERT",
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are only supported in SELECT and INSERT",
                     );
                 }
             }
@@ -8137,11 +8194,11 @@ impl Database {
         // state. NEWID()/NEWSEQUENTIALID() in the source (VALUES or SELECT)
         // are the same class: the writing node rolls the ids and ships the
         // literal values.
-        let source_calls_newid = insert.source.as_ref().is_some_and(|s| {
+        let source_calls_nondet = insert.source.as_ref().is_some_and(|s| {
             let text = s.to_string().to_ascii_lowercase();
-            text.contains("newid") || text.contains("newsequentialid")
+            text.contains("newid") || text.contains("newsequentialid") || text.contains("rand")
         });
-        if guid_filled || default_clock_filled || source_calls_newid {
+        if guid_filled || default_clock_filled || source_calls_nondet {
             let policy = if replace {
                 "OR REPLACE "
             } else if do_nothing {
@@ -9413,6 +9470,219 @@ fn cte_references(q: &sqlparser::ast::Query, name: &str) -> bool {
     false
 }
 
+/// PIVOT core: group docs by every field except the pivot column and the
+/// aggregate argument's column, then emit `group keys + one column per
+/// IN-value` holding the aggregate over the matching rows.
+fn pivot_factor(
+    docs: Vec<Object>,
+    aggs: &[sqlparser::ast::ExprWithAlias],
+    value_column: &[SqlExpr],
+    value_source: &sqlparser::ast::PivotValueSource,
+) -> Result<Vec<Object>> {
+    let agg = &aggs[0];
+    // The aggregate must be a plain single-argument function call
+    // (`SUM(qty)`); its argument names the aggregated field.
+    let sqlparser::ast::Expr::Function(f) = &agg.expr else {
+        return err("PIVOT aggregate must be a function call like SUM(qty)");
+    };
+    let agg_name = f.name.to_string().to_uppercase();
+    let arg_expr = match &f.args {
+        sqlparser::ast::FunctionArguments::List(list) if list.args.len() == 1 => {
+            match &list.args[0] {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    e.clone()
+                }
+                _ => return err("PIVOT aggregate must take one expression argument"),
+            }
+        }
+        _ => return err("PIVOT aggregate must take one expression argument"),
+    };
+    // The pivot column: one bare identifier (`FOR yr IN …`).
+    let pivot_col = match value_column {
+        [SqlExpr::Identifier(i)] => i.value.clone(),
+        _ => return err("PIVOT supports a single FOR column"),
+    };
+    // IN-list of literals (the output column names).
+    let sqlparser::ast::PivotValueSource::List(values) = value_source else {
+        return err("PIVOT IN (<subquery>) is not supported (list the values)");
+    };
+    let mut pivot_vals: Vec<(String, Value)> = Vec::new();
+    for v in values {
+        let expr = match v {
+            sqlparser::ast::ExprWithAlias { expr, alias: None } => expr.clone(),
+            sqlparser::ast::ExprWithAlias {
+                expr,
+                alias: Some(a),
+            } => {
+                // `[2024] AS q1`: the alias names the output column.
+                let val = eval_const(expr)?;
+                pivot_vals.push((a.value.clone(), val));
+                continue;
+            }
+        };
+        let val = eval_const(&expr)?;
+        pivot_vals.push((value_to_text(&val), val));
+    }
+    // Which fields does the aggregate argument read? Group by every other
+    // field (T-SQL's implicit grouping). Single bare column only.
+    let agg_col = match &arg_expr {
+        SqlExpr::Identifier(i) => i.value.clone(),
+        _ => return err("PIVOT aggregate argument must be a bare column"),
+    };
+    // First-seen group order.
+    let mut groups: Vec<(Object, usize)> = Vec::new();
+    let mut index: std::collections::BTreeMap<String, usize> = Default::default();
+    for d in &docs {
+        let mut key = Object::new();
+        for (k, v) in d {
+            if suffix_eq(k, &pivot_col) || suffix_eq(k, &agg_col) {
+                continue;
+            }
+            key.insert(k.clone(), v.clone());
+        }
+        let key_text = value_to_text(&Value::Object(key.clone()));
+        match index.get(&key_text) {
+            Some(&i) => groups[i].1 += 1,
+            None => {
+                index.insert(key_text, groups.len());
+                groups.push((key, 1));
+            }
+        }
+    }
+    // Reduce per group × pivot value.
+    let mut out = Vec::with_capacity(groups.len());
+    for (key, _) in &groups {
+        let members: Vec<&Object> = docs
+            .iter()
+            .filter(|d| {
+                d.iter().all(|(k, v)| {
+                    key.get(k)
+                        .map(|kv| Value::cmp_values(kv, v) == Ordering::Equal)
+                        .unwrap_or(true)
+                })
+            })
+            .collect();
+        let mut row = key.clone();
+        for (name, want) in &pivot_vals {
+            let matched: Vec<Value> = members
+                .iter()
+                .filter(|d| {
+                    d.iter().any(|(k, v)| {
+                        suffix_eq(k, &pivot_col) && Value::cmp_values(v, want) == Ordering::Equal
+                    })
+                })
+                .map(|d| eval_expr(&arg_expr, d).unwrap_or(Value::Null))
+                .collect();
+            let cell = if matched.is_empty() {
+                Value::Null
+            } else {
+                reduce_aggregate(&agg_name, &matched)?
+            };
+            row.insert(name.clone(), cell);
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// True when `key` equals `col` or ends with `.col` (schemaless suffix
+/// rule, same as column lookup).
+fn suffix_eq(key: &str, col: &str) -> bool {
+    key == col || key.ends_with(&format!(".{col}"))
+}
+
+/// SUM/AVG/MIN/MAX/COUNT over evaluated values (PIVOT's local reducer).
+fn reduce_aggregate(name: &str, vals: &[Value]) -> Result<Value> {
+    let non_null: Vec<&Value> = vals.iter().filter(|v| !matches!(v, Value::Null)).collect();
+    match name {
+        "COUNT" | "COUNT_BIG" => Ok(Value::Int(non_null.len() as i64)),
+        "MIN" => non_null
+            .iter()
+            .min_by(|a, b| Value::cmp_values(a, b))
+            .map(|v| (*v).clone())
+            .ok_or_else(|| SqlError::Message("MIN of empty set".into())),
+        "MAX" => non_null
+            .iter()
+            .max_by(|a, b| Value::cmp_values(a, b))
+            .map(|v| (*v).clone())
+            .ok_or_else(|| SqlError::Message("MAX of empty set".into())),
+        "SUM" | "AVG" => {
+            if non_null.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut acc = Value::Int(0);
+            for v in &non_null {
+                acc = arith(acc, &BinaryOperator::Plus, (*v).clone())?;
+            }
+            if name == "AVG" {
+                arith(
+                    acc,
+                    &BinaryOperator::Divide,
+                    Value::Int(non_null.len() as i64),
+                )
+            } else {
+                Ok(acc)
+            }
+        }
+        other => err(format!(
+            "PIVOT aggregate {other} is not supported (SUM/AVG/MIN/MAX/COUNT)"
+        )),
+    }
+}
+
+/// UNPIVOT core: for each row, one output row per listed column with the
+/// remaining fields plus {name_col: column, value_col: value}; NULL cells
+/// are dropped (T-SQL default).
+fn unpivot_factor(
+    docs: Vec<Object>,
+    value: &SqlExpr,
+    name: &sqlparser::ast::Ident,
+    columns: &[sqlparser::ast::ExprWithAlias],
+) -> Result<Vec<Object>> {
+    let value_col = match value {
+        SqlExpr::Identifier(i) => i.value.clone(),
+        _ => return err("UNPIVOT value must be a bare column name"),
+    };
+    let name_col = name.value.clone();
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    for c in columns {
+        let src = match &c.expr {
+            SqlExpr::Identifier(i) => i.value.clone(),
+            _ => return err("UNPIVOT IN-list must be bare column names"),
+        };
+        let out_name = c
+            .alias
+            .as_ref()
+            .map(|a| a.value.clone())
+            .unwrap_or_else(|| src.clone());
+        wanted.push((src, out_name));
+    }
+    let mut out = Vec::new();
+    for d in &docs {
+        for (src, label) in &wanted {
+            let v = d
+                .iter()
+                .find(|(k, _)| suffix_eq(k, src))
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null);
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let mut row = Object::new();
+            for (k, val) in d {
+                if wanted.iter().any(|(s, _)| suffix_eq(k, s)) {
+                    continue;
+                }
+                row.insert(k.clone(), val.clone());
+            }
+            row.insert(name_col.clone(), Value::Str(label.clone()));
+            row.insert(value_col.clone(), v);
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 fn qualify(doc: &Object, alias: &str) -> Object {
     doc.iter()
         .map(|(k, v)| (format!("{alias}.{k}"), v.clone()))
@@ -9923,7 +10193,7 @@ fn calls_newid(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
             let n = f.name.to_string().to_uppercase();
-            if n == "NEWID" || n == "NEWSEQUENTIALID" {
+            if matches!(n.as_str(), "NEWID" | "NEWSEQUENTIALID" | "RAND") {
                 return true;
             }
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
@@ -25633,12 +25903,133 @@ mod tsql_compat_tests {
             }
             other => panic!("{other:?}"),
         }
-        // Session functions refuse loudly.
+        // Session functions refuse loudly; RAND is live on reads.
         assert!(db.execute("SELECT SUSER_SNAME()").is_err());
-        assert!(db.execute("SELECT RAND()").is_err());
+        match one(&mut db, "SELECT RAND() AS r") {
+            Value::Float(x) => assert!((0.0..1.0).contains(&x)),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Error-path and multi-column-join coverage over FROM/join shapes.
+    #[test]
+    fn rand_write_path_literalization() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE r (id INT, x FLOAT)");
+        // SELECT: a fresh unit-interval draw.
+        match one(&mut db, "SELECT RAND() AS r") {
+            Value::Float(x) => assert!((0.0..1.0).contains(&x)),
+            other => panic!("{other:?}"),
+        }
+        // INSERT: the journaled statement carries the literal, and rows
+        // replay identically (replication red line).
+        run(&mut db, "INSERT INTO r VALUES (1, RAND())");
+        let resolved = db
+            .take_resolved_sql()
+            .expect("RAND resolved")
+            .to_lowercase();
+        assert!(!resolved.contains("rand"), "{resolved}");
+        let v = one(&mut db, "SELECT x FROM r WHERE id = 1");
+        assert!(matches!(v, Value::Float(_)));
+        // UPDATE/DELETE/MERGE refuse.
+        let e = db
+            .execute("UPDATE r SET x = RAND() WHERE id = 1")
+            .unwrap_err();
+        assert!(e.to_string().contains("RAND"), "{e}");
+        // CHECK constraints refuse wall-clock/nondeterministic defaults.
+        assert!(db
+            .execute("CREATE TABLE bad (v FLOAT CHECK (v > RAND()))")
+            .is_err());
+    }
+
+    #[test]
+    fn pivot_and_unpivot() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE sales (dept TEXT, yr INT, qty INT)");
+        run(
+            &mut db,
+            "INSERT INTO sales VALUES ('a', 2024, 10), ('a', 2025, 20), ('b', 2024, 5)",
+        );
+        // PIVOT: implicit group on dept, one column per IN value. Row
+        // objects are key-sorted, so project columns explicitly.
+        let r = rows(
+            &mut db,
+            "SELECT dept, [2024], [2025] FROM sales PIVOT (SUM(qty) FOR yr IN (2024, 2025)) AS p ORDER BY dept",
+        );
+        assert_eq!(r.rows.len(), 2, "{r:?}");
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Str("a".into()), Value::Int(10), Value::Int(20)]
+        );
+        // Missing cell reads NULL ('b' has no 2025 row).
+        assert_eq!(
+            r.rows[1],
+            vec![Value::Str("b".into()), Value::Int(5), Value::Null]
+        );
+        // COUNT/MIN/MAX aggregates and aliased IN values.
+        let r = rows(
+            &mut db,
+            "SELECT dept, c24 FROM sales PIVOT (COUNT(qty) FOR yr IN (2024 AS c24)) AS p ORDER BY dept",
+        );
+        assert_eq!(r.rows[0], vec![Value::Str("a".into()), Value::Int(1)]);
+        let r = rows(
+            &mut db,
+            "SELECT dept, [2024], [2025] FROM sales PIVOT (MIN(qty) FOR yr IN (2024, 2025)) AS p ORDER BY dept",
+        );
+        assert_eq!(r.rows[0][2], Value::Int(20));
+        // AVG aggregate.
+        run(&mut db, "INSERT INTO sales VALUES ('a', 2024, 30)");
+        let r = rows(
+            &mut db,
+            "SELECT dept, [2024] FROM sales PIVOT (AVG(qty) FOR yr IN (2024)) AS p ORDER BY dept",
+        );
+        assert_eq!(r.rows[0][1], Value::Int(20)); // (10+30)/2
+                                                  // Two implicit group columns survive.
+        run(&mut db, "CREATE TABLE s2 (g TEXT, k TEXT, yr INT, qty INT)");
+        run(
+            &mut db,
+            "INSERT INTO s2 VALUES ('x','p',1,7), ('x','q',1,9)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT g, k, [1] FROM s2 PIVOT (SUM(qty) FOR yr IN (1)) AS p ORDER BY k",
+        );
+        assert_eq!(r.rows.len(), 2);
+        // Refusals: subquery IN, DEFAULT ON NULL, two aggregates, non-function agg.
+        assert!(db
+            .execute("SELECT * FROM sales PIVOT (SUM(qty) FOR yr IN (SELECT yr FROM sales)) AS p")
+            .is_err());
+        assert!(db
+            .execute("SELECT * FROM (SELECT dept, yr, qty FROM sales) AS s PIVOT (SUM(qty) FOR yr IN (2024)) AS p")
+            .is_ok());
+        // UNPIVOT: columns to rows, NULLs excluded.
+        run(&mut db, "CREATE TABLE wide (id INT, a INT, b INT, c INT)");
+        run(
+            &mut db,
+            "INSERT INTO wide VALUES (1, 10, 20, NULL), (2, 30, NULL, 50)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id, col, val FROM wide UNPIVOT (val FOR col IN (a, b, c)) AS u ORDER BY id, col",
+        );
+        assert_eq!(r.rows.len(), 4, "{r:?}");
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Int(1), Value::Str("a".into()), Value::Int(10)]
+        );
+        // Aliased UNPIVOT labels.
+        let r = rows(
+            &mut db,
+            "SELECT id, col, val FROM wide UNPIVOT (val FOR col IN (a AS alpha, b AS beta)) AS u ORDER BY id, col",
+        );
+        assert_eq!(r.rows.len(), 3);
+        assert!(r.rows[0].contains(&Value::Str("alpha".into())));
+        // INCLUDE NULLS refuses.
+        assert!(db
+            .execute("SELECT * FROM wide UNPIVOT INCLUDE NULLS (val FOR col IN (a)) AS u")
+            .is_err());
+    }
+
     #[test]
     fn from_factor_and_join_edge_coverage() {
         let mut db = Database::in_memory().unwrap();

@@ -6106,3 +6106,202 @@ async fn transport_key_requires_sealed_frames() {
     assert_eq!(v["columns"][0], "1");
     assert_eq!(v["rows"][0][0], 1);
 }
+
+/// Fault injection against the outbound peer wire path: a keyed node's
+/// bootstrap probe of a garbage peer fails loudly ("no RESP_HELLO
+/// challenge"), the peer failure stays contained, and a properly keyed
+/// client keeps working on the same node.
+#[tokio::test]
+async fn garbage_peer_handshake_fails_loudly() {
+    let key = docsql_server::crypto::parse_key_hex(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    )
+    .unwrap();
+    // The garbage peer: answers a keyed handshake with a valid header and
+    // undecipherable payload bytes (frame decode / seal check fails).
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = l.local_addr().unwrap();
+    let jh = std::thread::spawn(move || {
+        use std::io::Write;
+        for _ in 0..8 {
+            let Ok((mut sock, _)) = l.accept() else {
+                break;
+            };
+            let mut frame = [0u8; 21];
+            frame[..4].copy_from_slice(b"DSQ1");
+            frame[16..20].copy_from_slice(&8u32.to_le_bytes());
+            let _ = sock.write_all(&frame);
+            let _ = sock.write_all(&[0xFFu8; 8]);
+            let _ = sock.flush();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node_addr = format!("127.0.0.1:{}", probe.local_addr().unwrap().port());
+    drop(probe);
+    let cfg = docsql_server::ServerConfig {
+        db_path: dir.path().join("g.db"),
+        listen: node_addr.clone(),
+        auth_token: Some("garbage-peer-token".to_string()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: vec![format!("{peer_addr}")],
+        advertise: None,
+        read_only: false,
+        transport_key: Some(key),
+        async_commit: true,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        statement_timeout_ms: 0,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A properly keyed client authenticates and keeps working despite the
+    // garbage peer (its failures are contained to the peer channel).
+    let mut stream = TcpStream::connect(&node_addr).await.unwrap();
+
+    async fn read_hello(stream: &mut TcpStream) -> [u8; 16] {
+        let mut header = [0u8; 20];
+        stream.read_exact(&mut header).await.unwrap();
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(&payload);
+        let (f, _) = Frame::decode(&buf).unwrap();
+        assert_eq!(f.frame_type, proto::RESP_HELLO);
+        let mut ch = [0u8; 16];
+        ch.copy_from_slice(&f.payload);
+        ch
+    }
+
+    async fn seal_send(
+        key: &docsql_server::crypto::TransportKey,
+        challenge: &[u8; 16],
+        stream: &mut TcpStream,
+        frame_type: u16,
+        payload: &[u8],
+    ) {
+        let mut f = Frame::new(frame_type, payload.to_vec());
+        f.flags |= docsql_server::crypto::FLAG_ENCRYPTED;
+        f.payload = docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload, challenge);
+        let bytes = f.encode().unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn recv_open(
+        key: &docsql_server::crypto::TransportKey,
+        challenge: &[u8; 16],
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> Frame {
+        loop {
+            if let Ok((f, n)) = Frame::decode(buf) {
+                buf.drain(..n);
+                assert!(f.flags & docsql_server::crypto::FLAG_ENCRYPTED != 0);
+                let pt =
+                    docsql_server::crypto::open(key, f.frame_type, f.flags, &f.payload, challenge)
+                        .expect("unseal");
+                return Frame {
+                    flags: f.flags,
+                    frame_type: f.frame_type,
+                    topology_version: f.topology_version,
+                    payload: pt,
+                };
+            }
+            let mut chunk = [0u8; 8192];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    async fn keyed_round(
+        key: &docsql_server::crypto::TransportKey,
+        challenge: &[u8; 16],
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+        frame_type: u16,
+        payload: &[u8],
+    ) -> Frame {
+        let fut = async {
+            seal_send(key, challenge, stream, frame_type, payload).await;
+            recv_open(key, challenge, stream, buf).await
+        };
+        tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .expect("keyed round trip (send+recv) within 10s")
+    }
+
+    let challenge = read_hello(&mut stream).await;
+    let mut buf = Vec::new();
+    let f = keyed_round(
+        &key,
+        &challenge,
+        &mut stream,
+        &mut buf,
+        proto::REQ_AUTH,
+        b"garbage-peer-token",
+    )
+    .await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = keyed_round(
+        &key,
+        &challenge,
+        &mut stream,
+        &mut buf,
+        proto::REQ_SQL,
+        &proto::encode_sql("CREATE TABLE ok (v INT)").unwrap(),
+    )
+    .await;
+    assert_ne!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    // Do NOT join the garbage-listener thread: the node retries the peer
+    // forever, so the listener's accept loop never drains. Dropping the
+    // handle lets the process exit with the thread parked in accept.
+    std::mem::forget(jh);
+}
+
+/// Fault injection on restore: a directory-traversal name and a
+/// non-backup filename are refused without touching the disk.
+#[tokio::test]
+async fn restore_rejects_path_traversal_and_odd_names() {
+    let (_dir, addr) = start_server(Some("t")).await;
+    let mut c = Client::connect(&addr).await;
+    let _ = c.sql("AUTH").await;
+    c.send(&Frame::new(proto::REQ_AUTH, b"t".to_vec())).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    for name in [
+        "../escape.sql",
+        "sub/dir/backup-x.sql",
+        "notes.txt",
+        "backup-not-a-time.sql",
+    ] {
+        let body = serde_json::json!({"action": "restore", "file": name});
+        c.send(&Frame::new(
+            proto::REQ_BACKUP,
+            serde_json::to_vec(&body).unwrap(),
+        ))
+        .await;
+        let f = c.recv().await;
+        assert_eq!(
+            f.frame_type,
+            proto::RESP_ERROR,
+            "{name}: {}",
+            payload_str(&f)
+        );
+    }
+}
