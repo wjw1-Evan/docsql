@@ -139,7 +139,11 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
   `LIKE '[a-z]'/[^…]` 字符类、日期/字符串/数学/转换(CONVERT 带 style、TRY_CAST/TRY_CONVERT/PARSE)/
   逻辑(IIF/CHOOSE)/哈希(HASHBYTES MD5/SHA1/SHA2_256)函数族、`NEWID()`(SELECT/INSERT,写路径定值回写)、
   `GETDATE()` 族(写路径折叠为字面量)、表值函数 `STRING_SPLIT`/`GENERATE_SERIES`/`OPENJSON`,
-  以及 `SET <option>`/`USE`/`PRINT`/`GO` 会话垫片(接受并忽略,PRAGMA 同通道)。
+  以及 `SET <option>`/`USE`/`PRINT`/`GO` 会话垫片(接受并忽略,PRAGMA 同通道);
+- **T-SQL 批/控制流**(`core/tsql_batch.rs`,逐连接会话):`DECLARE @x`/`SET @x`/`SELECT @a = …`、
+  `IF … ELSE`、`BEGIN…END`、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@VERSION`、
+  会话身份函数替换(`SUSER_SNAME()` 族,经连接上下文);变量替换走 `value_literal`,
+  写语句只以字面量进入日志/复制;GO 清空批次变量;预算封顶防失控循环。
 
 ### 3.4 函数
 

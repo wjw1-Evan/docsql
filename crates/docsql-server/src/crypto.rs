@@ -10,6 +10,13 @@
 //! flipping a flag (clearing FLAG_ENCRYPTED, setting FLAG_REPLICATION)
 //! invalidates the frame instead of re-routing it.
 //!
+//! Connection binding: the server opens every keyed connection with a
+//! random 16-byte challenge (RESP_HELLO) that both directions fold into
+//! the GCM associated data — a sealed frame replayed onto a DIFFERENT
+//! connection fails the tag, so recording a whole session no longer
+//! resurrects it (the per-connection ReplayGuard still catches in-stream
+//! reordering and single-frame replays).
+//!
 //! Nonce construction: a fully random 96-bit nonce per frame carries the
 //! NIST SP 800-38D birthday bound of 2^32 encryptions per key — a busy
 //! fan-out cluster (one short-lived connection per write per target)
@@ -54,11 +61,16 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Associated data for a frame's tag: the transmitted header fields a
-/// receiver routes on (type + flags), little-endian like the wire form.
-pub fn aad(frame_type: u16, flags: u16) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    out[..2].copy_from_slice(&frame_type.to_le_bytes());
-    out[2..].copy_from_slice(&flags.to_le_bytes());
+/// receiver routes on (type + flags, little-endian like the wire form)
+/// followed by the connection challenge (see RESP_HELLO). Binding the
+/// per-connection challenge is what kills cross-connection replay: a
+/// frame captured on one TCP connection carries a different AAD on any
+/// other and fails the GCM tag before its payload is ever trusted.
+pub fn aad(frame_type: u16, flags: u16, conn: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + conn.len());
+    out.extend_from_slice(&frame_type.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(conn);
     out
 }
 
@@ -117,7 +129,13 @@ impl ReplayGuard {
 
 /// Seal one frame payload: nonce ‖ ciphertext+tag. `flags` must be the
 /// flags as transmitted (i.e. with [`FLAG_ENCRYPTED`] already set).
-pub fn seal(key: &TransportKey, frame_type: u16, flags: u16, plaintext: &[u8]) -> Vec<u8> {
+pub fn seal(
+    key: &TransportKey,
+    frame_type: u16,
+    flags: u16,
+    plaintext: &[u8],
+    conn: &[u8],
+) -> Vec<u8> {
     let nonce = next_nonce();
     let cipher = Aes256Gcm::new(key.into());
     let ct = cipher
@@ -125,7 +143,7 @@ pub fn seal(key: &TransportKey, frame_type: u16, flags: u16, plaintext: &[u8]) -
             Nonce::from_slice(&nonce),
             aes_gcm::aead::Payload {
                 msg: plaintext,
-                aad: &aad(frame_type, flags),
+                aad: &aad(frame_type, flags, conn),
             },
         )
         .expect("aes-gcm encrypt cannot fail with valid key/nonce");
@@ -142,6 +160,7 @@ pub fn open(
     frame_type: u16,
     flags: u16,
     sealed: &[u8],
+    conn: &[u8],
 ) -> Result<Vec<u8>, String> {
     if sealed.len() < 12 + 16 {
         return Err("sealed payload too short".into());
@@ -153,7 +172,7 @@ pub fn open(
             Nonce::from_slice(nonce),
             aes_gcm::aead::Payload {
                 msg: ct,
-                aad: &aad(frame_type, flags),
+                aad: &aad(frame_type, flags, conn),
             },
         )
         .map_err(|_| "decrypt failed (wrong key or tampered frame)".to_string())
@@ -194,20 +213,26 @@ mod tests {
     fn seal_open_roundtrip() {
         let k = key();
         let pt = b"SELECT 1 FROM t";
-        let sealed = seal(&k, 0x0102, 0x0004, pt);
+        let sealed = seal(&k, 0x0102, 0x0004, pt, b"conn");
         // nonce(12) + tag(16) + plaintext
         assert_eq!(sealed.len(), 12 + 16 + pt.len());
         assert_ne!(&sealed[12..], &pt[..]);
-        assert_eq!(open(&k, 0x0102, 0x0004, &sealed).unwrap(), pt.to_vec());
+        assert_eq!(
+            open(&k, 0x0102, 0x0004, &sealed, b"conn").unwrap(),
+            pt.to_vec()
+        );
         // fresh nonce each seal
-        assert_ne!(seal(&k, 0x0102, 0x0004, pt), seal(&k, 0x0102, 0x0004, pt));
+        assert_ne!(
+            seal(&k, 0x0102, 0x0004, pt, b"conn"),
+            seal(&k, 0x0102, 0x0004, pt, b"conn")
+        );
     }
 
     #[test]
     fn replay_guard_rejects_replayed_and_reordered_frames() {
         let k = key();
-        let first = seal(&k, 0x0102, 0x0004, b"one");
-        let second = seal(&k, 0x0102, 0x0004, b"two");
+        let first = seal(&k, 0x0102, 0x0004, b"one", b"conn");
+        let second = seal(&k, 0x0102, 0x0004, b"two", b"conn");
         let mut g = ReplayGuard::default();
         assert!(g.check(&first).is_ok());
         assert!(g.check(&second).is_ok());
@@ -222,9 +247,25 @@ mod tests {
     }
 
     #[test]
+    fn frames_bound_to_one_connection_challenge_do_not_open_on_another() {
+        let k = key();
+        let sealed = seal(&k, 0x0101, FLAG_ENCRYPTED, b"data", b"connection-a");
+        assert_eq!(
+            open(&k, 0x0101, FLAG_ENCRYPTED, &sealed, b"connection-a").unwrap(),
+            b"data".to_vec()
+        );
+        // Same key, different challenge (another connection's hello): the
+        // tag fails — the recorded frame cannot be replayed across
+        // connections.
+        assert!(open(&k, 0x0101, FLAG_ENCRYPTED, &sealed, b"connection-b").is_err());
+        // An empty challenge (pre-hello frames) is its own binding domain.
+        assert!(open(&k, 0x0101, FLAG_ENCRYPTED, &sealed, b"").is_err());
+    }
+
+    #[test]
     fn nonces_share_prefix_and_increase() {
-        let a = seal(&key(), 1, FLAG_ENCRYPTED, b"x");
-        let b = seal(&key(), 1, FLAG_ENCRYPTED, b"x");
+        let a = seal(&key(), 1, FLAG_ENCRYPTED, b"x", b"conn");
+        let b = seal(&key(), 1, FLAG_ENCRYPTED, b"x", b"conn");
         assert_eq!(a[..4], b[..4]);
         let ca = u64::from_le_bytes(a[4..12].try_into().unwrap());
         let cb = u64::from_le_bytes(b[4..12].try_into().unwrap());
@@ -234,16 +275,16 @@ mod tests {
     #[test]
     fn open_rejects_wrong_key_and_tampering() {
         let k = key();
-        let sealed = seal(&k, 0x0102, 0x0004, b"payload");
+        let sealed = seal(&k, 0x0102, 0x0004, b"payload", b"conn");
         let other = parse_key_hex(&"f".repeat(64)).unwrap();
-        assert!(open(&other, 0x0102, 0x0004, &sealed).is_err());
+        assert!(open(&other, 0x0102, 0x0004, &sealed, b"conn").is_err());
         let mut tampered = sealed.clone();
         tampered[13] ^= 0xff;
-        assert!(open(&k, 0x0102, 0x0004, &tampered).is_err());
-        assert!(open(&k, 0x0102, 0x0004, b"short").is_err());
+        assert!(open(&k, 0x0102, 0x0004, &tampered, b"conn").is_err());
+        assert!(open(&k, 0x0102, 0x0004, b"short", b"conn").is_err());
         // Header fields are authenticated: flipping type or flags fails.
-        assert!(open(&k, 0x0103, 0x0004, &sealed).is_err());
-        assert!(open(&k, 0x0102, 0x0006, &sealed).is_err());
-        assert!(open(&k, 0x0102, 0x0000, &sealed).is_err());
+        assert!(open(&k, 0x0103, 0x0004, &sealed, b"conn").is_err());
+        assert!(open(&k, 0x0102, 0x0006, &sealed, b"conn").is_err());
+        assert!(open(&k, 0x0102, 0x0000, &sealed, b"conn").is_err());
     }
 }

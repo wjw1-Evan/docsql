@@ -314,6 +314,7 @@ fn run_embedded(
     let interactive = script.is_none();
     let mut stmt = String::new();
     let mut done = false;
+    let mut tsql = docsql_core::tsql_batch::TsqlSession::new();
     for line in std::io::BufReader::new(source).lines() {
         let line = line.unwrap_or_else(|e| {
             eprintln!("read error: {e}");
@@ -336,34 +337,76 @@ fn run_embedded(
         if !statements_ready(&stmt) {
             continue;
         }
-        for part in split_ready(&stmt) {
-            match db.execute(&part) {
-                Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
-                Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    if !interactive {
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
+        run_embedded_chunk(db, &mut tsql, &stmt, format, interactive);
         stmt.clear();
     }
     // Scripts tolerate a missing final `;`.
     if !done && !stmt.trim().is_empty() {
-        for part in split_ready(&stmt) {
-            match db.execute(&part) {
-                Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
-                Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    if !interactive {
-                        std::process::exit(1);
+        run_embedded_chunk(db, &mut tsql, &stmt, format, interactive);
+    }
+}
+
+/// Execute one ready buffer. T-SQL batches (variables, control flow,
+/// multi-statement scripts) run through the per-run session interpreter;
+/// single plain statements keep the direct engine path.
+fn run_embedded_chunk(
+    db: &mut Database,
+    tsql: &mut docsql_core::tsql_batch::TsqlSession,
+    text: &str,
+    format: Format,
+    interactive: bool,
+) {
+    if docsql_core::tsql_batch::needs_interpretation(text) {
+        let mut exec = EmbeddedBatchExec { db };
+        match docsql_core::tsql_batch::block_on(tsql.run_batch(text, &mut exec)) {
+            Ok(out) => {
+                for msg in tsql.take_prints() {
+                    println!("PRINT: {msg}");
+                }
+                match out {
+                    Some(docsql_core::tsql_batch::ExecResult::Rows(r)) => print_rows(&r, format),
+                    Some(docsql_core::tsql_batch::ExecResult::Affected(n)) => {
+                        println!("({n} rows affected)")
                     }
+                    None => {}
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                if !interactive {
+                    std::process::exit(1);
                 }
             }
         }
+        return;
+    }
+    for part in split_ready(text) {
+        match db.execute(&part) {
+            Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
+            Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                if !interactive {
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Engine-backed batch executor for the embedded CLI session.
+struct EmbeddedBatchExec<'a> {
+    db: &'a mut Database,
+}
+
+impl docsql_core::tsql_batch::BatchExecutor for EmbeddedBatchExec<'_> {
+    fn execute(&mut self, sql: &str) -> docsql_core::tsql_batch::ExecFuture<'_> {
+        let out = match self.db.execute(sql) {
+            Ok(ExecOutcome::Rows(r)) => Ok(docsql_core::tsql_batch::ExecResult::Rows(r)),
+            Ok(ExecOutcome::Affected(n)) => Ok(docsql_core::tsql_batch::ExecResult::Affected(n)),
+            Err(e) => Err(e),
+        };
+        Box::pin(std::future::ready(out))
     }
 }
 
@@ -835,6 +878,26 @@ fn remote_shell(
         stmt.push_str(&line);
         stmt.push('\n');
         if !statements_ready(&stmt) {
+            continue;
+        }
+        // T-SQL batches (variables/control flow) go to the server as ONE
+        // frame: the connection's session state interprets them there,
+        // which also keeps @variables alive across chunks.
+        if docsql_core::tsql_batch::needs_interpretation(&stmt) {
+            let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&stmt).unwrap());
+            match remote.round_trip(&frame) {
+                Ok(f) => {
+                    if !print_frame(&f, format) && !interactive {
+                        std::process::exit(1);
+                    }
+                    stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            stmt.clear();
             continue;
         }
         for part in split_ready(&stmt) {

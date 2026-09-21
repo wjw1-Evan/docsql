@@ -464,6 +464,22 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     // a user-less node stays catalog-clean (digests/snapshots consistent
     // with pre-upgrade peers).
     let has_users0 = db.any_user_exists().unwrap_or(false);
+    // Misconfiguration traps that silently widen the attack surface — say
+    // them once, loudly, at startup:
+    if cfg.auth_token.is_none() && (cfg.read_token.is_some() || cfg.cluster_token.is_some()) {
+        eprintln!(
+            "warning: DOCSQL_READ_TOKEN/DOCSQL_CLUSTER_TOKEN set but no DOCSQL_TOKEN — \
+             the CLIENT plane is fully open (those tokens do not gate client connections)"
+        );
+    }
+    if cfg.auth_token.is_none() && cfg.cluster_token.is_none() && has_users0 {
+        eprintln!(
+            "warning: user accounts exist but no DOCSQL_TOKEN/DOCSQL_CLUSTER_TOKEN is \
+             configured — the documented token-less replication channel stays open to \
+             unauthenticated connections (full dump, journal pull, write freeze via \
+             REQ_HOLD); configure tokens for any networked deployment"
+        );
+    }
     let state = Arc::new(ServerState {
         db: std::sync::RwLock::new(db),
         metrics: metrics::Metrics::new(),
@@ -625,19 +641,12 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                         proto::RESP_ERROR,
                         err_payload("too many connections; retry later"),
                     );
-                    // Seal like any other frame on a keyed transport: the
-                    // client requires encryption both directions and would
-                    // drop a plaintext rejection as a bad frame.
-                    let bytes = match &state.transport_key {
-                        Some(k) => {
-                            let mut sealed = msg;
-                            sealed.flags |= crypto::FLAG_ENCRYPTED;
-                            sealed.payload =
-                                crypto::seal(k, sealed.frame_type, sealed.flags, &sealed.payload);
-                            sealed.encode().unwrap_or_default()
-                        }
-                        None => msg.encode().unwrap_or_default(),
-                    };
+                    // Plaintext by design: no per-connection challenge
+                    // exists yet (the RESP_HELLO challenge is the first
+                    // frame of a fully accepted connection), and keyed
+                    // clients accept an unencrypted RESP_ERROR before the
+                    // hello as a terminal connection-level failure.
+                    let bytes = msg.encode().unwrap_or_default();
                     use tokio::io::AsyncWriteExt;
                     let _ = s.write_all(&bytes).await;
                     continue;
@@ -998,16 +1007,42 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let (tx, mut rx) = mpsc::channel::<Frame>(32);
     let key = state.transport_key;
     let wmetrics = state.metrics.clone();
+    // Per-connection challenge for keyed transports: 16 random bytes sent
+    // as the FIRST frame (plaintext RESP_HELLO) and folded into every
+    // frame's AAD in both directions. Without it a captured encrypted
+    // session could be replayed byte-for-byte onto a fresh connection —
+    // the static PSK would decrypt it happily and the per-connection
+    // ReplayGuard would even see a perfectly increasing counter.
+    let conn_challenge: [u8; 16] = rand::random();
 
     // Writer task: serializes responses (sealing when a transport key is
-    // configured).
+    // configured). The challenge goes out IMMEDIATELY — before any client
+    // frame — because keyed clients block on the hello before they send
+    // anything (deferring it to the first response would deadlock both
+    // sides).
     let writer = tokio::spawn(async move {
+        if key.is_some() {
+            if let Ok(b) = Frame::new(proto::RESP_HELLO, conn_challenge.to_vec()).encode() {
+                wmetrics
+                    .bytes_out_total
+                    .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                let wrote = tokio::time::timeout(IO_TIMEOUT, async {
+                    wr.write_all(&b).await?;
+                    wr.flush().await
+                })
+                .await;
+                if !matches!(wrote, Ok(Ok(()))) {
+                    return;
+                }
+            }
+        }
         while let Some(f) = rx.recv().await {
             let f = if let Some(k) = key {
                 let flags = f.flags | crypto::FLAG_ENCRYPTED;
-                // The transmitted header is the tag's associated data: a
-                // MITM cannot flip a flag without invalidating the frame.
-                let payload = crypto::seal(&k, f.frame_type, flags, &f.payload);
+                // The transmitted header + the connection challenge are the
+                // tag's associated data: a MITM cannot flip a flag, and a
+                // frame captured on another connection cannot replay here.
+                let payload = crypto::seal(&k, f.frame_type, flags, &f.payload, &conn_challenge);
                 Frame {
                     flags,
                     payload,
@@ -1062,6 +1097,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     // template SQL with `?` placeholders. Per connection, dies with it.
     let mut prepared: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut next_stmt_handle: u64 = 1;
+    // T-SQL session state (@variables, @@ROWCOUNT) lives with the
+    // connection, exactly like prepared handles: DECLARE in one REQ_SQL
+    // frame is visible to the next. Replication/replay traffic never
+    // routes through it (that text is already literal).
+    let mut tsql_session = docsql_core::tsql_batch::TsqlSession::new();
     // Legacy anonymous access is judged at connection start: connections
     // that were legitimate when they opened (user-less node) keep working
     // — the operator bootstrap (CREATE USER + GRANT over one session)
@@ -1151,7 +1191,13 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     let _ = tx.send(Frame::new(proto::RESP_ERROR, err_payload(&e))).await;
                     break;
                 }
-                match crypto::open(&k, frame.frame_type, frame.flags, &frame.payload) {
+                match crypto::open(
+                    &k,
+                    frame.frame_type,
+                    frame.flags,
+                    &frame.payload,
+                    &conn_challenge,
+                ) {
                     Ok(pt) => frame.payload = pt,
                     Err(e) => {
                         let _ = tx
@@ -1591,7 +1637,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     // read.
                     let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
                     let mut logged = false;
-                    let resp = match querylog::try_serve_log_view(&sql, &state, user.as_ref()) {
+                    let resp = match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly) {
                         // 读日志的查询本身不写日志(避免读日志刷日志)。
                         Some(f) => f,
                         None => {
@@ -1619,6 +1665,44 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                 Some(f) => {
                                     // Audited later by the drain replay.
                                     f
+                                }
+                                None if !is_replication
+                                    && docsql_core::tsql_batch::needs_interpretation(&sql) =>
+                                {
+                                    // T-SQL batch/variables/control flow:
+                                    // interpret statement-by-statement; each
+                                    // rendered statement goes through the
+                                    // same execute_sql pipeline (auth, log,
+                                    // fan-out, deadline) as a plain one.
+                                    tsql_session.ctx = docsql_core::tsql_batch::SessionContext {
+                                        user: user.as_ref().map(|u| u.name.clone()),
+                                        app_name: None,
+                                        host: None,
+                                    };
+                                    let deadline = state
+                                        .statement_timeout
+                                        .map(|t| std::time::Instant::now() + t);
+                                    let mut exec = BatchPipeExec {
+                                        state: &state,
+                                        user: user.as_ref(),
+                                        conn: Some(conn_id),
+                                        deadline,
+                                    };
+                                    match tsql_session
+                                        .run_batch(&sql, &mut exec)
+                                        .await
+                                    {
+                                        Ok(out) => {
+                                            for msg in tsql_session.take_prints() {
+                                                eprintln!("conn {conn_id} PRINT: {msg}");
+                                            }
+                                            exec_result_frame(out)
+                                        }
+                                        Err(e) => Frame::new(
+                                            proto::RESP_ERROR,
+                                            err_payload(&e.to_string()),
+                                        ),
+                                    }
                                 }
                                 None => {
                                     let (effective, allow_system) = if is_replication {
@@ -1792,7 +1876,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                 .statement_timeout
                                 .map(|t| std::time::Instant::now() + t);
                             let (resp, logged) =
-                                match querylog::try_serve_log_view(&sql, &state, user.as_ref())
+                                match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly)
                                 {
                                 // 读日志的查询本身不写日志(避免读日志刷日志)。
                                 Some(f) => (f, false),
@@ -2282,6 +2366,105 @@ fn render_param(p: &Value) -> String {
 /// JSON object, affected counts as a LE u64, errors as RESP_ERROR. Shared by
 /// the write path and the guardless read tier so the wire shape cannot drift
 /// between them.
+/// The interpreter's executor: one statement through the full client
+/// pipeline (authorization, query log, replication fan-out, deadline) —
+/// interpreted batches behave exactly like hand-split statements.
+struct BatchPipeExec<'a> {
+    state: &'a Arc<ServerState>,
+    user: Option<&'a UserAuth>,
+    conn: Option<u64>,
+    deadline: Option<std::time::Instant>,
+}
+
+impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
+    fn execute(&mut self, sql: &str) -> docsql_core::tsql_batch::ExecFuture<'_> {
+        let state = self.state;
+        let user = self.user;
+        let conn = self.conn;
+        let deadline = self.deadline;
+        let sql = sql.to_string();
+        Box::pin(async move {
+            let frame = execute_sql(
+                state, &sql, false, // allow_system_table: the pubsub-view rewrite above
+                // already ran for the batch text; plain statements
+                // against system tables keep their error.
+                false, // never the replication path
+                conn, false, None, user, deadline,
+            )
+            .await;
+            frame_to_exec(frame)
+        })
+    }
+}
+
+/// Decode a response frame back into the interpreter's result shape.
+fn frame_to_exec(frame: Frame) -> docsql_core::engine::Result<docsql_core::tsql_batch::ExecResult> {
+    use docsql_core::tsql_batch::ExecResult;
+    if frame.frame_type == proto::RESP_ERROR {
+        return Err(docsql_core::engine::SqlError::Message(
+            String::from_utf8_lossy(&frame.payload).to_string(),
+        ));
+    }
+    if frame.frame_type == proto::RESP_AFFECTED {
+        let mut bytes = [0u8; 8];
+        let n = frame.payload.len().min(8);
+        bytes[..n].copy_from_slice(&frame.payload[..n]);
+        return Ok(ExecResult::Affected(u64::from_le_bytes(bytes)));
+    }
+    // RESP_ROWS: {"columns": [...], "rows": [[...]]} — the wire JSON is
+    // the engine's own value serialization, so it round-trips exactly
+    // ($dec/$ts/$bytes markers included).
+    let payload = String::from_utf8_lossy(&frame.payload).to_string();
+    match docsql_core::json::from_str(&payload) {
+        Ok(docsql_core::Value::Object(obj)) => {
+            let columns: Vec<String> = match obj.get("columns") {
+                Some(docsql_core::Value::Array(cols)) => cols
+                    .iter()
+                    .map(|c| match c {
+                        docsql_core::Value::Str(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let rows: Vec<Vec<docsql_core::Value>> = match obj.get("rows") {
+                Some(docsql_core::Value::Array(rows)) => rows
+                    .iter()
+                    .map(|r| match r {
+                        docsql_core::Value::Array(vals) => vals.clone(),
+                        other => vec![other.clone()],
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Ok(ExecResult::Rows(docsql_core::engine::QueryResult {
+                columns,
+                rows,
+            }))
+        }
+        _ => Err(docsql_core::engine::SqlError::Message(
+            "interpreter: malformed rows payload".into(),
+        )),
+    }
+}
+
+/// The batch's reply frame: the LAST statement's outcome, rendered exactly
+/// like a single-statement response.
+fn exec_result_frame(out: Option<docsql_core::tsql_batch::ExecResult>) -> Frame {
+    match out {
+        Some(docsql_core::tsql_batch::ExecResult::Affected(n)) => {
+            Frame::new(proto::RESP_AFFECTED, n.to_le_bytes().to_vec())
+        }
+        Some(docsql_core::tsql_batch::ExecResult::Rows(r)) => {
+            outcome_frame(Ok::<ExecOutcome, std::convert::Infallible>(
+                ExecOutcome::Rows(r),
+            ))
+        }
+        // A batch of only control flow/assignments affected nothing.
+        None => Frame::new(proto::RESP_AFFECTED, 0u64.to_le_bytes().to_vec()),
+    }
+}
+
 fn outcome_frame<E: std::fmt::Display>(outcome: std::result::Result<ExecOutcome, E>) -> Frame {
     match outcome {
         Ok(ExecOutcome::Rows(r)) => {
@@ -2434,9 +2617,15 @@ pub(crate) async fn wait_engine_tx_free(state: &Arc<ServerState>, deadline: toki
 /// and compatibility views mirror the read-only token's reach).
 fn readable_by_all(t: &str) -> bool {
     docsql_core::engine::is_system_table(t)
+        // The compatibility views are addressed as
+        // information_schema.tables / information_schema.columns — the
+        // walker yields the qualified name, so an exact match on the bare
+        // prefix never fired (and the virtual views cannot be GRANTed, so
+        // custom-role users were locked out of the EF SchemaSync probes).
+        || t.starts_with("information_schema.")
         || matches!(
             t,
-            "sqlite_master" | "sqlite_temporal_master" | "information_schema"
+            "sqlite_master" | "sqlite_temporal_master"
         )
         || t.starts_with('@')
 }
@@ -2493,7 +2682,37 @@ fn authorize_statement(
                 S::Truncate(_) => (PRIV_DELETE, "TRUNCATE"),
                 _ => return Err("DDL and administrative statements require the admin role".into()),
             };
-            for t in Database::stmt_write_targets(s) {
+            let mut write_targets = Database::stmt_write_targets(s);
+            // TRUNCATE ... CASCADE clears the FK children too (transitive
+            // closure, same as execution time) — those tables are as much
+            // authorization input as the named ones. Without this, a user
+            // holding DELETE on the parent alone could empty child tables
+            // they hold no grant on at all.
+            if let S::Truncate(tr) = s.as_ref() {
+                if tr.cascade == Some(sqlparser::ast::CascadeOption::Cascade) {
+                    match db {
+                        Some(db) => {
+                            let mut targets = write_targets.clone();
+                            loop {
+                                let referencing: Vec<String> = db
+                                    .table_foreign_keys_of(&targets)
+                                    .into_iter()
+                                    .filter(|t| !targets.contains(t))
+                                    .collect();
+                                if referencing.is_empty() {
+                                    break;
+                                }
+                                targets.extend(referencing);
+                            }
+                            write_targets = targets;
+                        }
+                        None => {
+                            return Err("TRUNCATE ... CASCADE cannot be authorized here".into());
+                        }
+                    }
+                }
+            }
+            for t in write_targets {
                 if !g.may_dml(&t, bit) {
                     return Err(format!(
                         "{label} on table {t} requires the readwrite role or a table grant"
@@ -2992,7 +3211,7 @@ pub(crate) const RECV_CAP: usize = 64 * 1024 * 1024;
 /// Read one response frame from an outbound connection.
 async fn read_response_frame_with_guard(
     stream: &mut TcpStream,
-    key: Option<&crypto::TransportKey>,
+    wire: WireKey<'_>,
     replay: &mut crypto::ReplayGuard,
 ) -> std::io::Result<Frame> {
     let mut header = [0u8; proto::HEADER_LEN];
@@ -3012,8 +3231,8 @@ async fn read_response_frame_with_guard(
     // Peer responses are sealed like any other frame; the old code handed
     // encrypted payloads to its callers (status JSON, AUTH replies), so a
     // keyed cluster could not actually talk to itself.
-    match key {
-        Some(k) => {
+    match wire {
+        Some((k, hello)) => {
             if f.flags & crypto::FLAG_ENCRYPTED == 0 {
                 return Err(std::io::Error::other(format!(
                     "peer sent an unencrypted {} response on a keyed transport",
@@ -3021,7 +3240,7 @@ async fn read_response_frame_with_guard(
                 )));
             }
             replay.check(&f.payload).map_err(std::io::Error::other)?;
-            f.payload = crypto::open(k, f.frame_type, f.flags, &f.payload)
+            f.payload = crypto::open(k, f.frame_type, f.flags, &f.payload, hello)
                 .map_err(std::io::Error::other)?;
         }
         None => {
@@ -3035,21 +3254,63 @@ async fn read_response_frame_with_guard(
     Ok(f)
 }
 
+/// Keyed-transport state for one OUTBOUND peer connection: the key plus
+/// the server's RESP_HELLO challenge, both bound into every frame's AAD.
+/// `(None, _)` is a plaintext link.
+pub(crate) type WireKey<'a> = Option<(&'a crypto::TransportKey, &'a [u8; 16])>;
+
+/// Read the server's connection challenge on a fresh keyed link. Before
+/// the hello, a plaintext RESP_ERROR is a terminal connection-level
+/// failure (e.g. the peer's connection-limit rejection) — surface its
+/// message instead of a framing error.
+async fn read_wire_hello(
+    stream: &mut TcpStream,
+    key: Option<&crypto::TransportKey>,
+) -> std::io::Result<[u8; 16]> {
+    let Some(_) = key else {
+        return Ok([0u8; 16]);
+    };
+    let mut header = [0u8; proto::HEADER_LEN];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut header)).await??;
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    if len > RECV_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer hello too large",
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut payload)).await??;
+    let mut buf = header.to_vec();
+    buf.extend_from_slice(&payload);
+    let (f, _) = Frame::decode(&buf).map_err(std::io::Error::other)?;
+    if f.frame_type == proto::RESP_ERROR && f.flags & crypto::FLAG_ENCRYPTED == 0 {
+        return Err(std::io::Error::other(format!(
+            "peer refused the connection: {}",
+            String::from_utf8_lossy(&f.payload)
+        )));
+    }
+    if f.frame_type != proto::RESP_HELLO || f.payload.len() != 16 {
+        return Err(std::io::Error::other(
+            "keyed peer did not send its RESP_HELLO challenge",
+        ));
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&f.payload);
+    Ok(out)
+}
+
 /// AUTH on a fresh peer connection when the server requires a token (the
 /// peer rejects everything else with "unauthorized").
-async fn auth_on(
-    stream: &mut TcpStream,
-    token: &str,
-    key: Option<&crypto::TransportKey>,
-) -> std::io::Result<()> {
+async fn auth_on(stream: &mut TcpStream, token: &str, wire: WireKey<'_>) -> std::io::Result<()> {
     let mut frame = Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec());
-    if let Some(k) = key {
+    if let Some((k, hello)) = wire {
         frame.flags |= crypto::FLAG_ENCRYPTED;
-        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload);
+        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload, hello);
     }
     write_frame_on(stream, &frame).await?;
     let mut replay = crypto::ReplayGuard::default();
-    let resp = read_response_frame_with_guard(stream, key, &mut replay).await?;
+    let resp = read_response_frame_with_guard(stream, wire, &mut replay).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "peer rejected AUTH: {}",
@@ -3059,31 +3320,30 @@ async fn auth_on(
     Ok(())
 }
 
-/// Connect and authenticate one outbound peer connection.
+/// Connect, consume the keyed handshake and authenticate one outbound peer
+/// connection.
 async fn open_peer_conn(
     target: &str,
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
-) -> std::io::Result<TcpStream> {
+) -> std::io::Result<(TcpStream, [u8; 16])> {
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await??;
+    let hello = read_wire_hello(&mut stream, key).await?;
     if let Some(token) = auth {
-        auth_on(&mut stream, token, key).await?;
+        let wire: WireKey = key.map(|k| (k, &hello));
+        auth_on(&mut stream, token, wire).await?;
     }
-    Ok(stream)
+    Ok((stream, hello))
 }
 
 /// Build a replication-internal frame: FLAG_REPLICATION plus transport
 /// sealing when a key is configured.
-fn replication_frame(
-    frame_type: u16,
-    payload: Vec<u8>,
-    key: Option<&crypto::TransportKey>,
-) -> Frame {
+fn replication_frame(frame_type: u16, payload: Vec<u8>, wire: WireKey<'_>) -> Frame {
     let mut frame = Frame::new(frame_type, payload);
     frame.flags = FLAG_REPLICATION;
-    if let Some(k) = key {
+    if let Some((k, hello)) = wire {
         frame.flags |= crypto::FLAG_ENCRYPTED;
-        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload);
+        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload, hello);
     }
     frame
 }
@@ -3102,12 +3362,12 @@ async fn send_frame_on(
     mut stream: TcpStream,
     frame_type: u16,
     payload: &[u8],
-    key: Option<&crypto::TransportKey>,
+    wire: WireKey<'_>,
 ) -> std::io::Result<(Frame, TcpStream)> {
-    let frame = replication_frame(frame_type, payload.to_vec(), key);
+    let frame = replication_frame(frame_type, payload.to_vec(), wire);
     write_frame_on(&mut stream, &frame).await?;
     let mut replay = crypto::ReplayGuard::default();
-    let resp = read_response_frame_with_guard(&mut stream, key, &mut replay).await?;
+    let resp = read_response_frame_with_guard(&mut stream, wire, &mut replay).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "replica rejected: {}",
@@ -3177,8 +3437,9 @@ pub(crate) async fn forward_frame(
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
 ) -> std::io::Result<Frame> {
-    let stream = open_peer_conn(target, key, auth).await?;
-    let (resp, _stream) = send_frame_on(stream, frame_type, payload, key).await?;
+    let (stream, hello) = open_peer_conn(target, key, auth).await?;
+    let wire: WireKey = key.map(|k| (k, &hello));
+    let (resp, _stream) = send_frame_on(stream, frame_type, payload, wire).await?;
     Ok(resp)
 }
 
@@ -3192,11 +3453,12 @@ async fn forward_frame_raw(
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
 ) -> std::io::Result<Frame> {
-    let mut stream = open_peer_conn(target, key, auth).await?;
-    let frame = replication_frame(frame_type, payload.to_vec(), key);
+    let (mut stream, hello) = open_peer_conn(target, key, auth).await?;
+    let wire: WireKey = key.map(|k| (k, &hello));
+    let frame = replication_frame(frame_type, payload.to_vec(), wire);
     write_frame_on(&mut stream, &frame).await?;
     let mut replay = crypto::ReplayGuard::default();
-    read_response_frame_with_guard(&mut stream, key, &mut replay).await
+    read_response_frame_with_guard(&mut stream, wire, &mut replay).await
 }
 
 /// Credential fan-out presents to peers: the cluster token when
@@ -4113,16 +4375,16 @@ async fn hold_peer(
         Ok(Err(e)) => return Err(unreachable(e)),
         Err(_) => return Err(HoldFail::Unreachable("connect timed out".into())),
     };
+    let hello = read_wire_hello(&mut stream, state.transport_key.as_ref())
+        .await
+        .map_err(unreachable)?;
+    let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
     if let Some(token) = fanout_auth(state) {
-        auth_on(&mut stream, token, state.transport_key.as_ref())
+        auth_on(&mut stream, token, wire)
             .await
             .map_err(|e| HoldFail::Busy(format!("auth: {e}")))?;
     }
-    let frame = replication_frame(
-        proto::REQ_HOLD,
-        advertise.as_bytes().to_vec(),
-        state.transport_key.as_ref(),
-    );
+    let frame = replication_frame(proto::REQ_HOLD, advertise.as_bytes().to_vec(), wire);
     // Encode/write failures on a connected peer mean the peer went away
     // mid-hold — same classification as an unreachable target.
     if let Err(e) = write_frame_on(&mut stream, &frame).await {
@@ -4131,10 +4393,9 @@ async fn hold_peer(
     // The peer accepted the connection: if it now fails to answer in time
     // it is busy (alive, writes possibly in flight) — never "unreachable".
     let mut replay = crypto::ReplayGuard::default();
-    let resp =
-        read_response_frame_with_guard(&mut stream, state.transport_key.as_ref(), &mut replay)
-            .await
-            .map_err(|e| HoldFail::Busy(format!("no hold answer: {e}")))?;
+    let resp = read_response_frame_with_guard(&mut stream, wire, &mut replay)
+        .await
+        .map_err(|e| HoldFail::Busy(format!("no hold answer: {e}")))?;
     match resp.frame_type {
         proto::RESP_AFFECTED if resp.payload.len() == 8 => {
             Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
@@ -4558,8 +4819,9 @@ enum JoinApply {
 /// Ask one peer for the cluster state and return the dump script.
 async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<String> {
     let attempt = async {
-        let mut stream =
+        let (mut stream, hello) =
             open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+        let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
         let frame = replication_frame(
             proto::REQ_SYNC,
             state
@@ -4567,18 +4829,13 @@ async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<S
                 .as_deref()
                 .map(|a| a.as_bytes().to_vec())
                 .unwrap_or_default(),
-            state.transport_key.as_ref(),
+            wire,
         );
         write_frame_on(&mut stream, &frame).await?;
         let mut script = String::new();
         let mut replay = crypto::ReplayGuard::default();
         loop {
-            let f = read_response_frame_with_guard(
-                &mut stream,
-                state.transport_key.as_ref(),
-                &mut replay,
-            )
-            .await?;
+            let f = read_response_frame_with_guard(&mut stream, wire, &mut replay).await?;
             match f.frame_type {
                 proto::RESP_SYNC => {
                     script.push_str(&proto::decode_sql(&f.payload).map_err(std::io::Error::other)?);
@@ -5577,11 +5834,13 @@ async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
 /// the response frame untouched — the caller validates the frame type and
 /// parses the payload. Shared by the digest/status probes.
 async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::io::Result<Frame> {
-    let mut stream = open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
-    let frame = replication_frame(frame_type, vec![], state.transport_key.as_ref());
+    let (mut stream, hello) =
+        open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+    let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
+    let frame = replication_frame(frame_type, vec![], wire);
     write_frame_on(&mut stream, &frame).await?;
     let mut replay = crypto::ReplayGuard::default();
-    read_response_frame_with_guard(&mut stream, state.transport_key.as_ref(), &mut replay).await
+    read_response_frame_with_guard(&mut stream, wire, &mut replay).await
 }
 
 /// One peer's table digests over REQ_DIGEST (see `repair_sync`). Errors
@@ -5933,23 +6192,16 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
 /// the repair then falls back to snapshot adoption.
 async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std::io::Result<u64> {
     let attempt = async {
-        let mut stream =
+        let (mut stream, hello) =
             open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
-        let frame = replication_frame(
-            proto::REQ_CATCHUP,
-            after.to_le_bytes().to_vec(),
-            state.transport_key.as_ref(),
-        );
+        let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
+        let frame = replication_frame(proto::REQ_CATCHUP, after.to_le_bytes().to_vec(), wire);
         write_frame_on(&mut stream, &frame).await?;
         let mut replay = crypto::ReplayGuard::default();
         loop {
             let f = tokio::time::timeout(
                 IO_TIMEOUT,
-                read_response_frame_with_guard(
-                    &mut stream,
-                    state.transport_key.as_ref(),
-                    &mut replay,
-                ),
+                read_response_frame_with_guard(&mut stream, wire, &mut replay),
             )
             .await??;
             match f.frame_type {
@@ -6185,7 +6437,11 @@ mod security_tests {
         assert!(readable_by_all("_pubsub_messages"));
         assert!(readable_by_all("_cluster_log"));
         assert!(readable_by_all("sqlite_master"));
-        assert!(readable_by_all("information_schema"));
+        // The walker yields the QUALIFIED compatibility-view names; the
+        // prefix match keeps custom-role users able to run the EF
+        // SchemaSync probes (the virtual views cannot be GRANTed).
+        assert!(readable_by_all("information_schema.tables"));
+        assert!(readable_by_all("information_schema.columns"));
         assert!(readable_by_all("@compat"));
         assert!(!readable_by_all("user_tbl"));
         assert!(!readable_by_all("docsql_users"));
@@ -6287,7 +6543,9 @@ mod security_tests {
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
         )
         .unwrap();
-        let f = replication_frame(proto::REQ_DIGEST, b"hi".to_vec(), Some(&key));
+        let hello = [7u8; 16];
+        let wire: WireKey = Some((&key, &hello));
+        let f = replication_frame(proto::REQ_DIGEST, b"hi".to_vec(), wire);
         assert_ne!(f.payload, b"hi");
         assert_eq!(f.flags & crypto::FLAG_ENCRYPTED, crypto::FLAG_ENCRYPTED);
     }
@@ -6301,6 +6559,43 @@ mod security_tests {
         assert_eq!(db.position_get("node-a").unwrap(), Some(7 + 3));
         advance_position(&mut db, "node-a", 12);
         assert_eq!(db.position_get("node-a").unwrap(), Some(12));
+    }
+
+    #[test]
+    fn truncate_cascade_authorizes_the_fk_children_too() {
+        use docsql_core::useradmin::PRIV_DELETE;
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE parent (id INT PRIMARY KEY)",
+            "CREATE TABLE child (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES parent (id))",
+            "CREATE TABLE grandchild (id INT PRIMARY KEY, cid INT, \
+             FOREIGN KEY (cid) REFERENCES child (id))",
+            "INSERT INTO parent VALUES (1)",
+            "INSERT INTO child VALUES (10, 1)",
+            "INSERT INTO grandchild VALUES (100, 10)",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let parse = |sql: &str| docsql_core::engine::Database::parse_classified(sql).unwrap();
+        let mut g = docsql_core::useradmin::UserGrants {
+            admin: false,
+            ..Default::default()
+        };
+        g.table_privs.insert("parent".into(), PRIV_DELETE);
+        // Plain TRUNCATE on the granted table is fine.
+        let p = parse("TRUNCATE parent");
+        assert!(authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &g).is_ok());
+        // CASCADE clears the FK children — every one of them is
+        // authorization input now; holding DELETE on `parent` alone no
+        // longer empties child/grandchild tables with no grant at all.
+        let p = parse("TRUNCATE parent CASCADE");
+        let e = authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &g).unwrap_err();
+        assert!(e.contains("child"), "{e}");
+        // Granting the whole closure satisfies the check again.
+        g.table_privs.insert("child".into(), PRIV_DELETE);
+        g.table_privs.insert("grandchild".into(), PRIV_DELETE);
+        assert!(authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &g).is_ok());
     }
 
     #[test]

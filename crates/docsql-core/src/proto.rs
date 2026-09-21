@@ -175,6 +175,16 @@ pub const RESP_BACKUP: u16 = 0x010D;
 /// `{"handle": n}`.
 pub const RESP_PREPARED: u16 = 0x010E;
 
+/// Keyed-transport connection challenge: sent by the server as the FIRST
+/// frame of every encrypted connection (plaintext payload: 16 random
+/// bytes). Both directions bind it into the GCM associated data, so a
+/// sealed frame captured on one connection can never decrypt on another —
+/// replaying a recorded session onto a fresh TCP connection fails the tag
+/// instead of resurrecting the authenticated identity. Clients must accept
+/// an unencrypted RESP_ERROR before the hello (e.g. the connection-limit
+/// rejection, which is sent before any per-connection state exists).
+pub const RESP_HELLO: u16 = 0x010F;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     pub frame_type: u16,
@@ -191,7 +201,17 @@ pub enum ProtoError {
     BadMagic(u32),
     #[error("frame truncated: need {0} bytes, have {1}")]
     Truncated(usize, usize),
+    #[error("frame length {0} exceeds the 64 MiB transport cap")]
+    FrameTooLarge(usize),
 }
+
+/// Hard transport cap on one frame's payload. Enforced at header decode so
+/// an absurd length is refused before the peer buffers it: the read loops
+/// treat any non-truncated decode error as permanent garbage and drop the
+/// connection immediately (previously the cap only applied once the buffer
+/// had actually grown past it, letting a hostile peer pin ~64 MiB per
+/// connection for the whole slow read).
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 pub type Result<T> = std::result::Result<T, ProtoError>;
 
@@ -229,6 +249,9 @@ impl Frame {
         let frame_type = u16::from_le_bytes(buf[6..8].try_into().unwrap());
         let topology_version = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         let len = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+        if len > MAX_FRAME_BYTES {
+            return Err(ProtoError::FrameTooLarge(len));
+        }
         let end = HEADER_LEN + len;
         if buf.len() < end {
             return Err(ProtoError::Truncated(end, buf.len()));

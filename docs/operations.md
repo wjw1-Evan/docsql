@@ -139,7 +139,7 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_UPSTREAM` | 无 | 默认管理节点(启动参数 > 此变量 > `DOCSQL_PEERS` 首条) |
 | `DOCSQL_WEB_AUTH_FILE` | 无 | 控制台账号门凭据文件;空/未设 = 关闭(API 开放,浏览器无令牌输入),已设 = 首次强制 setup |
 | `DOCSQL_WEB_COOKIE_SECURE` | 0 | HTTPS 反代下置 1(会话 Cookie Secure) |
-| `DOCSQL_WEB_TRUST_PROXY` | 0 | 1 = 按 `X-Forwarded-For` 分桶(登录锁定/审计) |
+| `DOCSQL_WEB_TRUST_PROXY` | 0 | 1 = 按 `X-Forwarded-For` **末跳**分桶(登录锁定/审计);多级反代需在最近一层重写 XFF 为仅客户端地址 |
 | `DOCSQL_WEB_TLS_CERT` / `_KEY` | 无 | PEM 证书/私钥路径,同时设置即以 HTTPS 服务(只设其一拒绝启动) |
 
 **配置快速失败**:以上数值变量非法值一律拒绝启动(exit 2),不静默回退。

@@ -100,11 +100,18 @@ impl QueryLog {
                         .unwrap_or_else(|p| p.into_inner())
                         .is_none_or(|t| now >= t);
                     if retry_ok {
-                        *sink = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                            .ok();
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.create(true).append(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt as _;
+                            // Owner-only: the audit trail carries every
+                            // statement text (redacted passwords included in
+                            // shape) — no reason for other local accounts to
+                            // read it.
+                            opts.mode(0o600);
+                        }
+                        *sink = opts.open(path).ok();
                         if sink.is_none() {
                             *self
                                 .sink_retry_after
@@ -236,12 +243,16 @@ pub(crate) fn try_serve_log_view(
     sql: &str,
     state: &Arc<ServerState>,
     user: Option<&crate::UserAuth>,
+    read_only: bool,
 ) -> Option<crate::Frame> {
     // The audit log carries other users' statement text (only PASSWORD
-    // literals are redacted), so a non-admin login must not harvest it.
-    // Returning None drops the query into the normal path, where
-    // docsql_log simply does not exist for them.
-    if user.is_some_and(|u| !u.grants.admin) {
+    // literals are redacted), so a non-admin login must not harvest it —
+    // and neither may a read-only token connection: it carries no user
+    // identity, so the user check below would skip it entirely (the
+    // REQ_LOGS arm already refuses the read-only role; this view must not
+    // be the side door). Returning None drops the query into the normal
+    // path, where docsql_log simply does not exist for them.
+    if read_only || user.is_some_and(|u| !u.grants.admin) {
         return None;
     }
     let lower = sql.to_lowercase();

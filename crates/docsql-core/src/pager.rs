@@ -409,12 +409,23 @@ impl Pager {
     /// Open (creating if needed) a database at `path` with WAL at `path.wal`,
     /// running crash recovery first.
     pub fn open(path: &Path) -> Result<Pager> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false) // never clobber an existing database
-            .open(path)?;
+        let file = {
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false); // never clobber an existing database
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // Owner-only: the file holds every document plus the user
+                // table's PBKDF2 hashes — the same content backups already
+                // create 0600 (see backup.rs write_private); the default
+                // 0644 made it readable by every local account.
+                opts.mode(0o600).open(path)?
+            }
+            #[cfg(not(unix))]
+            {
+                opts.open(path)?
+            }
+        };
         // No exclusive-open guard here on purpose: same-process concurrent
         // handles on one database file are a supported pattern (tests open a
         // second read-side Database; flock cannot tell that apart from a
@@ -1825,6 +1836,22 @@ mod tests {
         pager.commit_tx(tx).unwrap();
         pager.sync().unwrap();
     }
+    #[test]
+    #[cfg(unix)]
+    fn database_and_wal_files_are_owner_only() {
+        // The data file and WAL carry every document plus the user table's
+        // PBKDF2 hashes — a strict superset of a backup's sensitive
+        // content, which is already created 0600 (backup.rs). Same floor.
+        let (_dir, path) = tmp_db("perms.db");
+        let _pager = Pager::open(&path).unwrap();
+        let mode = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&wal_path_for(&path)), 0o600);
+    }
+
     #[test]
     fn many_pages_commit_and_reopen() {
         let (_dir, path) = tmp_db("many.db");

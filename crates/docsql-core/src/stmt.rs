@@ -208,7 +208,7 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
 
 /// Length in bytes of the UTF-8 sequence starting with byte `b` (1 for ASCII;
 /// the input being a valid `&str` guarantees the continuation bytes exist).
-fn utf8_len(b: u8) -> usize {
+pub(crate) fn utf8_len(b: u8) -> usize {
     match b {
         0x00..=0x7F => 1,
         0xC0..=0xDF => 2,
@@ -226,7 +226,7 @@ fn utf8_len(b: u8) -> usize {
 /// trailing `;`) is a batch separator like `;` — the line itself is
 /// dropped. `GO <count>` repeats stay verbatim so the parser reports them
 /// (repeat counts are not supported).
-fn text_chunks(sql: &str) -> Vec<String> {
+pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
     let chars: Vec<char> = sql.chars().collect();

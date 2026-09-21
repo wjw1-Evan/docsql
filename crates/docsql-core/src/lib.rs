@@ -15,6 +15,7 @@ pub mod pager;
 pub mod proto;
 pub mod stmt;
 pub mod tsql;
+pub mod tsql_batch;
 pub mod useradmin;
 pub mod value;
 pub mod wal;

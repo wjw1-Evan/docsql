@@ -15,7 +15,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 | `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/AspireSample(AppHost 示例) |
 | `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile;`run-tests.sh` 部署测试入口 |
 
-关键文件:`core/engine.rs`(SQL 执行器/约束/事务/写单元,最大文件)、`core/btree.rs`、`core/encode.rs`+`core/value.rs`、`core/guid.rs`、`core/useradmin.rs`+`core/kdf.rs`(数据库用户/角色 + PBKDF2)、`core/meta.rs`、`core/stmt.rs`、`core/tsql.rs`(T-SQL 兼容层:preprocess/函数族/表值函数)、`core/proto.rs`、`server/lib.rs`(连接循环/全部 REQ_* 帧/join-repair,模块头注释权威)、`server/pubsub.rs`(锁顺序权威)、`server/querylog.rs`、`server/backup.rs`、`web/lib.rs`、`web/auth.rs`、`web/console.html`、`dotnet/Docsql.Client/AdoNet.cs`、`DocsqlSubscriber.cs`。基准:`crates/docsql-core/examples/bench*.rs`。
+关键文件:`core/engine.rs`(SQL 执行器/约束/事务/写单元,最大文件)、`core/btree.rs`、`core/encode.rs`+`core/value.rs`、`core/guid.rs`、`core/useradmin.rs`+`core/kdf.rs`(数据库用户/角色 + PBKDF2)、`core/meta.rs`、`core/stmt.rs`、`core/tsql.rs`(T-SQL 兼容层:preprocess/函数族/表值函数)、`core/tsql_batch.rs`(T-SQL 批解释器:@变量/IF/WHILE/@@ROWCOUNT,逐连接会话),`core/proto.rs`、`server/lib.rs`(连接循环/全部 REQ_* 帧/join-repair,模块头注释权威)、`server/pubsub.rs`(锁顺序权威)、`server/querylog.rs`、`server/backup.rs`、`web/lib.rs`、`web/auth.rs`、`web/console.html`、`dotnet/Docsql.Client/AdoNet.cs`、`DocsqlSubscriber.cs`。基准:`crates/docsql-core/examples/bench*.rs`。
 
 ## 常用命令
 

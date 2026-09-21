@@ -144,6 +144,89 @@ async fn explicit_transaction_journals_on_single_node() {
     );
 }
 
+/// T-SQL batch interpretation on one connection: @variables persist across
+/// REQ_SQL frames, IF/WHILE/BEGIN batches run statement-by-statement
+/// through the normal pipeline (journal sees only literal statements),
+/// and @@ROWCOUNT tracks the previous statement.
+#[tokio::test]
+async fn tsql_batch_variables_and_control_flow() {
+    let (_dir, addr) = start_server(Some("t")).await;
+    let mut c = Client::connect(&addr).await;
+    let _ = c.sql("AUTH").await;
+    c.send(&Frame::new(proto::REQ_AUTH, b"t".to_vec())).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    // DECLARE in one frame, usable in later frames (per-connection scope).
+    let f = c.sql("DECLARE @n INT = 5").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = c.sql("SELECT @n * 2 AS v").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS);
+    assert!(payload_str(&f).contains("[[10]]"), "{}", payload_str(&f));
+    c.sql("CREATE TABLE tsql_b (v INT)").await;
+    // SET + a control-flow batch: journal only ever sees literal INSERTs.
+    let f = c.sql(
+        "SET @n = 0\nWHILE @n < 3\nBEGIN\n  SET @n = @n + 1\n  IF @n = 2 CONTINUE\n  INSERT INTO tsql_b VALUES (@n)\nEND",
+    )
+    .await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = c.sql("SELECT v FROM tsql_b ORDER BY v").await;
+    assert!(payload_str(&f).contains("[[1],[3]]"), "{}", payload_str(&f));
+    // The table had to be created first — do that ordering check via a
+    // fresh IF/ELSE batch on the same session.
+    let f = c.sql("DECLARE @cnt INT\nSELECT @cnt = COUNT(*) FROM tsql_b\nIF @cnt = 2 SELECT 'two' AS r ELSE SELECT 'other' AS r")
+        .await;
+    assert!(payload_str(&f).contains("two"), "{}", payload_str(&f));
+    // @@ROWCOUNT reflects the previous statement's result-set size (the
+    // COUNT query returns one row, so 1 — not the counted total).
+    let f = c
+        .sql("SELECT COUNT(*) AS c FROM tsql_b\nDECLARE @rc INT = @@ROWCOUNT\nSELECT @rc AS rc")
+        .await;
+    assert!(payload_str(&f).contains("[[1]]"), "{}", payload_str(&f));
+    // Undeclared variables stay loud; the connection survives.
+    let f = c.sql("SELECT @missing").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+    assert!(
+        payload_str(&f).contains("Must declare"),
+        "{}",
+        payload_str(&f)
+    );
+    // Plain single statements keep the untouched fast path.
+    let f = c.sql("SELECT 1 AS v").await;
+    assert!(payload_str(&f).contains("[[1]]"), "{}", payload_str(&f));
+    // Session state is per connection: a fresh client sees no variables.
+    let mut c2 = Client::connect(&addr).await;
+    let _ = c2.sql("AUTH").await;
+    c2.send(&Frame::new(proto::REQ_AUTH, b"t".to_vec())).await;
+    let _ = c2.recv().await;
+    let f = c2.sql("SELECT @n").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+}
+
+/// The `docsql_log` audit view carries every user's statement text; the
+/// REQ_LOGS arm already refuses the read-only role — the view must not be
+/// the side door (read-token connections carry no user identity, so the
+/// user-grants check alone skipped them entirely).
+#[tokio::test]
+async fn read_token_cannot_read_the_log_view() {
+    let (_dir, addr) = start_server_sec(Some("tok"), Some("rotok"), None, 0, 0, 10).await;
+    let mut c = Client::connect(&addr).await;
+    c.send(&Frame::new(proto::REQ_AUTH, b"rotok".to_vec()))
+        .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    // Something legitimate works on the read token.
+    let f = c.sql("SELECT 1").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    // The audit view is not reachable: not the data, not even its shape.
+    let f = c.sql("SELECT COUNT(*) FROM docsql_log").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).to_lowercase().contains("docsql_log"),
+        "{}",
+        payload_str(&f)
+    );
+}
+
 /// Pre-auth PING is allowed only within a small budget: the web console's
 /// cluster probe pings once before sending credentials, but an
 /// unauthenticated socket must not keep its slot alive forever with
@@ -211,15 +294,31 @@ async fn keyed_transport_rejects_replayed_frame() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    async fn read_hello(stream: &mut TcpStream) -> [u8; 16] {
+        let mut header = [0u8; 20];
+        stream.read_exact(&mut header).await.unwrap();
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(&payload);
+        let (f, _) = Frame::decode(&buf).unwrap();
+        assert_eq!(f.frame_type, proto::RESP_HELLO);
+        let mut ch = [0u8; 16];
+        ch.copy_from_slice(&f.payload);
+        ch
+    }
+
     async fn seal_send(
         key: &docsql_server::crypto::TransportKey,
+        challenge: &[u8; 16],
         stream: &mut TcpStream,
         frame_type: u16,
         payload: &[u8],
     ) -> Vec<u8> {
         let mut f = Frame::new(frame_type, payload.to_vec());
         f.flags |= docsql_server::crypto::FLAG_ENCRYPTED;
-        f.payload = docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload);
+        f.payload = docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload, challenge);
         let bytes = f.encode().unwrap();
         stream.write_all(&bytes).await.unwrap();
         stream.flush().await.unwrap();
@@ -228,6 +327,7 @@ async fn keyed_transport_rejects_replayed_frame() {
 
     async fn recv_open(
         key: &docsql_server::crypto::TransportKey,
+        challenge: &[u8; 16],
         stream: &mut TcpStream,
         buf: &mut Vec<u8>,
     ) -> Frame {
@@ -238,8 +338,9 @@ async fn keyed_transport_rejects_replayed_frame() {
                     f.flags & docsql_server::crypto::FLAG_ENCRYPTED != 0,
                     "response must be sealed"
                 );
-                let pt = docsql_server::crypto::open(key, f.frame_type, f.flags, &f.payload)
-                    .expect("unseal");
+                let pt =
+                    docsql_server::crypto::open(key, f.frame_type, f.flags, &f.payload, challenge)
+                        .expect("unseal");
                 return Frame {
                     flags: f.flags,
                     frame_type: f.frame_type,
@@ -255,27 +356,48 @@ async fn keyed_transport_rejects_replayed_frame() {
     }
 
     let mut stream = TcpStream::connect(&addr).await.unwrap();
+    let challenge = read_hello(&mut stream).await;
     let mut buf = Vec::new();
-    seal_send(&key, &mut stream, proto::REQ_AUTH, b"tok").await;
-    let f = recv_open(&key, &mut stream, &mut buf).await;
+    seal_send(&key, &challenge, &mut stream, proto::REQ_AUTH, b"tok").await;
+    let f = recv_open(&key, &challenge, &mut stream, &mut buf).await;
     assert_eq!(f.frame_type, proto::RESP_AFFECTED);
 
     let sealed = seal_send(
         &key,
+        &challenge,
         &mut stream,
         proto::REQ_SQL,
         &proto::encode_sql("SELECT 1").unwrap(),
     )
     .await;
-    let f = recv_open(&key, &mut stream, &mut buf).await;
+    let f = recv_open(&key, &challenge, &mut stream, &mut buf).await;
     assert_eq!(f.frame_type, proto::RESP_ROWS);
 
-    // Byte-identical replay of the accepted frame.
+    // Byte-identical replay of the accepted frame on the SAME connection:
+    // the ReplayGuard's monotonic counter rejects it.
     stream.write_all(&sealed).await.unwrap();
     stream.flush().await.unwrap();
-    let f = recv_open(&key, &mut stream, &mut buf).await;
+    let f = recv_open(&key, &challenge, &mut stream, &mut buf).await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
     assert!(payload_str(&f).contains("replayed"), "{}", payload_str(&f));
+    drop(stream);
+
+    // Whole-session transplant onto a NEW connection: the fresh challenge
+    // differs, so the recorded frame fails the GCM tag before any
+    // authentication logic runs — a captured session cannot be replayed.
+    let mut stream2 = TcpStream::connect(&addr).await.unwrap();
+    let challenge2 = read_hello(&mut stream2).await;
+    assert_ne!(challenge, challenge2, "challenges must be per-connection");
+    stream2.write_all(&sealed).await.unwrap();
+    stream2.flush().await.unwrap();
+    let mut buf2 = Vec::new();
+    let f = recv_open(&key, &challenge2, &mut stream2, &mut buf2).await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("decrypt failed"),
+        "cross-connection replay must fail the challenge binding: {}",
+        payload_str(&f)
+    );
 }
 
 struct Client {
@@ -5910,8 +6032,20 @@ async fn transport_key_requires_sealed_frames() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Plaintext frame on a keyed server: refused (response itself is sealed).
+    // Each keyed connection opens with the server's plaintext challenge;
+    // every seal/open below binds it.
+    async fn hello(c: &mut Client) -> [u8; 16] {
+        let h = c.recv().await;
+        assert_eq!(h.frame_type, proto::RESP_HELLO, "{}", payload_str(&h));
+        let mut ch = [0u8; 16];
+        ch.copy_from_slice(&h.payload);
+        ch
+    }
+
+    // Plaintext frame on a keyed server: refused (response itself is sealed
+    // with the connection's challenge).
     let mut c = Client::connect(&addr).await;
+    let ch = hello(&mut c).await;
     c.send(&Frame::new(
         proto::REQ_SQL,
         proto::encode_sql("SELECT 1").unwrap(),
@@ -5921,11 +6055,13 @@ async fn transport_key_requires_sealed_frames() {
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
     assert_ne!(f.flags & FLAG_ENCRYPTED, 0);
     let msg =
-        String::from_utf8(crypto::open(&key, f.frame_type, f.flags, &f.payload).unwrap()).unwrap();
+        String::from_utf8(crypto::open(&key, f.frame_type, f.flags, &f.payload, &ch).unwrap())
+            .unwrap();
     assert!(msg.contains("transport encrypted"), "{msg}");
 
     // Sealed with the wrong key: refused before touching the engine.
     let mut c = Client::connect(&addr).await;
+    let ch = hello(&mut c).await;
     let bad: crypto::TransportKey = [0x41; 32];
     c.send(&Frame {
         frame_type: proto::REQ_SQL,
@@ -5936,17 +6072,20 @@ async fn transport_key_requires_sealed_frames() {
             proto::REQ_SQL,
             FLAG_ENCRYPTED,
             &proto::encode_sql("SELECT 1").unwrap(),
+            &ch,
         ),
     })
     .await;
     let f = c.recv().await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
     let msg =
-        String::from_utf8(crypto::open(&key, f.frame_type, f.flags, &f.payload).unwrap()).unwrap();
+        String::from_utf8(crypto::open(&key, f.frame_type, f.flags, &f.payload, &ch).unwrap())
+            .unwrap();
     assert!(msg.contains("decrypt failed"), "{msg}");
 
     // Correctly sealed frame: normal SQL execution.
     let mut c = Client::connect(&addr).await;
+    let ch = hello(&mut c).await;
     c.send(&Frame {
         frame_type: proto::REQ_SQL,
         flags: FLAG_ENCRYPTED,
@@ -5956,12 +6095,13 @@ async fn transport_key_requires_sealed_frames() {
             proto::REQ_SQL,
             FLAG_ENCRYPTED,
             &proto::encode_sql("SELECT 1").unwrap(),
+            &ch,
         ),
     })
     .await;
     let f = c.recv().await;
     assert_ne!(f.flags & FLAG_ENCRYPTED, 0);
-    let plaintext = crypto::open(&key, f.frame_type, f.flags, &f.payload).unwrap();
+    let plaintext = crypto::open(&key, f.frame_type, f.flags, &f.payload, &ch).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
     assert_eq!(v["columns"][0], "1");
     assert_eq!(v["rows"][0][0], 1);

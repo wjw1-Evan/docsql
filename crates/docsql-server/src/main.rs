@@ -178,6 +178,13 @@ fn config_from_env(
                 docsql_core::kdf::MAX_PBKDF2_ITERATIONS
             ));
         }
+        if n < 10_000 {
+            eprintln!(
+                "warning: DOCSQL_PBKDF2_ITERATIONS={n} is far below the 210000 default — \
+                 every NEW credential becomes cheap to brute-force offline (existing \
+                 credentials keep their stored iteration count)"
+            );
+        }
     }
     let backup_dir = getenv("DOCSQL_BACKUP_DIR")
         .map(std::path::PathBuf::from)
@@ -186,6 +193,12 @@ fn config_from_env(
         Some(k) if !k.trim().is_empty() => {
             let key =
                 docsql_server::crypto::parse_key_hex(&k).map_err(|e| format!("DOCSQL_KEY: {e}"))?;
+            if key.iter().all(|&b| b == 0) {
+                eprintln!(
+                    "warning: DOCSQL_KEY is all zeros — generate a real 32-byte key \
+                     (e.g. openssl rand -hex 32)"
+                );
+            }
             Some(key)
         }
         _ => None,

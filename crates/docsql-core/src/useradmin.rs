@@ -505,9 +505,18 @@ pub fn redact_sql(sql: &str) -> String {
                     .next_back()
                     .is_some_and(char::is_whitespace))
         {
+            // Skip to the literal with the SAME whitespace semantics the
+            // tokenizer accepts (`char::is_whitespace`, Unicode White_Space:
+            // VT/NBSP/U+3000…): scanning ASCII bytes only let a PASSWORD\u{b}
+            // 'secret' statement parse and hash fine while slipping past
+            // this redaction branch — the plaintext landed in the audit
+            // log and the slow-query sink.
             let mut j = i + "password".len();
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
+            while let Some(c) = sql[j..].chars().next() {
+                if !c.is_whitespace() {
+                    break;
+                }
+                j += c.len_utf8();
             }
             if bytes.get(j) == Some(&b'\'') {
                 let (end, closed) = crate::stmt::sql_literal_end(sql, j);
@@ -572,6 +581,15 @@ fn stored_password_form(password: &str) -> Result<String, String> {
         return Err(format!(
             "password must be at least 8 characters (got {password_len})"
         ));
+    }
+    // Same strength floor as the server token and the web console
+    // account: a single repeated character is trivially guessable and
+    // those two callers already refuse it.
+    if password
+        .chars()
+        .all(|c| c == password.chars().next().unwrap())
+    {
+        return Err("password must not be a single repeated character".into());
     }
     // OS entropy, not the guid PRF: see kdf::os_random_bytes.
     let salt = crate::kdf::os_random_bytes(16);
@@ -1217,6 +1235,37 @@ mod tests {
                 password: tricky,
             }
         );
+    }
+
+    #[test]
+    fn redact_masks_unicode_whitespace_before_the_literal() {
+        // The tokenizer accepts Unicode White_Space between PASSWORD and
+        // the literal; the redactor used to skip ASCII whitespace only, so
+        // `PASSWORD\u{b}'secret'` hashed fine while the plaintext slipped
+        // into the audit log. Both sides must share one whitespace
+        // semantics — differential over every space the tokenizer takes.
+        for pad in [
+            "", " ", "\t", "\u{b}", "\u{c}", "\u{85}", "\u{a0}", "\u{3000}",
+        ] {
+            let sql = format!("CREATE USER eve PASSWORD{pad}'s3cret-pw12'");
+            // The statement still parses (the tokenizer skips the pad).
+            assert!(parse(&sql).is_some(), "parse failed for pad {pad:?}");
+            let redacted = redact_sql(&sql);
+            assert!(
+                !redacted.contains("s3cret-pw12"),
+                "leak with pad {pad:?}: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_password_form_rejects_single_repeated_characters() {
+        assert!(stored_password_form("aaaaaaaa").is_err());
+        assert!(stored_password_form("short").is_err());
+        assert!(stored_password_form("a-good-password").is_ok());
+        // Pre-hashed forms ride through untouched.
+        let hashed = crate::kdf::hash_password("a-good-password", &[0u8; 16]);
+        assert!(stored_password_form(&hashed).is_ok());
     }
 
     #[test]

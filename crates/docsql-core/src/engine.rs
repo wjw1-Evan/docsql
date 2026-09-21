@@ -4166,6 +4166,20 @@ impl Database {
     /// gate classifies on this instead of a substring scan, so a user
     /// write that merely MENTIONS a system table in a literal is not
     /// rejected while any write aimed at one still is.
+    /// Tables declaring a FOREIGN KEY into any of `targets` (one closure
+    /// step; callers iterate for transitivity). Authorization input for
+    /// `TRUNCATE ... CASCADE`, whose execution clears the FK children —
+    /// those children must be authorization input too.
+    pub fn table_foreign_keys_of(&self, targets: &[String]) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter(|(t, m)| {
+                !targets.contains(t) && m.foreign_keys.iter().any(|(_, rt, _)| targets.contains(rt))
+            })
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
     pub fn stmt_write_targets(stmt: &Statement) -> Vec<String> {
         fn factor_name(factor: &sqlparser::ast::TableFactor) -> Option<String> {
             match factor {
@@ -7270,6 +7284,22 @@ impl Database {
             }
             return err(format!("view {name} already exists"));
         }
+        // A view is a SELECT grant boundary: handing one out exposes its
+        // BASE tables to the grantee. The user/role tables (password
+        // hashes!) are admin-only everywhere else — direct SELECT, GRANT,
+        // the object tree — so a view over them must not exist as a
+        // bypass; refuse it at creation instead of policing every read.
+        let body = Statement::Query(view.query.clone());
+        if let Some(reads) = Self::stmt_read_targets(&body) {
+            for t in &reads {
+                if crate::useradmin::is_user_table(t) {
+                    return err(format!(
+                        "views cannot read {t}: user/role data is visible to the \
+                         admin role only (query it directly instead)"
+                    ));
+                }
+            }
+        }
         if exists {
             let meta = self.tables.get(&name).expect("checked just above");
             if !meta.is_view() {
@@ -8206,6 +8236,21 @@ impl Database {
                             return err(format!("column {col} does not exist"));
                         }
                         cols.push(col);
+                    }
+                    if cols.is_empty() {
+                        // No column list: the VALUES map onto the table's
+                        // declared column order (the INSERT rule). Zipping
+                        // against the empty list used to silently drop the
+                        // values and append an all-NULL row.
+                        if values.rows[0].content.len() != meta.columns.len() {
+                            return err(format!(
+                                "MERGE INSERT has {} values but the table has {} \
+                                 columns; use an explicit column list",
+                                values.rows[0].content.len(),
+                                meta.columns.len()
+                            ));
+                        }
+                        cols = meta.columns.clone();
                     }
                     let mut exprs = Vec::new();
                     for row in &values.rows {
@@ -13884,6 +13929,46 @@ mod tests {
             "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM (SELECT 3.0 AS v UNION ALL SELECT 3))",
         );
         assert_eq!(r.rows[0][0].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn views_cannot_wrap_user_or_role_tables() {
+        // A view is a SELECT grant boundary; one over docsql_users would
+        // hand password hashes to any grantee (the direct SELECT and GRANT
+        // are both admin-only). Refused at creation.
+        let mut db = Database::in_memory().unwrap();
+        let e = db
+            .execute("CREATE VIEW leak AS SELECT name, pw FROM docsql_users")
+            .unwrap_err();
+        assert!(e.to_string().contains("docsql_users"), "{e}");
+        // Views over ordinary tables keep working.
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "CREATE VIEW v AS SELECT a FROM t");
+    }
+
+    #[test]
+    fn merge_insert_without_column_list_maps_declared_columns() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE tgt (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "CREATE TABLE src (id INT, v INT)");
+        run(&mut db, "INSERT INTO src VALUES (5, 50)");
+        run(
+            &mut db,
+            "MERGE INTO tgt USING src ON tgt.id = src.id \
+             WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v)",
+        );
+        let r = rows(&mut db, "SELECT id, v FROM tgt");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].as_i64().unwrap(), 5);
+        assert_eq!(r.rows[0][1].as_i64().unwrap(), 50);
+        // Mismatched width is a loud error, never a silent NULL row.
+        let e = db
+            .execute(
+                "MERGE INTO tgt USING src ON tgt.id = src.id \
+                 WHEN NOT MATCHED THEN INSERT VALUES (src.id)",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("column list"), "{e}");
     }
 
     // ---- index-backed engine paths ----

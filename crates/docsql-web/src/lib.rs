@@ -323,6 +323,22 @@ async fn shutdown_signal() {
     }
 }
 
+/// Every response leaves the API uncacheable: payloads carry
+/// credentials-adjacent data (user grants, audit text, query results) and
+/// `json_response` already sets no-store on the auth endpoints — this
+/// covers the data endpoints that returned bare `Json` bodies, so no
+/// shared or heuristic browser cache can retain them.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
+}
+
 fn build_router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index))
@@ -347,6 +363,7 @@ fn build_router(state: Arc<WebState>) -> Router {
             count_requests,
         ))
         .with_state(state)
+        .layer(axum::middleware::from_fn(security_headers))
 }
 
 /// HTTP request accounting middleware feeding
@@ -709,13 +726,21 @@ use docsql_server::crypto::constant_time_eq;
 /// by default; the forwarded client IP when running behind a trusted
 /// reverse proxy (`DOCSQL_WEB_TRUST_PROXY=1`) — otherwise every user
 /// shares the proxy's single bucket and anyone can lock out everybody.
-/// Only set the flag where the proxy strips/overwrites X-Forwarded-For;
-/// a client-supplied header must never choose the bucket.
+///
+/// The LAST hop of X-Forwarded-For is taken, never the first: an appending
+/// proxy (nginx's default `proxy_add_x_forwarded_for`) keeps client-chosen
+/// spoofed addresses at the FRONT and appends the hop it actually observed
+/// at the END. Reading the first hop let a client rotate a fake address
+/// per request and never accumulate lockout failures; the last hop is the
+/// trusted proxy's observation under both appending and overwriting
+/// setups. Chained proxies that append intermediate hops need a
+/// proxy-side rewrite (XFF = client address only), after which last ==
+/// the client.
 fn lockout_key(state: &WebState, headers: &HeaderMap, peer: SocketAddr) -> std::net::IpAddr {
     if state.trust_proxy {
         if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = xff.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
+            if let Some(last) = xff.rsplit(',').next() {
+                if let Ok(ip) = last.trim().parse::<std::net::IpAddr>() {
                     return ip;
                 }
             }
@@ -2356,20 +2381,27 @@ mod tests {
             http_requests: Mutex::new(std::collections::HashMap::new()),
         };
         let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
-        let client: std::net::IpAddr = "203.0.113.9".parse().unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("X-Forwarded-For", "203.0.113.9, 10.0.0.1".parse().unwrap());
+        // Appending-proxy shape: the client-spoofed address sits FIRST,
+        // the hop the trusted proxy actually observed is appended LAST.
+        let observed: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        headers.insert(
+            "X-Forwarded-For",
+            "198.51.100.77, 10.0.0.1".parse().unwrap(),
+        );
         // Without the flag the header is attacker-controlled: keep the peer.
         assert_eq!(lockout_key(&state, &headers, peer), peer.ip());
-        // With the flag the first forwarded hop owns the bucket.
+        // With the flag the LAST hop — the proxy's own observation — owns
+        // the bucket. Reading the first hop let a client rotate the spoofed
+        // front address per request and never accumulate lockout failures.
         let trusted = WebState {
             trust_proxy: true,
             secure_cookie: false,
             ..state
         };
-        assert_eq!(lockout_key(&trusted, &headers, peer), client);
-        // Malformed first hop or missing header: no bucket confusion.
-        headers.insert("X-Forwarded-For", "not-an-ip, 10.0.0.1".parse().unwrap());
+        assert_eq!(lockout_key(&trusted, &headers, peer), observed);
+        // Malformed last hop or missing header: no bucket confusion.
+        headers.insert("X-Forwarded-For", "203.0.113.9, not-an-ip".parse().unwrap());
         assert_eq!(lockout_key(&trusted, &headers, peer), peer.ip());
         headers.remove("X-Forwarded-For");
         assert_eq!(lockout_key(&trusted, &headers, peer), peer.ip());

@@ -59,6 +59,11 @@ public enum FrameType : ushort
     RespMeta = 0x010A,
     /// <summary>REQ_PREPARE 的应答:JSON {"handle":n} — 句柄按连接隔离,随连接生死。</summary>
     RespPrepared = 0x010E,
+
+    /// <summary>密钥传输的连接挑战:keyed 连接的第一帧(明文,16 随机字节),
+    /// 双向折入 GCM AAD —— 在别的连接上重放录制的密文帧必因 AAD 不同而验签失败。
+    /// hello 之前允许出现明文 RespError(如连接数上限拒绝)。</summary>
+    RespHello = 0x010F,
 }
 
 public readonly record struct Frame(FrameType Type, ushort Flags, ulong TopologyVersion, byte[] Payload)
@@ -143,6 +148,9 @@ public sealed class ProtocolConnection : IDisposable
     // 进程前缀且计数器严格递增;重放/乱序帧虽可解密但在此拒绝。
     private byte[]? _peerPrefix;
     private long _peerLastCounter;
+
+    // 连接挑战(RespHello,16 字节):折入本连接全部帧的 AAD,封死跨连接重放。
+    private byte[] _connChallenge = Array.Empty<byte>();
     private const int PreparedCapacity = 96;
 
     public ProtocolConnection(
@@ -169,6 +177,7 @@ public sealed class ProtocolConnection : IDisposable
             _stream = _tcp.GetStream();
             _key = key;
             _tcp.ReceiveTimeout = ReadTimeoutMs;
+            ReadHandshake().Wait();
         }
         catch
         {
@@ -177,12 +186,55 @@ public sealed class ProtocolConnection : IDisposable
         }
     }
 
-    private ProtocolConnection(TcpClient connected, byte[]? key)
+    private ProtocolConnection(TcpClient connected, byte[]? key, bool handshakeDone = false)
     {
         _tcp = connected;
         _stream = connected.GetStream();
         _key = key;
         _tcp.ReceiveTimeout = ReadTimeoutMs;
+        if (!handshakeDone)
+        {
+            ReadHandshake().Wait();
+        }
+    }
+
+    private async System.Threading.Tasks.Task ReadHandshakeAsync()
+    {
+        if (_key is null)
+        {
+            return;
+        }
+        var f = await ReadFrameAsync().ConfigureAwait(false);
+        if (f.Type == FrameType.RespError && (f.Flags & FlagEncrypted) == 0)
+        {
+            throw new DocsqlException($"节点拒绝连接: {System.Text.Encoding.UTF8.GetString(f.Payload)}");
+        }
+        if (f.Type != FrameType.RespHello || f.Payload.Length != 16)
+        {
+            throw new DocsqlException("keyed 节点未发送 RespHello 挑战(版本不匹配?)");
+        }
+        _connChallenge = f.Payload;
+    }
+
+    /// <summary>keyed 连接读服务端 RespHello 挑战(与 Rust crypto.rs 对称)。
+    /// 明文模式下无帧;hello 之前的明文 RespError 按连接级失败抛出。</summary>
+    private System.Threading.Tasks.Task ReadHandshake()
+    {
+        if (_key is null)
+        {
+            return System.Threading.Tasks.Task.CompletedTask;
+        }
+        var f = ReadFrame();
+        if (f.Type == FrameType.RespError && (f.Flags & FlagEncrypted) == 0)
+        {
+            throw new DocsqlException($"节点拒绝连接: {System.Text.Encoding.UTF8.GetString(f.Payload)}");
+        }
+        if (f.Type != FrameType.RespHello || f.Payload.Length != 16)
+        {
+            throw new DocsqlException("keyed 节点未发送 RespHello 挑战(版本不匹配?)");
+        }
+        _connChallenge = f.Payload;
+        return System.Threading.Tasks.Task.CompletedTask;
     }
 
     /// <summary>异步建连(真异步,不占线程):超时与外部取消共用一个令牌。
@@ -198,7 +250,9 @@ public sealed class ProtocolConnection : IDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(connectTimeoutMs);
             await tcp.ConnectAsync(host, port, cts.Token);
-            return new ProtocolConnection(tcp, key);
+            var conn = new ProtocolConnection(tcp, key, handshakeDone: true);
+            await conn.ReadHandshakeAsync();
+            return conn;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -367,11 +421,12 @@ public sealed class ProtocolConnection : IDisposable
     /// fields a receiver routes on (type + flags), bound little-endian like
     /// the wire form. A MITM flipping a flag invalidates the frame instead
     /// of re-routing it (the server does the same).</summary>
-    private static byte[] Aad(FrameType type, ushort flags)
+    private byte[] Aad(FrameType type, ushort flags)
     {
-        var aad = new byte[4];
+        var aad = new byte[4 + _connChallenge.Length];
         BinaryPrimitives.WriteUInt16LittleEndian(aad.AsSpan(0, 2), (ushort)type);
         BinaryPrimitives.WriteUInt16LittleEndian(aad.AsSpan(2, 2), flags);
+        _connChallenge.CopyTo(aad, 4);
         return aad;
     }
 
@@ -411,7 +466,7 @@ public sealed class ProtocolConnection : IDisposable
 
     /// <summary>AES-256-GCM:nonce(12)=前缀(4)+计数器(8,LE) ‖ 密文 ‖ tag(16),
     /// 头部字段作为 AAD。</summary>
-    private static byte[] Seal(byte[] key, FrameType type, ushort flags, byte[] plaintext)
+    private byte[] Seal(byte[] key, FrameType type, ushort flags, byte[] plaintext)
     {
         var nonce = new byte[12];
         NoncePrefix.CopyTo(nonce, 0);
@@ -428,7 +483,7 @@ public sealed class ProtocolConnection : IDisposable
         return sealed_;
     }
 
-    private static byte[] Unseal(byte[] key, FrameType type, ushort flags, byte[] sealed_)
+    private byte[] Unseal(byte[] key, FrameType type, ushort flags, byte[] sealed_)
     {
         if (sealed_.Length < 12 + 16)
             throw new DocsqlException("加密载荷过短");
@@ -489,6 +544,14 @@ public sealed class ProtocolConnection : IDisposable
 
     private Frame Assemble(ushort flags, FrameType type, ulong topo, byte[] payload)
     {
+        // A keyless client that receives the keyed-server handshake
+        // challenge is talking plaintext to an encrypted node: the frames
+        // that follow are undecipherable — fail with an actionable message
+        // instead of surfacing challenge bytes as response payloads.
+        if (type == FrameType.RespHello && _key is null)
+        {
+            throw new DocsqlException("服务端要求加密传输:keyed 节点拒绝明文客户端(未配置 key)");
+        }
         if ((flags & FlagEncrypted) != 0)
         {
             if (_key is null)

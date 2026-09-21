@@ -122,12 +122,21 @@ pub struct Wal {
 impl Wal {
     pub fn open(path: &Path) -> Result<Wal> {
         let exists = path.try_exists().map_err(WalError::Io)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false) // never clobber an existing log
-            .open(path)?;
+        let mut file = {
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false); // never clobber an existing log
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // Owner-only, same rationale as the data file: the WAL is
+                // a strict superset of a backup's sensitive content.
+                opts.mode(0o600).open(path)?
+            }
+            #[cfg(not(unix))]
+            {
+                opts.open(path)?
+            }
+        };
         if !exists || file.metadata()?.len() == 0 {
             file.write_all(HEADER)?;
             file.sync_all()?;
