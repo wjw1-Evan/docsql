@@ -10,7 +10,7 @@ DocSQL 的 Aspire hosting 集成:在 AppHost 中以容器方式编排 DocSQL 数
 
 包发布在 GitHub Packages(`net10.0`),源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`,
 读取需要 GitHub PAT(权限 `read:packages`;`nuget.config` 源配置见
-[仓库 README](https://github.com/wjw1-Evan/docsql#net-与-aspireadonet--ef-core--apphost-编排)):
+[docs/drivers.md](https://github.com/wjw1-Evan/docsql/blob/main/docs/drivers.md)):
 
 ```bash
 # AppHost 项目:

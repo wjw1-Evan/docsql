@@ -100,11 +100,11 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 - 小步提交直接在 `main`;提交信息风格见 git log(如 `M16: ...`),里程碑式概括。
 - 完整流程:过提交门禁 → 相关专项测试 → **最后一步提交并推送源码**(push 即触发 CI:门禁 + dotnet 测试 → 多架构镜像发布 GHCR → main 分支部署测试)。
 - 改动跨复制:本地 e2e 之外必须跑 `./deploy/run-tests.sh`;改动 EF/事务:跑两个 dotnet 套件。
-- 文档分工:用户可见行为 → README;完整功能清单/索引入口 → `docs/features.md`;Aspire 使用手册 → `docs/aspire.md`;开发命令、机制约束与红线 → 本文。
+- 文档分工(内容写对地方,别让同一主题散落两处):入门/快速开始/能力概览 → README;完整功能清单/索引入口 → `docs/features.md`;SQL 语法与函数 → `docs/sql-reference.md`;.NET/CLI/线协议 → `docs/drivers.md`;Aspire 使用手册 → `docs/aspire.md`;部署运维/环境变量/监控 → `docs/operations.md`;安全(含等保对照)→ `docs/security.md`;架构边界与路线 → `docs/limitations.md`;存储/引擎设计文档 → `docs/design/`;开发命令、机制约束与红线 → 本文。
 
 ## 运行时环境变量(开发/测试相关)
 
-> 用途与安全含义的完整列表见 README;以下是代理改动代码/测试时最常碰到的。
+> 用途与安全含义的完整列表见 `docs/operations.md`(环境变量一节)与 `docs/security.md`;以下是代理改动代码/测试时最常碰到的。
 
 - `DOCSQL_TOKEN` / `DOCSQL_READ_TOKEN` / `DOCSQL_CLUSTER_TOKEN`:客户端 / 只读 / 节点间凭据。匹配顺序 cluster→client→read;read 与 client 同值按 client;集群各节点 cluster token 必须同值且最好不同于 client(相同启动告警);未配置 cluster token = 旧行为。
 - `DOCSQL_KEY`:AES-256-GCM 帧加密(含 token 与数据,**帧头 type+flags 作为 AAD 绑定**,改标志即失效;对端响应同样解封——.NET 客户端与 Rust 服务端必须同版本);绑定非回环且未配置时启动告警(传输加密测试用它)。

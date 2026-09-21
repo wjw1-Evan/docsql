@@ -3,7 +3,26 @@
 ## 安装(四个 NuGet 包,GitHub Packages)
 
 包发布在 GitHub Packages 源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`(读取需 GitHub
-PAT,权限 `read:packages`;`nuget.config` 源配置见 [README](../README.md#net-与-aspireadonet--ef-core--apphost-编排)):
+PAT,权限 `read:packages`)。先把源与凭据配进 `nuget.config`(仓库级或用户级皆可):
+
+```xml
+<configuration>
+  <packageSources>
+    <add key="github" value="https://nuget.pkg.github.com/wjw1-Evan/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <github>
+      <add key="Username" value="<GitHub 用户名>" />
+      <add key="ClearTextPassword" value="<PAT,read:packages>" />
+    </github>
+  </packageSourceCredentials>
+</configuration>
+```
+
+> 也可走用户级配置(对本机所有仓库生效):`dotnet nuget add source
+> https://nuget.pkg.github.com/wjw1-Evan/index.json --name github --username <用户名>
+> --password <PAT> --store-password-in-clear-text`。CI 用 `GITHUB_TOKEN` 注入凭据。
+> 示例见 [`dotnet/samples/AspireSample/`](../dotnet/samples/AspireSample/)。
 
 ```bash
 dotnet add package Docsql.Client                # .NET ADO.NET

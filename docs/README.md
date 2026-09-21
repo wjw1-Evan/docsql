@@ -15,6 +15,7 @@
 | 部署、扩容、备份恢复、环境变量、监控 | [运维手册](operations.md) |
 | 配用户/角色、审计、加密(等保对照) | [安全指南](security.md) |
 | 确认架构边界与路线 | [已知边界与定位](limitations.md) |
+| 查版本历史 / 报安全漏洞 | [CHANGELOG](../CHANGELOG.md) · [SECURITY](../SECURITY.md) |
 | 参与开发(门禁、红线、测试) | [CONTRIBUTING](../CONTRIBUTING.md) · [AGENTS](../AGENTS.md) |
 
 ## 全部文档
@@ -45,6 +46,14 @@
 | 文档 | 内容 |
 |---|---|
 | [已知边界与定位](limitations.md) | 架构硬边界(单写者、16MiB、无递归 CTE/行级合并等)、商用化现状与路线 |
+
+**内部设计(贡献者)**
+
+| 文档 | 内容 |
+|---|---|
+| [复合索引设计](design/001-composite-indexes.md) | 复合键 = `Value::Array`、root_key 泛化与判重语义(已实施) |
+| [溢出页链设计](design/002-overflow-page-chains.md) | >4KB 文档的堆层分帧布局、链页回收(已实施) |
+| [MVCC 读并发设计](design/003-mvcc-read-concurrency.md) | 快照读分阶段路线、锁兼容矩阵(阶段 A/B 已实施) |
 
 ## 五分钟速览
 

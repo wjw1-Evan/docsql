@@ -15,8 +15,8 @@ DocSQL 通过两个 NuGet 包接入 .NET Aspire:
 - **.NET 10 + Aspire 13.5+**:AppHost 项目 SDK 形如 `<Project Sdk="Aspire.AppHost.Sdk/13.5.3">`;
 - **Docker 可用**(Aspire 以容器方式拉起节点;本地镜像缺失时会拉取 GHCR);
 - **包源**:两个包发布在 GitHub Packages(`https://nuget.pkg.github.com/wjw1-Evan/index.json`,
-  读取需 GitHub PAT `read:packages`),`nuget.config` 配置见
-  [README](../README.md#net-与-aspireadonet--ef-core--apphost-编排);
+  读取需 GitHub PAT `read:packages`),`nuget.config` 源配置见
+  [客户端与驱动 · 安装](drivers.md);
 - **镜像与端口约定**(`ghcr.io/wjw1-evan/docsql`,多架构 amd64/arm64):
 
   | 约定 | 值 |
@@ -133,8 +133,8 @@ cluster.Nodes[1].WithWebConsole();
 ```
 
 节点数量 1~8。集群的写入复制、离线补齐、扩容加入、故障恢复语义见
-[README「Docker 部署」](../README.md#docker-部署单节点--多节点本地开发与生产两个-compose-文件)与
-[功能总览 · 复制与集群](features.md#8-复制与集群)。
+[运维手册](operations.md)与
+[功能总览 · 复制与集群](features.md#6-复制与集群)。
 
 ## 4. Web 控制台(WithWebConsole)
 

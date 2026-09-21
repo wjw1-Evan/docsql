@@ -29,7 +29,7 @@ dotnet nuget add source https://nuget.pkg.github.com/wjw1-Evan/index.json \
   --name github --username <用户名> --password <PAT> --store-password-in-clear-text
 ```
 
-> 也可按 [仓库 README](../../../README.md#net-与-aspireadonet--ef-core--apphost-编排)
+> 也可按 [客户端与驱动 · 安装](../../../docs/drivers.md)
 > 的 `packageSourceCredentials` 形式配置;CI 用 `GITHUB_TOKEN` 注入凭据。
 
 ## 2. 运行

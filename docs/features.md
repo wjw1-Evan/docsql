@@ -253,7 +253,7 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
   字符串翻倍转义,取值无法逃逸字面量);
 - **Web 控制台账号门**:首次强制 setup,PBKDF2 凭据文件,HttpOnly 会话,改密码踢出其它会话,
   `node` 参数受 `DOCSQL_PEERS` 白名单约束(SSRF 防护);
-- **等保对照**:逐项映射见 [README 安全章节](../README.md)与[安全指南](security.md)。
+- **等保对照**:等级保护第三级逐项映射见[安全指南 · 等保 2.0 对照](security.md#等保-20-对照)。
 
 ## 9. Web 控制台(DocSQL Studio)
 
@@ -349,4 +349,4 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 - 无表达式/部分/JSON 路径索引;查询优化器为规则式(无 EXPLAIN/统计信息);
 - 备份为逻辑全量 + 增量 PITR(PITR 窗口 = 本节点期刊保留;对称集群跨节点写不在本节点期刊);
   无 TDE(部署加密卷替代);
-- 不支持 SQL 清单见 [SQL 参考 · 不支持](sql-reference.md#不支持)。
+- 不支持 SQL 清单见 [SQL 参考 · 不支持的语法](sql-reference.md#不支持的语法)。

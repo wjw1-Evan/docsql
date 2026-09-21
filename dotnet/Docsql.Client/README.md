@@ -6,7 +6,7 @@ ADO.NET data provider for [DocSQL](https://github.com/wjw1-Evan/docsql) — a Ru
 
 包发布在 GitHub Packages(`net10.0`);先把源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`
 配到 `nuget.config`(读取需 GitHub PAT,权限 `read:packages`;配置见
-[仓库 README](https://github.com/wjw1-Evan/docsql#net-与-aspireadonet--ef-core--apphost-编排)),然后:
+[docs/drivers.md](https://github.com/wjw1-Evan/docsql/blob/main/docs/drivers.md)),然后:
 
 ```bash
 dotnet add package Docsql.Client
