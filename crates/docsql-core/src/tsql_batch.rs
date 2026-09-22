@@ -99,6 +99,23 @@ pub struct TsqlSession {
 }
 
 impl TsqlSession {
+    /// Feed the connection's identity from a statement the host executed
+    /// OUTSIDE the interpreter (single-statement fast path). Call only for
+    /// INSERTs: `Some` sets the new id, `None` records that this INSERT
+    /// allocated none — resetting a previous value, exactly like an
+    /// interpreted INSERT.
+    pub fn note_identity(&mut self, identity: Option<Value>) {
+        self.last_identity = identity;
+    }
+
+    /// Record an error raised by a fast-path statement so a later batch's
+    /// @@ERROR reads it.
+    pub fn note_error(&mut self, code: i64) {
+        self.last_error = code;
+    }
+}
+
+impl TsqlSession {
     pub fn new() -> Self {
         Self::default()
     }
@@ -176,10 +193,7 @@ impl TsqlSession {
         match stmt {
             Stmt::Plain(sql) => {
                 let rendered = self.substitute(&sql)?;
-                let is_insert = {
-                    let t = rendered.trim_start();
-                    t.len() >= 6 && t[..6].eq_ignore_ascii_case("INSERT")
-                };
+                let is_insert = is_insert_statement(&rendered);
                 let out = match exec.execute(&rendered).await {
                     Ok(out) => out,
                     Err(e) => {
@@ -280,25 +294,38 @@ impl TsqlSession {
             }
             Stmt::Break => Ok(Some(Flow::Break)),
             Stmt::Continue => Ok(Some(Flow::Continue)),
-            Stmt::Throw(args) => {
-                // Bare THROW inside CATCH re-raises the caught error.
-                let (code, message) = match args {
-                    Some((c, m)) => (c, m.clone()),
-                    None => match self.error_ctx.take() {
-                        Some((c, m)) => (c, m),
-                        None => (50000, "error raised by batch".into()),
+            Stmt::Throw(form, raw) => {
+                // Arguments resolve at RUN time: @variables and @@ functions
+                // substitute first, then the literal shapes parse — T-SQL's
+                // `THROW @code, @msg, 1` works, and an unparsable argument
+                // fails loudly instead of degrading to a bare raise.
+                let rendered = self.substitute(&raw)?;
+                let (code, message) = match parse_throw(&rendered, form) {
+                    Some(pair) => pair,
+                    // Bare THROW inside CATCH re-raises the caught error;
+                    // the context is kept, so a second bare THROW still
+                    // re-raises instead of falling back to the default.
+                    None => match self.error_ctx.clone() {
+                        Some(pair) => pair,
+                        None => (50000, DEFAULT_THROW_MESSAGE.into()),
                     },
                 };
                 self.last_error = code;
                 err(format!("{message} (error {code})"))
             }
             Stmt::TryCatch { try_, catch_ } => {
-                self.error_ctx = None;
-                match self.run_stmts(try_, exec, budget, depth).await {
+                // The CATCH block sees this TRY's error; on every exit the
+                // caller's context comes back — a nested TRY...CATCH inside
+                // an outer CATCH must not blind the outer ERROR_MESSAGE().
+                // Cloned, not taken: statements inside the TRY body itself
+                // still see the caller's error until this TRY fails.
+                let saved = self.error_ctx.clone();
+                let outcome = match self.run_stmts(try_, exec, budget, depth).await {
                     Ok(flow) => {
                         // BREAK/CONTINUE inside TRY still propagates to the
                         // enclosing WHILE.
                         if let Some(f) = flow {
+                            self.error_ctx = saved;
                             return Ok(Some(f));
                         }
                         self.last_error = 0;
@@ -309,12 +336,13 @@ impl TsqlSession {
                         // inside the failed try body does not survive.
                         self.error_ctx = Some((error_number(&e), e.to_string()));
                         self.last_error = error_number(&e);
-                        let out = self.run_stmts(catch_, exec, budget, depth).await;
-                        self.error_ctx = None;
-                        out.map(|_| ())
+                        self.run_stmts(catch_, exec, budget, depth)
+                            .await
+                            .map(|_| ())
                     }
-                }
-                .map(|_: ()| None)
+                };
+                self.error_ctx = saved;
+                outcome.map(|_: ()| None)
             }
         }
     }
@@ -550,13 +578,25 @@ impl Flow {
 }
 
 /// Numeric code for an arbitrary engine error: 50000 (generic user
-/// range) unless the text already carries a `(error NNNNN)` tail.
+/// range) unless the text ENDS with the interpreter's `(error NNNNN)`
+/// marker — a user message that merely contains the pattern must not
+/// fake a code.
 fn error_number(e: &SqlError) -> i64 {
-    let text = e.to_string();
+    error_code_from_text(&e.to_string())
+}
+
+/// Numeric code carried by an error text ENDING in "(error N)": 50000
+/// otherwise. Public for hosts that execute statements outside the
+/// interpreter and only hold the rendered error text (they must keep the
+/// session's @@ERROR current the same way).
+pub fn error_code_from_text(text: &str) -> i64 {
     if let Some(idx) = text.rfind("(error ") {
-        if let Some(end) = text[idx + 7..].find(')') {
-            if let Ok(n) = text[idx + 7..idx + 7 + end].parse::<i64>() {
-                return n;
+        let rest = &text[idx + 7..];
+        if let Some(end) = rest.find(')') {
+            if rest[end + 1..].trim().is_empty() {
+                if let Ok(n) = rest[..end].parse::<i64>() {
+                    return n;
+                }
             }
         }
     }
@@ -629,8 +669,11 @@ enum Stmt {
     },
     Break,
     Continue,
-    /// THROW [code, 'msg', state] / RAISERROR('msg', sev, state).
-    Throw(Option<(i64, String)>),
+    /// THROW [code, 'msg', state] / RAISERROR('msg', sev, state), kept as
+    /// RAW argument text — @variables substitute at run time (T-SQL allows
+    /// `THROW @code, @msg, 1`), then the shape parses per [`ThrowForm`].
+    /// Empty text = bare THROW (re-raises inside CATCH).
+    Throw(ThrowForm, String),
     /// BEGIN TRY … END TRY BEGIN CATCH … END CATCH.
     TryCatch {
         try_: Vec<Stmt>,
@@ -853,13 +896,11 @@ impl<'a> Parser<'a> {
                 }
                 b"throw" => {
                     self.i += 5;
-                    let args = self.read_plain();
-                    out.push(parse_throw(&args, None));
+                    out.push(Stmt::Throw(ThrowForm::Throw, self.read_plain()));
                 }
                 b"raiserror" => {
                     self.i += 9;
-                    let args = self.read_plain();
-                    out.push(parse_throw(&args, Some(50000)));
+                    out.push(Stmt::Throw(ThrowForm::RaiseError, self.read_plain()));
                 }
                 b"select" if self.select_has_assignment() => {
                     self.i += 6;
@@ -1345,13 +1386,11 @@ impl<'a> Parser<'a> {
             }
             Some(b"throw") => {
                 self.i += 5;
-                let args = self.read_plain();
-                return Ok(vec![parse_throw(&args, None)]);
+                return Ok(vec![Stmt::Throw(ThrowForm::Throw, self.read_plain())]);
             }
             Some(b"raiserror") => {
                 self.i += 9;
-                let args = self.read_plain();
-                return Ok(vec![parse_throw(&args, Some(50000))]);
+                return Ok(vec![Stmt::Throw(ThrowForm::RaiseError, self.read_plain())]);
             }
             _ => {}
         }
@@ -1415,15 +1454,52 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// THROW / RAISERROR argument shapes:
-/// `THROW` (re-raise), `THROW 50000, 'msg', 1`,
-/// `RAISERROR('msg', 16, 1)`. The default code backs a bare RAISERROR.
-fn parse_throw(args: &str, raiserror_default: Option<i64>) -> Stmt {
+/// Default message for a raise that carries none (bare THROW outside CATCH,
+/// or a degenerate RAISERROR).
+const DEFAULT_THROW_MESSAGE: &str = "error raised by batch";
+
+/// Which raise syntax produced a [`Stmt::Throw`]: the argument orders differ
+/// (THROW: code, message, state — RAISERROR: message, severity, state).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ThrowForm {
+    Throw,
+    RaiseError,
+}
+
+/// THROW / RAISERROR argument shapes (after run-time substitution):
+/// bare (None — THROW re-raises inside CATCH), `THROW 50000, 'msg', 1`,
+/// `RAISERROR('msg', 16, 1)`, `RAISERROR 'msg', 16, 1`. RAISERROR's message
+/// is its FIRST argument and severity/state are ignored — every raise fails
+/// the statement here.
+fn parse_throw(args: &str, form: ThrowForm) -> Option<(i64, String)> {
     let text = args.trim().trim_end_matches(';').trim();
     if text.is_empty() {
-        return Stmt::Throw(None);
+        return None;
     }
-    // Split top-level commas.
+    // RAISERROR's paren form hides the separating commas from the top-level
+    // split — strip the one wrapping pair first.
+    let text = if form == ThrowForm::RaiseError {
+        strip_outer_parens(text).unwrap_or(text)
+    } else {
+        text
+    };
+    let parts = split_top_level_commas(text);
+    let (code_arg, message_arg) = match form {
+        ThrowForm::Throw => (parts.first().copied(), parts.get(1).copied()),
+        ThrowForm::RaiseError => (None, parts.first().copied()),
+    };
+    let code = code_arg
+        .and_then(|p| p.parse::<i64>().ok())
+        .unwrap_or(50000);
+    let message = message_arg
+        .map(unquote_literal)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_THROW_MESSAGE.into());
+    Some((code, message))
+}
+
+/// Split on commas outside string literals and parentheses.
+fn split_top_level_commas(text: &str) -> Vec<&str> {
     let b = text.as_bytes();
     let mut parts: Vec<&str> = Vec::new();
     let mut depth = 0i32;
@@ -1447,16 +1523,74 @@ fn parse_throw(args: &str, raiserror_default: Option<i64>) -> Stmt {
         i += 1;
     }
     parts.push(text[start..].trim());
-    let code = parts
-        .first()
-        .and_then(|p| p.parse::<i64>().ok())
-        .or(raiserror_default);
-    let message = parts
-        .get(1)
-        .map(|p| unquote_literal(p))
-        .or_else(|| parts.first().map(|p| unquote_literal(p)))
-        .unwrap_or_else(|| "error raised by batch".into());
-    Stmt::Throw(code.zip(Some(message)))
+    parts
+}
+
+/// Strip one balanced leading/trailing parenthesis pair (parens inside
+/// string literals do not count). None when the text is not a single
+/// wrapping group — the caller keeps it verbatim for the split to judge.
+fn strip_outer_parens(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    if b.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = stmt::sql_literal_end(text, i);
+                i = end;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i != b.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    Some(&text[1..text.len() - 1])
+}
+
+/// True when the statement's first real token (comments skipped) is
+/// INSERT. Hosts that run statements outside the interpreter use this to
+/// know when a statement's identity snapshot must reach the session.
+pub fn is_insert_statement(sql: &str) -> bool {
+    let i = leading_trivia_end(sql);
+    sql.len() >= i + 6 && sql[i..i + 6].eq_ignore_ascii_case("INSERT")
+}
+
+/// Byte offset of the first real token after leading whitespace and
+/// comments (`-- line`, `/* block */`) — keyword sniffing on rendered
+/// statements must not be fooled by a comment prefix.
+fn leading_trivia_end(text: &str) -> usize {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b[i..].starts_with(b"--") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i..].starts_with(b"/*") {
+            match text[i + 2..].find("*/") {
+                Some(j) => i += 2 + j + 2,
+                None => return i,
+            }
+        } else {
+            return i;
+        }
+    }
 }
 
 /// Strip one layer of single quotes; anything else returns as-is.
@@ -2144,6 +2278,78 @@ mod tests {
         .unwrap();
         assert_eq!(rows_of(&out)[0][0], Value::Null);
         assert_eq!(rows_of(&out)[0][1], Value::Null);
+    }
+
+    /// RAISERROR message extraction: the paren form reports just the message
+    /// (never the whole argument list), the no-paren form must not grab the
+    /// severity as the message, and THROW accepts @variables (T-SQL's
+    /// `THROW @code, @msg, 1`) instead of silently degrading to a bare
+    /// re-raise.
+    #[test]
+    fn raise_forms_carry_clean_messages() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        // Paren form: message only, generic 50000 code.
+        let e = run_script(&mut s, &mut db, "RAISERROR('boom', 16, 1)").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(msg.contains("(error 50000)"), "{msg}");
+        assert!(!msg.contains("16,"), "{msg}");
+        // No-paren form: the severity must not become the message.
+        let e = run_script(&mut s, &mut db, "RAISERROR 'plain', 16, 1").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("plain"), "{msg}");
+        assert!(!msg.starts_with("16"), "{msg}");
+        // THROW with variable arguments.
+        let e = run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @c INT = 52001\nDECLARE @m TEXT = 'via vars'\nTHROW @c, @m, 1",
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("via vars"), "{msg}");
+        assert!(msg.contains("52001"), "{msg}");
+    }
+
+    /// A nested TRY...CATCH inside an outer CATCH must not blind the outer
+    /// ERROR_MESSAGE() once the inner one finishes; and bare THROW keeps
+    /// re-raising the same caught error on every use.
+    #[test]
+    fn nested_catch_keeps_outer_error_context() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE t (v INT)").unwrap();
+        run_script(
+            &mut s,
+            &mut db,
+            "BEGIN TRY\n  THROW 53000, 'outer', 1\nEND TRY\nBEGIN CATCH\n  BEGIN TRY\n    THROW 54000, 'inner', 1\n  END TRY\n  BEGIN CATCH\n  END CATCH\n  IF ERROR_MESSAGE() LIKE '%outer%'\n    INSERT INTO t VALUES (1)\n  ELSE\n    INSERT INTO t VALUES (2)\nEND CATCH",
+        )
+        .unwrap();
+        let out = run_script(&mut s, &mut db, "SELECT v FROM t").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(1));
+        // Two bare THROWs in one CATCH both re-raise the caught error.
+        let e = run_script(
+            &mut s,
+            &mut db,
+            "BEGIN TRY\n  THROW 55000, 'keepme', 1\nEND TRY\nBEGIN CATCH\n  BEGIN TRY\n    THROW\n  END TRY\n  BEGIN CATCH\n    THROW\n  END CATCH\nEND CATCH",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("keepme"), "{e}");
+    }
+
+    /// An INSERT behind a leading comment still updates @@IDENTITY (the
+    /// keyword sniff skips trivia, not just whitespace).
+    #[test]
+    fn commented_insert_still_tracks_identity() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        db.db
+            .execute("CREATE TABLE t (id INT AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        run_script(&mut s, &mut db, "-- load\nINSERT INTO t (v) VALUES ('a')").unwrap();
+        let out = run_script(&mut s, &mut db, "SELECT @@IDENTITY AS i").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(1));
     }
 
     #[test]

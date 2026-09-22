@@ -202,6 +202,41 @@ async fn tsql_batch_variables_and_control_flow() {
     assert_eq!(f.frame_type, proto::RESP_ERROR);
 }
 
+/// SCOPE_IDENTITY()/@@IDENTITY are per-session: the id rides the statement
+/// result (snapshotted inside the write lock), so a connection that never
+/// inserted into an AUTOINCREMENT table — or one whose INSERT allocated no
+/// identity at all — never adopts another connection's id.
+#[tokio::test]
+async fn tsql_identity_is_per_connection() {
+    let (_dir, addr) = start_server(Some("t")).await;
+    let mut c = Client::connect(&addr).await;
+    let _ = c.sql("AUTH").await;
+    c.send(&Frame::new(proto::REQ_AUTH, b"t".to_vec())).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED);
+    c.sql("CREATE TABLE ident (id INT AUTOINCREMENT, v TEXT)")
+        .await;
+    c.sql("CREATE TABLE plain (k INT)").await;
+    let f = c.sql("INSERT INTO ident (v) VALUES ('a')").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = c.sql("SELECT @@IDENTITY AS i").await;
+    assert!(payload_str(&f).contains("[[1]]"), "{}", payload_str(&f));
+
+    // A second connection inserting into a table with no AUTOINCREMENT
+    // column must not adopt the first connection's id.
+    let mut c2 = Client::connect(&addr).await;
+    let _ = c2.sql("AUTH").await;
+    c2.send(&Frame::new(proto::REQ_AUTH, b"t".to_vec())).await;
+    let _ = c2.recv().await;
+    let f = c2.sql("INSERT INTO plain VALUES (7)").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = c2.sql("SELECT @@IDENTITY AS i").await;
+    assert!(payload_str(&f).contains("null"), "{}", payload_str(&f));
+    // The first connection still sees its own id.
+    let f = c.sql("SELECT @@IDENTITY AS i").await;
+    assert!(payload_str(&f).contains("[[1]]"), "{}", payload_str(&f));
+}
+
 /// The `docsql_log` audit view carries every user's statement text; the
 /// REQ_LOGS arm already refuses the read-only role — the view must not be
 /// the side door (read-token connections carry no user identity, so the

@@ -1113,16 +1113,15 @@ impl<'a> ReadCx<'a> {
         };
         if let Ok(Some(rename)) = table_alias_columns(&alias_obj.columns, source_cols.len()) {
             for row in &mut out {
-                let pairs: Vec<(String, Value)> = rename
-                    .iter()
-                    .zip(source_cols.iter())
-                    .filter_map(|(new, old)| {
-                        row.get(&format!("{akey}.{old}"))
-                            .map(|v| (format!("{akey}.{new}"), v.clone()))
-                    })
-                    .collect();
-                for (k, v) in pairs {
-                    row.insert(k, v);
+                // Rename IN PLACE (move the value from the function's output
+                // column to its alias). Inserting alongside would leak the
+                // original column into SELECT *.
+                for (new, old) in rename.iter().zip(source_cols.iter()) {
+                    let old_key = format!("{akey}.{old}");
+                    if let Some(v) = row.get(&old_key).cloned() {
+                        row.remove(&old_key);
+                        row.insert(format!("{akey}.{new}"), v);
+                    }
                 }
             }
         }
@@ -2799,7 +2798,7 @@ impl<'a> ReadCx<'a> {
                 all.push(d);
                 if all.len() > MAX_ROWS {
                     return err(format!(
-                        "recursive CTE {name} exceeded the {MAX_ROWS}-row budget                          (UNION ALL cycle?)"
+                        "recursive CTE {name} exceeded the {MAX_ROWS}-row budget (UNION ALL cycle?)"
                     ));
                 }
             }
@@ -5003,6 +5002,32 @@ impl Database {
                 }
             }
         }
+        // T-SQL RAND(): evaluated ONCE per statement — every row of the
+        // result sees the same value. Reads (and CTAS, whose query is row
+        // data created now) fold the calls into one literal before
+        // executing; other writes keep the call in the text so exec_insert's
+        // rewrite ships resolved values and UPDATE/DELETE/MERGE keep their
+        // loud refusal below.
+        let is_ctas = matches!(
+            &parsed.stmt,
+            AnyStmt::Sql(s) if matches!(
+                s.as_ref(),
+                Statement::CreateTable(c) if c.query.is_some()
+            )
+        );
+        if (!parsed.is_write || is_ctas) && crate::stmt::mentions_nondet_call(&parsed.source) {
+            let lit = crate::engine::value_literal(&crate::value::Value::Float(
+                crate::tsql::rand_unit(),
+            ))?;
+            if let Some(folded) = crate::stmt::fold_rand_calls(&parsed.source, &lit) {
+                let reparsed = Self::parse_classified(&folded)?;
+                let outcome = self.execute_parsed(reparsed)?;
+                if is_ctas && self.resolved_sql.is_none() {
+                    self.resolved_sql = Some(folded);
+                }
+                return Ok(outcome);
+            }
+        }
         // NEWID()/NEWSEQUENTIALID() in writes: only INSERT has the canonical
         // per-row rewrite that ships generated ids as literals (exec_insert).
         // UPDATE/DELETE/MERGE journal their original text, so a random id
@@ -7193,9 +7218,9 @@ impl Database {
                             CO::Check(c) => {
                                 if expr_calls_wall_clock(&c.expr) {
                                     return err(
-                                        "CHECK constraints cannot call wall-clock functions \
-                                         (NOW/SYSDATE/CURRENT_TIMESTAMP); every node would \
-                                         evaluate a different instant",
+                                        "CHECK constraints cannot call wall-clock or random \
+                                         functions (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND); \
+                                         every node would evaluate a different value",
                                     );
                                 }
                                 meta.checks.push(format!("{}", c.expr))
@@ -7849,9 +7874,9 @@ impl Database {
                     }
                     CO::Check(c) => {
                         if expr_calls_wall_clock(&c.expr) {
-                            return err("CHECK constraints cannot call wall-clock functions \
-                                 (NOW/SYSDATE/CURRENT_TIMESTAMP); every node would \
-                                 evaluate a different instant");
+                            return err("CHECK constraints cannot call wall-clock or random \
+                                 functions (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND); \
+                                 every node would evaluate a different value");
                         }
                         meta.checks.push(format!("{}", c.expr))
                     }
@@ -8194,10 +8219,10 @@ impl Database {
         // state. NEWID()/NEWSEQUENTIALID() in the source (VALUES or SELECT)
         // are the same class: the writing node rolls the ids and ships the
         // literal values.
-        let source_calls_nondet = insert.source.as_ref().is_some_and(|s| {
-            let text = s.to_string().to_ascii_lowercase();
-            text.contains("newid") || text.contains("newsequentialid") || text.contains("rand")
-        });
+        let source_calls_nondet = insert
+            .source
+            .as_ref()
+            .is_some_and(|s| crate::stmt::mentions_nondet_call(&s.to_string()));
         if guid_filled || default_clock_filled || source_calls_nondet {
             let policy = if replace {
                 "OR REPLACE "
@@ -8808,8 +8833,11 @@ impl Database {
                             // (unlike INSERT); replaying the statement on a
                             // peer would stamp a different clock. Fail loudly
                             // instead of silently diverging.
-                            return err("MERGE INSERT cannot apply a wall-clock DEFAULT \
-                                 (NOW/SYSDATE/CURRENT_TIMESTAMP); supply the column explicitly");
+                            return err(
+                                "MERGE INSERT cannot apply a wall-clock or random DEFAULT \
+                                 (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND); \
+                                 supply the column explicitly",
+                            );
                         }
                         doc.insert(col.clone(), eval_const(e)?);
                     }
@@ -9529,10 +9557,15 @@ fn pivot_factor(
         SqlExpr::Identifier(i) => i.value.clone(),
         _ => return err("PIVOT aggregate argument must be a bare column"),
     };
-    // First-seen group order.
-    let mut groups: Vec<(Object, usize)> = Vec::new();
+    // First-seen group order. Members are bucketed by the group key at
+    // partition time — the buckets ARE the grouping. Matching rows back
+    // with a field predicate instead would be asymmetric (it would only
+    // constrain the doc's fields against the key, not the key's fields
+    // against the doc), so schemaless rows with differing field sets could
+    // land in several groups at once and their aggregates would double-count.
+    let mut groups: Vec<(Object, Vec<usize>)> = Vec::new();
     let mut index: std::collections::BTreeMap<String, usize> = Default::default();
-    for d in &docs {
+    for (di, d) in docs.iter().enumerate() {
         let mut key = Object::new();
         for (k, v) in d {
             if suffix_eq(k, &pivot_col) || suffix_eq(k, &agg_col) {
@@ -9542,26 +9575,17 @@ fn pivot_factor(
         }
         let key_text = value_to_text(&Value::Object(key.clone()));
         match index.get(&key_text) {
-            Some(&i) => groups[i].1 += 1,
+            Some(&i) => groups[i].1.push(di),
             None => {
                 index.insert(key_text, groups.len());
-                groups.push((key, 1));
+                groups.push((key, vec![di]));
             }
         }
     }
     // Reduce per group × pivot value.
     let mut out = Vec::with_capacity(groups.len());
-    for (key, _) in &groups {
-        let members: Vec<&Object> = docs
-            .iter()
-            .filter(|d| {
-                d.iter().all(|(k, v)| {
-                    key.get(k)
-                        .map(|kv| Value::cmp_values(kv, v) == Ordering::Equal)
-                        .unwrap_or(true)
-                })
-            })
-            .collect();
+    for (key, member_idx) in &groups {
+        let members: Vec<&Object> = member_idx.iter().map(|&i| &docs[i]).collect();
         let mut row = key.clone();
         for (name, want) in &pivot_vals {
             let matched: Vec<Value> = members
@@ -9573,11 +9597,7 @@ fn pivot_factor(
                 })
                 .map(|d| eval_expr(&arg_expr, d).unwrap_or(Value::Null))
                 .collect();
-            let cell = if matched.is_empty() {
-                Value::Null
-            } else {
-                reduce_aggregate(&agg_name, &matched)?
-            };
+            let cell = reduce_aggregate(&agg_name, &matched)?;
             row.insert(name.clone(), cell);
         }
         out.push(row);
@@ -9592,20 +9612,22 @@ fn suffix_eq(key: &str, col: &str) -> bool {
 }
 
 /// SUM/AVG/MIN/MAX/COUNT over evaluated values (PIVOT's local reducer).
+/// Empty input (no rows matched the pivot value, or every matched value is
+/// NULL) follows SQL aggregate semantics: COUNT → 0, everything else → NULL.
 fn reduce_aggregate(name: &str, vals: &[Value]) -> Result<Value> {
     let non_null: Vec<&Value> = vals.iter().filter(|v| !matches!(v, Value::Null)).collect();
     match name {
         "COUNT" | "COUNT_BIG" => Ok(Value::Int(non_null.len() as i64)),
-        "MIN" => non_null
+        "MIN" => Ok(non_null
             .iter()
             .min_by(|a, b| Value::cmp_values(a, b))
             .map(|v| (*v).clone())
-            .ok_or_else(|| SqlError::Message("MIN of empty set".into())),
-        "MAX" => non_null
+            .unwrap_or(Value::Null)),
+        "MAX" => Ok(non_null
             .iter()
             .max_by(|a, b| Value::cmp_values(a, b))
             .map(|v| (*v).clone())
-            .ok_or_else(|| SqlError::Message("MAX of empty set".into())),
+            .unwrap_or(Value::Null)),
         "SUM" | "AVG" => {
             if non_null.is_empty() {
                 return Ok(Value::Null);
@@ -25940,6 +25962,105 @@ mod tsql_compat_tests {
         assert!(db
             .execute("CREATE TABLE bad (v FLOAT CHECK (v > RAND()))")
             .is_err());
+    }
+
+    /// Schemaless field-set differences must not blur PIVOT groups: rows
+    /// written before an ALTER ADD COLUMN lack the new field entirely, and
+    /// the group buckets must follow the fields a row actually has (a
+    /// permissive field predicate used to pull such rows into every
+    /// superset group, double-counting their aggregates). Also pins the
+    /// aggregate edge semantics: an empty cell set is COUNT 0 / otherwise
+    /// NULL — including an all-NULL cell set, which is not an error.
+    #[test]
+    fn pivot_field_sets_and_empty_cells() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE s (dept TEXT, yr INT, qty INT)");
+        run(
+            &mut db,
+            "INSERT INTO s VALUES ('a', 2024, 10), ('a', 2024, 100)",
+        );
+        // Rows written before the ALTER lack the `region` field entirely.
+        run(&mut db, "ALTER TABLE s ADD COLUMN region TEXT");
+        run(
+            &mut db,
+            "INSERT INTO s (dept, region, yr, qty) VALUES ('a', 'east', 2024, 5)",
+        );
+        // All-NULL cell for 2025 / dept 'c'.
+        run(
+            &mut db,
+            "INSERT INTO s (dept, yr, qty) VALUES ('c', 2025, NULL)",
+        );
+        // The east row aggregates alone; the field-less rows stay in their
+        // own group (pre-fix this cell summed to 115).
+        let r = rows(
+            &mut db,
+            "SELECT dept, region, [2024] FROM s PIVOT (SUM(qty) FOR yr IN (2024)) AS p ORDER BY dept, region",
+        );
+        // Three implicit groups: the two field-less rows, the east row, and
+        // dept 'c' (whose only row pivots on 2025 — its 2024 cell is NULL).
+        assert_eq!(r.rows.len(), 3, "{r:?}");
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Str("a".into()), Value::Null, Value::Int(110)]
+        );
+        assert_eq!(
+            r.rows[1],
+            vec![
+                Value::Str("a".into()),
+                Value::Str("east".into()),
+                Value::Int(5)
+            ]
+        );
+        assert_eq!(
+            r.rows[2],
+            vec![Value::Str("c".into()), Value::Null, Value::Null]
+        );
+        // Empty cells: COUNT reads 0 (T-SQL), MIN reads NULL — no error.
+        let r = rows(
+            &mut db,
+            "SELECT dept, [2025] FROM s PIVOT (COUNT(qty) FOR yr IN (2025)) AS p ORDER BY dept",
+        );
+        assert_eq!(r.rows[0][1], Value::Int(0));
+        assert_eq!(r.rows[1][1], Value::Int(0));
+        let r = rows(
+            &mut db,
+            "SELECT dept, [2025] FROM s PIVOT (MIN(qty) FOR yr IN (2025)) AS p ORDER BY dept",
+        );
+        assert_eq!(r.rows[0][1], Value::Null);
+    }
+
+    /// RAND() is statement-scoped on reads (T-SQL): every call inside one
+    /// SELECT folds to the same value, later statements draw again, and a
+    /// CTAS pins the drawn value into the journaled rewrite so a peer
+    /// replay cannot re-roll it.
+    #[test]
+    fn rand_reads_are_statement_scoped() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(&mut db, "SELECT RAND() AS a, RAND() AS b, RAND() AS c");
+        assert_eq!(r.rows[0][0], r.rows[0][1]);
+        assert_eq!(r.rows[0][1], r.rows[0][2]);
+        // Successive statements draw independently (five identical draws in
+        // a row is practically impossible for the advancing xorshift).
+        let first = one(&mut db, "SELECT RAND() AS r");
+        let mut differed = false;
+        for _ in 0..5 {
+            if one(&mut db, "SELECT RAND() AS r") != first {
+                differed = true;
+                break;
+            }
+        }
+        assert!(differed);
+        // CTAS: the journaled rewrite carries the literal, not the call.
+        run(&mut db, "CREATE TABLE rd (x INT)");
+        run(&mut db, "INSERT INTO rd VALUES (1)");
+        run(&mut db, "CREATE TABLE rd2 AS SELECT RAND() AS r FROM rd");
+        let resolved = db
+            .take_resolved_sql()
+            .expect("CTAS resolved")
+            .to_lowercase();
+        assert!(!resolved.contains("rand"), "{resolved}");
+        let r = rows(&mut db, "SELECT r FROM rd2");
+        assert!(matches!(r.rows[0][0], Value::Float(_)));
     }
 
     #[test]

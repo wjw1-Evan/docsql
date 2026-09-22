@@ -2866,10 +2866,12 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Per-process PRNG state for RAND(): xorshift64*, seeded from the wall
-/// clock so successive calls differ within a statement. Statistical
+/// Per-process PRNG state for RAND(): xorshift64, seeded from the wall
+/// clock so successive calls differ across statements. Statistical
 /// quality is irrelevant — RAND feeds feature code, not cryptography.
-fn rand_unit() -> f64 {
+/// Statement-level semantics (one value per statement) come from the
+/// read-path fold in [`crate::stmt::fold_rand_calls`], not from here.
+pub(crate) fn rand_unit() -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut x = STATE.load(Ordering::Relaxed);

@@ -1687,6 +1687,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         user: user.as_ref(),
                                         conn: Some(conn_id),
                                         deadline,
+                                        stmt_identity: None,
                                     };
                                     match tsql_session
                                         .run_batch(&sql, &mut exec)
@@ -1774,7 +1775,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                     if read_eligible {
                                         execute_read_sql(&state, &effective, stmt_deadline).await
                                     } else {
-                                        execute_sql(
+                                        let (resp, identity) = execute_sql_with_identity(
                                             &state,
                                             &effective,
                                             allow_system,
@@ -1792,7 +1793,28 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                             user.as_ref(),
                                             stmt_deadline,
                                         )
-                                        .await
+                                        .await;
+                                        // The fast path bypasses the T-SQL
+                                        // session, but the session owns the
+                                        // connection-scoped @@IDENTITY and
+                                        // @@ERROR: feed it what just ran so a
+                                        // later batch sees this statement's
+                                        // effects.
+                                        if !is_replication {
+                                            if docsql_core::tsql_batch::is_insert_statement(&effective) {
+                                                tsql_session.note_identity(
+                                                    identity.map(docsql_core::Value::Int),
+                                                );
+                                            }
+                                            if resp.frame_type == proto::RESP_ERROR {
+                                                tsql_session.note_error(
+                                                    docsql_core::tsql_batch::error_code_from_text(
+                                                        &String::from_utf8_lossy(&resp.payload),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        resp
                                     }
                                 }
                             }
@@ -2374,14 +2396,16 @@ struct BatchPipeExec<'a> {
     user: Option<&'a UserAuth>,
     conn: Option<u64>,
     deadline: Option<std::time::Instant>,
+    /// The last statement's AUTOINCREMENT id, snapshotted inside the engine
+    /// write lock by the executor pipeline. Never re-read the engine-global
+    /// counter here: another connection's INSERT between this statement's
+    /// unlock and a late read would leak its id into this session.
+    stmt_identity: Option<docsql_core::Value>,
 }
 
 impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
     fn last_identity(&mut self) -> Option<docsql_core::Value> {
-        // The engine records the last autoinc id per INSERT; read it under
-        // the same write-tier lock the statement just ran under.
-        let db = self.state.db.read().unwrap_or_else(|p| p.into_inner());
-        db.last_insert_id().map(docsql_core::Value::Int)
+        self.stmt_identity.clone()
     }
 
     fn execute(&mut self, sql: &str) -> docsql_core::tsql_batch::ExecFuture<'_> {
@@ -2391,7 +2415,7 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
         let deadline = self.deadline;
         let sql = sql.to_string();
         Box::pin(async move {
-            let frame = execute_sql(
+            let (frame, identity) = execute_sql_with_identity(
                 state, &sql, false, // allow_system_table: the pubsub-view rewrite above
                 // already ran for the batch text; plain statements
                 // against system tables keep their error.
@@ -2399,6 +2423,7 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
                 conn, false, None, user, deadline,
             )
             .await;
+            self.stmt_identity = identity.map(docsql_core::Value::Int);
             frame_to_exec(frame)
         })
     }
@@ -2832,6 +2857,39 @@ async fn execute_sql(
     user: Option<&UserAuth>,
     stmt_deadline: Option<std::time::Instant>,
 ) -> Frame {
+    execute_sql_with_identity(
+        state,
+        sql,
+        allow_system_table,
+        is_replication,
+        conn,
+        order_held,
+        seq_pos,
+        user,
+        stmt_deadline,
+    )
+    .await
+    .0
+}
+
+/// Same statement pipeline as [`execute_sql`], plus the statement's
+/// AUTOINCREMENT identity snapshot. The snapshot is taken INSIDE the engine
+/// write lock right after `execute` returns — reading `Database::last_insert_id`
+/// later (lock released) would race with another connection's INSERT and hand
+/// this caller a foreign id (T-SQL identity is strictly per-session).
+async fn execute_sql_with_identity(
+    state: &Arc<ServerState>,
+    sql: &str,
+    allow_system_table: bool,
+    is_replication: bool,
+    conn: Option<u64>,
+    order_held: bool,
+    seq_pos: Option<(&str, u64)>,
+    user: Option<&UserAuth>,
+    stmt_deadline: Option<std::time::Instant>,
+) -> (Frame, Option<i64>) {
+    #![allow(clippy::too_many_arguments)]
+
     // Statement throughput/error-rate accounting: every executor caller
     // (client REQ_SQL, replication replay, restore) funnels through here,
     // so the counters describe node-wide SQL work in one place.
@@ -2839,7 +2897,7 @@ async fn execute_sql(
         .metrics
         .statements_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resp = execute_sql_inner(
+    let (resp, identity) = execute_sql_inner(
         state,
         sql,
         allow_system_table,
@@ -2857,7 +2915,7 @@ async fn execute_sql(
             .statement_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    resp
+    (resp, identity)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2871,13 +2929,18 @@ async fn execute_sql_inner(
     seq_pos: Option<(&str, u64)>,
     user: Option<&UserAuth>,
     stmt_deadline: Option<std::time::Instant>,
-) -> Frame {
+) -> (Frame, Option<i64>) {
     // One parse for the whole round-trip: the AST executes at the bottom,
     // the classification routes the request here (parse errors surface with
     // the same message `execute` would have produced).
     let mut parsed = Some(match Database::parse_classified(sql) {
         Ok(p) => p,
-        Err(e) => return Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
+        Err(e) => {
+            return (
+                Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
+                None,
+            )
+        }
     });
     let p = parsed.as_ref().expect("parsed just above");
     let is_write = p.is_write;
@@ -2910,12 +2973,15 @@ async fn execute_sql_inner(
                 || (docsql_core::engine::is_internal_table(t) && !internal_ok)
         });
         if let Some(target) = hit {
-            return Frame::new(
-                proto::RESP_ERROR,
-                err_payload(&format!(
-                    "system table {target} is internal to the engine and cannot be modified; \
-                     SELECT is allowed (docsql_pubsub view / PUBSUB TRIM for _pubsub_messages)"
-                )),
+            return (
+                Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload(&format!(
+                        "system table {target} is internal to the engine and cannot be modified; \
+                         SELECT is allowed (docsql_pubsub view / PUBSUB TRIM for _pubsub_messages)"
+                    )),
+                ),
+                None,
             );
         }
     }
@@ -2926,15 +2992,18 @@ async fn execute_sql_inner(
         if let Err(denial) =
             authorize_statement(Some(&db_ref), &p.stmt, &tx_kind, is_write, &u.grants)
         {
-            return Frame::new(proto::RESP_ERROR, err_payload(&denial));
+            return (Frame::new(proto::RESP_ERROR, err_payload(&denial)), None);
         }
     }
     // Replica read-only gate (replication-internal frames pass through).
     let read_only = state.read_only.load(std::sync::atomic::Ordering::SeqCst);
     if read_only && !is_replication && is_write {
-        return Frame::new(
-            proto::RESP_ERROR,
-            err_payload("read-only replica; PROMOTE to accept writes"),
+        return (
+            Frame::new(
+                proto::RESP_ERROR,
+                err_payload("read-only replica; PROMOTE to accept writes"),
+            ),
+            None,
         );
     }
     // The single global transaction belongs to the connection that opened
@@ -2948,9 +3017,12 @@ async fn execute_sql_inner(
                 .unwrap()
                 .is_some_and(|o| Some(o) != conn);
         if foreign_control {
-            return Frame::new(
-                proto::RESP_ERROR,
-                err_payload("transaction is held open by another connection"),
+            return (
+                Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload("transaction is held open by another connection"),
+                ),
+                None,
             );
         }
     }
@@ -2959,11 +3031,14 @@ async fn execute_sql_inner(
         // replication frame would open the global transaction with no owner
         // connection to clean it up — every later replicated write would
         // then spin in the busy-wait below for the full 30s and fail.
-        return Frame::new(
-            proto::RESP_ERROR,
-            err_payload(
-                "transaction control statements are not allowed on replication connections",
+        return (
+            Frame::new(
+                proto::RESP_ERROR,
+                err_payload(
+                    "transaction control statements are not allowed on replication connections",
+                ),
             ),
+            None,
         );
     }
     // A client BEGIN queues behind an open engine transaction instead of
@@ -2977,9 +3052,12 @@ async fn execute_sql_inner(
     if !is_replication && is_write && conn.is_some() {
         let owned = *state.tx_owner.lock().unwrap() == conn;
         if owned && !state.tx_pending.lock().await.check_room(sql.len()) {
-            return Frame::new(
-                proto::RESP_ERROR,
-                err_payload("transaction buffer exceeded; COMMIT or ROLLBACK first"),
+            return (
+                Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload("transaction buffer exceeded; COMMIT or ROLLBACK first"),
+                ),
+                None,
             );
         }
     }
@@ -2992,176 +3070,192 @@ async fn execute_sql_inner(
     // re-journaling them here would re-broadcast them to third nodes with
     // this node's origin (unbounded amplification).
     let journal_wanted = !is_replication && is_write && matches!(tx_kind, TxControl::None);
-    let (outcome, in_tx, _order_guard, resolved, journal_seq) = loop {
-        // Plain reads wait out a foreign transaction too: the engine applies
-        // a transaction's statements to the in-memory tables immediately, so
-        // reading while another connection holds BEGIN served uncommitted
-        // rows (a dirty read that a later ROLLBACK made vanish). Same-owner
-        // reads must pass — they see their own writes by design.
-        let plain_read = !is_write && matches!(tx_kind, TxControl::None);
-        let foreign_tx = (is_write || plain_read) && *state.tx_owner.lock().unwrap() != conn;
-        if queues || foreign_tx {
-            wait_engine_tx_free(state, deadline).await;
-            // A plain read that waited must re-check before executing: the
-            // engine applies an open transaction's statements immediately,
-            // so reading past a still-open transaction serves uncommitted
-            // rows a later ROLLBACK would make vanish — the dirty read this
-            // wait exists to prevent. Writes and replication applies
-            // re-check inside their write_order branches below; without
-            // this, only the plain read fell through on timeout.
-            if plain_read && !is_replication && !order_held {
-                let busy = {
-                    let in_tx = state
+    let (outcome, in_tx, _order_guard, resolved, journal_seq, identity) =
+        loop {
+            // Plain reads wait out a foreign transaction too: the engine applies
+            // a transaction's statements to the in-memory tables immediately, so
+            // reading while another connection holds BEGIN served uncommitted
+            // rows (a dirty read that a later ROLLBACK made vanish). Same-owner
+            // reads must pass — they see their own writes by design.
+            let plain_read = !is_write && matches!(tx_kind, TxControl::None);
+            let foreign_tx = (is_write || plain_read) && *state.tx_owner.lock().unwrap() != conn;
+            if queues || foreign_tx {
+                wait_engine_tx_free(state, deadline).await;
+                // A plain read that waited must re-check before executing: the
+                // engine applies an open transaction's statements immediately,
+                // so reading past a still-open transaction serves uncommitted
+                // rows a later ROLLBACK would make vanish — the dirty read this
+                // wait exists to prevent. Writes and replication applies
+                // re-check inside their write_order branches below; without
+                // this, only the plain read fell through on timeout.
+                if plain_read && !is_replication && !order_held {
+                    let busy = {
+                        let in_tx = state
+                            .db
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .in_transaction();
+                        in_tx && *state.tx_owner.lock().unwrap() != conn
+                    };
+                    if busy {
+                        return (
+                            Frame::new(
+                                proto::RESP_ERROR,
+                                err_payload(
+                                    "timed out waiting for the transaction on another connection",
+                                ),
+                            ),
+                            None,
+                        );
+                    }
+                }
+            }
+            let guard =
+                if order_held {
+                    // Caller already holds write_order (cluster-join drain, backup
+                    // restore replay) and waited out any open transaction on the
+                    // way to taking it — re-locking would self-deadlock.
+                    None
+                } else if !is_replication && (is_write || !matches!(tx_kind, TxControl::None)) {
+                    let order = state.write_order.lock().await;
+                    let busy = {
+                        let in_tx = state
+                            .db
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .in_transaction();
+                        in_tx && *state.tx_owner.lock().unwrap() != conn
+                    };
+                    if busy {
+                        drop(order);
+                        if tokio::time::Instant::now() >= deadline {
+                            return (Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("timed out waiting for the transaction on another connection"),
+                    ), None);
+                        }
+                        tokio::time::sleep(BEGIN_QUEUE_POLL).await;
+                        continue;
+                    }
+                    Some(order)
+                } else if is_replication && is_write && !order_held {
+                    // Replicated writes must land in autocommit: executing inside a
+                    // client's open transaction would let its ROLLBACK undo writes
+                    // the origin node already acknowledged (silent divergence).
+                    // Holding write_order keeps a BEGIN from slipping in between the
+                    // check and the execute; the cluster-join drain replays with
+                    // write_order already held (re-locking would self-deadlock).
+                    let order = state.write_order.lock().await;
+                    let busy = state
                         .db
                         .read()
                         .unwrap_or_else(|p| p.into_inner())
                         .in_transaction();
-                    in_tx && *state.tx_owner.lock().unwrap() != conn
-                };
-                if busy {
-                    return Frame::new(
-                        proto::RESP_ERROR,
-                        err_payload("timed out waiting for the transaction on another connection"),
-                    );
-                }
-            }
-        }
-        let guard = if order_held {
-            // Caller already holds write_order (cluster-join drain, backup
-            // restore replay) and waited out any open transaction on the
-            // way to taking it — re-locking would self-deadlock.
-            None
-        } else if !is_replication && (is_write || !matches!(tx_kind, TxControl::None)) {
-            let order = state.write_order.lock().await;
-            let busy = {
-                let in_tx = state
-                    .db
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .in_transaction();
-                in_tx && *state.tx_owner.lock().unwrap() != conn
-            };
-            if busy {
-                drop(order);
-                if tokio::time::Instant::now() >= deadline {
-                    return Frame::new(
-                        proto::RESP_ERROR,
-                        err_payload("timed out waiting for the transaction on another connection"),
-                    );
-                }
-                tokio::time::sleep(BEGIN_QUEUE_POLL).await;
-                continue;
-            }
-            Some(order)
-        } else if is_replication && is_write && !order_held {
-            // Replicated writes must land in autocommit: executing inside a
-            // client's open transaction would let its ROLLBACK undo writes
-            // the origin node already acknowledged (silent divergence).
-            // Holding write_order keeps a BEGIN from slipping in between the
-            // check and the execute; the cluster-join drain replays with
-            // write_order already held (re-locking would self-deadlock).
-            let order = state.write_order.lock().await;
-            let busy = state
-                .db
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .in_transaction();
-            if busy {
-                drop(order);
-                if tokio::time::Instant::now() >= deadline {
-                    return Frame::new(
+                    if busy {
+                        drop(order);
+                        if tokio::time::Instant::now() >= deadline {
+                            return (Frame::new(
                         proto::RESP_ERROR,
                         err_payload("replication write timed out waiting for the open transaction"),
-                    );
-                }
+                    ), None);
+                        }
+                        tokio::time::sleep(BEGIN_QUEUE_POLL).await;
+                        continue;
+                    }
+                    Some(order)
+                } else {
+                    None
+                };
+            let (out, in_tx, resolved, seq, sync_failed, identity) = {
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                // Arm the client-statement deadline inside the engine lock —
+                // it is engine-global, so it must cover exactly this statement
+                // and be cleared on every path below (the guard block does).
+                db.set_statement_deadline(stmt_deadline);
+                // Fuse the statement's commit with its replication bookkeeping
+                // into ONE WAL fsync: journal append on the writing side,
+                // position update on the receiving side. Unfused, each is an
+                // engine commit of its own — two fsyncs per clustered write —
+                // and a crash between them leaves bookkeeping lagging the data.
+                // The unit lands both atomically (all-or-nothing prefix).
+                // Async-commit mode keeps the unit (bookkeeping still runs,
+                // grouped): the engine's `end` is async-aware and leaves the
+                // fsync to the background flusher instead of imposing one per
+                // write — group-commit batching stays intact.
+                let fuse =
+                    !db.in_transaction() && (journal_wanted || (seq_pos.is_some() && is_write));
+                let (out, resolved, seq, sync_failed, identity) = if fuse {
+                    let mut unit = db.write_unit();
+                    let out = match parsed.take() {
+                        Some(p) => unit.execute_parsed(p),
+                        None => unit.execute(sql),
+                    };
+                    let resolved = unit.take_resolved_sql();
+                    // Sample INSIDE the lock, right after the statement (through
+                    // the unit's Deref): journal bookkeeping below writes tables
+                    // of its own and would clobber the statement's id.
+                    let identity = unit.last_insert_id();
+                    let mut seq = None;
+                    if out.is_ok() {
+                        // Auto-generated GUID values are random: peers cannot
+                        // re-derive them, so journal the explicit-value rewrite.
+                        let forward = resolved.as_deref().unwrap_or(sql);
+                        if journal_wanted {
+                            seq = journal_append_trimmed(&mut unit, state, forward);
+                        }
+                        if let Some((origin, s)) = seq_pos {
+                            advance_position(&mut unit, origin, s);
+                        }
+                    }
+                    let end = unit.end();
+                    (out, resolved, seq, end.is_err(), identity)
+                } else {
+                    let out = match parsed.take() {
+                        Some(p) => db.execute_parsed(p),
+                        // Consumed by a lost BEGIN-queue race above: re-parse (the
+                        // failed attempt left no state behind) and retry.
+                        None => db.execute(sql),
+                    };
+                    let identity = db.last_insert_id();
+                    let resolved = db.take_resolved_sql();
+                    (out, resolved, None, false, identity)
+                };
+                // Capture inside the same lock: another connection must not be
+                // able to open/close a transaction between execute and
+                // classification.
+                let in_tx = db.in_transaction();
+                db.set_statement_deadline(None);
+                (out, in_tx, resolved, seq, sync_failed, identity)
+            };
+            if sync_failed {
+                // The fused unit's single fsync failed: durable state is
+                // unknown, the statement must not be acknowledged.
+                return (
+                    Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("failed to make the write durable"),
+                    ),
+                    None,
+                );
+            }
+            // Lost the race for the engine transaction between the wait and the
+            // locks: requeue until the deadline, then let the error through.
+            // Skip the requeue when THIS connection already owns the open
+            // transaction (its own duplicate BEGIN): the error cannot clear,
+            // so waiting would only spin out the full 30s budget.
+            if queues
+                && out
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("transaction already in progress"))
+                && *state.tx_owner.lock().unwrap() != conn
+                && tokio::time::Instant::now() < deadline
+            {
+                drop(guard);
                 tokio::time::sleep(BEGIN_QUEUE_POLL).await;
                 continue;
             }
-            Some(order)
-        } else {
-            None
+            break (out, in_tx, guard, resolved, seq, identity);
         };
-        let (out, in_tx, resolved, seq, sync_failed) = {
-            let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-            // Arm the client-statement deadline inside the engine lock —
-            // it is engine-global, so it must cover exactly this statement
-            // and be cleared on every path below (the guard block does).
-            db.set_statement_deadline(stmt_deadline);
-            // Fuse the statement's commit with its replication bookkeeping
-            // into ONE WAL fsync: journal append on the writing side,
-            // position update on the receiving side. Unfused, each is an
-            // engine commit of its own — two fsyncs per clustered write —
-            // and a crash between them leaves bookkeeping lagging the data.
-            // The unit lands both atomically (all-or-nothing prefix).
-            // Async-commit mode keeps the unit (bookkeeping still runs,
-            // grouped): the engine's `end` is async-aware and leaves the
-            // fsync to the background flusher instead of imposing one per
-            // write — group-commit batching stays intact.
-            let fuse = !db.in_transaction() && (journal_wanted || (seq_pos.is_some() && is_write));
-            let (out, resolved, seq, sync_failed) = if fuse {
-                let mut unit = db.write_unit();
-                let out = match parsed.take() {
-                    Some(p) => unit.execute_parsed(p),
-                    None => unit.execute(sql),
-                };
-                let resolved = unit.take_resolved_sql();
-                let mut seq = None;
-                if out.is_ok() {
-                    // Auto-generated GUID values are random: peers cannot
-                    // re-derive them, so journal the explicit-value rewrite.
-                    let forward = resolved.as_deref().unwrap_or(sql);
-                    if journal_wanted {
-                        seq = journal_append_trimmed(&mut unit, state, forward);
-                    }
-                    if let Some((origin, s)) = seq_pos {
-                        advance_position(&mut unit, origin, s);
-                    }
-                }
-                let end = unit.end();
-                (out, resolved, seq, end.is_err())
-            } else {
-                let out = match parsed.take() {
-                    Some(p) => db.execute_parsed(p),
-                    // Consumed by a lost BEGIN-queue race above: re-parse (the
-                    // failed attempt left no state behind) and retry.
-                    None => db.execute(sql),
-                };
-                let resolved = db.take_resolved_sql();
-                (out, resolved, None, false)
-            };
-            // Capture inside the same lock: another connection must not be
-            // able to open/close a transaction between execute and
-            // classification.
-            let in_tx = db.in_transaction();
-            db.set_statement_deadline(None);
-            (out, in_tx, resolved, seq, sync_failed)
-        };
-        if sync_failed {
-            // The fused unit's single fsync failed: durable state is
-            // unknown, the statement must not be acknowledged.
-            return Frame::new(
-                proto::RESP_ERROR,
-                err_payload("failed to make the write durable"),
-            );
-        }
-        // Lost the race for the engine transaction between the wait and the
-        // locks: requeue until the deadline, then let the error through.
-        // Skip the requeue when THIS connection already owns the open
-        // transaction (its own duplicate BEGIN): the error cannot clear,
-        // so waiting would only spin out the full 30s budget.
-        if queues
-            && out
-                .as_ref()
-                .is_err_and(|e| e.to_string().contains("transaction already in progress"))
-            && *state.tx_owner.lock().unwrap() != conn
-            && tokio::time::Instant::now() < deadline
-        {
-            drop(guard);
-            tokio::time::sleep(BEGIN_QUEUE_POLL).await;
-            continue;
-        }
-        break (out, in_tx, guard, resolved, seq);
-    };
     // Successful user-management statements move the grants epoch (user
     // connections re-resolve) and may flip the has-users flag that closes
     // anonymous access. Runs on every node that applies the statement —
@@ -3235,7 +3329,7 @@ async fn execute_sql_inner(
             _ => {}
         }
     }
-    outcome_frame(outcome)
+    (outcome_frame(outcome), identity)
 }
 
 /// Peer I/O budget: a partitioned or malicious peer must not wedge client

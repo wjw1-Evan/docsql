@@ -135,13 +135,27 @@ public sealed class DocsqlTsqlMethodTranslator : IMethodCallTranslator
                     return _sql.OrElse(_sql.IsNull(arguments[0]), empty);
                 }
             case nameof(string.Concat) when arguments.Count is >= 2:
-                return _sql.Function(
-                    "CONCAT",
-                    arguments,
-                    nullable: true,
-                    argumentsPropagateNullability: arguments.Select(_ => true).ToList(),
-                    typeof(string),
-                    _typeMappingSource.FindMapping(typeof(string)));
+                {
+                    // .NET string.Concat(和 T-SQL CONCAT)把 NULL 当空串;
+                    // 引擎 CONCAT 遇 NULL 返回 NULL。每个实参包
+                    // COALESCE(arg, '') 对齐 .NET 语义,NULL 不再传播。
+                    var coalesced = arguments
+                        .Select(a => _sql.Function(
+                            "COALESCE",
+                            [a, _sql.Constant("")],
+                            nullable: false,
+                            argumentsPropagateNullability: new List<bool> { false, false },
+                            typeof(string),
+                            _typeMappingSource.FindMapping(typeof(string))))
+                        .ToList();
+                    return _sql.Function(
+                        "CONCAT",
+                        coalesced,
+                        nullable: false,
+                        argumentsPropagateNullability: coalesced.Select(_ => false).ToList(),
+                        typeof(string),
+                        _typeMappingSource.FindMapping(typeof(string)));
+                }
             default:
                 return null;
         }
@@ -288,6 +302,14 @@ public static class DocsqlDbFunctionsExtensions
     public static int DateDiffMinute(this DbFunctions _, DateTimeOffset start, DateTimeOffset end)
         => throw new InvalidOperationException(DocsqlSqlOnly);
     public static int DateDiffSecond(this DbFunctions _, DateTimeOffset start, DateTimeOffset end)
+        => throw new InvalidOperationException(DocsqlSqlOnly);
+    public static int DateDiffQuarter(this DbFunctions _, DateTimeOffset start, DateTimeOffset end)
+        => throw new InvalidOperationException(DocsqlSqlOnly);
+    public static int DateDiffDayOfYear(this DbFunctions _, DateTimeOffset start, DateTimeOffset end)
+        => throw new InvalidOperationException(DocsqlSqlOnly);
+    public static int DateDiffWeek(this DbFunctions _, DateTimeOffset start, DateTimeOffset end)
+        => throw new InvalidOperationException(DocsqlSqlOnly);
+    public static int DateDiffMillisecond(this DbFunctions _, DateTimeOffset start, DateTimeOffset end)
         => throw new InvalidOperationException(DocsqlSqlOnly);
 
     private const string DocsqlSqlOnly =

@@ -43,6 +43,114 @@ pub fn sql_literal_end(sql: &str, open: usize) -> (usize, bool) {
     (b.len(), false)
 }
 
+/// Word-boundary + call-shape scan for zero-argument non-deterministic
+/// function calls (RAND/NEWID/NEWSEQUENTIALID) outside string literals and
+/// comments. `brand`, `random`, literal text and argument-carrying calls
+/// never match; `RAND ()` (whitespace before the parens) does. Conservative
+/// on purpose: a missed call would let a journaled write re-roll values per
+/// peer (cluster divergence red line), while a false hit only triggers the
+/// harmless canonical rewrite.
+pub fn mentions_nondet_call(sql: &str) -> bool {
+    !find_nondet_calls(sql, false).is_empty()
+}
+
+/// Fold every zero-argument RAND() into one Float literal, returning the
+/// rewritten text (None when nothing folded). T-SQL evaluates RAND once per
+/// statement — every row of the result sees the same value — and a read (or
+/// a CTAS, whose query is row data created now) must pin that value into any
+/// text that could be replayed elsewhere.
+pub fn fold_rand_calls(sql: &str, rand_literal: &str) -> Option<String> {
+    // RAND only — NEWID/NEWSEQUENTIALID stay live on the read path (fresh
+    // UUID per call) and are handled by the write-path rewrite instead.
+    let hits = find_nondet_calls(sql, true);
+    if hits.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + rand_literal.len() + 16);
+    let mut last = 0usize;
+    for r in hits {
+        out.push_str(&sql[last..r.start]);
+        out.push_str(rand_literal);
+        last = r.end;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
+/// Byte ranges of zero-argument RAND/NEWID/NEWSEQUENTIALID calls. String
+/// literals, comments and quoted identifiers are skipped; a matching word
+/// must be a complete identifier followed by an empty argument list.
+fn find_nondet_calls(sql: &str, rand_only: bool) -> Vec<std::ops::Range<usize>> {
+    let b = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = sql_literal_end(sql, i);
+                i = end;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut j = i + 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                i = if j + 1 < b.len() { j + 2 } else { b.len() };
+            }
+            b'"' | b'`' => {
+                let quote = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == quote {
+                        if b.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if !matches!(&lb[start..i], b"rand" | b"newid" | b"newsequentialid") {
+                    continue;
+                }
+                if rand_only && &lb[start..i] != b"rand" {
+                    continue;
+                }
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'(') {
+                    continue;
+                }
+                let mut k = j + 1;
+                while k < b.len() && b[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if b.get(k) == Some(&b')') {
+                    out.push(start..k + 1);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// Cheap pre-filter for [`fold_wall_clocks`]: true when the text contains
 /// any wall-clock function token at all (substring match — the scanner does
 /// the precise work). ASCII-lowercase is byte-length preserving, so a byte
