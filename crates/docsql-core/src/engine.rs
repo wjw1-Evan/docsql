@@ -27162,7 +27162,7 @@ mod tsql_compat_tests {
             "SELECT dept, [2024] FROM sales PIVOT (AVG(qty) FOR yr IN (2024)) AS p ORDER BY dept",
         );
         assert_eq!(r.rows[0][1], Value::Float(20.0)); // (10+30)/2
-                                                  // Two implicit group columns survive.
+                                                      // Two implicit group columns survive.
         run(&mut db, "CREATE TABLE s2 (g TEXT, k TEXT, yr INT, qty INT)");
         run(
             &mut db,
