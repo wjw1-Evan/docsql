@@ -202,6 +202,10 @@ fn main() {
 /// inside a string literal or a quoted identifier must not terminate the
 /// statement (the old `line.ends_with(';')` check executed a truncated
 /// `VALUES ('line1;` and reported a parse error).
+///
+/// BEGIN…END block depth is tracked too: a `;` inside an open T-SQL block
+/// (`WHILE … BEGIN …; … END`) would otherwise hand the interpreter a
+/// truncated block whose WHILE never sees its END.
 fn statements_ready(sql: &str) -> bool {
     #[derive(PartialEq)]
     enum S {
@@ -217,8 +221,13 @@ fn statements_ready(sql: &str) -> bool {
         Block,
     }
     let b = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let lb = lower.as_bytes();
     let mut st = S::Code;
     let mut last_semi = false;
+    // Depth of open BEGIN…END blocks (BEGIN TRAN/TRANSACTION excluded — it
+    // is the transaction statement, not a block opener).
+    let mut begin_depth: i32 = 0;
     let mut i = 0;
     while i < b.len() {
         match st {
@@ -236,6 +245,59 @@ fn statements_ready(sql: &str) -> bool {
                     i += 1;
                 }
                 b';' => last_semi = true,
+                c if c.is_ascii_alphabetic() => {
+                    last_semi = false;
+                    let mut k = i;
+                    while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+                        k += 1;
+                    }
+                    let word = &lb[i..k];
+                    if word == b"begin" {
+                        let mut j = k;
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let is_tran = ["tran", "transaction", "distributed"].iter().any(|kw| {
+                            let kb = kw.as_bytes();
+                            b.len() >= j + kb.len()
+                                && &lb[j..j + kb.len()] == kb
+                                && (b.len() == j + kb.len()
+                                    || !(b[j + kb.len()].is_ascii_alphanumeric()
+                                        || b[j + kb.len()] == b'_'))
+                        });
+                        if !is_tran {
+                            begin_depth += 1;
+                        }
+                    } else if word == b"case" {
+                        // CASE … END is expression syntax: its END must not
+                        // close the surrounding BEGIN block.
+                        let mut case_nesting = 1i32;
+                        let mut j = k;
+                        while j < b.len() && case_nesting > 0 {
+                            if lb[j].is_ascii_alphabetic() {
+                                let mut m = j;
+                                while m < b.len() && (b[m].is_ascii_alphanumeric() || b[m] == b'_')
+                                {
+                                    m += 1;
+                                }
+                                match &lb[j..m] {
+                                    b"case" => case_nesting += 1,
+                                    b"end" => case_nesting -= 1,
+                                    _ => {}
+                                }
+                                j = m;
+                                continue;
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
+                    } else if word == b"end" && begin_depth > 0 {
+                        begin_depth -= 1;
+                    }
+                    i = k;
+                    continue;
+                }
                 c if !c.is_ascii_whitespace() => last_semi = false,
                 _ => {}
             },
@@ -290,8 +352,9 @@ fn statements_ready(sql: &str) -> bool {
         i += 1;
     }
     // A line comment is terminated by end-of-input just like by a newline;
-    // any other open state means the statement is incomplete.
-    matches!(st, S::Code | S::Line) && last_semi
+    // any other open state means the statement is incomplete. An open
+    // BEGIN…END block also holds the `;` inside the statement.
+    matches!(st, S::Code | S::Line) && last_semi && begin_depth == 0
 }
 
 /// Split a complete buffer into executable statements (quote/comment aware).

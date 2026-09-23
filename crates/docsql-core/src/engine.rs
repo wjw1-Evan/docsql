@@ -12862,6 +12862,35 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
         }
         SqlExpr::Identifier(i) => err(format!("column {} not allowed here", i.value)),
         SqlExpr::TypedString(ts) => typed_string_value(ts),
+        // Constant CASE (`VALUES (CASE WHEN … THEN … END)` in a resolved
+        // INSERT, replayed scripts): every branch is constant-foldable, the
+        // same comparison rule as the row-level CASE arm applies.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let base = operand.as_ref().map(|o| eval_const(o)).transpose()?;
+            for w in conditions {
+                let hit = match &base {
+                    Some(b) => {
+                        let cv = eval_const(&w.condition)?;
+                        !matches!(b, Value::Null)
+                            && !matches!(cv, Value::Null)
+                            && cmp_coerced(b, &cv) == Some(std::cmp::Ordering::Equal)
+                    }
+                    None => matches!(eval_const(&w.condition)?, Value::Bool(true)),
+                };
+                if hit {
+                    return eval_const(&w.result);
+                }
+            }
+            match else_result {
+                Some(r) => eval_const(r),
+                None => Ok(Value::Null),
+            }
+        }
         other => err(format!("unsupported expression: {other}")),
     }
 }

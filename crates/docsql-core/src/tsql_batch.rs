@@ -145,9 +145,31 @@ impl TsqlSession {
         self.last_result = None;
         let mut budget = MAX_BATCH_STATEMENTS;
         let mut first_chunk = true;
+        // `;` inside an open BEGIN…END block must not split the batch:
+        // text_chunks is block-blind (it also feeds the engine's plain
+        // statement path, where BEGIN is the transaction statement), so
+        // merge chunks while a block stays open. Transaction-style
+        // `BEGIN … COMMIT` scripts simply coalesce into one chunk, which
+        // parse_batch then runs as sequential statements.
+        let mut merged: Vec<String> = Vec::new();
         for chunk in stmt::text_chunks(sql) {
+            if let Some(last) = merged.last_mut() {
+                if batch_begin_depth(last) > 0 {
+                    last.push('\n');
+                    last.push_str(&chunk);
+                    continue;
+                }
+            }
+            merged.push(chunk);
+        }
+        for chunk in merged {
             let chunk = chunk.trim();
             if chunk.is_empty() {
+                // An empty chunk exists only around a dropped separator
+                // (a leading GO leaves one before the real batch): it still
+                // ends the previous batch, so the NEXT chunk must not ride
+                // `first_chunk` and inherit the old variables.
+                first_chunk = false;
                 continue;
             }
             if !first_chunk {
@@ -214,7 +236,11 @@ impl TsqlSession {
             }
             Stmt::Declare(decls) => {
                 for (name, init) in decls {
-                    if self.vars.contains_key(&name) {
+                    // A duplicate is an error only at batch top level: the
+                    // same parsed DECLARE inside a WHILE body re-executes
+                    // every iteration, and T-SQL treats re-execution as
+                    // re-initialization.
+                    if depth == 0 && self.vars.contains_key(&name) {
                         return err(format!(
                             "The variable name '@{name}' has already been declared"
                         ));
@@ -765,6 +791,112 @@ fn is_word_in(word: &[u8], list: &[&str]) -> bool {
     list.iter().any(|w| w.as_bytes() == word)
 }
 
+/// Net BEGIN…END depth of a batch chunk (quote/comment/bracket aware).
+/// Only used to keep `;`-split chunks of one T-SQL block together; BEGIN
+/// TRAN/TRANSACTION is excluded exactly like the block scanners.
+fn batch_begin_depth(s: &str) -> i32 {
+    let b = s.as_bytes();
+    let lower = s.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = stmt::sql_literal_end(s, i);
+                i = end;
+                continue;
+            }
+            b'"' | b'`' | b'[' => {
+                let close = match b[i] {
+                    b'[' => b']',
+                    other => other,
+                };
+                i += 1;
+                while i < b.len() {
+                    if b[i] == close {
+                        if b.get(i + 1) == Some(&close) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                continue;
+            }
+            c if c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                match &lb[start..i] {
+                    b"begin" => {
+                        let mut j = i;
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let is_tran = ["tran", "transaction", "distributed"].iter().any(|kw| {
+                            let kb = kw.as_bytes();
+                            b.len() >= j + kb.len()
+                                && &lb[j..j + kb.len()] == kb
+                                && (b.len() == j + kb.len()
+                                    || !(b[j + kb.len()].is_ascii_alphanumeric()
+                                        || b[j + kb.len()] == b'_'))
+                        });
+                        if !is_tran {
+                            depth += 1;
+                        }
+                    }
+                    b"case" => {
+                        // CASE … END is expression syntax: its END must not
+                        // bring the block depth back to zero (a chunk ending
+                        // inside an open block must keep merging).
+                        let mut case_nesting = 1i32;
+                        while i < b.len() && case_nesting > 0 {
+                            if lb[i].is_ascii_alphabetic() {
+                                let s = i;
+                                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_')
+                                {
+                                    i += 1;
+                                }
+                                match &lb[s..i] {
+                                    b"case" => case_nesting += 1,
+                                    b"end" => case_nesting -= 1,
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            i += 1;
+                        }
+                    }
+                    b"end" if depth > 0 => depth -= 1,
+                    _ => {}
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
 /// Parse one batch (already GO/;-split) into statements.
 fn parse_batch(sql: &str) -> Result<Vec<Stmt>> {
     let mut p = Parser {
@@ -844,106 +976,110 @@ impl<'a> Parser<'a> {
             if self.at_end() {
                 return Ok(out);
             }
-            let word = match self.peek_word() {
-                Some(w) => w.to_vec(),
-                None => {
-                    // Not a word: the remainder is one plain run for the
-                    // engine to judge.
-                    out.push(Stmt::Plain(self.read_plain()));
-                    continue;
-                }
-            };
-            match word.as_slice() {
-                b"declare" => {
-                    self.i += 7;
-                    out.push(self.parse_declare()?);
-                }
-                b"set" if self.starts_with_var_ahead() => {
+            out.extend(self.parse_one_stmt(depth)?);
+        }
+    }
+
+    /// Dispatch and consume ONE statement at the cursor. Shared by the
+    /// batch loop and the governed-body reader: an `IF`/`WHILE` body must
+    /// understand the same statement kinds as the top level — routing a
+    /// governed `SET @x = …` through the plain fallback used to substitute
+    /// the variable BEFORE assigning it (`SET 5 = 2` reaching the engine).
+    fn parse_one_stmt(&mut self, depth: usize) -> Result<Vec<Stmt>> {
+        let word = match self.peek_word() {
+            Some(w) => w.to_vec(),
+            None => {
+                // Not a word: the remainder is one plain run for the
+                // engine to judge.
+                return Ok(vec![Stmt::Plain(self.read_plain())]);
+            }
+        };
+        match word.as_slice() {
+            b"declare" => {
+                self.i += 7;
+                Ok(vec![self.parse_declare()?])
+            }
+            b"set" if self.starts_with_var_ahead() => {
+                self.i += 3;
+                Ok(vec![self.parse_set()?])
+            }
+            b"print" => {
+                self.i += 5;
+                Ok(vec![Stmt::Print(self.read_plain())])
+            }
+            b"if" => {
+                self.i += 2;
+                Ok(vec![self.parse_if(depth)?])
+            }
+            b"while" => {
+                self.i += 5;
+                Ok(vec![self.parse_while(depth)?])
+            }
+            b"begin" if self.peek_word_after_begin_is(b"try") => {
+                self.i += 5;
+                self.skip_trivia();
+                self.i += 3; // TRY
+                let try_ = self.parse_block(depth)?;
+                // parse_block consumed the END of "END TRY"; swallow
+                // the trailing marker word.
+                self.skip_trivia();
+                if self.peek_word() == Some(b"try") {
                     self.i += 3;
-                    out.push(self.parse_set()?);
                 }
-                b"print" => {
+                self.skip_trivia();
+                // Expect BEGIN CATCH
+                if self.peek_word() != Some(b"begin") || !self.peek_word_after_begin_is(b"catch") {
+                    return err("BEGIN TRY requires a matching BEGIN CATCH");
+                }
+                self.i += 5;
+                self.skip_trivia();
+                self.i += 5; // CATCH
+                let catch_ = self.parse_block(depth)?;
+                self.skip_trivia();
+                if self.peek_word() == Some(b"catch") {
                     self.i += 5;
-                    out.push(Stmt::Print(self.read_plain()));
                 }
-                b"if" => {
-                    self.i += 2;
-                    out.push(self.parse_if(depth)?);
+                Ok(vec![Stmt::TryCatch { try_, catch_ }])
+            }
+            b"begin" if self.begin_opens_block() => {
+                self.i += 5;
+                self.parse_block(depth)
+            }
+            b"break" => {
+                self.i += 5;
+                Ok(vec![Stmt::Break])
+            }
+            b"continue" => {
+                self.i += 8;
+                Ok(vec![Stmt::Continue])
+            }
+            b"return" | b"waitfor" | b"goto" => err(format!(
+                "{} is not supported in DocSQL batches",
+                String::from_utf8_lossy(&word)
+            )),
+            b"throw" => {
+                self.i += 5;
+                Ok(vec![Stmt::Throw(ThrowForm::Throw, self.read_plain())])
+            }
+            b"raiserror" => {
+                self.i += 9;
+                Ok(vec![Stmt::Throw(ThrowForm::RaiseError, self.read_plain())])
+            }
+            b"select" if self.select_has_assignment() => {
+                self.i += 6;
+                Ok(vec![self.parse_select_assign()?])
+            }
+            _ => {
+                // 兜底:read_plain 必须消费输入(零字符语句 + 游标不动
+                // = 扫描器空转,曾让批解析无限循环)。
+                let before = self.i;
+                let text = self.read_plain();
+                if self.i == before {
+                    return err(
+                        "batch parser made no progress — unexpected keyword at statement start",
+                    );
                 }
-                b"while" => {
-                    self.i += 5;
-                    out.push(self.parse_while(depth)?);
-                }
-                b"begin" if self.peek_word_after_begin_is(b"try") => {
-                    self.i += 5;
-                    self.skip_trivia();
-                    self.i += 3; // TRY
-                    let try_ = self.parse_block(depth)?;
-                    // parse_block consumed the END of "END TRY"; swallow
-                    // the trailing marker word.
-                    self.skip_trivia();
-                    if self.peek_word() == Some(b"try") {
-                        self.i += 3;
-                    }
-                    self.skip_trivia();
-                    // Expect BEGIN CATCH
-                    if self.peek_word() != Some(b"begin")
-                        || !self.peek_word_after_begin_is(b"catch")
-                    {
-                        return err("BEGIN TRY requires a matching BEGIN CATCH");
-                    }
-                    self.i += 5;
-                    self.skip_trivia();
-                    self.i += 5; // CATCH
-                    let catch_ = self.parse_block(depth)?;
-                    self.skip_trivia();
-                    if self.peek_word() == Some(b"catch") {
-                        self.i += 5;
-                    }
-                    out.push(Stmt::TryCatch { try_, catch_ });
-                }
-                b"begin" if self.begin_opens_block() => {
-                    self.i += 5;
-                    out.extend(self.parse_block(depth)?);
-                }
-                b"break" => {
-                    self.i += 5;
-                    out.push(Stmt::Break);
-                }
-                b"continue" => {
-                    self.i += 8;
-                    out.push(Stmt::Continue);
-                }
-                b"return" | b"waitfor" | b"goto" => {
-                    return err(format!(
-                        "{} is not supported in DocSQL batches",
-                        String::from_utf8_lossy(&word)
-                    ))
-                }
-                b"throw" => {
-                    self.i += 5;
-                    out.push(Stmt::Throw(ThrowForm::Throw, self.read_plain()));
-                }
-                b"raiserror" => {
-                    self.i += 9;
-                    out.push(Stmt::Throw(ThrowForm::RaiseError, self.read_plain()));
-                }
-                b"select" if self.select_has_assignment() => {
-                    self.i += 6;
-                    out.push(self.parse_select_assign()?);
-                }
-                _ => {
-                    // 兜底:read_plain 必须消费输入(零字符语句 + 游标不动
-                    // = 扫描器空转,曾让批解析无限循环)。
-                    let before = self.i;
-                    let text = self.read_plain();
-                    if self.i == before {
-                        return err(
-                            "batch parser made no progress — unexpected keyword at statement start",
-                        );
-                    }
-                    out.push(Stmt::Plain(text));
-                }
+                Ok(vec![Stmt::Plain(text)])
             }
         }
     }
@@ -967,6 +1103,25 @@ impl<'a> Parser<'a> {
                     j = end;
                     continue;
                 }
+                b'"' | b'`' | b'[' => {
+                    let close = match b[j] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    j += 1;
+                    while j < b.len() {
+                        if b[j] == close {
+                            if b.get(j + 1) == Some(&close) {
+                                j += 2;
+                                continue;
+                            }
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    continue;
+                }
                 b'-' if b.get(j + 1) == Some(&b'-') => {
                     while j < b.len() && b[j] != b'\n' {
                         j += 1;
@@ -984,13 +1139,28 @@ impl<'a> Parser<'a> {
                     while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
                         k += 1;
                     }
-                    if &lb[j..k] == b"begin" {
-                        nesting += 1;
-                    } else if &lb[j..k] == b"end" {
+                    let word = &lb[j..k];
+                    if word == b"begin" {
+                        // BEGIN TRAN inside the prospective block is a
+                        // transaction statement, not a nested block; an
+                        // inner BEGIN TRAN used to hide the block's END and
+                        // turned the block opener into a real transaction.
+                        if !self.word_after_is_transaction(k) {
+                            nesting += 1;
+                        }
+                    } else if word == b"end" {
                         nesting -= 1;
                         if nesting == 0 {
                             return true;
                         }
+                    } else if word == b"case" {
+                        // CASE … END belongs to the expression grammar; its
+                        // END must not close this block.
+                        if let Some(after) = self.skip_case_from(k) {
+                            j = after;
+                            continue;
+                        }
+                        return false; // unterminated CASE: not a block shape
                     }
                     j = k;
                     continue;
@@ -1005,9 +1175,32 @@ impl<'a> Parser<'a> {
     /// BEGIN TRAN/TRANSACTION/DISTRIBUTED is a transaction statement, not
     /// a block opener.
     fn begin_starts_transaction(&self) -> bool {
-        let mut j = self.i + 5;
-        while j < self.b.len() && self.b[j].is_ascii_whitespace() {
-            j += 1;
+        self.word_after_is_transaction(self.i + 5)
+    }
+
+    /// At `j` (just past a `begin` word): does a transaction keyword follow,
+    /// skipping trivia? Used both at the cursor (`begin_starts_transaction`)
+    /// and inside block-shape scans that look ahead.
+    fn word_after_is_transaction(&self, mut j: usize) -> bool {
+        loop {
+            while j < self.b.len() && self.b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if self.b.get(j) == Some(&b'-') && self.b.get(j + 1) == Some(&b'-') {
+                while j < self.b.len() && self.b[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            if self.b.get(j) == Some(&b'/') && self.b.get(j + 1) == Some(&b'*') {
+                j += 2;
+                while j + 1 < self.b.len() && !(self.b[j] == b'*' && self.b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(self.b.len());
+                continue;
+            }
+            break;
         }
         let lb = self.lb();
         for kw in ["tran", "transaction", "distributed"] {
@@ -1024,14 +1217,39 @@ impl<'a> Parser<'a> {
         false
     }
 
-    /// Word immediately after the BEGIN at the cursor (skipping ws).
+    /// Word immediately after the BEGIN at the cursor (skipping ws and
+    /// comments), with a word-boundary check so `BEGIN TRYX` is NOT a
+    /// `BEGIN TRY` — a prefix-only match used to swallow the whole
+    /// structure and demand a BEGIN CATCH that never comes.
     fn peek_word_after_begin_is(&self, want: &[u8]) -> bool {
         let mut j = self.i + 5;
-        while j < self.b.len() && self.b[j].is_ascii_whitespace() {
-            j += 1;
+        loop {
+            while j < self.b.len() && self.b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if self.b.get(j) == Some(&b'-') && self.b.get(j + 1) == Some(&b'-') {
+                while j < self.b.len() && self.b[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            if self.b.get(j) == Some(&b'/') && self.b.get(j + 1) == Some(&b'*') {
+                j += 2;
+                while j + 1 < self.b.len() && !(self.b[j] == b'*' && self.b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(self.b.len());
+                continue;
+            }
+            break;
         }
-        let lb = self.lb();
-        self.b.len() >= j + want.len() && &lb[j..j + want.len()] == want
+        if self.b.len() < j + want.len() || &self.lb()[j..j + want.len()] != want {
+            return false;
+        }
+        // Word boundary: the match must not run into a longer identifier.
+        self.b
+            .get(j + want.len())
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
     }
 
     fn starts_with_var_ahead(&self) -> bool {
@@ -1109,10 +1327,29 @@ impl<'a> Parser<'a> {
                     self.i = end;
                     continue;
                 }
+                b'"' | b'`' | b'[' => {
+                    let close = match self.b[self.i] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    self.i += 1;
+                    while self.i < self.b.len() {
+                        if self.b[self.i] == close {
+                            if self.b.get(self.i + 1) == Some(&close) {
+                                self.i += 2;
+                                continue;
+                            }
+                            self.i += 1;
+                            break;
+                        }
+                        self.i += 1;
+                    }
+                    continue;
+                }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 b'=' | b',' | b';' if depth == 0 => break,
-                b'\n' if depth == 0 && self.at_statement_boundary() => break,
+                b'\n' if depth == 0 && self.at_statement_boundary(start) => break,
                 _ => {}
             }
             self.i += 1;
@@ -1132,6 +1369,27 @@ impl<'a> Parser<'a> {
                 b'\'' => {
                     let (end, _) = stmt::sql_literal_end(self.sql, self.i);
                     self.i = end;
+                    continue;
+                }
+                // Quoted identifiers are data: `[order]` must not hit the
+                // clause-starter check on its inner word.
+                b'"' | b'`' | b'[' => {
+                    let close = match self.b[self.i] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    self.i += 1;
+                    while self.i < self.b.len() {
+                        if self.b[self.i] == close {
+                            if self.b.get(self.i + 1) == Some(&close) {
+                                self.i += 2;
+                                continue;
+                            }
+                            self.i += 1;
+                            break;
+                        }
+                        self.i += 1;
+                    }
                     continue;
                 }
                 b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
@@ -1154,7 +1412,7 @@ impl<'a> Parser<'a> {
                 b')' => depth -= 1,
                 b',' | b';' if depth == 0 => break,
                 _ if depth == 0 && c_is_alpha && self.word_at_is(SELECT_CLAUSE_STARTERS) => break,
-                b'\n' if depth == 0 && self.at_statement_boundary() => break,
+                b'\n' if depth == 0 && self.at_statement_boundary(start) => break,
                 _ => {}
             }
             self.i += 1;
@@ -1162,9 +1420,12 @@ impl<'a> Parser<'a> {
         self.sql[start..self.i].trim().to_string()
     }
 
-    /// True at a '\n' cursor whose next word starts a new statement —
-    /// plain statements end there when the script omits semicolons.
-    fn at_statement_boundary(&self) -> bool {
+    /// True at a '\n' cursor whose next word starts a new statement AND the
+    /// current text can legally end there — plain statements end there when
+    /// the script omits semicolons. `start` is where the current plain run
+    /// began; the shape guard needs it to tell a complete statement from a
+    /// continuation line.
+    fn at_statement_boundary(&self, start: usize) -> bool {
         if self.b.get(self.i) != Some(&b'\n') {
             return false;
         }
@@ -1188,7 +1449,122 @@ impl<'a> Parser<'a> {
         while k < self.b.len() && (self.b[k].is_ascii_alphanumeric() || self.b[k] == b'_') {
             k += 1;
         }
-        is_word_in(&self.lb()[j..k], STATEMENT_STARTERS)
+        is_word_in(&self.lb()[j..k], STATEMENT_STARTERS) && self.newline_cut_allowed(start)
+    }
+
+    /// Statement-shape guard for the newline boundary heuristic: the next
+    /// line's starter word only ends the current statement when the current
+    /// text is syntactically allowed to stop. `UPDATE t ⏎ SET …`,
+    /// `INSERT INTO t ⏎ SELECT …`, `SELECT 1 ⏎ UNION ⏎ SELECT 2` and
+    /// `WITH c AS (…) ⏎ SELECT …` are single statements whose second line
+    /// merely continues them — cutting there fed the engine a truncated
+    /// statement (parse error) or split a CTE from its consumer.
+    fn newline_cut_allowed(&self, start: usize) -> bool {
+        let prefix = &self.sql[start..self.i];
+        let t = prefix.trim_end();
+        // Trailing join token: the expression visibly continues.
+        if t.ends_with([',', '(', '.'])
+            || t.ends_with(['+', '-', '*', '/', '%', '=', '<', '>', '&', '|', '^'])
+            || t.ends_with('!')
+        {
+            return false;
+        }
+        // Top-level token walk (literals/comments/quoted runs are opaque).
+        let b = prefix.as_bytes();
+        let lower = prefix.to_ascii_lowercase();
+        let lb = lower.as_bytes();
+        let mut depth = 0i32;
+        let mut first: &[u8] = b"";
+        let mut last: &[u8] = b"";
+        let mut top_words: Vec<&[u8]> = Vec::new();
+        let mut i = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => {
+                    let (end, _) = stmt::sql_literal_end(prefix, i);
+                    i = end;
+                    continue;
+                }
+                b'"' | b'`' | b'[' => {
+                    let close = match b[i] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == close {
+                            if b.get(i + 1) == Some(&close) {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                c if c.is_ascii_alphabetic() => {
+                    let s = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    let w = &lb[s..i];
+                    if first.is_empty() {
+                        first = w;
+                    }
+                    last = w;
+                    if depth == 0 {
+                        top_words.push(w);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let top = |w: &[u8]| top_words.contains(&w);
+        match first {
+            // UPDATE needs its SET clause before the statement can end.
+            b"update" if !top(b"set") => return false,
+            // INSERT needs its row source.
+            b"insert"
+                if !top(b"select") && !top(b"values") && !top(b"exec") && !top(b"execute") =>
+            {
+                return false
+            }
+            b"merge" if !top(b"using") => return false,
+            // A WITH prefix is only complete once its main DML appeared at
+            // the top level (the CTE bodies' SELECTs live inside parens).
+            b"with"
+                if !top(b"select")
+                    && !top(b"insert")
+                    && !top(b"update")
+                    && !top(b"delete")
+                    && !top(b"merge") =>
+            {
+                return false
+            }
+            _ => {}
+        }
+        // A set operator cannot be the last top-level word of a statement.
+        !matches!(last, b"union" | b"except" | b"intersect" | b"all")
     }
 
     /// Read the rest of the current plain statement, INCLUDING any
@@ -1261,7 +1637,7 @@ impl<'a> Parser<'a> {
                 {
                     break
                 }
-                b'\n' if depth == 0 && self.at_statement_boundary() => break,
+                b'\n' if depth == 0 && self.at_statement_boundary(start) => break,
                 _ => {}
             }
             self.i += 1;
@@ -1354,6 +1730,28 @@ impl<'a> Parser<'a> {
                     end = self.i;
                     continue;
                 }
+                // Quoted identifier run: `[select] = 7` must not trip the
+                // statement-starter check on its inner word.
+                b'"' | b'`' | b'[' => {
+                    let close = match self.b[self.i] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    self.i += 1;
+                    while self.i < self.b.len() {
+                        if self.b[self.i] == close {
+                            if self.b.get(self.i + 1) == Some(&close) {
+                                self.i += 2;
+                                continue;
+                            }
+                            self.i += 1;
+                            break;
+                        }
+                        self.i += 1;
+                    }
+                    end = self.i;
+                    continue;
+                }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 // CASE 表达式整体跳过:内部的 ELSE 等语句起始词不结束条件
@@ -1422,67 +1820,83 @@ impl<'a> Parser<'a> {
         {
             self.i += 1;
         }
+        match self.skip_case_from(self.i) {
+            Some(after) => self.i = after,
+            // Unterminated CASE: consume to end of input; the engine
+            // downstream rejects the shape loudly.
+            None => self.i = self.b.len(),
+        }
+    }
+
+    /// From `j` just past a `case` word, the position just past its
+    /// matching END (None when unbalanced). Cursor-based twin of
+    /// [`Self::skip_case_block`] for the non-mutating block-shape scans:
+    /// a CASE expression's END must never be counted as a block END.
+    fn skip_case_from(&self, mut j: usize) -> Option<usize> {
+        let b = self.b;
+        let lb = self.lb();
         let mut nesting = 1i32;
-        while self.i < self.b.len() {
-            match self.b[self.i] {
+        while j < b.len() {
+            match b[j] {
                 b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(self.sql, self.i);
-                    self.i = end;
+                    let (end, _) = stmt::sql_literal_end(self.sql, j);
+                    j = end;
                     continue;
                 }
                 b'"' | b'`' | b'[' => {
-                    let close = match self.b[self.i] {
+                    let close = match b[j] {
                         b'[' => b']',
                         other => other,
                     };
-                    self.i += 1;
-                    while self.i < self.b.len() {
-                        if self.b[self.i] == close {
-                            if self.b.get(self.i + 1) == Some(&close) {
-                                self.i += 2;
+                    j += 1;
+                    while j < b.len() {
+                        if b[j] == close {
+                            if b.get(j + 1) == Some(&close) {
+                                j += 2;
                                 continue;
                             }
-                            self.i += 1;
+                            j += 1;
                             break;
                         }
-                        self.i += 1;
+                        j += 1;
                     }
                     continue;
                 }
-                b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
-                    while self.i < self.b.len() && self.b[self.i] != b'\n' {
-                        self.i += 1;
+                b'-' if b.get(j + 1) == Some(&b'-') => {
+                    while j < b.len() && b[j] != b'\n' {
+                        j += 1;
                     }
-                    continue;
                 }
-                b'/' if self.b.get(self.i + 1) == Some(&b'*') => {
-                    self.i += 2;
-                    while self.i + 1 < self.b.len()
-                        && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
-                    {
-                        self.i += 1;
+                b'/' if b.get(j + 1) == Some(&b'*') => {
+                    j += 2;
+                    while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                        j += 1;
                     }
-                    self.i = (self.i + 2).min(self.b.len());
-                    continue;
+                    j = (j + 2).min(b.len());
                 }
                 c if c.is_ascii_alphabetic() => {
-                    let word = self.peek_word().unwrap_or_default().to_vec();
-                    if word == b"case" {
-                        nesting += 1;
-                    } else if word == b"end" {
-                        nesting -= 1;
-                        if nesting == 0 {
-                            self.i += 3;
-                            return;
-                        }
+                    let mut k = j;
+                    while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+                        k += 1;
                     }
-                    self.i += word.len().max(1);
+                    match &lb[j..k] {
+                        b"case" => nesting += 1,
+                        b"end" => {
+                            nesting -= 1;
+                            if nesting == 0 {
+                                return Some(k);
+                            }
+                        }
+                        _ => {}
+                    }
+                    j = k;
                     continue;
                 }
                 _ => {}
             }
-            self.i += 1;
+            j += 1;
         }
+        None
     }
 
     fn parse_if(&mut self, depth: usize) -> Result<Stmt> {
@@ -1537,7 +1951,11 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
-        Ok(vec![Stmt::Plain(self.read_plain())])
+        // Same dispatch as the top level: a governed body may be a
+        // SET/SELECT assignment, DECLARE, PRINT, TRY…CATCH or a nested
+        // IF/WHILE — the old plain-run fallback substituted variables
+        // before the assignment could write them.
+        self.parse_one_stmt(depth)
     }
 
     /// Statements of a BEGIN…END block, consuming the matching END.
@@ -1550,6 +1968,25 @@ impl<'a> Parser<'a> {
                 b'\'' => {
                     let (end, _) = stmt::sql_literal_end(self.sql, self.i);
                     self.i = end;
+                    continue;
+                }
+                b'"' | b'`' | b'[' => {
+                    let close = match self.b[self.i] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    self.i += 1;
+                    while self.i < self.b.len() {
+                        if self.b[self.i] == close {
+                            if self.b.get(self.i + 1) == Some(&close) {
+                                self.i += 2;
+                                continue;
+                            }
+                            self.i += 1;
+                            break;
+                        }
+                        self.i += 1;
+                    }
                     continue;
                 }
                 b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
@@ -1570,8 +2007,23 @@ impl<'a> Parser<'a> {
                 }
                 c if c.is_ascii_alphabetic() => {
                     let word = self.peek_word().unwrap_or_default().to_vec();
-                    if word == b"begin" {
-                        nesting += 1;
+                    if word == b"case" {
+                        // CASE … END is expression syntax: its END must not
+                        // close this block (same rule as read_plain).
+                        if let Some(after) = self.skip_case_from(self.i + word.len()) {
+                            self.i = after;
+                            continue;
+                        }
+                        // Unterminated CASE: let the outer loop run to end
+                        // of input and fail with the missing-END error.
+                    } else if word == b"begin" {
+                        // BEGIN TRAN/TRANSACTION is a statement, not a
+                        // nested block (an inner BEGIN TRAN used to swallow
+                        // the block's END and execute the opener as a real
+                        // transaction).
+                        if !self.word_after_is_transaction(self.i + word.len()) {
+                            nesting += 1;
+                        }
                     } else if word == b"end" {
                         nesting -= 1;
                         if nesting == 0 {
