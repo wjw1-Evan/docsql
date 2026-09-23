@@ -566,7 +566,7 @@ impl Pager {
             self.persist_header()?;
             lock(&self.file).sync_all()?;
         }
-        self.truncate_wal_locked()?;
+        self.truncate_wal_locked(false)?;
         Ok(())
     }
 
@@ -695,10 +695,10 @@ impl Pager {
     /// epoch, so `None → None` across a checkpoint is still detected.
     fn page_version(&self, id: u32) -> (u64, Option<u64>) {
         // Sample page_lsn BEFORE the epoch: truncation publishes in the
-        // opposite order (clear page_lsn under its lock, then store the new
-        // epoch), so this order can only yield a consistent pre-truncation
-        // pair (both old — nothing changed yet) or a new epoch, which every
-        // consumer treats as "changed". Sampling epoch first could observe
+        // opposite order (store the new epoch, then clear page_lsn), so
+        // this order can only yield a consistent pre-truncation pair (both
+        // old — nothing changed yet) or a new epoch, which every consumer
+        // treats as "changed". Sampling epoch first could observe
         // (old epoch, cleared page_lsn) across a truncation and pass a
         // stale file image off as unchanged — exactly what the seqlock
         // double-check exists to prevent.
@@ -1036,10 +1036,9 @@ impl Pager {
         if !covered {
             return Ok(false);
         }
-        if !lock(&self.snaps).active.is_empty() {
+        if !self.truncate_wal_locked(true)? {
             return Ok(false);
         }
-        self.truncate_wal_locked()?;
         lock(&self.ckpt.st).covered_len = 0;
         Ok(true)
     }
@@ -1065,20 +1064,35 @@ impl Pager {
     /// Drop the log (data file already synced past it) and bump the epoch
     /// mirror. Callers must hold no other pager lock; the WAL mutex is taken
     /// here, the epoch mirror is refreshed and the per-page LSN table is
-    /// cleared under it.
-    fn truncate_wal_locked(&self) -> Result<()> {
+    /// cleared under it. `respect_snaps` (soft paths) yields to active
+    /// read snapshots UNDER the WAL lock — `begin_snapshot` registers under
+    /// the same lock, so an unlocked check would race a registration that
+    /// still needs this epoch's WAL history. Returns whether the log was
+    /// truncated.
+    fn truncate_wal_locked(&self, respect_snaps: bool) -> Result<bool> {
         let mut wal = lock(&self.wal);
+        if respect_snaps && !lock(&self.snaps).active.is_empty() {
+            return Ok(false);
+        }
         wal.checkpoint()?;
+        // Publish the new epoch BEFORE clearing the per-page LSNs. Readers
+        // sample (lsn, epoch) in that same order without the WAL lock; a
+        // writer publishing in the reader's order could expose the torn
+        // pair (lsn cleared, epoch still old), which `read_page_as_of`
+        // reads as "never dirtied in this epoch" while serving a
+        // post-snapshot image off the fast path. Epoch-first keeps the
+        // invariant "lsn cleared ⇒ epoch already new": a reader seeing the
+        // old epoch sampled the LSN before the clear (a genuine pre-state),
+        // and a reader seeing a cleared LSN necessarily sees the new epoch
+        // (the loud SnapshotTooOld path).
+        self.epoch.store(wal.epoch(), Ordering::Release);
         // Old-epoch page LSNs are meaningless once the checkpoint resets
         // LSNs to 1: a stale entry would compare against new-epoch snapshot
         // LSNs as "dirtied after the snapshot" and push correct fast-path
         // reads into the (now history-less) slow path. Cleared in the
         // commit path's lock order (wal → page_lsn).
         lock(&self.page_lsn).clear();
-        // Publish while the WAL lock is held so snapshot validation never
-        // observes a torn pre/post-checkpoint state.
-        self.epoch.store(wal.epoch(), Ordering::Release);
-        Ok(())
+        Ok(true)
     }
 
     fn commit_tx_inner(&self, mut tx: Tx, fsync: bool) -> Result<u64> {
@@ -1303,7 +1317,7 @@ impl Pager {
             // this thread waited) — the loop re-checks and breaks.
         }
         drop(st);
-        self.truncate_wal_locked()?;
+        self.truncate_wal_locked(false)?;
         let mut st = lock(&self.ckpt.st);
         st.covered_len = 0;
         Ok(())
@@ -2318,7 +2332,7 @@ mod tests {
             pager.commit_tx(tx).unwrap();
         }
 
-        pager.truncate_wal_locked().unwrap();
+        pager.truncate_wal_locked(false).unwrap();
 
         // A fresh snapshot reads the pre-checkpoint version via the fast
         // path (a truncation only happens after a covering data-file fsync,

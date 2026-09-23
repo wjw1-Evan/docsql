@@ -374,6 +374,14 @@ impl Wal {
         if self.deferred_since_fence == 0 {
             return Ok(0);
         }
+        if self.deferred_txids.is_empty() {
+            // Count > 0 with an empty list means the bookkeeping diverged
+            // (only reachable through a corrupted abort path): fencing now
+            // would legitimize deferred commits whose txids were lost.
+            return Err(WalError::Io(io::Error::other(
+                "WAL deferred bookkeeping diverged (outstanding count without txids); refusing to fence",
+            )));
+        }
         let lsn = self.append(KIND_FENCE, 0, &[])?;
         self.deferred_since_fence = 0;
         self.deferred_txids.clear();
@@ -387,7 +395,16 @@ impl Wal {
     /// durable. Recovery only replays the fsynced prefix, so a crash before
     /// sync simply drops those (uncommitted) transactions.
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_data()?;
+        if let Err(e) = self.file.sync_data() {
+            // The already-appended COMMIT/FENCE frames may still reach the
+            // disk via kernel writeback, so recovery could replay a
+            // transaction the caller is about to report as failed — the
+            // live catalog and any later recovery would diverge. Fail-stop
+            // (see `poisoned`): refuse every further append; a restart
+            // replays whatever actually made it to disk.
+            self.poisoned = Some("WAL fsync failed; on-disk durability is ambiguous".into());
+            return Err(e.into());
+        }
         self.durable_lsn = self.durable_lsn.max(self.last_commit_lsn);
         Ok(())
     }
@@ -404,10 +421,19 @@ impl Wal {
     /// committed and resurrect it. With the ABORT frames, recovery voids those
     /// deferred commits no matter what fence follows.
     pub fn abort_deferred(&mut self) -> Result<()> {
-        let txids = std::mem::take(&mut self.deferred_txids);
-        for txid in txids {
+        // Consume in place: on a mid-loop append failure the remaining txids
+        // must survive. `fence()` keys off the counter alone, so an emptied
+        // list with `deferred_since_fence > 0` would let the next fence
+        // cover the very transactions this ROLLBACK is voiding and
+        // resurrect them. Re-appending an ABORT for an already-voided txid
+        // is harmless on recovery, so retrying the loop is idempotent.
+        let mut i = 0;
+        while i < self.deferred_txids.len() {
+            let txid = self.deferred_txids[i];
             self.append(KIND_ABORT, txid, &[])?;
+            i += 1;
         }
+        self.deferred_txids.clear();
         self.deferred_since_fence = 0;
         Ok(())
     }
@@ -450,14 +476,16 @@ impl Wal {
     /// against reopen scans (which seed continuity from the first frame).
     pub fn checkpoint(&mut self) -> Result<()> {
         self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        // Rewrite the header before the counters reset: if the truncation
-        // landed but the header (or its sync) failed, the file on disk no
-        // longer matches `appended`/`next_lsn` — poison the log so no later
-        // append positional-writes into the zero hole (see `poisoned`).
+        // Rewrite the header (seek first) before the counters reset: if the
+        // truncation landed but the header (or its sync) failed, the file on
+        // disk no longer matches `appended`/`next_lsn` — poison the log so
+        // no later append positional-writes into the zero hole (see
+        // `poisoned`). The seek belongs inside the guarded block: failing
+        // after set_len(0) leaves the same header-less zero-hole state.
         if let Err(e) = self
             .file
-            .write_all(HEADER)
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(HEADER))
             .and_then(|()| self.file.sync_all())
         {
             self.poisoned =
