@@ -2740,6 +2740,21 @@ fn authorize_statement(
                         }
                         match db.and_then(|d| d.view_base_tables(&t)) {
                             Some(bases) => {
+                                // A direct table grant on the view itself is
+                                // a valid SELECT boundary: the view is the
+                                // permission surface and its bases stay
+                                // hidden (standard SQL view semantics — the
+                                // grant row could previously never match).
+                                // readonly/readwrite blanket access must NOT
+                                // take this shortcut: the base expansion is
+                                // exactly what refuses user-table views to
+                                // those roles.
+                                if !g.readonly
+                                    && !g.readwrite
+                                    && g.may_select(&t)
+                                {
+                                    continue;
+                                }
                                 depth += 1;
                                 if depth > 16 {
                                     return Err("view chain too deep to authorize".into());

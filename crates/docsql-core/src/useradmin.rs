@@ -277,6 +277,26 @@ impl Cursor {
             other => Err(format!("expected a name, found {other:?}")),
         }
     }
+    /// A table name for GRANT/REVOKE targets: case PRESERVED. The engine
+    /// catalog is case-sensitive, so a grant stored lowercased could never
+    /// match a mixed-case table (the grant failed loudly, but roles were
+    /// useless against such tables). Resolve-side matching is
+    /// case-insensitive, so rows written by older versions keep working.
+    fn name_raw(&mut self) -> Result<String, String> {
+        match self.next() {
+            Some(Tok::Word(w)) => Ok(w),
+            other => Err(format!("expected a name, found {other:?}")),
+        }
+    }
+    /// Comma-separated list of case-preserved table names.
+    fn name_list_raw(&mut self) -> Result<Vec<String>, String> {
+        let mut out = vec![self.name_raw()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            out.push(self.name_raw()?);
+        }
+        Ok(out)
+    }
     /// A comma-separated list of names.
     fn name_list(&mut self) -> Result<Vec<String>, String> {
         let mut out = vec![self.name()?];
@@ -386,7 +406,7 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
                 c.next();
             }
         }
-        let tables = c.name_list()?;
+        let tables = c.name_list_raw()?;
         c.kw(if is_grant { "TO" } else { "FROM" })?;
         let names = c.name_list()?;
         c.expect_end()?;
@@ -533,9 +553,11 @@ pub fn redact_sql(sql: &str) -> String {
             if bytes.get(j) == Some(&b'\'') {
                 let (end, closed) = crate::stmt::sql_literal_end(sql, j);
                 // An unterminated literal still hides the tail: the query
-                // log must never carry a password's characters.
+                // log must never carry a password's characters. The hash
+                // exemption needs the FULL stored shape (prefix alone would
+                // let a hostile prefix smuggle a real secret through).
                 let value = &sql[j + 1..if closed { end - 1 } else { bytes.len() }];
-                if !value.starts_with(kdf::HASH_PREFIX) {
+                if !kdf::is_stored_form(value) {
                     out.push_str("PASSWORD '***'");
                     i = end;
                     continue;
@@ -575,6 +597,17 @@ fn validate_name(name: &str) -> Result<(), String> {
     if BUILTIN_ROLES.contains(&name) {
         return Err(format!(
             "{name} is a built-in role name and cannot be reused"
+        ));
+    }
+    // Privilege keywords can never be granted as ROLE names: the GRANT
+    // parser reads them as the privilege list, so such a role would be a
+    // dead end (creatable, ungrantable).
+    if matches!(
+        name,
+        "select" | "insert" | "update" | "delete" | "all"
+    ) {
+        return Err(format!(
+            "{name} is a privilege keyword and cannot be used as a name"
         ));
     }
     Ok(())
@@ -974,12 +1007,18 @@ impl UserGrants {
             || self.readwrite
             || self
                 .table_privs
-                .get(table)
-                .is_some_and(|b| b & PRIV_SELECT != 0)
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(table))
+                .is_some_and(|(_, b)| b & PRIV_SELECT != 0)
     }
 
     pub fn may_dml(&self, table: &str, bit: u8) -> bool {
-        self.readwrite || self.table_privs.get(table).is_some_and(|b| b & bit != 0)
+        self.readwrite
+            || self
+                .table_privs
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(table))
+                .is_some_and(|(_, b)| b & bit != 0)
     }
 }
 
@@ -1314,8 +1353,20 @@ mod tests {
             redact_sql(&format!("CREATE USER alice PASSWORD '{pw}'")),
             "CREATE USER alice PASSWORD '***'"
         );
-        let hashed = format!("CREATE USER a PASSWORD '{}$60000$aa$bb'", kdf::HASH_PREFIX);
-        assert_eq!(redact_sql(&hashed), hashed);
+        // A real stored form rides through (dump/replay text stays readable).
+        let real = crate::kdf::hash_password("a-good-password", &[0u8; 16]);
+        let stmt = format!("CREATE USER a PASSWORD '{real}'");
+        assert_eq!(redact_sql(&stmt), stmt);
+        // A prefix-forged value (fails the full stored-shape parse) is a
+        // password like any other — never reach the log.
+        let forged = format!(
+            "CREATE USER a PASSWORD '{}my-real-secret'",
+            kdf::HASH_PREFIX
+        );
+        assert_eq!(
+            redact_sql(&forged),
+            "CREATE USER a PASSWORD '***'"
+        );
     }
 
     #[test]

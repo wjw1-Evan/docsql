@@ -8083,6 +8083,20 @@ impl Database {
                     // The old name must not keep a stale AUTOINCREMENT
                     // watermark for a table created under it later.
                     self.autoinc_cache.remove(&tname);
+                    // Grants follow the rename: a row left on the old name
+                    // would (a) resurrect onto a future same-named table —
+                    // silent privilege escalation across unrelated data —
+                    // and (b) break dump replay (GRANT on a table that no
+                    // longer exists aborts the whole restore).
+                    let lit_old = crate::stmt::sql_string_literal(&tname);
+                    let lit_new = crate::stmt::sql_string_literal(&new_name);
+                    self.execute(&format!(
+                        "UPDATE {} SET tbl = {} WHERE tbl = {}",
+                        crate::useradmin::GRANTS_TABLE,
+                        lit_new,
+                        lit_old
+                    ))
+                    .ok();
                     if let Err(e) = self.rewrite_table(&new_name, &mut meta, docs) {
                         // rewrite_table's own failure restore only covers the
                         // NEW name's entry (absent here) — without this the

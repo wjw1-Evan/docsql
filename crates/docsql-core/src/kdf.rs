@@ -321,9 +321,10 @@ impl StoredPw {
 
     /// Constant-time password check against this stored credential.
     /// Out-of-bound parameters fail closed (deny the login) instead of
-    /// running an attacker-chosen work factor.
+    /// running an attacker-chosen work factor. Zero iterations is out of
+    /// bounds too: the primitive asserts on it.
     pub fn verify(&self, password: &str) -> bool {
-        if self.iterations > MAX_PBKDF2_ITERATIONS
+        if !(1..=MAX_PBKDF2_ITERATIONS).contains(&self.iterations)
             || self.salt.len() > MAX_SALT_LEN
             || self.salt.is_empty()
         {
