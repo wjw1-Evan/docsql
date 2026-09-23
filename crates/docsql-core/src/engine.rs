@@ -1111,7 +1111,10 @@ impl<'a> ReadCx<'a> {
             "GENERATE_SERIES" => &["value"],
             _ => &["key", "value", "type"],
         };
-        if let Ok(Some(rename)) = table_alias_columns(&alias_obj.columns, source_cols.len()) {
+        // A wrong column list must fail loudly, exactly like the derived
+        // table path — swallowing it silently dropped the rename.
+        let rename = table_alias_columns(&alias_obj.columns, source_cols.len())?;
+        if let Some(rename) = rename {
             for row in &mut out {
                 // Rename IN PLACE (move the value from the function's output
                 // column to its alias). Inserting alongside would leak the
@@ -1267,14 +1270,14 @@ impl<'a> ReadCx<'a> {
                 }
                 let (inner_name, _inner_alias, docs) = self.load_table_factor(table, ctes)?;
                 let pivot = pivot_factor(docs, aggregate_functions, value_column, value_source)?;
-                let out_alias = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| inner_name);
-                let _ = &out_alias;
+                // Same alias fallback as UNPIVOT: without it the sentinel
+                // "@pivot" leaked into output column names on JOIN.
                 return Ok((
                     "@pivot".into(),
-                    alias.as_ref().map(|a| a.name.value.clone()),
+                    alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .or(Some(inner_name)),
                     pivot,
                 ));
             }
@@ -2158,7 +2161,17 @@ impl<'a> ReadCx<'a> {
         if base.joins.is_empty() && from.len() == 1 {
             if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &base.relation {
                 let tname = obj_name(name);
-                if self.tables.contains_key(&tname) && !ctes.contains_key(&tname) {
+                // Same gates as the window paths: a non-plain table factor
+                // (TABLESAMPLE / index hints / alias column lists / …) must
+                // reach load_table_factor's loud rejections instead of being
+                // silently executed as a plain scan, and compat views (dual,
+                // sqlite_master, …) must not be shadowed by same-named user
+                // tables depending on index presence.
+                if plain_table_factor(&base.relation)
+                    && !is_compat_view(&tname)
+                    && self.tables.contains_key(&tname)
+                    && !ctes.contains_key(&tname)
+                {
                     let akey = alias.as_ref().map(|a| a.name.value.clone());
                     if let Some(pairs) =
                         self.index_probe(&tname, akey.as_deref(), selection, ctes)?
@@ -2273,14 +2286,42 @@ impl<'a> ReadCx<'a> {
                     let on = match c {
                         JoinConstraint::On(e) => Some(e.clone()),
                         JoinConstraint::Using(cols) => {
-                            // a USING b == ON left.b = right.b (unqualified lookups
-                            // are not supported; use alias-qualified names)
+                            // a USING b == ON left.b = right.b, with `left`
+                            // resolved against the ACCUMULATED left rows: in
+                            // a join chain the column may belong to a middle
+                            // table, and binding it to the base table read
+                            // the merged row as NULL (silently zero rows).
                             let mut e = None;
                             for c in cols {
                                 let col = obj_name(c);
+                                let suffix = format!(".{col}");
+                                let owner = match rows.first() {
+                                    Some(sample) => {
+                                        let owners: Vec<&str> = sample
+                                            .keys()
+                                            .filter_map(|k| k.strip_suffix(&suffix))
+                                            .collect();
+                                        match owners.as_slice() {
+                                            [] => {
+                                                return err(format!(
+                                                    "USING column {col} does not exist on the left side of the join"
+                                                ))
+                                            }
+                                            [one] => (*one).to_string(),
+                                            _ => {
+                                                return err(format!(
+                                                    "USING column {col} is ambiguous on the left side of the join"
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    // No rows yet: nothing to verify against;
+                                    // keep the historical base-table binding.
+                                    None => bkey.clone(),
+                                };
                                 let eq = SqlExpr::BinaryOp {
                                     left: Box::new(SqlExpr::Identifier(
-                                        sqlparser::ast::Ident::new(format!("{bkey}.{col}")),
+                                        sqlparser::ast::Ident::new(format!("{owner}.{col}")),
                                     )),
                                     op: sqlparser::ast::BinaryOperator::Eq,
                                     right: Box::new(SqlExpr::Identifier(
@@ -2346,6 +2387,16 @@ impl<'a> ReadCx<'a> {
         // expression evaluator never sees them.
         if let Some(sel) = &mut select.selection {
             self.subst_expr(sel)?;
+        }
+        // JOIN ON conditions can carry uncorrelated subqueries too
+        // (`ON a.x = (SELECT MIN(y) FROM b)`); without the same substitution
+        // the row-local evaluator misreports them as correlated.
+        for twj in &mut select.from {
+            for j in &mut twj.joins {
+                if let Some(e) = join_on_expr_mut(&mut j.join_operator) {
+                    self.subst_expr(e)?;
+                }
+            }
         }
         // ORDER BY expressions too: EF Core emits `ORDER BY (SELECT 1)` for
         // Skip/Take without an explicit ordering key.
@@ -2552,6 +2603,20 @@ impl<'a> ReadCx<'a> {
                 ) {
                     return err(format!("unsupported set operation: {op}"));
                 }
+                // BY NAME alignment is not implemented: silently running it
+                // positionally would pair unrelated columns (and ALL BY NAME
+                // would additionally lose the bag semantics to the implicit
+                // DISTINCT below).
+                if matches!(
+                    set_quantifier,
+                    SetQuantifier::ByName
+                        | SetQuantifier::AllByName
+                        | SetQuantifier::DistinctByName
+                ) {
+                    return err(
+                        "UNION/INTERSECT/EXCEPT ... BY NAME is not supported (columns align positionally)".to_string(),
+                    );
+                }
                 // Set operations combine whole result sets: strip per-arm
                 // ORDER BY/LIMIT/FETCH so they apply to the combination only.
                 // (Leaving `fetch` in applied `FETCH FIRST n ROWS ONLY` to
@@ -2660,6 +2725,14 @@ impl<'a> ReadCx<'a> {
                 }
                 let rows = self.apply_order_limit(query, rows, &columns, None)?;
                 Ok(ExecOutcome::Rows(QueryResult { columns, rows }))
+            }
+            SetExpr::Query(inner) => {
+                // Parenthesized query body, e.g. `((SELECT 1))`: re-dispatch
+                // the inner query (its ORDER BY/LIMIT apply) instead of
+                // rejecting the shape.
+                let mut q = *inner;
+                q.with = None; // CTEs are already materialized in `ctes`
+                self.exec_query_body(q, ctes)
             }
             other => err(format!("unsupported query body: {other}")),
         }
@@ -3045,23 +3118,7 @@ impl<'a> ReadCx<'a> {
         let mut from_names = std::collections::BTreeSet::new();
         collect_from_names(q, &mut from_names);
         let mut hits = Vec::new();
-        if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
-            if let Some(sel_expr) = &sel.selection {
-                collect_correlated_refs(sel_expr, &from_names, self.tables, &mut hits);
-            }
-            if let Some(having) = &sel.having {
-                collect_correlated_refs(having, &from_names, self.tables, &mut hits);
-            }
-            for item in &sel.projection {
-                match item {
-                    sqlparser::ast::SelectItem::UnnamedExpr(e)
-                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
-                        collect_correlated_refs(e, &from_names, self.tables, &mut hits);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.collect_correlated_in_body(&q.body, &from_names, &mut hits);
         if let Some(qualifier) = hits.first() {
             return err(format!(
                 "correlated subqueries are not supported (reference to outer table {qualifier})"
@@ -3070,6 +3127,60 @@ impl<'a> ReadCx<'a> {
         match self.exec_query(q.clone())? {
             ExecOutcome::Rows(r) => Ok(r),
             _ => err("subquery must be a SELECT"),
+        }
+    }
+
+    /// Scan every expression surface of a subquery body for outer references.
+    /// Set-operation arms, parenthesized query bodies, GROUP BY keys and JOIN
+    /// ON conditions all evaluate in the inner scope — a shape the old
+    /// Select-only scan skipped silently read the outer column as NULL.
+    fn collect_correlated_in_body(
+        &self,
+        body: &sqlparser::ast::SetExpr,
+        from_names: &std::collections::BTreeSet<String>,
+        hits: &mut Vec<String>,
+    ) {
+        use sqlparser::ast::SetExpr;
+        match body {
+            SetExpr::Select(sel) => {
+                for twj in &sel.from {
+                    for j in &twj.joins {
+                        if let Some(e) = join_on_expr(&j.join_operator) {
+                            collect_correlated_refs(e, from_names, self.tables, hits);
+                        }
+                    }
+                }
+                if let Some(sel_expr) = &sel.selection {
+                    collect_correlated_refs(sel_expr, from_names, self.tables, hits);
+                }
+                if let Some(having) = &sel.having {
+                    collect_correlated_refs(having, from_names, self.tables, hits);
+                }
+                if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &sel.group_by {
+                    for e in es {
+                        collect_correlated_refs(e, from_names, self.tables, hits);
+                    }
+                }
+                for item in &sel.projection {
+                    match item {
+                        sqlparser::ast::SelectItem::UnnamedExpr(e)
+                        | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                            collect_correlated_refs(e, from_names, self.tables, hits);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.collect_correlated_in_body(left, from_names, hits);
+                self.collect_correlated_in_body(right, from_names, hits);
+            }
+            SetExpr::Query(inner) => {
+                let mut nested = from_names.clone();
+                collect_from_names(inner, &mut nested);
+                self.collect_correlated_in_body(&inner.body, &nested, hits);
+            }
+            _ => {}
         }
     }
 
@@ -3182,7 +3293,32 @@ impl<'a> ReadCx<'a> {
                             || bound_elements(v).is_some_and(|items| items.iter().any(promotes))
                     }),
             };
-        if !has_str_bound {
+        // A TIMESTAMP-typed bound (TIMESTAMP '…' literal / CAST fold) needs
+        // the same band check from the other side: the coercing predicate
+        // (cmp_coerced) lifts Str KEYS to Timestamps, so a raw-band probe
+        // against a Str or mixed band silently loses rows (Eq probes match
+        // nothing — Timestamps rank below every Str; exact windows return
+        // the whole Str band). Only a pure-Timestamp band keeps the probe.
+        let ts_positions = |v: &Value| -> Vec<usize> {
+            match v {
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches!(e, Value::Timestamp(_)))
+                    .map(|(i, _)| i)
+                    .collect(),
+                Value::Timestamp(_) => vec![0],
+                _ => Vec::new(),
+            }
+        };
+        let has_ts_bound = match plan {
+            ProbePlan::Eq(v) | ProbePlan::Prefix(v) => !ts_positions(v).is_empty(),
+            ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|(v, _)| !ts_positions(v).is_empty()),
+        };
+        if !has_str_bound && !has_ts_bound {
             return Ok(Some((plan.clone(), false)));
         }
         let reader = self.reader();
@@ -3254,6 +3390,13 @@ impl<'a> ReadCx<'a> {
                         return Ok(None);
                     }
                 }
+                for i in ts_positions(v) {
+                    // Timestamp 边界只在纯 Timestamp 带上与谓词同义;
+                    // Str/混合带回退全扫。
+                    if !band_ts_at(i) {
+                        return Ok(None);
+                    }
+                }
             }
             ProbePlan::Range { lo, hi } => {
                 for i in [lo.as_ref(), hi.as_ref()]
@@ -3262,6 +3405,15 @@ impl<'a> ReadCx<'a> {
                     .flat_map(|(v, _)| str_positions(v))
                 {
                     if !safe_at(i) {
+                        return Ok(None);
+                    }
+                }
+                for i in [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(v, _)| ts_positions(v))
+                {
+                    if !band_ts_at(i) {
                         return Ok(None);
                     }
                 }
@@ -9470,6 +9622,12 @@ fn resolve_conflict_constraint(meta: &TableMeta, name: &str) -> Result<String> {
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value> {
+    // NULL is sticky: an overflowed partial (see the Int/Int arm below) must
+    // keep the whole SUM NULL instead of erroring "non-numeric" on the next
+    // addition — the result used to depend on where the overflow landed.
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(Value::Null);
+    }
     // Decimal poisons the sum toward exactness: Int/Float operands convert
     // losslessly (a Float contributes its exact binary value).
     if matches!(a, Value::Decimal(_)) || matches!(b, Value::Decimal(_)) {
@@ -9638,12 +9796,20 @@ fn eval_agg(
                         }
                     })
                     .unwrap_or(Value::Null),
-                AggOp::GroupConcat => Value::Str(
-                    vals.iter()
-                        .map(value_to_text)
-                        .collect::<Vec<_>>()
-                        .join(sep.as_deref().unwrap_or(",")),
-                ),
+                AggOp::GroupConcat => {
+                    // Zero contributing rows (or all-NULL input) is NULL, not
+                    // the empty string — IS NULL checks depend on it.
+                    if vals.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Str(
+                            vals.iter()
+                                .map(value_to_text)
+                                .collect::<Vec<_>>()
+                                .join(sep.as_deref().unwrap_or(",")),
+                        )
+                    }
+                }
             })
         }
     }
@@ -9938,19 +10104,38 @@ fn reduce_aggregate(name: &str, vals: &[Value]) -> Result<Value> {
             if non_null.is_empty() {
                 return Ok(Value::Null);
             }
+            if name == "AVG" {
+                // Mirror eval_agg's AVG (float, or exact when decimal input):
+                // `arith`'s Int/Int Divide truncates, so PIVOT(AVG) used to
+                // disagree with a plain AVG over the same rows.
+                if non_null.iter().any(|v| matches!(v, Value::Decimal(_))) {
+                    let mut acc = Decimal::ZERO;
+                    for v in &non_null {
+                        acc = acc
+                            .checked_add(as_decimal(v)?)
+                            .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                    }
+                    return Ok(acc
+                        .checked_div(Decimal::from(non_null.len() as i64))
+                        .map(Value::Decimal)
+                        .unwrap_or(Value::Null));
+                }
+                let n = non_null.len() as f64;
+                let mut acc = 0.0f64;
+                for v in &non_null {
+                    acc += match v {
+                        Value::Int(i) => *i as f64,
+                        Value::Float(f) => *f,
+                        _ => return err("AVG of non-numeric"),
+                    };
+                }
+                return Ok(Value::Float(acc / n));
+            }
             let mut acc = Value::Int(0);
             for v in &non_null {
                 acc = arith(acc, &BinaryOperator::Plus, (*v).clone())?;
             }
-            if name == "AVG" {
-                arith(
-                    acc,
-                    &BinaryOperator::Divide,
-                    Value::Int(non_null.len() as i64),
-                )
-            } else {
-                Ok(acc)
-            }
+            Ok(acc)
         }
         other => err(format!(
             "PIVOT aggregate {other} is not supported (SUM/AVG/MIN/MAX/COUNT)"
@@ -10669,6 +10854,32 @@ fn contains_agg(e: &SqlExpr) -> bool {
         SqlExpr::Nested(inner) => contains_agg(inner),
         SqlExpr::BinaryOp { left, right, .. } => contains_agg(left) || contains_agg(right),
         SqlExpr::UnaryOp { expr, .. } => contains_agg(expr),
+        // Wrappers the projection router must see through: `CAST(SUM(x))`,
+        // `SUM(x) BETWEEN …`, `SUM(x) IS NULL`, `SUM(x) LIKE …`,
+        // `SUM(x) IN (…)` — all evaluate aggregates (check_group_refs and
+        // eval_group_expr implement the arms; only the routing predicate
+        // was missing, which turned these into loud errors).
+        SqlExpr::Cast { expr, .. } => contains_agg(expr),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => contains_agg(expr) || contains_agg(low) || contains_agg(high),
+        SqlExpr::IsNull(expr) => contains_agg(expr),
+        SqlExpr::IsNotNull(expr) => contains_agg(expr),
+        SqlExpr::IsDistinctFrom(a, b) | SqlExpr::IsNotDistinctFrom(a, b) => {
+            contains_agg(a) || contains_agg(b)
+        }
+        SqlExpr::InList { expr, list, .. } => contains_agg(expr) || list.iter().any(contains_agg),
+        SqlExpr::Like { .. } | SqlExpr::ILike { .. } => {
+            // negated/any flags and the char escape cannot carry aggregates;
+            // only the two operand expressions can.
+            let (expr, pattern) = match e {
+                SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+                    (expr, pattern)
+                }
+                _ => unreachable!(),
+            };
+            contains_agg(expr) || contains_agg(pattern)
+        }
         SqlExpr::Case {
             operand,
             conditions,
@@ -11581,6 +11792,17 @@ fn collect_from_names(q: &Query, out: &mut std::collections::BTreeSet<String>) {
                     out.insert(a.name.value.clone());
                 }
             }
+            // Joined tables are inner-scope names too: a reference to them
+            // from inside the subquery is NOT a correlation (the old
+            // base-relation-only scan misrejected legitimate subqueries).
+            for j in &twj.joins {
+                if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &j.relation {
+                    out.insert(obj_name(name));
+                    if let Some(a) = alias {
+                        out.insert(a.name.value.clone());
+                    }
+                }
+            }
         }
     }
 }
@@ -11663,12 +11885,48 @@ fn join_on_expr(op: &sqlparser::ast::JoinOperator) -> Option<&SqlExpr> {
     use sqlparser::ast::JoinConstraint as JC;
     use sqlparser::ast::JoinOperator as JO;
     let constraint = match op {
-        JO::Inner(c)
+        JO::Join(c)
+        | JO::Inner(c)
+        | JO::Left(c)
         | JO::LeftOuter(c)
+        | JO::Right(c)
         | JO::RightOuter(c)
         | JO::FullOuter(c)
+        | JO::CrossJoin(c)
+        | JO::Semi(c)
         | JO::LeftSemi(c)
         | JO::RightSemi(c)
+        | JO::Anti(c)
+        | JO::LeftAnti(c)
+        | JO::RightAnti(c) => c,
+        _ => return None,
+    };
+    match constraint {
+        JC::On(e) => Some(e),
+        _ => None,
+    }
+}
+
+/// Mutable twin of [`join_on_expr`] for in-place expression substitution.
+/// Every constraint-carrying variant must be covered here AND there: the
+/// read-target walkers use the shared accessor, so an uncovered variant
+/// would let a subquery inside its ON read tables the authorizer never saw.
+fn join_on_expr_mut(op: &mut sqlparser::ast::JoinOperator) -> Option<&mut SqlExpr> {
+    use sqlparser::ast::JoinConstraint as JC;
+    use sqlparser::ast::JoinOperator as JO;
+    let constraint = match op {
+        JO::Join(c)
+        | JO::Inner(c)
+        | JO::Left(c)
+        | JO::LeftOuter(c)
+        | JO::Right(c)
+        | JO::RightOuter(c)
+        | JO::FullOuter(c)
+        | JO::CrossJoin(c)
+        | JO::Semi(c)
+        | JO::LeftSemi(c)
+        | JO::RightSemi(c)
+        | JO::Anti(c)
         | JO::LeftAnti(c)
         | JO::RightAnti(c) => c,
         _ => return None,
@@ -12270,9 +12528,17 @@ fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
     if let Some(v) = doc.get(name) {
         return Ok(v.clone());
     }
+    // Unqualified name on JOINED rows (every key is "alias.col"): take the
+    // FIRST source in row order (BTreeMap order is deterministic; matches
+    // left-table-first convention). Restricted to join-shaped rows: a
+    // single-table doc with a literal dotted column ("x.v") must not leak
+    // into bare `v` — index trees only ever key the bare name, so the
+    // generic path answering what a probe cannot see made query results
+    // depend on whether an index exists.
+    if !doc.keys().all(|k| k.contains('.')) {
+        return Ok(Value::Null);
+    }
     let suffix = format!(".{name}");
-    // Unqualified name on joined rows: take the FIRST source in row order
-    // (BTreeMap order is deterministic; matches left-table-first convention).
     Ok(doc
         .iter()
         .find(|(k, _)| k.ends_with(&suffix))
@@ -13997,6 +14263,16 @@ fn probe_plan(
     // partial prefix becomes a Prefix scan with a prefix retain. Non-leading
     // columns alone cannot use the tree — they fall back to the scan.
     if !eq_map.is_empty() {
+        // eq_map keys keep their SQL spelling (t.a / x.a / a): normalize to
+        // bare column names so qualified conjuncts still build the prefix —
+        // `covered` already mapped them, only the prefix lookup missed.
+        let mut bare_eq: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+        for (k, v) in &eq_map {
+            if let Some(name) = unqualified_col(k, table, alias) {
+                bare_eq.insert(name, v.clone());
+            }
+        }
         let mut best: Option<(String, Vec<Value>)> = None;
         for root_key in meta.index_roots.keys() {
             let cols = meta.index_columns_of(root_key);
@@ -14005,7 +14281,7 @@ fn probe_plan(
             }
             let mut prefix = Vec::with_capacity(cols.len());
             for c in &cols {
-                match eq_map.get(c) {
+                match bare_eq.get(c) {
                     Some(v) => prefix.push(v.clone()),
                     None => break,
                 }
@@ -26879,13 +27155,13 @@ mod tsql_compat_tests {
             "SELECT dept, [2024], [2025] FROM sales PIVOT (MIN(qty) FOR yr IN (2024, 2025)) AS p ORDER BY dept",
         );
         assert_eq!(r.rows[0][2], Value::Int(20));
-        // AVG aggregate.
+        // AVG aggregate: float division, consistent with a plain AVG.
         run(&mut db, "INSERT INTO sales VALUES ('a', 2024, 30)");
         let r = rows(
             &mut db,
             "SELECT dept, [2024] FROM sales PIVOT (AVG(qty) FOR yr IN (2024)) AS p ORDER BY dept",
         );
-        assert_eq!(r.rows[0][1], Value::Int(20)); // (10+30)/2
+        assert_eq!(r.rows[0][1], Value::Float(20.0)); // (10+30)/2
                                                   // Two implicit group columns survive.
         run(&mut db, "CREATE TABLE s2 (g TEXT, k TEXT, yr INT, qty INT)");
         run(
