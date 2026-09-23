@@ -269,6 +269,27 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                     i += ch_len;
                 }
             }
+            b'[' => {
+                // T-SQL bracket identifier: opaque to the scan (`]]` is the
+                // escaped `]`), same as the quoted runs above. Without this
+                // arm a column literally named [current_timestamp] folded
+                // into a CAST literal — silently writing to a garbage field
+                // name that then rode the journal/replication fan-out.
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b']' {
+                        if b.get(i + 1) == Some(&b']') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += utf8_len(b[i]);
+                }
+                out.push_str(&sql[start..i]);
+            }
             c if c.is_ascii_alphanumeric() || c == b'_' => {
                 let start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
@@ -367,8 +388,10 @@ pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
     let mut line_begin = 0usize;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\'' || c == '"' {
-            // quoted run with doubling escapes; always stays inside the
+        if c == '\'' || c == '"' || c == '`' {
+            // quoted run with doubling escapes (backquote included: the
+            // GenericDialect accepts it as a delimited identifier, so a `;`
+            // inside one must not split the batch); always stays inside the
             // current chunk
             let quote = c;
             cur.push(c);
@@ -501,7 +524,13 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, String> {
         // splitter itself dropped a trailing GO separator, the chunk —
         // not the original — is the statement text.
         if crate::useradmin::parse(&chunks[0]).is_some() {
-            return Ok(vec![sql.trim().to_string()]);
+            // Same GO-drop guard as the sqlparser branch below: the original
+            // text still carries a dropped trailing GO, which the hand
+            // parser would reject as a trailing token.
+            if chunks[0].trim() == sql.trim() {
+                return Ok(vec![sql.trim().to_string()]);
+            }
+            return Ok(vec![chunks[0].trim().to_string()]);
         }
         let stmts = Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&chunks[0]))
             .map_err(|e| e.to_string())?;

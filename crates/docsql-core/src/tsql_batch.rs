@@ -453,7 +453,7 @@ impl TsqlSession {
                         let ch_len = stmt::utf8_len(b[i]);
                         out.push_str(&sql[i..i + ch_len]);
                         if b[i] == close {
-                            if close != b']' && b.get(i + 1) == Some(&close) {
+                            if b.get(i + 1) == Some(&close) {
                                 out.push_str(&sql[i + 1..i + 2]);
                                 i += 2;
                                 continue;
@@ -1211,7 +1211,7 @@ impl<'a> Parser<'a> {
                     self.i += 1;
                     while self.i < self.b.len() {
                         if self.b[self.i] == close {
-                            if close != b']' && self.b.get(self.i + 1) == Some(&close) {
+                            if self.b.get(self.i + 1) == Some(&close) {
                                 self.i += 2;
                                 continue;
                             }
@@ -1438,7 +1438,7 @@ impl<'a> Parser<'a> {
                     self.i += 1;
                     while self.i < self.b.len() {
                         if self.b[self.i] == close {
-                            if close != b']' && self.b.get(self.i + 1) == Some(&close) {
+                            if self.b.get(self.i + 1) == Some(&close) {
                                 self.i += 2;
                                 continue;
                             }
@@ -1801,7 +1801,7 @@ fn mentions_var(sql: &str) -> bool {
                 i += 1;
                 while i < b.len() {
                     if b[i] == close {
-                        if close != b']' && b.get(i + 1) == Some(&close) {
+                        if b.get(i + 1) == Some(&close) {
                             i += 2;
                             continue;
                         }

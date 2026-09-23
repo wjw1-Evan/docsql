@@ -38,8 +38,30 @@ type Res<T> = crate::engine::Result<T>;
 /// only fires when the first comma-separated segment is one of these —
 /// anything else stays verbatim and fails loudly downstream.
 fn is_tsql_type_name(word: &str) -> bool {
+    let w = word.trim();
+    // The CONVERT spec form is `data_type [(length)]` — `VARCHAR(10)`,
+    // `DECIMAL(10,2)`, `NVARCHAR(MAX)` are the canonical spellings, the
+    // bare name is the special case. The suffix is validated but kept in
+    // the type text: `cast_value` understands the sized forms.
+    let (base, suffix) = match w.find('(') {
+        Some(idx) if w.ends_with(')') => (&w[..idx], Some(&w[idx + 1..w.len() - 1])),
+        Some(_) => return false,
+        None => (w, None),
+    };
+    if let Some(s) = suffix {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split(',').collect();
+        let ok = s.eq_ignore_ascii_case("max")
+            || (parts.len() <= 2
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())));
+        if !ok {
+            return false;
+        }
+    }
     matches!(
-        word.trim().to_ascii_uppercase().as_str(),
+        base.to_ascii_uppercase().as_str(),
         "INT"
             | "INTEGER"
             | "BIGINT"
@@ -505,6 +527,14 @@ fn strip_leading_trivia(s: &str) -> String {
 /// Rewrite `CONVERT(type, value[, style])` / `PARSE(value AS type [USING
 /// 'culture'])` into the marker call. Returns the index after the closing
 /// paren, or None to leave the call verbatim.
+/// Trim only spaces/tabs: newlines must survive — they terminate `--` line
+/// comments, so a full `trim()` could pull the closing paren of a rewritten
+/// call into a trailing comment and break the statement.
+fn trim_h(s: &str) -> &str {
+    let t = |c: char| c == ' ' || c == '\t';
+    s.trim_matches(t)
+}
+
 fn rewrite_call(
     sql: &str,
     word_end: usize,
@@ -521,7 +551,7 @@ fn rewrite_call(
         return None;
     }
     let close = balanced_close(sql, i)?;
-    let inner = sql[i + 1..close].trim();
+    let inner = trim_h(&sql[i + 1..close]);
     let is_parse = word == b"parse" || word == b"try_parse";
     let (type_text, value_text, tail) = if is_parse {
         split_parse_args(inner)?
@@ -540,11 +570,11 @@ fn rewrite_call(
     }
     out.push_str(&format!(
         "{marker}({}, {}",
-        stmt::sql_string_literal(type_text.trim()),
-        value_text.trim()
+        stmt::sql_string_literal(trim_h(type_text)),
+        trim_h(value_text)
     ));
     if let Some(tail) = tail {
-        out.push_str(&format!(", {}", tail.trim()));
+        out.push_str(&format!(", {}", trim_h(tail)));
     }
     out.push(')');
     Some(close + 1)
@@ -613,13 +643,15 @@ fn split_parse_args(inner: &str) -> Option<(&str, &str, Option<&str>)> {
         check_word(ws, b.len(), depth);
     }
     let (as_ws, as_we) = as_idx?;
-    let value = inner[..as_ws].trim();
+    // trim_h (not trim): newlines terminate `--` comments and must survive
+    // into the rewritten statement.
+    let value = trim_h(&inner[..as_ws]);
     let ty_end = using_idx.map(|(ws, _)| ws).unwrap_or(b.len());
-    let ty = inner[as_we..ty_end].trim();
+    let ty = trim_h(&inner[as_we..ty_end]);
     if value.is_empty() || ty.is_empty() {
         return None;
     }
-    let culture = using_idx.map(|(_, we)| inner[we..].trim());
+    let culture = using_idx.map(|(_, we)| trim_h(&inner[we..]));
     if culture.is_some_and(|c| c.is_empty()) {
         return None;
     }
@@ -682,17 +714,34 @@ fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
                 i = end;
                 continue;
             }
+            // Comments are opaque: a comma inside one must not split the
+            // argument list (a mis-split leaves the call verbatim, which
+            // then fails loudly downstream).
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut j = i + 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                i = if j + 1 < b.len() { j + 2 } else { b.len() };
+                continue;
+            }
             b'(' => depth += 1,
             b')' => depth -= 1,
             c if c == sep && depth == 0 => {
-                parts.push(s[start..i].trim());
+                parts.push(trim_h(&s[start..i]));
                 start = i + 1;
             }
             _ => {}
         }
         i += 1;
     }
-    parts.push(s[start..].trim());
+    parts.push(trim_h(&s[start..]));
     parts
 }
 
@@ -1356,6 +1405,9 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
             [v] => Ok(Value::Int(match v {
                 Value::Timestamp(_) => 1,
                 Value::Str(s) => parse_timestamp_ms(s).map(|_| 1).unwrap_or(0),
+                // Integers are epoch milliseconds elsewhere in the date
+                // family (YEAR(0) works) — ISDATE must agree.
+                Value::Int(ms) => i64::from(crate::value::is_valid_timestamp_ms(*ms)),
                 _ => 0,
             })),
             _ => err("ISDATE takes 1 argument"),
@@ -1691,9 +1743,17 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
         // ---- logical ----
         "IIF" => match args {
             [c, a, b] => Ok(match c {
-                // T-SQL treats a NULL condition as false.
                 Value::Bool(true) => a.clone(),
-                _ => b.clone(),
+                // T-SQL treats a NULL condition as false…
+                Value::Null => b.clone(),
+                // …but a non-boolean condition is a type error, not a
+                // silent else-branch.
+                other => {
+                    return err(format!(
+                        "IIF condition must be a boolean, got {}",
+                        other.type_name()
+                    ))
+                }
             }),
             _ => err("IIF takes 3 arguments"),
         },
@@ -1935,6 +1995,12 @@ fn str_fn(args: &[Value]) -> Res<Value> {
         },
         None => 10,
     };
+    // Rust's format width only holds u16 and `"*"..repeat` would happily
+    // allocate gigabytes — a hostile length must fail loudly, same rule as
+    // REPLICATE/SPACE's MAX_BUILD_CHARS.
+    if len > 65535 {
+        return err("Invalid length parameter in STR (max 65535)");
+    }
     let dec = match args.get(2) {
         Some(v) => match int_arg(v, "STR", 2)? {
             Some(n) if (0..=16).contains(&n) => n as usize,
@@ -1965,6 +2031,7 @@ fn quotename(v: &Value, delim: Option<&str>) -> Res<Value> {
         "'" => format!("'{}'", s.replace('\'', "''")),
         "\"" => format!("\"{}\"", s.replace('"', "\"\"")),
         "(" => format!("({s})"),
+        ")" => format!("({s})"), // ')' pairs with '(' per the T-SQL doc table
         _ => return Ok(Value::Null),
     };
     Ok(Value::Str(out))
@@ -2096,6 +2163,13 @@ fn two_arg_datepart(
 // CONVERT / PARSE
 // ---------------------------------------------------------------------------
 
+/// Styles the CONVERT implementation knows (output rendering plus the input
+/// restyle table). Anything else is a parameter error even under TRY_CONVERT.
+const KNOWN_CONVERT_STYLES: &[i64] = &[
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 20, 21, 23, 25, 101, 102, 103, 104, 105, 106,
+    107, 108, 110, 111, 112, 113, 114, 120, 121, 126, 127,
+];
+
 fn convert_call(args: &[Value], try_cast: bool) -> Res<Value> {
     // (type, value[, style])
     if args.len() < 2 || args.len() > 3 {
@@ -2109,6 +2183,14 @@ fn convert_call(args: &[Value], try_cast: bool) -> Res<Value> {
         Some(Value::Int(n)) => Some(*n),
         Some(_) => return err("CONVERT style must be an integer"),
     };
+    // Style validity is a parameter error, not a conversion failure: T-SQL
+    // rejects an unknown style even under TRY_CONVERT, and a value that
+    // never parses as a date must not silently dodge the validation.
+    if let Some(n) = style {
+        if !KNOWN_CONVERT_STYLES.contains(&n) {
+            return err(format!("CONVERT style {n} is not supported"));
+        }
+    }
     let res = convert_with_style(ty, &args[1], style);
     if try_cast {
         Ok(res.unwrap_or(Value::Null))
@@ -2201,6 +2283,16 @@ fn convert_with_style(ty: &str, v: &Value, style: Option<i64>) -> Res<Value> {
     }
 }
 
+/// Fractional-seconds suffix that disappears when the milliseconds are zero
+/// (styles 126/127 per the CONVERT table footnote).
+fn frac_part(mill: i64) -> String {
+    if mill == 0 {
+        String::new()
+    } else {
+        format!(".{mill:03}")
+    }
+}
+
 /// Render an instant with a T-SQL date→string style.
 fn format_style(ms: i64, style: i64) -> Res<Value> {
     let secs = ms.div_euclid(1000);
@@ -2228,7 +2320,10 @@ fn format_style(ms: i64, style: i64) -> Res<Value> {
         106 => format!("{d} {mon3} {y4}"),
         7 => format!("{mon3} {d:02}, {yy:02}"),
         107 => format!("{mon3} {d:02}, {y4}"),
-        8 | 108 | 114 => format!("{h:02}:{mi:02}:{s:02}"),
+        8 | 108 => format!("{h:02}:{mi:02}:{s:02}"),
+        // 14/114 = hh:mi:ss:mmm (24h) — same as 13/113's time part; folding
+        // it into 8/108 silently dropped the milliseconds.
+        14 | 114 => format!("{h:02}:{mi:02}:{s:02}:{mill:03}"),
         10 => format!("{m2}-{d2}-{yy:02}"),
         110 => format!("{m2}-{d2}-{y4}"),
         11 => format!("{yy:02}/{m2}/{d2}"),
@@ -2239,8 +2334,10 @@ fn format_style(ms: i64, style: i64) -> Res<Value> {
         20 | 120 => format!("{y4}-{m2}-{d2} {h:02}:{mi:02}:{s:02}"),
         21 | 25 | 121 => format!("{y4}-{m2}-{d2} {h:02}:{mi:02}:{s:02}.{mill:03}"),
         23 => format!("{y4}-{m2}-{d2}"),
-        126 => format!("{y4}-{m2}-{d2}T{h:02}:{mi:02}:{s:02}.{mill:03}"),
-        127 => format!("{y4}-{m2}-{d2}T{h:02}:{mi:02}:{s:02}.{mill:03}Z"),
+        // ODBC/ISO forms omit the fractional part when it is zero (style
+        // footnote 6 in the CONVERT table).
+        126 => format!("{y4}-{m2}-{d2}T{h:02}:{mi:02}:{s:02}{}", frac_part(mill)),
+        127 => format!("{y4}-{m2}-{d2}T{h:02}:{mi:02}:{s:02}{}Z", frac_part(mill)),
         other => return err(format!("CONVERT style {other} is not supported")),
     };
     Ok(Value::Str(text))
@@ -2369,7 +2466,9 @@ fn format_fn(args: &[Value]) -> Res<Value> {
             if !(date_like && date_token)
                 && matches!(c, 'C' | 'D' | 'F' | 'G' | 'N' | 'P' | 'X' | 'E')
             {
-                return format_numeric(v, c, 2);
+                // Bare D/X mean minimum digits in .NET (no zero padding);
+                // the other numeric specifiers default to 2.
+                return format_numeric(v, c, if c == 'D' || c == 'X' { 0 } else { 2 });
             }
         }
     }
@@ -2381,6 +2480,12 @@ fn format_fn(args: &[Value]) -> Res<Value> {
 }
 
 fn format_numeric(v: &Value, c: char, prec: usize) -> Res<Value> {
+    // Rust's format width/precision only hold u16 — a hostile `.D1000000`
+    // pattern must fail loudly instead of panicking the process (same rule
+    // as STR's length cap).
+    if prec > 65535 {
+        return err("FORMAT precision exceeds 65535");
+    }
     let out = match c {
         'D' => match v {
             Value::Int(i) => format!("{i:0width$}", width = prec.max(1)),
@@ -2466,8 +2571,8 @@ fn format_date_pattern(ms: i64, fmt: &str) -> Res<String> {
         match c {
             'y' => match run {
                 1 | 2 => out.push_str(&format!("{:02}", (p.year % 100).abs())),
-                r @ 3.. => out.push_str(&format!("{:0width$}", p.year, width = r)),
-                _ => out.push_str(&format!("{:04}", p.year)),
+                3..=65535 => out.push_str(&format!("{:0width$}", p.year, width = run)),
+                _ => return err("FORMAT date pattern 'y' run exceeds 65535"),
             },
             'M' => match run {
                 1 => out.push_str(&p.month.to_string()),
@@ -3836,7 +3941,7 @@ mod tests {
             (111, "2026/09/21"),
             (112, "20260921"),
             (113, "21 Sep 2026 13:45:06:250"),
-            (114, "13:45:06"),
+            (114, "13:45:06:250"),
             (120, "2026-09-21 13:45:06"),
             (121, "2026-09-21 13:45:06.250"),
             (126, "2026-09-21T13:45:06.250"),
@@ -4182,7 +4287,7 @@ mod tests {
         assert_eq!(preprocess("SET NOCOUNT 'oops"), "SET NOCOUNT 'oops");
         assert_eq!(
             preprocess("SELECT CONVERT(INT, x -- c\n)"),
-            "SELECT __TSQL_CONVERT__('INT', x -- c)"
+            "SELECT __TSQL_CONVERT__('INT', x -- c\n)"
         );
     }
     /// Final sweep over the scanner/date/catalogue branches the earlier
