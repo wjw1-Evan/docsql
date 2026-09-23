@@ -255,18 +255,52 @@ fn chain_header(page: &[u8], pid: u32) -> Result<(u32, usize)> {
 
 /// Walk an overflow chain, zero every page and park the page ids in the
 /// table's free list (used by remove/replace of overflow documents).
-fn recycle_chain(pager: &Pager, tx: &mut Tx, head: u32, free: &mut Vec<u32>) -> Result<()> {
+/// The chain is validated exactly like the read path (`slot_document_bytes`)
+/// BEFORE any page is zeroed: the write path must not trust the slot's head
+/// pointer further than reads do — a corrupt head pointing at a live heap
+/// page would otherwise be walked, zeroed (destroying a full page of live
+/// documents) and parked in the free list for the next oversized insert.
+fn recycle_chain(
+    pager: &Pager,
+    tx: &mut Tx,
+    head: u32,
+    total: usize,
+    prefix: usize,
+    free: &mut Vec<u32>,
+) -> Result<()> {
+    if total > MAX_DOC_SIZE {
+        return Err(HeapError::Page(
+            head,
+            "overflow chain corrupt (total exceeds max document size)",
+        ));
+    }
+    let min_chunk = PAGE_SIZE - CHAIN_HEADER;
+    let mut assembled = 0usize;
     let mut next = head;
     let mut seen = HashSet::new();
+    let mut chain = Vec::new();
     while next != 0 {
-        if !seen.insert(next) {
+        if !seen.insert(next) || chain.len() > total / min_chunk + 2 {
             return Err(HeapError::Page(next, "overflow chain corrupt (cycle)"));
         }
         let page = load_page_owned(&PageReader::current(pager), Some(tx), next)?;
-        let (nxt, _) = chain_header(&page, next)?;
-        pager.write_page(tx, next, 0, &vec![0u8; PAGE_SIZE])?;
-        free.push(next);
+        let (nxt, l) = chain_header(&page, next)?;
+        if CHAIN_HEADER + l > page.len() || assembled + l > total {
+            return Err(HeapError::Page(next, "overflow chain corrupt (bad length)"));
+        }
+        assembled += l;
+        chain.push(next);
         next = nxt;
+    }
+    if prefix + assembled != total {
+        return Err(HeapError::Page(
+            head,
+            "overflow chain corrupt (short chain)",
+        ));
+    }
+    for id in chain {
+        pager.write_page(tx, id, 0, &vec![0u8; PAGE_SIZE])?;
+        free.push(id);
     }
     Ok(())
 }
@@ -563,8 +597,15 @@ impl Heap {
         // case the old chain is gone).
         if page[off] == OVERFLOW_MARK {
             let content = &page[off..off + len];
-            let (_, head) = overflow_slot_header(content, page_id)?;
-            recycle_chain(pager, tx, head, &mut self.overflow_free)?;
+            let (total, head) = overflow_slot_header(content, page_id)?;
+            recycle_chain(
+                pager,
+                tx,
+                head,
+                total,
+                content.len() - OVERFLOW_SLOT_HEADER,
+                &mut self.overflow_free,
+            )?;
         }
         // Rebuild the page with the new document at the replaced document's
         // position — slot order (== row order) is preserved.
@@ -657,8 +698,15 @@ impl Heap {
                 // dies (they are unreachable afterwards).
                 if page[off] == OVERFLOW_MARK {
                     let content = &page[off..off + len];
-                    let (_, head) = overflow_slot_header(content, page_id)?;
-                    recycle_chain(pager, tx, head, &mut self.overflow_free)?;
+                    let (total, head) = overflow_slot_header(content, page_id)?;
+                    recycle_chain(
+                        pager,
+                        tx,
+                        head,
+                        total,
+                        content.len() - OVERFLOW_SLOT_HEADER,
+                        &mut self.overflow_free,
+                    )?;
                 }
                 tombstone(&mut page, s);
             }

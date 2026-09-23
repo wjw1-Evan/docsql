@@ -2372,7 +2372,10 @@ fn render_param(p: &Value) -> String {
             }
         }
         Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
+        // Debug formatting keeps integral floats distinguishable from Int
+        // (Display prints 3.0 as "3", which the engine would re-parse and
+        // store as an Int) — same rationale as value_literal.
+        Value::Float(f) => format!("{f:?}"),
         Value::Decimal(d) => {
             // Exactness survives the text round-trip: an unquoted number
             // would re-parse as Float on the engine side.

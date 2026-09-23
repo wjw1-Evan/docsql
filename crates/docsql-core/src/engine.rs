@@ -12139,7 +12139,15 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
                     Ok(Value::Int(i.wrapping_neg()))
                 }
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
-                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => {
+                    // Signed-zero guard, same as the runtime unary minus.
+                    let neg = -d;
+                    Ok(Value::Decimal(if neg.is_zero() && neg.is_sign_negative() {
+                        rust_decimal::Decimal::ZERO
+                    } else {
+                        neg
+                    }))
+                }
                 // T-SQL bitwise NOT (~x): two's-complement on 64-bit ints.
                 (sqlparser::ast::UnaryOperator::BitwiseNot, Value::Int(i)) => Ok(Value::Int(!i)),
                 _ => err("unsupported unary operand"),
@@ -12345,7 +12353,19 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                     None => Ok(Value::Float(-(i as f64))),
                 },
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
-                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => {
+                    // Signed-zero guard: decimal text cannot replay -0
+                    // ("−0.00" parses back to +0), so the dump/replica
+                    // rewrite would silently flip the encoded bytes.
+                    let neg = -d;
+                    Ok(Value::Decimal(
+                        if neg.is_zero() && neg.is_sign_negative() {
+                            rust_decimal::Decimal::ZERO
+                        } else {
+                            neg
+                        },
+                    ))
+                }
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
                 // T-SQL bitwise NOT (~x): two's-complement on 64-bit ints.
@@ -14474,7 +14494,17 @@ fn eval_group_expr(
                     None => Ok(Value::Float(-(i as f64))),
                 },
                 (sqlparser::ast::UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
-                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => Ok(Value::Decimal(-d)),
+                (sqlparser::ast::UnaryOperator::Minus, Value::Decimal(d)) => {
+                    // Signed-zero guard: decimal text cannot replay -0
+                    // ("−0.00" parses back to +0), so the dump/replica
+                    // rewrite would silently flip the encoded bytes.
+                    let neg = -d;
+                    Ok(Value::Decimal(if neg.is_zero() && neg.is_sign_negative() {
+                        rust_decimal::Decimal::ZERO
+                    } else {
+                        neg
+                    }))
+                }
                 (sqlparser::ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                 (sqlparser::ast::UnaryOperator::Not, Value::Null) => Ok(Value::Null),
                 // T-SQL bitwise NOT (~x): two's-complement on 64-bit ints.
@@ -14512,9 +14542,12 @@ fn eval_group_expr(
                 let hit = match &base {
                     Some(b) => {
                         let cv = eval_group_expr(&w.condition, out, docs, group_exprs)?;
+                        // Same coerced equality as the scalar CASE arm
+                        // (Str ↔ Timestamp lifts etc.); a bare cmp_values
+                        // here made grouped CASE disagree with ungrouped.
                         !matches!(b, Value::Null)
                             && !matches!(cv, Value::Null)
-                            && Value::cmp_values(b, &cv) == Ordering::Equal
+                            && cmp_coerced(b, &cv) == Some(Ordering::Equal)
                     }
                     None => matches!(
                         eval_group_expr(&w.condition, out, docs, group_exprs)?,

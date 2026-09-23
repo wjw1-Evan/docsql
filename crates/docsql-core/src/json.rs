@@ -63,7 +63,13 @@ fn write_value(out: &mut String, v: &Value) {
         }
         Value::Float(f) => {
             if f.is_finite() {
-                let _ = write!(out, "{f}");
+                // Debug formatting, not Display: `format!("{}", 3.0f64)` is
+                // "3", which `from_str`'s number parser reads back as an
+                // Int (and -0.0 loses its sign). Every integral Debug form
+                // carries a '.' or 'e' ("3.0", "-0.0", "1e300"), so the
+                // round-trip stays a Float — dump/backup/replication and
+                // `value_literal`'s JSON_EXTRACT replay all depend on it.
+                let _ = write!(out, "{f:?}");
             } else {
                 // JSON has no NaN/Inf: a marker object keeps the exact value
                 // losslessly (mirrors `$dec`/`$bytes`; `from_str` decodes it).
@@ -377,15 +383,29 @@ impl<'a> Parser<'a> {
                         let cp = self.hex4()?;
                         // Surrogate pair handling.
                         let ch = if (0xD800..0xDC00).contains(&cp) {
-                            if self.bump() == Some(b'\\') && self.bump() == Some(b'u') {
-                                let lo = self.hex4()?;
-                                if !(0xDC00..0xE000).contains(&lo) {
-                                    // Not a low surrogate: the pair arithmetic
-                                    // would underflow — substitute instead.
-                                    '\u{FFFD}'
+                            // Peek, don't bump: a lone high surrogate followed
+                            // by any other escape must not consume it — bumping
+                            // ahead would silently drop up to two input bytes
+                            // (e.g. "\ud83d\n" losing the newline).
+                            if self.peek() == Some(b'\\') {
+                                self.bump();
+                                if self.peek() == Some(b'u') {
+                                    self.bump();
+                                    let lo = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&lo) {
+                                        // Not a low surrogate: the pair arithmetic
+                                        // would underflow — substitute instead.
+                                        '\u{FFFD}'
+                                    } else {
+                                        let combined =
+                                            0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                        char::from_u32(combined).unwrap_or('\u{FFFD}')
+                                    }
                                 } else {
-                                    let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                    char::from_u32(combined).unwrap_or('\u{FFFD}')
+                                    // Put the escape start back: the outer loop
+                                    // must still parse whatever escape follows.
+                                    self.pos -= 1;
+                                    '\u{FFFD}'
                                 }
                             } else {
                                 '\u{FFFD}'
@@ -438,6 +458,39 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integral_floats_roundtrip_as_floats() {
+        // Display prints 3.0 as "3", which re-parses as Int — the dump/
+        // replication rewrite (value_literal's JSON_EXTRACT) would silently
+        // change the stored type. Debug keeps a '.'/'e' in every form.
+        for f in [3.0f64, -0.0, 0.0, 1e300, -2.5e-8] {
+            let v = Value::Float(f);
+            let s = to_string(&v);
+            assert!(
+                matches!(from_str(&s).unwrap(), Value::Float(_)),
+                "{s} must stay a Float"
+            );
+        }
+        // Nested inside documents (the exact shape value_literal replays).
+        let doc = Value::Object(Object::from([
+            ("score".into(), Value::Float(3.0)),
+            ("nested".into(), Value::Array(vec![Value::Float(-0.0)])),
+        ]));
+        let s = to_string(&doc);
+        let back = from_str(&s).unwrap();
+        assert_eq!(back, doc, "via {s}");
+        let Value::Object(o) = back else { panic!() };
+        assert!(matches!(o.get("score"), Some(Value::Float(_))));
+    }
+
+    #[test]
+    fn lone_high_surrogate_does_not_eat_the_next_escape() {
+        // The pair lookahead must not consume bytes it did not use: the
+        // newline escape after the unpaired surrogate has to survive.
+        let v = from_str(r#""a\ud83d\nb""#).unwrap();
+        assert_eq!(v, Value::Str("a\u{FFFD}\nb".into()));
+    }
 
     #[test]
     fn roundtrip_scalars() {
@@ -634,12 +687,12 @@ mod tests {
         // \u with fewer than 4 digits / eof
         assert!(from_str(r#""\u12""#).is_err());
         assert!(from_str(r#""\u""#).is_err());
-        // lone high surrogate without a following pair degrades to U+FFFD
-        // (the closing quote is consumed by the failed pair lookahead, so a
-        // trailing char keeps the parse alive)
+        // lone high surrogate without a following pair degrades to U+FFFD;
+        // the failed pair lookahead must NOT consume the next input byte
+        // (it used to eat the space, and up to two bytes of a real escape)
         assert_eq!(
             from_str(r#""\ud83d x""#).unwrap(),
-            Value::Str("\u{FFFD}x".into())
+            Value::Str("\u{FFFD} x".into())
         );
         // proper surrogate pair decodes to the emoji
         assert_eq!(

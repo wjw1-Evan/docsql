@@ -85,7 +85,12 @@ fn split_at_for_insert<T>(
         .map(|i| i.max(1))
         .unwrap_or(cells.len() - 1);
     let mut m = boundary.min(at).max(1);
-    while m < boundary && total - prefix[m] > PAGE_SIZE {
+    // The right node pays the header too: shrink until header + suffix
+    // cells fit a page. Without the header term a suffix of
+    // (PAGE_SIZE - header, PAGE_SIZE] bytes passes here and the per-cell
+    // fit check in `write_node` then rejects a legal insert (every cell is
+    // within the half-page cap) as KeyTooLarge.
+    while m < boundary && header + (total - prefix[m]) > PAGE_SIZE {
         m += 1;
     }
     Ok(m.min(cells.len() - 1))
@@ -464,7 +469,12 @@ impl BTree {
     /// page staged by the current transaction reads back its staged image.
     pub fn collect_pages(&self, reader: &PageReader, tx: &Tx) -> Result<Vec<u32>> {
         let mut out = Vec::new();
-        Self::collect_rec(reader, tx, self.root, &mut out, 0)?;
+        // A corrupt internal node can point two children at the same page
+        // (acyclic DAG): without dedup the id would enter the free pool
+        // twice and later serve two different trees as a dual-owner page.
+        // Healthy trees are pure trees and never revisit a page.
+        let mut seen = std::collections::HashSet::new();
+        Self::collect_rec(reader, tx, self.root, &mut out, 0, &mut seen)?;
         Ok(out)
     }
 
@@ -474,17 +484,21 @@ impl BTree {
         id: u32,
         out: &mut Vec<u32>,
         depth: usize,
+        seen: &mut std::collections::HashSet<u32>,
     ) -> Result<()> {
         if depth > MAX_TREE_DEPTH {
             return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
+        }
+        if !seen.insert(id) {
+            return Ok(());
         }
         out.push(id);
         match Self::read_node(reader, tx, id)? {
             Node::Leaf { .. } => {}
             Node::Internal { leftmost, cells } => {
-                Self::collect_rec(reader, tx, leftmost, out, depth + 1)?;
+                Self::collect_rec(reader, tx, leftmost, out, depth + 1, seen)?;
                 for (_, child) in cells {
-                    Self::collect_rec(reader, tx, child, out, depth + 1)?;
+                    Self::collect_rec(reader, tx, child, out, depth + 1, seen)?;
                 }
             }
         }
@@ -1000,6 +1014,35 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].1, 1);
         assert_eq!(all[1].1, 2);
+    }
+
+    #[test]
+    fn split_right_half_accounts_for_header() {
+        // Regression: the split-point fit check used to ignore the right
+        // node's header, so a suffix of (PAGE_SIZE-header, PAGE_SIZE] cell
+        // bytes passed the check and `write_node` then rejected a legal
+        // insert (every cell well within the half-page cap) as KeyTooLarge.
+        let (_d, pager) = fresh("bt-split-header.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&pager, &mut tx).unwrap();
+        let big = |p: char, filler: char, n: usize| {
+            Value::Str(p.to_string() + &filler.to_string().repeat(n))
+        };
+        tree.insert(&pager, &mut tx, big('A', 'a', 2029), 0, false)
+            .unwrap();
+        tree.insert(&pager, &mut tx, big('C', 'c', 2030), 1, false)
+            .unwrap();
+        // Cells 2045 + 2046 bytes: the leaf holds 4094 of 4096 bytes. The
+        // middle key's cell is exactly 2048 — the split's right half becomes
+        // 3 + 4094 bytes, one past the page, which the old check accepted.
+        tree.insert(&pager, &mut tx, big('B', 'b', 2032), 2, false)
+            .unwrap();
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        assert_eq!(
+            tree.scan(&PageReader::current(&pager), &tx).unwrap().len(),
+            3
+        );
     }
 
     #[test]

@@ -203,6 +203,16 @@ fn put_u32(out: &mut Vec<u8>, v: usize) -> Result<(), EncodeError> {
 }
 
 pub fn encode(value: &Value, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    encode_at(value, out, 0)
+}
+
+// Depth-guarded twin of the decoder's limit: a programmatically built Value
+// (not reachable through the JSON parser, which caps at the same depth)
+// must not turn encoding into unbounded recursion.
+fn encode_at(value: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), EncodeError> {
+    if depth > MAX_DEPTH {
+        return Err(EncodeError::TooDeep);
+    }
     match value {
         Value::Null => out.push(0),
         Value::Bool(b) => {
@@ -239,7 +249,7 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) -> Result<(), EncodeError> {
             out.push(6);
             put_u32(out, items.len())?;
             for v in items {
-                encode(v, out)?;
+                encode_at(v, out, depth + 1)?;
             }
         }
         Value::Object(obj) => {
@@ -248,7 +258,7 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) -> Result<(), EncodeError> {
             for (k, v) in obj {
                 put_u32(out, k.len())?;
                 out.extend_from_slice(k.as_bytes());
-                encode(v, out)?;
+                encode_at(v, out, depth + 1)?;
             }
         }
     }
@@ -270,7 +280,7 @@ pub fn encode_object(doc: &Object, out: &mut Vec<u8>) -> Result<(), EncodeError>
     for (k, v) in doc {
         put_u32(out, k.len())?;
         out.extend_from_slice(k.as_bytes());
-        encode(v, out)?;
+        encode_at(v, out, 1)?;
     }
     Ok(())
 }
