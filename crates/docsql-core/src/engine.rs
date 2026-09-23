@@ -1744,6 +1744,24 @@ impl<'a> ReadCx<'a> {
                 .into_iter()
                 .filter(|c| c != "ROWNUM")
                 .collect();
+            if cols.is_empty() {
+                // Empty rowset: `SELECT *` still owes its column metadata —
+                // ADO readers (EF SchemaSync's ExistingColumns via
+                // `SELECT * … LIMIT 0`) learn the shape from the names, and
+                // a data-derived union left them with ZERO columns on an
+                // empty table. Declared columns of the FROM factors are
+                // the shape; sorted to match union_of_fields' order.
+                let mut declared = std::collections::HashSet::new();
+                for twj in &select.from {
+                    collect_factor_columns(&twj.relation, self.tables, &mut declared);
+                    for j in &twj.joins {
+                        collect_factor_columns(&j.relation, self.tables, &mut declared);
+                    }
+                }
+                let mut v: Vec<String> = declared.into_iter().collect();
+                v.sort();
+                cols = v;
+            }
             cols.extend(project.iter().map(|(n, _)| n.clone()));
             cols
         } else {
@@ -6448,34 +6466,53 @@ impl Database {
                 }
                 fk_removals.sort();
                 fk_removals.dedup();
+                // Snapshot the catalog: any failure between here and the
+                // commit must leave the in-memory catalog untouched (the
+                // pager tx undoes the pages; without this the removed
+                // entries stayed gone while nothing was journaled, and the
+                // next successful write would persist a half-drop whose
+                // pages were never freed).
+                let catalog_prev = self.tables.clone();
                 self.delete_grants_for(&dropping);
                 let mut tx = self.pager.begin_tx();
                 // CASCADE drops the referencing FK declarations along with
                 // the table (PostgreSQL semantics): the child table stays,
                 // its constraint on the vanished parent goes.
-                for child in &fk_removals {
-                    if let Some(meta) = self.catalog_mut(child) {
-                        meta.foreign_keys
-                            .retain(|(_, rt, _)| !drop_set.contains(rt.as_str()));
+                let drop_result: Result<()> = (|| {
+                    for child in &fk_removals {
+                        if let Some(meta) = self.catalog_mut(child) {
+                            meta.foreign_keys
+                                .retain(|(_, rt, _)| !drop_set.contains(rt.as_str()));
+                        }
+                    }
+                    for name in &table_dropping {
+                        if let Some(meta) = self.tables.get(name) {
+                            self.free_table_storage(&mut tx, meta)?;
+                        }
+                        self.tables.remove(name);
+                        // A recreated table must start its AUTOINCREMENT counter
+                        // from its own rows (max+1), not inherit the dropped
+                        // table's watermark — replicas that restarted compute a
+                        // different value and the nodes diverge.
+                        self.autoinc_cache.remove(name);
+                    }
+                    for name in &view_dropping {
+                        self.tables.remove(name);
+                    }
+                    self.save_catalog_into(&mut tx)?;
+                    Ok(())
+                })();
+                match drop_result {
+                    Ok(()) => {
+                        self.commit_pager_tx(tx)?;
+                        Ok(ExecOutcome::Affected(0))
+                    }
+                    Err(e) => {
+                        self.pager.abort_tx(tx)?;
+                        self.tables = catalog_prev;
+                        Err(e)
                     }
                 }
-                for name in &table_dropping {
-                    if let Some(meta) = self.tables.get(name) {
-                        self.free_table_storage(&mut tx, meta)?;
-                    }
-                    self.tables.remove(name);
-                    // A recreated table must start its AUTOINCREMENT counter
-                    // from its own rows (max+1), not inherit the dropped
-                    // table's watermark — replicas that restarted compute a
-                    // different value and the nodes diverge.
-                    self.autoinc_cache.remove(name);
-                }
-                for name in &view_dropping {
-                    self.tables.remove(name);
-                }
-                self.save_catalog_into(&mut tx)?;
-                self.commit_pager_tx(tx)?;
-                Ok(ExecOutcome::Affected(0))
             }
             Statement::Insert(insert) => self.exec_insert(insert),
             Statement::Update(update) => {
@@ -6633,7 +6670,7 @@ impl Database {
                         // `TRUNCATE parent, child` must not fail on the
                         // parent's rows the child still references.
                         let removed = self.table_docs_cx(name)?;
-                        self.check_fk_parent_delete_skipping(name, &removed, &[], &targets)?;
+                        self.check_fk_parent_delete_skipping(name, &removed, &[], &targets, None)?;
                     }
                 }
                 for name in &targets {
@@ -6731,6 +6768,9 @@ impl Database {
         }
         let mut pairs: Vec<(u64, Object)> = Vec::with_capacity(docs.len());
         for doc in &docs {
+            // Rebuilds walk every row (ALTER/RENAME on a large table must
+            // stay interruptible like every other long row loop).
+            self.stmt_deadline.check()?;
             let loc = heap.insert(&self.pager, &mut tx, doc)?;
             pairs.push((loc, doc.clone()));
         }
@@ -7542,6 +7582,198 @@ impl Database {
         Ok(ExecOutcome::Affected(0))
     }
 
+    /// All-or-nothing validation for ALTER TABLE: every operation is checked
+    /// against a simulated meta (columns / PK / CHECKs evolve op by op) so a
+    /// failure in a later operation cannot leave earlier ones committed —
+    /// each rewrite persists its own write unit, so a mid-statement failure
+    /// used to leave the statement half-applied (with no journal entry for
+    /// the applied part, diverging replicas until repair). Also fronts the
+    /// per-op existence/duplication checks the apply loop historically
+    /// skipped (DROP of a missing column silently "succeeded").
+    #[allow(clippy::too_many_lines)]
+    fn validate_alter_ops(
+        &self,
+        base: &TableMeta,
+        tname: &str,
+        ops: &[sqlparser::ast::AlterTableOperation],
+    ) -> Result<()> {
+        use sqlparser::ast::AlterTableOperation as Op;
+        // RENAME TABLE returns from the apply loop early; anything after it
+        // in the same statement was silently discarded.
+        if ops.iter().any(|o| matches!(o, Op::RenameTable { .. })) && ops.len() > 1 {
+            return err(
+                "ALTER TABLE ... RENAME TO must be the only operation in the statement".to_string(),
+            );
+        }
+        let mut columns: Vec<String> = base.columns.clone();
+        let mut pk: Option<String> = base.primary_key.clone();
+        let mut checks: Vec<String> = base.checks.clone();
+        for op in ops {
+            match op {
+                Op::AddColumn { column_def, .. } => {
+                    let col = &column_def.name.value;
+                    if columns.contains(col) {
+                        return err(format!("duplicate column name: {col}"));
+                    }
+                    let mut add_not_null = false;
+                    for opt in &column_def.options {
+                        use sqlparser::ast::ColumnOption as CO;
+                        match &opt.option {
+                            CO::Check(c) => {
+                                if expr_calls_wall_clock(&c.expr) {
+                                    return err(
+                                        "CHECK constraints cannot call wall-clock or random \
+                                         functions (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND); \
+                                         every node would evaluate a different value",
+                                    );
+                                }
+                            }
+                            CO::NotNull => add_not_null = true,
+                            CO::PrimaryKey { .. }
+                            | CO::Unique { .. }
+                            | CO::ForeignKey(_)
+                            | CO::DialectSpecific(_) => {
+                                return err(format!(
+                                    "constraint options are not supported on ADD COLUMN {col}"
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A new column's default can only arrive in this very
+                    // definition (the apply loop registers it in the same
+                    // pass, before the NOT NULL rule is judged).
+                    if add_not_null
+                        && !column_def
+                            .options
+                            .iter()
+                            .any(|o| matches!(o.option, sqlparser::ast::ColumnOption::Default(_)))
+                    {
+                        return err(format!(
+                            "cannot add NOT NULL column {col} without a DEFAULT"
+                        ));
+                    }
+                    columns.push(col.clone());
+                }
+                Op::DropColumn { column_names, .. } => {
+                    for id in column_names {
+                        let name = &id.value;
+                        if !columns.contains(name) {
+                            return err(format!("column {name} does not exist"));
+                        }
+                        if pk.as_deref() == Some(name.as_str()) {
+                            return err("cannot drop a PRIMARY KEY column");
+                        }
+                        if let Some(bad) = checks.iter().find(|c| {
+                            parse_expr_text(c)
+                                .map(|e| expr_references_ident(&e, name))
+                                .unwrap_or(true)
+                        }) {
+                            return err(format!(
+                                "cannot drop column {name}: CHECK constraint {bad} references it"
+                            ));
+                        }
+                        let referencing: Vec<String> = self
+                            .tables
+                            .iter()
+                            .filter(|(_, m)| {
+                                m.foreign_keys
+                                    .iter()
+                                    .any(|(_, rt, rc)| rt == tname && rc == name)
+                            })
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        if !referencing.is_empty() {
+                            return err(format!(
+                                "cannot drop column {tname}.{name}: referenced by FOREIGN KEY in {}",
+                                referencing.join(", ")
+                            ));
+                        }
+                        columns.retain(|c| c != name);
+                    }
+                }
+                Op::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                } => {
+                    let (old, new) = (&old_column_name.value, &new_column_name.value);
+                    if !columns.contains(old) {
+                        return err(format!("column {old} does not exist"));
+                    }
+                    // Stored view SQL is not rewritten: renaming a column of
+                    // a referenced table breaks the view (and makes its
+                    // dump_script unreplayable). Refuse like DROP does.
+                    let deps = self.direct_view_dependents(&[tname.to_string()]);
+                    if !deps.is_empty() {
+                        return err(format!(
+                            "cannot rename column {tname}.{old}: table is referenced by VIEW {} \
+                             (drop the view first; its stored SQL is not rewritten)",
+                            deps.join(", ")
+                        ));
+                    }
+                    if old != new {
+                        // Every namespace the new name can collide with: a
+                        // duplicate column collapses two columns' data into
+                        // one key, and an index root-key (single-column roots
+                        // key by column name, composites by index name) would
+                        // be silently overwritten by the rename.
+                        if columns.contains(new) {
+                            return err(format!("duplicate column name: {new}"));
+                        }
+                        if base.index_roots.contains_key(new)
+                            || base.index_defs.iter().any(|d| &d.name == new)
+                        {
+                            return err(format!("name {new} is already used by an index"));
+                        }
+                    }
+                    columns = columns
+                        .iter()
+                        .map(|c| if c == old { new.clone() } else { c.clone() })
+                        .collect();
+                    if pk.as_deref() == Some(old.as_str()) {
+                        pk = Some(new.clone());
+                    }
+                    checks = checks
+                        .iter()
+                        .map(|c| rename_ident_in_text(c, old, new))
+                        .collect();
+                }
+                Op::RenameTable { table_name } => {
+                    let new_name = match table_name {
+                        sqlparser::ast::RenameTableNameKind::As(n)
+                        | sqlparser::ast::RenameTableNameKind::To(n) => obj_name(n),
+                    };
+                    if self.tables.contains_key(&new_name) {
+                        return err(format!("table {new_name} already exists"));
+                    }
+                    // Reserved names are filtered out of dump/snapshot or
+                    // collide with internal tables; CREATE refuses them, so
+                    // rename must too (a renamed-away table would silently
+                    // vanish from every backup).
+                    if is_system_table(&new_name) || crate::useradmin::is_user_table(&new_name) {
+                        return err(format!(
+                            "table name {new_name} is reserved for internal use"
+                        ));
+                    }
+                    // Stored view SQL is not rewritten: a view left pointing
+                    // at the old name breaks every SELECT and — worse — makes
+                    // dump_script unreplayable (backup/restore and join/repair
+                    // snapshots all fail). Refuse like DROP does.
+                    let deps = self.direct_view_dependents(&[tname.to_string()]);
+                    if !deps.is_empty() {
+                        return err(format!(
+                            "cannot rename table {tname}: referenced by VIEW {} \
+                             (drop the view first; its stored SQL is not rewritten)",
+                            deps.join(", ")
+                        ));
+                    }
+                }
+                other => return err(format!("unsupported ALTER TABLE operation: {other}")),
+            }
+        }
+        Ok(())
+    }
+
     fn exec_alter(&mut self, alter: sqlparser::ast::AlterTable) -> Result<ExecOutcome> {
         use sqlparser::ast::AlterTableOperation as Op;
         let tname = obj_name(&alter.name);
@@ -7549,6 +7781,7 @@ impl Database {
             return err(format!("table {tname} does not exist"));
         };
         ensure_not_view("ALTER", &tname, &meta)?;
+        self.validate_alter_ops(&meta, &tname, &alter.operations)?;
         // rewrite_table persists the catalog in its own transaction; only
         // metadata-only ALTERs (plain ADD COLUMN) need the tail save.
         let mut rewrote = false;
@@ -7863,11 +8096,21 @@ impl Database {
                     // 引用方的外键表名跟随改写:悬挂 rt 会让子表的一切写
                     // 路径报 "table does not exist",dump/restore 还会把
                     // 坏状态原样带回(旧条目尚未动,失败路径保持原子)。
-                    for other in self.tables.values_mut() {
-                        let m = std::sync::Arc::make_mut(other);
-                        for (_, rt, _) in m.foreign_keys.iter_mut() {
-                            if *rt == tname {
-                                *rt = new_name.clone();
+                    // 只对真正引用旧名的表定点 make_mut——全库逐表 make_mut
+                    // 会在有 detached 读者时深拷每一张表的 meta。
+                    let referrers: Vec<String> = self
+                        .tables
+                        .iter()
+                        .filter(|(_, m)| m.foreign_keys.iter().any(|(_, rt, _)| rt == &tname))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    for name in referrers {
+                        if let Some(m) = self.tables.get_mut(&name) {
+                            let m = std::sync::Arc::make_mut(m);
+                            for (_, rt, _) in m.foreign_keys.iter_mut() {
+                                if *rt == tname {
+                                    *rt = new_name.clone();
+                                }
                             }
                         }
                     }
@@ -7933,26 +8176,31 @@ impl Database {
     /// from `table` (DELETE, or UPDATE rows whose key value changes) may be
     /// referenced by child tables. `replacement_docs` carries the statement's
     /// surviving/updated rows of `table`: a parent-key value kept by any of
-    /// them stays referenceable. Referenced columns are PK/UNIQUE in
-    /// practice, so a disappearing value has no other copy in the table.
+    /// them stays referenceable.
     fn check_fk_parent_delete(
         &mut self,
         table: &str,
         removed_docs: &[Object],
         replacement_docs: &[Object],
     ) -> Result<()> {
-        self.check_fk_parent_delete_skipping(table, removed_docs, replacement_docs, &[])
+        self.check_fk_parent_delete_skipping(table, removed_docs, replacement_docs, &[], None)
     }
 
     /// [`check_fk_parent_delete`] with a child-table exclusion list: children
     /// named in `skip` are also being emptied by the same statement (e.g.
     /// `TRUNCATE parent, child`), so their rows cannot end up orphaned.
+    /// `self_children` overrides the scan of `table`'s own rows with the
+    /// statement's FINAL images (MERGE: the heap still shows pre-statement
+    /// rows, so a self-reference created by the INSERT arm would be missed
+    /// and one removed by the UPDATE arm wrongly reported).
+    #[allow(clippy::too_many_arguments)]
     fn check_fk_parent_delete_skipping(
         &mut self,
         table: &str,
         removed_docs: &[Object],
         replacement_docs: &[Object],
         skip: &[String],
+        self_children: Option<&[Object]>,
     ) -> Result<()> {
         if removed_docs.is_empty() {
             return Ok(());
@@ -7998,8 +8246,47 @@ impl Database {
         if lost.is_empty() {
             return Ok(());
         }
+        // Non-unique referenced columns: a value can survive in rows this
+        // statement never touched. `replacement_docs` only carries the
+        // statement's own rows, so screen `lost` against the whole
+        // pre-statement table: a value the removed set does not exhaust
+        // (current count > removed count) is still referenceable. For
+        // PK/UNIQUE referenced columns the counts are equal and this is a
+        // no-op; for anything else it un-rejects legitimate deletes.
+        {
+            let current = self.table_docs_cx(table)?;
+            let count_in = |docs: &[Object], rc: &str, v: &Value| {
+                docs.iter()
+                    .filter(|d| {
+                        d.get(rc)
+                            .map(|rv| Value::cmp_values(rv, v) == Ordering::Equal)
+                            .unwrap_or(false)
+                    })
+                    .count()
+            };
+            lost.retain(|v| {
+                !parent_cols
+                    .iter()
+                    .any(|rc| count_in(&current, rc, v) > count_in(removed_docs, rc, v))
+            });
+        }
+        if lost.is_empty() {
+            return Ok(());
+        }
         for (child_table, child_col, rc) in &children {
-            let child_docs = self.table_docs_cx(child_table)?;
+            let fallback;
+            let child_docs: &[Object] = if child_table == table {
+                match self_children {
+                    Some(docs) => docs,
+                    None => {
+                        fallback = self.table_docs_cx(child_table)?;
+                        &fallback
+                    }
+                }
+            } else {
+                fallback = self.table_docs_cx(child_table)?;
+                &fallback
+            };
             let offender = child_docs.iter().any(|cd| {
                 cd.get(child_col)
                     .map(|cv| {
@@ -8233,6 +8520,14 @@ impl Database {
             .iter()
             .map(|c| c.name.value.clone())
             .collect();
+        // Duplicate column names collapse two logical columns into one
+        // document key (the later one silently wins); reject like SQLite.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            if let Some(dup) = columns.iter().find(|c| !seen.insert((*c).clone())) {
+                return err(format!("duplicate column name: {dup}"));
+            }
+        }
         let mut meta = TableMeta {
             columns,
             ..Default::default()
@@ -8247,7 +8542,11 @@ impl Database {
                             None,
                             None,
                         )?;
-                        meta.primary_key = Some(col.name.value.clone());
+                        // A second PK declaration silently replaced the
+                        // first (its uniqueness tree was never built).
+                        if meta.primary_key.replace(col.name.value.clone()).is_some() {
+                            return err("table has more than one primary key".to_string());
+                        }
                     }
                     CO::Unique(u) => {
                         reject_constraint_decorations(
@@ -8360,7 +8659,10 @@ impl Database {
                              (declare a single-column PRIMARY KEY or use CREATE UNIQUE INDEX)");
                     }
                     if let Some(ic) = pk.columns.first() {
-                        meta.primary_key = Some(expr_name(&ic.column.expr));
+                        let name = expr_name(&ic.column.expr);
+                        if meta.primary_key.replace(name).is_some() {
+                            return err("table has more than one primary key".to_string());
+                        }
                     }
                 }
                 TC::Check(chk) => {
@@ -8537,6 +8839,9 @@ impl Database {
             std::collections::HashMap::new();
         let mut new_docs: Vec<Object> = Vec::new();
         for row in rows {
+            // INSERT … SELECT walks every source row (millions on a big
+            // backfill): the timeout must be able to interrupt it.
+            self.stmt_deadline.check()?;
             let mut row = row;
             if autoinc_appended {
                 row.push(Value::Int(next_autoinc));
@@ -8895,8 +9200,17 @@ impl Database {
         }
         // Legacy files whose constraint columns predate trees keep the
         // whole-set duplicate check; tables with no constraints skip it.
+        // ANY untreed constraint column triggers it (same gate as the
+        // UPDATE fast path): an all-or-nothing gate used to skip the check
+        // whenever a sibling column had a tree, silently admitting
+        // duplicates on the treeless one.
         let has_constraints = meta.primary_key.is_some() || !meta.unique.is_empty();
-        if has_constraints && indexed.is_empty() && !placed.is_empty() {
+        let all_treed = meta
+            .primary_key
+            .iter()
+            .chain(meta.unique.iter())
+            .all(|c| indexed.contains(c));
+        if has_constraints && !all_treed && !placed.is_empty() {
             // A failed scan must abort, not silently skip the unique check.
             let mut combined = match (Heap {
                 pages: meta.pages.clone(),
@@ -9104,6 +9418,9 @@ impl Database {
         for (t_loc, t_doc) in &tdocs {
             let mut hits = 0;
             for (si, s_doc) in src_rows.iter().enumerate() {
+                // O(target×source) pairing must stay interruptible under
+                // the statement timeout like every other row loop.
+                self.stmt_deadline.check()?;
                 let row = Self::merge_join_row(t_doc, tkey.as_str(), s_doc, &skey);
                 if matches!(eval_expr(&merge.on, &row)?, Value::Bool(true)) {
                     hits += 1;
@@ -9144,13 +9461,11 @@ impl Database {
                 meta.check(&new_doc)?;
                 updates.push((*t_loc, t_doc.clone(), new_doc));
             }
-            // Updated target rows must not orphan referenced parents.
-            let old_docs: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
-            let new_docs: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
-            for doc in &new_docs {
-                self.check_fks_in(&tname, &meta, doc, &new_docs)?;
-            }
-            self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
+            // NOTE: both FK directions are validated against the statement's
+            // FINAL state after the INSERT arm below — checking here (against
+            // pre-statement data) let a MERGE land a dangling self-reference
+            // (UPDATE removes the parent the INSERT arm still points at) and
+            // wrongly reject parents the other arm had just created.
         }
 
         // One pager transaction for heap pages and index trees alike.
@@ -9254,6 +9569,7 @@ impl Database {
                 if s_consumed[si] {
                     continue;
                 }
+                self.stmt_deadline.check()?;
                 let mut doc = Object::new();
                 for (c, e) in cols.iter().zip(exprs.iter()) {
                     let v = eval_expr(e, s_doc)?;
@@ -9292,10 +9608,9 @@ impl Database {
                     }
                 }
                 meta.check(&doc)?;
-                // 行间/自引用 FK:本 MERGE 已插入的新像作父候选。
+                // FK child-side validation moved to the unified post-statement
+                // check below (final state, both arms included).
                 inserted_docs.push(doc.clone());
-                let last = inserted_docs.len() - 1;
-                self.check_fks_in(&tname, &meta, &inserted_docs[last], &inserted_docs)?;
                 let loc = heap.insert(&self.pager, &mut tx, &doc)?;
                 reindex_insert(&self.pager, &mut tx, &idx_specs, &mut roots, &doc, loc)?;
                 if let Some(col) = &meta.autoinc {
@@ -9347,6 +9662,83 @@ impl Database {
             if let Err(e) = meta.check_unique(&combined) {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
+            }
+        }
+        // FK validation against the statement's FINAL state: pre-state −
+        // updated pre-images + updated post-images + inserted rows. Both
+        // directions used to be checked per-arm against pre-statement data,
+        // which let a MERGE land a dangling self-reference (UPDATE removes
+        // the parent the INSERT arm points at) or wrongly reject a parent
+        // the other arm had just created.
+        if !updates.is_empty() || !inserted_docs.is_empty() {
+            let final_docs: Vec<Object> = {
+                let mut docs = match self.table_docs_cx(&tname) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.pager.abort_tx(tx)?;
+                        return Err(e);
+                    }
+                };
+                for (_, old, _) in &updates {
+                    docs.retain(|d| d != old);
+                }
+                docs.extend(updates.iter().map(|(_, _, n)| n.clone()));
+                docs.extend(inserted_docs.iter().cloned());
+                docs
+            };
+            // Child side: every FK value in a new/inserted image must exist
+            // in the final state. For self-references the candidate set is
+            // EXACTLY the final images — `check_fks_in`'s same_batch is only
+            // an ADDITIONAL parent source, so the pre-state heap would still
+            // satisfy values this very statement removes.
+            for (col, rtable, rcol) in &meta.foreign_keys {
+                for doc in updates
+                    .iter()
+                    .map(|(_, _, n)| n)
+                    .chain(inserted_docs.iter())
+                {
+                    let Some(v) = doc.get(col) else { continue };
+                    if matches!(v, Value::Null) {
+                        continue; // NULL passes (MATCH SIMPLE semantics)
+                    }
+                    let matches_parent = |rd: &Object| {
+                        rd.get(rcol)
+                            .map(|rv| Value::cmp_values(rv, v) == Ordering::Equal)
+                            .unwrap_or(false)
+                    };
+                    let hit = if rtable == &tname {
+                        final_docs.iter().any(matches_parent)
+                    } else {
+                        match self.table_docs_cx(rtable) {
+                            Ok(d) => d.iter().any(matches_parent),
+                            Err(e) => {
+                                self.pager.abort_tx(tx)?;
+                                return Err(e);
+                            }
+                        }
+                    };
+                    if !hit {
+                        self.pager.abort_tx(tx)?;
+                        return err(format!(
+                            "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
+                        ));
+                    }
+                }
+            }
+            // Parent side: removed values must not stay referenced — the
+            // self-reference child scan runs over the final images.
+            let removed: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
+            if !removed.is_empty() {
+                if let Err(e) = self.check_fk_parent_delete_skipping(
+                    &tname,
+                    &removed,
+                    &final_docs,
+                    &[],
+                    Some(&final_docs),
+                ) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
             }
         }
         // Emptied heap pages are released inside this transaction so later

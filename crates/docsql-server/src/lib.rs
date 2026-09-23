@@ -244,8 +244,12 @@ impl TxPending {
     }
 
     /// ROLLBACK TO SAVEPOINT name: drop writes past the mark (and later marks).
+    /// Duplicate savepoint names resolve to the MOST RECENT one — the same
+    /// `rposition` the engine uses (SQLite semantics); a `position` here
+    /// truncated the buffer to the earliest duplicate and silently diverged
+    /// the fan-out from what the engine actually kept.
     pub fn rollback_to(&mut self, name: &str) {
-        if let Some(pos) = self.marks.iter().position(|(n, _)| n == name) {
+        if let Some(pos) = self.marks.iter().rposition(|(n, _)| n == name) {
             let (_, len) = self.marks[pos].clone();
             self.writes.truncate(len);
             self.marks.truncate(pos);
@@ -253,9 +257,10 @@ impl TxPending {
         }
     }
 
-    /// RELEASE SAVEPOINT name: forget the mark, keep the writes.
+    /// RELEASE SAVEPOINT name: forget the mark, keep the writes. Most recent
+    /// duplicate wins, matching `rollback_to` and the engine.
     pub fn release(&mut self, name: &str) {
-        if let Some(pos) = self.marks.iter().position(|(n, _)| n == name) {
+        if let Some(pos) = self.marks.iter().rposition(|(n, _)| n == name) {
             self.marks.truncate(pos);
         }
     }
