@@ -209,6 +209,10 @@ fn statements_ready(sql: &str) -> bool {
         Single,
         Double,
         Backtick,
+        /// T-SQL [bracket identifier]: `;` inside is identifier data, `]]`
+        /// escapes a literal `]` (same rule as stmt.rs's splitter and
+        /// tsql::preprocess — the scanners must agree).
+        Bracket,
         Line,
         Block,
     }
@@ -222,6 +226,7 @@ fn statements_ready(sql: &str) -> bool {
                 b'\'' => st = S::Single,
                 b'"' => st = S::Double,
                 b'`' => st = S::Backtick,
+                b'[' => st = S::Bracket,
                 b'-' if b.get(i + 1) == Some(&b'-') => {
                     st = S::Line;
                     i += 1;
@@ -255,6 +260,15 @@ fn statements_ready(sql: &str) -> bool {
             S::Backtick => {
                 if b[i] == b'`' {
                     if b.get(i + 1) == Some(&b'`') {
+                        i += 1;
+                    } else {
+                        st = S::Code;
+                    }
+                }
+            }
+            S::Bracket => {
+                if b[i] == b']' {
+                    if b.get(i + 1) == Some(&b']') {
                         i += 1;
                     } else {
                         st = S::Code;
@@ -1948,6 +1962,19 @@ mod statement_ready_tests {
         // 未闭合的块注释 / 未闭合反引号都不算就绪。
         assert!(!statements_ready("SELECT `open;"));
         assert!(!statements_ready("SELECT 1; /* still open"));
+    }
+
+    #[test]
+    fn bracket_identifiers_and_doubled_brackets() {
+        // T-SQL [bracket] 标识符里的 `;` 是数据,不再截断语句
+        // (与 stmt.rs 的 split_statements / tsql::preprocess 同一规则)。
+        assert!(statements_ready("SELECT [a;b] FROM t;"));
+        assert!(!statements_ready("SELECT [a;b FROM t;"));
+        // `]]` 是转义的 `]`,括号仍闭合;其后的 `;` 照常终结。
+        assert!(statements_ready("SELECT [a]]b;c];"));
+        assert!(!statements_ready("SELECT [a]]b;"));
+        // 未闭合的 bracket 不算就绪。
+        assert!(!statements_ready("SELECT [open;"));
     }
 
     #[test]

@@ -27,7 +27,9 @@
 //! sit behind interior locks. The engine's write lock still serializes all
 //! writers; the locks here only separate writers from readers.
 
-use crate::wal::{Wal, WalError, KIND_COMMIT, KIND_COMMIT_DEFERRED, KIND_FENCE, KIND_WRITE};
+use crate::wal::{
+    Wal, WalError, KIND_ABORT, KIND_COMMIT, KIND_COMMIT_DEFERRED, KIND_FENCE, KIND_WRITE,
+};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
@@ -523,25 +525,31 @@ impl Pager {
         // SQL transaction) only counts when a later fence — the SQL COMMIT
         // boundary — is present in the valid prefix. A crash mid-transaction
         // therefore drops the whole prefix instead of replaying part of it.
+        // A deferred commit aborted by ROLLBACK stays dropped even under a
+        // later fence (DeferredSet, shared with Wal::open's scanner).
         let mut committed = std::collections::HashSet::new();
-        let mut deferred: Vec<(u64, u64)> = Vec::new();
-        let mut last_fence_lsn = 0u64;
+        let mut deferred = crate::wal::DeferredSet::default();
+        let mut max_txid = 0u64;
         for rec in Wal::frames(&wal_path)? {
             let rec = rec?;
+            max_txid = max_txid.max(rec.txid);
             match rec.kind {
                 KIND_COMMIT => {
                     committed.insert(rec.txid);
                 }
-                KIND_COMMIT_DEFERRED => deferred.push((rec.lsn, rec.txid)),
-                KIND_FENCE => last_fence_lsn = last_fence_lsn.max(rec.lsn),
+                KIND_COMMIT_DEFERRED => deferred.push(rec.lsn, rec.txid),
+                KIND_FENCE => deferred.fence(rec.lsn),
+                KIND_ABORT => deferred.abort(rec.txid, rec.lsn),
                 _ => {}
             }
         }
-        for (lsn, txid) in deferred {
-            if lsn < last_fence_lsn {
-                committed.insert(txid);
-            }
+        for txid in deferred.durable_txids() {
+            committed.insert(txid);
         }
+        // Txids restart at 1 on a fresh process; seeding from the log keeps
+        // new transactions from colliding with pre-crash ones (an ABORT of a
+        // reused id must never void an unrelated deferred commit).
+        self.next_txid.fetch_max(max_txid + 1, Ordering::Relaxed);
         let mut applied = false;
         for rec in Wal::frames(&wal_path)? {
             let rec = rec?;
@@ -1299,6 +1307,12 @@ impl Pager {
         let mut st = lock(&self.ckpt.st);
         st.covered_len = 0;
         Ok(())
+    }
+
+    /// ROLLBACK 的 WAL 语义标记:作废全部未 fence 的 deferred 提交(见
+    /// [`Wal::abort_deferred`])。必须在恢复事务(replay undo)开始前调用。
+    pub fn abort_deferred(&self) -> Result<()> {
+        lock(&self.wal).abort_deferred().map_err(PagerError::from)
     }
 
     /// Abort: staged writes never reach disk, nothing to undo (WAL never

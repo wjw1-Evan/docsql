@@ -38,6 +38,7 @@ use docsql_core::engine::{AnyStmt, Database, ExecOutcome, TableDigest, TxControl
 use docsql_core::now_ms;
 use docsql_core::proto::{self, Frame};
 use docsql_core::value::Value;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -133,6 +134,9 @@ pub struct ServerState {
     /// Writes from any other connection (and replication applies) queue
     /// behind it instead of silently joining — the owner's ROLLBACK would
     /// otherwise drop writes the actor already acknowledged.
+    /// Locking uses the engine's poison policy (`into_inner`): a panic in
+    /// one holder must not cascade into every later statement panicking on
+    /// a poisoned mutex.
     pub tx_owner: std::sync::Mutex<Option<u64>>,
     /// Serializes write execution together with its fan-out so peers apply
     /// writes in the order this node executed them (and the
@@ -313,8 +317,10 @@ pub struct QueuedWrite {
 /// closed and never queues.
 #[derive(Default)]
 pub struct SyncGate {
-    /// Replication writes acknowledged but not yet applied.
-    pub pending: Vec<QueuedWrite>,
+    /// Replication writes acknowledged but not yet applied. VecDeque: the
+    /// drain is peek-front / pop-front, and a Vec's remove(0) made every
+    /// replay O(n) (O(n²) over a full queue).
+    pub pending: VecDeque<QueuedWrite>,
     /// Sum of `pending[*].sql.len()` — the budget feed for
     /// MAX_SYNC_QUEUE_BYTES, maintained by every mutation site.
     pub pending_bytes: usize,
@@ -422,18 +428,14 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("cluster id: {e}")))?;
     // Drop peer entries that point at ourselves: forwarding to self would
     // double-apply every write locally.
-    let peers: Vec<String> = cfg
-        .peers
-        .into_iter()
-        .filter(|p| {
-            if is_self_peer(&cfg.listen, p) {
-                eprintln!("ignoring self-referencing peer entry {p}");
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
+    let mut peers: Vec<String> = Vec::new();
+    for p in cfg.peers {
+        if is_self_peer(&cfg.listen, &p).await {
+            eprintln!("ignoring self-referencing peer entry {p}");
+        } else {
+            peers.push(p);
+        }
+    }
     if let (Some(cluster), Some(client)) = (&cfg.cluster_token, &cfg.auth_token) {
         if cluster == client {
             eprintln!(
@@ -505,7 +507,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         holds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         next_hold_id: std::sync::atomic::AtomicU64::new(1),
         sync_queue: tokio::sync::Mutex::new(SyncGate {
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             pending_bytes: 0,
             closed: !peers_configured,
         }),
@@ -561,7 +563,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             {
                 let mut gate = st.sync_queue.lock().await;
                 let n = gate.pending.len();
-                gate.pending = Vec::new();
+                gate.pending.clear();
                 gate.pending_bytes = 0;
                 gate.closed = true;
                 // Acknowledged writes that will never be applied: keep the
@@ -759,21 +761,29 @@ fn set_tcp_keepalive(s: TcpStream) -> TcpStream {
 
 /// True when `peer` resolves to a loopback address on the port we listen on
 /// (or is literally the listen address): forwarding there would loop back.
-fn is_self_peer(listen: &str, peer: &str) -> bool {
+/// DNS goes through tokio's async resolver with a bounded budget: both live
+/// call sites (handle_sync registration / handle_hold) sit on the write path
+/// holding write_order, where a synchronous resolver would tax every write
+/// with the DNS worst case (the resolver has no own timeout). Resolution
+/// failure or timeout returns false — the same conservative answer as a
+/// malformed address.
+const SELF_PEER_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn is_self_peer(listen: &str, peer: &str) -> bool {
     if listen.eq_ignore_ascii_case(peer) {
         return true;
     }
-    use std::net::ToSocketAddrs;
     let Some(port) = listen
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
     else {
         return false;
     };
-    let peer_addrs = match peer.to_socket_addrs() {
-        Ok(a) => a.collect::<Vec<_>>(),
-        Err(_) => return false,
-    };
+    let peer_addrs =
+        match tokio::time::timeout(SELF_PEER_DNS_TIMEOUT, tokio::net::lookup_host(peer)).await {
+            Ok(Ok(a)) => a.collect::<Vec<_>>(),
+            _ => return false,
+        };
     // A loopback advertisement with our listen port is us; so is any
     // address that resolves to the same socket as our own listen address
     // (the joiner advertising its LAN IP while listen says 0.0.0.0 must
@@ -784,12 +794,12 @@ fn is_self_peer(listen: &str, peer: &str) -> bool {
     {
         return true;
     }
-    match listen.to_socket_addrs() {
-        Ok(ls) => {
+    match tokio::time::timeout(SELF_PEER_DNS_TIMEOUT, tokio::net::lookup_host(listen)).await {
+        Ok(Ok(ls)) => {
             let lset: std::collections::HashSet<_> = ls.collect();
             peer_addrs.iter().any(|a| lset.contains(a))
         }
-        Err(_) => false,
+        _ => false,
     }
 }
 
@@ -1812,6 +1822,12 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                                         &String::from_utf8_lossy(&resp.payload),
                                                     ),
                                                 );
+                                            } else {
+                                                // T-SQL:每条语句都刷新
+                                                // @@ERROR,成功归零 —— 不然
+                                                // 批内失败后紧跟的快路径
+                                                // 成功语句留下 stale 错误码。
+                                                tsql_session.note_error(0);
                                             }
                                         }
                                         resp
@@ -2155,8 +2171,8 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     // the same order execute_sql takes.
     {
         let _order = state.write_order.lock().await;
-        if *state.tx_owner.lock().unwrap() == Some(conn_id) {
-            *state.tx_owner.lock().unwrap() = None;
+        if *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) == Some(conn_id) {
+            *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
             {
                 let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
                 if db.in_transaction() {
@@ -2228,8 +2244,15 @@ fn json_param_to_value(p: &serde_json::Value) -> Value {
                 }
             }
             // TIMESTAMP: UTC milliseconds (the ADO.NET driver's $ts marker).
+            // Domain-checked against the canonical 0001..=9999 window: an
+            // out-of-range value has no round-trippable text form, so
+            // value_literal/dump could not replay it — fall back to text,
+            // the same policy as an unparsable $dec.
             if let Some(serde_json::Value::Number(n)) = o.get("$ts") {
-                if let Some(ms) = n.as_i64() {
+                if let Some(ms) = n
+                    .as_i64()
+                    .filter(|ms| docsql_core::value::is_valid_timestamp_ms(*ms))
+                {
                     return Value::Timestamp(ms);
                 }
             }
@@ -3014,7 +3037,7 @@ async fn execute_sql_inner(
             && state
                 .tx_owner
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .is_some_and(|o| Some(o) != conn);
         if foreign_control {
             return (
@@ -3050,7 +3073,7 @@ async fn execute_sql_inner(
     // transaction must not apply a write locally and then fail to buffer it
     // (peers would never see a write this node reported as applied).
     if !is_replication && is_write && conn.is_some() {
-        let owned = *state.tx_owner.lock().unwrap() == conn;
+        let owned = *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) == conn;
         if owned && !state.tx_pending.lock().await.check_room(sql.len()) {
             return (
                 Frame::new(
@@ -3078,7 +3101,8 @@ async fn execute_sql_inner(
             // rows (a dirty read that a later ROLLBACK made vanish). Same-owner
             // reads must pass — they see their own writes by design.
             let plain_read = !is_write && matches!(tx_kind, TxControl::None);
-            let foreign_tx = (is_write || plain_read) && *state.tx_owner.lock().unwrap() != conn;
+            let foreign_tx = (is_write || plain_read)
+                && *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) != conn;
             if queues || foreign_tx {
                 wait_engine_tx_free(state, deadline).await;
                 // A plain read that waited must re-check before executing: the
@@ -3095,7 +3119,7 @@ async fn execute_sql_inner(
                             .read()
                             .unwrap_or_else(|p| p.into_inner())
                             .in_transaction();
-                        in_tx && *state.tx_owner.lock().unwrap() != conn
+                        in_tx && *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) != conn
                     };
                     if busy {
                         return (
@@ -3124,7 +3148,7 @@ async fn execute_sql_inner(
                             .read()
                             .unwrap_or_else(|p| p.into_inner())
                             .in_transaction();
-                        in_tx && *state.tx_owner.lock().unwrap() != conn
+                        in_tx && *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) != conn
                     };
                     if busy {
                         drop(order);
@@ -3247,7 +3271,7 @@ async fn execute_sql_inner(
                 && out
                     .as_ref()
                     .is_err_and(|e| e.to_string().contains("transaction already in progress"))
-                && *state.tx_owner.lock().unwrap() != conn
+                && *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) != conn
                 && tokio::time::Instant::now() < deadline
             {
                 drop(guard);
@@ -3291,21 +3315,21 @@ async fn execute_sql_inner(
         // exists. A failed COMMIT clears the buffer without draining (the
         // writes were never durably committed, so peers must not see them).
         if matches!(tx_kind, TxControl::Commit) {
-            *state.tx_owner.lock().unwrap() = None;
+            *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if outcome.is_ok() {
                 drain_tx_pending(state).await;
             } else {
                 state.tx_pending.lock().await.clear();
             }
         } else if matches!(tx_kind, TxControl::Rollback { savepoint: None }) {
-            *state.tx_owner.lock().unwrap() = None;
+            *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
             state.tx_pending.lock().await.clear();
         }
     }
     if !is_replication && outcome.is_ok() {
         match tx_kind {
             TxControl::Begin => {
-                *state.tx_owner.lock().unwrap() = conn;
+                *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = conn;
             }
             TxControl::Commit | TxControl::Rollback { savepoint: None } => {}
             TxControl::Rollback {
@@ -4699,7 +4723,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
             );
         } else {
             let mut peers = state.peers.lock().await;
-            if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise) {
+            if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise).await {
                 if peers.len() >= MAX_DYNAMIC_PEERS {
                     eprintln!(
                         "cluster join: peer list full ({MAX_DYNAMIC_PEERS}), \
@@ -4819,7 +4843,15 @@ async fn handle_hold(state: &Arc<ServerState>, frame: &Frame) -> Frame {
                 err_payload("hold: advertise address must be host:port"),
             );
         }
-        if state.peers.lock().await.len() >= MAX_DYNAMIC_PEERS {
+        // 满员检查只约束「新增」注册:已在 peer 列表内的节点(静态
+        // DOCSQL_PEERS 或此前注册过的)重启后重新 join 时,其 HOLD 若被
+        // 满员拒绝,静态节点数 ≥ MAX_DYNAMIC_PEERS 的集群里重启节点的
+        // join 会永久失败——它本来就不新增任何列表条目。
+        let (already_present, list_len) = {
+            let peers = state.peers.lock().await;
+            (peers.contains(&advertise), peers.len())
+        };
+        if !already_present && list_len >= MAX_DYNAMIC_PEERS {
             return Frame::new(
                 proto::RESP_ERROR,
                 err_payload(&format!(
@@ -4852,7 +4884,7 @@ async fn handle_hold(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     // hold fans out to the joiner; ones before it are in the dump.
     if !advertise.is_empty() {
         let mut peers = state.peers.lock().await;
-        if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise) {
+        if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise).await {
             peers.push(advertise.clone());
             querylog::sync_event(&state.sync_log, "join", &advertise, None, true, None);
         }
@@ -5083,7 +5115,7 @@ async fn gate_enqueue(
         ));
     }
     gate.pending_bytes += sql.len();
-    gate.pending.push(QueuedWrite {
+    gate.pending.push_back(QueuedWrite {
         origin,
         sql: sql.to_string(),
     });
@@ -5209,7 +5241,7 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) -> u64 {
         // acknowledged write it is about to strand.
         let q = {
             let mut gate = state.sync_queue.lock().await;
-            match gate.pending.first() {
+            match gate.pending.front() {
                 None => {
                     gate.closed = true;
                     break;
@@ -5233,7 +5265,12 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) -> u64 {
             };
             if covered {
                 let mut gate = state.sync_queue.lock().await;
-                gate.pending_bytes -= gate.pending.remove(0).sql.len();
+                gate.pending_bytes -= gate
+                    .pending
+                    .pop_front()
+                    .expect("front peeked at loop head")
+                    .sql
+                    .len();
                 continue;
             }
         }
@@ -5274,7 +5311,12 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) -> u64 {
         }
         {
             let mut gate = state.sync_queue.lock().await;
-            gate.pending_bytes -= gate.pending.remove(0).sql.len();
+            gate.pending_bytes -= gate
+                .pending
+                .pop_front()
+                .expect("front peeked at loop head")
+                .sql
+                .len();
         }
         total_failures += failures;
     }
@@ -5707,6 +5749,22 @@ pub(crate) async fn run_catchup(
     plan: &[CatchupTask],
 ) -> Result<(), String> {
     for task in plan {
+        // 与 live REQ_SQL_SEQ 应用路径同一把 per-origin 锁:拉取期间同源的
+        // 直连扇出写可能正在途(源端的第一次尝试超时后已发出下一条)。
+        // 不持锁时拉取到的旧行像会与新写的直连应用交错,非交换写乱序落地,
+        // 而下方的位点推进随后掩盖分叉。锁序 origin → write_order 与 live
+        // 路径一致(catch_up_from 内部经 execute_sql 走写路径)。逐任务
+        // 持有:不同 origin 的任务在循环里本就串行,不引入跨 origin 锁序。
+        let (origin_lock, origin_rejected) = origin_apply_lock(state, &task.node_id).await;
+        if origin_rejected {
+            // 与 live 路径同语义:超过 origin 上限时拒绝而非绕过串行化;
+            // catch-up 失败后由 digest 复验走快照兜底。
+            return Err(format!(
+                "origin {} rejected (max {MAX_APPLY_ORIGINS} tracked origins)",
+                task.node_id
+            ));
+        }
+        let _origin_guard = origin_lock.lock_owned().await;
         let head = catch_up_from(state, &task.addr, task.from)
             .await
             .map_err(|e| format!("pull from {}: {e}", task.addr))?;
@@ -6454,6 +6512,18 @@ mod security_tests {
         assert!(matches!(json_param_to_value(&p), Value::Str(_)));
         let p: serde_json::Value = serde_json::from_str(r#"{"$bytes":"not-an-array"}"#).unwrap();
         assert!(matches!(json_param_to_value(&p), Value::Str(_)));
+        // $ts 在规范值域内解码为 Timestamp;超域值没有可重放的文本形,
+        // 与 $dec 解析失败同样回退为字符串。
+        let p: serde_json::Value = serde_json::from_str(r#"{"$ts":1577836800000}"#).unwrap();
+        assert_eq!(json_param_to_value(&p), Value::Timestamp(1_577_836_800_000));
+        let p: serde_json::Value = serde_json::from_str(r#"{"$ts":253402300800000}"#).unwrap();
+        assert!(matches!(json_param_to_value(&p), Value::Str(_)));
+        let p: serde_json::Value = serde_json::from_str(&format!(
+            "{{\"$ts\":{}}}",
+            docsql_core::value::TIMESTAMP_MIN_MS - 1
+        ))
+        .unwrap();
+        assert!(matches!(json_param_to_value(&p), Value::Str(_)));
         // Ordinary objects stay text (render_param quotes them).
         let p: serde_json::Value = serde_json::from_str(r#"{"k":1}"#).unwrap();
         assert_eq!(json_param_to_value(&p), Value::Str(r#"{"k":1}"#.into()));
@@ -6510,20 +6580,20 @@ mod security_tests {
         assert_eq!(parse_peer_addr("no-port-here"), None);
     }
 
-    #[test]
-    fn is_self_peer_matches_literal_loopback_and_resolved_forms() {
+    #[tokio::test]
+    async fn is_self_peer_matches_literal_loopback_and_resolved_forms() {
         // 字面相等(大小写不敏感)即自身。
-        assert!(is_self_peer("0.0.0.0:7600", "0.0.0.0:7600"));
-        assert!(!is_self_peer("0.0.0.0:7600", "0.0.0.1:7600"));
+        assert!(is_self_peer("0.0.0.0:7600", "0.0.0.0:7600").await);
+        assert!(!is_self_peer("0.0.0.0:7600", "0.0.0.1:7600").await);
         // 回环地址 + 同监听端口 = 自身(advertise 127.0.0.1)。
-        assert!(is_self_peer("0.0.0.0:7600", "127.0.0.1:7600"));
-        assert!(is_self_peer("0.0.0.0:7600", "localhost:7600"));
+        assert!(is_self_peer("0.0.0.0:7600", "127.0.0.1:7600").await);
+        assert!(is_self_peer("0.0.0.0:7600", "localhost:7600").await);
         // 同端口但非回环 ≠ 自身;回环但端口不同 ≠ 自身。
-        assert!(!is_self_peer("0.0.0.0:7600", "127.0.0.1:7601"));
-        assert!(!is_self_peer("0.0.0.0:7600", "192.0.2.99:7600"));
+        assert!(!is_self_peer("0.0.0.0:7600", "127.0.0.1:7601").await);
+        assert!(!is_self_peer("0.0.0.0:7600", "192.0.2.99:7600").await);
         // 解析失败的 listen 串保守返回 false,不 panic。
-        assert!(!is_self_peer("not an addr", "127.0.0.1:7600"));
-        assert!(!is_self_peer("0.0.0.0:7600", "definitely not an addr"));
+        assert!(!is_self_peer("not an addr", "127.0.0.1:7600").await);
+        assert!(!is_self_peer("0.0.0.0:7600", "definitely not an addr").await);
     }
 
     #[test]

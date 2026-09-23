@@ -344,11 +344,13 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
         // skipping it on the fresh-base first tick would leave the PITR
         // chain behind across restarts.
         if state.sync_queue.lock().await.closed && try_begin_backup(&state) {
+            // RunningFlagGuard:export_incremental panic 时 running 标志在
+            // unwind 中也能复位,定时备份不会卡死到重启(与 finish_backup
+            // 同一形态)。
+            let _running = RunningFlagGuard(&state);
             if let Err(e) = export_incremental(&state).await {
                 eprintln!("incremental export failed: {e}");
             }
-            let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-            b.running = false;
         }
         // Full backup freshness: first tick writes one when none exists or
         // the newest is older than the interval; a fresh base is kept (a
@@ -776,10 +778,10 @@ pub(crate) async fn handle_backup(
                     crate::err_payload("backup already in progress"),
                 );
             }
+            // RunningFlagGuard:export 路径 panic 时 running 标志同样复位,
+            // 不再手动清零(手动复位在 unwind 时被跳过,会 wedged 后续备份)。
+            let _running = RunningFlagGuard(state);
             let res = export_incremental(state).await;
-            let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-            b.running = false;
-            drop(b);
             // Audit: a manual export is an operator action on the backup
             // trail, same as trigger/restore.
             querylog::record(

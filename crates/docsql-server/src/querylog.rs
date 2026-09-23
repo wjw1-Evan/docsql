@@ -86,77 +86,94 @@ impl QueryLog {
             eprintln!("slow query ({:.1} ms): {}", e.ms, e.sql);
         }
         if let Some(path) = &self.log_file {
-            if let Ok(line) = serde_json::to_string(&serde_json::json!({
-                "ts_ms": e.ts_ms, "peer": e.peer, "sql": e.sql,
-                "ms": e.ms, "affected": e.affected,
-                "error": e.error, "replicated": e.replicated,
-            })) {
-                let mut sink = self.sink.lock().unwrap_or_else(|p| p.into_inner());
-                if sink.is_none() {
-                    let now = std::time::Instant::now();
-                    let retry_ok = self
-                        .sink_retry_after
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .is_none_or(|t| now >= t);
-                    if retry_ok {
-                        let mut opts = std::fs::OpenOptions::new();
-                        opts.create(true).append(true);
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::OpenOptionsExt as _;
-                            // Owner-only: the audit trail carries every
-                            // statement text (redacted passwords included in
-                            // shape) — no reason for other local accounts to
-                            // read it.
-                            opts.mode(0o600);
-                        }
-                        *sink = opts.open(path).ok();
-                        if sink.is_none() {
-                            *self
-                                .sink_retry_after
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner()) =
-                                Some(now + std::time::Duration::from_secs(10));
-                            if !self
-                                .sink_warned
-                                .swap(true, std::sync::atomic::Ordering::Relaxed)
-                            {
-                                eprintln!("query log file {path}: cannot open for append");
-                            }
-                        }
-                    }
-                }
-                if let Some(f) = sink.as_mut() {
-                    use std::io::Write;
-                    if let Err(err) = writeln!(f, "{line}") {
-                        // Drop the handle so the next push reopens; retry
-                        // slowly and keep the failure visible.
-                        *sink = None;
-                        *self
-                            .sink_retry_after
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner()) =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
-                        if !self
-                            .sink_warned
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                        {
-                            eprintln!("query log file {path}: {err}");
-                        }
-                    } else {
-                        // Healthy again: re-arm the one-shot warning.
-                        self.sink_warned
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
+            self.append_jsonl(path, &e);
         }
         let mut ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
         if ring.len() == self.capacity {
             ring.pop_front();
         }
         ring.push_back(e);
+    }
+
+    /// 同步追加一条 JSONL 审计记录。有意保持同步写而非专职写线程:
+    /// 审计落盘的可观测契约是「语句返回后立即可见」——单测
+    /// (jsonl_sink_appends_every_entry…)与 .NET QueryLogTests 都在
+    /// push 之后直接读文件,不等轮询;有界 mpsc + 异步刷盘只能做到
+    /// 最终可见,满足不了该契约。取舍落在收缩阻塞面:JSON 序列化与
+    /// 重试窗口判定都在 sink 锁外完成,sink 锁内只剩 open/write 本身
+    /// (append 模式单行几十字节的一次 write(2)),环形缓冲的锁也与
+    /// 文件锁彻底分离(读视图不付文件 IO 的代价);未配置
+    /// DOCSQL_LOG_FILE 时整条路径零开销。
+    fn append_jsonl(&self, path: &str, e: &LogEntry) {
+        let Ok(line) = serde_json::to_string(&serde_json::json!({
+            "ts_ms": e.ts_ms, "peer": e.peer, "sql": e.sql,
+            "ms": e.ms, "affected": e.affected,
+            "error": e.error, "replicated": e.replicated,
+        })) else {
+            return;
+        };
+        // 退避判定在 sink 锁外读取:坏路径/满盘时并发的 push 各付一次
+        // 短命 retry_after 锁,不把退避检查也串进全局写锁。
+        let now = std::time::Instant::now();
+        let retry_ok = self
+            .sink_retry_after
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none_or(|t| now >= t);
+        if !retry_ok {
+            return;
+        }
+        let mut sink = self.sink.lock().unwrap_or_else(|p| p.into_inner());
+        if sink.is_none() {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // Owner-only: the audit trail carries every
+                // statement text (redacted passwords included in
+                // shape) — no reason for other local accounts to
+                // read it.
+                opts.mode(0o600);
+            }
+            *sink = opts.open(path).ok();
+            if sink.is_none() {
+                *self
+                    .sink_retry_after
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) =
+                    Some(now + std::time::Duration::from_secs(10));
+                if !self
+                    .sink_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    eprintln!("query log file {path}: cannot open for append");
+                }
+            }
+        }
+        if let Some(f) = sink.as_mut() {
+            use std::io::Write;
+            if let Err(err) = writeln!(f, "{line}") {
+                // Drop the handle so the next push reopens; retry
+                // slowly and keep the failure visible.
+                *sink = None;
+                *self
+                    .sink_retry_after
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                if !self
+                    .sink_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    eprintln!("query log file {path}: {err}");
+                }
+            } else {
+                // Healthy again: re-arm the one-shot warning.
+                self.sink_warned
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Vec<LogEntry> {

@@ -367,7 +367,28 @@ fn cmp_decimal_f64(d: &Decimal, f: f64) -> std::cmp::Ordering {
         return Ordering::Less; // d < NaN
     }
     match Decimal::from_f64_retain(f) {
-        Some(fd) => d.cmp(&fd),
+        Some(fd) => {
+            if fd.is_zero() && f != 0.0 {
+                // 下溢:非零浮点小到 Decimal 装不下时 from_f64_retain 给
+                // Some(0),让 Decimal(0) 与 1e-30 判等 —— 序失去传递性,
+                // 唯一判定/树内定位全部失真。拆开按量级比:
+                // · d == 0:零小于任何正次正规、大于任何负次正规;
+                // · 非零 d:量级 ≥ 1e-28 严格大于 |f|,正 d 恒大、负 d 恒小。
+                if d.is_zero() {
+                    return if f > 0.0 {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    };
+                }
+                return if d.is_sign_negative() {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            d.cmp(&fd)
+        }
         None if f > 0.0 => Ordering::Less, // d < +inf
         None => Ordering::Greater,         // d > -inf
     }
@@ -451,6 +472,39 @@ impl fmt::Display for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decimal ↔ 次正规 Float(如 1e-30)的下溢:from_f64_retain 会给
+    /// Some(0),曾让 Decimal(0) 与非零 Float 判等,序失去传递性。
+    #[test]
+    fn decimal_vs_subnormal_float_keeps_total_order() {
+        use std::cmp::Ordering::*;
+        let d0 = Decimal::ZERO;
+        let tiny_pos = 1e-30f64;
+        let tiny_neg = -1e-30f64;
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(d0), &Value::Float(tiny_pos)),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(d0), &Value::Float(tiny_neg)),
+            Greater
+        );
+        let dpos: Decimal = "1".parse().unwrap();
+        let dneg: Decimal = "-1".parse().unwrap();
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(dpos), &Value::Float(tiny_pos)),
+            Greater
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(dneg), &Value::Float(tiny_neg)),
+            Less
+        );
+        // 传递性守卫:Decimal(0) < Float(1e-30) < Float(1e-29)。
+        assert_eq!(
+            Value::cmp_values(&Value::Float(tiny_pos), &Value::Float(1e-29)),
+            Less
+        );
+    }
 
     #[test]
     fn ordering_is_total_and_type_stable() {

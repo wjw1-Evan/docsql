@@ -2299,17 +2299,19 @@ fn restyle_to_iso(s: &str, style: i64) -> Res<String> {
             }
         }
         12 | 112 => {
-            let n: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
-            if n.len() != 6 && n.len() != 8 {
+            // ISO 紧凑形:原文必须恰好是 6 或 8 个 ASCII 数字 —— 预过滤
+            // 数字会静默接受 '2026-09-01' 乃至混入字母后凑足位数的输入,
+            // 得到完全不同的日期(静默错误数据)。
+            if !t.chars().all(|c| c.is_ascii_digit()) || (t.len() != 6 && t.len() != 8) {
                 return Err(bad());
             }
-            let (ys, rest) = if n.len() == 8 {
-                (&n[..4], &n[4..])
+            let (ys, rest) = if t.len() == 8 {
+                (&t[..4], &t[4..])
             } else {
-                (&n[..2], &n[2..])
+                (&t[..2], &t[2..])
             };
             let y: i64 = ys.parse().map_err(|_| bad())?;
-            let y = if n.len() == 6 { century(y) } else { y };
+            let y = if t.len() == 6 { century(y) } else { y };
             let m: i64 = rest[..2].parse().map_err(|_| bad())?;
             let d: i64 = rest[2..].parse().map_err(|_| bad())?;
             (y, m, d)
@@ -2602,10 +2604,24 @@ fn generate_series(args: &[Value]) -> Res<Vec<Object>> {
     if step == 0 {
         return err("GENERATE_SERIES step cannot be 0");
     }
+    // 跨度/步长取负都可能溢出(异号极值、step = i64::MIN),溢出时行数必然远超上限,
+    // 与超限统一报错,绝不带符号回绕绕过行数门禁。
     let count = if step > 0 {
-        (b - a) / step + i64::from(b >= a)
+        b.checked_sub(a).and_then(|span| {
+            span.checked_div(step)
+                .and_then(|q| q.checked_add(i64::from(b >= a)))
+        })
     } else {
-        (a - b) / -step + i64::from(a >= b)
+        step.checked_neg().and_then(|step_abs| {
+            a.checked_sub(b).and_then(|span| {
+                span.checked_div(step_abs)
+                    .and_then(|q| q.checked_add(i64::from(a >= b)))
+            })
+        })
+    };
+    let count = match count {
+        Some(c) => c,
+        None => return err("GENERATE_SERIES range is too large"),
     };
     if count > 1_000_000 {
         return err("GENERATE_SERIES result exceeds 1,000,000 rows");
@@ -2613,6 +2629,9 @@ fn generate_series(args: &[Value]) -> Res<Vec<Object>> {
     let mut rows = Vec::new();
     let mut v = a;
     while (step > 0 && v <= b) || (step < 0 && v >= b) {
+        if rows.len() > 1_000_000 {
+            return err("GENERATE_SERIES result exceeds 1,000,000 rows");
+        }
         let mut doc = Object::new();
         doc.insert("value".into(), Value::Int(v));
         rows.push(doc);
@@ -3528,6 +3547,34 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].get("value"), Some(&Value::Int(3)));
+
+        // 异号极值的跨度溢出:必须报错,不得绕过行数门禁(debug 下曾是
+        // 减法溢出 panic,release 下 wrapping 成负数后无限循环 OOM)。
+        assert!(table_function(
+            "GENERATE_SERIES",
+            &[Value::Int(i64::MIN + 1), Value::Int(i64::MAX)]
+        )
+        .unwrap()
+        .is_err());
+        // step = i64::MIN:取负溢出同样报错
+        assert!(table_function(
+            "GENERATE_SERIES",
+            &[Value::Int(0), Value::Int(i64::MAX), Value::Int(i64::MIN)]
+        )
+        .unwrap()
+        .is_err());
+        // 大跨度但步长同步放大:行数在限内,正常出数
+        let rows = table_function(
+            "GENERATE_SERIES",
+            &[
+                Value::Int(0),
+                Value::Int(i64::MAX),
+                Value::Int(i64::MAX / 2),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rows.len(), 3);
 
         let rows = table_function("OPENJSON", &[v_str(r#"[1,"a",null]"#)])
             .unwrap()

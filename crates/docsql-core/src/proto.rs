@@ -226,6 +226,13 @@ impl Frame {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        // 与 decode 对称的硬上限:超限 payload 的 `as u32` 会静默回绕,
+        // 帧头声明长度与实际不符,对端按回绕长度读帧造成流错位(比
+        // "帧太大被拒"更糟的静默损坏)。当前所有出站调用点都有 cap,
+        // 这是公共库函数的纵深防线。
+        if self.payload.len() > MAX_FRAME_BYTES {
+            return Err(ProtoError::FrameTooLarge(self.payload.len()));
+        }
         let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
         out.extend_from_slice(&MAGIC.to_le_bytes());
         out.extend_from_slice(&self.flags.to_le_bytes());

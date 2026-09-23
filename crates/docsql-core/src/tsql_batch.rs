@@ -222,7 +222,7 @@ impl TsqlSession {
                     let value = match init {
                         Some(expr) => {
                             let rendered = self.substitute(&format!("SELECT ({expr})"))?;
-                            eval_last_row(exec, &rendered)
+                            self.eval_tracked(exec, &rendered)
                                 .await?
                                 .and_then(|row| row.into_iter().next())
                                 .unwrap_or(Value::Null)
@@ -240,7 +240,7 @@ impl TsqlSession {
                 let exprs: Vec<&str> = assigns.iter().map(|(_, e)| e.as_str()).collect();
                 let query = format!("SELECT {} {}", exprs.join(", "), tail);
                 let rendered = self.substitute(&query)?;
-                if let Some(row) = eval_last_row(exec, &rendered).await? {
+                if let Some(row) = self.eval_tracked(exec, &rendered).await? {
                     for (i, (name, _)) in assigns.iter().enumerate() {
                         let v = row.get(i).cloned().unwrap_or(Value::Null);
                         self.vars.insert(name.clone(), v);
@@ -250,7 +250,8 @@ impl TsqlSession {
             }
             Stmt::SetOne(name, expr) => {
                 let rendered = self.substitute(&format!("SELECT ({expr})"))?;
-                let v = eval_last_row(exec, &rendered)
+                let v = self
+                    .eval_tracked(exec, &rendered)
                     .await?
                     .and_then(|row| row.into_iter().next())
                     .unwrap_or(Value::Null);
@@ -259,7 +260,8 @@ impl TsqlSession {
             }
             Stmt::Print(expr) => {
                 let rendered = self.substitute(&format!("SELECT ({expr})"))?;
-                let v = eval_last_row(exec, &rendered)
+                let v = self
+                    .eval_tracked(exec, &rendered)
                     .await?
                     .and_then(|row| row.into_iter().next())
                     .unwrap_or(Value::Null);
@@ -367,17 +369,41 @@ impl TsqlSession {
 
     async fn eval_cond(&mut self, exec: &mut dyn BatchExecutor, cond: &str) -> Result<bool> {
         let rendered = self.substitute(&format!("SELECT ({cond})"))?;
-        match eval_last_row(exec, &rendered).await? {
+        match self.eval_tracked(exec, &rendered).await? {
             Some(row) => match row.into_iter().next().unwrap_or(Value::Null) {
                 // T-SQL treats an UNKNOWN (here: NULL) condition as false.
                 Value::Bool(b) => Ok(b),
                 Value::Null => Ok(false),
-                other => err(format!(
-                    "IF/WHILE condition must be a boolean, got {}",
-                    other.type_name()
-                )),
+                other => {
+                    let msg = format!(
+                        "IF/WHILE condition must be a boolean, got {}",
+                        other.type_name()
+                    );
+                    self.last_error = error_number(&SqlError::Message(msg.clone()));
+                    err(msg)
+                }
             },
             None => Ok(false),
+        }
+    }
+
+    /// eval_last_row 的会话包装:任何经引擎执行的批语句形态(DECLARE/
+    /// SET/PRINT/条件求值)都刷新 @@ERROR —— 成功归零、失败记错误码,
+    /// 与 Stmt::Plain 的记账一致(T-SQL:每条语句都刷新 @@ERROR)。
+    async fn eval_tracked(
+        &mut self,
+        exec: &mut dyn BatchExecutor,
+        sql: &str,
+    ) -> Result<Option<Vec<Value>>> {
+        match eval_last_row(exec, sql).await {
+            Ok(v) => {
+                self.last_error = 0;
+                Ok(v)
+            }
+            Err(e) => {
+                self.last_error = error_number(&e);
+                Err(e)
+            }
         }
     }
 
@@ -906,7 +932,18 @@ impl<'a> Parser<'a> {
                     self.i += 6;
                     out.push(self.parse_select_assign()?);
                 }
-                _ => out.push(Stmt::Plain(self.read_plain())),
+                _ => {
+                    // 兜底:read_plain 必须消费输入(零字符语句 + 游标不动
+                    // = 扫描器空转,曾让批解析无限循环)。
+                    let before = self.i;
+                    let text = self.read_plain();
+                    if self.i == before {
+                        return err(
+                            "batch parser made no progress — unexpected keyword at statement start",
+                        );
+                    }
+                    out.push(Stmt::Plain(text));
+                }
             }
         }
     }
@@ -1208,7 +1245,16 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 // A depth-0 ELSE ends the governed statement of a
-                // single-line `IF … stmt ELSE stmt`.
+                // single-line `IF … stmt ELSE stmt`. A CASE expression is
+                // skipped whole first, so its inner ELSE never ends up here.
+                _ if depth == 0
+                    && self.b[self.i].is_ascii_alphabetic()
+                    && self.at_word_start()
+                    && self.word_at_is(&["case"]) =>
+                {
+                    self.skip_case_block();
+                    continue;
+                }
                 _ if depth == 0
                     && self.b[self.i].is_ascii_alphabetic()
                     && self.word_at_is(&["else"]) =>
@@ -1310,6 +1356,16 @@ impl<'a> Parser<'a> {
                 }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
+                // CASE 表达式整体跳过:内部的 ELSE 等语句起始词不结束条件
+                _ if depth == 0
+                    && c.is_ascii_alphabetic()
+                    && self.at_word_start()
+                    && self.word_at_is(&["case"]) =>
+                {
+                    self.skip_case_block();
+                    end = self.i;
+                    continue;
+                }
                 _ if depth == 0
                     && c.is_ascii_alphabetic()
                     && self.word_at_is_statement_starter() =>
@@ -1340,6 +1396,93 @@ impl<'a> Parser<'a> {
             k += 1;
         }
         is_word_in(&self.lb()[self.i..k], list)
+    }
+
+    /// True when the cursor sits on the FIRST byte of a word (the previous
+    /// byte is not a word character) — guards the mid-word false match of a
+    /// keyword inside an identifier like `eelse`.
+    fn at_word_start(&self) -> bool {
+        match self.i.checked_sub(1).and_then(|p| self.b.get(p)) {
+            Some(prev) => !prev.is_ascii_alphanumeric() && *prev != b'_',
+            None => true,
+        }
+    }
+
+    /// Skip a complete `CASE … END` expression (cursor on the word "case").
+    /// An ELSE/newline inside CASE is expression syntax, not a statement
+    /// boundary — without this, the scanners cut the statement at the
+    /// CASE's ELSE and the leftover tail wedges the parser. Nested CASE
+    /// pairs are counted; literals/brackets/comments are skipped as usual.
+    /// An unterminated CASE runs to end of input and is rejected loudly by
+    /// the engine downstream.
+    fn skip_case_block(&mut self) {
+        // 消费 "case" 词本身
+        while self.i < self.b.len()
+            && (self.b[self.i].is_ascii_alphanumeric() || self.b[self.i] == b'_')
+        {
+            self.i += 1;
+        }
+        let mut nesting = 1i32;
+        while self.i < self.b.len() {
+            match self.b[self.i] {
+                b'\'' => {
+                    let (end, _) = stmt::sql_literal_end(self.sql, self.i);
+                    self.i = end;
+                    continue;
+                }
+                b'"' | b'`' | b'[' => {
+                    let close = match self.b[self.i] {
+                        b'[' => b']',
+                        other => other,
+                    };
+                    self.i += 1;
+                    while self.i < self.b.len() {
+                        if self.b[self.i] == close {
+                            if close != b']' && self.b.get(self.i + 1) == Some(&close) {
+                                self.i += 2;
+                                continue;
+                            }
+                            self.i += 1;
+                            break;
+                        }
+                        self.i += 1;
+                    }
+                    continue;
+                }
+                b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
+                    while self.i < self.b.len() && self.b[self.i] != b'\n' {
+                        self.i += 1;
+                    }
+                    continue;
+                }
+                b'/' if self.b.get(self.i + 1) == Some(&b'*') => {
+                    self.i += 2;
+                    while self.i + 1 < self.b.len()
+                        && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
+                    {
+                        self.i += 1;
+                    }
+                    self.i = (self.i + 2).min(self.b.len());
+                    continue;
+                }
+                c if c.is_ascii_alphabetic() => {
+                    let word = self.peek_word().unwrap_or_default().to_vec();
+                    if word == b"case" {
+                        nesting += 1;
+                    } else if word == b"end" {
+                        nesting -= 1;
+                        if nesting == 0 {
+                            self.i += 3;
+                            return;
+                        }
+                    }
+                    self.i += word.len().max(1);
+                    continue;
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
     }
 
     fn parse_if(&mut self, depth: usize) -> Result<Stmt> {
@@ -1721,6 +1864,54 @@ mod tests {
             Some(ExecResult::Rows(r)) => r.rows.clone(),
             other => panic!("expected rows, got {other:?}"),
         }
+    }
+
+    /// 无括号包裹的 CASE 表达式:read_plain 曾在其 ELSE 处切断语句,残留的
+    /// `ELSE …` 让 parse_stmts 零进度空转(无限循环 + 无限内存)。
+    #[test]
+    fn case_in_plain_batch_stmt() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @x INT = 1\nSELECT CASE WHEN @x = 1 THEN 'a' ELSE 'b' END AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Str("a".into()));
+        // 换行版:CASE 内的 ELSE 行不是语句边界
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @y INT = 2\nSELECT CASE WHEN @y = 1 THEN 'a'\nELSE 'b' END AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Str("b".into()));
+        // 嵌套 CASE
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "SELECT CASE WHEN @x = 1 THEN CASE WHEN @y = 2 THEN 'ab' ELSE 'ax' END ELSE 'z' END AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Str("ab".into()));
+        // 条件里的 CASE:read_condition 不在 CASE 的 ELSE 处切断
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @z INT = CASE WHEN 1 = 1 THEN 5 ELSE 6 END\nSELECT @z AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(5));
+    }
+
+    /// 批首孤立 ELSE(无 IF)是畸形批:必须响亮报错,而不是零进度空转。
+    #[test]
+    fn orphan_else_errors_loudly() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        let out = run_script(&mut s, &mut db, "ELSE SELECT 1");
+        assert!(out.is_err());
     }
 
     #[test]
@@ -2220,16 +2411,34 @@ mod tests {
         let out = run_script(&mut s, &mut db, "SELECT v FROM t").unwrap();
         assert_eq!(rows_of(&out)[0][0], Value::Int(50000));
         // ERROR_MESSAGE carries the caught text; @@ERROR inside CATCH is
-        // the caught number, and clears to 0 after a good statement.
+        // the caught number — 捕获必须是 CATCH 首句(T-SQL 里每条语句、
+        // 包括 SET/DECLARE 成功后都把 @@ERROR 归零)。
         let out = run_script(
             &mut s,
             &mut db,
-            "DECLARE @msg TEXT, @num INT\nBEGIN TRY\n  INSERT INTO no_such_table VALUES (1)\nEND TRY\nBEGIN CATCH\n  SET @msg = ERROR_MESSAGE()\n  SET @num = @@ERROR\nEND CATCH\nSELECT @msg LIKE '%no_such_table%' AS hit, @num AS n",
+            "DECLARE @msg TEXT, @num INT\nBEGIN TRY\n  INSERT INTO no_such_table VALUES (1)\nEND TRY\nBEGIN CATCH\n  SET @num = @@ERROR\n  SET @msg = ERROR_MESSAGE()\nEND CATCH\nSELECT @msg LIKE '%no_such_table%' AS hit, @num AS n",
         )
         .unwrap();
         assert_eq!(rows_of(&out)[0][0], Value::Bool(true));
         assert_eq!(rows_of(&out)[0][1], Value::Int(50000));
+        // 成功的 SET 同样刷新 @@ERROR(曾经留下 stale 50000)。
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "BEGIN TRY\n  INSERT INTO no_such_table VALUES (1)\nEND TRY\nBEGIN CATCH\n  SET @num = @@ERROR\nEND CATCH\nSET @msg = 'ok'\nSELECT @@ERROR AS e",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(0));
+        // DECLARE 初始化失败(坏表)记录错误码,成功归零。
+        assert!(run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @bad INT = (SELECT v FROM no_such_table)"
+        )
+        .is_err());
         let out = run_script(&mut s, &mut db, "SELECT @@ERROR AS e").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(50000));
+        let out = run_script(&mut s, &mut db, "DECLARE @ok INT = 1\nSELECT @@ERROR AS e").unwrap();
         assert_eq!(rows_of(&out)[0][0], Value::Int(0));
         // THROW with arguments raises; the batch fails loudly.
         let e =

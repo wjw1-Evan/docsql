@@ -90,10 +90,21 @@ impl AuthStore {
 
     /// First-use account creation. Fails if the account already exists
     /// (the file is the source of truth) or the input violates policy.
+    /// Single-call convenience over the two-phase form below (tests and
+    /// other single-threaded callers); the HTTP handlers use the split so
+    /// the PBKDF2 derivation runs without the store mutex.
     pub fn setup(&mut self, username: &str, password: &str) -> Result<Creds, SetupError> {
         if self.creds.is_some() {
             return Err(SetupError::Exists);
         }
+        let creds = Self::prepare_setup(username, password)?;
+        self.install_setup(creds)
+    }
+
+    /// Setup phase 1 (off-lock): validate input and derive the new
+    /// credentials. Pure CPU work — no store state is touched, so the
+    /// caller runs it outside the mutex (login's snapshot discipline).
+    pub fn prepare_setup(username: &str, password: &str) -> Result<Creds, SetupError> {
         let username = username.trim();
         let password_ok = validate_password(password);
         if let Err(msg) = validate_username(username) {
@@ -103,12 +114,24 @@ impl AuthStore {
             return Err(SetupError::Invalid(msg));
         }
         let salt = random_salt();
-        let creds = Creds {
+        let iterations = pbkdf2_iterations();
+        Ok(Creds {
             username: username.to_string(),
             salt,
-            iterations: pbkdf2_iterations(),
-            hash: derive_hash(password, &salt, pbkdf2_iterations()),
-        };
+            iterations,
+            hash: derive_hash(password, &salt, iterations),
+        })
+    }
+
+    /// Setup phase 2 (short lock): install derived credentials. The
+    /// existence check runs again under the lock right before the write,
+    /// so two concurrent setups both deriving off-lock still land exactly
+    /// one account (the loser gets `Exists`) — the one-shot claim
+    /// semantics do not depend on phase 1's snapshot.
+    pub fn install_setup(&mut self, creds: Creds) -> Result<Creds, SetupError> {
+        if self.creds.is_some() {
+            return Err(SetupError::Exists);
+        }
         self.write(&creds).map_err(SetupError::Io)?;
         self.creds = Some(creds.clone());
         Ok(creds)
@@ -134,6 +157,10 @@ impl AuthStore {
     /// new password keeps the current one (username-only rename). The file
     /// is rewritten before the in-memory copy moves, so a failed write
     /// leaves the old credentials authoritative.
+    ///
+    /// Single-call convenience over the two-phase form below; the HTTP
+    /// handler uses the split so both PBKDF2 derivations (verify current +
+    /// derive new) run without the store mutex.
     pub fn change_credentials(
         &mut self,
         current_password: &str,
@@ -143,15 +170,29 @@ impl AuthStore {
         let Some(creds) = &self.creds else {
             return Err(ChangeError::Auth);
         };
-        let candidate = derive_hash(current_password, &creds.salt, creds.iterations);
-        if !constant_time_eq(&candidate, &creds.hash) {
+        let seen = creds.clone();
+        let next = Self::prepare_change(&seen, current_password, new_username, new_password)?;
+        self.install_change(&seen, next)
+    }
+
+    /// Change phase 1 (off-lock): verify the current password against a
+    /// snapshot and build the next credentials. Pure CPU work on `seen`
+    /// (from `creds_snapshot`) — no store state is touched.
+    pub fn prepare_change(
+        seen: &Creds,
+        current_password: &str,
+        new_username: &str,
+        new_password: Option<&str>,
+    ) -> Result<Creds, ChangeError> {
+        let candidate = derive_hash(current_password, &seen.salt, seen.iterations);
+        if !constant_time_eq(&candidate, &seen.hash) {
             return Err(ChangeError::Auth);
         }
         let new_username = new_username.trim();
         if let Err(msg) = validate_username(new_username) {
             return Err(ChangeError::Invalid(msg));
         }
-        let next = match new_password {
+        Ok(match new_password {
             Some(pw) => {
                 if let Err(msg) = validate_password(pw) {
                     return Err(ChangeError::Invalid(msg));
@@ -169,9 +210,20 @@ impl AuthStore {
             }
             None => Creds {
                 username: new_username.to_string(),
-                ..creds.clone()
+                ..seen.clone()
             },
-        };
+        })
+    }
+
+    /// Change phase 2 (short lock): install the derived credentials, but
+    /// only if the store still holds exactly the snapshot the derivation
+    /// verified against. A concurrent change (or a completed setup racing
+    /// the snapshot) surfaces as `Conflict` instead of being overwritten —
+    /// last-writer-wins would silently discard the other rotation.
+    pub fn install_change(&mut self, seen: &Creds, next: Creds) -> Result<Creds, ChangeError> {
+        if self.creds.as_ref() != Some(seen) {
+            return Err(ChangeError::Conflict);
+        }
         self.write(&next).map_err(ChangeError::Io)?;
         self.creds = Some(next.clone());
         Ok(next)
@@ -334,6 +386,10 @@ pub enum ChangeError {
     /// Current password did not verify (or no account exists yet).
     Auth,
     Invalid(String),
+    /// The stored credentials changed between the off-lock derivation and
+    /// the locked install (concurrent change/setup won the race). Nothing
+    /// was written; the caller retries against the fresh snapshot.
+    Conflict,
     Io(String),
 }
 
@@ -703,6 +759,63 @@ mod tests {
         let reopened = AuthStore::open(&path).unwrap();
         assert_eq!(reopened.username(), Some("ops"));
         assert!(reopened.verify("ops", "s3cret-pw"));
+    }
+
+    /// 两阶段 setup 的并发兜底:锁外派生完成后再 install,若期间凭据
+    /// 已被落盘,第二个安装者拿到 Exists 而不是覆盖。
+    #[test]
+    fn install_setup_refuses_when_account_appeared_off_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-auth.json");
+        let mut store = AuthStore::open(&path).unwrap();
+        let first = AuthStore::prepare_setup("admin", "s3cret-pw").unwrap();
+        store.install_setup(first).unwrap();
+        // 并发派生的第二个凭据到达写回阶段:被拒,原账号不被覆盖。
+        let second = AuthStore::prepare_setup("root", "n3w-password").unwrap();
+        assert_eq!(store.install_setup(second).unwrap_err(), SetupError::Exists);
+        assert_eq!(store.username(), Some("admin"));
+        assert!(store.verify("admin", "s3cret-pw"));
+        assert!(!store.verify("root", "n3w-password"));
+    }
+
+    /// 两阶段 change 的 TOCTOU 防护:凭据在锁外派生期间被并发修改时,
+    /// install 以 Conflict 拒绝且不落盘 —— 对方的轮换不被覆盖。
+    #[test]
+    fn install_change_refuses_when_credentials_moved_off_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-auth.json");
+        let mut store = AuthStore::open(&path).unwrap();
+        store.setup("admin", "s3cret-pw").unwrap();
+        let seen = store.creds_snapshot().unwrap();
+        // 锁外派生期间另一个会话先完成了改密。
+        store.change_credentials("s3cret-pw", "ops", None).unwrap();
+        let next =
+            AuthStore::prepare_change(&seen, "s3cret-pw", "attacker", Some("stolen-pw")).unwrap();
+        assert_eq!(
+            store.install_change(&seen, next).unwrap_err(),
+            ChangeError::Conflict
+        );
+        // 落盘与内存都还是赢家的形态。
+        assert_eq!(store.username(), Some("ops"));
+        assert!(!store.verify("attacker", "stolen-pw"));
+        let reopened = AuthStore::open(&path).unwrap();
+        assert_eq!(reopened.username(), Some("ops"));
+        assert!(reopened.verify("ops", "s3cret-pw"));
+    }
+
+    /// 凭据仍与快照一致时,install 正常落盘(两阶段路径的直通形态)。
+    #[test]
+    fn install_change_writes_when_snapshot_still_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-auth.json");
+        let mut store = AuthStore::open(&path).unwrap();
+        store.setup("admin", "s3cret-pw").unwrap();
+        let seen = store.creds_snapshot().unwrap();
+        let next = AuthStore::prepare_change(&seen, "s3cret-pw", "ops", Some("n3w-password"))
+            .expect("current password verified");
+        store.install_change(&seen, next).unwrap();
+        assert!(store.verify("ops", "n3w-password"));
+        assert!(!store.verify("admin", "s3cret-pw"));
     }
 
     #[test]

@@ -362,6 +362,11 @@ async fn security_headers(
                 }
                 if !constant_time_eq(got.as_bytes(), expect.as_bytes()) {
                     lockout.record_failure(key);
+                } else {
+                    // 成功的旁路与成功的登录对称:清掉该来源的失败计数,
+                    // 否则先输错几次登录、再改用正确 token 的脚本/脚本化
+                    // 客户端会带着旧账被挡在 429 上。
+                    lockout.reset(key);
                 }
             }
         }
@@ -903,8 +908,9 @@ async fn auth_setup(
             json!({"error": "尝试次数过多,请一分钟后再试"}),
         );
     }
-    // setup() runs the PBKDF2 derivation (~tens of ms) — keep it off the
-    // async worker, under the global derivation permit.
+    // The setup derivation (~210k iterations) runs off the async worker,
+    // under the global derivation permit, and off the store mutex (the
+    // snapshot/derive/install discipline shared with login below).
     let permit = match a.derivations.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -914,13 +920,26 @@ async fn auth_setup(
             )
         }
     };
+    // 短锁快照:账号已被占用就不烧派生(并发兜底在写回阶段的
+    // install_setup 锁内重验,两个同时进行的 setup 只有一个落盘)。
+    if a.creds_snapshot().is_some() {
+        a.lockout.lock().unwrap().record_failure(source);
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({"error": "账号已存在,请直接登录"}),
+        );
+    }
+    // PBKDF2 派生(~210k 迭代,数百毫秒)锁外执行 —— 同 login 的快照纪律:
+    // 持 store 锁跨派生会让 /api/auth/status 等全部排队在其后。
     let st = state.clone();
     let username = body.username.clone();
     let password = body.password.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let a = st.auth.as_ref().expect("checked at fn entry");
-        a.store.lock().unwrap().setup(&username, &password)
+        let creds = auth::AuthStore::prepare_setup(&username, &password)?;
+        // 短锁写回:写前锁内重验凭据仍缺失(TOCTOU 防护)。
+        a.store.lock().unwrap().install_setup(creds)
     })
     .await
     .unwrap_or_else(|_| Err(auth::SetupError::Io("task panicked".into())));
@@ -1092,6 +1111,10 @@ async fn auth_change(
             )
         }
     };
+    // 快照短锁读取(同 login);两段派生(验证当前密码 + 派生新哈希)都在
+    // 锁外进行,store 锁不再横跨 PBKDF2 —— 否则 /api/auth/status 等全部
+    // 排队在数百毫秒的派生之后。
+    let snapshot = a.creds_snapshot();
     let st = state.clone();
     let cur_pw = body.current_password.clone();
     let new_user = body.username.clone();
@@ -1099,10 +1122,13 @@ async fn auth_change(
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let a = st.auth.as_ref().expect("checked at fn entry");
-        a.store
-            .lock()
-            .unwrap()
-            .change_credentials(&cur_pw, &new_user, new_pw.as_deref())
+        let Some(seen) = snapshot else {
+            return Err(auth::ChangeError::Auth);
+        };
+        let next = auth::AuthStore::prepare_change(&seen, &cur_pw, &new_user, new_pw.as_deref())?;
+        // 短锁写回:锁内重验凭据仍是派生所依据的快照 —— 并发修改赢得
+        // 竞争时本次不写(报 Conflict),绝不覆盖对方的轮换。
+        a.store.lock().unwrap().install_change(&seen, next)
     })
     .await
     .unwrap_or_else(|_| Err(auth::ChangeError::Io("task panicked".into())));
@@ -1120,6 +1146,14 @@ async fn auth_change(
             // Same generic shape as login: no hint which part failed (the
             // current password is the only secret here).
             json_response(StatusCode::UNAUTHORIZED, json!({"error": "当前密码不正确"}))
+        }
+        Err(auth::ChangeError::Conflict) => {
+            // 锁外派生期间凭据被并发修改:本次不落盘。修改方可能已踢掉
+            // 全部会话,提示重新登录后重试。
+            json_response(
+                StatusCode::CONFLICT,
+                json!({"error": "凭据已被并发修改,请重新登录后再试"}),
+            )
         }
         Err(auth::ChangeError::Invalid(msg)) => {
             json_response(StatusCode::BAD_REQUEST, json!({"error": msg}))
@@ -1405,7 +1439,7 @@ async fn api_users(
         (async {
             let target = target_for(&state, &params.node)
                 .map_err(|e| e["error"].as_str().unwrap_or_default().to_string())?;
-            let query = |sql: &'static str| {
+            let query = |sql: &'static str, table: &'static str| {
                 let addr = target.clone();
                 let token = state.token.clone();
                 async move {
@@ -1422,9 +1456,14 @@ async fn api_users(
                                 .map_err(|e| format!("节点 {addr} 返回了无法解析的结果: {e}"))?;
                             Ok(v["rows"].as_array().cloned().unwrap_or_default())
                         }
-                        // 无用户节点尚未建表:按空集处理。
+                        // 无用户节点尚未建表:按空集处理。锚定完整错误前缀
+                        // 「table <该表> does not exist」(引擎缺表错误的固定
+                        // 形),而不是子串「does not exist」—— 任何其它错误
+                        // (权限、损坏、超时文本碰巧含该子串)都不再被当成
+                        // 空集静默吞掉。
                         proto::RESP_ERROR
-                            if String::from_utf8_lossy(&f.payload).contains("does not exist") =>
+                            if String::from_utf8_lossy(&f.payload)
+                                .starts_with(&format!("table {table} does not exist")) =>
                         {
                             Ok(Vec::new())
                         }
@@ -1433,10 +1472,18 @@ async fn api_users(
                     }
                 }
             };
-            let user_rows = query("SELECT name FROM docsql_users").await?;
-            let role_rows = query("SELECT name FROM docsql_roles").await?;
-            let member_rows = query("SELECT role, member FROM docsql_role_members").await?;
-            let grant_rows = query("SELECT grantee, priv, tbl FROM docsql_grants").await?;
+            let user_rows = query("SELECT name FROM docsql_users", "docsql_users").await?;
+            let role_rows = query("SELECT name FROM docsql_roles", "docsql_roles").await?;
+            let member_rows = query(
+                "SELECT role, member FROM docsql_role_members",
+                "docsql_role_members",
+            )
+            .await?;
+            let grant_rows = query(
+                "SELECT grantee, priv, tbl FROM docsql_grants",
+                "docsql_grants",
+            )
+            .await?;
             let col = |row: &serde_json::Value, i: usize| {
                 row.as_array()
                     .and_then(|a| a.get(i))

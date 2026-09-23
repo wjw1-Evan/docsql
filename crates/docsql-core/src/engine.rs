@@ -2396,11 +2396,28 @@ impl<'a> ReadCx<'a> {
                 .map(|(_, e)| eval_expr(e, &empty))
                 .collect::<Result<Vec<_>>>()?;
             // FROM-less SELECT still honors LIMIT/OFFSET (`SELECT 1 LIMIT 0`
-            // must return zero rows, not one). ORDER BY over a single row
-            // cannot reorder anything.
+            // must return zero rows, not one) and the standard FETCH clause
+            // (same truncation semantics). ORDER BY over a single row cannot
+            // reorder anything.
             let mut rows = vec![row];
             if let Some(lc) = &query.limit_clause {
                 rows = apply_limit_clause(lc, rows)?;
+            }
+            if let Some(fetch) = &query.fetch {
+                if fetch.percent {
+                    return err("FETCH … PERCENT is not supported");
+                }
+                if fetch.with_ties {
+                    return err("FETCH … WITH TIES requires ORDER BY");
+                }
+                let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
+                    Some(Value::Int(n)) if n >= 0 => n as usize,
+                    Some(Value::Int(n)) => {
+                        return err(format!("FETCH quantity must be non-negative ({n})"))
+                    }
+                    Some(_) | None => return err("FETCH quantity must be an integer"),
+                };
+                rows.truncate(n);
             }
             return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
         }
@@ -2458,6 +2475,7 @@ impl<'a> ReadCx<'a> {
             && !has_window
         {
             match self.ordered_index_window(
+                &select,
                 &select.from,
                 &select.selection,
                 &query.order_by,
@@ -2538,20 +2556,30 @@ impl<'a> ReadCx<'a> {
                 // ORDER BY/LIMIT/FETCH so they apply to the combination only.
                 // (Leaving `fetch` in applied `FETCH FIRST n ROWS ONLY` to
                 // each arm *and* the combination, truncating the result.)
+                // The WITH clause is dropped here too: the CTEs are already
+                // materialized in `ctes` — re-entering exec_query per arm
+                // would re-run every CTE body 2k-1 times on a k-arm chain.
                 let bare = Query {
                     order_by: None,
                     limit_clause: None,
                     fetch: None,
+                    with: None,
                     ..query.clone()
                 };
-                let l = self.exec_query(Query {
-                    body: left,
-                    ..bare.clone()
-                })?;
-                let r = self.exec_query(Query {
-                    body: right,
-                    ..bare
-                })?;
+                let l = self.exec_query_body(
+                    Query {
+                        body: left,
+                        ..bare.clone()
+                    },
+                    ctes,
+                )?;
+                let r = self.exec_query_body(
+                    Query {
+                        body: right,
+                        ..bare
+                    },
+                    ctes,
+                )?;
                 let (ExecOutcome::Rows(mut lr), ExecOutcome::Rows(rr)) = (l, r) else {
                     return err("set operations require SELECT on both sides");
                 };
@@ -3084,7 +3112,11 @@ impl<'a> ReadCx<'a> {
         let heap = meta.heap_of();
         let tx = self.pager.begin_tx(); // read-only handle: nothing staged, dropping it is the cleanup
         let tree = BTree::open(root);
-        let pairs = self.probe_pairs(&col, &tree, &tx, &plan, None)?;
+        let pairs = match self.probe_pairs(&col, &tree, &tx, &plan, None)? {
+            Some(pairs) => pairs,
+            // 混合带不可安全探测:回退通用扫描,结果不能依赖索引存在性。
+            None => return Ok(None),
+        };
         // Read-only tx: no staged pages, dropping it is the cleanup.
         drop(tx);
         let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
@@ -3103,18 +3135,28 @@ impl<'a> ReadCx<'a> {
     /// compare chronologically — the raw cmp_values band ranks Str above
     /// every Timestamp, which would silently turn `WHERE ts > '2026-…'`
     /// into an empty result. Sampling min+max keys decides the band (two
-    /// leaf reads); mixed-band trees keep the literal and need an explicit
-    /// `CAST('…' AS TIMESTAMP)` (documented boundary). Composite keys
-    /// promote element-wise: a bound Array element that is a parseable
-    /// string is lifted only when both sampled keys carry a Timestamp at
-    /// that position (single-column `ts = '…' AND x = 9` on `INDEX (ts, x)`
-    /// and trailing positions alike).
+    /// leaf reads). Returns `None` when the band is NOT safely probeable:
+    ///
+    /// * a MIXED band (extremes disagree — Timestamps and Strs coexist in
+    ///   the tree): keeping the string literal probes only the Str band and
+    ///   silently loses every Timestamp row, while promoting it pulls the
+    ///   whole Str band into the range — either way the result set depends
+    ///   on whether the index exists. The generic scan path (cmp_coerced)
+    ///   is the only correct answer, so callers fall back to it.
+    /// * an Eq/Prefix composite bound whose element beyond position 0 would
+    ///   be promoted: element purity is only provable at position 0 (the
+    ///   primary sort key); a middle key holding the literal STRING at that
+    ///   position would be missed by the promoted seek.
+    ///
+    /// The bool flag reports whether any bound was actually lifted; callers
+    /// owning an "exact" plan must demote exactness then (promoted bounds
+    /// admit candidates the coercing predicate would exclude).
     fn promote_plan_bounds(
         &self,
         tree: &BTree,
         tx: &crate::pager::Tx,
         plan: &ProbePlan,
-    ) -> Result<ProbePlan> {
+    ) -> Result<Option<(ProbePlan, bool)>> {
         let promotes = |v: &Value| -> bool {
             matches!(v, Value::Str(s) if crate::value::parse_timestamp_ms(s).is_some())
         };
@@ -3141,7 +3183,7 @@ impl<'a> ReadCx<'a> {
                     }),
             };
         if !has_str_bound {
-            return Ok(plan.clone());
+            return Ok(Some((plan.clone(), false)));
         }
         let reader = self.reader();
         let sample = |rev: bool| -> Result<Vec<(Value, u64)>> {
@@ -3156,7 +3198,10 @@ impl<'a> ReadCx<'a> {
         let min_key = sample(false)?.into_iter().next().map(|(k, _)| k);
         let max_key = sample(true)?.into_iter().next().map(|(k, _)| k);
         // Position i of the tree band is Timestamp when both sampled keys
-        // carry a Timestamp there (scalar keys are position 0).
+        // carry a Timestamp there (scalar keys are position 0). Because the
+        // tree is totally ordered and Timestamps rank below every Str, both
+        // extremes being Timestamp PROVES a pure band at the primary sort
+        // position; the same holds for both-Str (no Timestamps exist).
         let band_ts_at = |i: usize| -> bool {
             let at = |k: &Option<Value>| -> bool {
                 k.as_ref().is_some_and(|k| match k {
@@ -3169,19 +3214,74 @@ impl<'a> ReadCx<'a> {
             };
             at(&min_key) && at(&max_key)
         };
+        let band_str_at = |i: usize| -> bool {
+            let at = |k: &Option<Value>| -> bool {
+                k.as_ref().is_some_and(|k| match k {
+                    Value::Str(_) if i == 0 => true,
+                    Value::Array(items) => items.get(i).is_some_and(|e| matches!(e, Value::Str(_))),
+                    _ => false,
+                })
+            };
+            at(&min_key) && at(&max_key)
+        };
+        // 一致才可判:该位要么纯 Timestamp(提升)、要么纯 Str(保留字面量,
+        // 与 cmp_coerced 的 Str↔Str 明文比较一致);两极不一致 = 混合带。
+        // 只需检查边界里携带可解析时间戳字符串的位 —— 其它位的带型与
+        // 该边界的比较语义无关(Int 位永远不会被提升)。
+        let str_positions = |v: &Value| -> Vec<usize> {
+            match v {
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| promotes(e))
+                    .map(|(i, _)| i)
+                    .collect(),
+                other if promotes(other) => vec![0],
+                _ => Vec::new(),
+            }
+        };
+        let safe_at = |i: usize| band_ts_at(i) || band_str_at(i);
+        match plan {
+            ProbePlan::Eq(v) | ProbePlan::Prefix(v) => {
+                for i in str_positions(v) {
+                    if i > 0 {
+                        // 复合 Eq/Prefix 的非首元素:纯 Str 带保留字面量即可,
+                        // 其它带型(含纯 Timestamp —— 元素纯度不可证)回退。
+                        if !band_str_at(i) {
+                            return Ok(None);
+                        }
+                    } else if !safe_at(i) {
+                        return Ok(None);
+                    }
+                }
+            }
+            ProbePlan::Range { lo, hi } => {
+                for i in [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(v, _)| str_positions(v))
+                {
+                    if !safe_at(i) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         let any_band_ts = match min_key.as_ref() {
             Some(Value::Array(items)) => (0..items.len()).any(band_ts_at),
             Some(_) => band_ts_at(0),
             None => false,
         };
         if !any_band_ts {
-            return Ok(plan.clone());
+            return Ok(Some((plan.clone(), false)));
         }
-        let promote = |v: &Value| -> Value {
+        let mut promoted_any = false;
+        let promote = |v: &Value, promoted_any: &mut bool| -> Value {
             match v {
                 Value::Str(s) => {
                     if band_ts_at(0) {
                         if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                            *promoted_any = true;
                             return Value::Timestamp(ms);
                         }
                     }
@@ -3195,6 +3295,7 @@ impl<'a> ReadCx<'a> {
                             if let Value::Str(s) = e {
                                 if band_ts_at(i) {
                                     if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                                        *promoted_any = true;
                                         return Value::Timestamp(ms);
                                     }
                                 }
@@ -3206,14 +3307,19 @@ impl<'a> ReadCx<'a> {
                 other => other.clone(),
             }
         };
-        Ok(match &plan {
-            ProbePlan::Eq(v) => ProbePlan::Eq(promote(v)),
-            ProbePlan::Prefix(v) => ProbePlan::Prefix(promote(v)),
+        let out = match &plan {
+            ProbePlan::Eq(v) => ProbePlan::Eq(promote(v, &mut promoted_any)),
+            ProbePlan::Prefix(v) => ProbePlan::Prefix(promote(v, &mut promoted_any)),
             ProbePlan::Range { lo, hi } => ProbePlan::Range {
-                lo: lo.as_ref().map(|(v, incl)| (promote(v), *incl)),
-                hi: hi.as_ref().map(|(v, incl)| (promote(v), *incl)),
+                lo: lo
+                    .as_ref()
+                    .map(|(v, incl)| (promote(v, &mut promoted_any), *incl)),
+                hi: hi
+                    .as_ref()
+                    .map(|(v, incl)| (promote(v, &mut promoted_any), *incl)),
             },
-        })
+        };
+        Ok(Some((out, promoted_any)))
     }
 
     /// Index entries selected by `plan`, in key order. `max` caps the walk to
@@ -3227,9 +3333,12 @@ impl<'a> ReadCx<'a> {
         tx: &crate::pager::Tx,
         plan: &ProbePlan,
         max: Option<usize>,
-    ) -> Result<Vec<(Value, u64)>> {
+    ) -> Result<Option<Vec<(Value, u64)>>> {
         let reader = self.reader();
-        let plan = self.promote_plan_bounds(tree, tx, plan)?;
+        let plan = match self.promote_plan_bounds(tree, tx, plan)? {
+            Some((p, _)) => p,
+            None => return Ok(None),
+        };
         let pairs = match &plan {
             ProbePlan::Eq(v) => {
                 // Bounded range + equal filter so non-unique trees return
@@ -3293,7 +3402,7 @@ impl<'a> ReadCx<'a> {
                 pairs
             }
         };
-        Ok(pairs)
+        Ok(Some(pairs))
     }
 
     /// [`Database::probe_pairs`] walking in descending key order — the
@@ -3306,9 +3415,12 @@ impl<'a> ReadCx<'a> {
         tx: &crate::pager::Tx,
         plan: &ProbePlan,
         max: Option<usize>,
-    ) -> Result<Vec<(Value, u64)>> {
+    ) -> Result<Option<Vec<(Value, u64)>>> {
         let reader = self.reader();
-        let plan = self.promote_plan_bounds(tree, tx, plan)?;
+        let plan = match self.promote_plan_bounds(tree, tx, plan)? {
+            Some((p, _)) => p,
+            None => return Ok(None),
+        };
         let pairs = match &plan {
             ProbePlan::Eq(v) => tree
                 .range_bounded_rev_limited(&reader, tx, Some((v, true)), Some((v, true)), max)
@@ -3338,7 +3450,7 @@ impl<'a> ReadCx<'a> {
                     .map_err(|e| index_err(col, e))?
             }
         };
-        Ok(pairs)
+        Ok(Some(pairs))
     }
 
     /// `SELECT COUNT(*) FROM t` with no WHERE/GROUP BY/window: count the
@@ -3647,6 +3759,7 @@ impl<'a> ReadCx<'a> {
     /// rows without reading them.
     fn ordered_index_window(
         &self,
+        select: &sqlparser::ast::Select,
         from: &[sqlparser::ast::TableWithJoins],
         selection: &Option<SqlExpr>,
         order_by: &Option<sqlparser::ast::OrderBy>,
@@ -3676,8 +3789,58 @@ impl<'a> ReadCx<'a> {
         let Some(order_by) = order_by else {
             return Ok(None);
         };
+        let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
+            return Ok(None);
+        };
+        if exprs.is_empty() {
+            return Ok(None);
+        }
+        // 输出列名优先(与 apply_order_limit 同一解析序):ORDER BY 键名命中
+        // 投影别名时,通用路径按该输出列的值排序;索引窗口按同名表列走
+        // 树序 —— 只有输出列表达式恰是同一裸列引用时两者才一致,否则
+        // 必须回退通用路径,别让别名遮蔽带索引列静默给出错误行序。
+        // 通配符项展开为全部表列的恒等映射(position() 首个命中即表列),
+        // 无需逐项判定。
+        let mut effective: Vec<&SqlExpr> = Vec::with_capacity(exprs.len());
+        if !select.projection.iter().all(|i| {
+            matches!(
+                i,
+                sqlparser::ast::SelectItem::UnnamedExpr(_)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { .. }
+            )
+        }) {
+            for o in exprs {
+                effective.push(&o.expr);
+            }
+        } else {
+            let mut project: Vec<(String, &SqlExpr)> = Vec::new();
+            for item in &select.projection {
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e) => project.push((expr_name(e), e)),
+                    sqlparser::ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
+                        project.push((alias.value.clone(), expr))
+                    }
+                    _ => unreachable!("gated above"),
+                }
+            }
+            for o in exprs {
+                let name = expr_name(&o.expr);
+                effective.push(match project.iter().find(|(c, _)| *c == name) {
+                    Some((_, e)) => *e,
+                    None => {
+                        // 序号键(`ORDER BY 2`)按输出位置排序:树序无法
+                        // 保证一致,回退。
+                        if name.parse::<usize>().is_ok() {
+                            return Ok(None);
+                        }
+                        &o.expr
+                    }
+                });
+            }
+        }
         let akey = alias.as_ref().map(|a| a.name.value.clone());
-        let Some((root_key, asc)) = order_walk_index(meta, &tname, akey.as_deref(), order_by)
+        let Some((root_key, asc)) =
+            order_walk_index(meta, &tname, akey.as_deref(), exprs, &effective)
         else {
             return Ok(None);
         };
@@ -3687,17 +3850,30 @@ impl<'a> ReadCx<'a> {
         if take == 0 {
             return Ok(Some(Vec::new()));
         }
-        let (plan, exact) = match selection {
-            None => (None, true),
-            Some(cond) => match probe_plan(cond, meta, &tname, akey.as_deref()) {
-                Some((plan_root, plan, exact)) if plan_root == root_key => (Some(plan), exact),
-                _ => return Ok(None),
-            },
-        };
-
         let root = meta.index_roots[&root_key];
         let tree = BTree::open(root);
         let tx = self.pager.begin_tx();
+        let (plan, exact) = match selection {
+            None => (None, true),
+            Some(cond) => match probe_plan(cond, meta, &tname, akey.as_deref()) {
+                Some((plan_root, plan, exact)) if plan_root == root_key => {
+                    // 混合带不可安全探测:整体回退通用路径;边界被实际
+                    // 提升时计划降级为非 exact(残余过滤兜住多拉的候选)。
+                    match self.promote_plan_bounds(&tree, &tx, &plan)? {
+                        None => {
+                            drop(tx);
+                            return Ok(None);
+                        }
+                        Some((p, promoted)) => (Some(p), exact && !promoted),
+                    }
+                }
+                _ => {
+                    drop(tx);
+                    return Ok(None);
+                }
+            },
+        };
+
         // An exact walk yields exactly the window rows in the ORDER BY
         // direction, so it can stop collecting keys at the window's end;
         // residual filters need the whole candidate range first.
@@ -3709,8 +3885,21 @@ impl<'a> ReadCx<'a> {
             None => tree
                 .scan_limited_rev(&self.reader(), &tx, cap)
                 .map_err(|e| index_err(&root_key, e))?,
-            Some(plan) if asc => self.probe_pairs(&root_key, &tree, &tx, plan, cap)?,
-            Some(plan) => self.probe_pairs_rev(&root_key, &tree, &tx, plan, cap)?,
+            // promote_plan_bounds 已在上方把边界提升过,这里幂等无操作。
+            Some(plan) if asc => match self.probe_pairs(&root_key, &tree, &tx, plan, cap)? {
+                Some(pairs) => pairs,
+                None => {
+                    drop(tx);
+                    return Ok(None);
+                }
+            },
+            Some(plan) => match self.probe_pairs_rev(&root_key, &tree, &tx, plan, cap)? {
+                Some(pairs) => pairs,
+                None => {
+                    drop(tx);
+                    return Ok(None);
+                }
+            },
         };
         drop(tx);
 
@@ -4430,6 +4619,10 @@ impl Database {
         };
         self.savepoints.clear();
         let undo = self.pager.take_undo();
+        // 先把本事务各语句的 deferred 提交显式作废:没有这组 ABORT 帧,
+        // 恢复事务的同步提交会先落 FENCE,撕裂崩溃停在「FENCE 已持久、
+        // 恢复事务 COMMIT 未持久」窗口时,整个已回滚事务会复活。
+        self.pager.abort_deferred()?;
         self.restore_transaction(snap, undo, true)?;
         Ok(ExecOutcome::Affected(0))
     }
@@ -5786,7 +5979,13 @@ impl Database {
         // the per-row FK check.
         let mut dml = String::new();
         for name in fk_dependency_order(&names, &self.tables) {
-            for doc in self.table_docs_cx(&name)? {
+            let docs = self.table_docs_cx(&name)?;
+            // 自引用表按行级依赖序出:存储序的前向引用曾让回放必败。
+            let docs = match self.tables.get(&name) {
+                Some(meta) => self_ref_row_order(&name, meta, docs),
+                None => docs,
+            };
+            for doc in docs {
                 let cols: Vec<String> = doc.keys().cloned().collect();
                 let vals = cols
                     .iter()
@@ -6629,9 +6828,10 @@ impl Database {
             }
         };
         // Validate BEFORE writing: a failed UPDATE must not change data.
+        // 自引用 FK 的父候选是本语句的最终像集合(不只是表里的旧像)。
         for doc in &out {
             meta.check(doc)?;
-            self.check_fks(&meta, doc)?;
+            self.check_fks_in(&tname, &meta, doc, &out)?;
         }
         meta.check_unique(&out)?;
         // Parent-side FK: key values that disappear must not be referenced.
@@ -6669,8 +6869,15 @@ impl Database {
                 doc.insert(col_name, v);
             }
             meta.check(&doc)?;
-            self.check_fks(&meta, &doc)?;
             updates.push((loc, old_doc, doc));
+        }
+        // 子侧 FK 在收集完本语句全部最终像之后统一校验:自引用/行间引用
+        // 的父候选包含批次自身。
+        {
+            let batch: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
+            for doc in &batch {
+                self.check_fks_in(&tname, &meta, doc, &batch)?;
+            }
         }
         if updates.is_empty() {
             if let Some(ret) = update_returning {
@@ -7481,6 +7688,12 @@ impl Database {
                     }
                     let docs = self.table_docs_cx(&tname)?;
                     let old_entry = self.tables.get(&tname).cloned();
+                    // 自引用外键的 rt 跟随新名(与其它引用方一并改写)。
+                    for (_, rt, _) in meta.foreign_keys.iter_mut() {
+                        if *rt == tname {
+                            *rt = new_name.clone();
+                        }
+                    }
                     self.tables.remove(&tname);
                     // The old name must not keep a stale AUTOINCREMENT
                     // watermark for a table created under it later.
@@ -7495,6 +7708,18 @@ impl Database {
                         }
                         return Err(e);
                     }
+                    // 引用方的外键表名跟随改写:悬挂 rt 会让子表的一切写
+                    // 路径报 "table does not exist",dump/restore 还会把
+                    // 坏状态原样带回(旧条目尚未动,失败路径保持原子)。
+                    for other in self.tables.values_mut() {
+                        let m = std::sync::Arc::make_mut(other);
+                        for (_, rt, _) in m.foreign_keys.iter_mut() {
+                            if *rt == tname {
+                                *rt = new_name.clone();
+                            }
+                        }
+                    }
+                    self.save_catalog()?;
                     return Ok(ExecOutcome::Affected(0));
                 }
                 other => return err(format!("unsupported ALTER TABLE operation: {other}")),
@@ -7509,7 +7734,20 @@ impl Database {
 
     /// Validate FOREIGN KEY constraints of `meta` for one candidate doc:
     /// non-null values must exist in the referenced table's column.
-    fn check_fks(&mut self, meta: &TableMeta, doc: &Object) -> Result<()> {
+    /// Child-side FK check. `same_batch` carries the statement's own new
+    /// images for `table` — when an FK targets the SAME table (self- or
+    /// intra-statement references: `UPDATE emp SET mgr = 1 WHERE id = 1`,
+    /// multi-row inserts whose later rows reference earlier ones), those
+    /// images are legitimate parent candidates. Without them such rows were
+    /// rejected (or, via UPDATE, created rows that dump/restore could never
+    /// replay) even though SQLite/PG immediate FKs accept them.
+    fn check_fks_in(
+        &mut self,
+        table: &str,
+        meta: &TableMeta,
+        doc: &Object,
+        same_batch: &[Object],
+    ) -> Result<()> {
         for (col, rtable, rcol) in &meta.foreign_keys {
             let Some(v) = doc.get(col) else {
                 continue;
@@ -7517,17 +7755,20 @@ impl Database {
             if matches!(v, Value::Null) {
                 continue; // NULL passes (MATCH SIMPLE semantics)
             }
-            let ref_docs = self.table_docs_cx(rtable)?;
             // cmp_values (not PartialEq): the engine's comparison semantics
             // treat Int(1)/Float(1.0)/Decimal(1) as equal; a join would
             // match them, so the FK must not reject what the rest of the
             // engine considers the same key.
-            let found = ref_docs.iter().any(|rd| {
+            let matches_parent = |rd: &Object| {
                 rd.get(rcol)
                     .map(|rv| Value::cmp_values(rv, v) == Ordering::Equal)
                     .unwrap_or(false)
-            });
-            if !found {
+            };
+            if rtable == table && same_batch.iter().any(matches_parent) {
+                continue;
+            }
+            let ref_docs = self.table_docs_cx(rtable)?;
+            if !ref_docs.iter().any(matches_parent) {
                 return err(format!(
                     "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
                 ));
@@ -7995,6 +8236,16 @@ impl Database {
                     }) else {
                         return err("FOREIGN KEY requires a table");
                     };
+                    // zip 会静默截断较短的列清单,约束悄悄少一列 —— 列数
+                    // 不匹配必须显式报错(子句级静默忽略是红线)。
+                    if fk.columns.len() != fk.referred_columns.len() {
+                        return err(format!(
+                            "FOREIGN KEY column count mismatch: {} referencing columns \
+                             vs {} referred columns",
+                            fk.columns.len(),
+                            fk.referred_columns.len()
+                        ));
+                    }
                     for (lc, rc) in fk.columns.iter().zip(fk.referred_columns.iter()) {
                         meta.foreign_keys
                             .push((lc.value.clone(), rt.clone(), rc.value.clone()));
@@ -8067,15 +8318,17 @@ impl Database {
                 }
                 rows
             }
-            // INSERT INTO t (cols...) SELECT ...: take the SELECT's rows;
-            // when no column list is given the query's columns define them.
+            // INSERT INTO t (cols...) SELECT ...: take the SELECT's rows.
+            // Without a column list the mapping is POSITIONAL onto the
+            // target table's declared columns (standard SQL) — the query's
+            // output NAMES used to redefine the keys, silently dropping
+            // every value into ghost fields whenever the projection wasn't
+            // bare same-named identifiers (aliases, literals, `SELECT *`
+            // from a differently-named source).
             SetExpr::Select(_) => {
                 let ExecOutcome::Rows(r) = self.exec_query_cx(source.as_ref().clone())? else {
                     return err("INSERT source must be VALUES or SELECT");
                 };
-                if columns == meta.columns && insert.columns.is_empty() {
-                    columns = r.columns.clone();
-                }
                 if r.columns.len() != columns.len() {
                     return err(format!(
                         "INSERT SELECT has {} columns but {} are expected",
@@ -8187,8 +8440,10 @@ impl Database {
                 }
             }
             meta.check(&doc)?;
-            self.check_fks(&meta, &doc)?;
+            // 行间/自引用 FK:同语句已收集(含本行)的新像是合法父候选。
             new_docs.push(doc);
+            let last = new_docs.len() - 1;
+            self.check_fks_in(&table, &meta, &new_docs[last], &new_docs)?;
         }
         // Conflict policy: plain (error on duplicates), REPLACE INTO /
         // OR REPLACE (drop conflicting rows first), ON CONFLICT DO NOTHING /
@@ -8304,6 +8559,40 @@ impl Database {
         let scope_cols: Option<Vec<String>> = conflict_scope
             .as_deref()
             .map(|root| meta.index_columns_of(root));
+
+        // 批内重复键:后者胜(SQLite/MySQL 的 OR REPLACE 逐行语义)。位移
+        // 扫描只看语句前的树,批内冲突随后被树级 unique 检查整条打报错;
+        // 先按唯一键把「被更晚的行覆盖」的早行去掉,再走位移扫描。判重用
+        // 编码字节,与树查找同源。
+        if replace && !indexed.is_empty() && new_docs.len() > 1 {
+            let mut last_at: std::collections::BTreeMap<(String, Vec<u8>), usize> =
+                std::collections::BTreeMap::new();
+            for (i, doc) in new_docs.iter().enumerate() {
+                for col in &indexed {
+                    if let Some(k) = doc
+                        .get(col)
+                        .filter(|v| !matches!(v, Value::Null))
+                        .and_then(|v| encode::encode_to_vec(v).ok())
+                    {
+                        last_at.insert((col.clone(), k), i);
+                    }
+                }
+            }
+            let mut kept: Vec<Object> = Vec::with_capacity(new_docs.len());
+            for (i, doc) in new_docs.iter().enumerate() {
+                let shadowed = indexed.iter().any(|col| {
+                    doc.get(col)
+                        .filter(|v| !matches!(v, Value::Null))
+                        .and_then(|v| encode::encode_to_vec(v).ok())
+                        .and_then(|k| last_at.get(&(col.clone(), k)))
+                        .is_some_and(|&j| j > i)
+                });
+                if !shadowed {
+                    kept.push(doc.clone());
+                }
+            }
+            new_docs = kept;
+        }
 
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
@@ -8697,14 +8986,18 @@ impl Database {
                     new_doc.insert(col, v);
                 }
                 // Same constraint gate as UPDATE: NOT NULL/CHECK and the
-                // child-side FK must hold for the merged image.
+                // child-side FK must hold for the merged image (FK check
+                // runs after the batch is collected — self/intra-statement
+                // references count as parent candidates).
                 meta.check(&new_doc)?;
-                self.check_fks(&meta, &new_doc)?;
                 updates.push((*t_loc, t_doc.clone(), new_doc));
             }
             // Updated target rows must not orphan referenced parents.
             let old_docs: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
             let new_docs: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
+            for doc in &new_docs {
+                self.check_fks_in(&tname, &meta, doc, &new_docs)?;
+            }
             self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
         }
 
@@ -8783,6 +9076,14 @@ impl Database {
         // inserted.
         let mut inserted = 0usize;
         let mut inserted_docs: Vec<Object> = Vec::new();
+        // 本语句插入行的最大自增 id 与下一个自增值:提交成功后才写进会话
+        // 状态(与 INSERT 路径对齐),失败回滚不留幻影 SCOPE_IDENTITY。
+        let mut merge_last_id: Option<i64> = None;
+        let mut merge_next_autoinc = if meta.autoinc.is_some() {
+            self.autoinc_next_for(&tname, &meta)?
+        } else {
+            0
+        };
         if let Some((cols, exprs)) = &not_matched_ins {
             // Auto-generated GUIDs are random: letting each node generate its
             // own would silently diverge replicas (the INSERT path rewrites
@@ -8794,11 +9095,7 @@ impl Database {
                      tables with an auto-generated GUID column",
                 );
             }
-            let mut next_autoinc = if meta.autoinc.is_some() {
-                self.autoinc_next_for(&tname, &meta)?
-            } else {
-                0
-            };
+            let mut next_autoinc = merge_next_autoinc;
             let mut default_exprs: std::collections::HashMap<String, SqlExpr> =
                 std::collections::HashMap::new();
             for (si, s_doc) in src_rows.iter().enumerate() {
@@ -8843,19 +9140,23 @@ impl Database {
                     }
                 }
                 meta.check(&doc)?;
-                self.check_fks(&meta, &doc)?;
+                // 行间/自引用 FK:本 MERGE 已插入的新像作父候选。
                 inserted_docs.push(doc.clone());
+                let last = inserted_docs.len() - 1;
+                self.check_fks_in(&tname, &meta, &inserted_docs[last], &inserted_docs)?;
                 let loc = heap.insert(&self.pager, &mut tx, &doc)?;
                 reindex_insert(&self.pager, &mut tx, &idx_specs, &mut roots, &doc, loc)?;
                 if let Some(col) = &meta.autoinc {
                     if let Some(Value::Int(i)) = doc.get(col) {
-                        let cur = self.last_insert_id.unwrap_or(i64::MIN);
-                        self.last_insert_id = Some(cur.max(*i));
+                        // 只累计,提交成功后才落到 last_insert_id/autoinc_cache:
+                        // 循环中途失败回滚后,SCOPE_IDENTITY 不得读到幻影 id。
+                        let cur = merge_last_id.unwrap_or(i64::MIN);
+                        merge_last_id = Some(cur.max(*i));
                     }
-                    self.autoinc_cache.insert(tname.clone(), next_autoinc);
                 }
                 inserted += 1;
             }
+            merge_next_autoinc = next_autoinc;
         }
         // Legacy files whose constraint columns predate trees keep the
         // whole-set duplicate check (same gate as the INSERT path): with no
@@ -8914,6 +9215,11 @@ impl Database {
             )?;
         }
         self.commit_pager_tx(tx)?;
+        if let Some(id) = merge_last_id {
+            let cur = self.last_insert_id.unwrap_or(i64::MIN);
+            self.last_insert_id = Some(cur.max(id));
+            self.autoinc_cache.insert(tname.clone(), merge_next_autoinc);
+        }
         Ok(ExecOutcome::Affected((updates.len() + inserted) as u64))
     }
 
@@ -11611,6 +11917,150 @@ fn fk_dependency_order(
     out
 }
 
+/// Row order for a table that references ITSELF in a dump: parents first.
+/// Per-row FK checks run at replay, so a storage-order dump of a
+/// self-referencing table fails restore/join/repair replay whenever a row
+/// references a later-stored row (reachable via UPDATE, which never had the
+/// child-side batch check). Rows with NULL/missing FK values have no
+/// dependency; a row whose reference can be satisfied by ITSELF (the replay
+/// check counts the statement's own batch) is free too. Same-value parent
+/// groups open as soon as one member is emitted (the replay check needs one
+/// present parent). A cycle keeps the remaining storage order and fails
+/// loudly at replay instead of silently dropping rows. Kahn-style, O(rows +
+/// edges) — a long reference chain must not turn the dump quadratic.
+fn self_ref_row_order(table: &str, meta: &TableMeta, docs: Vec<Object>) -> Vec<Object> {
+    let self_fks: Vec<(&str, &str)> = meta
+        .foreign_keys
+        .iter()
+        .filter(|(_, rt, _)| rt == table)
+        .map(|(lc, _, rc)| (lc.as_str(), rc.as_str()))
+        .collect();
+    if self_fks.is_empty() || docs.len() < 2 {
+        return docs;
+    }
+    // 编码字节作值键:与 B+ 树/判重同源(Value 本身不作 Ord)。
+    let key_of = |v: &Value| encode::encode_to_vec(v).ok();
+    // 值 → 组号;组员 = rc 值落在该组的行。只把「能当父行」的值建组:
+    // NULL 被引用列值不当父(子行 NULL 引用本来就免检,值 NULL 的父行
+    // 也不会成为任何非 NULL 引用的目标)。
+    let mut group_of: std::collections::BTreeMap<Vec<u8>, usize> =
+        std::collections::BTreeMap::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for (i, doc) in docs.iter().enumerate() {
+        for (_, rc) in &self_fks {
+            if let Some(v) = doc.get(*rc).filter(|v| !matches!(v, Value::Null)) {
+                if let Some(k) = key_of(v) {
+                    let gid = *group_of.entry(k).or_insert_with(|| {
+                        members.push(Vec::new());
+                        members.len() - 1
+                    });
+                    members[gid].push(i);
+                }
+            }
+        }
+    }
+    let n = docs.len();
+    // 每行未满足的依赖数 + 每组的等待者;初始扫描定队列。
+    let mut blocked: Vec<usize> = vec![0; n];
+    let mut waiters: Vec<Vec<usize>> = vec![Vec::new(); members.len()];
+    let mut open: Vec<bool> = vec![false; members.len()];
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut in_queue = vec![false; n];
+    for (i, doc) in docs.iter().enumerate() {
+        for (lc, _) in &self_fks {
+            let Some(v) = doc.get(*lc) else { continue };
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let Some(k) = key_of(v) else { continue };
+            let Some(&gid) = group_of.get(&k) else {
+                continue;
+            };
+            if members[gid].contains(&i) {
+                // 引用可由本行自身满足(回放检查计入本语句批次)。
+                continue;
+            }
+            blocked[i] += 1;
+            waiters[gid].push(i);
+        }
+        if blocked[i] == 0 {
+            queue.push_back(i);
+            in_queue[i] = true;
+        }
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut emitted = vec![false; n];
+    while let Some(i) = queue.pop_front() {
+        in_queue[i] = false;
+        if emitted[i] {
+            continue;
+        }
+        emitted[i] = true;
+        order.push(i);
+        // 本行出列后,其 rc 值对应的组随之打开,唤醒等待者。
+        for (_, rc) in &self_fks {
+            let Some(v) = doc_i_rc(&docs[i], rc) else {
+                continue;
+            };
+            let Some(k) = key_of(v) else { continue };
+            let Some(&gid) = group_of.get(&k) else {
+                continue;
+            };
+            if !open[gid] {
+                open[gid] = true;
+                for &w in &waiters[gid] {
+                    if !emitted[w] && !in_queue[w] {
+                        // 该依赖被满足,计数清到零入队(blocked 精确记账
+                        // 复杂化,直接按「全部依赖已满足」重判一次)。
+                        if deps_ready(&docs[w], &self_fks, &group_of, &members, &open, w) {
+                            queue.push_back(w);
+                            in_queue[w] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if order.len() == n {
+        order.into_iter().map(|i| docs[i].clone()).collect()
+    } else {
+        // 环:剩余行按存储序输出,回放响亮报错。
+        let mut out: Vec<Object> = order.into_iter().map(|i| docs[i].clone()).collect();
+        out.extend((0..n).filter(|&i| !emitted[i]).map(|i| docs[i].clone()));
+        out
+    }
+}
+
+fn doc_i_rc<'a>(doc: &'a Object, col: &str) -> Option<&'a Value> {
+    doc.get(col).filter(|v| !matches!(**v, Value::Null))
+}
+
+fn deps_ready(
+    doc: &Object,
+    self_fks: &[(&str, &str)],
+    group_of: &std::collections::BTreeMap<Vec<u8>, usize>,
+    members: &[Vec<usize>],
+    open: &[bool],
+    self_idx: usize,
+) -> bool {
+    for (lc, _) in self_fks {
+        let Some(v) = doc.get(*lc) else { continue };
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        let Some(k) = encode::encode_to_vec(v).ok() else {
+            continue;
+        };
+        let Some(&gid) = group_of.get(&k) else {
+            continue;
+        };
+        if !open[gid] && !members[gid].contains(&self_idx) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Views in creation-safe order for a dump: every view after the views its
 /// body references (CREATE VIEW dry-runs the body, so a view of a view needs
 /// its base view restored first — alphabetical order would replay
@@ -13183,6 +13633,13 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<()> {
     if !query.pipe_operators.is_empty() {
         return err("pipe operators are not supported");
     }
+    // ClickHouse `LIMIT n BY cols`:dropping the BY list would silently run
+    // a bare LIMIT — the red line on clause-level silent ignoring.
+    if let Some(sqlparser::ast::LimitClause::LimitOffset { limit_by, .. }) = &query.limit_clause {
+        if !limit_by.is_empty() {
+            return err("LIMIT ... BY is not supported");
+        }
+    }
     Ok(())
 }
 
@@ -13326,25 +13783,24 @@ fn unqualified_col(ident: &str, table: &str, alias: Option<&str>) -> Option<Stri
 /// (NULLS FIRST/LAST is a different order — the sort path handles it). The
 /// trees omit NULL keys (`index_key_of`), so every key column must be
 /// declared NOT NULL or rows would silently go missing from the walk.
+///
+/// `effective` carries each ORDER BY key's sort SOURCE — the output-column
+/// expression when the key name hits a projection alias (the resolution
+/// `apply_order_limit` uses), the raw key otherwise — parallel to `exprs`.
 fn order_walk_index(
     meta: &TableMeta,
     table: &str,
     alias: Option<&str>,
-    order_by: &sqlparser::ast::OrderBy,
+    exprs: &[sqlparser::ast::OrderByExpr],
+    effective: &[&SqlExpr],
 ) -> Option<(String, bool)> {
-    let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
-        return None;
-    };
-    if exprs.is_empty() {
-        return None;
-    }
     let mut cols = Vec::with_capacity(exprs.len());
     let mut asc = true;
     for (i, o) in exprs.iter().enumerate() {
         if o.options.nulls_first.is_some() {
             return None;
         }
-        let col = unqualified_col(&expr_name(&o.expr), table, alias)?;
+        let col = unqualified_col(&expr_name(effective[i]), table, alias)?;
         let this_asc = o.options.asc.unwrap_or(true);
         if i == 0 {
             asc = this_asc;
@@ -17799,6 +18255,53 @@ mod tests {
         }
     }
 
+    /// 索引序窗口的别名遮蔽差分:ORDER BY 键名命中输出别名时,通用路径按
+    /// 输出列值排序,索引窗口曾按同名带索引表列走树序 —— 行序与 LIMIT
+    /// 截断的行集都错。
+    #[test]
+    fn ordered_index_window_alias_shadow_matches_generic() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (a INT NOT NULL PRIMARY KEY, b INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX i_b ON t(b)");
+        run(&mut db, "INSERT INTO t VALUES (1, 30), (2, 20), (3, 10)");
+        let pairs = [
+            // 别名遮蔽带索引列:键是投影表达式(b 的值),不是列 a。
+            (
+                "SELECT b AS a FROM t ORDER BY a LIMIT 2",
+                "SELECT b AS a FROM t WHERE 1 = 1 ORDER BY a LIMIT 2",
+            ),
+            // 恒等别名(表达式就是同一裸列):索引窗口照常生效且等价。
+            (
+                "SELECT b AS b FROM t ORDER BY b LIMIT 2",
+                "SELECT b AS b FROM t WHERE 1 = 1 ORDER BY b LIMIT 2",
+            ),
+            (
+                "SELECT a AS x FROM t ORDER BY a LIMIT 2",
+                "SELECT a AS x FROM t WHERE 1 = 1 ORDER BY a LIMIT 2",
+            ),
+            // 通配符投影:恒等映射,不受影响。
+            (
+                "SELECT * FROM t ORDER BY a LIMIT 2",
+                "SELECT * FROM t WHERE 1 = 1 ORDER BY a LIMIT 2",
+            ),
+            // 序号键回退通用路径。
+            (
+                "SELECT b, a FROM t ORDER BY 1 LIMIT 2",
+                "SELECT b, a FROM t WHERE 1 = 1 ORDER BY 1 LIMIT 2",
+            ),
+        ];
+        for (fast, generic) in pairs {
+            assert_eq!(
+                rows(&mut db, fast).rows,
+                rows(&mut db, generic).rows,
+                "fast={fast} generic={generic}"
+            );
+        }
+    }
+
     // ---- standard clause matrix ----
 
     #[test]
@@ -18106,6 +18609,8 @@ mod tests {
             ("SELECT v FROM t FOR XML AUTO", "FOR XML"),
             ("SELECT v FROM t FORMAT JSONCompact", "FORMAT"),
             ("SELECT v FROM t |> SELECT v", "pipe operators"),
+            // ClickHouse LIMIT … BY:曾被静默当成裸 LIMIT 处理。
+            ("SELECT v FROM t LIMIT 1 BY v", "LIMIT ... BY"),
         ];
         for (sql, want) in cases {
             let e = db.execute(sql).unwrap_err();
@@ -18114,6 +18619,47 @@ mod tests {
                 "sql={sql} error={e} want={want}"
             );
         }
+    }
+
+    /// FROM-less SELECT 的 FETCH 截断(曾完全忽略该子句)。
+    #[test]
+    fn from_less_select_honors_fetch() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(&mut db, "SELECT 1 FETCH FIRST 0 ROWS ONLY");
+        assert!(r.rows.is_empty(), "{r:?}");
+        let r = rows(&mut db, "SELECT 1 FETCH FIRST 5 ROWS ONLY");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        assert!(db.execute("SELECT 1 FETCH FIRST 1 ROWS WITH TIES").is_err());
+    }
+
+    /// 集合操作的臂共享一次 CTE 物化(语义等价;行集与重复执行一致)。
+    #[test]
+    fn union_arms_share_cte_materialization() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE u (v INT)");
+        run(&mut db, "INSERT INTO u VALUES (1), (2), (3)");
+        let r = rows(
+            &mut db,
+            "WITH c AS (SELECT v FROM u WHERE v > 1) \
+             SELECT v FROM c UNION SELECT v + 10 FROM c UNION SELECT 0 ORDER BY v",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(0)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+                vec![Value::Int(12)],
+                vec![Value::Int(13)]
+            ]
+        );
+        // EXCEPT/INTERSECT 臂同样受益且语义不变。
+        let r = rows(
+            &mut db,
+            "WITH c AS (SELECT v FROM u WHERE v > 1) \
+             SELECT v FROM c EXCEPT SELECT 3",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
     }
 
     #[test]
@@ -19602,6 +20148,161 @@ mod tests {
         assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
     }
 
+    /// 同语句行间引用与自引用 FK(与 SQLite/PG 立即 FK 对齐),以及自引用
+    /// 行的 dump 往返;引用方 FK 表名在 ALTER TABLE RENAME 时跟随改写。
+    #[test]
+    fn fk_intra_statement_self_reference_and_dump_roundtrip() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE emp (id INT PRIMARY KEY, mgr INT REFERENCES emp(id))",
+        );
+        // 自引用单行(1 的经理是自己)。
+        run(&mut db, "INSERT INTO emp VALUES (1, 1)");
+        // 行间引用:后行引用本语句的前行。
+        run(&mut db, "INSERT INTO emp VALUES (2, 1), (3, 2)");
+        // UPDATE 建自引用(此前 dump/restore 必败)。
+        run(&mut db, "INSERT INTO emp VALUES (4, NULL)");
+        run(&mut db, "UPDATE emp SET mgr = 3 WHERE id = 4");
+        // dump 往返:前向引用行(引用同表更晚存储的行)按拓扑序出。
+        let dump = db.dump_script().unwrap();
+        let mut restored = Database::in_memory().unwrap();
+        for stmt in crate::stmt::split_statements(&dump).unwrap() {
+            run(&mut restored, &stmt);
+        }
+        let r = rows(&mut restored, "SELECT id, mgr FROM emp ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Int(2), Value::Int(1)],
+                vec![Value::Int(3), Value::Int(2)],
+                vec![Value::Int(4), Value::Int(3)],
+            ]
+        );
+        // 环(互为父子):dump 保持存储序,回放响亮报错,不静默丢行。
+        // 单行 INSERT 的前向引用仍被拒(批内候选只覆盖同语句的行)。
+        assert!(db.execute("INSERT INTO emp VALUES (5, 6)").is_err());
+        run(&mut db, "INSERT INTO emp VALUES (5, NULL)");
+        run(&mut db, "INSERT INTO emp VALUES (6, 5)");
+        run(&mut db, "UPDATE emp SET mgr = 6 WHERE id = 5");
+        let dump = db.dump_script().unwrap();
+        let mut restored2 = Database::in_memory().unwrap();
+        let mut failed = false;
+        for stmt in crate::stmt::split_statements(&dump).unwrap() {
+            if restored2.execute(&stmt).is_err() {
+                failed = true;
+            }
+        }
+        assert!(failed, "环引用的回放必须响亮失败");
+
+        // RENAME 改写引用方 FK 表名:子表写路径不再瘫痪。
+        let mut db2 = Database::in_memory().unwrap();
+        run(&mut db2, "CREATE TABLE p (id INT PRIMARY KEY)");
+        run(
+            &mut db2,
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))",
+        );
+        run(&mut db2, "INSERT INTO p VALUES (1)");
+        run(&mut db2, "ALTER TABLE p RENAME TO p2");
+        run(&mut db2, "INSERT INTO c VALUES (10, 1)"); // 曾报 table p does not exist
+        let e = db2.execute("INSERT INTO c VALUES (11, 9)").unwrap_err();
+        assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+        // rename 后 dump 往返也保持引用一致。
+        let dump = db2.dump_script().unwrap();
+        let mut r2 = Database::in_memory().unwrap();
+        for stmt in crate::stmt::split_statements(&dump).unwrap() {
+            run(&mut r2, &stmt);
+        }
+        run(&mut r2, "INSERT INTO c VALUES (12, 1)");
+    }
+
+    /// 表级 FOREIGN KEY 列数不匹配必须报错(曾被 zip 静默截断)。
+    #[test]
+    fn fk_column_count_mismatch_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (a INT, b INT)");
+        let e = db
+            .execute("CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (a))")
+            .unwrap_err();
+        assert!(e.to_string().contains("mismatch"), "{e}");
+    }
+
+    /// OR REPLACE 批内重复键:后者胜(曾整条报 UNIQUE)。
+    #[test]
+    fn insert_or_replace_within_batch_last_wins() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(
+            &mut db,
+            "INSERT OR REPLACE INTO t VALUES (1, 'a'), (1, 'b')",
+        );
+        let r = rows(&mut db, "SELECT v FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Str("b".into())]]);
+        // 与既有行冲突 + 批内冲突并存。
+        run(
+            &mut db,
+            "INSERT OR REPLACE INTO t VALUES (1, 'c'), (2, 'x'), (2, 'y')",
+        );
+        let r = rows(&mut db, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Str("c".into())],
+                vec![Value::Int(2), Value::Str("y".into())],
+            ]
+        );
+    }
+
+    /// MERGE 失败回滚后 SCOPE_IDENTITY 不留幻影 id。
+    #[test]
+    fn merge_rollback_leaves_no_phantom_identity() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, k INT)",
+        );
+        run(&mut db, "CREATE TABLE s (k INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 1)");
+        run(&mut db, "INSERT INTO s VALUES (1), (2)");
+        // MERGE 插入的 not-matched 行带显式 id=1,撞唯一键 → 整条回滚;
+        // 曾经循环内提前推进 last_insert_id,回滚后留下幻影。
+        let e = db
+            .execute(
+                "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT VALUES (1, s.k)",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE"), "{e}");
+        assert_eq!(db.last_insert_id(), None, "回滚后不得有幻影 id");
+        // 成功路径照常上报最大 id。
+        run(
+            &mut db,
+            "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT VALUES (100 + s.k, s.k)",
+        );
+        assert_eq!(db.last_insert_id(), Some(102));
+    }
+
+    /// INSERT ... SELECT 无列清单按位置映射(曾按查询输出名建幽灵键)。
+    #[test]
+    fn insert_select_positional_mapping() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE logs (ts INT, lvl TEXT)");
+        run(&mut db, "CREATE TABLE staging (a INT, b TEXT)");
+        run(&mut db, "INSERT INTO staging VALUES (1, 'x')");
+        run(&mut db, "INSERT INTO logs SELECT * FROM staging");
+        run(&mut db, "INSERT INTO logs SELECT 2, 'y'");
+        run(&mut db, "INSERT INTO logs SELECT a AS ts2, b FROM staging");
+        let r = rows(&mut db, "SELECT ts, lvl FROM logs");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Str("x".into())],
+                vec![Value::Int(2), Value::Str("y".into())],
+                vec![Value::Int(1), Value::Str("x".into())],
+            ]
+        );
+    }
+
     #[test]
     fn fk_parent_delete_and_key_update_enforced() {
         let mut db = Database::in_memory().unwrap();
@@ -19835,6 +20536,53 @@ mod tests {
         // Unparseable string vs TIMESTAMP: NULL (unknown), never a wrong row.
         let junk = rows(&mut db, "SELECT id FROM ev2 WHERE at > 'not-a-time'");
         assert!(junk.rows.is_empty(), "unparseable bound must match nothing");
+    }
+
+    /// 混合带(Str+Timestamp 同列)不可安全探测:探针结果曾依赖索引
+    /// 存在性 —— 保留字面量只探 Str 带,丢掉整个 Timestamp 带。必须回退
+    /// 通用扫描,给出与无索引时一致的行集。
+    #[test]
+    fn mixed_band_index_probe_falls_back_to_scan_semantics() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE mb (id INT PRIMARY KEY, ts TEXT)");
+        run(&mut db, "CREATE INDEX i_mb_ts ON mb (ts)");
+        run(
+            &mut db,
+            "INSERT INTO mb VALUES (1, TIMESTAMP '2021-01-01T00:00:00Z')",
+        );
+        run(&mut db, "INSERT INTO mb VALUES (2, 'zzz')");
+        run(
+            &mut db,
+            "INSERT INTO mb VALUES (3, TIMESTAMP '2022-01-01T00:00:00Z')",
+        );
+        // 范围谓词:三行全部命中(cmp_coerced 逐行判定),不得只剩 Str 带。
+        let r = rows(
+            &mut db,
+            "SELECT id FROM mb WHERE ts > '2020-01-01T00:00:00Z' ORDER BY id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ],
+            "混合带范围探针不得静默丢 Timestamp 行"
+        );
+        // 等值谓词:命中 Timestamp 行。
+        let r = rows(
+            &mut db,
+            "SELECT id FROM mb WHERE ts = '2021-01-01T00:00:00Z'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // UPDATE 快路径(同一探针)也不丢行。
+        match run(
+            &mut db,
+            "UPDATE mb SET id = id WHERE ts > '2020-01-01T00:00:00Z'",
+        ) {
+            ExecOutcome::Affected(n) => assert_eq!(n, 3),
+            other => panic!("expected affected, got {other:?}"),
+        }
     }
 
     #[test]

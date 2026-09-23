@@ -77,6 +77,35 @@ pub fn fold_rand_calls(sql: &str, rand_literal: &str) -> Option<String> {
     Some(out)
 }
 
+/// From byte offset `j`, skip whitespace AND comments (`-- …` / `/* … */`)
+/// and return the offset of the first "real" character. The tokenizer treats
+/// comments as whitespace, so `NOW /*x*/ ()` parses exactly like `NOW()` —
+/// the call scanners must agree or a comment splits name from argument list
+/// and the call silently escapes folding (cluster divergence).
+fn skip_ws_comments(b: &[u8], mut j: usize) -> usize {
+    loop {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j + 1 < b.len() && b[j] == b'-' && b[j + 1] == b'-' {
+            j += 2;
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            continue;
+        }
+        if j + 1 < b.len() && b[j] == b'/' && b[j + 1] == b'*' {
+            j += 2;
+            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                j += 1;
+            }
+            j = (j + 2).min(b.len());
+            continue;
+        }
+        return j;
+    }
+}
+
 /// Byte ranges of zero-argument RAND/NEWID/NEWSEQUENTIALID calls. String
 /// literals, comments and quoted identifiers are skipped; a matching word
 /// must be a complete identifier followed by an empty argument list.
@@ -130,17 +159,11 @@ fn find_nondet_calls(sql: &str, rand_only: bool) -> Vec<std::ops::Range<usize>> 
                 if rand_only && &lb[start..i] != b"rand" {
                     continue;
                 }
-                let mut j = i;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
+                let j = skip_ws_comments(b, i);
                 if b.get(j) != Some(&b'(') {
                     continue;
                 }
-                let mut k = j + 1;
-                while k < b.len() && b[k].is_ascii_whitespace() {
-                    k += 1;
-                }
+                let k = skip_ws_comments(b, j + 1);
                 if b.get(k) == Some(&b')') {
                     out.push(start..k + 1);
                 }
@@ -252,30 +275,30 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                     i += 1;
                 }
                 let word = &lower_bytes[start..i];
-                // Look past whitespace for the argument list (`NOW ()` is
-                // the same call as `NOW()` to the parser). Only the empty
-                // argument list folds; other arities stay verbatim.
-                let mut j = i;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                let empty_call = b.get(j) == Some(&b'(')
-                    && b[j + 1..].iter().find(|&&x| !x.is_ascii_whitespace()) == Some(&b')');
-                let close = {
-                    let mut k = j + 1;
-                    while k < b.len() && b[k].is_ascii_whitespace() {
-                        k += 1;
+                // Look past whitespace/comments for the argument list
+                // (`NOW ()`, `NOW /*x*/ ()` are the same call as `NOW()` to
+                // the parser). Only the empty argument list folds; other
+                // arities stay verbatim.
+                let j = skip_ws_comments(b, i);
+                let close = if b.get(j) == Some(&b'(') {
+                    let k = skip_ws_comments(b, j + 1);
+                    if b.get(k) == Some(&b')') {
+                        k + 1
+                    } else {
+                        j
                     }
-                    k
+                } else {
+                    j
                 };
+                let empty_call = b.get(j) == Some(&b'(') && close > j;
                 if (word == b"now" || word == b"sysdate") && empty_call {
                     out.push_str(if word == b"now" { &ts_lit } else { &str_lit });
                     folded = true;
-                    i = close + 1;
+                    i = close;
                 } else if word == b"current_timestamp" && empty_call {
                     out.push_str(&ts_lit);
                     folded = true;
-                    i = close + 1;
+                    i = close;
                 } else if word == b"current_timestamp" && b.get(j) != Some(&b'(') {
                     // Bare keyword form.
                     out.push_str(&ts_lit);
@@ -293,7 +316,7 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                     // are UTC here — the engine has no local-time zone).
                     out.push_str(&ts_lit);
                     folded = true;
-                    i = close + 1;
+                    i = close;
                 } else {
                     out.push_str(&sql[start..i]);
                 }
@@ -354,6 +377,29 @@ pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
                 cur.push(chars[i]);
                 if chars[i] == quote {
                     if chars.get(i + 1) == Some(&quote) {
+                        cur.push(*chars.get(i + 1).unwrap());
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '[' {
+            // T-SQL [bracket identifier]: `;` and GO lines inside are
+            // identifier data, not separators. `]]` escapes a literal `]`
+            // (same rule as tsql::preprocess — the two scanners must agree).
+            // An unterminated bracket runs to end of input and is rejected
+            // loudly by the parser downstream.
+            cur.push(c);
+            i += 1;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == ']' {
+                    if chars.get(i + 1) == Some(&']') {
                         cur.push(*chars.get(i + 1).unwrap());
                         i += 2;
                         continue;
@@ -683,6 +729,45 @@ mod tests {
         // The pre-filter sees through whitespace/newline spellings.
         assert!(mentions_wall_clock("INSERT INTO t VALUES (now ())"));
         assert!(mentions_wall_clock("UPDATE t SET at = SYSDATE\n()"));
+    }
+
+    #[test]
+    fn fold_wall_clocks_and_nondet_scan_skip_comments_before_parens() {
+        // The tokenizer treats comments as whitespace, so `NOW /*x*/ ()`
+        // parses like `NOW()` — the scanner must agree or the call escapes
+        // folding and every replica stamps its own clock.
+        let now = 1_789_461_000_123i64;
+        let folded = fold_wall_clocks("INSERT INTO t VALUES (now /*sync*/ ())", now).unwrap();
+        assert!(folded.contains("AS TIMESTAMP"), "{folded}");
+        assert!(!folded.to_lowercase().contains("now"), "{folded}");
+        let folded = fold_wall_clocks("UPDATE t SET at = GETDATE\n-- note\n()", now).unwrap();
+        assert!(folded.contains("AS TIMESTAMP"), "{folded}");
+        // Comment inside the (empty) argument list counts as empty too.
+        assert!(fold_wall_clocks("INSERT INTO t VALUES (sysdate(/*x*/))", now).is_some());
+        // RAND 检测同样要看穿注释(find_nondet_calls 与折叠器同源对齐)。
+        assert_eq!(
+            super::find_nondet_calls("SELECT RAND /*seed*/ ()", false).len(),
+            1
+        );
+        assert_eq!(
+            super::find_nondet_calls("SELECT NEWID-- pick\n()", false).len(),
+            1
+        );
+        assert_eq!(super::find_nondet_calls("SELECT RAND(1)", false).len(), 0);
+    }
+
+    #[test]
+    fn text_chunks_skips_bracket_identifiers() {
+        // T-SQL [bracket identifiers]: `;`/GO inside are data, not
+        // separators — the splitter must agree with tsql::preprocess.
+        let v = split_statements("SELECT [a;b] FROM t;\nSELECT 1").unwrap();
+        assert_eq!(v.len(), 2, "{v:?}");
+        // 跨行 bracket 内的 go 行不是批分隔符。
+        let v = split_statements("SELECT [x\ngo\ny] FROM t\ngo\nSELECT 2").unwrap();
+        assert_eq!(v.len(), 2, "{v:?}");
+        // ]] escape stays data.
+        let v = split_statements("SELECT [a]]b;c] FROM t; SELECT 1").unwrap();
+        assert_eq!(v.len(), 2, "{v:?}");
     }
 
     #[test]

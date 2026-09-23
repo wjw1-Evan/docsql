@@ -25,6 +25,44 @@ pub const KIND_BEGIN: u8 = 1;
 pub const KIND_WRITE: u8 = 2;
 pub const KIND_COMMIT: u8 = 3;
 pub const KIND_ABORT: u8 = 4;
+
+/// Recovery-side bookkeeping for deferred commits shared by both scanners
+/// ([`Wal::open`] and `Pager::recover` — they MUST agree). Each entry walks
+/// pending → durable (a later FENCE covers it) or → voided (a later ABORT
+/// of the same txid: the ROLLBACK path appends one ABORT per outstanding
+/// deferred statement). A voided entry stays voided even if a subsequent
+/// fence covers its LSN — a rolled-back transaction must not resurrect.
+#[derive(Default)]
+pub(crate) struct DeferredSet {
+    /// (lsn, txid, status) with 0 = pending, 1 = durable, 2 = voided.
+    entries: Vec<(u64, u64, u8)>,
+}
+
+impl DeferredSet {
+    pub(crate) fn push(&mut self, lsn: u64, txid: u64) {
+        self.entries.push((lsn, txid, 0));
+    }
+    pub(crate) fn fence(&mut self, fence_lsn: u64) {
+        for e in self.entries.iter_mut() {
+            if e.0 < fence_lsn && e.2 == 0 {
+                e.2 = 1;
+            }
+        }
+    }
+    pub(crate) fn abort(&mut self, txid: u64, abort_lsn: u64) {
+        for e in self.entries.iter_mut() {
+            if e.1 == txid && e.0 < abort_lsn {
+                e.2 = 2;
+            }
+        }
+    }
+    fn durable_lsns(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().filter(|e| e.2 == 1).map(|e| e.0)
+    }
+    pub(crate) fn durable_txids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().filter(|e| e.2 == 1).map(|e| e.1)
+    }
+}
 /// Commit of a single statement inside an explicit SQL transaction: the
 /// transaction is still open, so recovery must not replay it unless a
 /// later [`KIND_FENCE`] (the SQL COMMIT's durable boundary) covers it.
@@ -104,6 +142,9 @@ pub struct Wal {
     /// [`Wal::fence`] is a no-op when this is zero, so an ordinary commit
     /// batch does not pay an extra frame + fsync cycle.
     deferred_since_fence: u64,
+    /// Txids of the outstanding (unfenced) deferred commits — the set
+    /// [`Wal::abort_deferred`] voids on ROLLBACK.
+    deferred_txids: Vec<u64>,
     /// Checkpoint generation: LSNs restart at 1 after every checkpoint, so a
     /// snapshot's LSN is only meaningful within its epoch (MVCC stage B).
     /// Monotonic across checkpoints for the lifetime of the process.
@@ -158,6 +199,7 @@ impl Wal {
                 durable_lsn: 0,
                 appended: HEADER.len() as u64,
                 deferred_since_fence: 0,
+                deferred_txids: Vec::new(),
                 epoch: 0,
                 poisoned: None,
             });
@@ -180,8 +222,7 @@ impl Wal {
         let mut durable = 0u64;
         let mut good_end = HEADER.len() as u64;
         let mut open_tx: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut deferred: Vec<(u64, u64)> = Vec::new(); // (lsn, txid)
-        let mut last_fence_lsn = 0u64;
+        let mut deferred = DeferredSet::default();
         let mut reader = FrameReader::open(path)?;
         while let Some(rec) = reader.next() {
             let rec = rec?;
@@ -192,9 +233,13 @@ impl Wal {
                 }
                 KIND_COMMIT if open_tx.remove(&rec.txid) => durable = durable.max(rec.lsn),
                 KIND_COMMIT_DEFERRED if open_tx.contains(&rec.txid) => {
-                    deferred.push((rec.lsn, rec.txid));
+                    deferred.push(rec.lsn, rec.txid);
                 }
-                KIND_FENCE => last_fence_lsn = last_fence_lsn.max(rec.lsn),
+                KIND_FENCE => deferred.fence(rec.lsn),
+                KIND_ABORT => {
+                    open_tx.remove(&rec.txid);
+                    deferred.abort(rec.txid, rec.lsn);
+                }
                 _ => {}
             }
             next_lsn = rec.lsn + 1;
@@ -203,11 +248,10 @@ impl Wal {
         // A deferred commit is only durable when a later fence (the SQL
         // COMMIT boundary) made it to disk. Without the fence the explicit
         // transaction never committed — dropping it is what keeps recovery
-        // atomic.
-        for (lsn, _txid) in deferred {
-            if lsn < last_fence_lsn {
-                durable = durable.max(lsn);
-            }
+        // atomic. A deferred commit aborted by ROLLBACK stays dropped even
+        // when a later fence covers its LSN.
+        for lsn in deferred.durable_lsns() {
+            durable = durable.max(lsn);
         }
         file.set_len(good_end)?;
         file.seek(SeekFrom::End(0))?;
@@ -219,6 +263,7 @@ impl Wal {
             durable_lsn: durable,
             appended: good_end,
             deferred_since_fence: 0,
+            deferred_txids: Vec::new(),
             epoch: 0,
             poisoned: None,
         })
@@ -272,6 +317,7 @@ impl Wal {
         self.appended += frame.len() as u64;
         if kind == KIND_COMMIT_DEFERRED {
             self.deferred_since_fence += 1;
+            self.deferred_txids.push(txid);
         }
         self.next_lsn += 1;
         Ok(lsn)
@@ -330,6 +376,7 @@ impl Wal {
         }
         let lsn = self.append(KIND_FENCE, 0, &[])?;
         self.deferred_since_fence = 0;
+        self.deferred_txids.clear();
         // The fence is a visible commit head too: snapshots begun after the
         // SQL COMMIT must include the deferred commits it covers.
         self.last_commit_lsn = self.last_commit_lsn.max(lsn);
@@ -347,6 +394,22 @@ impl Wal {
 
     pub fn abort(&mut self, txid: u64) -> Result<u64> {
         self.append(KIND_ABORT, txid, &[])
+    }
+
+    /// The ROLLBACK marker: append one ABORT frame per outstanding (unfenced)
+    /// deferred commit and clear the pending set. Without this, the restore
+    /// transaction's synchronous commit (`Wal::commit`) fences FIRST — a torn
+    /// crash landing between "FENCE durable" and "restore COMMIT durable"
+    /// would count every deferred statement of the rolled-back transaction as
+    /// committed and resurrect it. With the ABORT frames, recovery voids those
+    /// deferred commits no matter what fence follows.
+    pub fn abort_deferred(&mut self) -> Result<()> {
+        let txids = std::mem::take(&mut self.deferred_txids);
+        for txid in txids {
+            self.append(KIND_ABORT, txid, &[])?;
+        }
+        self.deferred_since_fence = 0;
+        Ok(())
     }
 
     /// Iterate all valid frames (recovery input), in LSN order. Continuity
@@ -406,6 +469,7 @@ impl Wal {
         self.next_lsn = 1;
         self.appended = HEADER.len() as u64;
         self.deferred_since_fence = 0;
+        self.deferred_txids.clear();
         self.epoch += 1;
         // A retry that got this far rewrote and synced a valid header over
         // the truncated file with the counters reset to match — the file
@@ -572,6 +636,40 @@ mod tests {
         // to byte-identical output of the original bitwise loop (WAL frames
         // written by older versions must keep verifying).
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// ROLLBACK 的 ABORT 语义:被作废的 deferred 提交即使被更晚的 FENCE
+    /// 覆盖也不得复活。模拟撕裂崩溃停在「FENCE 已持久、恢复事务 COMMIT
+    /// 未持久」—— 曾经这条序列会把整个已回滚事务判成已提交。
+    #[test]
+    fn aborted_deferred_stays_dropped_under_later_fence() {
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            let t = 7u64;
+            w.begin(t).unwrap();
+            w.log_write(t, b"after-image").unwrap();
+            w.commit_deferred(t).unwrap();
+            // ROLLBACK:先作废,再(撕裂后)出现一个 fence。
+            w.abort_deferred().unwrap();
+            w.fence().unwrap();
+            w.sync().unwrap();
+        }
+        let w = Wal::open(&path).unwrap();
+        assert_eq!(w.durable_lsn, 0, "aborted deferred 不得因 fence 复活");
+        // 正常提交(fence 覆盖、未 ABORT)照常 durable。
+        let (_dir2, path2) = wal_dir();
+        {
+            let mut w = Wal::open(&path2).unwrap();
+            let t = 9u64;
+            w.begin(t).unwrap();
+            w.log_write(t, b"img").unwrap();
+            w.commit_deferred(t).unwrap();
+            w.fence().unwrap();
+            w.sync().unwrap();
+        }
+        let w2 = Wal::open(&path2).unwrap();
+        assert!(w2.durable_lsn > 0);
     }
 
     #[test]

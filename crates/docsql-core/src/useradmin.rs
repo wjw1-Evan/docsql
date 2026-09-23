@@ -169,12 +169,20 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         if c == '"' {
             let mut v = String::new();
             i += 1;
+            // 与单引号分支对称:未闭合必须报错。截断的粘贴(如
+            // `DROP USER "alice`)曾把余下全文吞成一个标识符,畸形语句
+            // 被静默按非本意的名字执行。
+            let mut closed = false;
             while let Some(&ch) = chars.get(i) {
                 i += 1;
                 if ch == '"' {
+                    closed = true;
                     break;
                 }
                 v.push(ch);
+            }
+            if !closed {
+                return Err("unterminated quoted identifier".into());
             }
             if v.is_empty() {
                 return Err("empty quoted identifier".into());
@@ -1040,12 +1048,12 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
         ) else {
             continue;
         };
-        out.push(format!("CREATE USER {name} PASSWORD {}", lit(pw)));
+        out.push(format!("CREATE USER {} PASSWORD {}", q(name), lit(pw)));
     }
     for d in db.table_docs_cx(ROLES_TABLE).unwrap_or_default() {
         if let Some(name) = d.get("name").and_then(|v| v.as_str()) {
             if !BUILTIN_ROLES.contains(&name) {
-                out.push(format!("CREATE ROLE {name}"));
+                out.push(format!("CREATE ROLE {}", q(name)));
             }
         }
     }
@@ -1056,7 +1064,7 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
         ) else {
             continue;
         };
-        out.push(format!("GRANT {role} TO {member}"));
+        out.push(format!("GRANT {} TO {}", q(role), q(member)));
     }
     // Aggregate per (grantee, table) for deterministic, compact output.
     let mut grants: BTreeMap<(String, String), u8> = BTreeMap::new();
@@ -1086,9 +1094,10 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
         .map(|(_, p)| p)
         .collect();
         out.push(format!(
-            "GRANT {} ON {} TO {grantee}",
+            "GRANT {} ON {} TO {}",
             priv_names(&privs),
-            q(&tbl)
+            q(&tbl),
+            q(&grantee)
         ));
     }
     out.sort();
@@ -1103,6 +1112,16 @@ mod tests {
     /// credentials) — keep them out of source literals.
     fn test_pw() -> String {
         ["pa", "ss", "w0", "rd", "12", "34"].concat()
+    }
+
+    /// 未闭合的双引号标识符必须报错(曾把余下全文吞成一个名字,畸形
+    /// 语句被静默按非本意的名字执行 —— `DROP USER "alice` 真删了 alice)。
+    #[test]
+    fn unterminated_quoted_identifier_rejected() {
+        assert!(matches!(parse("DROP USER \"alice"), Some(Err(_))));
+        assert!(matches!(parse("DROP ROLE \"clerk"), Some(Err(_))));
+        // 闭合的正常形态不受影响。
+        assert!(matches!(parse("DROP USER \"alice\""), Some(Ok(_))));
     }
 
     #[test]
