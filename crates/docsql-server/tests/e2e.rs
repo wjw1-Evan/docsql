@@ -6013,16 +6013,23 @@ async fn long_read_does_not_block_writes() {
         assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
     }
     let write_elapsed = t0.elapsed();
-    assert!(
-        write_elapsed < Duration::from_secs(5),
-        "writes stalled {:?} behind an in-flight read",
-        write_elapsed
-    );
 
     let (read_elapsed, seen) = read.await.unwrap();
     assert!(
         read_elapsed > write_elapsed,
         "read ({read_elapsed:?}) finished before the writes ({write_elapsed:?}) — no overlap to test"
+    );
+    // Stall detection is RATIO-based, not absolute-time: both sides stretch
+    // together under host load (an image build running parallel cargo test
+    // suites once pushed the write burst past an absolute 5s cap while the
+    // read itself ran for many seconds — the overlap was fine, the fixed
+    // budget was not). The writes must land inside the read's first
+    // quarter: ≥4× margin, per the performance-baseline convention.
+    assert!(
+        write_elapsed * 4 < read_elapsed,
+        "writes stalled {:?} behind an in-flight read {:?} (must land in the first quarter)",
+        write_elapsed,
+        read_elapsed
     );
     // The in-flight reader stayed at its snapshot: exactly the pre-write
     // 700 × 700 pairs, none of the five late rows.
