@@ -1078,7 +1078,16 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 // The transmitted header + the connection challenge are the
                 // tag's associated data: a MITM cannot flip a flag, and a
                 // frame captured on another connection cannot replay here.
-                let payload = crypto::seal(&k, f.frame_type, flags, &f.payload, &conn_challenge);
+                // Nonce exhaustion (>2^32 seals from this process) closes
+                // the connection — the node must be restarted.
+                let payload =
+                    match crypto::seal(&k, f.frame_type, flags, &f.payload, &conn_challenge) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("docsql-crypto: {e}; closing the connection");
+                            break;
+                        }
+                    };
                 Frame {
                     flags,
                     payload,
@@ -3558,7 +3567,8 @@ async fn auth_on(stream: &mut TcpStream, token: &str, wire: WireKey<'_>) -> std:
     let mut frame = Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec());
     if let Some((k, hello)) = wire {
         frame.flags |= crypto::FLAG_ENCRYPTED;
-        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload, hello);
+        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload, hello)
+            .map_err(std::io::Error::other)?;
     }
     write_frame_on(stream, &frame).await?;
     let mut replay = crypto::ReplayGuard::default();
@@ -3589,13 +3599,27 @@ async fn open_peer_conn(
 }
 
 /// Build a replication-internal frame: FLAG_REPLICATION plus transport
-/// sealing when a key is configured.
+/// sealing when a key is configured. Nonce exhaustion (>2^32 seals from
+/// this process) is a restart-the-node event: reported once as a plaintext
+/// RESP_ERROR instead of a sealed frame — receivers treat the error as a
+/// failed operation, never as protocol data.
 fn replication_frame(frame_type: u16, payload: Vec<u8>, wire: WireKey<'_>) -> Frame {
     let mut frame = Frame::new(frame_type, payload);
     frame.flags = FLAG_REPLICATION;
     if let Some((k, hello)) = wire {
         frame.flags |= crypto::FLAG_ENCRYPTED;
-        frame.payload = crypto::seal(k, frame.frame_type, frame.flags, &frame.payload, hello);
+        match crypto::seal(k, frame.frame_type, frame.flags, &frame.payload, hello) {
+            Ok(sealed) => frame.payload = sealed,
+            Err(e) => {
+                static EXHAUSTION_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !EXHAUSTION_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("docsql-crypto: {e}");
+                }
+                frame.flags &= !crypto::FLAG_ENCRYPTED;
+                return Frame::new(proto::RESP_ERROR, e.into_bytes());
+            }
+        }
     }
     frame
 }

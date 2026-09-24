@@ -362,7 +362,8 @@ async fn keyed_transport_rejects_replayed_frame() {
     ) -> Vec<u8> {
         let mut f = Frame::new(frame_type, payload.to_vec());
         f.flags |= docsql_server::crypto::FLAG_ENCRYPTED;
-        f.payload = docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload, challenge);
+        f.payload =
+            docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload, challenge).unwrap();
         let bytes = f.encode().unwrap();
         stream.write_all(&bytes).await.unwrap();
         stream.flush().await.unwrap();
@@ -6117,7 +6118,8 @@ async fn transport_key_requires_sealed_frames() {
             FLAG_ENCRYPTED,
             &proto::encode_sql("SELECT 1").unwrap(),
             &ch,
-        ),
+        )
+        .unwrap(),
     })
     .await;
     let f = c.recv().await;
@@ -6140,7 +6142,8 @@ async fn transport_key_requires_sealed_frames() {
             FLAG_ENCRYPTED,
             &proto::encode_sql("SELECT 1").unwrap(),
             &ch,
-        ),
+        )
+        .unwrap(),
     })
     .await;
     let f = c.recv().await;
@@ -6240,7 +6243,8 @@ async fn garbage_peer_handshake_fails_loudly() {
     ) {
         let mut f = Frame::new(frame_type, payload.to_vec());
         f.flags |= docsql_server::crypto::FLAG_ENCRYPTED;
-        f.payload = docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload, challenge);
+        f.payload =
+            docsql_server::crypto::seal(key, f.frame_type, f.flags, &f.payload, challenge).unwrap();
         let bytes = f.encode().unwrap();
         stream.write_all(&bytes).await.unwrap();
         stream.flush().await.unwrap();
