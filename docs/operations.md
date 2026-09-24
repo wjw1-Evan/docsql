@@ -109,7 +109,7 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_TOKEN` | 无 | 客户端凭据(恒为管理员身份);Web 控制台以它连接节点(与节点同值),并作为账号门的 API 旁路;≥8 位且非单字符重复,违者拒绝启动 |
 | `DOCSQL_READ_TOKEN` | 无 | 只读客户端凭据(可查不可写) |
 | `DOCSQL_CLUSTER_TOKEN` | 无 | 节点间凭据(复制帧仅接受节点身份) |
-| `DOCSQL_KEY` | 无 | 64 位 hex → AES-256-GCM 帧加密(客户端与节点间同用) |
+| `DOCSQL_KEY` | 无 | 64 位 hex → AES-256-GCM 帧加密(客户端与节点间同用);全零 key 拒绝启动(公开密钥加密形同虚设,与弱 token 同策略) |
 
 ### 资源与执行
 

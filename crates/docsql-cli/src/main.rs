@@ -228,6 +228,9 @@ fn statements_ready(sql: &str) -> bool {
     // Depth of open BEGIN…END blocks (BEGIN TRAN/TRANSACTION excluded — it
     // is the transaction statement, not a block opener).
     let mut begin_depth: i32 = 0;
+    // Open CASE…END expressions: their END belongs to the expression, not
+    // to the block scanner.
+    let mut case_depth: i32 = 0;
     let mut i = 0;
     while i < b.len() {
         match st {
@@ -270,30 +273,19 @@ fn statements_ready(sql: &str) -> bool {
                         }
                     } else if word == b"case" {
                         // CASE … END is expression syntax: its END must not
-                        // close the surrounding BEGIN block.
-                        let mut case_nesting = 1i32;
-                        let mut j = k;
-                        while j < b.len() && case_nesting > 0 {
-                            if lb[j].is_ascii_alphabetic() {
-                                let mut m = j;
-                                while m < b.len() && (b[m].is_ascii_alphanumeric() || b[m] == b'_')
-                                {
-                                    m += 1;
-                                }
-                                match &lb[j..m] {
-                                    b"case" => case_nesting += 1,
-                                    b"end" => case_nesting -= 1,
-                                    _ => {}
-                                }
-                                j = m;
-                                continue;
-                            }
-                            j += 1;
+                        // close the surrounding BEGIN block. Counted in the
+                        // SAME lexically-aware walk (literals, comments and
+                        // bracket identifiers are skipped by the state
+                        // machine itself) — a pre-scan blind to quotes once
+                        // let an 'end;' inside a string literal close the
+                        // CASE and expose its `;` as a statement separator.
+                        case_depth += 1;
+                    } else if word == b"end" {
+                        if case_depth > 0 {
+                            case_depth -= 1;
+                        } else if begin_depth > 0 {
+                            begin_depth -= 1;
                         }
-                        i = j;
-                        continue;
-                    } else if word == b"end" && begin_depth > 0 {
-                        begin_depth -= 1;
                     }
                     i = k;
                     continue;
@@ -353,8 +345,8 @@ fn statements_ready(sql: &str) -> bool {
     }
     // A line comment is terminated by end-of-input just like by a newline;
     // any other open state means the statement is incomplete. An open
-    // BEGIN…END block also holds the `;` inside the statement.
-    matches!(st, S::Code | S::Line) && last_semi && begin_depth == 0
+    // BEGIN…END block or CASE expression also holds the `;` inside.
+    matches!(st, S::Code | S::Line) && last_semi && begin_depth == 0 && case_depth == 0
 }
 
 /// Split a complete buffer into executable statements (quote/comment aware).

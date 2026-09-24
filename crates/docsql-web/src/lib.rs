@@ -2104,7 +2104,20 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
             let f = node_read_frame(&mut stream)
                 .await
                 .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
-            budget = budget.saturating_sub(f.payload.len());
+            // Over-budget check BEFORE consuming: a batch whose results sum
+            // to exactly the cap is legal (a single frame may reach it), and
+            // aborting at `== 0` would also skip sending the remaining
+            // statements — silently dropping any DML after the boundary.
+            if f.payload.len() > budget {
+                return Ok((
+                    outcomes,
+                    Some((
+                        i,
+                        "batch result too large (64 MiB budget); narrow the query or split the batch".into(),
+                    )),
+                ));
+            }
+            budget -= f.payload.len();
             match f.frame_type {
                 proto::RESP_ROWS => {
                     let v: serde_json::Value = serde_json::from_slice(&f.payload)
@@ -2114,15 +2127,6 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
                         "columns": v.get("columns").cloned().unwrap_or_else(|| serde_json::json!([])),
                         "rows": v.get("rows").cloned().unwrap_or_else(|| serde_json::json!([])),
                     }));
-                    if budget == 0 {
-                        return Ok((
-                            outcomes,
-                            Some((
-                                i,
-                                "batch result too large (64 MiB budget); narrow the query or split the batch".into(),
-                            )),
-                        ));
-                    }
                 }
                 proto::RESP_AFFECTED => {
                     let n = proto::decode_affected(&f.payload);

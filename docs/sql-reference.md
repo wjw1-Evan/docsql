@@ -214,7 +214,7 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 | `CROSS JOIN`、`a, b` | 笛卡尔积 |
 | `DUAL` | Oracle 哑表（单行零列，大小写不敏感） |
 
-**不支持**：`NATURAL JOIN`、`LATERAL`、表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）、`PIVOT`——均显式报错。
+**不支持**：`NATURAL JOIN`、`LATERAL`、表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）——均显式报错。
 
 ### SELECT 备注
 
@@ -938,7 +938,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 |---|---|
 | 窗口 | `WINDOW` 命名子句、`QUALIFY`、自定义窗口帧（`ROWS/RANGE/GROUPS BETWEEN …`） |
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
-| 连接 | `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、`PIVOT`、表时态 `AS OF` |
+| 连接 | `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |
 | 子查询/CTE | 相关子查询（`APPLY` 子查询形式同此边界） |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |

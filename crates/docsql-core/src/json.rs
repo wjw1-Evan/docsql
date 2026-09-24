@@ -45,7 +45,7 @@ pub(crate) fn float_marker_text(f: f64) -> &'static str {
 }
 
 /// Parse a `$float` marker payload back into a non-finite float.
-pub(crate) fn parse_float_marker(s: &str) -> Option<f64> {
+pub fn parse_float_marker(s: &str) -> Option<f64> {
     match s {
         "NaN" => Some(f64::NAN),
         "inf" | "+inf" | "Infinity" => Some(f64::INFINITY),

@@ -1749,17 +1749,24 @@ impl<'a> ReadCx<'a> {
                 // ADO readers (EF SchemaSync's ExistingColumns via
                 // `SELECT * … LIMIT 0`) learn the shape from the names, and
                 // a data-derived union left them with ZERO columns on an
-                // empty table. Declared columns of the FROM factors are
-                // the shape; sorted to match union_of_fields' order.
-                let mut declared = std::collections::HashSet::new();
+                // empty table. Declared columns of the FROM factors are the
+                // shape; the SAME qualification rule as load_from applies:
+                // a solo table keeps bare names, anything joined carries
+                // "alias.col" keys (the merged-row key shape) — matching
+                // what the same query returns with rows present. Views keep
+                // zero columns honestly (their shape is the stored query's,
+                // not the catalog's).
+                let joined = select.from.len() > 1
+                    || select.from.first().is_some_and(|f| !f.joins.is_empty());
+                let mut v: Vec<String> = Vec::new();
                 for twj in &select.from {
-                    collect_factor_columns(&twj.relation, self.tables, &mut declared);
+                    collect_star_columns(&twj.relation, self.tables, &mut v, joined);
                     for j in &twj.joins {
-                        collect_factor_columns(&j.relation, self.tables, &mut declared);
+                        collect_star_columns(&j.relation, self.tables, &mut v, true);
                     }
                 }
-                let mut v: Vec<String> = declared.into_iter().collect();
                 v.sort();
+                v.dedup();
                 cols = v;
             }
             cols.extend(project.iter().map(|(n, _)| n.clone()));
@@ -7608,6 +7615,12 @@ impl Database {
         let mut columns: Vec<String> = base.columns.clone();
         let mut pk: Option<String> = base.primary_key.clone();
         let mut checks: Vec<String> = base.checks.clone();
+        // Index namespaces evolve too (DROP COLUMN kills trees over the
+        // dropped column); kept as owned copies so the rename-collision
+        // check sees the state earlier operations produced.
+        let mut roots: std::collections::BTreeSet<String> =
+            base.index_roots.keys().cloned().collect();
+        let mut index_defs: Vec<IndexDef> = base.index_defs.clone();
         for op in ops {
             match op {
                 Op::AddColumn { column_def, .. } => {
@@ -7627,6 +7640,22 @@ impl Database {
                                          every node would evaluate a different value",
                                     );
                                 }
+                                // Mirror the apply loop: later operations in
+                                // the same statement must see this CHECK in
+                                // the simulated state, or `DROP COLUMN` of
+                                // the just-added column passes validation and
+                                // half-applies.
+                                checks.push(format!("{}", c.expr));
+                            }
+                            CO::Default(e) => {
+                                // The apply loop constant-folds every new
+                                // DEFAULT for the backfill; pre-empt the same
+                                // failure here so a later operation failing
+                                // on it can never leave an earlier one
+                                // committed.
+                                let text = default_expr_text(e);
+                                let expr = parse_expr_text(&text)?;
+                                eval_const(&expr)?;
                             }
                             CO::NotNull => add_not_null = true,
                             CO::PrimaryKey { .. }
@@ -7690,6 +7719,15 @@ impl Database {
                             ));
                         }
                         columns.retain(|c| c != name);
+                        // Mirror the apply loop's index teardown on the
+                        // simulated state: the dropped column's single-column
+                        // tree dies, and every index over the column dies with
+                        // it. RenameColumn later in the statement must check
+                        // collisions against this EVOLVED state, or
+                        // `DROP COLUMN x, RENAME COLUMN y TO x` is wrongly
+                        // refused for x's dead index.
+                        roots.remove(name);
+                        index_defs.retain(|d| !d.columns.iter().any(|c| c == name));
                     }
                 }
                 Op::RenameColumn {
@@ -7716,13 +7754,13 @@ impl Database {
                         // duplicate column collapses two columns' data into
                         // one key, and an index root-key (single-column roots
                         // key by column name, composites by index name) would
-                        // be silently overwritten by the rename.
+                        // be silently overwritten by the rename. Both checks
+                        // run on the EVOLVED state (earlier DROP COLUMNs may
+                        // have removed trees/defs).
                         if columns.contains(new) {
                             return err(format!("duplicate column name: {new}"));
                         }
-                        if base.index_roots.contains_key(new)
-                            || base.index_defs.iter().any(|d| &d.name == new)
-                        {
+                        if roots.contains(new) || index_defs.iter().any(|d| d.name == *new) {
                             return err(format!("name {new} is already used by an index"));
                         }
                     }
@@ -11498,6 +11536,39 @@ fn collect_factor_columns(
         if let Some(meta) = catalog.get(&tname) {
             if !meta.is_view() {
                 out.extend(meta.columns.iter().cloned());
+            }
+        }
+    }
+}
+
+/// `SELECT *` column metadata for an EMPTY rowset: declared columns of one
+/// FROM factor, qualified as the merged rows would be (`key` = bare column
+/// for a solo table, "alias.col" / "table.col" once rows get joined — the
+/// exact shape `load_from` produces). Views contribute nothing (their shape
+/// belongs to the stored query, not the catalog).
+fn collect_star_columns(
+    factor: &sqlparser::ast::TableFactor,
+    catalog: &std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
+    out: &mut Vec<String>,
+    qualify: bool,
+) {
+    if let sqlparser::ast::TableFactor::Table { name, alias, .. } = factor {
+        let tname = obj_name(name);
+        let Some(meta) = catalog.get(&tname) else {
+            return;
+        };
+        if meta.is_view() {
+            return;
+        }
+        for c in &meta.columns {
+            if qualify {
+                let key = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| tname.clone());
+                out.push(format!("{key}.{c}"));
+            } else {
+                out.push(c.clone());
             }
         }
     }

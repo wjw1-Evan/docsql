@@ -2295,6 +2295,15 @@ fn json_param_to_value(p: &serde_json::Value) -> Value {
                     return Value::Timestamp(ms);
                 }
             }
+            // Non-finite float (the ADO.NET driver's $float marker): the
+            // read direction emits it, so the bind direction must decode it
+            // — without this arm NaN/±Infinity parameters bound as the
+            // literal marker TEXT and silently polluted the column.
+            if let Some(serde_json::Value::String(s)) = o.get("$float") {
+                if let Some(f) = docsql_core::json::parse_float_marker(s) {
+                    return Value::Float(f);
+                }
+            }
             if let Some(serde_json::Value::Array(a)) = o.get("$bytes") {
                 let mut bytes = Vec::with_capacity(a.len());
                 for v in a {

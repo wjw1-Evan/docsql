@@ -198,13 +198,14 @@ public sealed class ProtocolConnection : IDisposable
         }
     }
 
-    private async System.Threading.Tasks.Task ReadHandshakeAsync()
+    private async System.Threading.Tasks.Task ReadHandshakeAsync(
+        System.Threading.CancellationToken cancellationToken)
     {
         if (_key is null)
         {
             return;
         }
-        var f = await ReadFrameAsync().ConfigureAwait(false);
+        var f = await ReadFrameAsync(cancellationToken).ConfigureAwait(false);
         if (f.Type == FrameType.RespError && (f.Flags & FlagEncrypted) == 0)
         {
             throw new DocsqlException($"节点拒绝连接: {System.Text.Encoding.UTF8.GetString(f.Payload)}");
@@ -251,7 +252,12 @@ public sealed class ProtocolConnection : IDisposable
             cts.CancelAfter(connectTimeoutMs);
             await tcp.ConnectAsync(host, port, cts.Token);
             var conn = new ProtocolConnection(tcp, key, handshakeDone: true);
-            await conn.ReadHandshakeAsync();
+            // The handshake read shares the SAME linked budget: without it a
+            // server (or half-open LB) that accepts but never sends the
+            // RespHello parked OpenAsync indefinitely — the connect timeout
+            // only covered the TCP handshake, and the default ReadFrameAsync
+            // token is none.
+            await conn.ReadHandshakeAsync(cts.Token);
             return conn;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

@@ -975,7 +975,12 @@ public sealed class DocsqlCommand : DbCommand
         int or long or short or byte or sbyte
             => JsonSerializer.Serialize(Convert.ToInt64(v, CultureInfo.InvariantCulture)),
         uint or ushort => JsonSerializer.Serialize(Convert.ToInt64(v, CultureInfo.InvariantCulture)),
-        ulong u => JsonSerializer.Serialize(u),
+        // > long.MaxValue would degrade to an IEEE double on the server
+        // (precision loss, WHERE mismatches). Exact path: the $dec marker,
+        // same as decimal — the server renders CAST(.. AS DECIMAL).
+        ulong u when u > long.MaxValue =>
+            "{\"$dec\":\"" + u.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}",
+        ulong u => JsonSerializer.Serialize((long)u),
         // 非有限浮点:JSON 数字装不下,发 $float 标记(引擎双向对称)。
         // System.Text.Json 对 NaN/∞ 的 Serialize 直接抛异常,不发标记就发不出去。
         double d when !double.IsFinite(d) => FloatJson(d),

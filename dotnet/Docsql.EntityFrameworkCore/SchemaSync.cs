@@ -107,7 +107,20 @@ internal static partial class SchemaSync
             catch (Exception ex) when (IsIgnorableDdlError(ex))
             {
             }
+            catch (Exception ex) when (IsIgnorableAddColumnError(ex))
+            {
+                // 并发上下文刚补了同一列(校验快照过期):列已在即目标
+                // 达成。只放宽这一处,建表路径的失败仍原样抛出。
+            }
         }
+    }
+
+    /// <summary>补列路径专用的可忽略错误:另一并发上下文刚补了同一列
+    /// (两个并行 DbContext 的校验快照都缺该列),后到的 ALTER 报
+    /// duplicate column name —— 列已在即目标已达成。</summary>
+    private static bool IsIgnorableAddColumnError(Exception ex)
+    {
+        return ex.Message.StartsWith("duplicate column name:", StringComparison.Ordinal);
     }
 
     private static IEnumerable<string> ExistingColumns(DbConnection conn, string table)
