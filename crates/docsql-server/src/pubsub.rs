@@ -217,15 +217,15 @@ pub fn query_history_chunk(
     after_id: i64,
     upto_id: i64,
     limit: i64,
-) -> Vec<StoredMessage> {
+) -> Result<Vec<StoredMessage>, String> {
     if after_id >= upto_id || limit <= 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let sql = format!(
         "SELECT id, channel, ts_ms, payload FROM {PUBSUB_TABLE} \
          WHERE id > {after_id} AND id <= {upto_id} ORDER BY id LIMIT {limit}"
     );
-    decode_history(db.execute(&sql)).unwrap_or_default()
+    decode_history(db.execute(&sql))
 }
 
 fn decode_history(
@@ -409,8 +409,11 @@ impl PubSub {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Registry lock. The subscribe flow must hold it across register,
-    /// watermark snapshot, replay and filter arming (see module docs).
+    /// Registry lock. The subscribe flow holds it across register + the
+    /// watermark snapshot and re-samples + arms inside it on exit; the
+    /// REPLAY itself runs lock-free (module docs carry the authoritative
+    /// order — holding this lock across a large replay used to stall every
+    /// publish and the write path).
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Inner> {
         self.inner.lock().await
     }
@@ -900,7 +903,7 @@ mod tests {
         let mut chunked = Vec::new();
         let mut cursor = 0;
         loop {
-            let c = query_history_chunk(&mut db, cursor, upto, REPLAY_CHUNK_ROWS);
+            let c = query_history_chunk(&mut db, cursor, upto, REPLAY_CHUNK_ROWS).unwrap();
             assert!(c.len() as i64 <= REPLAY_CHUNK_ROWS);
             if c.is_empty() {
                 break;
@@ -915,8 +918,10 @@ mod tests {
         assert_eq!(chunked.len(), full.len());
         assert!(chunked.iter().zip(full.iter()).all(|(a, b)| a.id == b.id));
         // Degenerate windows stay empty, never loop.
-        assert!(query_history_chunk(&mut db, upto, upto, 512).is_empty());
-        assert!(query_history_chunk(&mut db, 0, 0, 512).is_empty());
+        assert!(query_history_chunk(&mut db, upto, upto, 512)
+            .unwrap()
+            .is_empty());
+        assert!(query_history_chunk(&mut db, 0, 0, 512).unwrap().is_empty());
     }
 
     #[test]

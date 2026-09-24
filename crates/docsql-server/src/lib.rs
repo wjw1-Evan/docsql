@@ -93,6 +93,12 @@ pub struct ServerState {
     /// the blocking pool, and unbounded concurrent derivations would let
     /// distributed auth floods starve every other blocking task.
     pub auth_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    /// PITR journal epoch: bumped whenever a snapshot adoption voids the
+    /// journal (the writes those incrementals carried are adjudicated
+    /// away). The incremental exporter re-checks it between its journal
+    /// read and the file rename — an in-flight export whose epoch moved is
+    /// discarded instead of landing a resurrectable incr file.
+    pub pitr_epoch: std::sync::atomic::AtomicU64,
     /// Per-origin serialization of sequenced replication applies. Two
     /// in-flight writes from one origin (its first attempt timed out while
     /// this node waited for a client transaction, then it sent the next)
@@ -531,6 +537,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         backup: Mutex::new(backup::BackupShared::default()),
         restore_progress: std::sync::Arc::new(backup::RestoreProgress::default()),
         grants_epoch: std::sync::atomic::AtomicU64::new(0),
+        pitr_epoch: std::sync::atomic::AtomicU64::new(0),
         has_users: std::sync::atomic::AtomicBool::new(has_users0),
         replay_failures: std::sync::atomic::AtomicU64::new(0),
         db_path: cfg.db_path,
@@ -939,13 +946,24 @@ async fn user_login_frame(
     };
     // Server-wide derivation gate: verification is CPU-bound on the
     // blocking pool; queuing excess attempts keeps a distributed auth
-    // flood from starving every other blocking task.
-    let permit = state
-        .auth_gate
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("auth gate never closed");
+    // flood from starving every other blocking task. The WAIT is bounded:
+    // without a deadline a flood of parked queue-waiters grew without
+    // limit and pushed legitimate logins minutes behind the backlog (the
+    // pre-auth frame timeout only covers the socket read, not this gate).
+    let permit =
+        match tokio::time::timeout(PRE_AUTH_TIMEOUT, state.auth_gate.clone().acquire_owned()).await
+        {
+            Ok(p) => p.expect("auth gate never closed"),
+            Err(_) => {
+                return (
+                    Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("authentication timeout; reconnect"),
+                    ),
+                    None,
+                );
+            }
+        };
     let ok = tokio::task::spawn_blocking(move || match stored {
         Some(s) => docsql_core::kdf::StoredPw::parse(&s)
             .map(|p| p.verify(&pw))
@@ -1108,6 +1126,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
     let mut inbound_replay = crypto::ReplayGuard::default();
     // Bounded pre-auth PING budget (see the REQ_PING arm).
     let mut pre_auth_pings = 0u32;
+    // Set when the connection must close after the current response (the
+    // pre-auth PING budget): a slowloris must not hold its slot forever.
+    let mut close_after = false;
     // Server-side prepared statements (REQ_PREPARE/REQ_EXECUTE): handle →
     // template SQL with `?` placeholders. Per connection, dies with it.
     let mut prepared: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
@@ -1447,13 +1468,19 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                 // (reachability first, auth second). Unbounded pre-auth
                 // pings would let a socket hold its task, buffer and
                 // connection slot forever — hence the counter, not the
-                // blanket refusal that broke the probe.
+                // blanket refusal that broke the probe. Past the budget the
+                // connection CLOSES: replying an error and continuing let a
+                // slowloris hold slots indefinitely (the per-frame
+                // pre-auth timeout never expires a live socket).
                 proto::REQ_PING if !authed => {
                     pre_auth_pings += 1;
                     if pre_auth_pings > 4 {
+                        // Budget exhausted: one last error frame, then the
+                        // connection closes (close_after = true).
+                        close_after = true;
                         Some(Frame::new(
                             proto::RESP_ERROR,
-                            err_payload("authentication required before PING"),
+                            err_payload("too many pre-auth pings; reconnect and authenticate"),
                         ))
                     } else {
                         Some(Frame::new(proto::RESP_PONG, vec![]))
@@ -1702,6 +1729,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         user: user.as_ref(),
                                         conn: Some(conn_id),
                                         deadline,
+                                        peer: peer.clone(),
                                         stmt_identity: None,
                                     };
                                     match tsql_session
@@ -2163,6 +2191,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                     break;
                 }
             }
+            if close_after {
+                break;
+            }
         }
         Ok::<(), std::io::Error>(())
     }
@@ -2427,6 +2458,10 @@ struct BatchPipeExec<'a> {
     user: Option<&'a UserAuth>,
     conn: Option<u64>,
     deadline: Option<std::time::Instant>,
+    /// Audit attribution for every interpreted statement — without it the
+    /// whole batch (writes included) bypassed the query log while plain
+    /// statements were recorded.
+    peer: String,
     /// The last statement's AUTOINCREMENT id, snapshotted inside the engine
     /// write lock by the executor pipeline. Never re-read the engine-global
     /// counter here: another connection's INSERT between this statement's
@@ -2444,8 +2479,10 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
         let user = self.user;
         let conn = self.conn;
         let deadline = self.deadline;
+        let peer = self.peer.clone();
         let sql = sql.to_string();
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let (frame, identity) = execute_sql_with_identity(
                 state, &sql, false, // allow_system_table: the pubsub-view rewrite above
                 // already ran for the batch text; plain statements
@@ -2455,6 +2492,14 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
             )
             .await;
             self.stmt_identity = identity.map(docsql_core::Value::Int);
+            querylog::record(
+                state,
+                &peer,
+                &sql,
+                started.elapsed().as_secs_f64() * 1000.0,
+                &frame,
+                false,
+            );
             frame_to_exec(frame)
         })
     }
@@ -2749,10 +2794,7 @@ fn authorize_statement(
                                 // take this shortcut: the base expansion is
                                 // exactly what refuses user-table views to
                                 // those roles.
-                                if !g.readonly
-                                    && !g.readwrite
-                                    && g.may_select(&t)
-                                {
+                                if !g.readonly && !g.readwrite && g.may_select(&t) {
                                     continue;
                                 }
                                 depth += 1;
@@ -3215,6 +3257,27 @@ async fn execute_sql_inner(
                 };
             let (out, in_tx, resolved, seq, sync_failed, identity) = {
                 let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                // Same-guard re-check of the plain-read dirty-read rule: the
+                // earlier check ran before this write() acquisition, and a
+                // foreign BEGIN that landed in between would otherwise serve
+                // uncommitted rows. Check and execute share the guard, so
+                // nothing can slip in between them anymore.
+                if plain_read
+                    && !is_replication
+                    && !order_held
+                    && db.in_transaction()
+                    && *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) != conn
+                {
+                    return (
+                        Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload(
+                                "timed out waiting for the transaction on another connection",
+                            ),
+                        ),
+                        None,
+                    );
+                }
                 // Arm the client-statement deadline inside the engine lock —
                 // it is engine-global, so it must cover exactly this statement
                 // and be cleared on every path below (the guard block does).
@@ -4115,7 +4178,20 @@ async fn handle_subscribe(
         while cursor < watermark {
             let chunk = {
                 let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-                pubsub::query_history_chunk(&mut db, cursor, watermark, window.limit())
+                match pubsub::query_history_chunk(&mut db, cursor, watermark, window.limit()) {
+                    Ok(c) => c,
+                    // An engine read failure must not masquerade as "ids
+                    // trimmed away": that would leave the subscriber a
+                    // permanent hole between progress and watermark with
+                    // nothing but this log line to show for it. Treat it
+                    // like a stall — the client can re-subscribe from its
+                    // last id (at-least-once).
+                    Err(e) => {
+                        eprintln!("docsql-pubsub: replay read failed at id {cursor}: {e}");
+                        stalled = true;
+                        break;
+                    }
+                }
             };
             if chunk.is_empty() {
                 // (cursor, watermark] holds no replayable rows (ids trimmed
@@ -5982,6 +6058,11 @@ async fn apply_repair_sync(
     }
     // The voided journal text lives on in any exported incrementals; they
     // must not survive the adoption (see invalidate_incremental_exports).
+    // The epoch bump also discards an in-flight export that read the
+    // pre-void journal and is still writing its file.
+    state
+        .pitr_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     crate::backup::invalidate_incremental_exports(&state.backup_dir);
     // Probe-round floor before the drain, fresh heads after — same order
     // and same reasoning as the join path (see finish_snapshot_adopt).

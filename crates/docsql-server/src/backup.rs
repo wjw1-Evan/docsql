@@ -244,9 +244,12 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     Ok(name)
 }
 
-/// Write bytes with owner-only permissions. A backup is the entire
-/// database — documents plus the PBKDF2 password hashes — in plain SQL;
-/// the default 0644 made it readable by every local account.
+/// Write bytes with owner-only permissions, fully synced before returning.
+/// The backup file must be durable (not merely visible) by the time the
+/// rename makes it appear: a crash landing between the data write and the
+/// sidecar rename used to leave a checksum-less truncated backup that the
+/// restore path then accepted as "pre-checksum legacy" — silently
+/// "restoring" nothing. The same guarantee covers the sidecar itself.
 /// Like [`write_private`] over two byte slices without concatenating them
 /// (the backup header + the dump body are written back to back).
 fn write_private_two(path: &Path, a: &[u8], b: &[u8]) -> std::io::Result<()> {
@@ -261,7 +264,8 @@ fn write_private_two(path: &Path, a: &[u8], b: &[u8]) -> std::io::Result<()> {
             .mode(0o600)
             .open(path)?;
         f.write_all(a)?;
-        f.write_all(b)
+        f.write_all(b)?;
+        f.sync_all()
     }
     #[cfg(not(unix))]
     {
@@ -277,13 +281,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
+        let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?
-            .write_all(bytes)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()
     }
     #[cfg(not(unix))]
     {
@@ -388,8 +393,34 @@ struct BackupHeader {
 
 /// Parse a base backup's v2 header (absent in v1 files → journal_seq 0).
 fn parse_backup_header(dir: &Path, name: &str) -> Option<BackupHeader> {
-    let text = std::fs::read_to_string(dir.join(name)).ok()?;
-    parse_backup_header_text(&text)
+    parse_backup_header_text(&read_file_head(dir, name))
+}
+
+/// First 64 KiB of a file as UTF-8 — all either header ever needs, and the
+/// callers sit on periodic timers: reading whole multi-GB backups to see one
+/// line spiked memory every export tick.
+fn read_file_head(dir: &Path, name: &str) -> String {
+    use std::io::Read as _;
+    let mut f = match std::fs::File::open(dir.join(name)) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut filled = 0usize;
+    loop {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                filled += n;
+                if filled == buf.len() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf.truncate(filled);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 fn parse_backup_header_text(text: &str) -> Option<BackupHeader> {
@@ -423,8 +454,7 @@ struct PitrHeader {
 }
 
 fn parse_pitr_header(dir: &Path, name: &str) -> Option<PitrHeader> {
-    let text = std::fs::read_to_string(dir.join(name)).ok()?;
-    parse_pitr_header_text(&text)
+    parse_pitr_header_text(&read_file_head(dir, name))
 }
 
 fn parse_pitr_header_text(text: &str) -> Option<PitrHeader> {
@@ -465,6 +495,11 @@ fn parse_pitr_entry(line: &str) -> Option<(u64, i64, String)> {
 /// loudly — replaying a partial chain would silently drop committed writes.
 fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec<String>, String> {
     let mut entries: Vec<(u64, i64, String)> = Vec::new();
+    // Highest journal seq any on-disk incremental segment claims to cover
+    // beyond the base: the chain must reach it, or the tail (possibly the
+    // whole chain) is missing and a restore would silently stop at the
+    // base while reporting success.
+    let mut chain_ceiling = base_seq;
     for name in read_incr_files(dir) {
         verify_backup_checksum(dir, &name)?;
         let text = std::fs::read_to_string(dir.join(&name))
@@ -473,6 +508,22 @@ fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec
             if h.to <= base_seq {
                 continue; // entirely covered by the base dump
             }
+            chain_ceiling = chain_ceiling.max(h.to);
+        } else {
+            // A headerless/truncated incr file that still carries entries
+            // beyond the base is unverifiable as a chain link: refuse
+            // rather than silently restoring a prefix.
+            for line in text.lines() {
+                if let Some((seq, _, _)) = parse_pitr_entry(line) {
+                    if seq > base_seq {
+                        return Err(format!(
+                            "incremental file {name} has no readable header but carries \
+                             journal seq {seq} > base {base_seq}; take a fresh full backup"
+                        ));
+                    }
+                }
+            }
+            continue;
         }
         for line in text.lines() {
             if line.starts_with("--") || line.trim().is_empty() {
@@ -511,6 +562,14 @@ fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec
         }
         expected += 1;
     }
+    if expected <= chain_ceiling {
+        return Err(format!(
+            "incremental chain is missing its tail: segments claim journal seq up to \
+             {chain_ceiling} but the chain stops at {} (a segment was pruned or the \
+             window trimmed); take a fresh full backup",
+            expected - 1
+        ));
+    }
     Ok(out)
 }
 
@@ -539,14 +598,18 @@ fn pitr_cursor(dir: &Path) -> u64 {
 /// Export journal entries after the cursor into one incremental file.
 async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
     let cursor = pitr_cursor(&state.backup_dir);
-    let entries = {
+    let entries;
+    let read_epoch;
+    {
         let Some(_order) = crate::lock_engine_for_write(state).await else {
             return Err("incremental export timed out waiting for the open transaction".into());
         };
+        read_epoch = state.pitr_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-        db.journal_entries_after(cursor, 200_000)
-            .map_err(|e| format!("journal read: {e}"))?
-    };
+        entries = db
+            .journal_entries_after(cursor, 200_000)
+            .map_err(|e| format!("journal read: {e}"))?;
+    }
     // Everything with a ts rides into the file — INCLUDING snapshot-adoption
     // sentinels: they occupy journal seqs, and dropping them here would punch
     // holes into the chain that the restore-side continuity audit (rightly)
@@ -585,6 +648,18 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
     let bytes = body.into_bytes();
     let tmp = state.backup_dir.join(format!("{name}.tmp"));
     write_private(&tmp, &bytes).map_err(|e| format!("incr write: {e}"))?;
+    // Epoch re-check right before the rename: a snapshot adoption that
+    // ran while this file was being written voided exactly the entries it
+    // carries — landing it would keep resurrectable journal text alive
+    // past the adoption's invalidation sweep.
+    if state.pitr_epoch.load(std::sync::atomic::Ordering::SeqCst) != read_epoch {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(
+            "journal was voided by a snapshot adoption during the export; \
+             the incremental was discarded (PITR restarts from the next full backup)"
+                .into(),
+        );
+    }
     std::fs::rename(&tmp, state.backup_dir.join(&name)).map_err(|e| format!("incr rename: {e}"))?;
     let digest = docsql_core::kdf::sha256(&bytes);
     let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
@@ -1560,7 +1635,9 @@ mod tests {
         let err = collect_pitr_entries(dir.path(), 2, i64::MAX).unwrap_err();
         assert!(err.contains("gap"), "断链必须响亮报错: {err}");
         // Snapshot-adoption sentinels occupy their seq but replay as
-        // nothing — the chain stays contiguous through them.
+        // nothing — the chain stays contiguous through them. The body must
+        // reach the header's `to` (a truncated body is exactly the
+        // missing-tail case the chain audit refuses).
         let dir2 = tempfile::tempdir().unwrap();
         std::fs::write(
             dir2.path().join("incr-1.sql"),
@@ -1568,11 +1645,27 @@ mod tests {
                 "-- docsql-pitr incr from=3 to=5\n",
                 "{\"seq\":3,\"ts\":300,\"sql\":\"PRAGMA discarded_by_snapshot_adoption;\"}\n",
                 "{\"seq\":4,\"ts\":400,\"sql\":\"C2\"}\n",
+                "{\"seq\":5,\"ts\":500,\"sql\":\"C3\"}\n",
             ),
         )
         .unwrap();
         let out = collect_pitr_entries(dir2.path(), 2, i64::MAX).unwrap();
-        assert_eq!(out, vec!["C2"], "哨兵占位不重放");
+        assert_eq!(out, vec!["C2", "C3"], "哨兵占位不重放");
+        // A body that stops short of its header's `to` is a truncated
+        // segment: the restore must refuse instead of silently stopping at
+        // the last delivered seq.
+        let dir2b = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir2b.path().join("incr-1.sql"),
+            concat!(
+                "-- docsql-pitr incr from=3 to=5\n",
+                "{\"seq\":3,\"ts\":300,\"sql\":\"C1\"}\n",
+                "{\"seq\":4,\"ts\":400,\"sql\":\"C2\"}\n",
+            ),
+        )
+        .unwrap();
+        let err = collect_pitr_entries(dir2b.path(), 2, i64::MAX).unwrap_err();
+        assert!(err.contains("missing its tail"), "{err}");
         // Overlapping exports dedup by seq.
         let dir3 = tempfile::tempdir().unwrap();
         std::fs::write(

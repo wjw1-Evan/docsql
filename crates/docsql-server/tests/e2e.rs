@@ -275,14 +275,23 @@ async fn preauth_ping_budget() {
         let f = c.recv().await;
         assert_eq!(f.frame_type, proto::RESP_PONG, "{}", payload_str(&f));
     }
+    // Past the budget: one last error frame, then the connection CLOSES —
+    // replying and continuing would let a slowloris hold its slot forever.
     c.send(&Frame::new(proto::REQ_PING, vec![])).await;
     let f = c.recv().await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
     assert!(
-        payload_str(&f).contains("authentication required"),
+        payload_str(&f).contains("too many pre-auth pings"),
         "{}",
         payload_str(&f)
     );
+    // The server closes the socket: a raw read hits EOF within seconds.
+    c.send(&Frame::new(proto::REQ_PING, vec![])).await;
+    let mut chunk = [0u8; 64];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), c.stream.read(&mut chunk))
+        .await
+        .expect("server should close the connection");
+    assert_eq!(read.unwrap_or(1), 0, "expected EOF after ping-budget close");
 }
 
 /// Keyed transport: the inbound replay guard rejects a byte-identical
