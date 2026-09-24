@@ -52,12 +52,25 @@ pub use docsql_core::kdf::constant_time_eq;
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
+    // Strict ASCII hex, byte-wise: the old char-index slicing panicked on a
+    // multibyte character whose byte length is even (`&s[0..2]` inside a
+    // code point), and `from_str_radix` quietly accepted `+`/`-` signs —
+    // both turning a hostile env into a crash (or a key that disagrees
+    // with the .NET client's strict parser) instead of a clean refusal.
+    if !s.is_ascii() {
+        return Err("hex must be ASCII".into());
+    }
     if !s.len().is_multiple_of(2) {
         return Err("odd-length hex".into());
     }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|e| format!("bad hex: {e}")))
-        .collect()
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for pair in b.as_chunks::<2>().0 {
+        let hi = (pair[0] as char).to_digit(16).ok_or("bad hex digit")?;
+        let lo = (pair[1] as char).to_digit(16).ok_or("bad hex digit")?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
 }
 
 /// Associated data for a frame's tag: the transmitted header fields a

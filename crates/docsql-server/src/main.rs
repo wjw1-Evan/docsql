@@ -100,7 +100,10 @@ fn listen_is_loopback(listen: &str) -> bool {
             host.parse::<std::net::IpAddr>().ok()
         })
         .map(|ip| ip.is_loopback())
-        .unwrap_or(true)
+        // Unparseable host (a hostname): treat as NON-loopback so the
+        // plaintext warning prints — it may resolve anywhere, and staying
+        // quiet is the one irrecoverable direction.
+        .unwrap_or(false)
 }
 
 /// Assemble the [ServerConfig] from positional args and the environment.
@@ -155,12 +158,12 @@ fn config_from_env(
     let advertise = getenv("DOCSQL_ADVERTISE")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let read_only = getenv("DOCSQL_READ_ONLY")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let async_commit = getenv("DOCSQL_ASYNC_COMMIT")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    // Boolean envs: trim like every other env, and refuse anything but the
+    // documented spellings — a trailing CR/space in a .env used to make
+    // DOCSQL_READ_ONLY=1␍ read as `false`, silently booting a replica
+    // writable (fail-open on a security flag).
+    let read_only = env_bool("DOCSQL_READ_ONLY", &getenv)?;
+    let async_commit = env_bool("DOCSQL_ASYNC_COMMIT", &getenv)?;
     let catchup_window = env_num("DOCSQL_CATCHUP_WINDOW", 100_000, &getenv)?;
     let backup_interval_secs = env_num("DOCSQL_BACKUP_INTERVAL_SECS", 86_400, &getenv)?;
     let backup_keep = env_num("DOCSQL_BACKUP_KEEP", 7, &getenv)?;
@@ -193,11 +196,13 @@ fn config_from_env(
         Some(k) if !k.trim().is_empty() => {
             let key =
                 docsql_server::crypto::parse_key_hex(&k).map_err(|e| format!("DOCSQL_KEY: {e}"))?;
+            // An all-zero key is a PUBLIC key: routing encryption through it
+            // is worse than no encryption because it reads as protected.
+            // Same policy as weak tokens: refuse to boot.
             if key.iter().all(|&b| b == 0) {
-                eprintln!(
-                    "warning: DOCSQL_KEY is all zeros — generate a real 32-byte key \
+                return Err("DOCSQL_KEY is all zeros — generate a real 32-byte key \
                      (e.g. openssl rand -hex 32)"
-                );
+                    .into());
             }
             Some(key)
         }
@@ -240,6 +245,23 @@ fn env_num<T: std::str::FromStr>(
             .parse::<T>()
             .map_err(|_| format!("{name}: invalid integer value {v:?}")),
         _ => Ok(default),
+    }
+}
+
+/// Boolean env: only the documented spellings pass, everything else refuses
+/// to boot loudly (same fail-fast rule as the numeric envs). A trailing
+/// CR/space in a .env used to make `DOCSQL_READ_ONLY=1␍` read as false —
+/// fail-open on a security flag.
+fn env_bool(name: &str, getenv: &impl Fn(&str) -> Option<String>) -> Result<bool, String> {
+    match getenv(name) {
+        Some(v) if !v.trim().is_empty() => match v.trim() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            other => Err(format!(
+                "{name}: invalid boolean value {other:?} (expected 1/0/true/false)"
+            )),
+        },
+        _ => Ok(false),
     }
 }
 
@@ -422,8 +444,9 @@ mod tests {
         assert!(listen_is_loopback("[::1]:7600"));
         assert!(!listen_is_loopback("0.0.0.0:7600"));
         assert!(!listen_is_loopback("192.168.1.5:7600"));
-        // Unparseable host: fall back to true (start with the warning).
-        assert!(listen_is_loopback("docsql-a:7600"));
+        // Unparseable host: treated as NON-loopback so the plaintext
+        // warning prints (it may resolve anywhere).
+        assert!(!listen_is_loopback("docsql-a:7600"));
     }
 
     #[test]

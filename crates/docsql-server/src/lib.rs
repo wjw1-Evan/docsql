@@ -36,7 +36,7 @@ pub mod querylog;
 
 use docsql_core::engine::{AnyStmt, Database, ExecOutcome, TableDigest, TxControl};
 use docsql_core::now_ms;
-use docsql_core::proto::{self, Frame};
+use docsql_core::proto::{self, Frame, MAX_FRAME_BYTES};
 use docsql_core::value::Value;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -850,7 +850,10 @@ impl Conn {
                 }
             }
             // Need more bytes; header length check avoids unbounded growth.
-            if self.buf.len() > 64 * 1024 * 1024 {
+            // The cap counts the WHOLE frame: 20 bytes of header on top of
+            // the 64 MiB payload cap, so a legal maximum frame split at an
+            // arbitrary TCP boundary is never mistaken for an oversized one.
+            if self.buf.len() > docsql_core::proto::HEADER_LEN + MAX_FRAME_BYTES {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "frame too large",

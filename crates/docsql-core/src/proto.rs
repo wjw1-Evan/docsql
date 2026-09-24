@@ -8,7 +8,9 @@
 //! - `topology_version` is reserved for the cluster milestone: 0 in
 //!   single-node mode, otherwise the routing-table version the request was
 //!   made against (mismatch may yield a REDIRECT response).
-//! - `flags` bit 0: compressed (reserved), bits 1..15 reserved.
+//! - `flags` bit 0: compressed (reserved); bit 1 = FLAG_REPLICATION
+//!   (server/lib.rs — peer-only frames); bit 2 = FLAG_ENCRYPTED
+//!   (server/crypto.rs — sealed payload); the rest reserved.
 //!
 //! Response frame uses the same header with frame_type from [resp constants];
 //! a REDIRECT response carries `node_host:port` in its payload.
