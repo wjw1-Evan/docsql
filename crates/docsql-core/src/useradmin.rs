@@ -171,11 +171,18 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             // 与单引号分支对称:未闭合必须报错。截断的粘贴(如
             // `DROP USER "alice`)曾把余下全文吞成一个标识符,畸形语句
-            // 被静默按非本意的名字执行。
+            // 被静默按非本意的名字执行。`""` 是 `"` 的转义(SQL 标准
+            // 双写),与控制台 `sql_quote_ident` 的产出一致 —— 不实现
+            // 双写时含引号的表名的 GRANT 永远解析失败。
             let mut closed = false;
             while let Some(&ch) = chars.get(i) {
                 i += 1;
                 if ch == '"' {
+                    if chars.get(i) == Some(&'"') {
+                        v.push('"');
+                        i += 1;
+                        continue;
+                    }
                     closed = true;
                     break;
                 }
@@ -602,10 +609,7 @@ fn validate_name(name: &str) -> Result<(), String> {
     // Privilege keywords can never be granted as ROLE names: the GRANT
     // parser reads them as the privilege list, so such a role would be a
     // dead end (creatable, ungrantable).
-    if matches!(
-        name,
-        "select" | "insert" | "update" | "delete" | "all"
-    ) {
+    if matches!(name, "select" | "insert" | "update" | "delete" | "all") {
         return Err(format!(
             "{name} is a privilege keyword and cannot be used as a name"
         ));
@@ -1363,10 +1367,7 @@ mod tests {
             "CREATE USER a PASSWORD '{}my-real-secret'",
             kdf::HASH_PREFIX
         );
-        assert_eq!(
-            redact_sql(&forged),
-            "CREATE USER a PASSWORD '***'"
-        );
+        assert_eq!(redact_sql(&forged), "CREATE USER a PASSWORD '***'");
     }
 
     #[test]

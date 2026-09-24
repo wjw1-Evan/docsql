@@ -531,13 +531,15 @@ impl Remote {
         // A server that accepts but never answers (wedged node, dead
         // middlebox) must fail the script with a nonzero exit instead of
         // hanging it forever. `DOCSQL_CLI_TIMEOUT_MS` overrides (0 =
-        // disable); the default stays clear of legitimate long queries.
+        // disable); the default stays clear of legitimate long queries. An
+        // INVALID value falls back to the default — mapping it to "no
+        // budget" let one typo silently disable the wedge protection.
         let budget = match std::env::var("DOCSQL_CLI_TIMEOUT_MS") {
-            Ok(v) => v
-                .parse::<u64>()
-                .ok()
-                .filter(|ms| *ms > 0)
-                .map(std::time::Duration::from_millis),
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+                Err(_) => Some(std::time::Duration::from_secs(600)),
+            },
             _ => Some(std::time::Duration::from_secs(600)),
         };
         loop {
@@ -602,10 +604,60 @@ fn reader_loop(mut stream: std::net::TcpStream, tx: std::sync::mpsc::Sender<Fram
     }
 }
 
+/// Strip ANSI escape sequences and C0 control characters (keeping `\n`
+/// and `\t`) from peer-controlled text before it reaches the terminal:
+/// a published payload or error message could otherwise clear the screen,
+/// rewrite the title bar or overwrite the clipboard (OSC 52) on the
+/// operator's terminal.
+fn sanitize_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // Skip the whole escape sequence: CSI runs to a byte in
+                // 0x40..=0x7E, OSC runs to BEL or ST; anything else skips
+                // just the next character so nothing after it survives raw.
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        while let Some(&n) = chars.peek() {
+                            chars.next();
+                            if ('\x40'..='\x7e').contains(&n) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        while let Some(&n) = chars.peek() {
+                            chars.next();
+                            if n == '\x07' {
+                                break;
+                            }
+                            if n == '\x1b' {
+                                chars.next(); // ST's second byte
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        chars.next();
+                    }
+                    None => {}
+                }
+            }
+            c if c.is_control() && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn print_push(f: &Frame) {
     if let Ok(Value::Object(o)) = docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
     {
-        let s = |k: &str| o.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let s = |k: &str| sanitize_terminal(o.get(k).and_then(|v| v.as_str()).unwrap_or(""));
         let id = o.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         if s("kind") == "pmessage" {
             println!(
@@ -620,7 +672,10 @@ fn print_push(f: &Frame) {
         }
         return;
     }
-    println!("[pubsub] {}", String::from_utf8_lossy(&f.payload));
+    println!(
+        "[pubsub] {}",
+        sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+    );
 }
 
 /// AUTH against a token-protected server (REQ_AUTH frame). Returns success.
@@ -935,26 +990,33 @@ fn remote_shell(
             print_remote_help();
             continue;
         }
-        // Inline AUTH: a dedicated auth frame, not SQL.
-        if let Some(tok) = trimmed
-            .strip_prefix("auth ")
-            .or_else(|| trimmed.strip_prefix("AUTH "))
-            .map(|t| t.trim().trim_end_matches(';').trim())
-            .filter(|t| !t.is_empty())
-        {
-            if auth(&mut remote, tok) {
-                println!("ok");
+        // Inline AUTH / pub-sub commands are TOP-LEVEL commands only: they
+        // are recognized while no statement text is buffered. Matching
+        // mid-statement let a data line inside a string literal (a dump
+        // replaying a message that happens to start with "publish") run as
+        // a protocol command and silently drop the line from its INSERT.
+        if stmt.trim().is_empty() {
+            // Inline AUTH: a dedicated auth frame, not SQL.
+            if let Some(tok) = trimmed
+                .strip_prefix("auth ")
+                .or_else(|| trimmed.strip_prefix("AUTH "))
+                .map(|t| t.trim().trim_end_matches(';').trim())
+                .filter(|t| !t.is_empty())
+            {
+                if auth(&mut remote, tok) {
+                    println!("ok");
+                }
+                continue;
             }
-            continue;
-        }
-        // Inline pub/sub commands (single line, `;`-terminated like SQL).
-        if let Some(cmd) = parse_pubsub_command(trimmed) {
-            if !run_pubsub_command(&mut remote, cmd, format) {
-                // A failed control round trip leaves the session unusable —
-                // exit nonzero so scripts see the transport loss.
-                std::process::exit(1);
+            // Inline pub/sub commands (single line, `;`-terminated like SQL).
+            if let Some(cmd) = parse_pubsub_command(trimmed) {
+                if !run_pubsub_command(&mut remote, cmd, format) {
+                    // A failed control round trip leaves the session unusable —
+                    // exit nonzero so scripts see the transport loss.
+                    std::process::exit(1);
+                }
+                continue;
             }
-            continue;
         }
         stmt.push_str(&line);
         stmt.push('\n');
@@ -1008,7 +1070,13 @@ fn remote_shell(
                     }
                     stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
                 }
-                Err(e) => eprintln!("{e}"),
+                // Same contract as the main loop: a transport loss on the
+                // trailing (semicolon-less) statement must fail the script —
+                // orchestration scripts read the exit status.
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -1071,7 +1139,10 @@ fn print_frame(f: &Frame, format: Format) -> bool {
             true
         }
         _ => {
-            eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
+            eprintln!(
+                "error: {}",
+                sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+            );
             false
         }
     }
@@ -1173,7 +1244,9 @@ pub fn render_rows(r: &QueryResult) -> String {
             row.iter()
                 .map(|v| match v {
                     Value::Null => "NULL".to_string(),
-                    other => other.to_string(),
+                    // Cell text is data from anywhere (other publishers,
+                    // other writers): terminal-bound tables sanitize it.
+                    other => sanitize_terminal(&other.to_string()),
                 })
                 .collect()
         })

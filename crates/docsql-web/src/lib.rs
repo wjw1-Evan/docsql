@@ -220,9 +220,18 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
                         let acceptor = acceptor.clone();
                         let app = app.clone();
                         tokio::spawn(async move {
-                            let Ok(tls_stream) = acceptor.accept(stream).await else {
-                                // A non-TLS client (or a scanner) on the TLS
-                                // port: log and close, never crash the loop.
+                            // Handshake deadline: `acceptor.accept` has no
+                            // timeout of its own, so an unauthenticated peer
+                            // could park a task + buffers indefinitely by
+                            // trickling TLS records (slowloris).
+                            let handshake = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                acceptor.accept(stream),
+                            );
+                            let Ok(Ok(tls_stream)) = handshake.await else {
+                                // A non-TLS client (or a scanner), or a
+                                // slowloris: log and close, never crash the
+                                // loop.
                                 eprintln!("tls handshake from {peer} failed");
                                 return;
                             };
@@ -2077,9 +2086,16 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
     };
     // (per-statement outcomes, first statement error) — transport failures
     // abort the whole call as a single error object.
+    const BATCH_RESULT_BUDGET: usize = 64 * 1024 * 1024;
     let run: BatchRun = async {
         let mut stream = node_connect(addr, token).await?;
         let mut outcomes = Vec::new();
+        // Cumulative budget across the batch: each frame is capped at
+        // 64 MiB, but a 2 MB request body can carry hundreds of statements
+        // and the parsed + cloned + re-serialized results multiplied far
+        // past the process's memory. One aborted batch beats one OOMed
+        // console shared by every operator.
+        let mut budget = BATCH_RESULT_BUDGET;
         for (i, stmt) in stmts.iter().enumerate() {
             let payload = proto::encode_sql(stmt).map_err(|e| e.to_string())?;
             node_write_frame(&mut stream, &Frame::new(proto::REQ_SQL, payload))
@@ -2088,6 +2104,7 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
             let f = node_read_frame(&mut stream)
                 .await
                 .map_err(|e| format!("节点 {addr} 无响应: {e}"))?;
+            budget = budget.saturating_sub(f.payload.len());
             match f.frame_type {
                 proto::RESP_ROWS => {
                     let v: serde_json::Value = serde_json::from_slice(&f.payload)
@@ -2097,6 +2114,15 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
                         "columns": v.get("columns").cloned().unwrap_or_else(|| serde_json::json!([])),
                         "rows": v.get("rows").cloned().unwrap_or_else(|| serde_json::json!([])),
                     }));
+                    if budget == 0 {
+                        return Ok((
+                            outcomes,
+                            Some((
+                                i,
+                                "batch result too large (64 MiB budget); narrow the query or split the batch".into(),
+                            )),
+                        ));
+                    }
                 }
                 proto::RESP_AFFECTED => {
                     let n = proto::decode_affected(&f.payload);
