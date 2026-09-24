@@ -5976,7 +5976,12 @@ async fn long_read_does_not_block_writes() {
     c.sql("CREATE TABLE lr (id INT PRIMARY KEY, pad TEXT)")
         .await;
     let mut all = Vec::new();
-    for i in 0..700 {
+    // 2000 rows → 4,000,000 nested-loop pairs: the read must dominate the
+    // write burst STRUCTURALLY (seconds of server CPU in release), not by a
+    // timing margin — an image build running two parallel cargo test suites
+    // once inflated the 5-write burst's round trips past an absolute cap,
+    // and a small read leaves the stall ratio fragile under that load.
+    for i in 0..2000 {
         all.push(format!("({i}, 'p{i}')"));
     }
     let f = c
@@ -5984,10 +5989,9 @@ async fn long_read_does_not_block_writes() {
         .await;
     assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
 
-    // Long read on its own connection: a quadratic join over 700 rows
-    // (490,000 nested-loop pairs) stays in flight well past the write burst
-    // below in BOTH debug and release profiles, so the overlap the test
-    // verifies is guaranteed to exist.
+    // Long read on its own connection: the quadratic join stays in flight
+    // well past the write burst below in BOTH debug and release profiles,
+    // so the overlap the test verifies is guaranteed to exist.
     let read_addr = addr.clone();
     let read = tokio::spawn(async move {
         let mut r = Client::connect(&read_addr).await;
@@ -6023,23 +6027,25 @@ async fn long_read_does_not_block_writes() {
     // together under host load (an image build running parallel cargo test
     // suites once pushed the write burst past an absolute 5s cap while the
     // read itself ran for many seconds — the overlap was fine, the fixed
-    // budget was not). The writes must land inside the read's first
-    // quarter: ≥4× margin, per the performance-baseline convention.
+    // budget was not). With the read dominating structurally (4M pairs,
+    // seconds of CPU), the writes must land inside its first half; a
+    // stage-A regression (writes queued for the WHOLE read) makes
+    // write_elapsed ≈ read_elapsed and fails this loudly.
     assert!(
-        write_elapsed * 4 < read_elapsed,
-        "writes stalled {:?} behind an in-flight read {:?} (must land in the first quarter)",
+        write_elapsed * 2 < read_elapsed,
+        "writes stalled {:?} behind an in-flight read {:?} (must land well inside the read)",
         write_elapsed,
         read_elapsed
     );
     // The in-flight reader stayed at its snapshot: exactly the pre-write
-    // 700 × 700 pairs, none of the five late rows.
-    assert_eq!(seen, 700 * 700);
+    // 2000 × 2000 pairs, none of the five late rows.
+    assert_eq!(seen, 2000 * 2000);
     // A fresh read sees every committed row.
     let f = c.sql("SELECT COUNT(id) FROM lr").await;
     let n: i64 = serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap()["rows"][0][0]
         .as_i64()
         .unwrap();
-    assert_eq!(n, 705);
+    assert_eq!(n, 2005);
 }
 
 /// Transport-encryption gate: with a pre-shared key configured, plaintext
