@@ -265,8 +265,10 @@ echo "$out" | grep -q "1 rows affected" && ok "c accepts local writes while part
 #      重连即刻恢复双向解析。服务器进程未停,数据无涉。
 docker network connect --alias node-c "$net" docsql-c
 up=""
+# distroless 运行层没有 getent:用 CLI 连接探测(DNS+TCP,连接成功即
+# EOF 退出 0;分区期间域名解析失败快速退出非零),语义严格强于 getent。
 for _ in $(seq 1 40); do
-  docker exec docsql-a getent hosts node-c >/dev/null 2>&1 && { up=1; break; }
+  docker exec docsql-a docsql-cli connect node-c:7600 >/dev/null 2>&1 && { up=1; break; }
   sleep 0.5
 done
 [ -n "$up" ] && ok "c reachable by name after rejoin (--alias reconnect)" || bad "c unreachable after rejoin"

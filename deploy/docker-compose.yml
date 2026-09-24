@@ -64,7 +64,10 @@ services:
       - peer-a-data:/data
     networks: [docsql]
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-a:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      # CMD-exec form (token comes from the container env via the CLI's
+      # DOCSQL_TOKEN fallback; EOF exits 0): the runtime image is distroless
+      # and has no shell, so CMD-SHELL would silently fail.
+      test: ["CMD", "docsql-cli", "connect", "node-a:7600"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -89,7 +92,7 @@ services:
       node-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-b:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "docsql-cli", "connect", "node-b:7600"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -114,7 +117,7 @@ services:
       node-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-c:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "docsql-cli", "connect", "node-c:7600"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -149,7 +152,7 @@ services:
       node-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-d:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "docsql-cli", "connect", "node-d:7600"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -206,7 +209,7 @@ services:
       - single-data:/data
     networks: [docsql]
     healthcheck:
-      test: ["CMD-SHELL", "docsql-cli connect node-single:7600 $${DOCSQL_TOKEN:-} <<< 'exit;' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "docsql-cli", "connect", "node-single:7600"]
       interval: 5s
       timeout: 3s
       retries: 10

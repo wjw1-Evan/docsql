@@ -18,24 +18,32 @@ COPY crates ./crates
 # Test gate: any failing test fails the build (exit code propagates).
 RUN if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace --release; fi
 RUN cargo build --release -p docsql-server -p docsql-cli -p docsql-web
+# Compose mount points must pre-exist in the runtime image owned by uid
+# 1000 (a fresh named volume inherits the ownership of the mount-point
+# directory in the image); the distroless runtime below has no shell, so
+# they are staged here.
+RUN mkdir -p /build/rootfs/data /build/rootfs/auth
 
-# Runtime stage: server + cli only, running as an unprivileged user.
-# Every compose mount point (/data data, /auth console account file) is
-# pre-owned: a fresh named volume inherits the ownership of the directory in
-# the image, and a mount point the image lacks is created root-owned — the
-# unprivileged process could never write there (os error 13).
-FROM mcr.microsoft.com/azurelinux/base/core:3.0
+# Runtime stage: azurelinux distroless — glibc runtime only. No shell, no
+# package manager, no ls/cat/getent: inspect the container from outside via
+# `docker exec <container> docsql-cli …` or `docker cp` (daemon-side tar
+# stream, needs no in-container binaries), and keep compose healthchecks in
+# exec-form CMD — CMD-SHELL would silently fail. The binaries link only
+# libc/libm/libgcc_s (all part of the distroless glibc runtime); the old
+# base's libstdc++/ca-certificates/bourne-tool layer was dead weight, and
+# nothing in the stack opens outbound TLS.
+FROM mcr.microsoft.com/azurelinux/distroless/base:3.0
 # glibc keeps freed memory in per-thread arenas (default cap = 8 × cores). The
 # join/repair snapshot replay churns hundreds of thousands of short-lived
 # allocations across threads; with 32 arenas a 500k-statement bootstrap grew
 # past 6 GB and the container was OOM-killed, while capping arenas keeps the
 # same replay at ~300 MB.
 ENV MALLOC_ARENA_MAX=2
-RUN tdnf install -y ca-certificates libstdc++ && tdnf clean all
 COPY --from=builder /build/target/release/docsql-server /usr/local/bin/docsql-server
 COPY --from=builder /build/target/release/docsql-cli /usr/local/bin/docsql-cli
 COPY --from=builder /build/target/release/docsql-web /usr/local/bin/docsql-web
-RUN mkdir /data /auth && chown 1000:1000 /data /auth
+COPY --from=builder --chown=1000:1000 /build/rootfs/data /data
+COPY --from=builder --chown=1000:1000 /build/rootfs/auth /auth
 USER 1000:1000
 EXPOSE 7600 7700
 ENTRYPOINT ["docsql-server"]

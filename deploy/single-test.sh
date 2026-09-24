@@ -159,9 +159,17 @@ fi
 echo "== 8. automatic backups (interval 5s via run-tests.sh) =="
 # 自动备份:定时逻辑 SQL 快照落在节点数据卷的 /data/backups(随卷持久);
 # 恢复 = 重放备份文件(整库替换,集群内会经扇出传播收敛)。
-# 容器内文件一律 docker exec cat 中转,命令走参数列表,不拼 shell 字符串。
+# 容器内文件一律 docker cp 中转到宿主临时目录再读:运行层是 distroless,
+# 没有 ls/cat 等工具;docker cp 走 daemon 侧 tar 流,不依赖容器内任何二进制。
 BK="/data/backups"
-backup_names() { docker exec "$CTR" ls "$BK" 2>&1 | grep -E '^backup-.*\.sql$' | sort; }
+BK_CACHE="$(mktemp -d)"
+trap 'rm -rf "$BK_CACHE"' EXIT
+backup_names() {
+  rm -rf "$BK_CACHE"; mkdir -p "$BK_CACHE"
+  docker cp -q "$CTR:$BK/." "$BK_CACHE/" 2>/dev/null
+  ls "$BK_CACHE" 2>/dev/null | grep -E '^backup-.*\.sql$' | sort
+}
+bk_read() { docker cp -q "$CTR:$BK/$1" "$BK_CACHE/$1" 2>/dev/null && cat "$BK_CACHE/$1"; }
 newest() { backup_names | tail -1; }
 # 备份文件出现(首拍即触发,栈就绪后应已有;轮询兜底)。
 bk=""
@@ -173,7 +181,7 @@ done
 [ -n "$bk" ] && ok "backup file created" || bad "no backup file appeared"
 # 内容是完整 SQL 快照(DDL + 数据)。
 if [ -n "$bk" ]; then
-  out=$(docker exec "$CTR" cat "$BK/$bk")
+  out=$(bk_read "$bk")
   echo "$out" | grep -q "CREATE TABLE" && echo "$out" | grep -q "INSERT" \
     && ok "backup contains DDL + data" || bad "backup content: $(echo "$out" | head -c 120)"
 else
@@ -202,7 +210,7 @@ sgbk=""
 for _ in $(seq 1 30); do
   bk=$(newest)
   [ -n "$bk" ] || { sleep 1; continue; }
-  out=$(docker exec "$CTR" cat "$BK/$bk")
+  out=$(bk_read "$bk")
   echo "$out" | grep -q "after-restart" && { sgbk="$bk"; break; }
   sleep 1
 done
@@ -215,7 +223,7 @@ if [ -n "$sgbk" ]; then
     sleep 0.3
   done
   if [ -n "$gone" ]; then
-    docker exec "$CTR" cat "$BK/$sgbk" | docker exec -i "$CTR" docsql-cli connect "$A" >/dev/null 2>&1
+    bk_read "$sgbk" | docker exec -i "$CTR" docsql-cli connect "$A" >/dev/null 2>&1
     restored=""
     for _ in $(seq 1 20); do
       out=$(sql "$A" "SELECT COUNT(id) FROM sg;" 2>&1)
@@ -238,7 +246,7 @@ wname=""
 for _ in $(seq 1 30); do
   w=$(newest)
   [ -n "$w" ] || { sleep 1; continue; }
-  out=$(docker exec "$CTR" cat "$BK/$w" 2>&1)
+  out=$(bk_read "$w")
   echo "$out" | grep -q "webrestore" && { wname="$w"; break; }
   sleep 1
 done

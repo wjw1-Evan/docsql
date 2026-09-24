@@ -24,3 +24,7 @@ num-traits = "0.2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Strip the symbol table from shipped binaries (~16% smaller). Panic
+# messages and file/line locations survive; symbolic backtraces need the
+# matching unstripped build of the same commit.
+strip = "symbols"
