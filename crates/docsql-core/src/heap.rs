@@ -72,14 +72,19 @@ fn set_count(page: &mut [u8], n: usize) {
 }
 
 /// Bounds-check a page image loaded from storage: the slot directory and
-/// every live document region must lie inside the page. A damaged file must
-/// surface as an error, not as a slice panic.
+/// every live document region must lie inside the page, and the live regions
+/// must fit alongside the directory — `repack`/`replace` re-pack every
+/// survivor into one page, so a page whose regions overlap enough to exceed
+/// it has no valid re-packed form (they used to underflow `end -= len` and
+/// take the process down). A damaged file must surface as an error, not as a
+/// slice panic.
 fn validate_page(page: &[u8], pid: u32) -> Result<()> {
     let n = count_of(page);
     let dir_end = HEADER_FIXED + n * SLOT_SIZE;
     if dir_end > page.len() {
         return Err(HeapError::Page(pid, "slot directory overflows page"));
     }
+    let mut live_bytes = 0usize;
     for i in 0..n {
         let (off, len) = slot(page, i);
         if len == 0 {
@@ -91,6 +96,13 @@ fn validate_page(page: &[u8], pid: u32) -> Result<()> {
         if off < dir_end || off + len > page.len() {
             return Err(HeapError::Page(pid, "document region out of bounds"));
         }
+        live_bytes += len;
+    }
+    if dir_end + live_bytes > page.len() {
+        return Err(HeapError::Page(
+            pid,
+            "document regions do not fit beside the slot directory",
+        ));
     }
     Ok(())
 }
@@ -1153,6 +1165,50 @@ mod tests {
             .replace(&pager, &mut pager.begin_tx(), loc, &doc(9, "xxx"))
             .expect_err("truncated overflow slot must fail on replace");
         assert!(format!("{err}").contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn overlapping_regions_are_rejected_before_repacking() {
+        // A damaged page whose live regions overlap can hold more document
+        // bytes than one page: re-packing every survivor then underflows
+        // `end -= len` and killed the process (debug: subtract overflow;
+        // release: range start out of range). Reads and write paths must
+        // refuse the page instead.
+        let (_d, pager) = db("heap-ovl.db");
+        {
+            let mut tx = pager.begin_tx();
+            pager.allocate_page(&mut tx).unwrap();
+            pager.commit_tx(tx).unwrap();
+        }
+        // Slot 0 dead, slots 1 and 2 live but pointing at the SAME region:
+        // each is individually in-bounds, yet their packed total (6000)
+        // exceeds one page.
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[0..2].copy_from_slice(&3u16.to_le_bytes());
+        page[2..4].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        page[4..6].copy_from_slice(&0u16.to_le_bytes());
+        let off = (PAGE_SIZE - 3000) as u16;
+        for slot in 1..=2 {
+            let at = 2 + slot * 4;
+            page[at..at + 2].copy_from_slice(&off.to_le_bytes());
+            page[at + 2..at + 4].copy_from_slice(&3000u16.to_le_bytes());
+        }
+        write_raw_page(&pager, 1, &page);
+        let mut heap = Heap {
+            pages: vec![1],
+            overflow_free: Vec::new(),
+            dropped: Vec::new(),
+        };
+        for err in [
+            heap.scan(&PageReader::current(&pager)).unwrap_err(),
+            heap.live_count(&PageReader::current(&pager)).unwrap_err(),
+            heap.remove_many(&pager, &mut pager.begin_tx(), &[pack_loc(1, 0)])
+                .unwrap_err(),
+            heap.replace(&pager, &mut pager.begin_tx(), pack_loc(1, 1), &doc(1, "x"))
+                .unwrap_err(),
+        ] {
+            assert!(format!("{err}").contains("do not fit"), "{err}");
+        }
     }
 
     #[test]

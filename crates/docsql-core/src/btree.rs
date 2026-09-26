@@ -750,7 +750,7 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_bounded_rec(reader, tx, self.root, lo, true, hi, max, &mut out, 0)?;
+        Self::range_bounded_rec(reader, tx, self.root, lo, true, hi, None, max, &mut out, 0)?;
         Ok(out)
     }
 
@@ -766,8 +766,84 @@ impl BTree {
         max: Option<usize>,
     ) -> Result<Vec<(Value, u64)>> {
         let mut out = Vec::new();
-        Self::range_bounded_rec(reader, tx, self.root, lo, false, hi, max, &mut out, 0)?;
+        Self::range_bounded_rec(reader, tx, self.root, lo, false, hi, None, max, &mut out, 0)?;
         Ok(out)
+    }
+
+    /// Composite-index prefix probe: every key that starts with `prefix`
+    /// element-wise, in ascending order.
+    ///
+    /// The walk stops at the first key that does NOT carry the prefix, and
+    /// that is exact rather than a heuristic. Keys carrying the prefix form
+    /// one contiguous run, and `lo = Array(prefix)` sorts immediately before
+    /// that run, so every key this walk looks at is at or above the run's
+    /// start: one that fails the test must differ at some position with a
+    /// LARGER element, which places it past the run — and so does every key
+    /// after it. Probing without the stop (scanning from `Array(prefix)` to
+    /// the end of the tree, then filtering) made `WHERE leading = 'x'` cost
+    /// the whole index in time *and* in materialized pairs, however few rows
+    /// matched.
+    pub fn range_prefix_limited(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        prefix: &[Value],
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let lo = Value::Array(prefix.to_vec());
+        let mut out = Vec::new();
+        Self::range_bounded_rec(
+            reader,
+            tx,
+            self.root,
+            &lo,
+            true,
+            None,
+            Some(prefix),
+            max,
+            &mut out,
+            0,
+        )?;
+        Ok(out)
+    }
+
+    /// Descending mirror of [`BTree::range_prefix_limited`] (a `DESC`
+    /// composite window).
+    ///
+    /// Built on the forward walk rather than a descending one: a descending
+    /// walk enters the tree at its right edge, where the keys sit *above* the
+    /// run, and no key value can serve as the run's exclusive upper bound
+    /// (strings and decimals are unbounded). Reversing the forward run costs
+    /// one pass over the matches — which the caller holds anyway — and keeps
+    /// the walk bounded by the match count instead of the whole tail.
+    pub fn range_prefix_rev_limited(
+        &self,
+        reader: &PageReader,
+        tx: &Tx,
+        prefix: &[Value],
+        max: Option<usize>,
+    ) -> Result<Vec<(Value, u64)>> {
+        let mut out = self.range_prefix_limited(reader, tx, prefix, None)?;
+        out.reverse();
+        if let Some(m) = max {
+            out.truncate(m);
+        }
+        Ok(out)
+    }
+
+    /// True when `k` is an Array key carrying `prefix` element-wise — the
+    /// composite prefix test (shared by both prefix walkers).
+    fn has_prefix(k: &Value, prefix: &[Value]) -> bool {
+        match k {
+            Value::Array(items) => {
+                items.len() >= prefix.len()
+                    && items
+                        .iter()
+                        .zip(prefix.iter())
+                        .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
+            }
+            _ => false,
+        }
     }
 
     /// True when a key at or past `hi` ends the in-order scan.
@@ -798,15 +874,16 @@ impl BTree {
         lo: &Value,
         lo_incl: bool,
         hi: Option<(&Value, bool)>,
+        stop: Option<&[Value]>,
         max: Option<usize>,
         out: &mut Vec<(Value, u64)>,
         depth: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if depth > MAX_TREE_DEPTH {
             return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
         }
         if max.is_some_and(|m| out.len() >= m) {
-            return Ok(());
+            return Ok(false);
         }
         match Self::read_node(reader, tx, id)? {
             Node::Leaf { cells } => {
@@ -818,9 +895,18 @@ impl BTree {
                     if o == Ordering::Less || (o == Ordering::Equal && !lo_incl) {
                         continue;
                     }
+                    // Prefix probe stop (see `range_prefix_limited`). It must
+                    // come AFTER the lower-bound filter: a leaf the walk
+                    // reaches can still hold keys below `lo`, and those sit
+                    // BEFORE the run — stopping on one drops the whole match
+                    // (the exactness argument only covers keys at or above
+                    // `lo`).
+                    if stop.is_some_and(|pfx| !Self::has_prefix(&k, pfx)) {
+                        return Ok(false);
+                    }
                     out.push((k, v));
                     if max.is_some_and(|m| out.len() >= m) {
-                        break;
+                        return Ok(false);
                     }
                 }
             }
@@ -835,22 +921,25 @@ impl BTree {
                     Some((k, _)) => Value::cmp_values(k, lo) != Ordering::Less,
                     None => true,
                 };
-                if leftmost_upper_ge {
-                    Self::range_bounded_rec(
+                if leftmost_upper_ge
+                    && !Self::range_bounded_rec(
                         reader,
                         tx,
                         leftmost,
                         lo,
                         lo_incl,
                         hi,
+                        stop,
                         max,
                         out,
                         depth + 1,
-                    )?;
+                    )?
+                {
+                    return Ok(false);
                 }
                 for (i, (sep, child)) in cells.iter().enumerate() {
                     if max.is_some_and(|m| out.len() >= m) {
-                        break;
+                        return Ok(false);
                     }
                     if skip_by_hi(sep) {
                         continue;
@@ -859,23 +948,26 @@ impl BTree {
                         Some((k, _)) => Value::cmp_values(k, lo) != Ordering::Less,
                         None => true,
                     };
-                    if upper_ge {
-                        Self::range_bounded_rec(
+                    if upper_ge
+                        && !Self::range_bounded_rec(
                             reader,
                             tx,
                             *child,
                             lo,
                             lo_incl,
                             hi,
+                            stop,
                             max,
                             out,
                             depth + 1,
-                        )?;
+                        )?
+                    {
+                        return Ok(false);
                     }
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Entries with key >(=) `lo` and <(=) `hi`, largest first, capped at
@@ -1113,6 +1205,77 @@ mod tests {
         assert!(all
             .windows(2)
             .all(|w| Value::cmp_values(&w[0].0, &w[1].0) == std::cmp::Ordering::Less));
+    }
+
+    /// Composite prefix walks return exactly the keys carrying the prefix —
+    /// the run and nothing else — in both directions. The stop is proven, not
+    /// heuristic (see `range_prefix_limited`), so this pins it against the
+    /// unbounded scan + retain it replaced.
+    #[test]
+    fn prefix_walks_return_exactly_the_run() {
+        let (_d, pager) = fresh("bt-prefix.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&pager, &mut tx).unwrap();
+        // Array keys, enough to split leaves AND the root: many distinct
+        // leading values, several entries each, plus a group whose leading
+        // value sorts LAST (the stop must not over-read into it).
+        let mut expected: std::collections::BTreeMap<i64, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for lead in 0..40i64 {
+            for tail in 0..7i64 {
+                let key = Value::Array(vec![Value::Int(lead), Value::Int(tail)]);
+                tree.insert(&pager, &mut tx, key, (lead * 100 + tail) as u64, false)
+                    .unwrap();
+                expected.entry(lead).or_default().push(tail as u64);
+            }
+        }
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let reader = PageReader::current(&pager);
+        for lead in 0..40i64 {
+            let pfx = vec![Value::Int(lead)];
+            let got = tree.range_prefix_limited(&reader, &tx, &pfx, None).unwrap();
+            let want_tails = &expected[&lead];
+            assert_eq!(got.len(), want_tails.len(), "lead {lead}");
+            for (k, v) in &got {
+                assert!(BTree::has_prefix(k, &pfx), "off-prefix key {k:?}");
+                assert!(want_tails.contains(&(*v % 100)), "lead {lead}");
+            }
+            // Ascending within the run, and identical to the old shape
+            // (unbounded scan from the prefix, then retain).
+            let legacy: Vec<(Value, u64)> = tree
+                .range_bounded(&reader, &tx, &Value::Array(pfx.clone()), None)
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| BTree::has_prefix(k, &pfx))
+                .collect();
+            assert_eq!(got, legacy, "lead {lead}");
+            let mut rev = got.clone();
+            rev.reverse();
+            let got_rev = tree
+                .range_prefix_rev_limited(&reader, &tx, &pfx, None)
+                .unwrap();
+            assert_eq!(got_rev, rev, "lead {lead} descending");
+        }
+        // A leading value that matches nothing yields nothing, and never
+        // wanders into a neighbouring run.
+        for none in [vec![Value::Int(40)], vec![Value::Int(-1)]] {
+            assert!(tree
+                .range_prefix_limited(&reader, &tx, &none, None)
+                .unwrap()
+                .is_empty());
+            assert!(tree
+                .range_prefix_rev_limited(&reader, &tx, &none, None)
+                .unwrap()
+                .is_empty());
+        }
+        // The cap still applies on top of the prefix stop.
+        assert_eq!(
+            tree.range_prefix_limited(&reader, &tx, &[Value::Int(0)], Some(3))
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

@@ -3531,27 +3531,23 @@ impl<'a> ReadCx<'a> {
                 p
             }
             ProbePlan::Prefix(prefix) => {
-                // Composite prefix probe: scan from the prefix (its rank
-                // makes Array(prefix) sort right before every key extending
-                // it) and keep keys that start with it element-wise. `max` is
-                // ignored: beyond-prefix keys would otherwise spend the cap
-                // that the retain then drops.
-                let mut p = tree
-                    .range_bounded(&reader, tx, prefix, None)
-                    .map_err(|e| index_err(col, e))?;
-                if let Value::Array(pfx) = prefix {
-                    p.retain(|(k, _)| match k {
-                        Value::Array(items) => {
-                            items.len() >= pfx.len()
-                                && items
-                                    .iter()
-                                    .zip(pfx.iter())
-                                    .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
-                        }
-                        _ => false,
-                    });
-                }
-                p
+                // Composite prefix probe: walk from the prefix (its rank makes
+                // Array(prefix) sort right before every key extending it) and
+                // stop at the first key that leaves the run — the walk itself
+                // yields only prefix matches, so neither a `retain` nor the
+                // tail beyond the run is needed. `max` stays ignored, as
+                // before: the cap exists for plans whose every entry is a
+                // result, and this one keeps nothing else. Walking to the end
+                // of the tree and filtering afterwards (the old shape) made
+                // `WHERE leading = 'x'` cost the whole index in time and in
+                // materialized pairs, however few rows matched.
+                let Value::Array(pfx) = prefix else {
+                    // Only a composite Array key has a prefix run; no other
+                    // shape is probeable — generic path, never a wrong answer.
+                    return Ok(None);
+                };
+                tree.range_prefix_limited(&reader, tx, pfx, None)
+                    .map_err(|e| index_err(col, e))?
             }
             ProbePlan::Range { lo, hi } => {
                 let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
@@ -3603,22 +3599,13 @@ impl<'a> ReadCx<'a> {
                 .range_bounded_rev_limited(&reader, tx, Some((v, true)), Some((v, true)), max)
                 .map_err(|e| index_err(col, e))?,
             ProbePlan::Prefix(prefix) => {
-                let mut p = tree
-                    .range_bounded_rev_limited(&reader, tx, Some((prefix, true)), None, None)
-                    .map_err(|e| index_err(col, e))?;
-                if let Value::Array(pfx) = prefix {
-                    p.retain(|(k, _)| match k {
-                        Value::Array(items) => {
-                            items.len() >= pfx.len()
-                                && items
-                                    .iter()
-                                    .zip(pfx.iter())
-                                    .all(|(a, b)| Value::cmp_values(a, b) == Ordering::Equal)
-                        }
-                        _ => false,
-                    });
-                }
-                p
+                // Descending mirror of the prefix probe: the same bounded
+                // forward run, reversed. `max` stays ignored, as above.
+                let Value::Array(pfx) = prefix else {
+                    return Ok(None);
+                };
+                tree.range_prefix_rev_limited(&reader, tx, pfx, None)
+                    .map_err(|e| index_err(col, e))?
             }
             ProbePlan::Range { lo, hi } => {
                 let lo_ref = lo.as_ref().map(|(v, incl)| (v, *incl));
@@ -6750,8 +6737,7 @@ impl Database {
         // Release old storage BEFORE the rebuild: allocations below then pop
         // those pages back (same transaction, so the catalog switch and the
         // page rewrites are atomic; snapshots rebuild old versions from the
-        // WAL and never observe the reuse). Restore paths skip this (see
-        // `rewrite_table_restore`).
+        // WAL and never observe the reuse).
         if free_old {
             for &p in &meta.pages {
                 self.pager.free_page(&mut tx, p)?;
@@ -6802,6 +6788,15 @@ impl Database {
         let prev_meta = self.tables.get(table).cloned();
         meta.pages = heap.pages;
         meta.index_roots = roots;
+        // The rebuild drained the recycled-chain free list above: every
+        // oversized document popped a page from it. Persist what is left —
+        // keeping the pre-rebuild list would advertise pages the rebuild just
+        // made live, and the next oversized insert would overwrite a live
+        // document's chain (reads then fail with "overflow chain corrupt" or
+        // return another row's bytes). The DML paths have always written the
+        // heap's list back through `sync_table_layout`; the rebuild is the
+        // one that did not.
+        meta.overflow_free = heap.overflow_free;
         self.autoinc_cache.remove(table);
         self.tables
             .insert(table.to_string(), std::sync::Arc::new(meta.clone()));
@@ -15673,6 +15668,269 @@ mod tests {
             ExecOutcome::Rows(r) => r,
             other => panic!("expected rows, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn table_rewrite_persists_the_drained_overflow_free_list() {
+        // A rebuild seeds its new heap from the recycled-chain free list and
+        // oversized rows pop pages from it. The catalog kept the PRE-rebuild
+        // list, so the next oversized insert handed out pages the rebuild had
+        // just made live and overwrote a live document's chain.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("ovfree.db")).unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, b TEXT)");
+        let long = "x".repeat(20_000);
+        run(&mut db, &format!("INSERT INTO t VALUES (1, '{long}')"));
+        run(&mut db, "INSERT INTO t VALUES (2, 'keep')");
+        // Shrink row 1: its chain pages are parked in the free list.
+        run(&mut db, "UPDATE t SET b = 'small' WHERE id = 1");
+        assert!(
+            !db.tables.get("t").unwrap().overflow_free.is_empty(),
+            "chain pages must be parked"
+        );
+        // A rebuild that re-inserts oversized rows drains that list.
+        run(
+            &mut db,
+            &format!("ALTER TABLE t ADD COLUMN pad TEXT DEFAULT ('{long}')"),
+        );
+        assert!(
+            db.tables.get("t").unwrap().overflow_free.is_empty(),
+            "the rebuild must not leave the pages it handed out in the free list"
+        );
+        // The next oversized insert must not reuse them: every row's chain
+        // still reads back whole.
+        run(&mut db, &format!("INSERT INTO t VALUES (3, 'y', '{long}')"));
+        for id in 1..=3 {
+            assert_eq!(
+                rows(&mut db, &format!("SELECT pad FROM t WHERE id = {id}")).rows[0],
+                vec![Value::Str(long.clone())],
+                "row {id} chain corrupted"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_documents_survive_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("big.db")).unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, b TEXT)");
+        let big1 = "a".repeat(20_000);
+        let big2 = "b".repeat(20_000);
+        let big3 = "c".repeat(20_000);
+        run(&mut db, &format!("INSERT INTO t VALUES (1, '{big1}')"));
+        run(&mut db, "INSERT INTO t VALUES (2, 'small2')");
+        run(&mut db, "INSERT INTO t VALUES (3, 'small3')");
+
+        // (1) one explicit transaction: grow a row, delete an oversized row
+        // (recycling its chain), insert another oversized row (spending it).
+        run(&mut db, "BEGIN");
+        run(&mut db, &format!("UPDATE t SET b = '{big2}' WHERE id = 2"));
+        run(&mut db, "DELETE FROM t WHERE id = 1");
+        run(&mut db, &format!("INSERT INTO t VALUES (4, '{big3}')"));
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0],
+            Value::Int(3)
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 2").rows[0][0],
+            Value::Str(big2.clone())
+        );
+        run(&mut db, "ROLLBACK");
+        // Rolled back: row 1 whole again, row 2 small, no row 4.
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 1").rows[0][0],
+            Value::Str(big1.clone()),
+            "row 1 chain after ROLLBACK"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 2").rows[0][0],
+            Value::Str("small2".into())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t WHERE id = 4").rows[0][0],
+            Value::Int(0)
+        );
+        // (2) savepoint: recycle row 1's chain, spend it, roll back to the
+        // savepoint — the pages must return to row 1, not to the free list.
+        run(&mut db, "BEGIN");
+        run(&mut db, "UPDATE t SET b = 'grown' WHERE id = 2");
+        run(&mut db, "SAVEPOINT s1");
+        run(&mut db, "DELETE FROM t WHERE id = 1");
+        run(&mut db, &format!("INSERT INTO t VALUES (5, '{big2}')"));
+        run(&mut db, "ROLLBACK TO s1");
+        run(&mut db, "COMMIT");
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 1").rows[0][0],
+            Value::Str(big1.clone()),
+            "row 1 chain after ROLLBACK TO"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 2").rows[0][0],
+            Value::Str("grown".into())
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t WHERE id = 5").rows[0][0],
+            Value::Int(0)
+        );
+        // (3) after the commit, a fresh oversized insert must not reuse the
+        // pages row 1 owns.
+        run(&mut db, &format!("INSERT INTO t VALUES (6, '{big3}')"));
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 1").rows[0][0],
+            Value::Str(big1.clone()),
+            "row 1 chain after a later big INSERT"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t WHERE id = 6").rows[0][0],
+            Value::Str(big3.clone())
+        );
+        // (4) survives reopen
+        drop(db);
+        let mut db = Database::open(&dir.path().join("big.db")).unwrap();
+        for (id, want) in [(1, big1.as_str()), (2, "grown"), (6, big3.as_str())] {
+            assert_eq!(
+                rows(&mut db, &format!("SELECT b FROM t WHERE id = {id}")).rows[0][0],
+                Value::Str((*want).into()),
+                "row {id} after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_data_file_never_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let base = "z".repeat(9_000);
+        let big = base.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fuzz.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(
+                &mut db,
+                "CREATE TABLE t (id INT PRIMARY KEY, b TEXT, blob TEXT, n INT)",
+            );
+            run(&mut db, "CREATE INDEX ix ON t (b, n)");
+            // Two more tables so the catalog chain spans several pages (its
+            // `next` pointer and per-page header are corruption targets), and
+            // a second oversized row so an overflow chain spans 3+ pages.
+            run(&mut db, "CREATE TABLE u (k TEXT PRIMARY KEY, v INT)");
+            run(&mut db, "CREATE TABLE v (k TEXT, v INT)");
+            for i in 0..40 {
+                run(&mut db, &format!("INSERT INTO u VALUES ('k{i:04}', {i})"));
+                run(&mut db, &format!("INSERT INTO v VALUES ('w{i:04}', {i})"));
+            }
+            for i in 0..12 {
+                run(
+                    &mut db,
+                    &format!(
+                        "INSERT INTO t VALUES ({i}, 'row-{i}-{}', 'small', {i})",
+                        "q".repeat(60 * i)
+                    ),
+                );
+            }
+            run(
+                &mut db,
+                &format!("INSERT INTO t VALUES (99, 'row-99', '{big}', 99)"),
+            );
+        }
+        let npages = std::fs::metadata(&path).unwrap().len() as usize / 4096;
+        let original = std::fs::read(&path).unwrap();
+        let battery = [
+            "SELECT COUNT(*) FROM t",
+            "SELECT * FROM t",
+            "SELECT * FROM t WHERE b = 'row-3-ccc'",
+            "SELECT * FROM t ORDER BY b, n LIMIT 3",
+            "SELECT * FROM t ORDER BY b, n DESC LIMIT 3",
+            "UPDATE t SET b = 'x' WHERE id = 3",
+            "UPDATE t SET blob = 'y' WHERE id = 99",
+            "DELETE FROM t WHERE id = 4",
+            "INSERT INTO t VALUES (500, 'new', 'small', 1)",
+            "TRUNCATE TABLE t",
+            "ALTER TABLE t ADD COLUMN zzz TEXT DEFAULT 'd'",
+            "DROP INDEX ix",
+            "SELECT * FROM u WHERE k = 'k0007'",
+        ];
+        // Byte-level damage must surface as an error, never as a panic: one
+        // corrupt page anywhere in the file is enough to take a node down if
+        // any read or write path slices or subtracts without checking.
+        let mut panics: Vec<String> = Vec::new();
+        let run = |label: String, stmts: &[&str], panics: &mut Vec<String>| {
+            for sql in stmts {
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    // A loud open error is a fine outcome for a damaged file;
+                    // only a panic is a defect.
+                    if let Ok(mut db) = Database::open(&path) {
+                        let _ = db.execute(sql);
+                    }
+                }));
+                if let Err(e) = r {
+                    let msg = e
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    let site = msg.split('\n').next().unwrap_or("").to_string();
+                    panics.push(format!("{label}: {sql} :: {site}"));
+                }
+            }
+        };
+        // Phase 1: one flipped byte per page (page 0 = the file header too).
+        for page in 0..npages {
+            for off in [0usize, 2, 8, 12, 16, 40, 2048, 4090] {
+                for delta in [0x01u8, 0xff] {
+                    let mut bytes = original.clone();
+                    bytes[page * 4096 + off] ^= delta;
+                    std::fs::write(&path, &bytes).unwrap();
+                    run(
+                        format!("page {page} off {off} delta {delta:#x}"),
+                        &battery,
+                        &mut panics,
+                    );
+                }
+            }
+        }
+        // Phase 2: bursts of damage (deterministic LCG, so a failure
+        // reproduces exactly).
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Bursts get the read/write half of the battery: 400+ damage shapes
+        // at full breadth would dominate the suite's runtime.
+        let burst_battery = &battery[..6];
+        for round in 0..100 {
+            let mut bytes = original.clone();
+            for _ in 0..6 {
+                let at = (next() as usize) % bytes.len();
+                bytes[at] = (next() & 0xff) as u8;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            run(format!("burst {round}"), burst_battery, &mut panics);
+        }
+        // Phase 3: header page-count damage (claims more/fewer pages than the
+        // file holds) and a physically truncated file.
+        for count in [0u32, 1, 2, npages as u32 - 1, npages as u32 + 1, u32::MAX] {
+            let mut bytes = original.clone();
+            bytes[12..16].copy_from_slice(&count.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            run(format!("num_pages {count}"), &battery, &mut panics);
+        }
+        for cut in [1usize, 2, 3, npages - 1, npages / 2] {
+            let mut bytes = original.clone();
+            bytes.truncate(cut * 4096);
+            std::fs::write(&path, &bytes).unwrap();
+            run(format!("truncated to {cut} pages"), &battery, &mut panics);
+        }
+        std::fs::write(&path, &original).unwrap();
+        assert!(
+            panics.is_empty(),
+            "{} panics, first 10: {:#?}",
+            panics.len(),
+            &panics[..panics.len().min(10)]
+        );
     }
 
     #[test]

@@ -60,6 +60,10 @@ pager 没有空闲页机制(allocate 只增;孤儿页是既有现状——rewrit
   (自描述对象加键,旧卷/旧代码忽略未知键,向后兼容读);
 - 删除/替换溢出文档:沿链收集页号 → 清零写回 → 加入 `overflow_free`;
 - 新建溢出链:优先从 `overflow_free` 取页(数量不足的差额新建;富余留在清单);
+- **发放必须回写**:清单是目录的一部分,任何从它取过页的路径都要把剩余清单存回
+  ——DML 走 `sync_table_layout`,全表重建走 `rewrite_table_inner`
+  (`meta.overflow_free = heap.overflow_free`)。漏写会让目录继续挂着本次重建刚
+  变活的页,下一次超大 INSERT 覆写活跃文档的链(读回报 "overflow chain corrupt");
 - 表删除随表消失;文件收缩留给 VACUUM。
 
 ## 5. 读取路径

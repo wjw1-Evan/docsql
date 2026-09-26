@@ -75,8 +75,12 @@ per-type 编码,与"排序统一走 cmp_values"的既有架构重复且必然引
   - **全列等值**(每个 ci 都有等值字面量)→ 精确键
     (`cols.len()==1` → 标量值,现状;否则 `Array([v1..vn])`)→ `ProbePlan::Eq`;
   - **前导 k 列等值(k < n)** → `ProbePlan::Prefix(Array([v1..vk]))`:
-    `range_bounded(lo=prefix, hi=None)` + 保留前缀匹配的键
-    (`cmp_values` 前缀判断;前缀序保证连续区段);
+    `range_prefix_limited`(前缀序保证连续区段,遍历内于首个不带前缀的键处停止;
+    停止判定排在 `lo` 过滤之后——叶子页仍可能含 `< lo` 的键,先停会丢掉整段命中);
+    DESC 窗口用 `range_prefix_rev_limited`(正向前缀段 + reverse,命中段上界无法用
+    某个键值表达)。**别退回「`range_bounded(lo=prefix, hi=None)` 扫到索引末尾再
+    retain」**:那让时间与物化对数都变成 O(索引尾部)(2 万行实测 10.4ms→0.3ms,
+    物化 20000→1 对);
   - 首列无等值 → 该 root_key 不可探测(范围条件留在 residual WHERE,正确性无损);
 - 单列索引行为逐字节不变(`cols.len()==1` 时 Eq/Range 两分支与现状完全一致,
   复合索引不参与 Range 探测)。

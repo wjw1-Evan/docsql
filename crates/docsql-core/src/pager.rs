@@ -64,6 +64,17 @@ pub enum PagerError {
     OutOfRange(u32, u32),
     #[error("data file corrupt: bad header")]
     BadHeader,
+    /// The page-id space is exhausted (the header claims ~4 billion pages).
+    /// Growing past it would wrap the counter and hand out page 0 — the file
+    /// header — as a data page, so allocation refuses instead.
+    #[error("page id space exhausted (header claims {0} pages)")]
+    PageIdExhausted(u32),
+    /// A WAL frame names a page no transaction could have allocated: page 0
+    /// is the file header (replaying it would erase the catalog) and an id
+    /// past `pages at open + frames in the log` means a corrupt length field
+    /// — replaying it would write 4 KB at a multi-terabyte offset.
+    #[error("wal corrupt: frame for page {0} (file has {1} pages, {2} frames)")]
+    WalPageId(u32, u32, u64),
     /// The snapshot's page history is gone (WAL checkpointed past it) or the
     /// snapshot was already ended. Reads fail loudly — serving a newer page
     /// version would be a silent isolation violation.
@@ -530,8 +541,10 @@ impl Pager {
         let mut committed = std::collections::HashSet::new();
         let mut deferred = crate::wal::DeferredSet::default();
         let mut max_txid = 0u64;
+        let mut frames = 0u64;
         for rec in Wal::frames(&wal_path)? {
             let rec = rec?;
+            frames += 1;
             max_txid = max_txid.max(rec.txid);
             match rec.kind {
                 KIND_COMMIT => {
@@ -550,6 +563,15 @@ impl Pager {
         // new transactions from colliding with pre-crash ones (an ABORT of a
         // reused id must never void an unrelated deferred commit).
         self.next_txid.fetch_max(max_txid + 1, Ordering::Relaxed);
+        // Every page a frame can name was either already counted in the
+        // header at open, or allocated during this replay — and each such
+        // allocation consumes a frame, so `pages + frames` is a hard ceiling.
+        // Page 0 is the header, never a data page. A frame outside that
+        // envelope means a corrupt log, and replaying it is destructive
+        // rather than merely wrong: id 0 overwrites the file header (the
+        // catalog is then silently gone), a wild id writes 4 KB at a
+        // multi-terabyte offset. Refuse the open instead.
+        let page_ceiling = self.num_pages() as u64 + frames;
         let mut applied = false;
         for rec in Wal::frames(&wal_path)? {
             let rec = rec?;
@@ -559,6 +581,9 @@ impl Pager {
             let Some((page, data)) = decode_page_image(&rec.payload)? else {
                 continue;
             };
+            if page == 0 || page as u64 >= page_ceiling {
+                return Err(PagerError::WalPageId(page, self.num_pages(), frames));
+            }
             self.write_file_page(page, &data)?;
             applied = true;
         }
@@ -582,7 +607,11 @@ impl Pager {
     fn write_file_page(&self, id: u32, data: &[u8]) -> Result<()> {
         debug_assert_eq!(data.len(), PAGE_SIZE);
         if id >= self.num_pages() {
-            self.num_pages.store(id + 1, Ordering::Relaxed);
+            // Saturating: `allocate_page` already refuses the top of the id
+            // space, so this cannot wrap — but a wrapped page count would make
+            // every later bounds check meaningless.
+            self.num_pages
+                .store(id.saturating_add(1), Ordering::Relaxed);
         }
         if id >= self.persisted_pages.load(Ordering::Relaxed) {
             self.persist_header()?;
@@ -720,13 +749,23 @@ impl Pager {
                 id
             }
             None => {
-                let id = self.num_pages.fetch_add(1, Ordering::Relaxed);
+                // `fetch_add` wraps at the top of the id space, and a wrapped
+                // counter hands out id 0 — the file HEADER page — as a data
+                // page (recovery then erases the catalog) and `u32::MAX` on the
+                // next call, which overflows every `id + 1` downstream. A
+                // header claiming ~4 billion pages is corruption, not a
+                // database; refuse loudly instead.
+                let prev = self.num_pages.fetch_add(1, Ordering::Relaxed);
+                if prev == 0 || prev == u32::MAX {
+                    self.num_pages.store(prev, Ordering::Relaxed);
+                    return Err(PagerError::PageIdExhausted(prev));
+                }
                 // A brand-new page id exists nowhere to return to once the
                 // tx aborts (the file header already counts it) — track it
                 // like a pool borrow so abort/drop recycles it instead of
                 // stranding the id (and its 4 KB) until restart.
-                tx.reused.push(id);
-                id
+                tx.reused.push(prev);
+                prev
             }
         };
         // Realloc: the transaction freed this page itself, so the restored
@@ -1947,6 +1986,88 @@ mod tests {
         let page = pager.read_page(page_id).unwrap().to_vec();
         assert_eq!(&page[..magic.len()], magic);
         assert_eq!(&page[20..26], b"APPEND");
+    }
+
+    #[test]
+    fn recovery_refuses_frames_no_transaction_could_have_written() {
+        // A committed frame for page 0 would overwrite the FILE HEADER during
+        // replay (the catalog is then silently gone — no error anywhere), and
+        // a wild id would write 4 KB at a multi-terabyte offset. Both mean a
+        // corrupt log: refuse the open, leave the data file alone.
+        for (name, page) in [("header-page", 0u32), ("wild-id", 1_000_000_000)] {
+            let (_dir, path) = tmp_db(&format!("wal-{name}.db"));
+            {
+                let pager = Pager::open(&path).unwrap();
+                let mut tx = pager.begin_tx();
+                let p = pager.allocate_page(&mut tx).unwrap();
+                pager.write_page(&mut tx, p, 0, b"keeper").unwrap();
+                pager.commit_tx(tx).unwrap();
+                let mut payload = vec![0u8; 4 + PAGE_SIZE];
+                payload[..4].copy_from_slice(&page.to_le_bytes());
+                let mut wal = lock(&pager.wal);
+                wal.begin(9_999).unwrap();
+                wal.log_write(9_999, &payload).unwrap();
+                wal.commit(9_999).unwrap();
+            }
+            let before = std::fs::metadata(&path).unwrap().len();
+            let err = match Pager::open(&path) {
+                Err(e) => e,
+                Ok(_) => panic!("{name}: a frame for page {page} must fail the open"),
+            };
+            assert!(
+                matches!(err, PagerError::WalPageId(p, ..) if p == page),
+                "{err}"
+            );
+            // The header still carries its magic (the catalog was not erased)
+            // and the file did not grow.
+            let mut hdr = [0u8; 16];
+            OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .unwrap()
+                .read_exact_at(&mut hdr, 0)
+                .unwrap();
+            assert_eq!(&hdr[..8], MAGIC, "{name}: file header destroyed");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                before,
+                "{name}: replay must not extend the file"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_refuses_the_top_of_the_page_id_space() {
+        // A header claiming ~4 billion pages is corruption. Growing past the
+        // top of the id space wraps the counter: the next allocation would
+        // hand out page 0 (the file header) as a data page, and the one after
+        // that `u32::MAX`, which overflows every downstream `id + 1`.
+        let (_dir, path) = tmp_db("idspace.db");
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap();
+            let hdr = encode_header(u32::MAX);
+            file.write_all_at(&hdr, 0).unwrap();
+            file.sync_all().unwrap();
+        }
+        let pager = Pager::open(&path).unwrap();
+        let mut tx = pager.begin_tx();
+        assert!(matches!(
+            pager.allocate_page(&mut tx),
+            Err(PagerError::PageIdExhausted(u32::MAX))
+        ));
+        // The counter is left as it was, not wrapped to 0.
+        assert_eq!(pager.num_pages(), u32::MAX);
+        assert!(matches!(
+            pager.allocate_page(&mut tx),
+            Err(PagerError::PageIdExhausted(u32::MAX))
+        ));
+        assert!(pager.allocate_page(&mut tx).is_err());
     }
 
     #[test]
