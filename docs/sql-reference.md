@@ -214,7 +214,7 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 | `CROSS JOIN`、`a, b` | 笛卡尔积 |
 | `DUAL` | Oracle 哑表（单行零列，大小写不敏感） |
 
-**不支持**：`NATURAL JOIN`、`LATERAL`、表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）——均显式报错。
+**不支持**：`NATURAL JOIN`、`LATERAL`、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）——均显式报错（`STRING_SPLIT`/`GENERATE_SERIES`/`OPENJSON` 表函数与 `CROSS/OUTER APPLY` 已支持，见 [T-SQL 兼容面](#tsqlsql-server兼容面)）。
 
 ### SELECT 备注
 
@@ -900,7 +900,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 转换 | `CONVERT(type, value[, style])`（常用日期 style 双向：23/101/112/120/121/126 等；未知 style 报错）、`TRY_CAST/TRY_CONVERT/PARSE/TRY_PARSE`（失败 → NULL；PARSE 文化仅 en-US） |
 | 逻辑 | `IIF`、`CHOOSE`、`ISNULL` |
 | 标识/元数据 | `NEWID/NEWSEQUENTIALID`（UUIDv7；**仅 SELECT/INSERT** —— INSERT 走回写把生成值作为字面量扇出，UPDATE/DELETE/MERGE 显式报错）、`DB_NAME/DB_ID/SERVERPROPERTY`、`CHECKSUM/BINARY_CHECKSUM`、`HASHBYTES`（MD5/SHA1/SHA2_256） |
-| 表值函数 | `FROM STRING_SPLIT(s, sep[, 1]) AS t`、`FROM GENERATE_SERIES(a, b[, step]) AS t`、`FROM OPENJSON(json) AS t`（默认 key/value/type 形状；`WITH` 子句报错） |
+| 表值函数 | `FROM STRING_SPLIT(s, sep[, 1]) AS t`、`FROM GENERATE_SERIES(a, b[, step]) AS t`、`FROM OPENJSON(json) AS t`（默认 key/value/type 形状；`WITH` 子句报错；NULL 输入得空行集） |
 | 批/变量 | `DECLARE @x [类型] [= 初值]`、`SET @x = 表达式`、`SELECT @a = e1, @b = e2 [FROM …]`（取扫描末行，空扫描保持原值）、`IF … ELSE`、`BEGIN…END` 嵌套块、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@ERROR`/`@@VERSION`、`PRINT 表达式`（CLI 打印消息）；变量是**逐连接会话状态**（GO 结束批次即清空），替换经 `value_literal` 渲染，写语句只以字面量形式进入日志/复制 |
 | 错误处理 | `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`（捕获后批继续；CATCH 内 `ERROR_MESSAGE()`/`ERROR_NUMBER()` 读被捕获错误，CATCH 外为 NULL；嵌套 TRY…CATCH 结束后外层 CATCH 的错误上下文恢复）；`THROW [code, 'msg', state]`（实参可为 @变量；CATCH 内裸 `THROW` 重抛原错误，可多次）、`RAISERROR('msg', sev, state)` 或 `RAISERROR 'msg', sev, state`（消息取第一实参，severity/state 不分级）；CATCH 内的错误继续上抛，TRY 内的 BREAK/CONTINUE 穿透到外层 WHILE |
 | 递归 CTE | `WITH [RECURSIVE] c(n) AS (锚点 UNION [ALL] 递归臂)`：半朴素迭代（每轮只见上一轮行，SQL Server 工作表语义）；`UNION` 按编码字节去重可收敛循环图、`UNION ALL` 循环在 100 轮/10 万行预算处响亮报错；T-SQL 无关键字拼写（自引用 UNION 体即递归）同样识别 |
@@ -928,7 +928,148 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 函数 | `SCOPE_IDENTITY`、`HASHBYTES` 的 `SHA2_512`/`MD2`、`TIMEFROMPARTS`（无 TIME 类型）；会话身份函数无连接上下文时报错（有上下文时替换，见上表） |
 | 会话垫片边界 | 未知 `SET` 选项、`GO <n>` 重复次数、非字面量 `PRINT`（PRAGMA 值语法装不下表达式） |
 
-`WINDOW` 子句、`QUALIFY`、递归 CTE、`CROSS APPLY` 等结构性缺口见[不支持的语法](#不支持的语法)。
+`WINDOW` 子句、`QUALIFY`、APPLY 子查询形式等结构性缺口见[不支持的语法](#不支持的语法)。
+
+### T-SQL 数据操作实例
+
+以下实例基于同一个办公用品订单库，全部在本引擎上实测通过（关键输出以 `-- →` 注释摘录）。嵌入式 CLI（`docsql <db>`）、`docsql-cli connect` 远程会话、控制台 SQL 编辑器均可执行；`PRINT` 消息在远程会话落在服务进程 stderr（嵌入式 CLI 打到本地 stdout）。约定：在 CTE/派生表里引用带表别名的列时显式写 `AS 别名`（当前不带别名的限定列名会原样物化，外层同名引用得到 NULL）。
+
+**准备数据**
+
+```sql
+CREATE TABLE Customers (Id INT PRIMARY KEY AUTOINCREMENT, Name TEXT NOT NULL, City TEXT, Tags TEXT);
+INSERT INTO Customers (Name, City, Tags) VALUES
+  (N'张三', N'上海', N'vip,批发'), (N'李四', N'北京', N'零售'), (N'王五', N'广州', N'vip,零售');
+SELECT SCOPE_IDENTITY() AS LastCustomerId;   -- → 3(本连接最近一次自增)
+CREATE TABLE Orders (Id INT PRIMARY KEY AUTOINCREMENT, CustomerId INT NOT NULL,
+                     Item TEXT NOT NULL, Qty INT NOT NULL, Amount INT NOT NULL, Meta TEXT);
+INSERT INTO Orders (CustomerId, Item, Qty, Amount, Meta) VALUES
+  (1, N'打印纸', 10, 120, N'{"color":"白","size":"A4"}'),
+  (1, N'墨盒',    2, 350, N'{"color":"黑"}'),
+  (2, N'订书机',  1,  25, NULL),
+  (3, N'打印纸',  5,  60, N'{"color":"黄"}'),
+  (3, N'白板笔',  4,  40, NULL);
+INSERT INTO Orders (CustomerId, Item, Qty, Amount) VALUES (2, N'文件夹', 3, 18);
+SELECT SCOPE_IDENTITY() AS LastOrderId;      -- → 6
+```
+
+**每客户金额前 2 的订单（CTE + 窗口函数 + JOIN）**
+
+```sql
+WITH Ranked AS (
+  SELECT Id, CustomerId, Item, Amount,
+         ROW_NUMBER() OVER (PARTITION BY CustomerId ORDER BY Amount DESC) AS rn
+  FROM Orders
+)
+SELECT c.Name AS Customer, r.Id AS OrderId, r.Item, r.Amount
+FROM Ranked AS r JOIN Customers AS c ON c.Id = r.CustomerId
+WHERE r.rn <= 2
+ORDER BY Customer, r.rn;
+-- → 张三:墨盒350/打印纸120;李四:订书机25/文件夹18;王五:打印纸60/白板笔40
+```
+
+**MERGE 库存对账（存在则同步，缺失则补建）**
+
+```sql
+CREATE TABLE StockTarget (Sku TEXT PRIMARY KEY, Need INT);
+CREATE TABLE StockActual (Sku TEXT PRIMARY KEY, Have INT);
+INSERT INTO StockTarget VALUES (N'A4纸', 100), (N'墨盒', 30), (N'订书机', 10);
+INSERT INTO StockActual VALUES (N'A4纸', 80), (N'墨盒', 50);
+MERGE INTO StockActual AS t USING StockTarget AS s ON t.Sku = s.Sku
+WHEN MATCHED THEN UPDATE SET Have = s.Need
+WHEN NOT MATCHED THEN INSERT (Sku, Have) VALUES (s.Sku, s.Need);
+-- → A4纸 100;墨盒 30;订书机 10(新插入)
+```
+
+**PIVOT 半年汇总 / UNPIVOT 宽表转窄表**
+
+```sql
+CREATE TABLE Sales (Region TEXT, Quarter TEXT, Amt INT);
+INSERT INTO Sales VALUES (N'北', 'Q1', 100), (N'北', 'Q2', 120), (N'南', 'Q1', 80), (N'南', 'Q2', 90);
+SELECT p.Region, p.Q1, p.Q2, p.Q1 + p.Q2 AS H1
+FROM Sales PIVOT (SUM(Amt) FOR Quarter IN ('Q1', 'Q2')) AS p
+ORDER BY p.Region;
+-- → 北 100|120|220;南 80|90|170
+CREATE TABLE StockWide (Sku TEXT, InStock INT, OnOrder INT);
+INSERT INTO StockWide VALUES (N'A4纸', 80, 20), (N'墨盒', 50, 8);
+SELECT u.Sku, u.State, u.Cnt
+FROM StockWide UNPIVOT (Cnt FOR State IN (InStock, OnOrder)) AS u
+ORDER BY u.Sku, u.State;
+-- → 每个库存量拆一行:A4纸 InStock 80 / OnOrder 20;墨盒 InStock 50 / OnOrder 8
+```
+
+**JSON 属性与标签拆解（APPLY × 表值函数）**
+
+```sql
+-- OUTER APPLY:无 Meta 的订单保留左行(右侧 NULL);CROSS APPLY 则整行剔除
+SELECT o.Id AS OrderId, j.[key] AS Attr, j.[value] AS Val
+FROM Orders AS o OUTER APPLY OPENJSON(o.Meta) AS j
+WHERE o.Id <= 3
+ORDER BY o.Id, Attr;
+-- → 订单1:color=白,size=A4;订单2:color=黑;订单3:NULL(无 JSON)
+SELECT c.Name AS Customer, s.value AS Tag
+FROM Customers AS c CROSS APPLY STRING_SPLIT(c.Tags, ',') AS s
+ORDER BY c.Name, s.value;
+-- → 张三:vip/批发;李四:零售;王五:vip/零售
+```
+
+**递归 CTE 组织架构路径**
+
+```sql
+CREATE TABLE Employees (Id INT PRIMARY KEY AUTOINCREMENT, Name TEXT NOT NULL, ManagerId INT);
+INSERT INTO Employees (Name, ManagerId) VALUES
+  (N'总经理', NULL), (N'副总A', 1), (N'副总B', 1), (N'部长A1', 2), (N'部长B1', 3), (N'专员A1a', 4);
+WITH Chain (Id, Name, ManagerId, Lvl, Path) AS (
+  SELECT Id, Name, ManagerId, 0, CAST(Name AS TEXT)
+  FROM Employees WHERE ManagerId IS NULL
+  UNION ALL
+  SELECT e.Id, e.Name, e.ManagerId, c.Lvl + 1, c.Path + N' / ' + e.Name
+  FROM Employees AS e JOIN Chain AS c ON e.ManagerId = c.Id
+)
+SELECT Lvl, Name, Path FROM Chain ORDER BY Path;
+-- → 0 总经理;1 副总A;2 部长A1;3 专员A1a(路径 总经理 / 副总A / 部长A1 / 专员A1a);1 副总B;2 部长B1
+```
+
+**跨表对账（UPDATE FROM / DELETE USING）**
+
+```sql
+UPDATE Orders SET Amount = Amount - 5
+FROM Customers AS c
+WHERE Orders.CustomerId = c.Id AND c.City = N'广州';
+-- → 2 rows affected(订单4:60→55;订单5:40→35)
+DELETE FROM Orders
+USING Customers AS c
+WHERE Orders.CustomerId = c.Id AND c.Tags LIKE N'%批发%';
+-- → 2 rows affected(张三的两笔订单整单删除)
+```
+
+**综合批处理：循环调价 + 逐类事务 + 错误回滚**
+
+每轮给一个客户的订单打 9 折并累计影响行数；调价后出现低于 20 的金额即 THROW，CATCH 回滚**该类**（其余类不受影响），已提交的类不受影响。`PRINT` 落在服务进程 stderr。
+
+```sql
+DECLARE @i INT = 1, @total INT = 0, @bad INT = 0, @n INT = 0;
+WHILE @i <= 3
+BEGIN
+  BEGIN TRY
+    BEGIN TRANSACTION;
+    UPDATE Orders SET Amount = CAST(Amount * 0.9 AS INT) WHERE CustomerId = @i;
+    SET @n = @@ROWCOUNT;
+    SELECT @bad = COUNT(*) FROM Orders WHERE CustomerId = @i AND Amount < 20;
+    IF @bad > 0 THROW 50010, N'调价后金额低于 20,回滚本类', 1;
+    SET @total = @total + @n;
+    COMMIT TRANSACTION;
+  END TRY
+  BEGIN CATCH
+    ROLLBACK TRANSACTION;
+    PRINT 'rolled back'
+  END CATCH;
+  SET @i = @i + 1;
+END;
+SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入)
+-- → 订单3/6 保持 25/18;订单4/5 已提交为 49/31
+```
+
 
 ## 不支持的语法
 
@@ -938,13 +1079,13 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 |---|---|
 | 窗口 | `WINDOW` 命名子句、`QUALIFY`、自定义窗口帧（`ROWS/RANGE/GROUPS BETWEEN …`） |
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
-| 连接 | `NATURAL JOIN`、`LATERAL` 派生表、表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
+| 连接 | `NATURAL JOIN`、`LATERAL` 派生表、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |
 | 子查询/CTE | 相关子查询（`APPLY` 子查询形式同此边界） |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
 | DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
-| T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、`@` 变量/参数、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`CROSS/OUTER APPLY`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
+| T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |
 
