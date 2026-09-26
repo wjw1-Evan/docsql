@@ -28050,6 +28050,20 @@ mod tsql_compat_tests {
         );
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0], vec![Value::Int(1), Value::Int(10)]);
+        // NULL JSON per left row: CROSS APPLY skips it, OUTER APPLY keeps
+        // the left row (an error here used to fail the whole statement).
+        run(&mut db, "INSERT INTO docs VALUES (2, NULL)");
+        let r = rows(
+            &mut db,
+            "SELECT d.id, j.[key] FROM docs AS d CROSS APPLY OPENJSON(d.body) AS j ORDER BY d.id",
+        );
+        assert_eq!(r.rows.len(), 2);
+        let r = rows(
+            &mut db,
+            "SELECT d.id, j.[key] FROM docs AS d OUTER APPLY OPENJSON(d.body) AS j ORDER BY d.id, j.[key]",
+        );
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[2], vec![Value::Int(2), Value::Null]);
         // APPLY over a subquery refuses loudly.
         assert!(db
             .execute("SELECT * FROM items AS i CROSS APPLY (SELECT i.id AS x) AS d")

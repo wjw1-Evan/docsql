@@ -2752,6 +2752,11 @@ fn openjson(args: &[Value]) -> Res<Vec<Object>> {
     if args.len() != 1 {
         return err("OPENJSON takes 1 argument (the WITH shape is not supported)");
     }
+    // NULL input yields an empty rowset (like STRING_SPLIT and T-SQL) — a
+    // nullable JSON column must not fail the whole APPLY per left row.
+    if matches!(args[0], Value::Null) {
+        return Ok(Vec::new());
+    }
     let Value::Str(text) = &args[0] else {
         return err("OPENJSON requires a text argument");
     };
@@ -4263,6 +4268,12 @@ mod tests {
             .unwrap()
             .is_err());
         assert!(table_function("OPENJSON", &[]).unwrap().is_err());
+        // NULL input is an empty rowset (STRING_SPLIT parity, T-SQL), so a
+        // CROSS APPLY over a nullable JSON column survives sparse rows.
+        assert!(table_function("OPENJSON", &[Value::Null])
+            .unwrap()
+            .unwrap()
+            .is_empty());
         assert!(table_function("OPENJSON", &[v_str("not json")])
             .unwrap()
             .is_err());

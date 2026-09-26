@@ -2219,6 +2219,80 @@ pub fn needs_interpretation(sql: &str) -> bool {
         if mentions_var(chunk) {
             return true;
         }
+        // Session-identity calls carry no `@` token, yet only the batch
+        // interpreter can substitute the connection's last identity — the
+        // engine's scalar path errors loudly. Route them here too.
+        if mentions_identity_fn(chunk) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `SCOPE_IDENTITY()`/`IDENT_CURRENT()` appears outside string
+/// literals/comments/bracketed identifiers, in the exact shape the
+/// interpreter substitutes (empty argument list, whitespace tolerated
+/// before the parens).
+fn mentions_identity_fn(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                let (end, _) = stmt::sql_literal_end(sql, i);
+                i = end;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            b'"' | b'`' | b'[' => {
+                let close = match b[i] {
+                    b'[' => b']',
+                    other => other,
+                };
+                i += 1;
+                while i < b.len() {
+                    if b[i] == close {
+                        if b.get(i + 1) == Some(&close) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let name = &sql.as_bytes()[start..i];
+                if !(name.eq_ignore_ascii_case(b"scope_identity")
+                    || name.eq_ignore_ascii_case(b"ident_current"))
+                {
+                    continue;
+                }
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'(') && b.get(j + 1) == Some(&b')') {
+                    return true;
+                }
+            }
+            _ => i += 1,
+        }
     }
     false
 }
@@ -2806,6 +2880,16 @@ mod tests {
         assert!(!needs_interpretation("SELECT [@x] FROM t"));
         assert!(!needs_interpretation("SELECT \"@x\""));
         assert!(!needs_interpretation("GO"));
+        // Session-identity calls need the interpreter even without any `@`
+        // token: only it substitutes the connection's last identity.
+        assert!(needs_interpretation("SELECT SCOPE_IDENTITY() AS i"));
+        assert!(needs_interpretation("select scope_identity () as i"));
+        assert!(needs_interpretation("SELECT IDENT_CURRENT() AS i"));
+        assert!(!needs_interpretation("SELECT 'SCOPE_IDENTITY()' AS i"));
+        assert!(!needs_interpretation("SELECT [SCOPE_IDENTITY()] FROM t"));
+        assert!(!needs_interpretation("SELECT /* SCOPE_IDENTITY() */ 1"));
+        assert!(!needs_interpretation("SELECT SCOPE_IDENTITY FROM t"));
+        assert!(!needs_interpretation("SELECT SCOPE_IDENTITY(x) FROM t"));
     }
 
     #[test]
@@ -2841,6 +2925,11 @@ mod tests {
         // A non-INSERT statement does not clear it (T-SQL keeps the value).
         run_script(&mut s, &mut db, "SELECT 1").unwrap();
         let out = run_script(&mut s, &mut db, "SELECT @@IDENTITY AS j").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(3));
+        // Bare SCOPE_IDENTITY() carries no `@` token — it must still route
+        // through the interpreter and read the session's last identity
+        // (routing it to the engine errors loudly instead).
+        let out = run_script(&mut s, &mut db, "SELECT SCOPE_IDENTITY() AS i").unwrap();
         assert_eq!(rows_of(&out)[0][0], Value::Int(3));
     }
 
