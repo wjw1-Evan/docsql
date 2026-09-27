@@ -870,6 +870,35 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
     }
 
     [Fact]
+    public void Navigation_Any_generates_correlated_exists()
+    {
+        Clean();
+        using (var db = NewDb())
+        {
+            db.Blogs.Add(new Blog
+            {
+                Title = "with-posts",
+                Posts = { new Post { Content = "hello world" }, new Post { Content = "meh" } },
+            });
+            db.Blogs.Add(new Blog { Title = "no-posts" });
+            db.SaveChanges();
+        }
+        using (var db = NewDb())
+        {
+            // 导航集合上的 Any() 由 EF 生成相关 EXISTS(内层引用外层
+            // Blog 的键),服务器逐行绑定外层行值求值。
+            var withHello = db.Blogs
+                .Where(b => b.Posts.Any(p => p.Content == "hello world")).ToList();
+            Assert.Single(withHello);
+            Assert.Equal("with-posts", withHello[0].Title);
+
+            var none = db.Blogs.Where(b => !b.Posts.Any()).ToList();
+            Assert.Single(none);
+            Assert.Equal("no-posts", none[0].Title);
+        }
+    }
+
+    [Fact]
     public void EnsureCreate_and_crud_roundtrip()
     {
         Clean();

@@ -895,17 +895,77 @@ impl Drop for ViewDepthGuard {
     }
 }
 
+/// Correlated-subquery evaluation budget. Each per-row correlated
+/// evaluation re-enters the engine's SELECT chain (a correlated subquery
+/// may itself contain one), so nesting depth costs real stack frames and
+/// quadratic work; anything past this depth is a pathological shape, not a
+/// query plan.
+const MAX_CORRELATED_DEPTH: usize = 8;
+
+thread_local! {
+    static CORR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CorrDepthGuard;
+
+fn enter_correlated_eval() -> Result<CorrDepthGuard> {
+    let entered = CORR_DEPTH.with(|d| {
+        let n = d.get();
+        if n < MAX_CORRELATED_DEPTH {
+            d.set(n + 1);
+            true
+        } else {
+            false
+        }
+    });
+    if entered {
+        Ok(CorrDepthGuard)
+    } else {
+        err(format!(
+            "correlated subquery nesting too deep (more than {MAX_CORRELATED_DEPTH} levels)"
+        ))
+    }
+}
+
+impl Drop for CorrDepthGuard {
+    fn drop(&mut self) {
+        CORR_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 impl<'a> ReadCx<'a> {
+    /// Evaluate one row-local expression; when it still holds subquery
+    /// nodes (correlated — the pre-pass left them), resolve the outer
+    /// references against this row first.
+    fn eval_row_expr(
+        &self,
+        e: &SqlExpr,
+        correlated: bool,
+        doc: &Object,
+        outer: &OuterFrom,
+    ) -> Result<Value> {
+        if correlated {
+            let mut row_local = e.clone();
+            self.subst_expr_row(&mut row_local, doc, outer)?;
+            eval_expr(&row_local, doc)
+        } else {
+            eval_expr(e, doc)
+        }
+    }
+
     /// ORDER BY + LIMIT/OFFSET. Sort keys resolve in order of preference to
     /// an output column name, an ordinal position (`ORDER BY 2`), or — when
     /// the caller supplies the source docs — an arbitrary expression
-    /// evaluated per row.
+    /// evaluated per row. `corr` supplies the outer scope for correlated
+    /// ORDER BY expressions (plain-select path only).
+    #[allow(clippy::too_many_arguments)]
     fn apply_order_limit(
         &self,
         query: Query,
         mut rows: Vec<Vec<Value>>,
         columns: &[String],
         docs: Option<Vec<Object>>,
+        corr: Option<&OuterFrom>,
     ) -> Result<Vec<Vec<Value>>> {
         // (column index, asc, nulls_first); hidden key columns appended for
         // ORDER BY expressions that are not output columns stay until the
@@ -935,9 +995,15 @@ impl<'a> ReadCx<'a> {
                             return err(format!("unknown ORDER BY key: {name}"));
                         }
                         // Evaluate the expression against each source doc and
-                        // append it as a hidden key column.
+                        // append it as a hidden key column. Correlated nodes
+                        // resolve their outer references per row (plain
+                        // path, which is the only caller passing docs).
+                        let sub = expr_has_subquery(&o.expr);
                         for (row, doc) in rows.iter_mut().zip(ds) {
-                            row.push(eval_expr(&o.expr, doc)?);
+                            row.push(match corr {
+                                Some(outer) => self.eval_row_expr(&o.expr, sub, doc, outer)?,
+                                None => eval_expr(&o.expr, doc)?,
+                            });
                         }
                         let col = columns.len() + extra_keys;
                         extra_keys += 1;
@@ -1710,7 +1776,7 @@ impl<'a> ReadCx<'a> {
                 out.push(row);
             }
         }
-        let out = self.apply_order_limit(query, out, &columns, None)?;
+        let out = self.apply_order_limit(query, out, &columns, None, None)?;
         Ok(ExecOutcome::Rows(QueryResult { columns, rows: out }))
     }
 
@@ -1801,6 +1867,14 @@ impl<'a> ReadCx<'a> {
             }
         }
         let mut out: Vec<Vec<Value>> = Vec::new();
+        // Correlated-subquery support: projection expressions still holding
+        // subquery nodes resolve their outer references per row.
+        let outer_from = {
+            let mut s = OuterFrom::new();
+            from_list_names(&select.from, &mut s);
+            s
+        };
+        let corr: Vec<bool> = project.iter().map(|(_, e)| expr_has_subquery(e)).collect();
         for doc in &docs {
             if want_star {
                 let mut row: Vec<Value> = columns_out
@@ -1810,13 +1884,13 @@ impl<'a> ReadCx<'a> {
                 // The trailing project.len() slots are the explicit exprs.
                 let base = columns_out.len() - project.len();
                 for (i, (_, e)) in project.iter().enumerate() {
-                    row[base + i] = eval_expr(e, doc)?;
+                    row[base + i] = self.eval_row_expr(e, corr[i], doc, &outer_from)?;
                 }
                 out.push(row);
             } else {
                 let mut row = Vec::with_capacity(project.len());
-                for (_, e) in &project {
-                    row.push(eval_expr(e, doc)?);
+                for (i, (_, e)) in project.iter().enumerate() {
+                    row.push(self.eval_row_expr(e, corr[i], doc, &outer_from)?);
                 }
                 out.push(row);
             }
@@ -1849,7 +1923,8 @@ impl<'a> ReadCx<'a> {
             None | Some(sqlparser::ast::Distinct::All) => {}
         }
         if !pre_windowed {
-            out = self.apply_order_limit(query, out, &columns_out, Some(docs))?;
+            out =
+                self.apply_order_limit(query, out, &columns_out, Some(docs), Some(&outer_from))?;
         }
         Ok(ExecOutcome::Rows(QueryResult {
             columns: columns_out,
@@ -2408,10 +2483,20 @@ impl<'a> ReadCx<'a> {
         ctes: &Ctes,
     ) -> Result<ExecOutcome> {
         reject_unsupported_select_clauses(&select)?;
+        // Outer scope for correlated subqueries: this level's FROM names and
+        // aliases. WHERE / projection / ORDER BY are row-local surfaces and
+        // may keep correlated nodes for per-row evaluation; JOIN ON, GROUP BY
+        // and HAVING evaluate outside a full row (partial join images, group
+        // images), where correlation must stay a loud error.
+        let outer_from = {
+            let mut s = OuterFrom::new();
+            from_list_names(&select.from, &mut s);
+            s
+        };
         // Resolve uncorrelated subqueries up front so the row-local
         // expression evaluator never sees them.
         if let Some(sel) = &mut select.selection {
-            self.subst_expr(sel)?;
+            self.subst_expr_scoped(sel, &outer_from, true)?;
         }
         // JOIN ON conditions can carry uncorrelated subqueries too
         // (`ON a.x = (SELECT MIN(y) FROM b)`); without the same substitution
@@ -2419,7 +2504,7 @@ impl<'a> ReadCx<'a> {
         for twj in &mut select.from {
             for j in &mut twj.joins {
                 if let Some(e) = join_on_expr_mut(&mut j.join_operator) {
-                    self.subst_expr(e)?;
+                    self.subst_expr_scoped(e, &outer_from, false)?;
                 }
             }
         }
@@ -2428,20 +2513,26 @@ impl<'a> ReadCx<'a> {
         if let Some(ob) = &mut query.order_by {
             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut ob.kind {
                 for o in exprs.iter_mut() {
-                    self.subst_expr(&mut o.expr)?;
+                    self.subst_expr_scoped(&mut o.expr, &outer_from, true)?;
                 }
             }
         }
         for item in &mut select.projection {
-            self.subst_item(item)?;
+            match item {
+                SelectItem::UnnamedExpr(e) => self.subst_expr_scoped(e, &outer_from, true)?,
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    self.subst_expr_scoped(expr, &outer_from, true)?
+                }
+                _ => {}
+            }
         }
         if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &mut select.group_by {
             for e in es {
-                self.subst_expr(e)?;
+                self.subst_expr_scoped(e, &outer_from, false)?;
             }
         }
         if let Some(having) = &mut select.having {
-            self.subst_expr(having)?;
+            self.subst_expr_scoped(having, &outer_from, false)?;
         }
 
         if select.from.is_empty() {
@@ -2586,7 +2677,7 @@ impl<'a> ReadCx<'a> {
         if !pre_windowed && select.selection.is_some() {
             let mut kept = Vec::with_capacity(rows.len());
             for doc in rows.drain(..) {
-                if self.matches(&select.selection, &doc)? {
+                if self.matches_in(&select.selection, &doc, &outer_from)? {
                     kept.push(doc);
                 }
             }
@@ -2720,7 +2811,7 @@ impl<'a> ReadCx<'a> {
                 }
                 // ORDER BY / LIMIT now apply to the combined result.
                 let cols = lr.columns.clone();
-                let rows = self.apply_order_limit(query, lr.rows, &cols, None)?;
+                let rows = self.apply_order_limit(query, lr.rows, &cols, None, None)?;
                 Ok(ExecOutcome::Rows(QueryResult {
                     columns: cols,
                     rows,
@@ -2748,7 +2839,7 @@ impl<'a> ReadCx<'a> {
                             .collect::<Result<Vec<_>>>()?,
                     );
                 }
-                let rows = self.apply_order_limit(query, rows, &columns, None)?;
+                let rows = self.apply_order_limit(query, rows, &columns, None, None)?;
                 Ok(ExecOutcome::Rows(QueryResult { columns, rows }))
             }
             SetExpr::Query(inner) => {
@@ -2939,20 +3030,41 @@ impl<'a> ReadCx<'a> {
         Ok(all)
     }
 
-    /// Substitute subqueries inside a projection item.
-    fn subst_item(&self, item: &mut SelectItem) -> Result<()> {
-        match item {
-            SelectItem::UnnamedExpr(e) => self.subst_expr(e),
-            SelectItem::ExprWithAlias { expr, .. } => self.subst_expr(expr),
-            _ => Ok(()),
-        }
-    }
-
     /// Rewrite uncorrelated subqueries inside `e` into row-local
     /// expressions (IN-lists / literals) before row iteration.
     fn subst_expr(&self, e: &mut SqlExpr) -> Result<()> {
+        self.subst_expr_scoped(e, &OuterFrom::new(), false)
+    }
+
+    /// [`subst_expr`] with an outer scope: `outer` names this query level's
+    /// FROM names/aliases, and `allow_rowcorr` marks the row-local surfaces
+    /// (WHERE / projection / ORDER BY / UPDATE·DELETE predicates and SET)
+    /// where a correlated subquery node may stay in place for per-row
+    /// evaluation. Everywhere else correlation must keep erroring loudly —
+    /// the row-local evaluator would read an outer column as NULL and
+    /// silently mis-filter (`NOT IN ()` over an empty list is vacuously
+    /// true, a row-deleting shape).
+    fn subst_expr_scoped(
+        &self,
+        e: &mut SqlExpr,
+        outer: &OuterFrom,
+        allow_rowcorr: bool,
+    ) -> Result<()> {
+        let corr = |q: &Query| query_mentions_outer(q, outer);
+        let reject = || {
+            err(
+                "correlated subqueries are not supported here \
+                 (supported: WHERE / SELECT projection / ORDER BY / UPDATE·DELETE predicates and SET)",
+            )
+        };
         match e {
             SqlExpr::Subquery(q) => {
+                if corr(q) {
+                    if allow_rowcorr {
+                        return Ok(());
+                    }
+                    return reject();
+                }
                 let r = self.subquery_result(q)?;
                 let v = r
                     .rows
@@ -2966,6 +3078,12 @@ impl<'a> ReadCx<'a> {
                 subquery,
                 negated,
             } => {
+                if corr(subquery) {
+                    if allow_rowcorr {
+                        return self.subst_expr_scoped(expr, outer, allow_rowcorr);
+                    }
+                    return reject();
+                }
                 let r = self.subquery_result(subquery)?;
                 let list = r
                     .rows
@@ -2979,6 +3097,12 @@ impl<'a> ReadCx<'a> {
                 };
             }
             SqlExpr::Exists { subquery, negated } => {
+                if corr(subquery) {
+                    if allow_rowcorr {
+                        return Ok(());
+                    }
+                    return reject();
+                }
                 let r = self.subquery_result(subquery)?;
                 *e = value_to_literal(Value::Bool(!r.rows.is_empty() != *negated))?;
             }
@@ -2988,10 +3112,16 @@ impl<'a> ReadCx<'a> {
                 right,
                 ..
             } => {
-                self.subst_expr(left)?;
+                self.subst_expr_scoped(left, outer, allow_rowcorr)?;
                 let SqlExpr::Subquery(q) = right.as_ref() else {
                     return err("ANY/ALL requires a subquery operand");
                 };
+                if corr(q) {
+                    if allow_rowcorr {
+                        return Ok(());
+                    }
+                    return reject();
+                }
                 if *compare_op == sqlparser::ast::BinaryOperator::Eq {
                     // `= ANY` is an IN list: cheaper than an OR chain and
                     // the shape the planner already understands.
@@ -3015,45 +3145,51 @@ impl<'a> ReadCx<'a> {
                 compare_op,
                 right,
             } => {
-                self.subst_expr(left)?;
+                self.subst_expr_scoped(left, outer, allow_rowcorr)?;
                 let SqlExpr::Subquery(q) = right.as_ref() else {
                     return err("ANY/ALL requires a subquery operand");
                 };
+                if corr(q) {
+                    if allow_rowcorr {
+                        return Ok(());
+                    }
+                    return reject();
+                }
                 *e = self.quantified_chain(q, left, compare_op, false)?;
             }
             // Recurse into composite expressions.
             SqlExpr::BinaryOp { left, right, .. } => {
-                self.subst_expr(left)?;
-                self.subst_expr(right)?;
+                self.subst_expr_scoped(left, outer, allow_rowcorr)?;
+                self.subst_expr_scoped(right, outer, allow_rowcorr)?;
             }
-            SqlExpr::UnaryOp { expr, .. } => self.subst_expr(expr)?,
-            SqlExpr::Nested(inner) => self.subst_expr(inner)?,
+            SqlExpr::UnaryOp { expr, .. } => self.subst_expr_scoped(expr, outer, allow_rowcorr)?,
+            SqlExpr::Nested(inner) => self.subst_expr_scoped(inner, outer, allow_rowcorr)?,
             SqlExpr::Between {
                 expr, low, high, ..
             } => {
-                self.subst_expr(expr)?;
-                self.subst_expr(low)?;
-                self.subst_expr(high)?;
+                self.subst_expr_scoped(expr, outer, allow_rowcorr)?;
+                self.subst_expr_scoped(low, outer, allow_rowcorr)?;
+                self.subst_expr_scoped(high, outer, allow_rowcorr)?;
             }
             SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
-                self.subst_expr(l)?;
-                self.subst_expr(r)?;
+                self.subst_expr_scoped(l, outer, allow_rowcorr)?;
+                self.subst_expr_scoped(r, outer, allow_rowcorr)?;
             }
             SqlExpr::Rollup(groups) | SqlExpr::Cube(groups) | SqlExpr::GroupingSets(groups) => {
                 for g in groups {
                     for e in g {
-                        self.subst_expr(e)?;
+                        self.subst_expr_scoped(e, outer, allow_rowcorr)?;
                     }
                 }
             }
             SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
-                self.subst_expr(expr)?;
-                self.subst_expr(pattern)?;
+                self.subst_expr_scoped(expr, outer, allow_rowcorr)?;
+                self.subst_expr_scoped(pattern, outer, allow_rowcorr)?;
             }
             SqlExpr::InList { expr, list, .. } => {
-                self.subst_expr(expr)?;
+                self.subst_expr_scoped(expr, outer, allow_rowcorr)?;
                 for item in list {
-                    self.subst_expr(item)?;
+                    self.subst_expr_scoped(item, outer, allow_rowcorr)?;
                 }
             }
             SqlExpr::Case {
@@ -3063,17 +3199,17 @@ impl<'a> ReadCx<'a> {
                 ..
             } => {
                 if let Some(op) = operand {
-                    self.subst_expr(op)?;
+                    self.subst_expr_scoped(op, outer, allow_rowcorr)?;
                 }
                 for w in conditions.iter_mut() {
-                    self.subst_expr(&mut w.condition)?;
-                    self.subst_expr(&mut w.result)?;
+                    self.subst_expr_scoped(&mut w.condition, outer, allow_rowcorr)?;
+                    self.subst_expr_scoped(&mut w.result, outer, allow_rowcorr)?;
                 }
                 if let Some(el) = else_result {
-                    self.subst_expr(el)?;
+                    self.subst_expr_scoped(el, outer, allow_rowcorr)?;
                 }
             }
-            SqlExpr::Cast { expr, .. } => self.subst_expr(expr)?,
+            SqlExpr::Cast { expr, .. } => self.subst_expr_scoped(expr, outer, allow_rowcorr)?,
             SqlExpr::Function(f) => {
                 if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
                     for a in &mut list.args {
@@ -3081,12 +3217,104 @@ impl<'a> ReadCx<'a> {
                             sqlparser::ast::FunctionArgExpr::Expr(inner),
                         ) = a
                         {
-                            self.subst_expr(inner)?;
+                            self.subst_expr_scoped(inner, outer, allow_rowcorr)?;
                         }
                     }
                 }
                 if let Some(filter) = &mut f.filter {
-                    self.subst_expr(filter)?;
+                    self.subst_expr_scoped(filter, outer, allow_rowcorr)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Per-row resolution of the correlated subquery nodes the pre-pass
+    /// left in place: substitute outer references with this row's values
+    /// (precise scoping — inner FROM names shadow the outer scope), then
+    /// run the standard once-eval substitution over the now-self-contained
+    /// node. Non-correlated leftovers (nested one level below a skipped
+    /// node) resolve through the same delegation.
+    fn subst_expr_row(&self, e: &mut SqlExpr, doc: &Object, outer: &OuterFrom) -> Result<()> {
+        let resolve_node = |e: &mut SqlExpr| -> Result<()> {
+            let _g = enter_correlated_eval()?;
+            if let Some(q) = subquery_of_mut(e) {
+                self.deadline.check()?;
+                subst_outer_refs_query(q, &OuterFrom::new(), outer, doc);
+            }
+            self.subst_expr(e)
+        };
+        match e {
+            SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => resolve_node(e)?,
+            SqlExpr::InSubquery { expr, .. } => {
+                // The left side may itself nest a correlated subquery.
+                self.subst_expr_row(expr, doc, outer)?;
+                resolve_node(e)?;
+            }
+            SqlExpr::AnyOp { left, .. } | SqlExpr::AllOp { left, .. } => {
+                self.subst_expr_row(left, doc, outer)?;
+                resolve_node(e)?;
+            }
+            // Same composite recursion as the pre-pass.
+            SqlExpr::BinaryOp { left, right, .. } => {
+                self.subst_expr_row(left, doc, outer)?;
+                self.subst_expr_row(right, doc, outer)?;
+            }
+            SqlExpr::UnaryOp { expr, .. } => self.subst_expr_row(expr, doc, outer)?,
+            SqlExpr::Nested(inner) => self.subst_expr_row(inner, doc, outer)?,
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                self.subst_expr_row(expr, doc, outer)?;
+                self.subst_expr_row(low, doc, outer)?;
+                self.subst_expr_row(high, doc, outer)?;
+            }
+            SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+                self.subst_expr_row(l, doc, outer)?;
+                self.subst_expr_row(r, doc, outer)?;
+            }
+            SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+                self.subst_expr_row(expr, doc, outer)?;
+                self.subst_expr_row(pattern, doc, outer)?;
+            }
+            SqlExpr::InList { expr, list, .. } => {
+                self.subst_expr_row(expr, doc, outer)?;
+                for item in list {
+                    self.subst_expr_row(item, doc, outer)?;
+                }
+            }
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    self.subst_expr_row(op, doc, outer)?;
+                }
+                for w in conditions.iter_mut() {
+                    self.subst_expr_row(&mut w.condition, doc, outer)?;
+                    self.subst_expr_row(&mut w.result, doc, outer)?;
+                }
+                if let Some(el) = else_result {
+                    self.subst_expr_row(el, doc, outer)?;
+                }
+            }
+            SqlExpr::Cast { expr, .. } => self.subst_expr_row(expr, doc, outer)?,
+            SqlExpr::Function(f) => {
+                if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                    for a in &mut list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) = a
+                        {
+                            self.subst_expr_row(inner, doc, outer)?;
+                        }
+                    }
+                }
+                if let Some(filter) = &mut f.filter {
+                    self.subst_expr_row(filter, doc, outer)?;
                 }
             }
             _ => {}
@@ -3209,10 +3437,25 @@ impl<'a> ReadCx<'a> {
         }
     }
 
-    fn matches(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
+    /// Row filter with correlated-subquery support: `outer` names the
+    /// enclosing FROM scopes whose row values `doc` carries. A selection
+    /// still holding subquery nodes at row time means the pre-pass skipped
+    /// them as correlated — substitute this row's outer values, then
+    /// evaluate.
+    fn matches_in(
+        &self,
+        selection: &Option<SqlExpr>,
+        doc: &Object,
+        outer: &OuterFrom,
+    ) -> Result<bool> {
         self.deadline.check()?;
         match selection {
             None => Ok(true),
+            Some(e) if expr_has_subquery(e) => {
+                let mut row_local = e.clone();
+                self.subst_expr_row(&mut row_local, doc, outer)?;
+                Ok(matches!(eval_expr(&row_local, doc)?, Value::Bool(true)))
+            }
             Some(e) => Ok(matches!(eval_expr(e, doc)?, Value::Bool(true))),
         }
     }
@@ -3944,6 +4187,13 @@ impl<'a> ReadCx<'a> {
             return Ok(None);
         };
         let tname = obj_name(name);
+        // Outer scope for correlated subqueries in a non-exact residual
+        // filter (an EXISTS conjunct makes every probe inexact).
+        let outer_from = {
+            let mut set = OuterFrom::new();
+            from_list_names(from, &mut set);
+            set
+        };
         if is_compat_view(&tname) {
             return Ok(None);
         }
@@ -4083,7 +4333,7 @@ impl<'a> ReadCx<'a> {
             let Some(doc) = heap.doc_at(&reader, loc)? else {
                 continue;
             };
-            if !exact && !self.matches(selection, &doc)? {
+            if !exact && !self.matches_in(selection, &doc, &outer_from)? {
                 continue;
             }
             if skipped < skip {
@@ -5284,8 +5534,11 @@ impl Database {
     fn table_pairs_cx(&self, table: &str) -> Result<Vec<(u64, Object)>> {
         self.read_cx().table_pairs(table)
     }
-    fn subst_expr_cx(&self, e: &mut SqlExpr) -> Result<()> {
-        self.read_cx().subst_expr(e)
+    /// Write-path pre-pass with the outer scope of the target statement
+    /// (UPDATE/DELETE target + FROM/USING tables): correlated subqueries on
+    /// row-local surfaces (WHERE, SET) stay in place for per-row evaluation.
+    fn subst_expr_cx_scoped(&self, e: &mut SqlExpr, outer: &OuterFrom) -> Result<()> {
+        self.read_cx().subst_expr_scoped(e, outer, true)
     }
     fn index_probe_cx(
         &self,
@@ -5296,8 +5549,30 @@ impl Database {
     ) -> Result<Option<Vec<(u64, Object)>>> {
         self.read_cx().index_probe(table, alias, selection, ctes)
     }
-    fn matches_cx(&self, selection: &Option<SqlExpr>, doc: &Object) -> Result<bool> {
-        self.read_cx().matches(selection, doc)
+    fn matches_cx_in(
+        &self,
+        selection: &Option<SqlExpr>,
+        doc: &Object,
+        outer: &OuterFrom,
+    ) -> Result<bool> {
+        self.read_cx().matches_in(selection, doc, outer)
+    }
+    /// [`eval_assignments`] with correlated-subquery support: SET values
+    /// still holding subquery nodes resolve their outer references per row.
+    fn eval_assignments_cx(
+        &self,
+        assignments: &[sqlparser::ast::Assignment],
+        doc: &Object,
+        outer: &OuterFrom,
+    ) -> Result<Vec<(String, Value)>> {
+        if !assignments.iter().any(|a| expr_has_subquery(&a.value)) {
+            return eval_assignments(assignments, doc);
+        }
+        let mut subst = assignments.to_vec();
+        for a in &mut subst {
+            self.read_cx().subst_expr_row(&mut a.value, doc, outer)?;
+        }
+        eval_assignments(&subst, doc)
     }
     fn load_from_cx(
         &self,
@@ -6882,12 +7157,6 @@ impl Database {
         mut selection: Option<SqlExpr>,
         update_returning: Option<Vec<SelectItem>>,
     ) -> Result<ExecOutcome> {
-        for a in &mut assignments {
-            self.subst_expr_cx(&mut a.value)?;
-        }
-        if let Some(sel) = &mut selection {
-            self.subst_expr_cx(sel)?;
-        }
         let sqlparser::ast::TableFactor::Table { name, alias, .. } = table.relation else {
             return err("only simple table names in UPDATE");
         };
@@ -6907,6 +7176,26 @@ impl Database {
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
+        // Outer scope for correlated subqueries: the target (name + alias)
+        // plus the FROM tables (the FROM form evaluates WHERE/SET over the
+        // merged image).
+        let mut outer = OuterFrom::new();
+        outer.insert(tname.clone());
+        outer.insert(tkey.clone());
+        if let Some(kind) = &from {
+            match kind {
+                sqlparser::ast::UpdateTableFromKind::BeforeSet(twjs)
+                | sqlparser::ast::UpdateTableFromKind::AfterSet(twjs) => {
+                    from_list_names(twjs, &mut outer);
+                }
+            }
+        }
+        for a in &mut assignments {
+            self.subst_expr_cx_scoped(&mut a.value, &outer)?;
+        }
+        if let Some(sel) = &mut selection {
+            self.subst_expr_cx_scoped(sel, &outer)?;
+        }
         let mut meta = self
             .tables
             .get(&tname)
@@ -6926,6 +7215,7 @@ impl Database {
                     &assignments,
                     &selection,
                     &update_returning,
+                    &outer,
                 );
             }
         }
@@ -6939,9 +7229,9 @@ impl Database {
                 let mut old_changed: Vec<Object> = Vec::new();
                 let mut count = 0u64;
                 for doc in docs {
-                    if self.matches_cx(&selection, &doc)? {
+                    if self.matches_cx_in(&selection, &doc, &outer)? {
                         old_changed.push(doc.clone());
-                        let new_vals = eval_assignments(&assignments, &doc)?;
+                        let new_vals = self.eval_assignments_cx(&assignments, &doc, &outer)?;
                         let mut doc = doc;
                         for (col_name, v) in new_vals {
                             doc.insert(col_name, v);
@@ -6995,11 +7285,11 @@ impl Database {
                     if updates.contains_key(&key) {
                         continue; // first qualifying match wins
                     }
-                    if !self.matches_cx(&selection, m)? {
+                    if !self.matches_cx_in(&selection, m, &outer)? {
                         continue;
                     }
                     old_changed.push(tdoc.clone());
-                    let new_vals = eval_assignments(&assignments, m)?;
+                    let new_vals = self.eval_assignments_cx(&assignments, m, &outer)?;
                     let mut tdoc = tdoc;
                     for (col_name, v) in new_vals {
                         tdoc.insert(col_name, v);
@@ -7047,10 +7337,11 @@ impl Database {
         assignments: &[sqlparser::ast::Assignment],
         selection: &Option<SqlExpr>,
         update_returning: &Option<Vec<SelectItem>>,
+        outer: &OuterFrom,
     ) -> Result<ExecOutcome> {
         let mut updates: Vec<(u64, Object, Object)> = Vec::new(); // (loc, old, new)
         for (loc, doc) in matches {
-            if !self.matches_cx(selection, &doc)? {
+            if !self.matches_cx_in(selection, &doc, outer)? {
                 continue; // probe col matched; some other conjunct did not
             }
             let mut doc = doc;
@@ -7058,7 +7349,7 @@ impl Database {
             // it drives the old-key removal in the apply loop below; pushing
             // the mutated doc as both old and new leaves stale entries.
             let old_doc = doc.clone();
-            let new_vals = eval_assignments(assignments, &doc)?;
+            let new_vals = self.eval_assignments_cx(assignments, &doc, outer)?;
             for (col_name, v) in new_vals {
                 doc.insert(col_name, v);
             }
@@ -7234,9 +7525,6 @@ impl Database {
         mut selection: Option<SqlExpr>,
         returning: Option<Vec<SelectItem>>,
     ) -> Result<ExecOutcome> {
-        if let Some(sel) = &mut selection {
-            self.subst_expr_cx(sel)?;
-        }
         let sqlparser::ast::FromTable::WithFromKeyword(tables) = from else {
             return err("unsupported DELETE form");
         };
@@ -7263,6 +7551,18 @@ impl Database {
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
+        // Outer scope for correlated subqueries: the target (name + alias)
+        // plus the USING tables (the USING form evaluates WHERE over the
+        // merged image).
+        let mut outer = OuterFrom::new();
+        outer.insert(tname.clone());
+        outer.insert(tkey.clone());
+        if let Some(using) = &using {
+            from_list_names(using, &mut outer);
+        }
+        if let Some(sel) = &mut selection {
+            self.subst_expr_cx_scoped(sel, &outer)?;
+        }
         let mut meta = self
             .tables
             .get(&tname)
@@ -7275,7 +7575,7 @@ impl Database {
             if let Some(matches) =
                 self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &Ctes::new())?
             {
-                return self.exec_delete_fast(tname, meta, matches, &selection, &returning);
+                return self.exec_delete_fast(tname, meta, matches, &selection, &returning, &outer);
             }
         }
         let docs = self.table_docs_cx(&tname)?;
@@ -7288,7 +7588,7 @@ impl Database {
             let prefix = format!("{tkey}.");
             let mut rm: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
             for m in &merged {
-                if !self.matches_cx(&selection, m)? {
+                if !self.matches_cx_in(&selection, m, &outer)? {
                     continue;
                 }
                 let tdoc = target_doc_from_merged(m, &prefix);
@@ -7308,7 +7608,7 @@ impl Database {
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for doc in docs {
-                if self.matches_cx(&selection, &doc)? {
+                if self.matches_cx_in(&selection, &doc, &outer)? {
                     removed.push(doc);
                 } else {
                     kept.push(doc);
@@ -7332,10 +7632,11 @@ impl Database {
         matches: Vec<(u64, Object)>,
         selection: &Option<SqlExpr>,
         returning: &Option<Vec<SelectItem>>,
+        outer: &OuterFrom,
     ) -> Result<ExecOutcome> {
         let mut targets: Vec<(u64, Object)> = Vec::new();
         for (loc, doc) in matches {
-            if self.matches_cx(selection, &doc)? {
+            if self.matches_cx_in(selection, &doc, outer)? {
                 targets.push((loc, doc));
             }
         }
@@ -11196,6 +11497,83 @@ fn calls_newid(e: &SqlExpr) -> bool {
                 || else_result.as_deref().is_some_and(calls_newid)
         }
         SqlExpr::Cast { expr, .. } => calls_newid(expr),
+        // Subqueries must recurse too: a NEWID() inside a subquery of an
+        // UPDATE/DELETE/MERGE predicate would evaluate per node on replay
+        // and silently diverge replicas — the same reason the statement is
+        // rejected at the top level.
+        SqlExpr::Subquery(q) | SqlExpr::Exists { subquery: q, .. } => query_calls_newid(q),
+        SqlExpr::InSubquery { expr, subquery, .. } => {
+            calls_newid(expr) || query_calls_newid(subquery)
+        }
+        SqlExpr::AnyOp { left, right, .. } | SqlExpr::AllOp { left, right, .. } => {
+            calls_newid(left) || calls_newid(right)
+        }
+        _ => false,
+    }
+}
+
+/// `calls_newid` over every scope-local surface of a query (mirrors the
+/// outer-reference walkers' surface set).
+fn query_calls_newid(q: &Query) -> bool {
+    if let Some(w) = &q.with {
+        for cte in &w.cte_tables {
+            if query_calls_newid(&cte.query) {
+                return true;
+            }
+        }
+    }
+    if setexpr_calls_newid(&q.body) {
+        return true;
+    }
+    if let Some(ob) = &q.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+            if exprs.iter().any(|o| calls_newid(&o.expr)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn setexpr_calls_newid(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(sel) => {
+            for twj in &sel.from {
+                for j in &twj.joins {
+                    if let Some(e) = join_on_expr(&j.join_operator) {
+                        if calls_newid(e) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if sel.selection.as_ref().is_some_and(calls_newid) {
+                return true;
+            }
+            if sel.having.as_ref().is_some_and(calls_newid) {
+                return true;
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &sel.group_by {
+                if es.iter().any(calls_newid) {
+                    return true;
+                }
+            }
+            sel.projection.iter().any(|item| match item {
+                sqlparser::ast::SelectItem::UnnamedExpr(e)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => calls_newid(e),
+                _ => false,
+            })
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            setexpr_calls_newid(left) || setexpr_calls_newid(right)
+        }
+        SetExpr::Query(inner) => query_calls_newid(inner),
+        SetExpr::Values(rows) => rows
+            .rows
+            .iter()
+            .flat_map(|parens| parens.content.iter())
+            .any(calls_newid),
         _ => false,
     }
 }
@@ -12257,25 +12635,485 @@ fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
 /// qualified references to anything else can be flagged as correlated.
 fn collect_from_names(q: &Query, out: &mut std::collections::BTreeSet<String>) {
     if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
-        for twj in &sel.from {
-            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &twj.relation {
+        from_list_names(&sel.from, out);
+    }
+}
+
+/// FROM names + aliases of a FROM list — the qualifiers legal at that query
+/// level, and the outer scope a correlated subquery may reference.
+fn from_list_names(from: &[sqlparser::ast::TableWithJoins], out: &mut OuterFrom) {
+    for twj in from {
+        if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &twj.relation {
+            out.insert(obj_name(name));
+            if let Some(a) = alias {
+                out.insert(a.name.value.clone());
+            }
+        }
+        // Joined tables are inner-scope names too: a reference to them
+        // from inside the subquery is NOT a correlation (the old
+        // base-relation-only scan misrejected legitimate subqueries).
+        for j in &twj.joins {
+            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &j.relation {
                 out.insert(obj_name(name));
                 if let Some(a) = alias {
                     out.insert(a.name.value.clone());
                 }
             }
-            // Joined tables are inner-scope names too: a reference to them
-            // from inside the subquery is NOT a correlation (the old
-            // base-relation-only scan misrejected legitimate subqueries).
-            for j in &twj.joins {
-                if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &j.relation {
-                    out.insert(obj_name(name));
-                    if let Some(a) = alias {
-                        out.insert(a.name.value.clone());
+        }
+    }
+}
+
+/// The outer scope of a query level: its FROM names and aliases. A
+/// correlated subquery's outer references must be qualified with one of
+/// these (`alias.col` / `table.col`); unqualified outer references stay
+/// out of scope on purpose — in a schemaless engine "inner doc lacks the
+/// field" and "outer column" are indistinguishable, so binding misses to
+/// the outer row would silently change sparse-document semantics.
+type OuterFrom = std::collections::BTreeSet<String>;
+
+/// Does `e` contain a subquery-bearing node anywhere (the shapes the
+/// pre-pass resolves)? Row-local sites use this to decide whether the
+/// per-row correlated pass must run.
+fn expr_has_subquery(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Subquery(_)
+        | SqlExpr::InSubquery { .. }
+        | SqlExpr::Exists { .. }
+        | SqlExpr::AnyOp { .. }
+        | SqlExpr::AllOp { .. } => true,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_has_subquery(left) || expr_has_subquery(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } => expr_has_subquery(expr),
+        SqlExpr::Nested(inner) => expr_has_subquery(inner),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            expr_has_subquery(l) || expr_has_subquery(r)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            expr_has_subquery(expr) || expr_has_subquery(pattern)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_has_subquery)
+                || conditions
+                    .iter()
+                    .any(|w| expr_has_subquery(&w.condition) || expr_has_subquery(&w.result))
+                || else_result.as_deref().is_some_and(expr_has_subquery)
+        }
+        SqlExpr::Cast { expr, .. } => expr_has_subquery(expr),
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                if list.args.iter().any(|a| {
+                    matches!(
+                        a,
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner)
+                        ) if expr_has_subquery(inner)
+                    )
+                }) {
+                    return true;
+                }
+            }
+            f.filter.as_ref().is_some_and(|flt| expr_has_subquery(flt))
+        }
+        _ => false,
+    }
+}
+
+/// Conservative correlation probe: any qualified reference in `e` whose
+/// qualifier belongs to `outer`. Deliberately ignores inner-FROM shadowing
+/// — a false positive only routes the node through the per-row path (the
+/// substitution itself scopes precisely), while a false negative would
+/// silently read the outer column as NULL.
+fn expr_mentions_outer(e: &SqlExpr, outer: &OuterFrom) -> bool {
+    match e {
+        SqlExpr::CompoundIdentifier(parts) => parts.len() >= 2 && outer.contains(&parts[0].value),
+        SqlExpr::Subquery(q) => query_mentions_outer(q, outer),
+        SqlExpr::InSubquery { expr, subquery, .. } => {
+            expr_mentions_outer(expr, outer) || query_mentions_outer(subquery, outer)
+        }
+        SqlExpr::Exists { subquery, .. } => query_mentions_outer(subquery, outer),
+        SqlExpr::AnyOp { left, right, .. } | SqlExpr::AllOp { left, right, .. } => {
+            expr_mentions_outer(left, outer) || expr_mentions_outer(right, outer)
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_mentions_outer(left, outer) || expr_mentions_outer(right, outer)
+        }
+        SqlExpr::UnaryOp { expr, .. } => expr_mentions_outer(expr, outer),
+        SqlExpr::Nested(inner) => expr_mentions_outer(inner, outer),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_mentions_outer(expr, outer)
+                || expr_mentions_outer(low, outer)
+                || expr_mentions_outer(high, outer)
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            expr_mentions_outer(l, outer) || expr_mentions_outer(r, outer)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            expr_mentions_outer(expr, outer) || expr_mentions_outer(pattern, outer)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            expr_mentions_outer(expr, outer) || list.iter().any(|e| expr_mentions_outer(e, outer))
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_mentions_outer(o, outer))
+                || conditions.iter().any(|w| {
+                    expr_mentions_outer(&w.condition, outer)
+                        || expr_mentions_outer(&w.result, outer)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|o| expr_mentions_outer(o, outer))
+        }
+        SqlExpr::Cast { expr, .. } => expr_mentions_outer(expr, outer),
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                if list.args.iter().any(|a| {
+                    matches!(
+                        a,
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner)
+                        ) if expr_mentions_outer(inner, outer)
+                    )
+                }) {
+                    return true;
+                }
+            }
+            f.filter
+                .as_ref()
+                .is_some_and(|flt| expr_mentions_outer(flt, outer))
+        }
+        _ => false,
+    }
+}
+
+/// `expr_mentions_outer` over a query: every surface that evaluates in the
+/// query's own scope (mirrors `collect_correlated_in_body` plus ORDER BY).
+fn query_mentions_outer(q: &Query, outer: &OuterFrom) -> bool {
+    if let Some(w) = &q.with {
+        for cte in &w.cte_tables {
+            if query_mentions_outer(&cte.query, outer) {
+                return true;
+            }
+        }
+    }
+    if body_mentions_outer(&q.body, outer) {
+        return true;
+    }
+    if let Some(ob) = &q.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+            if exprs.iter().any(|o| expr_mentions_outer(&o.expr, outer)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn body_mentions_outer(body: &sqlparser::ast::SetExpr, outer: &OuterFrom) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(sel) => {
+            for twj in &sel.from {
+                for j in &twj.joins {
+                    if let Some(e) = join_on_expr(&j.join_operator) {
+                        if expr_mentions_outer(e, outer) {
+                            return true;
+                        }
                     }
                 }
             }
+            if sel
+                .selection
+                .as_ref()
+                .is_some_and(|e| expr_mentions_outer(e, outer))
+            {
+                return true;
+            }
+            if sel
+                .having
+                .as_ref()
+                .is_some_and(|e| expr_mentions_outer(e, outer))
+            {
+                return true;
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &sel.group_by {
+                if es.iter().any(|e| expr_mentions_outer(e, outer)) {
+                    return true;
+                }
+            }
+            sel.projection.iter().any(|item| match item {
+                sqlparser::ast::SelectItem::UnnamedExpr(e)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                    expr_mentions_outer(e, outer)
+                }
+                _ => false,
+            })
         }
+        SetExpr::SetOperation { left, right, .. } => {
+            body_mentions_outer(left, outer) || body_mentions_outer(right, outer)
+        }
+        SetExpr::Query(inner) => query_mentions_outer(inner, outer),
+        SetExpr::Values(rows) => rows
+            .rows
+            .iter()
+            .flat_map(|parens| parens.content.iter())
+            .any(|e| expr_mentions_outer(e, outer)),
+        _ => false,
+    }
+}
+
+/// The subquery payload of a subquery-bearing node (`Subquery`,
+/// `InSubquery`, `Exists`, `ANY/ALL right side), for per-row outer-ref
+/// substitution.
+fn subquery_of_mut(e: &mut SqlExpr) -> Option<&mut Query> {
+    match e {
+        SqlExpr::Subquery(q) => Some(q),
+        SqlExpr::InSubquery { subquery, .. } => Some(subquery),
+        SqlExpr::Exists { subquery, .. } => Some(subquery),
+        SqlExpr::AnyOp { right, .. } | SqlExpr::AllOp { right, .. } => match right.as_mut() {
+            SqlExpr::Subquery(q) => Some(q),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Outer-row value for a correlated reference: the enclosing row carries
+/// `alias.col` keys when joined, bare `col` keys for a solo base table —
+/// the same resolution conventions `eval_expr` applies to the outer query
+/// itself. A missing column reads as NULL (schemaless semantics).
+fn outer_row_value(doc: &Object, qualifier: &str, rest: &[sqlparser::ast::Ident]) -> Value {
+    let rest = rest
+        .iter()
+        .map(|i| i.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let full = format!("{qualifier}.{rest}");
+    match lookup_col(doc, &full) {
+        Ok(Value::Null) => lookup_col(doc, &rest).unwrap_or(Value::Null),
+        v => v.unwrap_or(Value::Null),
+    }
+}
+
+/// Substitute outer references in `e` with literals from the enclosing row
+/// `doc`. Precise SQL scoping: names in `shadow` (the inner FROM names at
+/// this nesting level) win over `outer`. Returns true when at least one
+/// reference was substituted.
+fn subst_outer_refs_expr(
+    e: &mut SqlExpr,
+    shadow: &OuterFrom,
+    outer: &OuterFrom,
+    doc: &Object,
+) -> bool {
+    let mut hit = false;
+    match e {
+        SqlExpr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let qualifier = parts[0].value.clone();
+            if !shadow.contains(&qualifier) && outer.contains(&qualifier) {
+                let v = outer_row_value(doc, &qualifier, &parts[1..]);
+                hit = true;
+                *e = match value_to_literal(v) {
+                    Ok(lit) => lit,
+                    // Only exotic values fail to render (out-of-domain
+                    // timestamps); NULL is the honest row-local answer.
+                    Err(_) => SqlExpr::Value(sqlparser::ast::Value::Null.into()),
+                };
+            }
+        }
+        SqlExpr::Subquery(q) => {
+            hit = subst_outer_refs_query(q, shadow, outer, doc);
+        }
+        SqlExpr::InSubquery { expr, subquery, .. } => {
+            hit = subst_outer_refs_expr(expr, shadow, outer, doc);
+            hit |= subst_outer_refs_query(subquery, shadow, outer, doc);
+        }
+        SqlExpr::Exists { subquery, .. } => {
+            hit = subst_outer_refs_query(subquery, shadow, outer, doc);
+        }
+        SqlExpr::AnyOp { left, right, .. } | SqlExpr::AllOp { left, right, .. } => {
+            hit = subst_outer_refs_expr(left, shadow, outer, doc);
+            hit |= subst_outer_refs_expr(right, shadow, outer, doc);
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            hit = subst_outer_refs_expr(left, shadow, outer, doc);
+            hit |= subst_outer_refs_expr(right, shadow, outer, doc);
+        }
+        SqlExpr::UnaryOp { expr, .. } => hit = subst_outer_refs_expr(expr, shadow, outer, doc),
+        SqlExpr::Nested(inner) => hit = subst_outer_refs_expr(inner, shadow, outer, doc),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            hit = subst_outer_refs_expr(expr, shadow, outer, doc);
+            hit |= subst_outer_refs_expr(low, shadow, outer, doc);
+            hit |= subst_outer_refs_expr(high, shadow, outer, doc);
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            hit = subst_outer_refs_expr(l, shadow, outer, doc);
+            hit |= subst_outer_refs_expr(r, shadow, outer, doc);
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            hit = subst_outer_refs_expr(expr, shadow, outer, doc);
+            hit |= subst_outer_refs_expr(pattern, shadow, outer, doc);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            hit = subst_outer_refs_expr(expr, shadow, outer, doc);
+            for item in list.iter_mut() {
+                hit |= subst_outer_refs_expr(item, shadow, outer, doc);
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                hit = subst_outer_refs_expr(op, shadow, outer, doc);
+            }
+            for w in conditions.iter_mut() {
+                hit |= subst_outer_refs_expr(&mut w.condition, shadow, outer, doc);
+                hit |= subst_outer_refs_expr(&mut w.result, shadow, outer, doc);
+            }
+            if let Some(el) = else_result {
+                hit |= subst_outer_refs_expr(el, shadow, outer, doc);
+            }
+        }
+        SqlExpr::Cast { expr, .. } => hit = subst_outer_refs_expr(expr, shadow, outer, doc),
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                for a in list.args.iter_mut() {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        hit |= subst_outer_refs_expr(inner, shadow, outer, doc);
+                    }
+                }
+            }
+            if let Some(flt) = &mut f.filter {
+                hit |= subst_outer_refs_expr(flt, shadow, outer, doc);
+            }
+        }
+        _ => {}
+    }
+    hit
+}
+
+/// `subst_outer_refs_expr` over every scope-local surface of a query.
+/// `shadow` is the scope ENCLOSING the query; the query's own FROM names
+/// extend a local copy (they win over `outer` inside), and every nested
+/// subquery body starts from that copy — so sibling subqueries never
+/// inherit each other's FROM names, and an inner alias equal to an outer
+/// one (`EXISTS(SELECT 1 FROM t c WHERE c.x = 1)` under an outer alias
+/// `c`) keeps the inner `c.x` untouched.
+fn subst_outer_refs_query(
+    q: &mut Query,
+    shadow: &OuterFrom,
+    outer: &OuterFrom,
+    doc: &Object,
+) -> bool {
+    let mut hit = false;
+    if let Some(w) = &mut q.with {
+        // CTE bodies of one WITH share the level's accumulating scope (a
+        // later CTE may reference an earlier one).
+        let cte_shadow = shadow.clone();
+        for cte in &mut w.cte_tables {
+            hit |= subst_outer_refs_query(&mut cte.query, &cte_shadow, outer, doc);
+        }
+    }
+    hit |= subst_outer_refs_setexpr(&mut q.body, shadow, outer, doc);
+    if let Some(ob) = &mut q.order_by {
+        // ORDER BY resolves in the body's own scope: reuse its FROM names.
+        let mut own = shadow.clone();
+        if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
+            from_list_names(&sel.from, &mut own);
+        }
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut ob.kind {
+            for o in exprs.iter_mut() {
+                hit |= subst_outer_refs_expr(&mut o.expr, &own, outer, doc);
+            }
+        }
+    }
+    hit
+}
+
+fn subst_outer_refs_setexpr(
+    body: &mut sqlparser::ast::SetExpr,
+    shadow: &OuterFrom,
+    outer: &OuterFrom,
+    doc: &Object,
+) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(sel) => {
+            let mut own = shadow.clone();
+            from_list_names(&sel.from, &mut own);
+            let mut hit = false;
+            for twj in &mut sel.from {
+                for j in &mut twj.joins {
+                    if let Some(e) = join_on_expr_mut(&mut j.join_operator) {
+                        hit |= subst_outer_refs_expr(e, &own, outer, doc);
+                    }
+                }
+            }
+            if let Some(sel_expr) = &mut sel.selection {
+                hit |= subst_outer_refs_expr(sel_expr, &own, outer, doc);
+            }
+            if let Some(having) = &mut sel.having {
+                hit |= subst_outer_refs_expr(having, &own, outer, doc);
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(es, _) = &mut sel.group_by {
+                for e in es.iter_mut() {
+                    hit |= subst_outer_refs_expr(e, &own, outer, doc);
+                }
+            }
+            for item in &mut sel.projection {
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        hit |= subst_outer_refs_expr(e, &own, outer, doc);
+                    }
+                    _ => {}
+                }
+            }
+            hit
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            // Arms do not see each other's FROM names.
+            subst_outer_refs_setexpr(left, shadow, outer, doc)
+                | subst_outer_refs_setexpr(right, shadow, outer, doc)
+        }
+        SetExpr::Query(inner) => subst_outer_refs_query(inner, shadow, outer, doc),
+        SetExpr::Values(rows) => {
+            let mut hit = false;
+            for parens in rows.rows.iter_mut() {
+                for e in parens.content.iter_mut() {
+                    hit |= subst_outer_refs_expr(e, shadow, outer, doc);
+                }
+            }
+            hit
+        }
+        _ => false,
     }
 }
 
@@ -24907,28 +25745,63 @@ mod complex_query_tests {
     }
 
     #[test]
-    fn complex_correlated_subqueries_currently_yield_empty() {
-        // Known limitation, pinned so a change here is a conscious one:
-        // subqueries are rewritten uncorrelated (evaluated once, hoisted to
-        // literals/IN-lists). An outer reference inside the subquery resolves
-        // as a missing document column, the inner WHERE filters everything
-        // out, and the predicate quietly turns false — no error.
+    fn correlated_subqueries_evaluate_per_row() {
+        // Correlated subqueries resolve their outer references per row
+        // (they used to be rewritten uncorrelated — the outer column read
+        // as NULL and the predicate quietly filtered everything out).
         let mut db = complex_db();
-        for sql in [
+        // Scalar correlated: the customer whose max order is exactly 300.
+        let r = rows(
+            &mut db,
             "SELECT c.name FROM customers c WHERE 300 = (
                  SELECT MAX(o.amount) FROM orders o WHERE o.customer_id = c.id)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("Bob".into())]]);
+        // EXISTS: everyone with at least one order.
+        let r = rows(
+            &mut db,
             "SELECT c.name FROM customers c WHERE EXISTS (
+                 SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Bob".into())],
+                vec![Value::Str("Cara".into())],
+            ]
+        );
+        // NOT EXISTS anti-join: the customer without orders.
+        let r = rows(
+            &mut db,
+            "SELECT c.name FROM customers c WHERE NOT EXISTS (
                  SELECT 1 FROM orders o WHERE o.customer_id = c.id)",
-            // Bob matches by region, but the outer `c.region` reference has
-            // no rows to bind to inside the standalone subquery, so the IN
-            // list comes back empty for every row.
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("Dan".into())]]);
+        // Correlated IN with arithmetic on the outer reference.
+        let r = rows(
+            &mut db,
+            "SELECT c.name FROM customers c WHERE c.id NOT IN (
+                 SELECT o.customer_id FROM orders o WHERE o.amount < c.id * 30) ORDER BY c.id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("Alice".into())],
+                vec![Value::Str("Bob".into())],
+                vec![Value::Str("Dan".into())],
+            ]
+        );
+        // The outer reference inside the IN-subquery binds per row: for
+        // every non-'west' customer the inner predicate is false, and 'west'
+        // never appears among the >200 order statuses.
+        let r = rows(
+            &mut db,
             "SELECT c.name FROM customers c WHERE c.region IN (
                  SELECT o.status FROM orders o WHERE o.amount > 200 AND c.region = 'west')",
-        ] {
-            let r = rows(&mut db, sql);
-            assert!(r.rows.is_empty(), "expected empty for correlated: {sql}");
-        }
-        // The same intent expressed decorrelated works.
+        );
+        assert!(r.rows.is_empty());
+        // The same intent expressed decorrelated still works.
         let r = rows(
             &mut db,
             "SELECT name FROM customers
@@ -26496,30 +27369,192 @@ mod complex_query_tests {
     }
 
     #[test]
-    fn correlated_subquery_ref_arms_rejected() {
+    fn correlated_subquery_ref_arms_resolve_per_row() {
+        // Every expression shape the old rejection collector knew about
+        // (Between / Like / Case / Cast / inner projection / inner HAVING)
+        // now binds the enclosing row's values instead of refusing.
         let mut db = Database::in_memory().unwrap();
         run(
             &mut db,
             "CREATE TABLE a (id INT PRIMARY KEY, pattern TEXT, low INT, high INT)",
         );
-        run(&mut db, "CREATE TABLE b (x INT, y INT)");
+        run(&mut db, "CREATE TABLE b (x INT, y INT, z TEXT)");
         run(
             &mut db,
-            "INSERT INTO a VALUES (1, 'z', 0, 9), (2, 'q', 5, 6)",
+            "INSERT INTO a VALUES (1, '%z', 0, 9), (2, '%q', 5, 6)",
         );
-        run(&mut db, "INSERT INTO b VALUES (10, 2), (20, 8)");
+        run(
+            &mut db,
+            "INSERT INTO b VALUES (1, 2, 'fizz'), (2, 8, 'seq')",
+        );
         // Non-correlated subqueries still resolve fine (control).
         run(&mut db, "SELECT id FROM a WHERE id IN (SELECT x FROM b)");
-        // Each collector arm: an outer reference inside Between / Like /
-        // Case / Cast / HAVING / projection of the inner query is a loud
-        // refusal instead of a silent NULL-mismatch.
+
+        let cases: [(&str, Vec<i64>); 6] = [
+            ("SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE b.y BETWEEN a.low AND a.high)", vec![1]),
+            ("SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE b.z LIKE a.pattern)", vec![1, 2]),
+            (
+                "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE CASE WHEN b.y > 0 THEN a.id ELSE b.y END > 0)",
+                vec![1, 2],
+            ),
+            (
+                "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE CAST(a.low AS INT) > 0)",
+                vec![2],
+            ),
+            ("SELECT id FROM a WHERE id IN (SELECT a.id FROM b)", vec![1, 2]),
+            (
+                "SELECT id FROM a WHERE id IN (SELECT x FROM b GROUP BY x HAVING SUM(b.y) > a.id)",
+                vec![1, 2],
+            ),
+        ];
+        for (sql, want) in cases {
+            let mut r = rows(&mut db, sql);
+            r.rows.sort_by(|a, b| {
+                crate::value::Value::cmp_values(
+                    a.first().unwrap_or(&Value::Null),
+                    b.first().unwrap_or(&Value::Null),
+                )
+            });
+            let got: Vec<i64> = r
+                .rows
+                .iter()
+                .map(|row| match row.first() {
+                    Some(Value::Int(n)) => *n,
+                    other => panic!("{sql}: expected int, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn correlated_subqueries_supported_surfaces() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, dept INT, salary INT)",
+        );
+        run(&mut db, "CREATE TABLE dept (id INT PRIMARY KEY, name TEXT)");
+        run(&mut db, "CREATE TABLE nums (x INT)");
+        run(
+            &mut db,
+            "INSERT INTO emp VALUES (1,'a',10,300),(2,'b',10,100),(3,'c',20,300),(4,'d',20,200)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO dept VALUES (10,'eng'),(20,'ops'),(30,'hr')",
+        );
+        run(&mut db, "INSERT INTO nums VALUES (1),(2),(3)");
+
+        // WHERE EXISTS matches the JOIN equivalent.
+        let corr = rows(
+            &mut db,
+            "SELECT e.name FROM emp e
+             WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = e.dept) ORDER BY e.id",
+        );
+        let join = rows(
+            &mut db,
+            "SELECT e.name FROM emp e JOIN dept d ON d.id = e.dept ORDER BY e.id",
+        );
+        assert_eq!(corr.rows, join.rows);
+        // NOT EXISTS anti-join.
+        let r = rows(
+            &mut db,
+            "SELECT e.name FROM emp e
+             WHERE NOT EXISTS (SELECT 1 FROM dept d WHERE d.id = e.dept + 100)",
+        );
+        assert_eq!(r.rows.len(), 4);
+        // max-per-group scalar projection (the classic correlated shape).
+        let r = rows(
+            &mut db,
+            "SELECT d.name, (SELECT MAX(e.salary) FROM emp e WHERE e.dept = d.id) AS top
+             FROM dept d ORDER BY d.id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("eng".into()), Value::Int(300)],
+                vec![Value::Str("ops".into()), Value::Int(300)],
+                vec![Value::Str("hr".into()), Value::Null],
+            ]
+        );
+        // ORDER BY a correlated key.
+        let r = rows(
+            &mut db,
+            "SELECT e.name FROM emp e
+             ORDER BY (SELECT COUNT(*) FROM emp e2 WHERE e2.salary < e.salary), e.id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("b".into())],
+                vec![Value::Str("d".into())],
+                vec![Value::Str("a".into())],
+                vec![Value::Str("c".into())],
+            ]
+        );
+        // Inner alias shadows the outer one: `d` inside binds emp — the
+        // predicate is row-independent, so every outer dept matches.
+        let r = rows(
+            &mut db,
+            "SELECT d.name FROM dept d WHERE EXISTS (SELECT 1 FROM emp d WHERE d.dept = 20)",
+        );
+        assert_eq!(r.rows.len(), 3);
+        // Uncorrelated regression: still evaluated exactly once.
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+
+        // UPDATE with a correlated WHERE (slow path, bare table qualifier).
+        run(
+            &mut db,
+            "UPDATE emp SET salary = salary + 1
+             WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = emp.dept AND d.name = 'ops')",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT salary FROM emp WHERE id IN (3, 4) ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(301)], vec![Value::Int(201)]]);
+        // UPDATE fast path: index probe on the equality conjunct, the
+        // correlated EXISTS runs as the per-row residual.
+        run(
+            &mut db,
+            "UPDATE emp SET salary = salary + 10
+             WHERE id = 1 AND EXISTS (SELECT 1 FROM dept d WHERE d.id = emp.dept)",
+        );
+        let r = rows(&mut db, "SELECT salary FROM emp WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(310)]]);
+        // UPDATE SET with a correlated scalar subquery.
+        run(
+            &mut db,
+            "UPDATE dept SET name = (SELECT MAX(e.name) FROM emp e WHERE e.dept = dept.id)",
+        );
+        let r = rows(&mut db, "SELECT name FROM dept ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("b".into())],
+                vec![Value::Str("d".into())],
+                vec![Value::Null],
+            ]
+        );
+        // DELETE with a correlated WHERE: departments without employees.
+        run(
+            &mut db,
+            "DELETE FROM dept WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept = dept.id)",
+        );
+        let r = rows(&mut db, "SELECT COUNT(*) FROM dept");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+
+        // Surface boundaries stay loud: JOIN ON / HAVING / GROUP BY evaluate
+        // outside a full row, correlation there keeps refusing.
         for sql in [
-            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE b.y BETWEEN a.low AND a.high)",
-            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE b.y LIKE a.pattern)",
-            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE CASE WHEN b.y > 0 THEN a.id ELSE b.y END > 0)",
-            "SELECT id FROM a WHERE id IN (SELECT x FROM b WHERE CAST(a.low AS INT) > 0)",
-            "SELECT id FROM a WHERE id IN (SELECT a.id FROM b)",
-            "SELECT id FROM a WHERE id IN (SELECT x FROM b GROUP BY x HAVING SUM(b.y) > a.id)",
+            "SELECT e.name FROM emp e JOIN dept d ON d.id = (SELECT MIN(x) FROM nums WHERE x < e.dept)",
+            "SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > (SELECT COUNT(*) FROM nums WHERE x < emp.dept)",
+            "SELECT dept FROM emp GROUP BY (SELECT MAX(x) FROM nums WHERE x < emp.dept)",
         ] {
             let e = db.execute(sql).unwrap_err();
             assert!(
@@ -26530,702 +27565,40 @@ mod complex_query_tests {
     }
 
     #[test]
-    fn group_by_expression_validation() {
-        let mut db = Database::in_memory().unwrap();
-        run(&mut db, "CREATE TABLE t (id INT, n INT)");
-        run(&mut db, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 5)");
-        // Composite-aggregate projections over a group column resolve via
-        // check_group_refs/eval_group_expr (Cast, Case, function-arg arms).
-        let r = rows(
-            &mut db,
-            "SELECT SUM(n) + id AS s FROM t GROUP BY id ORDER BY s",
-        );
-        assert_eq!(
-            r.rows
-                .iter()
-                .map(|row| row[0].as_i64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![7, 31]
-        );
-        let r = rows(
-            &mut db,
-            "SELECT CASE WHEN SUM(n) >= 30 THEN 'big' ELSE 'small' END AS bucket FROM t GROUP BY id ORDER BY bucket",
-        );
-        assert_eq!(
-            r.rows,
-            vec![
-                vec![Value::Str("big".into())],
-                vec![Value::Str("small".into())]
-            ]
-        );
-        let r = rows(
-            &mut db,
-            "SELECT SUM(n) + ABS(id) AS s FROM t GROUP BY id ORDER BY s",
-        );
-        assert_eq!(
-            r.rows
-                .iter()
-                .map(|row| row[0].as_i64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![7, 31]
-        );
-        // A non-group column inside a composite is rejected loudly.
-        let e = db
-            .execute("SELECT SUM(n) + n FROM t GROUP BY id")
-            .unwrap_err();
-        assert!(e.to_string().contains("must appear in GROUP BY"), "{e}");
-        let e = db
-            .execute("SELECT SUM(n) + t.id AS s FROM t GROUP BY id")
-            .unwrap_err();
-        assert!(e.to_string().contains("must appear in GROUP BY"), "{e}");
-    }
-
-    #[test]
-    fn value_literal_rendering() {
-        // The resolved-SQL literal renderer: every stored value round-trips.
-        assert_eq!(value_literal(&Value::Null).unwrap(), "NULL");
-        assert_eq!(value_literal(&Value::Bool(true)).unwrap(), "TRUE");
-        assert_eq!(value_literal(&Value::Bool(false)).unwrap(), "FALSE");
-        assert_eq!(value_literal(&Value::Int(-7)).unwrap(), "-7");
-        // Debug keeps the type: 3.0 stays a FLOAT literal, not "3".
-        assert_eq!(value_literal(&Value::Float(3.0)).unwrap(), "3.0");
-        // SQL string literal escaping via the shared helper.
-        assert_eq!(
-            value_literal(&Value::Str("it's \"quoted\"".into())).unwrap(),
-            "'it''s \"quoted\"'"
-        );
-        // DECIMAL renders as an exact CAST of its text form (a bare number
-        // would re-parse as Float and lose precision on replay).
-        assert_eq!(
-            value_literal(&Value::Decimal("1234.56".parse().unwrap())).unwrap(),
-            "CAST('1234.56' AS DECIMAL)"
-        );
-        // BLOB renders as a hex literal.
-        assert_eq!(
-            value_literal(&Value::Bytes(vec![0xde, 0xad])).unwrap(),
-            "x'dead'"
-        );
-        // Non-finite floats and structured values render as replayable
-        // expressions (a dump/join of a table holding them used to fail).
-        assert_eq!(
-            value_literal(&Value::Float(f64::NAN)).unwrap(),
-            "CAST('NaN' AS REAL)"
-        );
-        assert_eq!(
-            value_literal(&Value::Float(f64::INFINITY)).unwrap(),
-            "CAST('inf' AS REAL)"
-        );
-        let arr = Value::Array(vec![Value::Int(1), Value::Str("x".into())]);
-        let lit = value_literal(&arr).unwrap();
-        assert!(lit.starts_with("JSON_EXTRACT('"), "{lit}");
-        assert_eq!(eval_const(&parse_expr_text(&lit).unwrap()).unwrap(), arr);
-        let obj = Value::Object(Object::from([("k".into(), Value::Float(f64::NAN))]));
-        let lit = value_literal(&obj).unwrap();
-        match eval_const(&parse_expr_text(&lit).unwrap()).unwrap() {
-            Value::Object(o) => {
-                assert!(matches!(o.get("k"), Some(Value::Float(f)) if f.is_nan()))
+    fn correlated_depth_guard_bounds() {
+        // Eight levels of nested correlated evaluation are allowed; the
+        // ninth refuses loudly instead of eating the thread stack.
+        {
+            let mut guards = Vec::new();
+            for _ in 0..super::MAX_CORRELATED_DEPTH {
+                guards.push(super::enter_correlated_eval().unwrap());
             }
-            other => panic!("expected object, got {other:?}"),
+            assert!(super::enter_correlated_eval().is_err());
         }
+        // Guards released → the depth is back to zero.
+        assert!(super::enter_correlated_eval().is_ok());
     }
 
     #[test]
-    fn decimal_exact_arithmetic_aggregates_and_indexes() {
+    fn newid_inside_subquery_of_write_rejected() {
+        // A nondeterministic call inside a subquery of a write used to slip
+        // past the NEWID gate (the expression walker did not recurse into
+        // subqueries); every replaying peer would roll its own GUIDs and the
+        // fan-out would silently diverge.
         let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE bills (id INT PRIMARY KEY, amount DECIMAL(18,2), label TEXT)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO bills VALUES \
-             (1, CAST('0.10' AS DECIMAL), 'a'), \
-             (2, CAST('0.20' AS DECIMAL), 'b'), \
-             (3, CAST('0.30' AS DECIMAL), 'c'), \
-             (4, CAST('12345678901234567.89' AS DECIMAL), 'd')",
-        );
-        // 0.1 + 0.2 stays exactly 0.6 — f64 would drift at the 17th digit.
-        assert_eq!(
-            rows(&mut db, "SELECT SUM(amount) FROM bills WHERE id <= 3").rows[0][0].to_string(),
-            "0.60"
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT SUM(amount) FROM bills").rows[0][0].to_string(),
-            "12345678901234568.49"
-        );
-        // Exact equality and range probes (f64 cannot represent the big row).
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT id FROM bills WHERE amount = CAST('0.30' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Int(3)
-        );
-        let ids: Vec<Value> = rows(
-            &mut db,
-            "SELECT id FROM bills WHERE amount > CAST('0.20' AS DECIMAL) ORDER BY id",
-        )
-        .rows
-        .iter()
-        .map(|r| r[0].clone())
-        .collect();
-        assert_eq!(ids, vec![Value::Int(3), Value::Int(4)]);
-        // Arithmetic keeps decimal exactness; ROUND is half-away-from-zero.
-        assert_eq!(
-            rows(&mut db, "SELECT amount * 2 FROM bills WHERE id = 4").rows[0][0].to_string(),
-            "24691357802469135.78"
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT ROUND(CAST('2.345' AS DECIMAL), 2)").rows[0][0].to_string(),
-            "2.35"
-        );
-        // AVG over decimals divides once at the end, exactly.
-        assert_eq!(
-            rows(&mut db, "SELECT AVG(amount) FROM bills WHERE id <= 3").rows[0][0],
-            Value::Decimal("0.2".parse().unwrap())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT TYPEOF(CAST('1.5' AS DECIMAL))").rows[0][0],
-            Value::Str("decimal".into())
-        );
-        // Decimal keys flow through cmp_values for indexes and ORDER BY.
-        run(&mut db, "CREATE INDEX ix_bills_amount ON bills (amount)");
-        run(
-            &mut db,
-            "INSERT INTO bills VALUES (5, CAST('-1.5' AS DECIMAL), 'e')",
-        );
-        let ordered: Vec<String> = rows(&mut db, "SELECT label FROM bills ORDER BY amount")
-            .rows
-            .iter()
-            .map(|r| r[0].to_string())
-            .collect();
-        assert_eq!(ordered, vec!["e", "a", "b", "c", "d"]);
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT label FROM bills WHERE amount = CAST('-1.5' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Str("e".into())
-        );
-    }
-
-    #[test]
-    fn blob_hex_literals_and_cast_roundtrip() {
-        let mut db = Database::in_memory().unwrap();
-        // x'..' literals parse to bytes; CAST(text AS BLOB) keeps UTF-8 bytes.
-        assert_eq!(
-            rows(&mut db, "SELECT x'deadbeef'").rows[0][0],
-            Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT CAST('abc' AS BLOB)").rows[0][0],
-            Value::Bytes(b"abc".to_vec())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT TYPEOF(x'00')").rows[0][0],
-            Value::Str("blob".into())
-        );
-        // Length counts bytes; a hex literal with odd digits is rejected.
-        assert_eq!(
-            rows(&mut db, "SELECT LENGTH(x'0102')").rows[0][0],
-            Value::Int(2)
-        );
-        assert!(db.execute("SELECT x'abc'").is_err());
-    }
-
-    #[test]
-    fn decimal_cast_unary_edges_and_text() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE parts (id INT PRIMARY KEY, amount DECIMAL(18,4), neg DECIMAL(18,4))",
-        );
-        // eval_const path: unary minus on a decimal CAST in VALUES.
-        run(
-            &mut db,
-            "INSERT INTO parts VALUES (1, CAST('1.25' AS DECIMAL), -CAST('2.50' AS DECIMAL))",
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT amount, neg FROM parts").rows[0],
-            vec![
-                Value::Decimal("1.25".parse().unwrap()),
-                Value::Decimal("-2.50".parse().unwrap())
-            ]
-        );
-        // eval_expr path: unary over a column.
-        assert_eq!(
-            rows(&mut db, "SELECT -amount FROM parts WHERE id = 1").rows[0][0],
-            Value::Decimal("-1.25".parse().unwrap())
-        );
-        // eval_group_expr path: unary over an aggregate.
-        assert_eq!(
-            rows(&mut db, "SELECT -SUM(amount) FROM parts").rows[0][0],
-            Value::Decimal("-1.25".parse().unwrap())
-        );
-        // CAST matrix: int/float/text sources, precision spec, chains, bool.
-        assert_eq!(
-            rows(&mut db, "SELECT CAST(1 AS DECIMAL) + CAST('2' AS DECIMAL)").rows[0][0],
-            Value::Decimal("3".parse().unwrap())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT CAST(3.5 AS DECIMAL)").rows[0][0],
-            Value::Decimal("3.5".parse().unwrap())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT CAST('  1.5  ' AS DECIMAL(10,2))").rows[0][0],
-            Value::Decimal("1.5".parse().unwrap())
-        );
-        // Truncation toward zero, text round-trip, bool coercion.
-        assert_eq!(
-            rows(&mut db, "SELECT CAST(CAST('1.9' AS DECIMAL) AS INT)").rows[0][0],
-            Value::Int(1)
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT CAST(CAST('-1.9' AS DECIMAL) AS INT)").rows[0][0],
-            Value::Int(-1)
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT CAST(CAST('1.50' AS DECIMAL) AS TEXT)").rows[0][0],
-            Value::Str("1.50".into())
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT CAST(CAST('0' AS DECIMAL) AS BOOL)").rows[0][0],
-            Value::Bool(false)
-        );
-        // Text forms keep the exact scale through CONCAT / ||.
-        assert_eq!(
-            rows(&mut db, "SELECT CONCAT(CAST('1.50' AS DECIMAL), '!')").rows[0][0],
-            Value::Str("1.50!".into())
-        );
-        // Invalid text errors loudly instead of degrading to Float/garbage.
-        let e = db.execute("SELECT CAST('bad' AS DECIMAL)").unwrap_err();
-        assert!(e.to_string().contains("cannot CAST"), "{e}");
-    }
-
-    #[test]
-    fn decimal_divide_modulo_overflow_and_aggregate_edges() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE d (id INT PRIMARY KEY, x DECIMAL(28,4))",
-        );
-        run(
-            &mut db,
-            "INSERT INTO d VALUES \
-             (1, CAST('7.5' AS DECIMAL)), (2, CAST('2' AS DECIMAL)), (3, NULL)",
-        );
-        // Division / modulo by zero yield NULL (Int/Float parity).
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT CAST('1.5' AS DECIMAL) / CAST('0' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Null
-        );
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT CAST('1.5' AS DECIMAL) % CAST('0' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Null
-        );
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT CAST('7.5' AS DECIMAL) % CAST('2' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Decimal("1.5".parse().unwrap())
-        );
-        // Overflow is checked, never a panic.
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT CAST('79228162514264337593543950335' AS DECIMAL) + CAST('1' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Null
-        );
-        // MIN/MAX/AVG over decimals, NULLs skipped.
-        assert_eq!(
-            rows(&mut db, "SELECT MIN(x), MAX(x), AVG(x) FROM d").rows[0],
-            vec![
-                Value::Decimal("2".parse().unwrap()),
-                Value::Decimal("7.5".parse().unwrap()),
-                Value::Decimal("4.75".parse().unwrap()),
-            ]
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT ABS(CAST('-3.25' AS DECIMAL))").rows[0][0],
-            Value::Decimal("3.25".parse().unwrap())
-        );
-        // Mixed Int * Decimal multiplies exactly; SUM promotes to decimal.
-        run(
-            &mut db,
-            "CREATE TABLE mix (id INT PRIMARY KEY, n INT, m DECIMAL(10,2))",
-        );
-        run(
-            &mut db,
-            "INSERT INTO mix VALUES \
-             (1, 1, CAST('0.10' AS DECIMAL)), (2, 2, CAST('0.20' AS DECIMAL))",
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT SUM(n * m) FROM mix").rows[0][0],
-            Value::Decimal("0.50".parse().unwrap())
-        );
-        // Overflow inside AVG reports loudly instead of dropping money.
-        run(&mut db, "CREATE TABLE big (v DECIMAL(28,4))");
-        run(
-            &mut db,
-            "INSERT INTO big VALUES \
-             (CAST('79228162514264337593543950335' AS DECIMAL)), \
-             (CAST('79228162514264337593543950335' AS DECIMAL))",
-        );
-        let e = db.execute("SELECT AVG(v) FROM big").unwrap_err();
-        assert!(e.to_string().contains("overflow"), "{e}");
-    }
-
-    #[test]
-    fn decimal_storage_constraints_indexes_updates_and_joins() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE m (id INT PRIMARY KEY, amount DECIMAL(12,2) UNIQUE NOT NULL, tag TEXT)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO m VALUES (1, CAST('1.00' AS DECIMAL), 'x')",
-        );
-        // UNIQUE compares numerically: a different scale is still a duplicate.
-        let e = db
-            .execute("INSERT INTO m VALUES (2, CAST('1.0' AS DECIMAL), 'y')")
-            .unwrap_err();
-        assert!(e.to_string().contains("UNIQUE"), "{e}");
-        // UPDATE fast path with the unique tree, then probe on the new key.
-        run(
-            &mut db,
-            "UPDATE m SET amount = amount + CAST('0.01' AS DECIMAL) WHERE id = 1",
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT amount FROM m").rows[0][0],
-            Value::Decimal("1.01".parse().unwrap())
-        );
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT tag FROM m WHERE amount = CAST('1.01' AS DECIMAL)"
-            )
-            .rows[0][0],
-            Value::Str("x".into())
-        );
-        // Composite index with a decimal leading column: point + range probes.
-        run(
-            &mut db,
-            "CREATE TABLE ci (id INT PRIMARY KEY, a DECIMAL(10,2), b TEXT)",
-        );
-        run(&mut db, "CREATE INDEX ci_ab ON ci (a, b)");
-        run(
-            &mut db,
-            "INSERT INTO ci VALUES \
-             (1, CAST('1.00' AS DECIMAL), 'x'), \
-             (2, CAST('2.00' AS DECIMAL), 'x'), \
-             (3, CAST('2.50' AS DECIMAL), 'y')",
-        );
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT id FROM ci WHERE a = CAST('2.00' AS DECIMAL) AND b = 'x'"
-            )
-            .rows[0][0],
-            Value::Int(2)
-        );
-        let ids: Vec<Value> = rows(
-            &mut db,
-            "SELECT id FROM ci WHERE a > CAST('1.00' AS DECIMAL) ORDER BY id",
-        )
-        .rows
-        .iter()
-        .map(|r| r[0].clone())
-        .collect();
-        assert_eq!(ids, vec![Value::Int(2), Value::Int(3)]);
-        // Equality join across decimal columns matches numerically equal keys.
-        run(
-            &mut db,
-            "CREATE TABLE j1 (id INT PRIMARY KEY, k DECIMAL(10,2))",
-        );
-        run(
-            &mut db,
-            "CREATE TABLE j2 (id INT PRIMARY KEY, k DECIMAL(10,2))",
-        );
-        run(
-            &mut db,
-            "INSERT INTO j1 VALUES (1, CAST('1.50' AS DECIMAL)), (2, CAST('9.99' AS DECIMAL))",
-        );
-        run(
-            &mut db,
-            "INSERT INTO j2 VALUES (1, CAST('1.5' AS DECIMAL)), (2, CAST('2.00' AS DECIMAL))",
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT j1.id FROM j1 JOIN j2 ON j1.k = j2.k").rows[0][0],
-            Value::Int(1)
-        );
-        // JSON_TYPE sees the wire marker as an exact number.
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_TYPE('{\"$dec\":\"1.5\"}')").rows[0][0],
-            Value::Str("real".into())
-        );
-    }
-
-    #[test]
-    fn decimal_group_by_and_distinct_semantics() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE g (id INT PRIMARY KEY, x DECIMAL(10,2))",
-        );
-        run(
-            &mut db,
-            "INSERT INTO g VALUES \
-             (1, CAST('1.50' AS DECIMAL)), (2, CAST('1.50' AS DECIMAL)), \
-             (3, CAST('2.25' AS DECIMAL)), (4, CAST('1.5' AS DECIMAL)), (5, NULL)",
-        );
-        // Grouping is byte-keyed (encode), exactly like Int/Float: identical
-        // text collapses, a different scale is a separate group. Scale is
-        // invisible to `PartialEq` and the two equal-valued groups tie under
-        // cmp_values, so key the assertion by rendered text without order.
-        let groups = rows(&mut db, "SELECT x, COUNT(*) FROM g GROUP BY x");
-        let by_text: std::collections::BTreeMap<String, Value> = groups
-            .rows
-            .iter()
-            .map(|r| (r[0].to_string(), r[1].clone()))
-            .collect();
-        assert_eq!(groups.rows.len(), 4);
-        assert_eq!(by_text.get("null"), Some(&Value::Int(1)));
-        assert_eq!(by_text.get("1.5"), Some(&Value::Int(1)));
-        assert_eq!(by_text.get("1.50"), Some(&Value::Int(2)));
-        assert_eq!(by_text.get("2.25"), Some(&Value::Int(1)));
-        // COUNT DISTINCT follows the same byte-keyed rule (NULL excluded).
-        assert_eq!(
-            rows(&mut db, "SELECT COUNT(DISTINCT x) FROM g").rows[0][0],
-            Value::Int(3)
-        );
-        // SUM DISTINCT keeps the first occurrence of each byte-keyed group.
-        assert_eq!(
-            rows(&mut db, "SELECT SUM(DISTINCT x) FROM g").rows[0][0].to_string(),
-            "5.25"
-        );
-    }
-
-    #[test]
-    fn json_array_contains_and_null_semantics() {
-        let mut db = Database::in_memory().unwrap();
-        // Membership over string/number/bool elements; strict JSON text input.
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('[\"a\",\"b\"]', 'a')").rows[0][0],
-            Value::Bool(true)
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('[\"a\",\"b\"]', 'c')").rows[0][0],
-            Value::Bool(false)
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('[1,2,3]', 2)").rows[0][0],
-            Value::Bool(true)
-        );
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT JSON_ARRAY_CONTAINS('[1.5,true,null]', TRUE)"
-            )
-            .rows[0][0],
-            Value::Bool(true)
-        );
-        // Non-array / malformed JSON are false; NULL text stays NULL.
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('{\"a\":1}', 'a')").rows[0][0],
-            Value::Bool(false)
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS('not json', 'a')").rows[0][0],
-            Value::Bool(false)
-        );
-        assert_eq!(
-            rows(&mut db, "SELECT JSON_ARRAY_CONTAINS(NULL, 'a')").rows[0][0],
-            Value::Null
-        );
-        // EF translation shape: column-vs-column membership.
-        run(
-            &mut db,
-            "CREATE TABLE roles (id INT PRIMARY KEY, list TEXT, role TEXT)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO roles VALUES \
-             (1, '[\"admin\",\"user\"]', 'admin'), (2, '[\"user\"]', 'admin')",
-        );
-        assert_eq!(
-            rows(
-                &mut db,
-                "SELECT COUNT(*) FROM roles WHERE JSON_ARRAY_CONTAINS(list, role)"
-            )
-            .rows[0][0],
-            Value::Int(1)
-        );
-    }
-
-    #[test]
-    fn null_semantics_for_soft_delete_and_single_column_unique() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE sd (id INT PRIMARY KEY, email TEXT UNIQUE, is_deleted BOOL)",
-        );
-        // Single-column UNIQUE allows multiple NULLs (Mongo missing-field parity).
-        run(
-            &mut db,
-            "INSERT INTO sd VALUES (1, NULL, NULL), (2, NULL, NULL)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO sd VALUES (3, 'a', TRUE), (4, 'b', NULL), (5, 'c', FALSE)",
-        );
-        run(&mut db, "INSERT INTO sd (id, email) VALUES (6, 'd')"); // is_deleted missing
-                                                                    // `IsDeleted != TRUE` matches NULL and missing fields — the Mongo
-                                                                    // soft-delete filter maps 1:1; `= FALSE` only matches explicit false.
-        let ids: Vec<Value> = rows(
-            &mut db,
-            "SELECT id FROM sd WHERE is_deleted != TRUE ORDER BY id",
-        )
-        .rows
-        .iter()
-        .map(|r| r[0].clone())
-        .collect();
-        assert_eq!(
-            ids,
-            vec![
-                Value::Int(1),
-                Value::Int(2),
-                Value::Int(4),
-                Value::Int(5),
-                Value::Int(6)
-            ]
-        );
-        let ids: Vec<Value> = rows(&mut db, "SELECT id FROM sd WHERE is_deleted = FALSE")
-            .rows
-            .iter()
-            .map(|r| r[0].clone())
-            .collect();
-        assert_eq!(ids, vec![Value::Int(5)]);
-        // A non-NULL duplicate still collides.
-        let e = db
-            .execute("INSERT INTO sd VALUES (7, 'a', NULL)")
-            .unwrap_err();
-        assert!(e.to_string().contains("UNIQUE"), "{e}");
-    }
-
-    #[test]
-    fn blob_storage_ordering_unique_and_updates() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE b (id INT PRIMARY KEY, raw BLOB UNIQUE)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO b VALUES (1, x'0102'), (2, x''), (3, NULL)",
-        );
-        // NULL < empty blob < blob; ORDER BY uses cmp_values.
-        let ids: Vec<Value> = rows(&mut db, "SELECT id FROM b ORDER BY raw")
-            .rows
-            .iter()
-            .map(|r| r[0].clone())
-            .collect();
-        assert_eq!(ids, vec![Value::Int(3), Value::Int(2), Value::Int(1)]);
-        // UNIQUE is byte-exact.
-        let e = db.execute("INSERT INTO b VALUES (4, x'0102')").unwrap_err();
-        assert!(e.to_string().contains("UNIQUE"), "{e}");
-        // UPDATE moves the index entry; probes find the new key only.
-        run(&mut db, "UPDATE b SET raw = x'03' WHERE id = 1");
-        assert_eq!(
-            rows(&mut db, "SELECT raw FROM b WHERE raw = x'03'").rows[0][0],
-            Value::Bytes(vec![3])
-        );
-        assert!(rows(&mut db, "SELECT id FROM b WHERE raw = x'0102'")
-            .rows
-            .is_empty());
-        // Malformed hex is rejected (odd digits / non-hex characters).
-        assert!(db.execute("SELECT x'abc'").is_err());
-        assert!(db.execute("SELECT x'zz'").is_err());
-    }
-
-    #[test]
-    fn insert_select_and_guid_rewrite_carry_decimal_and_blob_exactly() {
-        let mut db = Database::in_memory().unwrap();
-        run(
-            &mut db,
-            "CREATE TABLE src (id INT PRIMARY KEY, m DECIMAL(20,5), b BLOB)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO src VALUES \
-             (1, CAST('0.10000' AS DECIMAL), x'01'), (2, CAST('-2.50000' AS DECIMAL), NULL)",
-        );
-        run(
-            &mut db,
-            "CREATE TABLE dst (id INT PRIMARY KEY, m DECIMAL(20,5), b BLOB)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO dst SELECT id, m, b FROM src WHERE id >= 1",
-        );
-        let a = rows(&mut db, "SELECT id, m, b FROM src ORDER BY id");
-        let b = rows(&mut db, "SELECT id, m, b FROM dst ORDER BY id");
-        assert_eq!(a, b);
-        run(
-            &mut db,
-            "CREATE TABLE dst2 (id INT PRIMARY KEY, m DECIMAL(20,5), b BLOB)",
-        );
-        run(&mut db, "INSERT INTO dst2 SELECT * FROM src");
-        assert_eq!(
-            rows(&mut db, "SELECT COUNT(*) FROM dst2").rows[0][0],
-            Value::Int(2)
-        );
-
-        // auto-GUID resolved rewrite renders exact literals so a peer re-runs
-        // neither random ids nor lossy float text.
-        run(
-            &mut db,
-            "CREATE TABLE g (id GUID PRIMARY KEY AUTOINCREMENT, m DECIMAL(28,10), b BLOB)",
-        );
-        run(
-            &mut db,
-            "INSERT INTO g (m, b) VALUES \
-             (CAST('12345678901234567.8901234567' AS DECIMAL), x'deadbeef')",
-        );
-        let resolved = db.take_resolved_sql().expect("resolved rewrite");
-        assert!(
-            resolved.contains("CAST('12345678901234567.8901234567' AS DECIMAL)"),
-            "{resolved}"
-        );
-        assert!(resolved.contains("x'deadbeef'"), "{resolved}");
-        let mut peer = Database::in_memory().unwrap();
-        run(
-            &mut peer,
-            "CREATE TABLE g (id GUID PRIMARY KEY AUTOINCREMENT, m DECIMAL(28,10), b BLOB)",
-        );
-        peer.execute(&resolved).unwrap();
-        assert_eq!(
-            rows(&mut db, "SELECT id, m, b FROM g"),
-            rows(&mut peer, "SELECT id, m, b FROM g")
-        );
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)");
+        for sql in [
+            "UPDATE t SET v = v WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.id = t.id AND NEWID() IS NOT NULL)",
+            "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE NEWID() IS NOT NULL)",
+        ] {
+            let e = db.execute(sql).unwrap_err();
+            assert!(e.to_string().contains("NEWID()"), "{sql}: {e}");
+        }
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
     }
 }
-
-// ---- MVCC stage B: guardless snapshot reads ----
 
 #[cfg(test)]
 mod read_view_tests {

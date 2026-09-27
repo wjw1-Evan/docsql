@@ -444,20 +444,29 @@ public sealed class SqlSurfaceTests : IClassFixture<ServerFixture>
     }
 
     [Fact]
-    public void Correlated_subquery_rejected_loudly()
+    public void Correlated_subqueries_evaluate_per_row()
     {
         Exec(
             "DROP TABLE IF EXISTS cs_a", "DROP TABLE IF EXISTS cs_b",
             "CREATE TABLE cs_a (id INT PRIMARY KEY, low INT)",
             "CREATE TABLE cs_b (x INT, y INT)",
-            "INSERT INTO cs_a VALUES (1, 0)",
-            "INSERT INTO cs_b VALUES (10, 1)");
+            "INSERT INTO cs_a VALUES (1, 0), (2, 5)",
+            "INSERT INTO cs_b VALUES (1, 2), (2, 8)");
         // 非相关子查询照常可用。
-        Assert.Equal(1L, Long(
-            "SELECT COUNT(*) FROM cs_a WHERE id IN (SELECT y FROM cs_b)"));
-        // 内层 WHERE 引用外层表 = 显式拒绝,而非静默 NULL 错配。
+        Assert.Equal(2L, Long(
+            "SELECT COUNT(*) FROM cs_a WHERE id IN (SELECT x FROM cs_b)"));
+        // 内层 WHERE 引用外层列 = 逐行绑定外层行值(cs_a(1): y∈[0,8] 全中
+        // → x∈{1,2} → id 1 ✓;cs_a(2): y∈[5,8] → x=2 → id 2 ✓)。
+        Assert.Equal(2L, Long(
+            "SELECT COUNT(*) FROM cs_a WHERE id IN (SELECT x FROM cs_b WHERE cs_b.y BETWEEN cs_a.low AND 8)"));
+        // EXISTS / NOT EXISTS 反连接。
+        Assert.Equal(2L, Long(
+            "SELECT COUNT(*) FROM cs_b b WHERE EXISTS (SELECT 1 FROM cs_a a WHERE a.id = b.x)"));
+        Assert.Equal(0L, Long(
+            "SELECT COUNT(*) FROM cs_b b WHERE NOT EXISTS (SELECT 1 FROM cs_a a WHERE a.id = b.x)"));
+        // 边界面仍然响亮:HAVING 内相关保留显式拒绝。
         var ex = Assert.Throws<DocsqlException>(() => Scalar(
-            "SELECT id FROM cs_a WHERE id IN (SELECT x FROM cs_b WHERE b.y BETWEEN cs_a.low AND cs_a.id)"));
+            "SELECT id FROM cs_a GROUP BY id HAVING COUNT(*) > (SELECT COUNT(*) FROM cs_b WHERE cs_b.y = cs_a.low)"));
         Assert.Contains("correlated subqueries are not supported", ex.Message);
     }
 }

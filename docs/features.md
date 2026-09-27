@@ -111,7 +111,8 @@ SELECT ... INTERSECT [ALL] SELECT ...
 SELECT ... EXCEPT [ALL] SELECT ...       -- / MINUS
 WITH cte AS (SELECT ...) SELECT * FROM cte;              -- 非递归 CTE
 SELECT 1 IN (SELECT ...), EXISTS (SELECT ...);           -- 标量/IN/EXISTS 子查询
-SELECT v > ANY (SELECT ...), v <> ALL (SELECT ...);      -- 量化比较(非相关)
+SELECT v > ANY (SELECT ...), v <> ALL (SELECT ...);      -- 量化比较(非相关/相关)
+SELECT c.*, (SELECT MAX(o.amt) FROM o WHERE o.cid = c.id) FROM c; -- 相关子查询(逐行)
 SELECT a IS DISTINCT FROM b;                             -- NULL 安全比较
 SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(id, s);      -- 行值构造器
 SELECT CASE WHEN n > 0 THEN 'p' ELSE 'n' END FROM t;     -- CASE
@@ -128,8 +129,10 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 - 派生表(子查询作 FROM)、`SELECT *, expr`、`ROWNUM`、`DUAL` 支持;
 - **NULL / 软删语义**:`x != TRUE` 命中 NULL 与缺失字段(与 Mongo `$ne: true` 的软删过滤一致);
   单列 UNIQUE 允许多个 NULL,`CREATE UNIQUE INDEX` 复合唯一任一列 NULL 的行跳过整键(不判重);
+- 相关子查询:外层引用须限定名,行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的
+  WHERE 与 SET)逐行求值;JOIN ON/GROUP BY/HAVING 内相关仍显式报错(未限定外层引用与缺列不可区分,读 NULL——请写限定名);
 - 不支持(均显式报错,不静默吞掉):`WINDOW`/`QUALIFY`、自定义窗口帧、`DISTINCT ON`、
-  相关子查询、`WITH RECURSIVE`、`NATURAL JOIN`、`LATERAL`、
+  `WITH RECURSIVE`、`NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`、`TOP ... PERCENT`、
   `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`;
   T-SQL 专有形式(变量 `@p`/`@@ROWCOUNT`、`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、

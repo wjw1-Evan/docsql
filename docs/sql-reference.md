@@ -133,7 +133,7 @@ SELECT ts + 1500, ts - ts2 FROM t;              -- ± 毫秒整数 / 毫秒差(I
 | 模式 | `LIKE pat [ESCAPE 'c']`、`ILIKE pat` | `%`、`_` 通配与 T-SQL 字符类 `[a-z]`/`[^…]`；ILIKE 大小写不敏感；用 `ESCAPE` 指定转义字符 |
 | 空值 | `IS NULL`、`IS NOT NULL` | |
 | NULL 安全比较 | `IS DISTINCT FROM`、`IS NOT DISTINCT FROM` | 全序下的安全等价比较 |
-| 存在量词 | `EXISTS (SELECT ...)`、`IN (SELECT ...)`、`ANY/SOME/ALL (SELECT ...)` | 仅支持**非相关**子查询 |
+| 存在量词 | `EXISTS (SELECT ...)`、`IN (SELECT ...)`、`ANY/SOME/ALL (SELECT ...)` | 支持相关子查询(外层引用须限定名,见[与标准 SQL 的差异](#与标准-sql-的差异重要)) |
 | 类型 | `TYPEOF(expr)` | 返回值类型名 |
 
 **示例**
@@ -223,7 +223,10 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 - **聚合修饰**：`COUNT/SUM/... ( [DISTINCT] expr ) [ FILTER (WHERE condition) ]`；`FILTER` 先过滤行再做 DISTINCT 与聚合。
 - **集合运算**：两臂列数必须一致（列名取左）；`UNION`/`INTERSECT`/`EXCEPT` 默认去重，`ALL` 保留多重集（`INTERSECT ALL`/`EXCEPT ALL` 按最小计数）。
 - **CTE**：仅非递归；`WITH RECURSIVE` 报错。CTE 与派生表一样支持别名列。
-- **子查询**：支持非相关标量、`IN`、`EXISTS`、`ANY/SOME/ALL`；**相关子查询报错**。
+- **子查询**：支持标量、`IN`、`EXISTS`、`ANY/SOME/ALL`。**相关子查询**逐行绑定外层行值求值：
+  外层引用必须写限定名(`别名.列`/`表名.列`)，支持 SELECT 的 `WHERE`/投影/`ORDER BY` 与
+  UPDATE·DELETE 的 `WHERE`、UPDATE 的 `SET`；内层 FROM 的同名别名正确遮蔽外层；
+  JOIN ON/GROUP BY/HAVING 内的相关引用与未限定外层引用仍显式报错，嵌套相关深度上限 8。
 - **ROWNUM**：Oracle 伪列，在行取出后、WHERE 与 ORDER BY 之前编号；被 WHERE 过滤的行消耗编号；`SELECT *` 不含该列。
 - **GROUP BY 限制**：分组键不能是输出别名或序号（与 HAVING/ORDER BY 不同，显式报错）。
 
@@ -870,7 +873,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | NULL 逻辑 | 全序，无 UNKNOWN；`NULL = NULL` 为 TRUE |
 | 主键与 NULL | `PRIMARY KEY` 不隐含 `NOT NULL` |
 | 主键类型 | 仅单列；复合唯一用 `CREATE UNIQUE INDEX` |
-| 相关子查询 | 不支持（显式报错） |
+| 相关子查询 | 已支持：外层引用须限定名，行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的 WHERE 与 SET)逐行求值；JOIN ON/GROUP BY/HAVING 内相关、未限定外层引用仍显式报错 |
 | 窗口函数 | 已支持（见[窗口函数](#窗口函数)）；`WINDOW` 子句、`QUALIFY`、自定义窗口帧不支持 |
 | 递归 CTE | 不支持（显式报错） |
 | `SELECT t.*` | 不支持（用 `*`） |
@@ -904,7 +907,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 批/变量 | `DECLARE @x [类型] [= 初值]`、`SET @x = 表达式`、`SELECT @a = e1, @b = e2 [FROM …]`（取扫描末行，空扫描保持原值）、`IF … ELSE`、`BEGIN…END` 嵌套块、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@ERROR`/`@@VERSION`、`PRINT 表达式`（CLI 打印消息）；变量是**逐连接会话状态**（GO 结束批次即清空），替换经 `value_literal` 渲染，写语句只以字面量形式进入日志/复制 |
 | 错误处理 | `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`（捕获后批继续；CATCH 内 `ERROR_MESSAGE()`/`ERROR_NUMBER()` 读被捕获错误，CATCH 外为 NULL；嵌套 TRY…CATCH 结束后外层 CATCH 的错误上下文恢复）；`THROW [code, 'msg', state]`（实参可为 @变量；CATCH 内裸 `THROW` 重抛原错误，可多次）、`RAISERROR('msg', sev, state)` 或 `RAISERROR 'msg', sev, state`（消息取第一实参，severity/state 不分级）；CATCH 内的错误继续上抛，TRY 内的 BREAK/CONTINUE 穿透到外层 WHILE |
 | 递归 CTE | `WITH [RECURSIVE] c(n) AS (锚点 UNION [ALL] 递归臂)`：半朴素迭代（每轮只见上一轮行，SQL Server 工作表语义）；`UNION` 按编码字节去重可收敛循环图、`UNION ALL` 循环在 100 轮/10 万行预算处响亮报错；T-SQL 无关键字拼写（自引用 UNION 体即递归）同样识别 |
-| APPLY | `CROSS APPLY 表函数 AS t` / `OUTER APPLY …`（STRING_SPLIT/GENERATE_SERIES/OPENJSON）：**逐左行求值**的相关化表函数——实参引用左表列，OUTER 空行集保留左行（右列读 NULL）；支持别名列改名与连续 APPLY；APPLY 子查询仍显式报错（相关子查询边界） |
+| APPLY | `CROSS APPLY 表函数 AS t` / `OUTER APPLY …`（STRING_SPLIT/GENERATE_SERIES/OPENJSON）：**逐左行求值**的相关化表函数——实参引用左表列，OUTER 空行集保留左行（右列读 NULL）；支持别名列改名与连续 APPLY；APPLY 子查询仍显式报错 |
 | PIVOT/UNPIVOT | `FROM src PIVOT (SUM(x) FOR col IN (v1 [AS c1], v2)) AS p`：隐式分组（除透视列与聚合实参列外的全部字段，按编码字节精确分桶），单聚合（SUM/AVG/MIN/MAX/COUNT），空单元格 COUNT 为 0、其余为 NULL（组内全 NULL 同此），IN 子查询与 `DEFAULT ON NULL` 报错；`FROM src UNPIVOT (val FOR col IN (a [AS α], b)) AS u`：每行×每列出一行，NULL 单元格剔除（`INCLUDE|EXCLUDE NULLS` 报错） |
 | 标识与随机 | `SCOPE_IDENTITY()`/`@@IDENTITY`（逐连接会话状态：连接内最后一条 INSERT 的自增 id,非 INSERT 语句不清除;服务端在写锁内随语句结果快照,跨连接不串值）;`RAND()`（[0,1) 浮点;每语句一值,同语句内各处同值,与 T-SQL 一致）——**复制安全**:SELECT 读路径可用,INSERT 路径字面量化回写(同 NEWID),UPDATE/DELETE/MERGE 拒绝 |
 | 会话身份 | `SUSER_SNAME()`/`ORIGINAL_LOGIN()`/`SYSTEM_USER`/`SESSION_USER`/`USER_NAME()`/`APP_NAME()`/`HOST_NAME()` —— 经连接身份上下文替换（服务端为登录用户，无上下文时报错） |
@@ -1081,7 +1084,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |
-| 子查询/CTE | 相关子查询（`APPLY` 子查询形式同此边界） |
+| 子查询/CTE | JOIN ON/GROUP BY/HAVING 内的相关引用、`APPLY` 子查询形式(未限定名的外层引用无法与缺列区分,读 NULL——请写限定名) |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
 | DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
