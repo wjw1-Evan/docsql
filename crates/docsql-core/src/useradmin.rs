@@ -529,14 +529,24 @@ pub fn redact_sql(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // String literals are opaque: a PASSWORD inside quoted data is user
+        // text, not the keyword — redacting there rewrote the audit entry
+        // into a statement that never executed. Skip whole literals with
+        // the same scanner the rest of the pipeline uses.
+        if bytes[i] == b'\'' {
+            let (end, _closed) = crate::stmt::sql_literal_end(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
         // Compared on the original bytes: a full-Unicode `to_lowercase`
         // copy can change byte length (KELVIN SIGN → "k"), so its indices
         // cannot address this text — the previous version panicked on such
         // input.
         // The tokenizer also accepts token adjacency WITHOUT whitespace
-        // (`CREATE USER "eve"PASSWORD 'x'` parses fine), so the boundary
-        // is "previous character cannot be a word character": whitespace,
-        // a closing quote/bracket identifier, or the start of input.
+        // (`CREATE USER "eve"PASSWORD 'x'` parses fine — the closing dquote
+        // does NOT end keyword matching), so the boundary stays "previous
+        // character cannot be a word character or a closing single quote".
         let boundary_ok = |i: usize| -> bool {
             match sql[..i].chars().next_back() {
                 None => true,
@@ -1624,5 +1634,19 @@ mod tests {
         assert!(g.may_select("data"));
         assert!(g.may_dml("data", PRIV_UPDATE));
         assert!(!g.may_dml("data", PRIV_INSERT));
+    }
+
+    #[test]
+    fn redact_skips_password_inside_string_literals() {
+        // A PASSWORD inside quoted data is user text, not the keyword:
+        // redacting it rewrote the audit entry into a statement that never
+        // executed. The literal passes through verbatim.
+        let sql = "SELECT 'a PASSWORD ''secret''' AS note";
+        assert_eq!(redact_sql(sql), sql);
+        // The real keyword form still redacts.
+        assert_eq!(
+            redact_sql("CREATE USER u PASSWORD 'pw'"),
+            "CREATE USER u PASSWORD '***'"
+        );
     }
 }

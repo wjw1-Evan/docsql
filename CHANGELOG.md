@@ -5,6 +5,57 @@
 
 ## [未发布]
 
+### 缺陷审查轮 12:随机抽 20 功能点(2026-09-27)
+
+#### 修复(结果错误/数据完整性)
+
+- **OUTER JOIN 空侧补显式 NULL 键**:LEFT JOIN 右表为空(或 RIGHT/FULL 左表为空)时,
+  另一侧同名列经后缀回退**镜像对方表的值**——`SELECT a.id, b.id … LEFT JOIN b`(b 空)返回
+  a.id 的值,`WHERE r.id IS NULL` 反连接在空右表时返回 0 行。现在空侧按表列清单补 NULL 键。
+- **OUTER APPLY 空行集同因修复**:保留的左行补右列 NULL 键(此前同名左列冒充右值)。
+- **表函数别名列改名落地**:`FROM STRING_SPLIT(..) AS s(v)`、`FROM/APPLY OPENJSON(..) AS j(k,v,t)`
+  此前静默丢弃改名清单(`s.v` 读 NULL、`s.value` 仍有效);现按位置改名,宽度不符响亮报错
+  (含 STRING_SPLIT 第三参关闭 ordinal 时两列清单报错)。
+- **MERGE 的 AUTOINCREMENT 水位**:INSERT 臂显式给 id 或 UPDATE 臂 `SET id` 此前不推进/失效
+  水位,下一次普通 INSERT 在显式值上撞 UNIQUE 报错;纯 `WHEN NOT MATCHED INSERT` 臂多行命中
+  同一目标行此前误报「cannot update the same row twice」(没有 UPDATE 臂即无「两次更新」)。
+- **ON CONFLICT DO NOTHING/OR IGNORE 的 FK 孤儿**:子侧外键此前对「过滤前的整批」校验,
+  被跳过的父候选为同批子行背书,落盘即孤儿;现按最终落盘集统一校验(批内前向引用一并合法)。
+- **幽灵约束拒绝**:表级 `PRIMARY KEY(b)`/`UNIQUE(b)`(b 不存在)、`UNIQUE(LOWER(a))`、
+  `CHECK (y > 0)`(y 不存在)此前静默建成永不生效的约束(dump 还会丢 PK 声明),现 DDL 报错;
+  表级复合 FK 此前静默拆成逐列 FK(削弱为各列独立判定),现显式报错;列级 FK 多被引列同理。
+- **INSERT/CTAS/MERGE INSERT 重复列名报错**:此前 `INSERT INTO t (a, a, b)` 的首个值被
+  `zip().collect()` 静默覆盖。
+- **ADD COLUMN**:`DEFAULT` 回填值现在过 CHECK(含本语句新增的 CHECK,此前存量行可永久违反);
+  `GENERATED ALWAYS AS` 显式报错(此前静默降级为普通列)。
+- **标量函数 NULL 传播**:`UPPER/LOWER/TRIM/LTRIM/RTRIM/LENGTH/LEN/INSTR/LPAD/RPAD` 此前把
+  NULL 静默转成 `''`/`0`/报错(污染 `COUNT(expr)`/`SUM(LENGTH(..))` 聚合、`WHERE UPPER(v) IS NULL`
+  永不命中);现按 SQL 语义返回 NULL。
+- **SUBSTR 对齐 SQLite 语义**:起点 0 位于虚拟首位(`substr('abcde',0,2)` 得 `'a'`,此前多取
+  一位)、负长度取起点之前的字符(`substr('abcde',2,-1)` 得 `'a'`,此前返回空串)。
+- **SUM 单元素也校验数值性**:单行 BLOB/文本的 `SUM` 此前原样返回该值,第二行到达才报错。
+- **BLOB 文本化走规范形**:`CAST(x'0102' AS TEXT)`、`||` 拼接、`GROUP_CONCAT` 此前产出
+  Rust Debug 形态 `Bytes([1, 2])`,现为 `x'0102'`。
+- **B+ 树键上限计入页头**:cell 上限此前未含节点头(3/7 字节),三个接近上限的键分裂时左右
+  两半都放不进一页,合法插入被误报「key too large」;上限收紧为 `(PAGE_SIZE-头)/2` 后分裂恒有解。
+- **HAVING 支持谓词形态**:`HAVING k IS NULL`(ROLLUP 筛总计行的惯用写法)、`LIKE`/`BETWEEN`/`IN`
+  此前被列引用白名单误拒(求值器本就支持)。
+
+#### 修复(会话/运维)
+
+- **REQ_EXECUTE(参数化 INSERT)喂会话身份**:.NET 参数化命令走的 prepared 路径此前不更新
+  `@@IDENTITY`/`SCOPE_IDENTITY()`(滞留上一条快路径 INSERT 的旧值,拿错自增 id 关联外键即错数据);
+  MERGE 的 INSERT 臂此前同样不喂(快路径与解释器皆是)。
+- **`docsql_log` 视图不再劫持同名用户表**:用户建 `docsql_log` 表后写入走真表、SELECT 却被
+  审计视图替换(客户端读到与自己写入不一致的数据);现 catalog 有同名表时视图让位。
+- **redact_sql 跳过字符串字面量**:字面量内的 `PASSWORD` 字样此前被过度脱敏,审计日志记录的
+  语句文本与实际执行的不一致(方向是多脱不是泄漏)。
+- **DROP VIEW/DROP INDEX 的 catalog 回滚**:catalog 写页失败(存储 IO 错)时此前内存目录已
+  被改,下一次成功写会把半删除静默持久化;现与 DROP TABLE 同样快照回滚。
+- **语句超时采样补齐**:无 WHERE 的 SELECT(扫描/投影/DISTINCT)、GROUP BY 分组循环、
+  UPDATE/MERGE 的 CHECK+FK 校验循环此前零采样,`DOCSQL_STATEMENT_TIMEOUT_MS` 对这些形态
+  打不断。
+
 ### 相关子查询支持(2026-09-27)
 
 #### 新增

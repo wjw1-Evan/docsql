@@ -1134,9 +1134,24 @@ impl<'a> ReadCx<'a> {
             ));
         };
         let akey = alias_obj.name.value.clone();
+        let fname_upper = fname.to_uppercase();
+        // Static ordinal guess for the width check when no row ever
+        // materializes; the argument is correlated so a non-constant
+        // third argument falls back to the two-column shape.
+        let ordinal_on = args.len() == 3
+            && matches!(
+                eval_const(match args.last() {
+                    Some(sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    )) => e,
+                    _ => return err("table function arguments must be values"),
+                }),
+                Ok(Value::Int(n)) if n != 0
+            );
         // Alias column renames apply to the produced rows (same rule as
         // derived tables).
         let mut out = Vec::with_capacity(left.len());
+        let mut produced_cols: Option<Vec<String>> = None;
         for lrow in &left {
             self.deadline.check()?;
             let mut vals = Vec::new();
@@ -1148,7 +1163,7 @@ impl<'a> ReadCx<'a> {
                     _ => return err("table function arguments must be values"),
                 }
             }
-            let docs = match crate::tsql::table_function(&fname.to_uppercase(), &vals) {
+            let docs = match crate::tsql::table_function(&fname_upper, &vals) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
                 None => return err(format!("unknown table function {fname}")),
@@ -1159,42 +1174,85 @@ impl<'a> ReadCx<'a> {
                 }
                 continue;
             }
+            if produced_cols.is_none() {
+                produced_cols = Some(docs[0].keys().cloned().collect());
+            }
             for d in docs {
                 let qright = qualify(&d, &akey);
                 out.push(merged_row(lrow, &qright));
             }
         }
-        // Alias column renaming (APPLY f(..) AS t(col)): positional rename
-        // over the function's fixed output columns.
-        let source_cols: &[&str] = match fname.to_uppercase().as_str() {
-            "STRING_SPLIT" => {
-                if args.len() == 3 {
-                    &["value", "ordinal"]
-                } else {
-                    &["value"]
-                }
-            }
-            "GENERATE_SERIES" => &["value"],
-            _ => &["key", "value", "type"],
-        };
+        // Actual output columns (bare names) for the rename and NULL pad.
+        let cols: Vec<String> = produced_cols.unwrap_or_else(|| {
+            tablefn_static_cols(&fname_upper, ordinal_on)
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
         // A wrong column list must fail loudly, exactly like the derived
         // table path — swallowing it silently dropped the rename.
-        let rename = table_alias_columns(&alias_obj.columns, source_cols.len())?;
-        if let Some(rename) = rename {
-            for row in &mut out {
+        let rename = table_alias_columns(&alias_obj.columns, cols.len())?;
+        let final_names: Vec<String> = rename.clone().unwrap_or_else(|| cols.clone());
+        let prefix = format!("{akey}.");
+        for row in &mut out {
+            if let Some(rename) = &rename {
                 // Rename IN PLACE (move the value from the function's output
                 // column to its alias). Inserting alongside would leak the
                 // original column into SELECT *.
-                for (new, old) in rename.iter().zip(source_cols.iter()) {
+                for (new, old) in rename.iter().zip(cols.iter()) {
                     let old_key = format!("{akey}.{old}");
-                    if let Some(v) = row.get(&old_key).cloned() {
-                        row.remove(&old_key);
+                    if let Some(v) = row.remove(&old_key) {
                         row.insert(format!("{akey}.{new}"), v);
                     }
                 }
             }
+            if outer && !row.keys().any(|k| k.starts_with(&prefix)) {
+                // OUTER APPLY kept this left row because the applied rowset
+                // was empty. Pad the right columns with explicit NULLs:
+                // without keys, a same-named LEFT column would answer the
+                // suffix fallback and masquerade as the right value.
+                for c in &final_names {
+                    row.insert(format!("{akey}.{c}"), Value::Null);
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// Planned BARE column list of a table factor, when statically known:
+    /// base tables/views from the catalog, table functions from their fixed
+    /// shape. Used to pad explicit NULL keys when an OUTER join's other side
+    /// is empty (no row to sample the key shape from). `None` = unknown
+    /// (derived tables with non-trivial projections, CTEs, …) and the join
+    /// keeps its historical behavior.
+    fn table_factor_columns(
+        &self,
+        tf: &sqlparser::ast::TableFactor,
+        ctes: &Ctes,
+    ) -> Option<Vec<String>> {
+        match tf {
+            sqlparser::ast::TableFactor::Table { name, args, .. } => {
+                if args.is_some() {
+                    // Table-with-args = a table function whose output shape
+                    // depends on evaluated arguments (STRING_SPLIT's ordinal
+                    // toggle); let load_table_factor handle it and report no
+                    // planned shape here.
+                    return None;
+                }
+                let tname = obj_name(name);
+                if is_compat_view(&tname) || ctes.contains_key(&tname) {
+                    return None;
+                }
+                self.tables.get(&tname).map(|m| m.columns.clone())
+            }
+            sqlparser::ast::TableFactor::OpenJsonTable { .. } => Some(
+                tablefn_static_cols("OPENJSON", false)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
 
     fn load_table_factor(
@@ -1287,11 +1345,13 @@ impl<'a> ReadCx<'a> {
                         "{fname} requires a table alias (FROM {fname}(...) AS t)"
                     ));
                 };
-                let docs = match crate::tsql::table_function(&fname, &vals) {
+                let mut docs = match crate::tsql::table_function(&fname, &vals) {
                     Some(Ok(rows)) => rows,
                     Some(Err(e)) => return Err(e),
                     None => return err(format!("unknown table function {fname}")),
                 };
+                let ordinal_on = vals.len() == 3 && matches!(vals[2], Value::Int(n) if n != 0);
+                rename_tablefn_docs(alias_obj, &fname, ordinal_on, &mut docs)?;
                 return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
             }
             // `OPENJSON(x)` parses into a dedicated factor (WITH shapes and
@@ -1311,11 +1371,12 @@ impl<'a> ReadCx<'a> {
                 let Some(alias_obj) = alias else {
                     return err("OPENJSON requires a table alias (FROM OPENJSON(...) AS j)");
                 };
-                let docs = match crate::tsql::table_function("OPENJSON", &[val]) {
+                let mut docs = match crate::tsql::table_function("OPENJSON", &[val]) {
                     Some(Ok(rows)) => rows,
                     Some(Err(e)) => return Err(e),
                     None => return err("unknown table function OPENJSON"),
                 };
+                rename_tablefn_docs(alias_obj, "OPENJSON", false, &mut docs)?;
                 return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
             }
             // T-SQL PIVOT: implicit-group every column except the pivot
@@ -1404,11 +1465,13 @@ impl<'a> ReadCx<'a> {
                 ));
             };
             let alias = alias_obj.name.value.clone();
-            let docs = match crate::tsql::table_function(&fname, &vals) {
+            let mut docs = match crate::tsql::table_function(&fname, &vals) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
                 None => return err(format!("unknown table function {fname}")),
             };
+            let ordinal_on = vals.len() == 3 && matches!(vals[2], Value::Int(n) if n != 0);
+            rename_tablefn_docs(alias_obj, &fname, ordinal_on, &mut docs)?;
             return Ok(("@tablefn".into(), Some(alias), docs));
         }
         if sample.is_some() {
@@ -1741,6 +1804,10 @@ impl<'a> ReadCx<'a> {
             let mut group_index: std::collections::HashMap<Vec<u8>, usize> =
                 std::collections::HashMap::new();
             for doc in &rows {
+                // Inside the row loop too: one set over a big table must
+                // stay interruptible (the per-set check above samples only
+                // once per set).
+                self.deadline.check()?;
                 let key: Vec<Value> = set
                     .iter()
                     .map(|e| eval_expr(e, doc))
@@ -1759,6 +1826,7 @@ impl<'a> ReadCx<'a> {
                 groups.push((vec![], vec![]));
             }
             for (key, docs) in &groups {
+                self.deadline.check()?;
                 let mut row = Vec::with_capacity(agg_specs.len());
                 for spec in &agg_specs {
                     row.push(eval_grouped_spec(spec, &all_exprs, set, key, docs)?);
@@ -1876,6 +1944,10 @@ impl<'a> ReadCx<'a> {
         };
         let corr: Vec<bool> = project.iter().map(|(_, e)| expr_has_subquery(e)).collect();
         for doc in &docs {
+            // The projection loop is the only per-row work a WHERE-less
+            // SELECT does over a big table — keep the statement timeout
+            // armed here (the WHERE path samples inside matches_in).
+            self.deadline.check()?;
             if want_star {
                 let mut row: Vec<Value> = columns_out
                     .iter()
@@ -1910,6 +1982,7 @@ impl<'a> ReadCx<'a> {
                 let mut kept_docs = Vec::with_capacity(docs.len());
                 let mut kept_rows = Vec::with_capacity(out.len());
                 for (doc, row) in docs.into_iter().zip(out) {
+                    self.deadline.check()?;
                     let key = encode::encode_to_vec(&Value::Array(row.clone()))
                         .map_err(SqlError::Encode)?;
                     if seen.insert(key) {
@@ -2289,13 +2362,38 @@ impl<'a> ReadCx<'a> {
         } else {
             bdocs.drain(..).map(|d| qualify(&d, &bkey)).collect()
         };
+        // Accumulated LEFT key shape for RIGHT/FULL joins: rows carry bare
+        // base columns plus qualified keys of earlier joins; an empty left
+        // side cannot be sampled, so the planned list answers instead.
+        let mut left_cols: Option<Vec<String>> = if solo {
+            None
+        } else {
+            self.table_factor_columns(&base.relation, ctes)
+                .map(|cs| cs.iter().map(|c| format!("{bkey}.{c}")).collect())
+        };
         let mut all_joins: Vec<&sqlparser::ast::Join> = base.joins.iter().collect();
         if !solo {
             for twj in &from[1..] {
                 // comma-separated FROM entries: cross join their base tables
                 let (n, a, d) = self.load_table_factor(&twj.relation, ctes)?;
                 let k = a.unwrap_or(n);
-                rows = join_rows(rows, &d, &k, None, false, false, self.deadline)?;
+                let dcols = self.table_factor_columns(&twj.relation, ctes);
+                rows = join_rows(
+                    rows,
+                    &d,
+                    &k,
+                    None,
+                    false,
+                    false,
+                    self.deadline,
+                    dcols.as_deref(),
+                    left_cols.as_deref(),
+                )?;
+                if let (Some(lc), Some(dc)) = (&mut left_cols, &dcols) {
+                    lc.extend(dc.iter().map(|c| format!("{k}.{c}")));
+                } else {
+                    left_cols = None;
+                }
                 all_joins.extend(twj.joins.iter());
             }
         }
@@ -2327,6 +2425,9 @@ impl<'a> ReadCx<'a> {
                         &tf_args.args,
                         outer,
                     )?;
+                    // Applied rows carry `{alias}.{fn-col}` keys; the base
+                    // column shape no longer describes the left side.
+                    left_cols = None;
                     continue;
                 }
                 // OPENJSON keeps its dedicated factor shape in APPLY
@@ -2347,6 +2448,11 @@ impl<'a> ReadCx<'a> {
                     };
                     let akey = alias_obj.name.value.clone();
                     let mut out = Vec::with_capacity(rows.len());
+                    let mut produced_cols = false;
+                    let mut cols: Vec<String> = tablefn_static_cols("OPENJSON", false)
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
                     for lrow in &rows {
                         self.deadline.check()?;
                         let val = eval_expr(json_expr, lrow)?;
@@ -2361,11 +2467,39 @@ impl<'a> ReadCx<'a> {
                             }
                             continue;
                         }
+                        if !produced_cols {
+                            cols = docs[0].keys().cloned().collect();
+                            produced_cols = true;
+                        }
                         for d in docs {
                             out.push(merged_row(lrow, &qualify(&d, &akey)));
                         }
                     }
+                    // Alias column renames (`APPLY OPENJSON(..) AS j(k, v, t)`)
+                    // apply positionally over the qualified output keys; an
+                    // empty rowset on OUTER APPLY pads explicit NULLs so the
+                    // right columns cannot fall back onto same-named left
+                    // fields.
+                    let rename = table_alias_columns(&alias_obj.columns, cols.len())?;
+                    let final_names: Vec<String> = rename.clone().unwrap_or_else(|| cols.clone());
+                    let prefix = format!("{akey}.");
+                    for row in &mut out {
+                        if let Some(rename) = &rename {
+                            for (new, old) in rename.iter().zip(cols.iter()) {
+                                let old_key = format!("{akey}.{old}");
+                                if let Some(v) = row.remove(&old_key) {
+                                    row.insert(format!("{akey}.{new}"), v);
+                                }
+                            }
+                        }
+                        if outer && !row.keys().any(|k| k.starts_with(&prefix)) {
+                            for c in &final_names {
+                                row.insert(format!("{akey}.{c}"), Value::Null);
+                            }
+                        }
+                    }
                     rows = out;
+                    left_cols = None;
                     continue;
                 }
                 return err(
@@ -2375,6 +2509,7 @@ impl<'a> ReadCx<'a> {
             }
             let (jname, jalias, jdocs) = self.load_table_factor(&j.relation, ctes)?;
             let jkey = jalias.unwrap_or(jname);
+            let jcols = self.table_factor_columns(&j.relation, ctes);
             let (left_join, right_join, on) = match &j.join_operator {
                 JoinOperator::Join(c)
                 | JoinOperator::Inner(c)
@@ -2471,7 +2606,14 @@ impl<'a> ReadCx<'a> {
                 left_join,
                 right_join,
                 self.deadline,
+                jcols.as_deref(),
+                left_cols.as_deref(),
             )?;
+            if let (Some(lc), Some(jc)) = (&mut left_cols, &jcols) {
+                lc.extend(jc.iter().map(|c| format!("{jkey}.{c}")));
+            } else {
+                left_cols = None;
+            }
         }
         Ok(rows)
     }
@@ -4356,6 +4498,9 @@ impl<'a> ReadCx<'a> {
         let mut out = Vec::new();
         let rtx = self.pager.begin_tx();
         for &pid in &heap.pages {
+            // The heap walk is the first cost a WHERE-less SELECT pays over a
+            // big table — keep the statement timeout armed here too.
+            self.deadline.check()?;
             out.extend(heap.page_docs(&self.reader(), &rtx, pid)?);
         }
         // The read-only tx has no staged pages: dropping it is the cleanup.
@@ -5435,7 +5580,7 @@ impl Database {
     }
 
     /// True when the catalog holds a table with this exact name.
-    pub(crate) fn table_exists(&self, name: &str) -> bool {
+    pub fn table_exists(&self, name: &str) -> bool {
         self.tables.contains_key(name)
     }
 
@@ -6555,6 +6700,11 @@ impl Database {
                             return err(format!("index {iname} does not exist"));
                         }
                     }
+                    // Same catalog snapshot as DROP TABLE/VIEW: a failure in
+                    // the page-free loop or the catalog save must restore the
+                    // in-memory catalog, or the next successful write would
+                    // persist the (unjournalled) half-drop.
+                    let catalog_prev = self.tables.clone();
                     let mut dropped_roots: Vec<(String, u32)> = Vec::new();
                     for n in &names {
                         let iname = obj_name(n);
@@ -6618,17 +6768,28 @@ impl Database {
                         }
                     }
                     let mut tx = self.pager.begin_tx();
-                    for (root_key, root) in dropped_roots {
-                        for p in BTree::open(root)
-                            .collect_pages(&PageReader::current(&self.pager), &tx)
-                            .map_err(|e| index_err(&root_key, e))?
-                        {
-                            self.pager.free_page(&mut tx, p)?;
+                    let drop_result: Result<()> = (|| {
+                        for (root_key, root) in &dropped_roots {
+                            for p in BTree::open(*root)
+                                .collect_pages(&PageReader::current(&self.pager), &tx)
+                                .map_err(|e| index_err(root_key, e))?
+                            {
+                                self.pager.free_page(&mut tx, p)?;
+                            }
+                        }
+                        self.save_catalog_into(&mut tx)
+                    })();
+                    match drop_result {
+                        Ok(()) => {
+                            self.commit_pager_tx(tx)?;
+                            return Ok(ExecOutcome::Affected(0));
+                        }
+                        Err(e) => {
+                            self.pager.abort_tx(tx)?;
+                            self.tables = catalog_prev;
+                            return Err(e);
                         }
                     }
-                    self.save_catalog_into(&mut tx)?;
-                    self.commit_pager_tx(tx)?;
-                    return Ok(ExecOutcome::Affected(0));
                 }
                 if object_type == sqlparser::ast::ObjectType::View {
                     // Views have no storage: drop the catalog entries only.
@@ -6652,14 +6813,27 @@ impl Database {
                     // A dependent view left behind used to fail only at the
                     // next SELECT; refuse without CASCADE, join with it.
                     self.expand_view_dependents(&mut dropping, cascade)?;
+                    // Same snapshot discipline as DROP TABLE: a failed
+                    // save_catalog_into must not leave the views gone from
+                    // the in-memory catalog (the next successful write would
+                    // persist a half-drop that never freed anything).
+                    let catalog_prev = self.tables.clone();
                     self.delete_grants_for(&dropping);
                     let mut tx = self.pager.begin_tx();
                     for name in &dropping {
                         self.tables.remove(name);
                     }
-                    self.save_catalog_into(&mut tx)?;
-                    self.commit_pager_tx(tx)?;
-                    return Ok(ExecOutcome::Affected(0));
+                    match self.save_catalog_into(&mut tx) {
+                        Ok(()) => {
+                            self.commit_pager_tx(tx)?;
+                            return Ok(ExecOutcome::Affected(0));
+                        }
+                        Err(e) => {
+                            self.pager.abort_tx(tx)?;
+                            self.tables = catalog_prev;
+                            return Err(e);
+                        }
+                    }
                 }
                 if object_type != sqlparser::ast::ObjectType::Table {
                     return err("only DROP TABLE/VIEW/INDEX are supported");
@@ -7314,6 +7488,9 @@ impl Database {
         // Validate BEFORE writing: a failed UPDATE must not change data.
         // 自引用 FK 的父候选是本语句的最终像集合(不只是表里的旧像)。
         for doc in &out {
+            // Full-table UPDATEs walk this loop (plus a parent-table scan
+            // per FK inside check_fks_in) — keep the timeout armed.
+            self.stmt_deadline.check()?;
             meta.check(doc)?;
             self.check_fks_in(&tname, &meta, doc, &out)?;
         }
@@ -7361,6 +7538,9 @@ impl Database {
         {
             let batch: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
             for doc in &batch {
+                // Big UPDATEs (with a FK, check_fks_in also scans the parent
+                // table per row) must stay interruptible.
+                self.stmt_deadline.check()?;
                 self.check_fks_in(&tname, &meta, doc, &batch)?;
             }
         }
@@ -8149,6 +8329,15 @@ impl Database {
                                          every node would evaluate a different value",
                                     );
                                 }
+                                let mut refs = Vec::new();
+                                check_expr_column_refs(&c.expr, &mut refs)?;
+                                for r in refs {
+                                    if !meta.columns.contains(&r) {
+                                        return err(format!(
+                                            "CHECK constraint references unknown column {r}"
+                                        ));
+                                    }
+                                }
                                 meta.checks.push(format!("{}", c.expr))
                             }
                             CO::NotNull => add_not_null = true,
@@ -8162,7 +8351,24 @@ impl Database {
                                     "constraint options are not supported on ADD COLUMN {col}"
                                 ));
                             }
-                            _ => {}
+                            // Swallowing these silently degraded the column
+                            // to a plain one (the CREATE TABLE path rejects
+                            // the same spellings).
+                            CO::Generated { .. }
+                            | CO::Materialized(_)
+                            | CO::Ephemeral(_)
+                            | CO::Alias(_) => {
+                                return err(format!(
+                                    "generated/computed columns are not supported \
+                                     (ADD COLUMN {col})"
+                                ));
+                            }
+                            CO::Null => {}
+                            _ => {
+                                return err(format!(
+                                    "unsupported column option on ADD COLUMN {col}"
+                                ))
+                            }
                         }
                     }
                     // SQLite rule: a NOT NULL column needs a default to
@@ -8191,6 +8397,14 @@ impl Database {
                                 d
                             })
                             .collect();
+                        // The backfilled image must satisfy the checks —
+                        // including one riding along on THIS ADD COLUMN:
+                        // `ADD COLUMN c INT DEFAULT -5 CHECK (c > 0)` used
+                        // to backfill violating values while later INSERTs
+                        // were correctly rejected.
+                        for d in &filled {
+                            meta.check(d)?;
+                        }
                         self.rewrite_table(&tname, &mut meta, filled)?;
                         rewrote = true;
                     }
@@ -8856,6 +9070,15 @@ impl Database {
                 .into_iter()
                 .map(|row| r.columns.iter().cloned().zip(row).collect())
                 .collect();
+            // Duplicate output names would collapse two logical columns into
+            // one document key (the later value silently wins) — same rule
+            // as the explicit column list below.
+            {
+                let mut seen = std::collections::BTreeSet::new();
+                if let Some(dup) = r.columns.iter().find(|c| !seen.insert((*c).clone())) {
+                    return err(format!("duplicate column name: {dup}"));
+                }
+            }
             let mut meta = TableMeta {
                 columns: r.columns,
                 ..Default::default()
@@ -8918,6 +9141,18 @@ impl Database {
                                  functions (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND); \
                                  every node would evaluate a different value");
                         }
+                        // Unknown column references resolve to NULL at
+                        // evaluation time, so a typo'd CHECK would never
+                        // fire — validate at DDL time.
+                        let mut refs = Vec::new();
+                        check_expr_column_refs(&c.expr, &mut refs)?;
+                        for r in refs {
+                            if !meta.columns.contains(&r) {
+                                return err(format!(
+                                    "CHECK constraint references unknown column {r}"
+                                ));
+                            }
+                        }
                         meta.checks.push(format!("{}", c.expr))
                     }
                     CO::ForeignKey(fk) => {
@@ -8932,6 +9167,11 @@ impl Database {
                                 "FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
                                  (declare the constraint and keep parent keys stable)",
                             );
+                        }
+                        if fk.referred_columns.len() != 1 {
+                            // Silently taking the first referred column
+                            // quietly changed the constraint's meaning.
+                            return err("column-level FOREIGN KEY must reference a single column");
                         }
                         let (Some(rt), Some(rc)) = (
                             fk.foreign_table.0.last().map(|p| match p {
@@ -8986,7 +9226,16 @@ impl Database {
                              (use CREATE UNIQUE INDEX)");
                     }
                     for ic in &u.columns {
+                        if !matches!(ic.column.expr, SqlExpr::Identifier(_)) {
+                            return err("expression UNIQUE constraints are not supported \
+                                 (constraint a plain column)");
+                        }
                         let col = expr_name(&ic.column.expr);
+                        if !meta.columns.contains(&col) {
+                            // A ghost column builds a constraint tree that can
+                            // never fire and vanishes from dump_script.
+                            return err(format!("UNIQUE column {col} does not exist"));
+                        }
                         if !meta.unique.contains(&col) {
                             meta.unique.push(col.clone());
                             meta.constraint_unique.push(col);
@@ -9007,7 +9256,14 @@ impl Database {
                              (declare a single-column PRIMARY KEY or use CREATE UNIQUE INDEX)");
                     }
                     if let Some(ic) = pk.columns.first() {
+                        if !matches!(ic.column.expr, SqlExpr::Identifier(_)) {
+                            return err("expression PRIMARY KEY constraints are not supported \
+                                 (constraint a plain column)");
+                        }
                         let name = expr_name(&ic.column.expr);
+                        if !meta.columns.contains(&name) {
+                            return err(format!("PRIMARY KEY column {name} does not exist"));
+                        }
                         if meta.primary_key.replace(name).is_some() {
                             return err("table has more than one primary key".to_string());
                         }
@@ -9018,6 +9274,13 @@ impl Database {
                         return err("CHECK constraints cannot call wall-clock functions \
                              (NOW/SYSDATE/CURRENT_TIMESTAMP); every node would \
                              evaluate a different instant");
+                    }
+                    let mut refs = Vec::new();
+                    check_expr_column_refs(&chk.expr, &mut refs)?;
+                    for r in refs {
+                        if !meta.columns.contains(&r) {
+                            return err(format!("CHECK constraint references unknown column {r}"));
+                        }
                     }
                     meta.checks.push(format!("{}", chk.expr))
                 }
@@ -9038,6 +9301,13 @@ impl Database {
                     }) else {
                         return err("FOREIGN KEY requires a table");
                     };
+                    // A composite FK silently split into per-column pairs
+                    // enforces a different (weaker) constraint — each column
+                    // independently instead of the tuple. Refuse like the
+                    // composite PK/UNIQUE forms.
+                    if fk.columns.len() != 1 {
+                        return err("composite FOREIGN KEY constraints are not supported");
+                    }
                     // zip 会静默截断较短的列清单,约束悄悄少一列 —— 列数
                     // 不匹配必须显式报错(子句级静默忽略是红线)。
                     if fk.columns.len() != fk.referred_columns.len() {
@@ -9049,6 +9319,9 @@ impl Database {
                         ));
                     }
                     for (lc, rc) in fk.columns.iter().zip(fk.referred_columns.iter()) {
+                        if !meta.columns.contains(&lc.value) {
+                            return err(format!("FOREIGN KEY column {} does not exist", lc.value));
+                        }
                         meta.foreign_keys
                             .push((lc.value.clone(), rt.clone(), rc.value.clone()));
                     }
@@ -9101,7 +9374,14 @@ impl Database {
         let mut columns: Vec<String> = if insert.columns.is_empty() {
             meta.columns.clone()
         } else {
-            insert.columns.iter().map(obj_name).collect()
+            // A repeated name makes the later zip().collect() silently
+            // overwrite the earlier value — reject like mainstream engines.
+            let cols: Vec<String> = insert.columns.iter().map(obj_name).collect();
+            let mut seen = std::collections::BTreeSet::new();
+            if let Some(dup) = cols.iter().find(|c| !seen.insert((*c).clone())) {
+                return err(format!("duplicate column name: {dup}"));
+            }
+            cols
         };
         let Some(source) = &insert.source else {
             return err("INSERT requires VALUES");
@@ -9245,10 +9525,7 @@ impl Database {
                 }
             }
             meta.check(&doc)?;
-            // 行间/自引用 FK:同语句已收集(含本行)的新像是合法父候选。
             new_docs.push(doc);
-            let last = new_docs.len() - 1;
-            self.check_fks_in(&table, &meta, &new_docs[last], &new_docs)?;
         }
         // Conflict policy: plain (error on duplicates), REPLACE INTO /
         // OR REPLACE (drop conflicting rows first), ON CONFLICT DO NOTHING /
@@ -9546,6 +9823,24 @@ impl Database {
             self.pager.abort_tx(tx)?;
             return Err(e);
         }
+        // Child-side FK over the FINAL row set. ON CONFLICT DO NOTHING /
+        // OR IGNORE filter rows out after the batch was built — validating
+        // against the pre-filter batch let a skipped parent candidate
+        // legitimize a child that lands alone (dangling reference).
+        // Self-references resolve against the placed batch itself;
+        // statement-internal references count, including forward ones.
+        if !meta.foreign_keys.is_empty() && !placed.is_empty() {
+            let final_docs: Vec<Object> = placed.iter().map(|(_, d)| d.clone()).collect();
+            for doc in &final_docs {
+                // A big INSERT ... SELECT walks this per placed row: keep the
+                // statement timeout armed like every other row loop.
+                self.stmt_deadline.check()?;
+                if let Err(e) = self.check_fks_in(&table, &meta, doc, &final_docs) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
+            }
+        }
         // Legacy files whose constraint columns predate trees keep the
         // whole-set duplicate check; tables with no constraints skip it.
         // ANY untreed constraint column triggers it (same gate as the
@@ -9707,6 +10002,9 @@ impl Database {
                         if !meta.columns.contains(&col) {
                             return err(format!("column {col} does not exist"));
                         }
+                        if cols.contains(&col) {
+                            return err(format!("duplicate column name: {col}"));
+                        }
                         cols.push(col);
                     }
                     if cols.is_empty() {
@@ -9772,7 +10070,11 @@ impl Database {
                 let row = Self::merge_join_row(t_doc, tkey.as_str(), s_doc, &skey);
                 if matches!(eval_expr(&merge.on, &row)?, Value::Bool(true)) {
                     hits += 1;
-                    if hits > 1 {
+                    if hits > 1 && matched_upd.is_some() {
+                        // Only an UPDATE arm makes a second match a conflict
+                        // (it would update the row twice). With no WHEN
+                        // MATCHED clause every source row that matched is
+                        // simply consumed — nothing to update.
                         return err(format!(
                             "MERGE cannot update the same row of {tname} twice \
                              (multiple source rows matched)"
@@ -9787,6 +10089,12 @@ impl Database {
         // Build the matched updates: assignments evaluate on the merged
         // namespace (target columns and qualified source columns).
         let mut updates: Vec<(u64, Object, Object)> = Vec::new();
+        // An explicit autoinc id (INSERT arm) or an assignment touching the
+        // autoinc column (UPDATE arm) invalidates the session's high-water
+        // cache: `merge_next_autoinc` only tracks engine-generated ids, and
+        // keeping the stale cache made the next plain INSERT collide with
+        // the explicit value (UNIQUE constraint failed).
+        let mut autoinc_mutated = false;
         if let Some(assignments) = &matched_upd {
             for (t_loc, t_doc, si) in &pairs {
                 let s_doc = &src_rows[*si];
@@ -9799,6 +10107,9 @@ impl Database {
                             return err(format!("unsupported MERGE assignment target: {other}"))
                         }
                     };
+                    if Some(&col) == meta.autoinc.as_ref() {
+                        autoinc_mutated = true;
+                    }
                     let v = eval_expr(&a.value, &row)?;
                     new_doc.insert(col, v);
                 }
@@ -9929,6 +10240,11 @@ impl Database {
                     if matches!(doc.get(col), Some(Value::Null) | None) {
                         doc.insert(col.clone(), Value::Int(next_autoinc));
                         next_autoinc = next_autoinc.saturating_add(1);
+                    } else {
+                        // Explicit id: the engine didn't allocate it, so it
+                        // never advances `next_autoinc` — drop the cache at
+                        // commit and let the next INSERT recompute max+1.
+                        autoinc_mutated = true;
                     }
                 }
                 for (col, text) in &meta.defaults {
@@ -10045,6 +10361,7 @@ impl Database {
                     .map(|(_, _, n)| n)
                     .chain(inserted_docs.iter())
                 {
+                    self.stmt_deadline.check()?;
                     let Some(v) = doc.get(col) else { continue };
                     if matches!(v, Value::Null) {
                         continue; // NULL passes (MATCH SIMPLE semantics)
@@ -10110,6 +10427,13 @@ impl Database {
         if let Some(id) = merge_last_id {
             let cur = self.last_insert_id.unwrap_or(i64::MIN);
             self.last_insert_id = Some(cur.max(id));
+        }
+        if autoinc_mutated {
+            // Same recovery rule as the plain UPDATE path: an id this
+            // statement set explicitly (or reassigned) is invisible to
+            // `merge_next_autoinc`, so only a recompute stays correct.
+            self.autoinc_cache.remove(&tname);
+        } else if merge_last_id.is_some() {
             self.autoinc_cache.insert(tname.clone(), merge_next_autoinc);
         }
         Ok(ExecOutcome::Affected((updates.len() + inserted) as u64))
@@ -10480,7 +10804,11 @@ fn eval_agg(
                     if vals.is_empty() {
                         Value::Null
                     } else {
-                        let mut sum = vals.remove(0);
+                        // Fold from a numeric zero so a lone value goes
+                        // through add_values' type check too: SUM over a
+                        // single BLOB/text used to return the value itself
+                        // and only erroed once a second row arrived.
+                        let mut sum = Value::Int(0);
                         for v in vals {
                             sum = add_values(sum, v)?;
                         }
@@ -11222,21 +11550,53 @@ fn merged_row(l: &Object, right: &Object) -> Object {
 
 /// LEFT/INNER join's unmatched left row: the right side's columns padded
 /// with NULL. `right_sample` is any qualified right row (row schemas vary,
-/// the first row is the historical convention).
-fn null_extended_left(l: &Object, right_sample: Option<&Object>) -> Object {
+/// the first row is the historical convention). An EMPTY right side has no
+/// sample, so `right_cols` (the factor's planned columns) pads the keys —
+/// without them a same-named left column answers the suffix fallback and
+/// masquerades as the right value (`WHERE r.id IS NULL` never fires).
+fn null_extended_left(
+    l: &Object,
+    right_sample: Option<&Object>,
+    right_key: &str,
+    right_cols: Option<&[String]>,
+) -> Object {
     let mut merged = l.clone();
-    if let Some(sample) = right_sample {
-        for k in sample.keys() {
-            merged.insert(k.clone(), Value::Null);
+    match right_sample {
+        Some(sample) => {
+            for k in sample.keys() {
+                merged.insert(k.clone(), Value::Null);
+            }
+        }
+        None => {
+            if let Some(cols) = right_cols {
+                for c in cols {
+                    merged.insert(format!("{right_key}.{c}"), Value::Null);
+                }
+            }
         }
     }
     merged
 }
 
 /// RIGHT/FULL join's unmatched right row: the left side's columns padded
-/// with NULL. `right` keys must already be qualified.
-fn null_extended_right(left_fields: &[String], right: &Object) -> Object {
+/// with NULL. `right` keys must already be qualified. `left_cols` is the
+/// planned left key shape used when the left side produced no rows at all
+/// (bare base columns plus the qualified keys of earlier joins).
+fn null_extended_right(
+    left_fields: &[String],
+    right: &Object,
+    left_cols: Option<&[String]>,
+) -> Object {
     let mut merged = Object::new();
+    if left_fields.is_empty() {
+        // The left side produced no rows: its key shape cannot be read off
+        // data, so pad the PLANNED columns instead (without them a
+        // same-named right column answers the suffix fallback and leaks the
+        // right value into a left-side reference).
+        for k in left_cols.unwrap_or(&[]) {
+            merged.insert(k.clone(), Value::Null);
+        }
+    }
     for k in left_fields {
         merged.insert(k.clone(), Value::Null);
     }
@@ -11255,6 +11615,7 @@ fn null_extended_right(left_fields: &[String], right: &Object) -> Object {
 /// only their own row to "probe everything" instead of falling back for the
 /// whole join. Emission order matches the nested loop: left order, then
 /// right order within a left row.
+#[allow(clippy::too_many_arguments)]
 fn hash_join(
     left: &[Object],
     qright: &[Object],
@@ -11263,6 +11624,9 @@ fn hash_join(
     left_join: bool,
     right_join: bool,
     deadline: &StmtDeadline,
+    right_key: &str,
+    right_cols: Option<&[String]>,
+    left_cols: Option<&[String]>,
 ) -> Result<Vec<Object>> {
     let mut map: std::collections::HashMap<Vec<JoinKey>, Vec<usize>> =
         std::collections::HashMap::new();
@@ -11343,14 +11707,14 @@ fn hash_join(
             }
         }
         if !matched && left_join {
-            out.push(null_extended_left(l, qright.first()));
+            out.push(null_extended_left(l, qright.first(), right_key, right_cols));
         }
     }
     if right_join {
         let left_fields = union_of_fields(left);
         for (ri, r) in qright.iter().enumerate() {
             if !right_matched[ri] {
-                out.push(null_extended_right(&left_fields, r));
+                out.push(null_extended_right(&left_fields, r, left_cols));
             }
         }
     }
@@ -11359,6 +11723,10 @@ fn hash_join(
 
 /// Nested-loop join and hash-join dispatcher. ON is evaluated over the
 /// merged (qualified) row; LEFT/RIGHT joins null-extend the unmatched side.
+/// `right_cols`/`left_cols` are the factors' planned (bare / row-shape)
+/// column lists, used to pad NULL keys when a side is EMPTY (no row to
+/// sample the key shape from).
+#[allow(clippy::too_many_arguments)]
 fn join_rows(
     left: Vec<Object>,
     right: &[Object],
@@ -11367,6 +11735,8 @@ fn join_rows(
     left_join: bool,
     right_join: bool,
     deadline: &StmtDeadline,
+    right_cols: Option<&[String]>,
+    left_cols: Option<&[String]>,
 ) -> Result<Vec<Object>> {
     // Qualify the right rows once: both paths merge them into left rows as
     // pre-qualified key-value pairs, so assembly stays byte-identical
@@ -11379,7 +11749,10 @@ fn join_rows(
     // nested loop below.
     if let Some(on) = on {
         if let Some(plan) = equi_plan(right_key, on) {
-            return hash_join(&left, &qright, on, &plan, left_join, right_join, deadline);
+            return hash_join(
+                &left, &qright, on, &plan, left_join, right_join, deadline, right_key, right_cols,
+                left_cols,
+            );
         }
     }
     let mut right_matched = vec![false; qright.len()];
@@ -11401,14 +11774,14 @@ fn join_rows(
             }
         }
         if !matched && left_join {
-            out.push(null_extended_left(l, qright.first()));
+            out.push(null_extended_left(l, qright.first(), right_key, right_cols));
         }
     }
     if right_join {
         let left_fields = union_of_fields(&left);
         for (ri, qr) in qright.iter().enumerate() {
             if !right_matched[ri] {
-                out.push(null_extended_right(&left_fields, qr));
+                out.push(null_extended_right(&left_fields, qr, left_cols));
             }
         }
     }
@@ -11807,7 +12180,7 @@ impl RunningAgg {
             AggOp::Count => {}
             AggOp::Sum => {
                 let next = match self.sum.take() {
-                    None => argval.clone(),
+                    None => add_values(Value::Int(0), argval.clone())?,
                     Some(s) => add_values(s, argval.clone())?,
                 };
                 self.sum = Some(next);
@@ -12556,6 +12929,92 @@ fn expr_name(e: &SqlExpr) -> String {
             .collect::<Vec<_>>()
             .join("."),
         other => other.to_string(),
+    }
+}
+
+/// Column references of a CHECK constraint expression (bare identifiers and
+/// the leaf of qualified names). Subqueries are rejected outright — the
+/// runtime evaluator resolves unknown columns to NULL, so without this DDL
+/// gate a typo'd CHECK would be created and never fire.
+fn check_expr_column_refs(e: &SqlExpr, out: &mut Vec<String>) -> Result<()> {
+    use SqlExpr::*;
+    match e {
+        Identifier(i) => {
+            out.push(i.value.clone());
+            Ok(())
+        }
+        CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                out.push(last.value.clone());
+            }
+            Ok(())
+        }
+        Value(_) | TypedString { .. } => Ok(()),
+        Nested(i) | IsNull(i) | IsNotNull(i) | Cast { expr: i, .. } => {
+            check_expr_column_refs(i, out)
+        }
+        UnaryOp { expr, .. } => check_expr_column_refs(expr, out),
+        BinaryOp { left, right, .. } => {
+            check_expr_column_refs(left, out)?;
+            check_expr_column_refs(right, out)
+        }
+        IsDistinctFrom(a, b) | IsNotDistinctFrom(a, b) => {
+            check_expr_column_refs(a, out)?;
+            check_expr_column_refs(b, out)
+        }
+        Between {
+            expr, low, high, ..
+        } => {
+            check_expr_column_refs(expr, out)?;
+            check_expr_column_refs(low, out)?;
+            check_expr_column_refs(high, out)
+        }
+        Like { expr, pattern, .. } | ILike { expr, pattern, .. } => {
+            check_expr_column_refs(expr, out)?;
+            check_expr_column_refs(pattern, out)
+        }
+        InList { expr, list, .. } => {
+            check_expr_column_refs(expr, out)?;
+            for item in list {
+                check_expr_column_refs(item, out)?;
+            }
+            Ok(())
+        }
+        Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                check_expr_column_refs(o, out)?;
+            }
+            for w in conditions {
+                check_expr_column_refs(&w.condition, out)?;
+                check_expr_column_refs(&w.result, out)?;
+            }
+            if let Some(r) = else_result {
+                check_expr_column_refs(r, out)?;
+            }
+            Ok(())
+        }
+        Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        check_expr_column_refs(inner, out)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Subquery(_) | Exists { .. } | InSubquery { .. } => {
+            err("CHECK constraints cannot contain subqueries")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -14445,6 +14904,10 @@ pub(crate) fn value_to_text(v: &Value) -> String {
         // Timestamp renders as canonical fixed-width ISO text (Display),
         // not the debug enum shape.
         Value::Timestamp(ms) => crate::value::format_timestamp_ms(*ms),
+        // BLOB text renders in its canonical `x'…'` literal form (Display)
+        // — the Debug enum shape used to leak out here and the result could
+        // never be parsed back.
+        Value::Bytes(_) => v.to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -14588,15 +15051,26 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         }
         "UPPER" | "UCASE" => {
             exact_arity(name, args, 1)?;
-            Value::Str(value_to_text(arg(args, 0, name)?).to_uppercase())
+            let v = arg(args, 0, name)?;
+            if null_prop(v) {
+                Value::Null
+            } else {
+                Value::Str(value_to_text(v).to_uppercase())
+            }
         }
         "LOWER" | "LCASE" => {
             exact_arity(name, args, 1)?;
-            Value::Str(value_to_text(arg(args, 0, name)?).to_lowercase())
+            let v = arg(args, 0, name)?;
+            if null_prop(v) {
+                Value::Null
+            } else {
+                Value::Str(value_to_text(v).to_lowercase())
+            }
         }
         "LENGTH" | "LEN" => {
             exact_arity(name, args, 1)?;
             Value::Int(match arg(args, 0, name)? {
+                Value::Null => return Ok(Value::Null),
                 Value::Str(s) => {
                     if name == "LEN" {
                         // T-SQL LEN: trailing blanks are not counted.
@@ -14693,27 +15167,53 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Null
             } else {
                 let s: Vec<char> = value_to_text(arg(args, 0, name)?).chars().collect();
-                // 1-based start; negative counts from the end (SQLite rule).
-                let start = match args.get(1) {
-                    Some(Value::Int(i)) => {
-                        if *i < 0 {
-                            (s.len() as i64 + *i).max(0)
-                        } else {
-                            (*i - 1).max(0)
-                        }
-                    }
-                    _ => 0,
-                } as usize;
-                let end = match args.get(2) {
-                    Some(Value::Int(n)) => (start + (*n).max(0) as usize).min(s.len()),
-                    _ => s.len(),
+                // SQLite rules: 1-based start; negative start counts from
+                // the end; start 0 sits at a virtual pre-string position
+                // (so `substr('abcde',0,2)` yields 'a' — one char shorter);
+                // negative length selects the |len| characters *before*
+                // the start position.
+                let n = s.len() as i64;
+                let y = match args.get(1) {
+                    Some(Value::Int(i)) => *i,
+                    _ => 1,
                 };
-                Value::Str(s[start.min(s.len())..end].iter().collect())
+                let z = match args.get(2) {
+                    Some(Value::Int(i)) => *i,
+                    _ => i64::MAX,
+                };
+                let (b, take) = if y < 0 {
+                    let b0 = n + y;
+                    if b0 < 0 {
+                        (0, z + b0)
+                    } else {
+                        (b0, z)
+                    }
+                } else if y > 0 {
+                    (y - 1, z)
+                } else {
+                    (0, z - 1)
+                };
+                let (lo, hi) = if take < 0 {
+                    ((b + take).max(0), b.max(0))
+                } else {
+                    (b.max(0), b.saturating_add(take))
+                };
+                let lo = lo.clamp(0, n) as usize;
+                let hi = hi.clamp(0, n) as usize;
+                Value::Str(if lo < hi {
+                    s[lo..hi].iter().collect()
+                } else {
+                    String::new()
+                })
             }
         }
         "TRIM" | "LTRIM" | "RTRIM" => {
             exact_arity(name, args, 1)?;
-            let text = value_to_text(arg(args, 0, name)?);
+            let v = arg(args, 0, name)?;
+            if null_prop(v) {
+                return Ok(Value::Null);
+            }
+            let text = value_to_text(v);
             Value::Str(match name {
                 "TRIM" => text.trim().to_string(),
                 "LTRIM" => text.trim_start().to_string(),
@@ -14836,6 +15336,9 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         "INSTR" => {
             // 1-based position of the first occurrence; 0 when absent.
             exact_arity(name, args, 2)?;
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
             let (Value::Str(hay), Value::Str(needle)) = (arg(args, 0, name)?, arg(args, 1, name)?)
             else {
                 return err(format!("function {name} requires text arguments"));
@@ -14854,6 +15357,9 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                     "function {name} takes 2 or 3 arguments, got {}",
                     args.len()
                 ));
+            }
+            if args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
             }
             let Value::Str(s) = arg(args, 0, name)? else {
                 return err(format!("function {name} requires a text argument"));
@@ -15174,6 +15680,55 @@ fn table_alias_columns(
         return err("alias column names must be distinct");
     }
     Ok(Some(names))
+}
+
+/// Fixed output shape of a known table function. STRING_SPLIT's `ordinal`
+/// column only materializes when the third argument is enabled, so the
+/// width check for `AS s(v, ord)` follows the actual output, not the
+/// argument count.
+fn tablefn_static_cols(fname_upper: &str, ordinal_on: bool) -> &'static [&'static str] {
+    match fname_upper {
+        "STRING_SPLIT" => {
+            if ordinal_on {
+                &["value", "ordinal"]
+            } else {
+                &["value"]
+            }
+        }
+        "GENERATE_SERIES" => &["value"],
+        _ => &["key", "value", "type"],
+    }
+}
+
+/// Apply a table function's alias column list (`FROM f(..) AS t(c1, c2)`)
+/// as a positional rename over its BARE output columns. Used by every
+/// `FROM`-position table function; the APPLY path renames qualified keys
+/// itself. Silent omission here made `s.v` read NULL while `s.value`
+/// kept working.
+fn rename_tablefn_docs(
+    alias_obj: &sqlparser::ast::TableAlias,
+    fname_upper: &str,
+    ordinal_on: bool,
+    docs: &mut [Object],
+) -> Result<()> {
+    let actual: Vec<String> = match docs.first() {
+        Some(d) => d.keys().cloned().collect(),
+        None => tablefn_static_cols(fname_upper, ordinal_on)
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let Some(rename) = table_alias_columns(&alias_obj.columns, actual.len())? else {
+        return Ok(());
+    };
+    for row in docs.iter_mut() {
+        for (new, old) in rename.iter().zip(actual.iter()) {
+            if let Some(v) = row.remove(old) {
+                row.insert(new.clone(), v);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject SELECT clause syntax the engine does not implement instead of
@@ -15961,6 +16516,33 @@ fn check_having_refs(e: &SqlExpr, group_exprs: &[SqlExpr], out_columns: &[String
             Ok(())
         }
         SqlExpr::Nested(inner) => check_having_refs(inner, group_exprs, out_columns),
+        // Common predicate shapes the row-local evaluator (eval_group_expr's
+        // fallback) already handles; without them `HAVING k IS NULL` — the
+        // idiomatic ROLLUP total-row filter — was rejected as "unsupported".
+        SqlExpr::IsNull(inner) => check_having_refs(inner, group_exprs, out_columns),
+        SqlExpr::IsNotNull(inner) => check_having_refs(inner, group_exprs, out_columns),
+        SqlExpr::IsDistinctFrom(a, b) | SqlExpr::IsNotDistinctFrom(a, b) => {
+            check_having_refs(a, group_exprs, out_columns)?;
+            check_having_refs(b, group_exprs, out_columns)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            check_having_refs(expr, group_exprs, out_columns)?;
+            check_having_refs(pattern, group_exprs, out_columns)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            check_having_refs(expr, group_exprs, out_columns)?;
+            check_having_refs(low, group_exprs, out_columns)?;
+            check_having_refs(high, group_exprs, out_columns)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            check_having_refs(expr, group_exprs, out_columns)?;
+            for item in list {
+                check_having_refs(item, group_exprs, out_columns)?;
+            }
+            Ok(())
+        }
         SqlExpr::BinaryOp { left, right, .. } => {
             check_having_refs(left, group_exprs, out_columns)?;
             check_having_refs(right, group_exprs, out_columns)
@@ -18661,6 +19243,8 @@ mod tests {
             false,
             false,
             &deadline,
+            None,
+            None,
         )
         .unwrap();
         // doc ↔ doc (always bucket + unindexed probe) and 9 ↔ 9 by key; the
@@ -22128,15 +22712,20 @@ mod tests {
         run(&mut r2, "INSERT INTO c VALUES (12, 1)");
     }
 
-    /// 表级 FOREIGN KEY 列数不匹配必须报错(曾被 zip 静默截断)。
+    /// 表级 FOREIGN KEY 列数不匹配必须报错(曾被 zip 静默截断);复合 FK
+    /// 显式拒绝(曾被静默拆成独立单列 FK,削弱为逐列判定)。
     #[test]
     fn fk_column_count_mismatch_rejected() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE p (a INT, b INT)");
         let e = db
-            .execute("CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (a))")
+            .execute("CREATE TABLE c (x INT, FOREIGN KEY (x) REFERENCES p (a, b))")
             .unwrap_err();
         assert!(e.to_string().contains("mismatch"), "{e}");
+        let e = db
+            .execute("CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (a, b))")
+            .unwrap_err();
+        assert!(e.to_string().contains("composite FOREIGN KEY"), "{e}");
     }
 
     /// OR REPLACE 批内重复键:后者胜(曾整条报 UNIQUE)。
@@ -24502,7 +25091,7 @@ mod tx_rollback_tests {
         );
         assert_eq!(
             rows(&mut db, "SELECT LENGTH(s) FROM fn WHERE id = 2").rows[0][0],
-            Value::Int(0)
+            Value::Null
         );
         // 未知函数 / 标量上下文中的聚合
         assert!(db.execute("SELECT WOBBLE(1)").is_err());
@@ -28538,6 +29127,334 @@ mod tsql_compat_tests {
         );
         assert!(db
             .execute("SELECT FORMAT(TIMESTAMP '2026-01-01T00:00:00Z', 'gg')")
+            .is_err());
+    }
+
+    // ==== 缺陷审查轮 12 回归(随机抽 20 功能点)====
+
+    /// NULL 必须穿过文本标量函数族(UPPER/LENGTH/LEN/TRIM/LTRIM/RTRIM/
+    /// INSTR/LPAD/RPAD):此前 NULL 被静默转成 ''/0,聚合计数被虚增、
+    /// `WHERE UPPER(v) IS NULL` 永不命中。
+    #[test]
+    fn null_propagates_through_text_scalar_functions() {
+        let mut db = Database::in_memory().unwrap();
+        for e in [
+            "UPPER(NULL)",
+            "LOWER(NULL)",
+            "TRIM(NULL)",
+            "LTRIM(NULL)",
+            "RTRIM(NULL)",
+            "LENGTH(NULL)",
+            "LEN(NULL)",
+            "INSTR(NULL, 'a')",
+            "INSTR('a', NULL)",
+            "LPAD(NULL, 3)",
+            "RPAD(NULL, 3, 'x')",
+        ] {
+            assert_eq!(
+                one(&mut db, &format!("SELECT {e}")),
+                Value::Null,
+                "{e} must return NULL"
+            );
+        }
+        run(&mut db, "CREATE TABLE t (v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES ('a'), (NULL)");
+        let r = rows(&mut db, "SELECT COUNT(UPPER(v)), COUNT(v) FROM t");
+        assert_eq!(r.rows[0], vec![Value::Int(1), Value::Int(1)]);
+    }
+
+    /// SUBSTR 的 SQLite 语义:起点 0 位于虚拟首位(长度少取一个)、负长度
+    /// 取起点之前的字符、负起点从末尾数。此前 0,2 返回 'ab'(多取一位)、
+    /// 2,-1 返回 ''。
+    #[test]
+    fn substr_sqlite_edge_semantics() {
+        let mut db = Database::in_memory().unwrap();
+        let cases: &[(&str, &str)] = &[
+            ("SUBSTRING('abcde', 0, 2)", "a"),
+            ("SUBSTR('abcde', 2, -1)", "a"),
+            ("SUBSTR('abcde', 1, -2)", ""),
+            ("SUBSTR('abcde', 3, 2)", "cd"),
+            ("SUBSTR('abcde', 2)", "bcde"),
+            ("SUBSTR('hello', -2)", "lo"),
+            ("SUBSTR('hello', -2, 1)", "l"),
+            ("SUBSTR('abcde', -7, 3)", "a"),
+        ];
+        for (e, want) in cases {
+            assert_eq!(
+                one(&mut db, &format!("SELECT {e}")),
+                Value::Str((*want).into()),
+                "{e}"
+            );
+        }
+    }
+
+    /// SUM 的单元素也必须过数值校验:单行 BLOB 此前原样返回、第二行才
+    /// 报错——同一查询随行数改变语义。BLOB 文本化走 x'…' 规范形。
+    #[test]
+    fn sum_single_non_numeric_rejected_and_blob_text_form() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (b BLOB)");
+        run(&mut db, "INSERT INTO t VALUES (x'0102')");
+        assert!(db.execute("SELECT SUM(b) FROM t").is_err());
+        assert_eq!(
+            one(&mut db, "SELECT CAST(x'0102' AS TEXT)"),
+            Value::Str("x'0102'".into())
+        );
+    }
+
+    /// MERGE 的显式 id / UPDATE SET id 必须推进(或失效)autoinc 水位:
+    /// 此前下一次 INSERT 在显式值上撞 UNIQUE。
+    #[test]
+    fn merge_explicit_id_advances_autoinc_watermark() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES ('a')");
+        run(
+            &mut db,
+            "MERGE INTO t USING (SELECT 1 AS sid) s ON t.id = s.sid AND 1 = 0 \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (2, 'b')",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES ('c')");
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+        // UPDATE 臂改 id 同理。
+        run(
+            &mut db,
+            "MERGE INTO t USING (SELECT 3 AS sid) s ON t.id = s.sid \
+             WHEN MATCHED THEN UPDATE SET id = 9",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES ('d')");
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(r.rows.len(), 4);
+        // 不撞唯一:最后一个是 max+1 = 10。
+        assert_eq!(r.rows.last().unwrap()[0], Value::Int(10));
+    }
+
+    /// 纯 WHEN NOT MATCHED INSERT 臂:多行 source 命中同一 target 不再误报
+    /// "cannot update the same row twice"(没有 UPDATE 臂就无"两次更新")。
+    #[test]
+    fn merge_insert_only_arm_allows_shared_target_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE tgt (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE src (sid INT, w TEXT)");
+        run(&mut db, "INSERT INTO tgt VALUES (1, 'x')");
+        run(
+            &mut db,
+            "INSERT INTO src VALUES (1, 'p'), (1, 'q'), (9, 'z')",
+        );
+        run(
+            &mut db,
+            "MERGE INTO tgt USING src ON tgt.id = src.sid \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (sid, w)",
+        );
+        let r = rows(&mut db, "SELECT id FROM tgt ORDER BY id");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(9)]]);
+    }
+
+    /// OUTER JOIN 的空侧必须补显式 NULL 键:此前另一侧同名列经后缀回退
+    /// 镜像对方值,`WHERE r.id IS NULL` 反连接在空右表时整体失效。
+    #[test]
+    fn outer_join_empty_side_pads_null_keys() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT, va INT)");
+        run(&mut db, "CREATE TABLE b (id INT, vb INT)");
+        run(&mut db, "INSERT INTO a VALUES (1, 10), (2, 20)");
+        let r = rows(
+            &mut db,
+            "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Null],
+                vec![Value::Int(2), Value::Null],
+            ]
+        );
+        let r = rows(
+            &mut db,
+            "SELECT a.id FROM a LEFT JOIN b ON a.id = b.id WHERE b.id IS NULL",
+        );
+        assert_eq!(r.rows.len(), 2);
+        // RIGHT/FULL:左侧空时,左引用读 NULL 而非镜像右侧值。
+        run(&mut db, "CREATE TABLE e (id INT)");
+        run(&mut db, "INSERT INTO b VALUES (7, 70)");
+        let r = rows(
+            &mut db,
+            "SELECT e.id, b.vb FROM e RIGHT JOIN b ON e.id = b.id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Null, Value::Int(70)]]);
+        let r = rows(
+            &mut db,
+            "SELECT e.id, b.vb FROM e FULL OUTER JOIN b ON e.id = b.id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Null, Value::Int(70)]]);
+    }
+
+    /// OUTER APPLY 空行集保留的左行必须带右列 NULL 键(此前同名左列冒充
+    /// 右值);表函数别名列改名(`AS s(v)`、`AS j(k,v,t)`)不再被静默丢弃;
+    /// STRING_SPLIT 第三参关闭 ordinal 时两列改名清单报错。
+    #[test]
+    fn apply_and_tablefn_alias_columns() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE items (id INT, tags TEXT, value TEXT)",
+        );
+        run(&mut db, "INSERT INTO items VALUES (1, NULL, 'LEFTVAL')");
+        let r = rows(
+            &mut db,
+            "SELECT i.id, s.value FROM items AS i OUTER APPLY STRING_SPLIT(i.tags, ',') AS s",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1), Value::Null]]);
+        // FROM 表函数的别名列改名生效。
+        let r = rows(&mut db, "SELECT s.v FROM STRING_SPLIT('a,b', ',') AS s(v)");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("a".into())], vec![Value::Str("b".into())]]
+        );
+        // OPENJSON 的改名(FROM 与 APPLY 两种形态)。
+        let r = rows(
+            &mut db,
+            "SELECT j.k FROM OPENJSON('[{\"k\":1}]') AS j(k, v, t)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+        run(&mut db, "CREATE TABLE docs (id INT, body TEXT)");
+        run(&mut db, "INSERT INTO docs VALUES (1, '[{\"k\":5}]')");
+        let r = rows(
+            &mut db,
+            "SELECT d.id, j.k FROM docs AS d CROSS APPLY OPENJSON(d.body) AS j(k, v, t)",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1), Value::Int(0)]]);
+        // ordinal 关闭时产出单列,两列清单响亮报错(而非静默丢 ord)。
+        assert!(db
+            .execute("SELECT s.v FROM STRING_SPLIT('a,b', ',', 0) AS s(v, ord)")
+            .is_err());
+    }
+
+    /// HAVING 支持谓词形态(IS NULL/LIKE/BETWEEN/IN)——求值器本就支持,
+    /// 此前 check_having_refs 白名单缺形态而误拒(ROLLUP 总计行的惯用写法)。
+    #[test]
+    fn having_accepts_predicate_shapes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (k TEXT, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES ('a', 1), ('a', 2), (NULL, 3)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT k, COUNT(*) FROM t GROUP BY k HAVING k IS NULL",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Null, Value::Int(1)]]);
+        let r = rows(
+            &mut db,
+            "SELECT k, SUM(v) FROM t GROUP BY k HAVING k LIKE 'a%'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("a".into()), Value::Int(3)]]);
+        let r = rows(
+            &mut db,
+            "SELECT k FROM t GROUP BY k HAVING k BETWEEN 'a' AND 'b'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("a".into())]]);
+        let r = rows(&mut db, "SELECT k FROM t GROUP BY k HAVING k IN ('a')");
+        assert_eq!(r.rows, vec![vec![Value::Str("a".into())]]);
+    }
+
+    /// 表级 PK/UNIQUE/CHECK 引用不存在的列必须在 DDL 拒绝(幽灵约束树
+    /// 永不生效且 dump 丢失声明);表达式 UNIQUE 显式拒绝。
+    #[test]
+    fn ddl_rejects_ghost_constraint_columns() {
+        let mut db = Database::in_memory().unwrap();
+        assert!(db
+            .execute("CREATE TABLE t1 (a INT, PRIMARY KEY(b))")
+            .is_err());
+        assert!(db.execute("CREATE TABLE t2 (a INT, UNIQUE(b))").is_err());
+        assert!(db
+            .execute("CREATE TABLE t3 (a TEXT, UNIQUE(LOWER(a)))")
+            .is_err());
+        assert!(db.execute("CREATE TABLE t4 (x INT CHECK (y > 0))").is_err());
+        assert!(db
+            .execute("CREATE TABLE t5 (x INT, y INT, CHECK (z + y > 0))")
+            .is_err());
+        // 列级多被引列 FK 静默取第一列 → 显式报错。
+        run(&mut db, "CREATE TABLE p2 (x INT, y INT)");
+        assert!(db
+            .execute("CREATE TABLE c2 (a INT REFERENCES p2 (x, y))")
+            .is_err());
+    }
+
+    /// INSERT / CTAS / MERGE INSERT 的重复列名报错(此前 zip().collect()
+    /// 后者静默覆盖前者)。
+    #[test]
+    fn insert_rejects_duplicate_column_list() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE d (a INT, b INT)");
+        assert!(db
+            .execute("INSERT INTO d (a, a, b) VALUES (1, 2, 3)")
+            .is_err());
+        assert!(db
+            .execute("CREATE TABLE ct AS SELECT 1 AS a, 2 AS a")
+            .is_err());
+        run(&mut db, "CREATE TABLE m (a INT, b INT)");
+        assert!(db
+            .execute(
+                "MERGE INTO m USING (SELECT 1 AS s) src ON 1 = 0 \
+                 WHEN NOT MATCHED THEN INSERT (a, a) VALUES (1, 2)"
+            )
+            .is_err());
+    }
+
+    /// ON CONFLICT DO NOTHING / OR IGNORE 之后,子侧 FK 按最终落盘集校验:
+    /// 被跳过的父候选不得为同批子行背书(孤儿)。
+    #[test]
+    fn on_conflict_do_nothing_cannot_orphan_fk() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t9 (id INTEGER PRIMARY KEY, u TEXT UNIQUE, pid INT REFERENCES t9(id))",
+        );
+        run(&mut db, "INSERT INTO t9 VALUES (1, 'a', NULL)");
+        // (2,'a') 冲突被跳过;(3,'b',2) 的父候选 2 不落盘 → 整条语句报错。
+        assert!(db
+            .execute("INSERT INTO t9 VALUES (2, 'a', NULL), (3, 'b', 2) ON CONFLICT (u) DO NOTHING")
+            .is_err());
+        let r = rows(&mut db, "SELECT id FROM t9");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // 父在前、正常落盘的组合照常通过(含批内前向引用)。
+        run(
+            &mut db,
+            "INSERT INTO t9 VALUES (3, 'b', 1), (4, 'c', 3) ON CONFLICT (u) DO NOTHING",
+        );
+    }
+
+    /// ADD COLUMN:带 DEFAULT 回填的行必须过 CHECK(含本语句新增的);
+    /// GENERATED ALWAYS AS 显式拒绝(此前静默降级为普通列)。
+    #[test]
+    fn add_column_backfill_check_and_generated_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE bk (x INT)");
+        run(&mut db, "INSERT INTO bk VALUES (1)");
+        assert!(db
+            .execute("ALTER TABLE bk ADD COLUMN c INT DEFAULT -5 CHECK (c > 0)")
+            .is_err());
+        run(
+            &mut db,
+            "ALTER TABLE bk ADD COLUMN c INT DEFAULT 5 CHECK (c > 0)",
+        );
+        let r = rows(&mut db, "SELECT c FROM bk");
+        assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
+        assert!(db
+            .execute("ALTER TABLE bk ADD COLUMN g INT GENERATED ALWAYS AS (x + 1)")
             .is_err());
     }
 }

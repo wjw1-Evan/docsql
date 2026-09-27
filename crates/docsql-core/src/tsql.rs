@@ -2009,7 +2009,18 @@ fn str_fn(args: &[Value]) -> Res<Value> {
         },
         None => 0,
     };
-    let formatted = format!("{:.*}", dec, x);
+    // T-SQL STR rounds half AWAY FROM ZERO (STR(2.5) = '3', STR(0.125,5,2)
+    // = '0.13'); Rust's {:.prec} uses banker's rounding and returned '2' /
+    // '0.12'. The scale-multiply trick keeps the same binary-representation
+    // artifacts SQL Server's float STR shows (STR(2.675,5,2) = '2.67').
+    let m = 10f64.powi(dec as i32);
+    let scaled = x * m;
+    let rounded = if scaled >= 0.0 {
+        (scaled + 0.5).floor()
+    } else {
+        (scaled - 0.5).ceil()
+    };
+    let formatted = format!("{:.*}", dec, rounded / m);
     let out = if formatted.chars().count() > len {
         "*".repeat(len)
     } else {
@@ -4396,5 +4407,18 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].get("type"), Some(&Int(3)));
+    }
+
+    #[test]
+    fn str_rounds_half_away_from_zero() {
+        // T-SQL STR rounds half away from zero; Rust's format! default
+        // (banker's) returned '2' / '0.12' here before the fix.
+        let f = |name: &str, args: &[Value]| scalar(name, args).unwrap().unwrap();
+        assert_eq!(f("STR", &[Value::Float(2.5)]), v_str("         3"));
+        assert_eq!(f("STR", &[Value::Float(-2.5)]), v_str("        -3"));
+        assert_eq!(
+            f("STR", &[Value::Float(0.125), Value::Int(5), Value::Int(2)]),
+            v_str(" 0.13")
+        );
     }
 }

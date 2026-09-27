@@ -272,6 +272,15 @@ pub(crate) fn try_serve_log_view(
     if read_only || user.is_some_and(|u| !u.grants.admin) {
         return None;
     }
+    // A user-created table named docsql_log must not be shadowed by the
+    // view: its INSERTs would go to the real table while SELECTs silently
+    // swapped in audit rows. Let the catalog decide which one exists.
+    {
+        let db = state.db.read().unwrap_or_else(|p| p.into_inner());
+        if db.table_exists("docsql_log") {
+            return None;
+        }
+    }
     let lower = sql.to_lowercase();
     if !lower.trim_start().starts_with("select") {
         return None;

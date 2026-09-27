@@ -24,8 +24,13 @@ const LEAF: u8 = 1;
 const INTERNAL: u8 = 2;
 
 /// A cell that cannot occupy at most half a page leaves no split point with
-/// both halves inside a page, so such keys are rejected up front.
-const HALF_PAGE: usize = PAGE_SIZE / 2;
+/// both halves inside a page, so such keys are rejected up front. The cap
+/// must ALSO cover the node header: any two capped cells plus the header
+/// must fit one page, otherwise three near-cap cells split into two pages
+/// with no valid cut (2×2048+3 = 4099 > 4096) and a legal insert died as
+/// KeyTooLarge. Hence (PAGE_SIZE - header) / 2, not PAGE_SIZE / 2.
+const LEAF_CELL_CAP: usize = (PAGE_SIZE - 3) / 2;
+const INTERNAL_CELL_CAP: usize = (PAGE_SIZE - 7) / 2;
 /// Maximum B+tree height. An internal node holds at least one cell, so a
 /// healthy tree never comes close (a 1 KiB key per cell still gives dozens
 /// of levels only for astronomically many rows). A corrupt page whose child
@@ -384,7 +389,7 @@ impl BTree {
                     encode::encode(key, &mut ctx.scratch)?;
                     ctx.scratch.len()
                 };
-                if 2 + kb_len + 8 > HALF_PAGE {
+                if 2 + kb_len + 8 > LEAF_CELL_CAP {
                     return Err(BTreeError::KeyTooLarge(kb_len));
                 }
                 cells.insert(at, (key.clone(), val));
@@ -422,7 +427,7 @@ impl BTree {
                         encode::encode(&mid, &mut ctx.scratch)?;
                         ctx.scratch.len()
                     };
-                    if 2 + mb_len + 4 > HALF_PAGE {
+                    if 2 + mb_len + 4 > INTERNAL_CELL_CAP {
                         return Err(BTreeError::KeyTooLarge(mb_len));
                     }
                     cells.insert(at, (mid, right));
@@ -1110,10 +1115,15 @@ mod tests {
 
     #[test]
     fn split_right_half_accounts_for_header() {
-        // Regression: the split-point fit check used to ignore the right
+        // Regression 1: the split-point fit check used to ignore the right
         // node's header, so a suffix of (PAGE_SIZE-header, PAGE_SIZE] cell
         // bytes passed the check and `write_node` then rejected a legal
         // insert (every cell well within the half-page cap) as KeyTooLarge.
+        // Regression 2: the cap itself ignored the header — two 2048-byte
+        // cells plus the 3-byte header never fit one page, so three
+        // near-cap keys had NO valid cut (left and right both over a page)
+        // and a cap-passing insert died as KeyTooLarge. The cap now counts
+        // the header ((PAGE_SIZE-3)/2), which makes a cut always exist.
         let (_d, pager) = fresh("bt-split-header.db");
         let mut tx = pager.begin_tx();
         let mut tree = BTree::create(&pager, &mut tx).unwrap();
@@ -1124,11 +1134,16 @@ mod tests {
             .unwrap();
         tree.insert(&pager, &mut tx, big('C', 'c', 2030), 1, false)
             .unwrap();
-        // Cells 2045 + 2046 bytes: the leaf holds 4094 of 4096 bytes. The
-        // middle key's cell is exactly 2048 — the split's right half becomes
-        // 3 + 4094 bytes, one past the page, which the old check accepted.
-        tree.insert(&pager, &mut tx, big('B', 'b', 2032), 2, false)
+        // A third near-cap key (cell 2046 = the exact new cap) must split
+        // fine: 1|2 gives 3+2046 = 2049 and 3+2045+2046 = 4094 — both fit.
+        tree.insert(&pager, &mut tx, big('B', 'b', 2030), 2, false)
             .unwrap();
+        // One byte over the cap fails loudly at the pre-check — such a key
+        // could never share a page with a cap-sized sibling.
+        assert!(matches!(
+            tree.insert(&pager, &mut tx, big('D', 'd', 2032), 3, false),
+            Err(BTreeError::KeyTooLarge(_))
+        ));
         pager.commit_tx(tx).unwrap();
         let tx = pager.begin_tx();
         assert_eq!(

@@ -489,17 +489,20 @@ CREATE TABLE [ IF NOT EXISTS ] table_name AS SELECT ...
 | 参数 | 说明 |
 |---|---|
 | `IF NOT EXISTS` | 已存在时静默返回（0 行受影响） |
-| `AS SELECT` | CTAS：列名与行来自查询；`TEMPORARY` 关键字接受并按普通表处理 |
+| `AS SELECT` | CTAS：列名与行来自查询；`TEMPORARY` 关键字接受并按普通表处理；输出列重名报错 |
 | `PRIMARY KEY` | **仅单列**；主键**不隐含 NOT NULL**，需显式声明（EF 提供程序因此生成 `NOT NULL`） |
-| `UNIQUE` | 单列约束；复合唯一请用 `CREATE UNIQUE INDEX`（表级复合形式显式报错） |
+| `UNIQUE` | 单列约束；复合唯一请用 `CREATE UNIQUE INDEX`（表级复合与表达式形式显式报错） |
 | `NOT NULL` | 写入 NULL 或缺字段时报错 |
-| `DEFAULT expr` | INSERT 省略该列时求值填充；`ALTER TABLE ADD COLUMN` 带 DEFAULT 会回填存量行 |
-| `CHECK` | 写入时校验；仅求值为 FALSE 时失败（含 NULL 引用的表达式视为未知通过） |
-| `REFERENCES` | 外键（RESTRICT 式）；不支持 `ON DELETE`/`ON UPDATE` 动作 |
+| `DEFAULT expr` | INSERT 省略该列时求值填充；`ALTER TABLE ADD COLUMN` 带 DEFAULT 会回填存量行（回填值须满足 CHECK） |
+| `CHECK` | 写入时校验；仅求值为 FALSE 时失败（含 NULL 引用的表达式视为未知通过）；引用的列必须存在（DDL 拒绝幽灵列），不能含子查询 |
+| `REFERENCES` | 外键（RESTRICT 式）；不支持 `ON DELETE`/`ON UPDATE` 动作；表级复合形式与列级多被引列显式报错 |
 | `AUTOINCREMENT` | 整数列：插入省略/NULL 时取 max+1；GUID 列：生成 UUIDv7 并回写语句 |
 | `GUID` 类型 | `GUID`/`UUID`/`UNIQUEIDENTIFIER`/`UUIDV7` |
 
 ### 备注
+
+- 约束（PRIMARY KEY/UNIQUE/FOREIGN KEY）引用的列必须在建表列清单中存在——不存在的列名（含
+  表达式形式的「列名」）在 DDL 时报错，不再建出永不生效的幽灵约束。
 
 - 主键与 UNIQUE 约束的 B+ 树随建表创建，`sqlite_master` 以 `sqlite_autoindex_<表>_<n>` 派生展示（不落 catalog，不可 `DROP INDEX`）。
 - `docsql_users`/`docsql_roles`/`docsql_role_members`/`docsql_grants` 为保留表名，普通 DDL/DML 拒绝。
@@ -776,7 +779,7 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 
 | 分类 | 函数 | 说明 |
 |---|---|---|
-| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`（LEN 不计尾随空格）、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`（另支持 `TRIM('ab' FROM x)` 字符集形式）、`CONCAT(a, b, ...)`（NULL 当空串;`\|\|` 仍传染） | 位置按字符计;T-SQL 字符串函数族（LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT）见[T-SQL 兼容面](#tsql-sql-server兼容面) |
+| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`（LEN 不计尾随空格）、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`（另支持 `TRIM('ab' FROM x)` 字符集形式）、`CONCAT(a, b, ...)`（NULL 当空串;`\|\|` 仍传染） | 位置按字符计;除 CONCAT 外 NULL 输入返回 NULL;`SUBSTR` 遵循 SQLite 规则——起点 0 位于虚拟首位（`substr('abcde',0,2)` 得 `'a'`）、负长度取起点之前的字符、负起点从末尾数;T-SQL 字符串函数族（LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT）见[T-SQL 兼容面](#tsql-sql-server兼容面) |
 | 数值 | `ABS`、`ROUND(x [, digits])` | ROUND 对 DECIMAL 精确四舍五入（半离零），FLOAT 保持浮点 |
 | 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF` | |
 | 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`timestamp`/`blob`/`array`/`object` |

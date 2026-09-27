@@ -1962,9 +1962,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                 match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly)
                                 {
                                 // 读日志的查询本身不写日志(避免读日志刷日志)。
-                                Some(f) => (f, false),
+                                Some(f) => ((f, None), false),
                                 None => (
-                                    execute_sql(
+                                    execute_sql_with_identity(
                                         &state,
                                         &sql,
                                         false,
@@ -1979,6 +1979,19 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                     true,
                                 ),
                             };
+                            let (resp, identity) = resp;
+                            // Same session bookkeeping as the REQ_SQL fast
+                            // path: a parameterized INSERT owns the
+                            // connection's @@IDENTITY/SCOPE_IDENTITY, and a
+                            // later batch must see this statement's effects
+                            // (it used to keep the previous fast-path
+                            // INSERT's id).
+                            if logged
+                                && docsql_core::tsql_batch::is_insert_statement(&sql)
+                            {
+                                tsql_session
+                                    .note_identity(identity.map(docsql_core::Value::Int));
+                            }
                             if logged {
                                 querylog::record(
                                     &state,

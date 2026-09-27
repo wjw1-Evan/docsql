@@ -2155,12 +2155,14 @@ fn strip_outer_parens(text: &str) -> Option<&str> {
     Some(&text[1..text.len() - 1])
 }
 
-/// True when the statement's first real token (comments skipped) is
-/// INSERT. Hosts that run statements outside the interpreter use this to
-/// know when a statement's identity snapshot must reach the session.
+/// True when the statement's first real token (comments skipped) is INSERT
+/// or MERGE (whose INSERT arm also advances the engine's last-insert id).
+/// Hosts that run statements outside the interpreter use this to know when a
+/// statement's identity snapshot must reach the session.
 pub fn is_insert_statement(sql: &str) -> bool {
     let i = leading_trivia_end(sql);
-    sql.len() >= i + 6 && sql[i..i + 6].eq_ignore_ascii_case("INSERT")
+    (sql.len() >= i + 6 && sql[i..i + 6].eq_ignore_ascii_case("INSERT"))
+        || (sql.len() >= i + 5 && sql[i..i + 5].eq_ignore_ascii_case("MERGE"))
 }
 
 /// Byte offset of the first real token after leading whitespace and
