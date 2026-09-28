@@ -15139,9 +15139,7 @@ fn refs_rownum(e: &SqlExpr) -> bool {
         SqlExpr::Between {
             expr, low, high, ..
         } => refs_rownum(expr) || refs_rownum(low) || refs_rownum(high),
-        SqlExpr::InList { expr, list, .. } => {
-            refs_rownum(expr) || list.iter().any(refs_rownum)
-        }
+        SqlExpr::InList { expr, list, .. } => refs_rownum(expr) || list.iter().any(refs_rownum),
         SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
             refs_rownum(expr) || refs_rownum(pattern)
         }
