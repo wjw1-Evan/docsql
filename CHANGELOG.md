@@ -3,7 +3,7 @@
 本文件记录用户可见的功能、修复与行为变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/),
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.7.0] - 2026-09-29
 
 ### 缺陷审查轮 13:随机抽 20 功能点(2026-09-28)
 
@@ -178,6 +178,57 @@ docsql_pubsub 视图、PITR、Web 对象树/meta/stats、EF Core 同步与翻译
 
 - 写语句(UPDATE/DELETE/MERGE)子查询内的 `NEWID()`/`NEWSEQUENTIALID()`/`RAND()` 此前
   绕过拒绝——表达式扫描不递归子查询,各重放节点会各自掷随机值导致集群分叉;现已拦截。
+
+### 全库缺陷审查轮 1–11 与工程加固(2026-09-21 ~ 2026-09-26,发布补记)
+
+v0.6.0 与缺陷审查轮 12 之间落地的批次,发布切版时补记汇总;逐项明细见对应提交信息。
+
+#### 修复
+
+- **首轮全库审查 + T-SQL 缺陷批次(26+ 项)**:两个 DoS 级挂死、索引/探针静默错行、
+  FK 语义、ROLLBACK 崩溃一致性;T-SQL SCOPE_IDENTITY 会话隔离、RAISERROR 消息提取、
+  PIVOT 分组桶化、RAND 语句级折叠;
+- **存储底层(轮 1–2、11,共 18 项)**:WAL 截断 epoch 撕裂窗口、abort_deferred 丢
+  txid、fsync 失败 fail-stop 毒化、B+树分裂点误报 KeyTooLarge、JSON Float 往返降级
+  Int(集群分叉)、孤立代理项前瞻、collect_pages 双入池等;
+- **engine 读/写路径(轮 3–4,共 30 项)**:集合操作/嵌套查询/JOIN ON 的相关子查询
+  漏检、探针静默错行、RENAME COLUMN/表 毁数据与半应用、MERGE 两臂 FK 终态校验、
+  重名 SAVEPOINT 服务端对齐、ALTER 全操作预验证等;
+- **T-SQL 层(轮 5–6a,共 25 项)**:`[方括号]` 列名被 wall-clock 折叠器当函数静默
+  写坏数据、STR/FORMAT 宽度 panic、块扫描器误吃 CASE 的 END/BEGIN TRAN、IF/WHILE
+  单语句体派发、CLI 词法态 CASE 深度等;
+- **用户/授权(轮 6b,7 项)**:RENAME TABLE 同场改写 grants(旧授权复活)、
+  GRANT/REVOKE 表名大小写原形、授予视图的 SELECT 边界、StoredPw 迭代数下界等;
+- **server/backup/pubsub(轮 7,10 项)**:预认证 PING 超预算断连(slowloris)、
+  T-SQL 批逐条查询日志审计、回退读脏读复检、PBKDF2 认证闸门 60s 截止、PITR 链
+  完整性审计、备份 fsync 后 rename 等;
+- **web/auth/cli(轮 8,7 项)**:CLI 把字符串字面量内的数据行当协议命令执行、外部
+  文本 ANSI/C0 消毒、控制台批量 SQL 64MiB 结果预算、web TLS 握手 30s 截断等;
+- **proto/crypto/启动(轮 9,6 项)**:布尔 env 严格解析(`READ_ONLY=1\r` 曾静默失效
+  为可写)、DOCSQL_KEY 逐字节严格 hex、全零密钥拒绝启动、读缓冲守卫补 20 字节帧头等;
+- **dotnet/横切一致性(轮 10,12 项)**:服务端 `$float` 参数解码(NaN/±∞ 绑定曾
+  污染列)、keyed 握手共享超时预算(黑洞对端不再无限挂起)、ulong 走 `$dec` 精确
+  标记、SchemaSync 并发 duplicate column 容忍、ALTER 演化索引态预演等;
+- **T-SQL 会话状态(2 项)**:单句 SCOPE_IDENTITY()/IDENT_CURRENT() 路由判据漏识别
+  (撞响亮报错),OPENJSON(NULL) 改返回空行集(APPLY over 稀疏 JSON 列不再拖垮整句)。
+
+#### 安全
+
+- **传输加密 nonce 加固**:nonce 改 8 字节进程前缀 + 4 字节计数器 + 2^32 硬上限——
+  旧 4 字节前缀的生日界落在进程诞生数上(同 key 下约 6.5 万次重启即 ~50% 前缀碰撞,
+  碰撞进程从首帧起复用 nonce 致密钥流 XOR 泄漏);越上限响亮报错绝不回绕,混版本
+  第二帧起拒收。
+
+#### 变更(工程)
+
+- **镜像轻量化 159MB → 90MB → 31.6MB**:先 strip 符号表 + distroless 基座,后运行层
+  改 `FROM scratch`(镜像 = 三个静态二进制 + 固定 nsswitch.conf,glibc 静态链);
+  compose 健康检查改 CMD-exec 形态,容器内检查一律走 CLI / `docker cp`;
+- long_read e2e 时序断言去脆弱化(写突发改比值制判定 + 读负载结构化扩到 4M 对);
+- 文档新增 T-SQL 数据操作实例(窗口函数 top-N、MERGE 对账、PIVOT/UNPIVOT、APPLY
+  拆 JSON、递归 CTE 路径、UPDATE FROM/DELETE USING、循环事务批共 8 组实测)。
+
+## [0.6.0] - 2026-09-21
 
 ### 文档重组(2026-09-21)
 
