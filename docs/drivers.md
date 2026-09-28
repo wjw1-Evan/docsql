@@ -100,7 +100,7 @@ services.AddDbContext<AppDb>(o => o.UseDocsql(connectionString));
   `Func<string>`(**运行期连接串工厂**——测试夹具把每个用例路由到独立节点、读写入口切换
   等场景;同一进程模型只建一次,连接按上下文解析);
 - 类型映射:`decimal` → `DECIMAL`(参数经 `$dec` 文本标记精确绑定,服务端十进制聚合/比较;`HasPrecision` 进入列类型与 CAST 字面量)、`byte[]` → `BLOB`(参数经 `$bytes` 标记,响应按 `{"$bytes":[…]}` 解码;单值 ≤16MiB 文档上限)、`DateTime`/`DateTimeOffset` → `TIMESTAMP`(参数经 `$ts` UTC 毫秒标记,精度无损;`timestampformat=iso` 为旧服务器兼容开关,发 ISO-8601 文本)、`DateOnly`/`TimeOnly`/`TimeSpan`/`Guid` → 可排序 ISO 文本;未映射的 CLR 类型在模型构建期显式报错;
-- 模型复合索引(`HasIndex(e => new { … })`)按列序创建;`List.Contains` 翻译为 `IN (…)`;字符串 `StartsWith/EndsWith/Contains` 翻译为 `LIKE`(含 T-SQL 字符类支持);引擎不支持的语法在翻译期显式失败;
+- 模型复合索引(`HasIndex(e => new { … })`)按列序创建;实体集合属性 `List<T>.Contains` 翻译为 `JSON_ARRAY_CONTAINS`(常量/参数/取反/数值元素);字符串 `StartsWith/EndsWith/Contains` 翻译为 `LIKE`(常量转义 `%`/`_`/`[`,保持 .NET 字面子串语义;变量路径与 SQL Server 提供程序同形);引擎不支持的语法在翻译期显式失败;
 - **T-SQL 函数下推**(引擎第四批函数族,查询不回落客户端求值):
   日期成员 `Year/Month/Day/DayOfYear/Hour/Minute/Second/Millisecond` → `YEAR/MONTH/DAY/DAYOFYEAR/DATEPART`;
   `AddYears/…/AddMilliseconds` → `DATEADD`(月末钳制、毫秒分辨率);

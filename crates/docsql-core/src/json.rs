@@ -34,7 +34,7 @@ pub fn to_string(v: &Value) -> String {
 }
 
 /// Stable text for a non-finite float inside the `$float` marker.
-pub(crate) fn float_marker_text(f: f64) -> &'static str {
+pub fn float_marker_text(f: f64) -> &'static str {
     if f.is_nan() {
         "NaN"
     } else if f > 0.0 {

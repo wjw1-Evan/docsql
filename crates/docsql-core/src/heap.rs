@@ -317,6 +317,71 @@ fn recycle_chain(
     Ok(())
 }
 
+/// Free every overflow-chain page reachable from the live slots of `pages`
+/// (a table's heap page list) straight into the pager's reusable pool. Used
+/// when a table's storage is wiped or rewritten (TRUNCATE/DROP/ALTER) — the
+/// DML paths recycle chains via `recycle_chain`, but a wipe never walks the
+/// slots, so its live chains used to orphan (the file grew without bound
+/// under TRUNCATE churn of oversized documents).
+///
+/// Every chain is validated exactly like the read path (`slot_document_bytes`)
+/// BEFORE any page is freed — the same rule as `recycle_chain`: a corrupt
+/// head pointing at a live page must fail loudly, not free that page out from
+/// under another table. The heap pages themselves stay untouched; the caller
+/// frees them separately.
+pub fn free_overflow_chains(pager: &Pager, tx: &mut Tx, pages: &[u32]) -> Result<()> {
+    for &pid in pages {
+        let page = load_page_owned(&PageReader::current(pager), Some(tx), pid)?;
+        validate_page(&page, pid)?;
+        let n = count_of(&page);
+        for i in 0..n {
+            let (off, len) = slot(&page, i);
+            if len == 0 {
+                continue;
+            }
+            let content = &page[off..off + len];
+            if content.first() != Some(&OVERFLOW_MARK) {
+                continue;
+            }
+            let (total, head) = overflow_slot_header(content, pid)?;
+            // Validate the whole chain first (cycle defense + hop bound +
+            // per-page marker/length + assembled length), then free.
+            if total > MAX_DOC_SIZE {
+                return Err(HeapError::Page(
+                    pid,
+                    "overflow chain corrupt (total exceeds max document size)",
+                ));
+            }
+            let min_chunk = PAGE_SIZE - CHAIN_HEADER;
+            let mut assembled = 0usize;
+            let mut next = head;
+            let mut seen = HashSet::new();
+            let mut chain = Vec::new();
+            while next != 0 {
+                if !seen.insert(next) || chain.len() > total / min_chunk + 2 {
+                    return Err(HeapError::Page(next, "overflow chain corrupt (cycle)"));
+                }
+                let chain_page = load_page_owned(&PageReader::current(pager), Some(tx), next)?;
+                let (nxt, l) = chain_header(&chain_page, next)?;
+                if CHAIN_HEADER + l > chain_page.len() || assembled + l > total {
+                    return Err(HeapError::Page(next, "overflow chain corrupt (bad length)"));
+                }
+                assembled += l;
+                chain.push(next);
+                next = nxt;
+            }
+            let prefix = content.len() - OVERFLOW_SLOT_HEADER;
+            if prefix + assembled != total {
+                return Err(HeapError::Page(pid, "overflow chain corrupt (short chain)"));
+            }
+            for id in chain {
+                pager.free_page(tx, id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A document slot location: (page_id, slot_index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocId {

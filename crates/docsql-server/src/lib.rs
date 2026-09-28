@@ -1761,7 +1761,22 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                     }
                                 }
                                 None => {
-                                    let (effective, allow_system) = if is_replication {
+                                    // A user-created table named docsql_pubsub
+                                    // must not be shadowed by the view (same
+                                    // rule as docsql_log): its INSERTs would
+                                    // reach the real table while SELECTs
+                                    // silently swapped in message rows. The
+                                    // catalog decides which one exists.
+                                    let user_table_wins = !is_replication && {
+                                        state
+                                            .db
+                                            .read()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .table_exists("docsql_pubsub")
+                                    };
+                                    let (effective, allow_system) = if is_replication
+                                        || user_table_wins
+                                    {
                                         (sql.clone(), false)
                                     } else {
                                         match pubsub::try_rewrite_pubsub_view(&sql) {
@@ -1801,15 +1816,25 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> st
                                         .is_some();
                                     let parsed_stmt =
                                         Database::parse_classified(&effective).ok();
+                                    // The db reference is load-bearing: view
+                                    // base-table expansion (a view over
+                                    // docsql_users must refuse non-admins
+                                    // HERE, or the MVCC fast path leaks the
+                                    // hashes the write tier refuses). The
+                                    // guard is a microsecond-scale read lock.
                                     let authorized = match (&parsed_stmt, &user) {
-                                        (Some(p), Some(u)) => authorize_statement(
-                                            None,
-                                            &p.stmt,
-                                            &p.tx,
-                                            p.is_write,
-                                            &u.grants,
-                                        )
-                                        .is_ok(),
+                                        (Some(p), Some(u)) => {
+                                            let db_ref =
+                                                state.db.read().unwrap_or_else(|p| p.into_inner());
+                                            authorize_statement(
+                                                Some(&db_ref),
+                                                &p.stmt,
+                                                &p.tx,
+                                                p.is_write,
+                                                &u.grants,
+                                            )
+                                            .is_ok()
+                                        }
                                         (Some(_), None) => true, // token/开放连接
                                         _ => false,
                                     };
@@ -2444,7 +2469,14 @@ fn render_param(p: &Value) -> String {
         Value::Int(i) => i.to_string(),
         // Debug formatting keeps integral floats distinguishable from Int
         // (Display prints 3.0 as "3", which the engine would re-parse and
-        // store as an Int) — same rationale as value_literal.
+        // store as an Int) — same rationale as value_literal. Non-finite
+        // floats have no bare literal (NaN/inf would parse as identifiers
+        // and bind NULL or error); use the same CAST form the dump /
+        // replication rewrite round-trips.
+        Value::Float(f) if !f.is_finite() => format!(
+            "CAST({} AS REAL)",
+            docsql_core::stmt::sql_string_literal(docsql_core::json::float_marker_text(*f))
+        ),
         Value::Float(f) => format!("{f:?}"),
         Value::Decimal(d) => {
             // Exactness survives the text round-trip: an unquoted number
@@ -2517,12 +2549,36 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
         let sql = sql.to_string();
         Box::pin(async move {
             let started = std::time::Instant::now();
+            // The pubsub-view rewrite only covers single statements — batch
+            // statements land here directly, so the same rewrite (with the
+            // same user-table guard) must run per interpreted statement or
+            // `SELECT ... FROM docsql_pubsub` inside a batch fails with
+            // "table does not exist".
+            let user_table_wins = {
+                state
+                    .db
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .table_exists("docsql_pubsub")
+            };
+            let (effective, allow_system) = if user_table_wins {
+                (sql.clone(), false)
+            } else {
+                match pubsub::try_rewrite_pubsub_view(&sql) {
+                    Some(rewritten) => (rewritten, true),
+                    None => (sql.clone(), false),
+                }
+            };
             let (frame, identity) = execute_sql_with_identity(
-                state, &sql, false, // allow_system_table: the pubsub-view rewrite above
-                // already ran for the batch text; plain statements
-                // against system tables keep their error.
+                state,
+                &effective,
+                allow_system,
                 false, // never the replication path
-                conn, false, None, user, deadline,
+                conn,
+                false,
+                None,
+                user,
+                deadline,
             )
             .await;
             self.stmt_identity = identity.map(docsql_core::Value::Int);
@@ -3307,6 +3363,30 @@ async fn execute_sql_inner(
                             proto::RESP_ERROR,
                             err_payload(
                                 "timed out waiting for the transaction on another connection",
+                            ),
+                        ),
+                        None,
+                    );
+                }
+                // User/role writes are authorization state, not transactional
+                // data: inside an explicit transaction the per-frame grant
+                // refresh would read the UNCOMMITTED rows (revoked too early,
+                // and a ROLLBACK never re-bumps the epoch — the revoked state
+                // stuck until the next user-admin write). Refuse; every
+                // user-management statement is autocommit. Internal replay
+                // (join/restore execute_batch) bypasses this function, so
+                // snapshot scripts that embed CREATE USER stay unaffected.
+                if is_user_admin_stmt
+                    && conn.is_some()
+                    && !is_replication
+                    && db.in_transaction()
+                    && *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) == conn
+                {
+                    return (
+                        Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload(
+                                "user management statements cannot run inside a transaction",
                             ),
                         ),
                         None,

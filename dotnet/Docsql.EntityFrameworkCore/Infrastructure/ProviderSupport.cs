@@ -120,11 +120,14 @@ public sealed class DocsqlStringMethodTranslator : IMethodCallTranslator
         // 常量模式:直接拼 LIKE 字面量(转义通配符)。
         if (arguments[0] is SqlConstantExpression { Value: string pattern })
         {
-            // LIKE 通配符转义,ESCAPE 子句由 LikeExpression 生成
+            // LIKE 通配符转义,ESCAPE 子句由 LikeExpression 生成。[ 也必须转义:
+            // 引擎的 LIKE 按文档支持 T-SQL 字符类,未转义的 [..] 会被当成
+            // 字符集解释(.NET string.Contains 是字面子串语义)。
             var escaped = pattern
                 .Replace(@"\", @"\\")
                 .Replace("%", @"\%")
-                .Replace("_", @"\_");
+                .Replace("_", @"\_")
+                .Replace("[", @"\[");
             return new LikeExpression(
                 instance,
                 new SqlConstantExpression(

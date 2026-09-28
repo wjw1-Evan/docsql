@@ -5,6 +5,112 @@
 
 ## [未发布]
 
+### 缺陷审查轮 13:随机抽 20 功能点(2026-09-28)
+
+抽样的 20 个功能点:GUID 主键、MERGE、INSERT…SELECT、TRUNCATE CASCADE、RENAME/DROP COLUMN、
+CREATE VIEW、DROP INDEX、SELECT DISTINCT/ROWNUM/DUAL、CASE、T-SQL 字符串扩展、哈希族、
+T-SQL 转换、prepared statements、用户/角色/GRANT/REVOKE、Web 用户页、语句超时、
+docsql_pubsub 视图、PITR、Web 对象树/meta/stats、EF Core 同步与翻译。
+
+#### 修复(安全/授权)
+
+- **MVCC 读层授权不展开视图基表(权限绕过)**:SELECT 走读层快路径时资格预检传 `db: None`,
+  视图基表展开被跳过——readonly/readwrite 用户经「视图 over `docsql_users`」(旧卷 dump 回放
+  遗留的合法视图)直接读到**密码哈希**(写层同样语句拒绝,读层漏了)。预检现在持微秒级读锁
+  传 `Some(&db)`,与写层同一套展开逻辑。
+- **事务内 GRANT/REVOKE 未提交即生效、回滚不恢复**:引擎按语句成功即抬授权纪元,事务内的
+  useradmin 写被缓冲,但逐帧权限刷新在引擎写锁下读**未提交行**(提前吊销/提前授予);ROLLBACK
+  恢复成员行却不回抬纪元,吊销/授予效果常驻到下一次用户管理写。现在 useradmin 语句在显式
+  事务内显式报错(join/restore 的快照回放不经该路径,不受影响)。
+
+#### 修复(结果错误/数据完整性)
+
+- **TRUNCATE/DROP/全表重写泄漏溢出链页(违反红线 1)**:活文档的溢出链页只由槽头指针锚定,
+  清空/删表/重写只释放堆页与 `overflow_free`——大文档表的 TRUNCATE churn 让文件无界增长
+  (实测 5 轮 9→29 页),join/repair/恢复同中招。新增 `heap::free_overflow_chains`(先按读路径
+  同标准全量校验再释放),三条释放路径全部接入。
+- **RENAME COLUMN 悬空外键(备份/恢复断裂)**:被引用列改名后,子表 FK 的远程列名(rc)不跟随
+  ——子表一切非 NULL 插入永久 FK 报错,`dump_script()` 回放中断(join 快照/恢复全断)。现在
+  同表 FK 的 rc 与跨表引用方的 rc 一并改写(与 RENAME TABLE 改写 rt 同规则、同失败恢复次序);
+  同语句 `RENAME a TO b, DROP b` 组合的守卫也按演化后拼写匹配。
+- **RENAME COLUMN 把 CHECK 字符串字面量当标识符改写**:`CHECK (name <> 'name')` 改名列
+  `name` 后约束变成 `title <> 'title'`——插入 'name' 由拒变收、'title' 反被拒,坏文本经
+  catalog 持久化并随复制逐节点一致腐蚀。字面量改写现在按 `sql_literal_end` 跳过字符串区间
+  (与绑定/脱敏/词法同源扫描器)。
+- **RENAME COLUMN 落到已有动态字段名静默覆盖数据**:schemaless 文档里已有 `extra` 字段时
+  `RENAME COLUMN a TO extra` 把两列数据合并(动态字段版「重复列名静默覆盖」),现 validate
+  阶段扫描实测文档键响亮拒绝。
+- **DROP COLUMN 不查视图依赖**:视图按名列引用的列被静默删除,视图 WHERE 读 NULL 恒假返回
+  空集而 dump 回放「看起来成功」。现在按视图 SQL 的 literal-aware 词法扫描拒绝(未引用列照常删)。
+- **MERGE ON 目标限定缺列静默取源值**:`ON s.tag = t.tag` 中目标没有 `tag` 时,`t.tag` 经
+  CompoundIdentifier 裸名回退解析到**源的值** → 恒匹配 → 目标行被错误 UPDATE。合并行现在
+  同时登记目标限定键,目标缺列钉为 NULL。
+- **同语句「显式自增 id == 语句开始水位 + 省略 id 行」整句撞 UNIQUE**:INSERT 多行 VALUES
+  与 MERGE INSERT 臂的显式 id 不在行循环内推进水位,后续省略 id 的行复用同值报错。显式
+  `Value::Int` id 现按 mainstream 语义推进水位(`INSERT (3),(NULL)` 得 3、4)。
+- **INSERT … SELECT 源为空整句报错**:`WHERE 1=0` 过滤后 0 行曾报「INSERT has no rows」
+  (该检查本意护 VALUES 路径);现 SELECT 源 0 行 = Affected(0)(主流语义),空 VALUES 仍报错。
+- **CAST/CONVERT 到 DATE 目标原样穿透**:`CAST('2026-09-28' AS DATE)` 返回**普通文本**
+  (TYPEOF=text,wire 无 `$ts` 标记),非法日期文本也静默通过。现按 T-SQL 语义转换并截断到
+  UTC 零点,非法文本响亮报错(TRY 变体返 NULL)。
+- **BLOB → 数值目标静默穿透**:`CONVERT(INT, x'…')` 原样返回 BLOB,后续比较/算术永远错位
+  (`WHERE CONVERT(INT, x'01') = 1` 静默 miss)。INT/FLOAT/DECIMAL 三臂对 Bytes 显式报错。
+- **QUOTENAME 六个合法定界符返 NULL**:`]` `<` `>` `{` `}` 反引号按 T-SQL 文档表应有效
+  (闭合定界符双写),此前落入 `_ => NULL`;第二参为 NULL 现返回 NULL(此前当「未提供」
+  回退默认 `[`)。
+- **CONCAT_WS 分隔符 NULL 语义反了**:T-SQL 沿 CONCAT 家族 NULL 当空串(`CONCAT_WS(NULL,
+  'a','b')` = 'ab'),此前返回 NULL。
+- **STRING_ESCAPE json 不转义 solidus**:T-SQL `a/b` → `a\/b`,逐字节比对/哈希的应用静默失配。
+- **CONVERT style = NULL 被当「未提供」**:T-SQL 明文「For a style value of NULL, NULL is
+  returned」,此前继续按默认 style 转换出值。
+- **写语句谓词里的 ROWNUM 静默全表命中**:UPDATE/DELETE/MERGE 自身 WHERE/SET/ON 无行流可
+  编号,ROWNUM 读 NULL 且 `NULL <= n` 恒真——Oracle 风格 `DELETE … WHERE ROWNUM <= 1` 会
+  **清空全表**。现响亮拒绝(含 SET 赋值;子查询内的 ROWNUM 是子查询自己的行流,照常可用;
+  refs_rownum 顺带补齐 BETWEEN/IN/LIKE/CASE 递归面)。
+- **兼容字典视图名可被同名表占用(建得出读不回)**:`CREATE TABLE user_tables` 成功、写入
+  成功,SELECT 永远返回字典行(FROM 解析字典视图优先)。`DUAL`/`sqlite_master`/
+  `information_schema.*`/Oracle 字典视图名现于 CREATE TABLE/VIEW 保留拒绝。
+- **`docsql_pubsub` 同名用户表被视图劫持**:上轮只修了 `docsql_log`,pubsub 改写点仍无条件
+  换表——同名用户表写入成功、SELECT 静默返回消息行。现与 docsql_log 同规则:catalog 有同名
+  用户表则不改写。
+- **docsql_pubsub 视图在 T-SQL 批内失效**:批语句经 BatchPipeExec 直接执行、不过顶层改写臂,
+  批内 `SELECT … FROM docsql_pubsub` 报「表不存在」。批执行器现在逐语句跑同一改写(带同名
+  用户表守卫)。
+- **CTE 名被误判视图自引用**(walk_query 分类面):`WITH v AS (…) SELECT * FROM v` 的 FROM v
+  读的是 CTE,读取目标分类/授权基表收集不再把被本层 WITH 遮蔽的名字当基表。
+- **EF 字符串 Contains 漏转义 `[`**:常量翻译转义了 `\ % _` 但漏 `[`,引擎按 T-SQL 字符类
+  解释 `[..]` → `Contains("gam[ma]")` 漏报正主、误报字符集内行。补 `\[`(与已转义的 %/_
+  同为 .NET 字面子串语义)。
+- **$float 非有限浮点参数绑成裸标识符**:REQ_EXECUTE 的 `{"$float":"NaN"}` 渲染为裸 `NaN`
+  文本,引擎当列引用(SELECT 返 NULL / INSERT 报未知列)。现按 `value_literal` 同形渲染
+  `CAST('NaN' AS REAL)`。
+- **PITR `to` 早于基准备份自身快照静默降级**:重放「基准(状态@快照时刻)+ 增量(全部被
+  过滤)」= 把目标之后的写全部复活还报成功(轮 7「链缺失静默降级」修复的镜像缺口)。现于
+  restore 前比对 header ts,早于基准响亮拒绝。
+
+#### 修复(健壮性)
+
+- **语句超时采样补齐两段**:表值函数物化(GENERATE_SERIES 100 万行级,物化段曾完全不设防,
+  过冲可达预算 ~2×)现在逐行采样(`table_function_checked` 贯穿 STRING_SPLIT/OPENJSON/
+  GENERATE_SERIES);CREATE INDEX 的 B+ 树回填循环(build_trees)补 `check()`。
+- 上一轮已记录、本轮确认未复发:复制态 PUBLISH 绕过 sync gate 窗口、多表 TRUNCATE 逐表独立
+  事务(风险>收益,维持已记录)。
+
+#### 文档
+
+- `sql-reference`:INSERT…SELECT 无列清单按位置映射(原「取查询输出列」与实现矛盾);
+  视图干跑校验改为「基表必须存在,列按 schemaless 语义」(原「列必须存在」在 schemaless
+  模型下不可判定);ROWNUM 写语句拒绝;兼容字典视图保留名;useradmin 事务内拒绝。
+- `drivers.md`:`List.Contains` 翻译目标 `IN (…)` → `JSON_ARRAY_CONTAINS`(文档漂移)。
+
+#### 测试
+
+- 新增回归:engine 12 项(自增水位/空源/溢出链释放/MERGE 目标键/RENAME FK·字面量·动态字段/
+  DROP 列视图守卫/CTE 遮蔽分类/ROWNUM 写拒/保留名/DATE·BLOB cast)、tsql 3 组(QUOTENAME
+  定界符矩阵+NULL、CONCAT_WS、CONVERT style NULL + STRING_ESCAPE solidus)、server e2e 6 项
+  (读层视图授权/$float 绑定/useradmin 事务拒绝/pubsub 同名表/批内视图/PITR 早于基准)、
+  dotnet 1 项(LIKE `[` 转义)。
+
 ### 缺陷审查轮 12:随机抽 20 功能点(2026-09-27)
 
 #### 修复(结果错误/数据完整性)

@@ -6366,3 +6366,216 @@ async fn restore_rejects_path_traversal_and_odd_names() {
         );
     }
 }
+
+// ---- 缺陷审查轮13(server 面)回归 ----
+
+/// MVCC 读层的授权必须带 db(展开视图基表):readonly 用户经「视图 over
+/// docsql_users」曾读到密码哈希(写层拒绝、读层 None 跳过展开)。
+#[tokio::test]
+async fn view_over_user_tables_admin_only_on_read_tier() {
+    let (_dir, addr) = start_server(None).await;
+    let mut admin = Client::connect(&addr).await;
+    admin.sql("CREATE TABLE t (id INT)").await;
+    let pw = ["le", "ak", "pw", "12", "34"].concat();
+    admin
+        .sql(&format!("CREATE USER robyn PASSWORD '{pw}'"))
+        .await;
+    admin.sql("GRANT readonly TO robyn").await;
+    // 引擎有意允许建这种视图(旧卷 dump 回放必须能重放),泄露在授权侧关闭。
+    admin
+        .sql("CREATE VIEW legacy AS SELECT name, pw FROM docsql_users")
+        .await;
+    let mut ro = Client::connect(&addr).await;
+    assert_eq!(
+        user_login(&mut ro, "robyn", &pw).await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    let f = ro.sql("SELECT name, pw FROM legacy").await;
+    assert_eq!(
+        f.frame_type,
+        proto::RESP_ERROR,
+        "readonly read a view over docsql_users: {}",
+        payload_str(&f)
+    );
+    // admin 自己照常可读(视图是合法对象)。
+    let f = admin.sql("SELECT name FROM legacy").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+}
+
+/// 非有限浮点参数($float 标记)必须按 value_literal 同形绑定
+/// (CAST('NaN' AS REAL));裸 NaN/inf 文本会被引擎当标识符。
+#[tokio::test]
+async fn prepared_nonfinite_float_params_bind_as_values() {
+    async fn prepare(c: &mut Client, sql: &str) -> u64 {
+        c.send(&Frame::new(
+            proto::REQ_PREPARE,
+            proto::encode_sql(sql).unwrap(),
+        ))
+        .await;
+        let f = c.recv().await;
+        let body: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+        body["handle"].as_u64().expect("prepare handle")
+    }
+    async fn execute(c: &mut Client, handle: u64, params: serde_json::Value) -> Frame {
+        let body = serde_json::json!({"handle": handle, "params": params});
+        c.send(&Frame::new(
+            proto::REQ_EXECUTE,
+            body.to_string().into_bytes(),
+        ))
+        .await;
+        c.recv().await
+    }
+    let (_dir, addr) = start_server(Some("t13")).await;
+    let mut c = Client::connect(&addr).await;
+    c.auth("t13").await;
+    let h = prepare(&mut c, "SELECT ?").await;
+    let f = execute(&mut c, h, serde_json::json!([{"$float": "NaN"}])).await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("$float"),
+        "NaN bound as a bare identifier, not a value: {}",
+        payload_str(&f)
+    );
+    c.sql("CREATE TABLE ft (v REAL)").await;
+    let h = prepare(&mut c, "INSERT INTO ft VALUES (?)").await;
+    let f = execute(&mut c, h, serde_json::json!([{"$float": "inf"}])).await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = c.sql("SELECT v FROM ft").await;
+    assert!(payload_str(&f).contains("$float"), "{}", payload_str(&f));
+}
+
+/// 用户管理语句在显式事务内拒绝:授权纪元按语句成功即抬,事务内 REVOKE
+/// 曾被逐帧刷新读到未提交状态,且 ROLLBACK 不回抬纪元(吊销常驻)。
+#[tokio::test]
+async fn useradmin_statements_rejected_in_transaction() {
+    let (_dir, addr) = start_server(None).await;
+    let mut admin = Client::connect(&addr).await;
+    admin.sql("CREATE TABLE jj (id INT)").await;
+    let pw = ["tx", "us", "er", "pw", "12"].concat();
+    admin
+        .sql(&format!("CREATE USER tina PASSWORD '{pw}'"))
+        .await;
+    admin.sql("GRANT readwrite TO tina").await;
+    let mut u = Client::connect(&addr).await;
+    assert_eq!(
+        user_login(&mut u, "tina", &pw).await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    assert_eq!(
+        u.sql("INSERT INTO jj VALUES (1)").await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    admin.sql("BEGIN").await;
+    let f = admin.sql("REVOKE readwrite FROM tina").await;
+    assert_eq!(
+        f.frame_type,
+        proto::RESP_ERROR,
+        "useradmin inside a transaction must be refused: {}",
+        payload_str(&f)
+    );
+    assert!(
+        payload_str(&f).contains("transaction"),
+        "{}",
+        payload_str(&f)
+    );
+    admin.sql("ROLLBACK").await;
+    // 回滚后权限完好(成员行从未被改)。
+    let f = u.sql("INSERT INTO jj VALUES (2)").await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+}
+
+/// 同名用户表不被 docsql_pubsub 视图劫持(与 docsql_log 同规则:
+/// catalog 决定哪个存在)。
+#[tokio::test]
+async fn user_table_named_docsql_pubsub_not_shadowed() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.publish("ch", "m1").await;
+    c.sql("CREATE TABLE docsql_pubsub (x INT, note TEXT)").await;
+    c.sql("INSERT INTO docsql_pubsub VALUES (42, 'user data')")
+        .await;
+    let f = c.sql("SELECT x, note FROM docsql_pubsub").await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("user data"),
+        "user table was shadowed by the pubsub view: {}",
+        payload_str(&f)
+    );
+    // 无同名表时视图照常可用。
+    let f = c.sql("SELECT payload FROM docsql_pubsub_view_probe").await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR);
+}
+
+/// docsql_pubsub 视图在 T-SQL 批内同样可用(批语句逐条过同一改写)。
+#[tokio::test]
+async fn pubsub_view_works_inside_tsql_batch() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.publish("ch", "m1").await;
+    let r = c
+        .sql("DECLARE @x INT; SELECT payload FROM docsql_pubsub")
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    assert!(payload_str(&r).contains("m1"), "{}", payload_str(&r));
+}
+
+/// PITR:目标时间早于基准备份自身快照时间 → 响亮拒绝
+/// (曾静默降级为「基准时刻状态」,把目标之后的写全部复活)。
+#[tokio::test]
+async fn pitr_target_before_base_snapshot_refused() {
+    let (_dir, addr) = start_server(None).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE p (id INT)").await;
+    c.sql("INSERT INTO p VALUES (1)").await;
+    // 触发一份带 v2 头(journal-seq + ts)的备份。
+    let body = serde_json::json!({"action": "trigger"});
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        serde_json::to_vec(&body).unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    // 等备份落盘并取文件名。
+    let mut name = String::new();
+    for _ in 0..250 {
+        let v = backup_list(&addr, None).await;
+        if let Some(files) = v["files"].as_array() {
+            if let Some(first) = files
+                .iter()
+                .filter_map(|x| x["name"].as_str())
+                .find(|n| n.starts_with("backup-") && n.ends_with(".sql"))
+            {
+                name = first.to_string();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(name.starts_with("backup-"), "no backup file listed");
+    // to 早于基准 ts:必须报错,不得静默只回放基准(拒绝由后台任务异步呈现)。
+    let body = serde_json::json!({"action": "restore", "file": name, "to": "0001-01-01T00:00:00Z"});
+    c.send(&Frame::new(
+        proto::REQ_BACKUP,
+        serde_json::to_vec(&body).unwrap(),
+    ))
+    .await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "调度即确认");
+    for _ in 0..250 {
+        let v = backup_list(&addr, None).await;
+        if v["restore"]["running"] != true {
+            assert_eq!(
+                v["restore"]["ok"], false,
+                "early-target restore must fail: {v}"
+            );
+            let err = v["restore"]["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("precedes the base backup"),
+                "must name the boundary: {err}"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

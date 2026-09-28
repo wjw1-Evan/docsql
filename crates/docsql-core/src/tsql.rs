@@ -1496,6 +1496,10 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
         "STR" => str_fn(args),
         "QUOTENAME" => match args {
             [v] => quotename(v, None),
+            // A NULL second argument is a NULL quote character (T-SQL returns
+            // NULL), not a missing one — text_arg's None would otherwise
+            // silently fall back to the default `[`.
+            [_v, Value::Null] => Ok(Value::Null),
             [v, d] => quotename(v, text_arg(d).as_deref()),
             _ => err("QUOTENAME takes 1 or 2 arguments"),
         },
@@ -1543,9 +1547,11 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
             if args.len() < 2 {
                 return err("CONCAT_WS takes at least 2 arguments");
             }
-            // T-SQL: NULL separator → NULL; NULL values are skipped.
-            let Some(sep) = text_arg(&args[0]) else {
-                return Ok(Value::Null);
+            // T-SQL: a NULL separator is an empty string (CONCAT-family
+            // NULL-to-empty coercion); NULL values are skipped.
+            let sep = match &args[0] {
+                Value::Null => String::new(),
+                other => text_arg(other).unwrap_or_default(),
             };
             let parts: Vec<String> = args[1..].iter().filter_map(text_arg).collect();
             Ok(Value::Str(parts.join(&sep)))
@@ -1880,6 +1886,10 @@ fn string_escape_json(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
+            // T-SQL json rules escape the solidus too (STRING_ESCAPE('a/b',
+            // 'json') = 'a\/b') — byte-identical output is the contract for
+            // anyone hashing/comparing the escaped text.
+            '/' => out.push_str("\\/"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
@@ -2037,13 +2047,17 @@ fn quotename(v: &Value, delim: Option<&str>) -> Res<Value> {
         return Ok(Value::Null); // T-SQL: NULL when the input exceeds 128 chars
     }
     let delim = delim.unwrap_or("[");
+    // Each pair quotes with its canonical delimiters and doubles the CLOSING
+    // one inside the string (the same rule the `[`/`'`/`"` arms always had).
     let out = match delim {
-        "[" => format!("[{}]", s.replace(']', "]]")),
+        "[" | "]" => format!("[{}]", s.replace(']', "]]")),
         "'" => format!("'{}'", s.replace('\'', "''")),
         "\"" => format!("\"{}\"", s.replace('"', "\"\"")),
-        "(" => format!("({s})"),
-        ")" => format!("({s})"), // ')' pairs with '(' per the T-SQL doc table
-        _ => return Ok(Value::Null),
+        "(" | ")" => format!("({})", s.replace(')', "))")),
+        "<" | ">" => format!("<{}>", s.replace('>', ">>")),
+        "{" | "}" => format!("{{{}}}", s.replace('}', "}}")),
+        "`" => format!("`{}`", s.replace('`', "``")),
+        _ => return Ok(Value::Null), // not a valid quote character per the T-SQL table
     };
     Ok(Value::Str(out))
 }
@@ -2190,7 +2204,10 @@ fn convert_call(args: &[Value], try_cast: bool) -> Res<Value> {
         return err("CONVERT target type must be a type name");
     };
     let style = match args.get(2) {
-        Some(Value::Null) | None => None,
+        // A NULL style converts to NULL (T-SQL: "For a style value of NULL,
+        // NULL is returned"); treating it as "no style" used to convert on.
+        Some(Value::Null) => return Ok(Value::Null),
+        None => None,
         Some(Value::Int(n)) => Some(*n),
         Some(_) => return err("CONVERT style must be an integer"),
     };
@@ -2667,17 +2684,29 @@ fn format_date_pattern(ms: i64, fmt: &str) -> Res<String> {
 
 /// Evaluate a `FROM` table function by name. `None` = not one of ours (the
 /// engine reports its usual table-function error).
+/// Convenience form for callers without a deadline context (unit tests).
 pub fn table_function(name: &str, args: &[Value]) -> Option<Res<Vec<Object>>> {
+    table_function_checked(name, args, &mut || Ok(()))
+}
+
+pub fn table_function_checked(
+    name: &str,
+    args: &[Value],
+    check: &mut dyn FnMut() -> crate::engine::Result<()>,
+) -> Option<Res<Vec<Object>>> {
     let n = name.to_ascii_uppercase();
     match n.as_str() {
-        "STRING_SPLIT" => Some(string_split(args)),
-        "GENERATE_SERIES" => Some(generate_series(args)),
-        "OPENJSON" => Some(openjson(args)),
+        "STRING_SPLIT" => Some(string_split(args, check)),
+        "GENERATE_SERIES" => Some(generate_series(args, check)),
+        "OPENJSON" => Some(openjson(args, check)),
         _ => None,
     }
 }
 
-fn string_split(args: &[Value]) -> Res<Vec<Object>> {
+fn string_split(
+    args: &[Value],
+    check: &mut dyn FnMut() -> crate::engine::Result<()>,
+) -> Res<Vec<Object>> {
     if args.len() < 2 || args.len() > 3 {
         return err("STRING_SPLIT takes 2 or 3 arguments");
     }
@@ -2694,6 +2723,7 @@ fn string_split(args: &[Value]) -> Res<Vec<Object>> {
     let ordinal = matches!(args.get(2), Some(Value::Int(1)) | Some(Value::Bool(true)));
     let mut rows = Vec::new();
     for (i, part) in s.split(sep.as_str()).enumerate() {
+        check()?;
         let mut doc = Object::new();
         doc.insert("value".into(), Value::Str(part.into()));
         if ordinal {
@@ -2704,7 +2734,10 @@ fn string_split(args: &[Value]) -> Res<Vec<Object>> {
     Ok(rows)
 }
 
-fn generate_series(args: &[Value]) -> Res<Vec<Object>> {
+fn generate_series(
+    args: &[Value],
+    check: &mut dyn FnMut() -> crate::engine::Result<()>,
+) -> Res<Vec<Object>> {
     if args.len() < 2 || args.len() > 3 {
         return err("GENERATE_SERIES takes 2 or 3 arguments");
     }
@@ -2748,6 +2781,9 @@ fn generate_series(args: &[Value]) -> Res<Vec<Object>> {
         if rows.len() > 1_000_000 {
             return err("GENERATE_SERIES result exceeds 1,000,000 rows");
         }
+        // Sampled per row: 1M materialized rows is seconds of unsampled work
+        // otherwise.
+        check()?;
         let mut doc = Object::new();
         doc.insert("value".into(), Value::Int(v));
         rows.push(doc);
@@ -2759,7 +2795,10 @@ fn generate_series(args: &[Value]) -> Res<Vec<Object>> {
     Ok(rows)
 }
 
-fn openjson(args: &[Value]) -> Res<Vec<Object>> {
+fn openjson(
+    args: &[Value],
+    check: &mut dyn FnMut() -> crate::engine::Result<()>,
+) -> Res<Vec<Object>> {
     if args.len() != 1 {
         return err("OPENJSON takes 1 argument (the WITH shape is not supported)");
     }
@@ -2791,6 +2830,7 @@ fn openjson(args: &[Value]) -> Res<Vec<Object>> {
         }
     };
     for (key, item) in items {
+        check()?;
         let mut doc = Object::new();
         doc.insert("key".into(), key);
         doc.insert("value".into(), item.clone());
@@ -3278,6 +3318,13 @@ mod tests {
         );
         assert_eq!(f("QUOTENAME", &[v_str("a]b")]), v_str("[a]]b]"));
         assert_eq!(f("QUOTENAME", &[v_str("ab"), v_str("'")]), v_str("'ab'"));
+        // 全部合法定界符(T-SQL 文档表):]] 之外,>, }, ` 等闭合定界符同样双写。
+        assert_eq!(f("QUOTENAME", &[v_str("x"), v_str("]")]), v_str("[x]"));
+        assert_eq!(f("QUOTENAME", &[v_str("a>b"), v_str(">")]), v_str("<a>>b>"));
+        assert_eq!(f("QUOTENAME", &[v_str("a}b"), v_str("}")]), v_str("{a}}b}"));
+        assert_eq!(f("QUOTENAME", &[v_str("a`b"), v_str("`")]), v_str("`a``b`"));
+        // 第二参为 NULL:NULL 定界符不可接受 → NULL(不是回退默认 '[')。
+        assert_eq!(f("QUOTENAME", &[v_str("x"), Value::Null]), Value::Null);
         assert_eq!(f("ASCII", &[v_str("A")]), Value::Int(65));
         assert_eq!(f("CHAR", &[Value::Int(65)]), v_str("A"));
         assert_eq!(f("CHAR", &[Value::Int(999)]), Value::Null);
@@ -3290,7 +3337,9 @@ mod tests {
             ),
             v_str("a,b")
         );
-        assert_eq!(f("CONCAT_WS", &[Value::Null, v_str("a")]), Value::Null);
+        // NULL separator is an empty string (T-SQL CONCAT-family coercion);
+        // members that are NULL are skipped.
+        assert_eq!(f("CONCAT_WS", &[Value::Null, v_str("a")]), v_str("a"));
         assert_eq!(
             f("TRANSLATE", &[v_str("abc"), v_str("ab"), v_str("xy")]),
             v_str("xyc")
@@ -3312,6 +3361,11 @@ mod tests {
         assert_eq!(
             f("STRING_ESCAPE", &[v_str("a\"b\nc"), v_str("json")]),
             v_str("a\\\"b\\nc")
+        );
+        // json 规则连 solidus 也转义(T-SQL 'a/b' → 'a\/b')。
+        assert_eq!(
+            f("STRING_ESCAPE", &[v_str("a/b"), v_str("json")]),
+            v_str("a\\/b")
         );
         // NULL propagation.
         assert_eq!(f("LEFT", &[Value::Null, Value::Int(2)]), Value::Null);
@@ -3400,6 +3454,10 @@ mod tests {
     fn convert_styles() {
         let d = ts("2026-09-21T13:45:06.250Z");
         let f = |args: &[Value]| scalar("__TSQL_CONVERT__", args).unwrap().unwrap();
+        // style = NULL → NULL(T-SQL:「For a style value of NULL, NULL is
+        // returned」),不得当作「未提供 style」继续转换。
+        assert_eq!(f(&[v_str("VARCHAR"), d.clone(), Value::Null]), Value::Null);
+        assert_eq!(f(&[v_str("INT"), v_str("12"), Value::Null]), Value::Null);
         assert_eq!(
             f(&[v_str("VARCHAR"), d.clone(), Value::Int(23)]),
             v_str("2026-09-21")

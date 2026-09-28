@@ -1258,3 +1258,60 @@ public sealed class EfTransactionTests
         }
     }
 }
+
+// LikeEscapeItem/Db:LIKE 常量翻译的字面量语义(.NET string.Contains = 字面子串)。
+public class LikeEscapeItem
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+}
+
+public class LikeEscapeDb : DbContext
+{
+    private readonly string _cs;
+    public LikeEscapeDb(string cs) => _cs = cs;
+    public DbSet<LikeEscapeItem> Items => Set<LikeEscapeItem>();
+    protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
+}
+
+public sealed class LikeEscapeTests : IClassFixture<EfServerFixture>
+{
+    private readonly EfServerFixture _fx;
+    public LikeEscapeTests(EfServerFixture fx) => _fx = fx;
+    private string Cs => $"host=127.0.0.1;port={_fx.Port}";
+
+    private void Seed()
+    {
+        using var conn = new Docsql.Client.DocsqlConnection(Cs);
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DROP TABLE IF EXISTS LikeItems";
+        cmd.ExecuteNonQuery();
+        using (var db = new LikeEscapeDb(Cs))
+        {
+            db.Items.AddRange(new[]
+            {
+                new LikeEscapeItem { Name = "alpha" },
+                new LikeEscapeItem { Name = "be%ta_x" },
+                new LikeEscapeItem { Name = "gam[ma]" },
+            });
+            db.SaveChanges();
+        }
+    }
+
+    [Fact]
+    public void StringContains_constant_escapes_wildcards_and_bracket()
+    {
+        // 引擎的 LIKE 支持文档化的 T-SQL 字符类:常量翻译若不转义 %/_/[
+        // 会被当通配符/字符集解释,违背 .NET string.Contains 的字面子串语义。
+        Seed();
+        using var db = new LikeEscapeDb(Cs);
+        Assert.Equal(new[] { "be%ta_x" }, db.Items.Where(t => t.Name.Contains("%")).Select(t => t.Name).ToList());
+        Assert.Equal(new[] { "be%ta_x" }, db.Items.Where(t => t.Name.Contains("ta_")).Select(t => t.Name).ToList());
+        Assert.Equal(new[] { "gam[ma]" }, db.Items.Where(t => t.Name.Contains("gam[ma]")).Select(t => t.Name).ToList());
+        // 反向:含 [ 的模式不得误命中字符集内的行("gama"/"gamm" 之类)。
+        Assert.DoesNotContain(db.Items.Where(t => t.Name.Contains("am[m")).Select(t => t.Name).ToList(), n => n == "alpha");
+        Assert.Equal(new[] { "gam[ma]" }, db.Items.Where(t => t.Name.StartsWith("gam[")).Select(t => t.Name).ToList());
+        Assert.Equal(new[] { "gam[ma]" }, db.Items.Where(t => t.Name.EndsWith("a]")).Select(t => t.Name).ToList());
+    }
+}

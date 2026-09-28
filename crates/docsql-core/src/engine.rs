@@ -1163,7 +1163,9 @@ impl<'a> ReadCx<'a> {
                     _ => return err("table function arguments must be values"),
                 }
             }
-            let docs = match crate::tsql::table_function(&fname_upper, &vals) {
+            let docs = match crate::tsql::table_function_checked(&fname_upper, &vals, &mut || {
+                self.deadline.check()
+            }) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
                 None => return err(format!("unknown table function {fname}")),
@@ -1345,7 +1347,9 @@ impl<'a> ReadCx<'a> {
                         "{fname} requires a table alias (FROM {fname}(...) AS t)"
                     ));
                 };
-                let mut docs = match crate::tsql::table_function(&fname, &vals) {
+                let mut docs = match crate::tsql::table_function_checked(&fname, &vals, &mut || {
+                    self.deadline.check()
+                }) {
                     Some(Ok(rows)) => rows,
                     Some(Err(e)) => return Err(e),
                     None => return err(format!("unknown table function {fname}")),
@@ -1371,11 +1375,14 @@ impl<'a> ReadCx<'a> {
                 let Some(alias_obj) = alias else {
                     return err("OPENJSON requires a table alias (FROM OPENJSON(...) AS j)");
                 };
-                let mut docs = match crate::tsql::table_function("OPENJSON", &[val]) {
-                    Some(Ok(rows)) => rows,
-                    Some(Err(e)) => return Err(e),
-                    None => return err("unknown table function OPENJSON"),
-                };
+                let mut docs =
+                    match crate::tsql::table_function_checked("OPENJSON", &[val], &mut || {
+                        self.deadline.check()
+                    }) {
+                        Some(Ok(rows)) => rows,
+                        Some(Err(e)) => return Err(e),
+                        None => return err("unknown table function OPENJSON"),
+                    };
                 rename_tablefn_docs(alias_obj, "OPENJSON", false, &mut docs)?;
                 return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
             }
@@ -1465,7 +1472,9 @@ impl<'a> ReadCx<'a> {
                 ));
             };
             let alias = alias_obj.name.value.clone();
-            let mut docs = match crate::tsql::table_function(&fname, &vals) {
+            let mut docs = match crate::tsql::table_function_checked(&fname, &vals, &mut || {
+                self.deadline.check()
+            }) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
                 None => return err(format!("unknown table function {fname}")),
@@ -6097,6 +6106,10 @@ impl Database {
     /// dropped or wiped (a `rewrite_table` keeps `overflow_free`, which its
     /// next incarnation reuses for chains, so it frees only heap/tree pages).
     fn free_table_storage(&self, tx: &mut crate::pager::Tx, meta: &TableMeta) -> Result<()> {
+        // Live overflow chains are anchored only by the slots' head pointers
+        // (recycled ones sit in `overflow_free`); free them before the heap
+        // pages themselves go away.
+        crate::heap::free_overflow_chains(&self.pager, tx, &meta.pages)?;
         for &p in &meta.pages {
             self.pager.free_page(tx, p)?;
         }
@@ -7188,6 +7201,11 @@ impl Database {
         // page rewrites are atomic; snapshots rebuild old versions from the
         // WAL and never observe the reuse).
         if free_old {
+            // The docs being rewritten carried live overflow chains anchored
+            // only by the old slots' head pointers; free them too or every
+            // rewrite/TRUNCATE of a table with oversized documents orphans
+            // the chains (the file grows without bound under churn).
+            crate::heap::free_overflow_chains(&self.pager, &mut tx, &meta.pages)?;
             for &p in &meta.pages {
                 self.pager.free_page(&mut tx, p)?;
             }
@@ -7287,6 +7305,11 @@ impl Database {
         {
             let mut tree = BTree::create(&self.pager, tx).map_err(|e| index_err(root_key, e))?;
             for (loc, doc) in pairs {
+                // The backfill is the expensive half of CREATE INDEX on a big
+                // table (the materialization before it samples already) —
+                // without a check here the statement was uninterruptible
+                // once it entered the tree builds.
+                self.stmt_deadline.check()?;
                 if let Some(v) = index_key_of(doc, cols) {
                     tree.insert(&self.pager, tx, v, *loc, unique)
                         .map_err(|e| index_err(root_key, e))?;
@@ -7350,6 +7373,15 @@ impl Database {
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
+        // ROWNUM has no row stream to number in an UPDATE's own SET/WHERE:
+        // it reads NULL, and `NULL <= n` is TRUE under the documented total
+        // order — an Oracle-style `UPDATE ... WHERE ROWNUM <= 1` would
+        // silently rewrite every row. Fail loudly instead.
+        if assignments.iter().any(|a| refs_rownum(&a.value))
+            || selection.as_ref().is_some_and(refs_rownum)
+        {
+            return err("ROWNUM is not supported in UPDATE (use a subquery: WHERE id IN (SELECT ... WHERE ROWNUM <= n))");
+        }
         // Outer scope for correlated subqueries: the target (name + alias)
         // plus the FROM tables (the FROM form evaluates WHERE/SET over the
         // merged image).
@@ -7731,6 +7763,13 @@ impl Database {
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
+        // ROWNUM has no row stream to number in a DELETE's own WHERE: it
+        // reads NULL, and `NULL <= n` is TRUE under the documented total
+        // order — an Oracle-style `DELETE ... WHERE ROWNUM <= 1` would
+        // silently mass-delete. Fail loudly instead.
+        if selection.as_ref().is_some_and(refs_rownum) {
+            return err("ROWNUM is not supported in DELETE (use a subquery: WHERE id IN (SELECT ... WHERE ROWNUM <= n))");
+        }
         // Outer scope for correlated subqueries: the target (name + alias)
         // plus the USING tables (the USING form evaluates WHERE over the
         // merged image).
@@ -8097,6 +8136,11 @@ impl Database {
         let mut roots: std::collections::BTreeSet<String> =
             base.index_roots.keys().cloned().collect();
         let mut index_defs: Vec<IndexDef> = base.index_defs.clone();
+        // Column renames applied so far in this statement, so a later DROP
+        // COLUMN matches FK references under their post-rename spelling
+        // (`RENAME COLUMN a TO b, DROP COLUMN b` must still see the child
+        // FKs that the apply loop will rewrite a→b).
+        let mut renamed: Vec<(String, String)> = Vec::new();
         for op in ops {
             match op {
                 Op::AddColumn { column_def, .. } => {
@@ -8178,13 +8222,50 @@ impl Database {
                                 "cannot drop column {name}: CHECK constraint {bad} references it"
                             ));
                         }
+                        // Stored view SQL is not rewritten: dropping a column
+                        // a view still names breaks the view (its missing
+                        // column reads NULL — for a WHERE that is silently
+                        // wrong rows) while the dump replays "fine". Refuse
+                        // like RENAME does, scoped to views that actually
+                        // name the column.
+                        let view_refs: Vec<String> = self
+                            .direct_view_dependents(&[tname.to_string()])
+                            .into_iter()
+                            .filter(|v| {
+                                self.tables
+                                    .get(v)
+                                    .and_then(|m| m.view_sql.clone())
+                                    .is_some_and(|sql| text_references_ident(&sql, name))
+                            })
+                            .collect();
+                        if !view_refs.is_empty() {
+                            return err(format!(
+                                "cannot drop column {tname}.{name}: referenced by VIEW {} \
+                                 (drop the view first; its stored SQL is not rewritten)",
+                                view_refs.join(", ")
+                            ));
+                        }
                         let referencing: Vec<String> = self
                             .tables
                             .iter()
                             .filter(|(_, m)| {
-                                m.foreign_keys
-                                    .iter()
-                                    .any(|(_, rt, rc)| rt == tname && rc == name)
+                                m.foreign_keys.iter().any(|(_, rt, rc)| {
+                                    if rt != tname {
+                                        return false;
+                                    }
+                                    // Match under the rc spelling the apply
+                                    // loop will have produced by the time
+                                    // this DROP runs (renames earlier in the
+                                    // same statement rewrote it).
+                                    let evolved = renamed.iter().fold(rc.clone(), |cur, (o, n)| {
+                                        if cur == *o {
+                                            n.clone()
+                                        } else {
+                                            cur
+                                        }
+                                    });
+                                    evolved == *name
+                                })
                             })
                             .map(|(t, _)| t.clone())
                             .collect();
@@ -8239,7 +8320,22 @@ impl Database {
                         if roots.contains(new) || index_defs.iter().any(|d| d.name == *new) {
                             return err(format!("name {new} is already used by an index"));
                         }
+                        // Same collapse through the schemaless door: an
+                        // undeclared field already present in the stored
+                        // documents. The apply loop's remove(old)+insert(new)
+                        // would silently overwrite those values.
+                        if self
+                            .table_docs_cx(tname)?
+                            .iter()
+                            .any(|d| d.contains_key(new.as_str()))
+                        {
+                            return err(format!(
+                                "cannot rename column {tname}.{old} to {new}: \
+                                 {new} already exists as a data field"
+                            ));
+                        }
                     }
+                    renamed.push((old.clone(), new.clone()));
                     columns = columns
                         .iter()
                         .map(|c| if c == old { new.clone() } else { c.clone() })
@@ -8573,19 +8669,23 @@ impl Database {
                             }
                         })
                         .collect();
-                    // FK columns on this table follow the rename (references
-                    // from other tables to the renamed column are not
-                    // tracked — renaming a referenced column elsewhere keeps
-                    // its old name here by design).
+                    // FK columns on this table follow the rename, and so does
+                    // the remote column of a same-table FK (self-references
+                    // and sibling references): a dangling rc would fail every
+                    // subsequent child write with FK errors.
                     meta.foreign_keys = meta
                         .foreign_keys
                         .iter()
                         .map(|(c, rt, rc)| {
-                            if c == old {
-                                (new.clone(), rt.clone(), rc.clone())
-                            } else {
-                                (c.clone(), rt.clone(), rc.clone())
-                            }
+                            (
+                                if c == old { new.clone() } else { c.clone() },
+                                rt.clone(),
+                                if rt == &tname && rc == old {
+                                    new.clone()
+                                } else {
+                                    rc.clone()
+                                },
+                            )
                         })
                         .collect();
                     // CHECK texts reference the old column name; leaving them
@@ -8608,6 +8708,37 @@ impl Database {
                         .collect();
                     self.rewrite_table(&tname, &mut meta, renamed)?;
                     rewrote = true;
+                    // Referencing tables' remote columns follow too (the same
+                    // rule RENAME TABLE applies to their rt, also after the
+                    // commit so the failure path stays atomic): a dangling rc
+                    // makes every child write fail FK checks and aborts dump
+                    // replay mid-script (backup/restore, join snapshots).
+                    // Only tables actually referencing the old name get a
+                    // targeted make_mut — never a whole-catalog deep copy.
+                    let referrers: Vec<String> = self
+                        .tables
+                        .iter()
+                        .filter(|(n, m)| {
+                            n.as_str() != tname.as_str()
+                                && m.foreign_keys
+                                    .iter()
+                                    .any(|(_, rt, rc)| rt == &tname && rc == old)
+                        })
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    if !referrers.is_empty() {
+                        for name in referrers {
+                            if let Some(entry) = self.tables.get_mut(&name) {
+                                let m = std::sync::Arc::make_mut(entry);
+                                for (_, rt, rc) in m.foreign_keys.iter_mut() {
+                                    if rt == &tname && rc == old {
+                                        *rc = new.clone();
+                                    }
+                                }
+                            }
+                        }
+                        self.save_catalog()?;
+                    }
                 }
                 Op::RenameTable { table_name } => {
                     let new_name = match table_name {
@@ -8898,6 +9029,14 @@ impl Database {
         if crate::engine::is_system_table(&name) {
             return err(format!("view name {name} is reserved for the engine"));
         }
+        if is_compat_view(&name) {
+            // Same shadow rule as CREATE TABLE: the compatibility dictionary
+            // views always win at FROM-resolution, so a view created under
+            // one of these names would be unreachable.
+            return err(format!(
+                "view name {name} is reserved for the compatibility dictionary views"
+            ));
+        }
         let exists = self.tables.contains_key(&name);
         if exists && !view.or_replace {
             if view.if_not_exists {
@@ -8999,6 +9138,18 @@ impl Database {
             // from dumps by name). Only the internal replay path may create
             // reserved names, and it never creates these.
             return err(format!("table name {name} is reserved for the engine"));
+        }
+        if is_compat_view(&name) && !self.internal_ddl {
+            // The dictionary/compat views always shadow a same-named table
+            // at FROM-resolution (DUAL/sqlite_master/information_schema and
+            // the Oracle dictionary spellings): a table created under one of
+            // these names accepts writes but every SELECT reads the
+            // dictionary instead — data that can never be read back. Refuse
+            // at CREATE instead (existing pre-guard tables keep their
+            // shadowed behavior).
+            return err(format!(
+                "table name {name} is reserved for the compatibility dictionary views"
+            ));
         }
         if self.tables.contains_key(&name) {
             if create.if_not_exists {
@@ -9422,7 +9573,10 @@ impl Database {
             }
             other => return err(format!("unsupported INSERT source: {other}")),
         };
-        if rows.is_empty() {
+        // An empty VALUES list is a syntax-level mistake; an empty SELECT
+        // source (WHERE filtered everything) inserts 0 rows like every
+        // mainstream engine — ETL batches legitimately hit it.
+        if rows.is_empty() && matches!(&*source.body, SetExpr::Values(_)) {
             return err("INSERT has no rows");
         }
         // INSERT ... SELECT into an auto-GUID table cannot be replicated:
@@ -9488,9 +9642,20 @@ impl Database {
             if !autoinc_appended {
                 if let Some(col) = &meta.autoinc {
                     if let Some(idx) = columns.iter().position(|c| c == col) {
-                        if matches!(row.get(idx), Some(Value::Null) | None) {
-                            row[idx] = Value::Int(next_autoinc);
-                            next_autoinc = next_autoinc.saturating_add(1);
+                        match row.get(idx) {
+                            Some(Value::Null) | None => {
+                                row[idx] = Value::Int(next_autoinc);
+                                next_autoinc = next_autoinc.saturating_add(1);
+                            }
+                            // An explicit id at/above the statement-start
+                            // watermark must advance the watermark *within*
+                            // the statement, or a later row of the same
+                            // INSERT that omits the id reuses it and dies on
+                            // UNIQUE.
+                            Some(Value::Int(v)) => {
+                                next_autoinc = next_autoinc.max(v.saturating_add(1));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -10056,6 +10221,21 @@ impl Database {
         // on replication peers).
         let tdocs = self.table_pairs_cx(&tname)?;
 
+        // ROWNUM has no row stream to number in MERGE's ON / arms: it reads
+        // NULL and `NULL <= n` is TRUE under the documented total order, so
+        // every pair would silently match. Fail loudly (subquery sources may
+        // still use ROWNUM — that stream is their own).
+        if refs_rownum(&merge.on)
+            || matched_upd
+                .as_ref()
+                .is_some_and(|asg| asg.iter().any(|a| refs_rownum(&a.value)))
+            || not_matched_ins
+                .as_ref()
+                .is_some_and(|(_, exprs)| exprs.iter().any(refs_rownum))
+        {
+            return err("ROWNUM is not supported in MERGE ON / WHEN arms");
+        }
+
         // Pair every source row with its matching target row: ON evaluates
         // on the merged namespace (target columns first; source columns are
         // additionally available qualified as `skey.col`).
@@ -10237,14 +10417,23 @@ impl Database {
                 // Same generation rules as INSERT: missing/NULL AUTOINCREMENT
                 // gets max+1, declared DEFAULTs fill omitted columns.
                 if let Some(col) = &meta.autoinc {
-                    if matches!(doc.get(col), Some(Value::Null) | None) {
-                        doc.insert(col.clone(), Value::Int(next_autoinc));
-                        next_autoinc = next_autoinc.saturating_add(1);
-                    } else {
-                        // Explicit id: the engine didn't allocate it, so it
-                        // never advances `next_autoinc` — drop the cache at
-                        // commit and let the next INSERT recompute max+1.
-                        autoinc_mutated = true;
+                    match doc.get(col) {
+                        Some(Value::Null) | None => {
+                            doc.insert(col.clone(), Value::Int(next_autoinc));
+                            next_autoinc = next_autoinc.saturating_add(1);
+                        }
+                        // Explicit id: advance the in-statement watermark so a
+                        // later source row that omits the id doesn't reuse it
+                        // (same rule as INSERT); the engine didn't allocate
+                        // it, so the cache is still dropped at commit and the
+                        // next statement recomputes max+1.
+                        Some(Value::Int(v)) => {
+                            next_autoinc = next_autoinc.max(v.saturating_add(1));
+                            autoinc_mutated = true;
+                        }
+                        _ => {
+                            autoinc_mutated = true;
+                        }
                     }
                 }
                 for (col, text) in &meta.defaults {
@@ -10441,15 +10630,22 @@ impl Database {
 
     /// Merge-namespaced evaluation row: target columns (unqualified) plus
     /// source columns (qualified `skey.col`, and unqualified when the name
-    /// is not taken by the target).
+    /// is not taken by the target). Qualified target refs resolve to the
+    /// target's own columns only — a column the target row lacks pins to
+    /// NULL instead of falling back to the source's bare-name value.
     fn merge_join_row(t_doc: &Object, t_key: &str, s_doc: &Object, s_key: &str) -> Object {
-        let _ = t_key;
         let mut row = t_doc.clone();
         for (k, v) in s_doc {
             row.insert(format!("{s_key}.{k}"), v.clone());
             if !row.contains_key(k.as_str()) {
                 row.insert(k.clone(), v.clone());
             }
+        }
+        for k in t_doc.keys() {
+            row.insert(format!("{t_key}.{k}"), t_doc[k].clone());
+        }
+        for k in s_doc.keys() {
+            row.entry(format!("{t_key}.{k}")).or_insert(Value::Null);
         }
         row
     }
@@ -13060,9 +13256,12 @@ fn eval_assignments(
 
 /// Replace identifier `old` with `new` in SQL text, matching whole
 /// identifiers only (adjacent identifier characters disqualify the match).
-/// Walks char boundaries — a byte walk would panic slicing into a multibyte
-/// identifier, and non-ASCII chars count as identifier characters so the
-/// `a` inside `éa` can never match.
+/// String literals are copied through verbatim — a CHECK like
+/// `name <> 'name'` must not have its *literal* rewritten when the column
+/// `name` is renamed, or the constraint silently changes meaning. Walks char
+/// boundaries — a byte walk would panic slicing into a multibyte identifier,
+/// and non-ASCII chars count as identifier characters so the `a` inside
+/// `éa` can never match.
 fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
     fn is_word(c: char) -> bool {
         !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '$'
@@ -13073,6 +13272,14 @@ fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         let (byte_i, c) = chars[i];
+        if c == '\'' {
+            // Copy the literal span untouched (same scanner the bind/redact/
+            // lexing paths share — never a hand-rolled replacement walk).
+            let (end, _) = crate::stmt::sql_literal_end(text, byte_i);
+            out.push_str(&text[byte_i..end]);
+            i += text[byte_i..end].chars().count();
+            continue;
+        }
         let prev_word = i > 0 && is_word(chars[i - 1].1);
         let next_word = chars
             .get(i + old_chars)
@@ -13088,6 +13295,39 @@ fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
         }
     }
     out
+}
+
+/// Literal-aware word-boundary test: does `name` occur as a bare identifier
+/// outside string literals? Dependency checks over stored SQL text that a
+/// full parse-walk is not worth it — a false positive only over-refuses a
+/// DDL, a false negative would silently degrade a view. Same char-boundary
+/// walk (and word rule) as [`rename_ident_in_text`].
+fn text_references_ident(text: &str, name: &str) -> bool {
+    fn is_word(c: char) -> bool {
+        !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let name_chars = name.chars().count();
+    let mut i = 0;
+    while i < chars.len() {
+        let (byte_i, c) = chars[i];
+        if c == '\'' {
+            let (end, _) = crate::stmt::sql_literal_end(text, byte_i);
+            i += text[byte_i..end].chars().count();
+            continue;
+        }
+        let prev_word = i > 0 && is_word(chars[i - 1].1);
+        let next_word = chars
+            .get(i + name_chars)
+            .copied()
+            .map(|(_, c2)| is_word(c2))
+            .unwrap_or(false);
+        if !prev_word && !next_word && text[byte_i..].starts_with(name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Collect the table names and aliases a query reads in its own FROM, so
@@ -13581,11 +13821,34 @@ fn subst_outer_refs_setexpr(
 // classifiable" and the authorization caller must DENY (fail closed).
 
 fn walk_query(q: &Query, out: &mut Vec<String>) -> Option<()> {
+    walk_query_shadowed(q, out, &[])
+}
+
+/// `shadow` carries the CTE names visible at this scope: a WITH alias shadows
+/// same-named tables/views for its entire scope (subqueries included), so
+/// FROM refs under those names read the CTE, not a base object, and must not
+/// land in the base set — a view whose body opens `WITH v AS (…) SELECT *
+/// FROM v` used to be misjudged as self-referencing and refused.
+fn walk_query_shadowed(q: &Query, out: &mut Vec<String>, outer: &[String]) -> Option<()> {
+    let mut shadow: Vec<String> = outer.to_vec();
     if let Some(w) = &q.with {
         for cte in &w.cte_tables {
-            walk_query(&cte.query, out)?;
+            shadow.push(cte.alias.name.value.clone());
+            // CTE bodies see the WITH list built so far (and outer scopes):
+            // a recursive CTE's self-reference is a CTE read, not a table.
+            walk_query_shadowed(&cte.query, out, &shadow)?;
         }
     }
+    if shadow.len() == outer.len() {
+        return walk_query_inner(q, out);
+    }
+    let mut refs = Vec::new();
+    walk_query_inner(q, &mut refs)?;
+    out.extend(refs.into_iter().filter(|r| !shadow.iter().any(|s| s == r)));
+    Some(())
+}
+
+fn walk_query_inner(q: &Query, out: &mut Vec<String>) -> Option<()> {
     walk_setexpr(&q.body, out)?;
     if let Some(order_by) = &q.order_by {
         if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
@@ -14859,7 +15122,9 @@ fn select_refs_rownum(select: &sqlparser::ast::Select) -> bool {
 }
 
 /// Walk an expression tree looking for the Oracle ROWNUM pseudo-column
-/// reference (case-insensitive identifier).
+/// reference (case-insensitive identifier). Non-recursive shapes recurse;
+/// subqueries do NOT — a ROWNUM inside `(SELECT ... WHERE ROWNUM <= n)`
+/// belongs to the subquery's own row stream and is legal in a write's WHERE.
 fn refs_rownum(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Identifier(i) => i.value.eq_ignore_ascii_case("ROWNUM"),
@@ -14869,7 +15134,29 @@ fn refs_rownum(e: &SqlExpr) -> bool {
         | SqlExpr::IsFalse(e)
         | SqlExpr::IsTrue(e)
         | SqlExpr::IsNotNull(e)
-        | SqlExpr::IsNull(e) => refs_rownum(e),
+        | SqlExpr::IsNull(e)
+        | SqlExpr::Cast { expr: e, .. } => refs_rownum(e),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => refs_rownum(expr) || refs_rownum(low) || refs_rownum(high),
+        SqlExpr::InList { expr, list, .. } => {
+            refs_rownum(expr) || list.iter().any(refs_rownum)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            refs_rownum(expr) || refs_rownum(pattern)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(refs_rownum)
+                || conditions
+                    .iter()
+                    .any(|w| refs_rownum(&w.condition) || refs_rownum(&w.result))
+                || else_result.as_deref().is_some_and(refs_rownum)
+        }
         SqlExpr::Function(f) => {
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
                 list.args.iter().any(|a| match a {
@@ -14948,6 +15235,14 @@ pub(crate) fn cast_value(v: Value, type_name: &str) -> Result<Value> {
                     .parse::<i64>()
                     .map_err(|_| SqlError::Message(format!("cannot CAST '{s}' AS {type_name}")))?,
             ),
+            // A BLOB silently passing through as "the value" made every
+            // downstream comparison/arithmetic silently wrong (`WHERE
+            // CONVERT(INT, x'01') = 1` matched nothing, forever).
+            Value::Bytes(_) => {
+                return err(format!(
+                    "cannot CAST a BLOB AS {type_name} (decode it explicitly first)"
+                ))
+            }
             other => other,
         },
         v if t.contains("CHAR") || t.contains("TEXT") || t.contains("STRING") => {
@@ -14980,6 +15275,26 @@ pub(crate) fn cast_value(v: Value, type_name: &str) -> Result<Value> {
                 ))
             }
         },
+        // DATE: a real conversion with T-SQL semantics — parse/truncate to
+        // UTC midnight (`CONVERT(DATE, getdate())` is the classic idiom).
+        // This used to pass the input through untouched, storing a plain
+        // string with no date semantics at all.
+        v if t == "DATE" => match v {
+            Value::Timestamp(ms) => Value::Timestamp(ms - ms.rem_euclid(86_400_000)),
+            Value::Str(s) => {
+                let ms = crate::value::parse_timestamp_ms(&s).ok_or_else(|| {
+                    SqlError::Message(format!("cannot CAST '{s}' AS {type_name}: not a date"))
+                })?;
+                Value::Timestamp(ms - ms.rem_euclid(86_400_000))
+            }
+            other => {
+                return err(format!(
+                    "cannot CAST {} AS {type_name}: cast from {} is not defined",
+                    value_to_text(&other),
+                    other.type_name()
+                ))
+            }
+        },
         v if t.contains("BOOL") => match v {
             Value::Bool(_) => v,
             Value::Int(i) => Value::Bool(i != 0),
@@ -15001,6 +15316,11 @@ pub(crate) fn cast_value(v: Value, type_name: &str) -> Result<Value> {
                     .parse::<Decimal>()
                     .map_err(|_| SqlError::Message(format!("cannot CAST '{s}' AS {type_name}")))?,
             ),
+            Value::Bytes(_) => {
+                return err(format!(
+                    "cannot CAST a BLOB AS {type_name} (decode it explicitly first)"
+                ))
+            }
             other => other,
         },
         v if t.contains("REAL") || t.contains("DOUBLE") || t.contains("FLOAT") => match v {
@@ -15012,6 +15332,11 @@ pub(crate) fn cast_value(v: Value, type_name: &str) -> Result<Value> {
                     .parse::<f64>()
                     .map_err(|_| SqlError::Message(format!("cannot CAST '{s}' AS {type_name}")))?,
             ),
+            Value::Bytes(_) => {
+                return err(format!(
+                    "cannot CAST a BLOB AS {type_name} (decode it explicitly first)"
+                ))
+            }
             other => other,
         },
         // BLOB: bytes pass through; text keeps its UTF-8 bytes (SQLite-style
@@ -29456,5 +29781,314 @@ mod tsql_compat_tests {
         assert!(db
             .execute("ALTER TABLE bk ADD COLUMN g INT GENERATED ALWAYS AS (x + 1)")
             .is_err());
+    }
+
+    /// 缺陷审查轮13:同语句「显式 id == 语句开始水位 + 省略 id 行」曾整句撞
+    /// UNIQUE —— 显式 id 必须在行循环内推进水位(INSERT/MERGE 两路)。
+    #[test]
+    fn explicit_autoinc_id_advances_in_statement_watermark() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')");
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES (3, 'e3'), (NULL, 'gen')",
+        );
+        let mut ids = rows(&mut db, "SELECT id FROM t ORDER BY id")
+            .rows
+            .into_iter()
+            .filter_map(|r| r[0].as_i64())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        // NULL 在前、大显式 id 在后:后一个 NULL 跟进显式 id。
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES (NULL, 'g1'), (50, 'e50'), (NULL, 'g2')",
+        );
+        ids = rows(
+            &mut db,
+            "SELECT id FROM t WHERE v IN ('g1','g2') ORDER BY id",
+        )
+        .rows
+        .into_iter()
+        .filter_map(|r| r[0].as_i64())
+        .collect();
+        assert_eq!(ids, vec![5, 51]);
+        // MERGE INSERT 臂同款。
+        run(
+            &mut db,
+            "CREATE TABLE t2 (id INT PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        );
+        run(&mut db, "INSERT INTO t2 (id, v) VALUES (1, 'a'), (2, 'b')");
+        run(&mut db, "CREATE TABLE feed (id INT, v TEXT)");
+        run(&mut db, "INSERT INTO feed VALUES (3, 'e3'), (NULL, 'gen')");
+        run(
+            &mut db,
+            "MERGE INTO t2 USING feed ON t2.id = feed.id \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (feed.id, feed.v)",
+        );
+        let mids = rows(
+            &mut db,
+            "SELECT id FROM t2 WHERE v IN ('e3','gen') ORDER BY id",
+        )
+        .rows
+        .into_iter()
+        .filter_map(|r| r[0].as_i64())
+        .collect::<Vec<_>>();
+        assert_eq!(mids, vec![3, 4]);
+    }
+
+    /// INSERT … SELECT 源过滤后为空 = 插 0 行(主流语义);空 VALUES 仍报错。
+    #[test]
+    fn insert_select_empty_source_affected_zero() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE src (a INT)");
+        run(&mut db, "INSERT INTO src VALUES (1)");
+        run(&mut db, "CREATE TABLE dst (a INT)");
+        let out = run(&mut db, "INSERT INTO dst SELECT a FROM src WHERE 1 = 0");
+        assert!(matches!(out, ExecOutcome::Affected(0)));
+        assert!(db.execute("INSERT INTO dst VALUES ()").is_err());
+        let n = rows(&mut db, "SELECT COUNT(*) FROM dst").rows[0][0].as_i64();
+        assert_eq!(n, Some(0));
+    }
+
+    /// TRUNCATE/DROP 的溢出链页:活链随表释放回页池,churn 不再无界增长
+    /// (红线 1:页回收,DML 之外的重写路径同样不得孤儿化链页)。
+    #[test]
+    fn truncate_and_drop_release_overflow_chain_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("ovchurn.db")).unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, b TEXT)");
+        let big = "x".repeat(20_000);
+        run(&mut db, &format!("INSERT INTO t VALUES (1, '{big}')"));
+        let filled = db.num_pages();
+        for i in 0..5 {
+            run(
+                &mut db,
+                &format!("INSERT INTO t VALUES ({}, '{big}')", 10 + i),
+            );
+            run(&mut db, "TRUNCATE TABLE t");
+        }
+        assert!(
+            db.num_pages() <= filled + 8,
+            "TRUNCATE churn leaked chain pages: {filled} -> {}",
+            db.num_pages()
+        );
+        // DROP:释放的链页立即可复用(文件不因重建而增长)。
+        run(&mut db, "DROP TABLE t");
+        run(&mut db, "CREATE TABLE t2 (id INT PRIMARY KEY, b TEXT)");
+        run(&mut db, &format!("INSERT INTO t2 VALUES (1, '{big}')"));
+        assert!(
+            db.num_pages() <= filled + 8,
+            "freed chain pages must be reused after DROP: {} vs {filled}",
+            db.num_pages()
+        );
+    }
+
+    /// MERGE ON 目标限定引用一个目标没有、源有的列:必须按目标侧 NULL 判定,
+    /// 不得经裸名回退静默取源值(否则恒匹配 → 目标行被错误 UPDATE)。
+    #[test]
+    fn merge_on_target_qualified_missing_column_reads_null() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE tgt (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO tgt VALUES (1, 'keep')");
+        run(&mut db, "CREATE TABLE src (id INT, tag TEXT)");
+        run(&mut db, "INSERT INTO src VALUES (1, 'x')");
+        // t.tag 目标没有 → NULL → ON 不成立 → INSERT 臂(撞 PK 报错);
+        // 旧行为:s.tag/t.tag 都取源值 → 恒匹配 → 目标行被改成 'upd'。
+        let e = db
+            .execute(
+                "MERGE INTO tgt AS t USING src AS s ON t.id = s.id AND s.tag = t.tag \
+                 WHEN MATCHED THEN UPDATE SET v = 'upd' \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.tag)",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("UNIQUE"),
+            "target-qualified missing column must not silently match: {e}"
+        );
+        let r = rows(&mut db, "SELECT v FROM tgt");
+        assert_eq!(r.rows, vec![vec![Value::Str("keep".into())]]);
+    }
+
+    /// RENAME COLUMN:被引用列改名后,本表自引用/同表 FK 的 rc 与跨表引用方
+    /// 的 rc 都必须跟随;dump 回放不再中断。
+    #[test]
+    fn rename_column_follows_fk_remote_columns() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY, a INT)");
+        run(&mut db, "CREATE TABLE c (x INT REFERENCES p(id))");
+        run(&mut db, "INSERT INTO p VALUES (1, 10)");
+        run(&mut db, "INSERT INTO c VALUES (1)");
+        run(&mut db, "ALTER TABLE p RENAME COLUMN id TO gid");
+        run(&mut db, "INSERT INTO c VALUES (1)");
+        // dump 回放(备份/快照通道)。
+        let dump = db.dump_script().unwrap();
+        let mut db2 = Database::in_memory().unwrap();
+        for stmt in dump.split(';').filter(|s| !s.trim().is_empty()) {
+            db2.execute(stmt)
+                .unwrap_or_else(|e| panic!("replay {stmt}: {e}"));
+        }
+        // 自引用与同表兄弟列。
+        run(
+            &mut db,
+            "CREATE TABLE e (id INT PRIMARY KEY, mgr INT REFERENCES e(id))",
+        );
+        run(&mut db, "INSERT INTO e VALUES (1, NULL)");
+        run(&mut db, "ALTER TABLE e RENAME COLUMN id TO eid");
+        run(&mut db, "INSERT INTO e VALUES (2, 1)");
+        run(
+            &mut db,
+            "CREATE TABLE s (id INT PRIMARY KEY, b INT REFERENCES s(id))",
+        );
+        run(&mut db, "INSERT INTO s VALUES (1, 1)");
+        run(&mut db, "ALTER TABLE s RENAME COLUMN id TO sid");
+        run(&mut db, "INSERT INTO s VALUES (2, 1)");
+    }
+
+    /// RENAME COLUMN 的 CHECK 文本改写不得触碰字符串字面量
+    /// (CHECK (name <> 'name') 改名列后约束语义不得漂移)。
+    #[test]
+    fn rename_column_keeps_check_string_literals() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (name TEXT CHECK (name <> 'name'))");
+        run(&mut db, "INSERT INTO t VALUES ('ok')");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN name TO title");
+        assert!(db.execute("INSERT INTO t VALUES ('name')").is_err());
+        run(&mut db, "INSERT INTO t VALUES ('title')");
+    }
+
+    /// RENAME COLUMN 落到已存在的动态字段名:静默覆盖数据 → 响亮拒绝。
+    #[test]
+    fn rename_column_onto_existing_data_field_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, a INT)");
+        run(&mut db, "INSERT INTO t (id, a, extra) VALUES (1, 10, 99)");
+        let e = db
+            .execute("ALTER TABLE t RENAME COLUMN a TO extra")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("data field"), "{e}");
+        let r = rows(&mut db, "SELECT a, extra FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(10), Value::Int(99)]]);
+    }
+
+    /// DROP COLUMN 被视图按名列引用:拒绝(存储视图 SQL 不改写,缺列读 NULL
+    /// 对 WHERE 是静默错误行;dump 回放还「看起来成功」)。
+    #[test]
+    fn drop_column_referenced_by_view_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, c INT, d INT)");
+        run(&mut db, "CREATE VIEW v AS SELECT c, d FROM t WHERE c > 0");
+        let e = db
+            .execute("ALTER TABLE t DROP COLUMN c")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("VIEW"), "{e}");
+        // 同被视图引用的 d 同拒;视图未引用的列照常可删。
+        assert!(db.execute("ALTER TABLE t DROP COLUMN d").is_err());
+        run(&mut db, "ALTER TABLE t ADD COLUMN e INT");
+        run(&mut db, "ALTER TABLE t DROP COLUMN e");
+    }
+
+    /// CTE 名遮蔽同名对象:读取目标分类不再把 CTE 名当基表
+    /// (FROM v 读的是 CTE,不是名为 v 的表/视图)。
+    #[test]
+    fn read_targets_skip_cte_shadowed_names() {
+        let mut stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            "WITH v AS (SELECT x FROM secret) SELECT * FROM v",
+        )
+        .unwrap();
+        let targets = Database::stmt_read_targets(&stmts.swap_remove(0)).unwrap();
+        assert_eq!(targets, vec!["secret"]);
+        // 建视图撞名场景:WITH 体视图本身被响亮拒绝(既有边界),
+        // 不再以误导性的「自引用」为由。
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        let e = db
+            .execute("CREATE VIEW v AS WITH v AS (SELECT a FROM t) SELECT * FROM v")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("WITH queries must use the write path"), "{e}");
+    }
+
+    /// ROWNUM 在写语句自己的谓词里没有行流可编号:读 NULL 且 NULL<=n 恒真,
+    /// Oracle 风格 `WHERE ROWNUM <= 1` 曾静默全表改写/删除 → 响亮拒绝;
+    /// 子查询内的 ROWNUM 是子查询自己的行流,照常可用。
+    #[test]
+    fn rownum_in_write_predicates_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+        for sql in [
+            "UPDATE t SET v = 'x' WHERE ROWNUM <= 1",
+            "DELETE FROM t WHERE ROWNUM <= 1",
+            "UPDATE t SET v = ROWNUM",
+        ] {
+            let e = db.execute(sql).unwrap_err().to_string();
+            assert!(e.contains("ROWNUM"), "{sql}: {e}");
+        }
+        let n = rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0].as_i64();
+        assert_eq!(n, Some(3), "rejected statements must not touch rows");
+        // 子查询形态合法。
+        run(
+            &mut db,
+            "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE ROWNUM = 1)",
+        );
+        let n = rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0].as_i64();
+        assert_eq!(n, Some(2));
+    }
+
+    /// 兼容字典视图名(DUAL/sqlite_master/USER_TABLES…)在 CREATE TABLE/VIEW
+    /// 保留:FROM 解析永远让字典视图优先,建得出写进不去的数据必须拒绝。
+    #[test]
+    fn compat_dictionary_names_reserved_at_create() {
+        let mut db = Database::in_memory().unwrap();
+        for name in ["dual", "sqlite_master", "user_tables", "ALL_TAB_COLUMNS"] {
+            assert!(
+                db.execute(&format!("CREATE TABLE {name} (x INT)")).is_err(),
+                "CREATE TABLE {name} must be reserved"
+            );
+            assert!(
+                db.execute(&format!("CREATE VIEW {name} AS SELECT 1"))
+                    .is_err(),
+                "CREATE VIEW {name} must be reserved"
+            );
+        }
+        // 普通名不受影响。
+        run(&mut db, "CREATE TABLE user_notes (x INT)");
+    }
+
+    /// CAST/CONVERT 到 DATE:真转换 + UTC 零点截断(T-SQL 语义),不再是
+    /// 「原文原样返回」;非法文本响亮报错。
+    #[test]
+    fn cast_as_date_converts_and_truncates() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(&mut db, "SELECT TYPEOF(CAST('2026-09-28' AS DATE))");
+        assert_eq!(r.rows[0][0], Value::Str("timestamp".into()));
+        assert_eq!(
+            rows(&mut db, "SELECT CAST('2026-09-28 10:30' AS DATE)").rows[0][0].to_string(),
+            "2026-09-28T00:00:00.000Z"
+        );
+        assert!(db.execute("SELECT CAST('not a date' AS DATE)").is_err());
+        assert!(db.execute("SELECT TRY_CAST('nope' AS DATE)").is_ok());
+    }
+
+    /// BLOB → 数值目标:静默原样穿透曾让比较/算术永远错位 → 响亮报错。
+    #[test]
+    fn cast_numeric_from_blob_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        for sql in [
+            "SELECT CONVERT(INT, x'12345678')",
+            "SELECT CAST(x'01' AS FLOAT)",
+            "SELECT CAST(x'01' AS DECIMAL)",
+        ] {
+            assert!(db.execute(sql).is_err(), "{sql} must fail loudly");
+        }
     }
 }

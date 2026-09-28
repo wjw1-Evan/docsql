@@ -216,6 +216,8 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 
 **不支持**：`NATURAL JOIN`、`LATERAL`、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）——均显式报错（`STRING_SPLIT`/`GENERATE_SERIES`/`OPENJSON` 表函数与 `CROSS/OUTER APPLY` 已支持，见 [T-SQL 兼容面](#tsqlsql-server兼容面)）。
 
+兼容字典视图名(`DUAL`/`sqlite_master`/`sqlite_temporal_master`/`information_schema.*`/`USER_TABLES`/`ALL_TABLES`/`USER_TAB_COLUMNS`/`ALL_TAB_COLUMNS`/`USER_INDEXES`/`ALL_INDEXES`)是**保留名**:FROM 解析永远让字典视图优先,CREATE TABLE/VIEW 占用这些名字显式报错(建得出写进不去的影子数据必须拒绝)。
+
 ### SELECT 备注
 
 - **执行与优化**：`ORDER BY <索引键> + 常量 LIMIT/OFFSET` 走索引序窗口（首屏/深页只装载窗口内文档）；无索引但有界 LIMIT 走键提取 top-K；`SELECT COUNT(*) FROM t`（无 WHERE/GROUP BY/ORDER/LIMIT）走免解码活槽计数。查询计划为规则式，无 `EXPLAIN`。
@@ -227,7 +229,7 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
   外层引用必须写限定名(`别名.列`/`表名.列`)，支持 SELECT 的 `WHERE`/投影/`ORDER BY` 与
   UPDATE·DELETE 的 `WHERE`、UPDATE 的 `SET`；内层 FROM 的同名别名正确遮蔽外层；
   JOIN ON/GROUP BY/HAVING 内的相关引用与未限定外层引用仍显式报错，嵌套相关深度上限 8。
-- **ROWNUM**：Oracle 伪列，在行取出后、WHERE 与 ORDER BY 之前编号；被 WHERE 过滤的行消耗编号；`SELECT *` 不含该列。
+- **ROWNUM**:Oracle 伪列,在行取出后、WHERE 与 ORDER BY 之前编号;被 WHERE 过滤的行消耗编号;`SELECT *` 不含该列。写语句(UPDATE/DELETE/MERGE)自身谓词/赋值中的 ROWNUM 显式报错(无行流可编号,读 NULL 会静默全表命中);子查询内的 ROWNUM 属于子查询自己的行流,照常可用。
 - **GROUP BY 限制**：分组键不能是输出别名或序号（与 HAVING/ORDER BY 不同，显式报错）。
 
 ### SELECT 示例
@@ -326,7 +328,7 @@ REPLACE INTO table_name ...          -- = INSERT OR REPLACE
 
 | 参数 | 说明 |
 |---|---|
-| 列清单 | 省略时按表的声明列序取全部列；`INSERT ... SELECT` 未给列清单时取查询的输出列 |
+| 列清单 | 省略时按表的声明列序取全部列;`INSERT ... SELECT` 未给列清单时**按位置映射**到目标表的声明列(标准 SQL,列数须相等) |
 | `VALUES` | 常量表达式，多行用逗号分隔；`VALUES` 中的子查询会被先求值 |
 | `SELECT` | `INSERT INTO t (...) SELECT ...`；**auto-GUID 表不支持**（随机会在对端分叉） |
 | `OR REPLACE` / `REPLACE INTO` | 唯一键冲突时**先删除冲突行再插入** |
@@ -616,7 +618,7 @@ DROP VIEW [ IF EXISTS ] view_name [ , ...n ] [ CASCADE | RESTRICT ]
 | 参数 | 说明 |
 |---|---|
 | `OR REPLACE` | 同名视图已存在时整体替换定义；同名对象是表时显式报错 |
-| `AS SELECT` | 建视图时干跑校验：基表/列必须存在，自引用与传递闭包成环被拒；`SELECT` 展开预算 16 层 |
+| `AS SELECT` | 建视图时干跑校验:基表必须存在,自引用与传递闭包成环被拒;列引用按 schemaless 语义(未声明列读 NULL,与全引擎一致);`SELECT` 展开预算 16 层 |
 | 列清单 | 不支持（给投影加别名即可） |
 | `MATERIALIZED` / `SECURE` / `WITH NO SCHEMA BINDING` | 显式报错 |
 
@@ -743,6 +745,8 @@ REVOKE { SELECT | INSERT | UPDATE | DELETE | ALL } [ , ...n ]
 | 保留名 | `docsql_users`/`docsql_roles`/`docsql_role_members`/`docsql_grants` 不可直接读写 |
 
 存在任一用户后，匿名连接被拒绝（`DOCSQL_TOKEN` 旁路不受影响，可用于首次建号）。
+
+用户管理语句(`CREATE/ALTER/DROP USER`、`GRANT/REVOKE`、角色)不能在显式事务内执行(显式报错):授权以纪元即时生效,事务缓冲会让未提交的授权状态泄漏进逐帧权限刷新,且回滚不会回抬纪元。
 
 ### 示例
 

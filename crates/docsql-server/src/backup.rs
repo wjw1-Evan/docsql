@@ -1177,13 +1177,22 @@ async fn restore_inner(
     // position to anchor the replay window and fail loudly instead.
     let pitr_stmts = match target_ms {
         Some(target) => {
-            let head = parse_backup_header_text(&script)
-                .ok_or_else(|| {
-                    "restore to timestamp requires a v2 backup (journal-seq header);                      take a new full backup first"
-                        .to_string()
-                })?
-                .journal_seq;
-            collect_pitr_entries(&state.backup_dir, head, target)?
+            let head = parse_backup_header_text(&script).ok_or_else(|| {
+                "restore to timestamp requires a v2 backup (journal-seq header);                      take a new full backup first"
+                    .to_string()
+            })?;
+            // A target EARLIER than the base snapshot itself cannot be
+            // honored: the base already contains every write up to its own
+            // ts, and the replay would silently resurrect the post-target
+            // prefix (the mirror image of the "missing chain" refusal).
+            if head.ts_ms > 0 && (target < 0 || (head.ts_ms as i64) > target) {
+                return Err(format!(
+                    "restore target {} precedes the base backup's snapshot time {}; \
+                     take an earlier full backup",
+                    target, head.ts_ms
+                ));
+            }
+            collect_pitr_entries(&state.backup_dir, head.journal_seq, target)?
         }
         None => Vec::new(),
     };
