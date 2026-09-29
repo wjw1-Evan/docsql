@@ -294,12 +294,27 @@ async fn preauth_ping_budget() {
         payload_str(&f)
     );
     // The server closes the socket: a raw read hits EOF within seconds.
+    // The first read may legally return a PARTIAL frame prefix — the
+    // writer task can flush a byte or two of one last response before the
+    // close lands (observed as a 1-byte read under release timing) — so
+    // drain to EOF and assert no complete protocol frame ever arrives.
     c.send(&Frame::new(proto::REQ_PING, vec![])).await;
+    let mut all = Vec::new();
     let mut chunk = [0u8; 64];
-    let read = tokio::time::timeout(std::time::Duration::from_secs(5), c.stream.read(&mut chunk))
-        .await
-        .expect("server should close the connection");
-    assert_eq!(read.unwrap_or(1), 0, "expected EOF after ping-budget close");
+    loop {
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), c.stream.read(&mut chunk))
+                .await
+                .expect("server should close the connection");
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => all.extend_from_slice(&chunk[..n]),
+        }
+    }
+    assert!(
+        all.is_empty() || Frame::decode(&all).is_err(),
+        "expected EOF after ping-budget close, got protocol data: {all:?}"
+    );
 }
 
 /// Keyed transport: the inbound replay guard rejects a byte-identical
