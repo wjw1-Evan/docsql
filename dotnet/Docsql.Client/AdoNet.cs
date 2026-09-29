@@ -1287,14 +1287,34 @@ public sealed class DocsqlDataReader : DbDataReader
     public override int GetOrdinal(string name)
     {
         var idx = _columns.IndexOf(name);
+        if (idx < 0)
+        {
+            // ADO.NET 惯例:精确匹配失败后按大小写不敏感回退(EF 的
+            // 列名重排/别名场景依赖它,SqlClient 同款行为)。
+            for (int i = 0; i < _columns.Count; i++)
+            {
+                if (string.Equals(_columns[i], name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+        }
         return idx >= 0 ? idx : throw new IndexOutOfRangeException($"no column named '{name}'");
     }
 
-    public override long GetInt64(int ordinal) => Convert.ToInt64(CurrentRow[ordinal]);
-    public override int GetInt32(int ordinal) => Convert.ToInt32(CurrentRow[ordinal]);
-    public override double GetDouble(int ordinal) => Convert.ToDouble(CurrentRow[ordinal]);
-    public override string GetString(int ordinal) => Convert.ToString(CurrentRow[ordinal])!;
-    public override bool GetBoolean(int ordinal) => Convert.ToBoolean(CurrentRow[ordinal]);
+    // ADO.NET 契约:强类型 getter 遇 NULL 必须抛 InvalidCastException
+    // (静默 0/false/null 把漏判 IsDBNull 的调用方变成错数据)。
+    private T NonNull<T>(int ordinal, Func<object, T> convert) => CurrentRow[ordinal] is null
+        ? throw new InvalidCastException(
+            $"column {_columns[ordinal]} is NULL; check IsDBNull first")
+        : convert(CurrentRow[ordinal]);
+
+    public override long GetInt64(int ordinal) => NonNull(ordinal, Convert.ToInt64);
+    public override int GetInt32(int ordinal) => NonNull(ordinal, Convert.ToInt32);
+    public override double GetDouble(int ordinal) => NonNull(ordinal, Convert.ToDouble);
+    public override string GetString(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToString(v, CultureInfo.InvariantCulture)!);
+    public override bool GetBoolean(int ordinal) => NonNull(ordinal, Convert.ToBoolean);
 
     /// <summary>EF 提供程序按类型映射读取;泛型读取覆盖 DECIMAL/BLOB/DATE/TIME 文本。</summary>
     public override T GetFieldValue<T>(int ordinal)
@@ -1342,6 +1362,27 @@ public sealed class DocsqlDataReader : DbDataReader
         if (t == typeof(Guid))
         {
             return (T)(object)Guid.Parse(Convert.ToString(v, CultureInfo.InvariantCulture)!);
+        }
+        if (t == typeof(TimeSpan))
+        {
+            // EF 映射(IsoTimeSpanMapping)把参数写成 "c" 文本;wire 无标记
+            // → 读回字符串。没有这条分支,物化器落到 ChangeType 直接抛
+            // "写得进、读不出"。
+            return (T)(object)TimeSpan.Parse(
+                Convert.ToString(v, CultureInfo.InvariantCulture)!, CultureInfo.InvariantCulture);
+        }
+        if (t == typeof(DateTimeOffset))
+        {
+            // $ts 标记在解码层归一为 UTC DateTime:这里包回偏移为零的
+            // DateTimeOffset(EF 映射声明 DateTimeOffset 列,投影/过滤
+            // 一直正确,唯独实体物化缺这条分支)。
+            return (T)(object)(v switch
+            {
+                DateTime dt => new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc)),
+                string s => DateTimeOffset.Parse(s, CultureInfo.InvariantCulture),
+                _ => throw new InvalidCastException(
+                    $"column {_columns[ordinal]} is not a TIMESTAMP value"),
+            });
         }
         return (T)Convert.ChangeType(v, t, CultureInfo.InvariantCulture);
     }

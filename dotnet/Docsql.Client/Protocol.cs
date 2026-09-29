@@ -393,7 +393,19 @@ public sealed class ProtocolConnection : IDisposable
         int budget = readTimeoutMs >= 0 ? readTimeoutMs : ReadTimeoutMs;
         if (budget <= 0)
         {
-            return await ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // 外部令牌取消:服务端(每连接一问一答)仍会执行完这条语句
+                // 并送出应答帧 —— 该连接的帧流从此错位,必须弃用;否则同一
+                // 连接上的下一条命令会读到这条已取消语句的结果(静默错数据;
+                // 池路径靠 Rent 前 PING 验活兜底,直接复用连接对象时无兜底)。
+                BreakConnection();
+                throw;
+            }
         }
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(budget);
@@ -403,10 +415,22 @@ public sealed class ProtocolConnection : IDisposable
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            Broken = true;
-            try { _tcp.Dispose(); } catch { /* already gone */ }
+            BreakConnection();
             throw new TimeoutException($"statement read timed out after {budget} ms");
         }
+        catch (OperationCanceledException)
+        {
+            // 外部令牌取消,同上:帧流错位,弃用连接后原样上抛。
+            BreakConnection();
+            throw;
+        }
+    }
+
+    /// <summary>读阶段的取消/超时意味着帧流已错位:连接标记弃用并关 socket。</summary>
+    private void BreakConnection()
+    {
+        Broken = true;
+        try { _tcp.Dispose(); } catch { /* already gone */ }
     }
 
     private Frame SealFrame(Frame request)

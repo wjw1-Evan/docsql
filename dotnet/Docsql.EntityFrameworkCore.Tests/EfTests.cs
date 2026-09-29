@@ -505,7 +505,9 @@ public sealed class EfExtraTests : IClassFixture<EfServerFixture>
             c.ExecuteNonQuery();
         };
         run("DROP TABLE IF EXISTS Members");
-        run("CREATE TABLE Members (Id INT PRIMARY KEY, Email TEXT, Label TEXT)");
+        // AUTOINCREMENT:EF 对 int 键默认值生成(INSERT 后回读 Id),外部
+        // 存量表也几乎总带自增;省略它会让回读列落 NULL。
+        run("CREATE TABLE Members (Id INT PRIMARY KEY AUTOINCREMENT, Email TEXT, Label TEXT)");
         // 手工建的索引:不是 IX_ 前缀,同步不得回收
         run("CREATE INDEX manual_email ON Members (Email)");
 

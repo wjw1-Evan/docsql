@@ -5,6 +5,15 @@
 # automatic full-state bootstrap.
 # Any node accepts writes and fans them out to its DOCSQL_PEERS.
 set -u
+# This suite wipes and recreates the node-d data volume — it MUST run on the
+# throwaway test prefix. Run it via ./deploy/run-tests.sh (which exports
+# DOCSQL_DEV_DATA_PREFIX=docsql-dev-testdata); invoked directly, the default
+# expansion would point that destructive path at the real dev volume set.
+if [ -z "${DOCSQL_DEV_DATA_PREFIX:-}" ]; then
+  echo "ERROR: run this via ./deploy/run-tests.sh (needs the throwaway" >&2
+  echo "DOCSQL_DEV_DATA_PREFIX; a direct run would wipe docsql-dev-data-d)." >&2
+  exit 1
+fi
 # All traffic runs inside the compose network via the image's own CLI
 # (no host toolchain needed); host ports stay mapped for external access.
 A="node-a:7600"
@@ -397,9 +406,9 @@ wait_row "$B" "SELECT id FROM nodes WHERE id = 41;" "^[[:space:]]*41[[:space:]]*
 wait_row_c "SELECT id FROM nodes WHERE id = 41;" "^[[:space:]]*41[[:space:]]*$" \
   && ok "d's write reaches c" || bad "c missing d's write"
 
-# 12.5 收敛:d 与 a/b 行数一致(c 因第 9-10 章刻意的离线/分区分歧不在
-#      等值断言内,这正是无反熵追赶的既有特征)。d 的历史来自 a 的快照
-#      加加入后的全网写,故 a=b=d。
+# 12.5 收敛:d 与 a/b 行数一致。c 在第 9-10 章离线/分区期间的分歧已由
+#      9.5/10.5 的重连修复(反熵 repair)收敛,但等值断言刻意保持保守
+#      (a=b=d 已覆盖 join 语义;d 的历史来自 a 的快照加加入后的全网写)。
 ca=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 cb=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
 cd_=$(sqld "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")

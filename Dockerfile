@@ -30,6 +30,19 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+# Dependency warm-up layer: stub every workspace member's sources and build
+# the full dependency graph (test deps included when RUN_TESTS=true) BEFORE
+# any real source lands. Source edits then invalidate only the member
+# rebuild below, not the registry downloads / dependency compilation —
+# without this, every ./deploy/run-tests.sh build was a clean rebuild.
+RUN set -e; \
+  for c in core server cli web; do \
+    mkdir -p "crates/docsql-$c/src"; \
+    echo 'pub fn _docsql_build_stub() {}' > "crates/docsql-$c/src/lib.rs"; \
+  done; \
+  HOST=$(rustc -vV | sed -n 's/^host: //p'); \
+  if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace --release --target "$HOST"; fi && \
+  cargo build --release --target "$HOST" -p docsql-server -p docsql-cli -p docsql-web
 COPY crates ./crates
 # Test gate and build. The explicit --target is load-bearing even though it
 # equals the build host: only then does cargo scope the CARGO_TARGET_*_RUSTFLAGS

@@ -88,12 +88,12 @@ public sealed class DocsqlMethodCallTranslatorPlugin(
     public IEnumerable<IMethodCallTranslator> Translators { get; } =
         new IMethodCallTranslator[]
         {
-            new DocsqlStringMethodTranslator(),
+            new DocsqlStringMethodTranslator(sqlExpressionFactory),
             new DocsqlTsqlMethodTranslator(sqlExpressionFactory, typeMappingSource),
         };
 }
 
-public sealed class DocsqlStringMethodTranslator : IMethodCallTranslator
+public sealed class DocsqlStringMethodTranslator(ISqlExpressionFactory sql) : IMethodCallTranslator
 {
     public SqlExpression? Translate(
         SqlExpression? instance,
@@ -144,13 +144,18 @@ public sealed class DocsqlStringMethodTranslator : IMethodCallTranslator
             or SqlBinaryExpression
             or SqlFunctionExpression)
         {
+            // 参数/子表达式必须先应用类型映射再进 SQL 树:EF 在翻译结束
+            // 后校验每个节点的 TypeMapping,裸塞 SqlParameterExpression 会
+            // 抛 "does not have a type mapping assigned"(常量路径的字面量
+            // 构造时带了 mapping,变量路径此前漏了 —— 前缀搜索整类查询失效)。
+            var mappedPattern = sql.ApplyTypeMapping(arguments[0], mapping);
             var pieces = new List<SqlExpression>(3);
             if (prefix.Length > 0)
             {
                 pieces.Add(new SqlConstantExpression(
                     System.Linq.Expressions.Expression.Constant(prefix), mapping));
             }
-            pieces.Add(arguments[0]);
+            pieces.Add(mappedPattern);
             if (suffix.Length > 0)
             {
                 pieces.Add(new SqlConstantExpression(

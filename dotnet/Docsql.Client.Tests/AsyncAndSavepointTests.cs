@@ -264,4 +264,43 @@ public sealed class PoolCapacityTests : IClassFixture<ServerFixture>
         a.Close();
         Assert.Equal(1L, await borrower);
     }
+
+    [Fact]
+    public async Task Cancelled_command_breaks_connection_not_serves_stale_reply()
+    {
+        // 外部令牌在读取阶段取消:服务端(每连接一问一答)仍会执行完这条
+        // 语句并送出应答帧。若连接不标记弃用,同一连接对象上的下一条命令
+        // 会读到这条已取消语句的结果 —— 静默错数据。修复后:取消即毒化,
+        // 后续命令响亮失败。
+        using var conn = new DocsqlConnection(Cs("pooling=false"));
+        await conn.OpenAsync();
+        using var slow = (DocsqlCommand)conn.CreateCommand();
+        // ~1.9s(debug server 实测):CROSS APPLY 逐左行物化 100 万行,
+        // 150ms 取消预算留足余量(时序断言按 4 倍以上余量取值)。
+        slow.CommandText =
+            "SELECT COUNT(*) FROM GENERATE_SERIES(1, 1000) AS a CROSS APPLY GENERATE_SERIES(1, 1000) AS b";
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => slow.ExecuteScalarAsync(cts.Token));
+
+        Exception? followUp = null;
+        try
+        {
+            using var next = (DocsqlCommand)conn.CreateCommand();
+            next.CommandText = "SELECT 12345";
+            next.ExecuteScalar();
+        }
+        catch (Exception e)
+        {
+            followUp = e;
+        }
+        // 绝不允许"成功返回":要么抛错(帧流已弃用),要么 —— 理论上不该
+        // 发生 —— 返回的也绝不能是被取消语句的大数聚合值。
+        Assert.True(
+            followUp is not null,
+            "connection survived an in-flight cancellation; the next command must fail loudly");
+        Assert.Equal(ConnectionState.Open, conn.State);
+        // Close 对 Broken 连接物理丢弃,不归还池(池外连接也无泄漏)。
+        conn.Close();
+    }
 }

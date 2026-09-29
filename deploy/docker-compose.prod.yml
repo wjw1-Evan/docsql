@@ -72,9 +72,15 @@ services:
       # DOCSQL_TOKEN fallback; EOF exits 0): the runtime image is distroless
       # and has no shell, so CMD-SHELL would silently fail.
       test: ["CMD", "docsql-cli", "connect", "node-a:7600"]
+      # The listener binds only AFTER WAL recovery + startup sync finish: a
+      # big-WAL node is legitimately unreachable for a while, and with
+      # `restart: unless-stopped` an early unhealthy verdict also churns
+      # restarts mid-recovery. start_period keeps that grace out of the
+      # retry budget.
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
@@ -88,6 +94,12 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      # Least-privilege client credential + connection caps from .env
+      # (previously documented but never wired — silently ignored). Empty
+      # keeps the server defaults, same as unset.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -103,7 +115,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-b:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
@@ -117,6 +130,12 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      # Least-privilege client credential + connection caps from .env
+      # (previously documented but never wired — silently ignored). Empty
+      # keeps the server defaults, same as unset.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -132,7 +151,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-c:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
@@ -157,6 +177,12 @@ services:
       DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      # Least-privilege client credential + connection caps from .env
+      # (previously documented but never wired — silently ignored). Empty
+      # keeps the server defaults, same as unset.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -172,7 +198,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-d:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
@@ -219,6 +246,11 @@ services:
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
+      # Least-privilege client credential + connection caps, same wiring as
+      # the cluster nodes above.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       # Automatic backups: same semantics as the cluster nodes above.
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
@@ -232,7 +264,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-single:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

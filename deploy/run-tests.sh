@@ -14,6 +14,18 @@ set -eu
 cd "$(dirname "$0")"
 DEPLOY_DIR="$PWD"
 
+# Snapshot the caller's own env BEFORE the test overrides below replace it:
+# the restored stack must come back with the user's image tag / data prefix /
+# token / auth file, not the deployment defaults. DOCSQL_WEB_AUTH_FILE needs
+# a set/unset marker (compose uses `${VAR-}` there: empty string MEANS "gate
+# disabled", unlike the others where empty equals unset).
+USER_DEV_IMAGE_TAG="${DOCSQL_DEV_IMAGE_TAG:-}"
+USER_DATA_PREFIX="${DOCSQL_DEV_DATA_PREFIX:-}"
+USER_DEV_TOKEN="${DOCSQL_DEV_TOKEN:-}"
+USER_BACKUP_INTERVAL="${DOCSQL_BACKUP_INTERVAL_SECS:-}"
+USER_WEB_AUTH_FILE="${DOCSQL_WEB_AUTH_FILE:-}"
+HAD_WEB_AUTH_FILE="${DOCSQL_WEB_AUTH_FILE+set}"
+
 # Test-stack overrides (never the user's config): raw unauthenticated curls
 # need the console account gate off, and the client token stays empty for
 # deterministic open-mode assertions. Export (not inline) — the join test in
@@ -55,10 +67,20 @@ restore_user_stack() {
   done
   if [ -n "$UP_PROFILES" ]; then
     echo "== restore the previous dev stack ($UP_PROFILES) =="
-    # Fall back to the deployment's own configuration (.env / defaults) —
-    # the test overrides above must not leak into the restored stack.
-    unset DOCSQL_DEV_DATA_PREFIX DOCSQL_WEB_AUTH_FILE DOCSQL_DEV_TOKEN \
-      DOCSQL_BACKUP_INTERVAL_SECS DOCSQL_DEV_IMAGE_TAG
+    # Replay the caller's own environment (captured at entry): a stack started
+    # with DOCSQL_DEV_IMAGE_TAG=ci / a custom data prefix / an auth file must
+    # come back exactly as it was, not silently retagged to :local defaults.
+    # Empty values equal "unset" for these compose keys (all use ${VAR:-});
+    # only DOCSQL_WEB_AUTH_FILE distinguishes the two (${VAR-} semantics).
+    export DOCSQL_DEV_IMAGE_TAG="$USER_DEV_IMAGE_TAG"
+    export DOCSQL_DEV_DATA_PREFIX="$USER_DATA_PREFIX"
+    export DOCSQL_DEV_TOKEN="$USER_DEV_TOKEN"
+    export DOCSQL_BACKUP_INTERVAL_SECS="$USER_BACKUP_INTERVAL"
+    if [ "$HAD_WEB_AUTH_FILE" = set ]; then
+      export DOCSQL_WEB_AUTH_FILE="$USER_WEB_AUTH_FILE"
+    else
+      unset DOCSQL_WEB_AUTH_FILE
+    fi
     docker compose $UP_PROFILES up -d >/dev/null 2>&1 \
       || echo "warning: could not restore the dev stack — run 'cd deploy && docker compose $UP_PROFILES up -d'" >&2
   fi

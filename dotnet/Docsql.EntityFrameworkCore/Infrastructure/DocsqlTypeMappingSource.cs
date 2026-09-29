@@ -56,6 +56,11 @@ public sealed class DocsqlTypeMappingSource(
         protected override string GenerateNonNullSqlLiteral(object value) =>
             "CAST('" + ((DateTimeOffset)value).ToString("O", CultureInfo.InvariantCulture)
             + "' AS TIMESTAMP)";
+
+        // 物化走 GetFieldValue<DateTimeOffset>($ts 解码为 UTC DateTime,
+        // 包装回偏移为零);GetValue + Convert 对 DateTime→DateTimeOffset 抛。
+        public override MethodInfo GetDataReaderMethod() =>
+            GetFieldValueMethod(typeof(DateTimeOffset));
     }
 
     private sealed class IsoTimeSpanMapping : TimeSpanTypeMapping
@@ -64,6 +69,11 @@ public sealed class DocsqlTypeMappingSource(
 
         protected override string GenerateNonNullSqlLiteral(object value) =>
             $"'{((System.TimeSpan)value).ToString("c", CultureInfo.InvariantCulture)}'";
+
+        // 物化走 GetFieldValue<TimeSpan>(wire 是 "c" 文本);默认的
+        // ChangeType(string→TimeSpan) 不支持,同样"写得进读不出"。
+        public override MethodInfo GetDataReaderMethod() =>
+            GetFieldValueMethod(typeof(System.TimeSpan));
     }
 
     /// <summary>DECIMAL:精度/小数位随模型 HasPrecision 进入列类型与 CAST 字面量。</summary>

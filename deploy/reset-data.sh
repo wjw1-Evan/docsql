@@ -21,4 +21,10 @@ for v in docsql-data-a docsql-data-b docsql-data-c docsql-data-d docsql-data-web
          docsql-prod_web-auth docsql-prod_web-auth-single; do
   docker volume rm -f "$v" >/dev/null 2>&1 || true
 done
+# Custom DOCSQL_DEV_DATA_PREFIX volumes (any prefix, e.g. run-tests.sh's own
+# or a user-chosen one) are not in the list above — sweep the two built-in
+# dev families by prefix. Anchored patterns keep other projects' volumes
+# (and prod's docsql-data-*) untouched.
+docker volume ls -q 2>/dev/null | grep -E '^docsql-dev-data-|^docsql-dev-testdata-' \
+  | while read -r v; do docker volume rm -f "$v" >/dev/null 2>&1 || true; done
 echo "DocSQL data volumes removed (stack stopped)"

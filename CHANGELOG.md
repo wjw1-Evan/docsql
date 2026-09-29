@@ -5,6 +5,67 @@
 
 ## [Unreleased]
 
+### 缺陷审查轮 15:deploy 部署面 + .NET EF 提供程序/客户端剩余面(2026-09-29)
+
+#### 修复(.NET 客户端/EF 提供程序)
+
+- **外部取消后连接未弃用,下一条命令读到被取消语句的应答(静默错数据)**:
+  `SendAsync` 读阶段只把「预算超时」标记连接弃用,外部 `CancellationToken` 取消原样上抛
+  且不毒化——服务端(每连接一问一答)仍会执行完被取消的语句并送出应答帧,同一连接对象上
+  的下一条命令读到的是**旧语句的结果**(实测:取消大聚合后 `SELECT 12345` 返回被取消查询
+  的和;池路径靠租借前 PING 验活侥幸兜底,直接复用连接对象时无兜底)。读阶段的任何取消
+  现在都标记弃用并关 socket(发送前取消保持无害不毒化)。
+- **EF 变量(参数化)StartsWith/EndsWith/Contains 翻译直接抛异常**:变量分支裸构造
+  SQL 树、未对参数应用类型映射,EF 校验阶段抛 "does not have a type mapping assigned"
+  —— 前缀/子串搜索整类查询失效(常量路径正常,LIKE 转义测试只钉了常量)。经
+  `ISqlExpressionFactory.ApplyTypeMapping` 应用映射后正常生成 `LIKE CONCAT('%', @p, '%')`。
+- **TimeSpan/DateTimeOffset 属性「写得进、读不出」**:EF 映射声明支持这两类(参数分别写
+  "c" 文本 / `$ts` UTC 毫秒),但 `GetFieldValue<T>` 无对应分支,物化落到
+  `Convert.ChangeType`(string→TimeSpan、DateTime→DateTimeOffset 均不支持)抛
+  InvalidCastException——模型一经采用即困死。补读取分支与 `GetDataReaderMethod` 覆写;
+  `$ts` 只存 UTC 毫秒,DateTimeOffset 往返时刻精确(偏移口径随物化层,文档明示)。
+- **ADO 强类型 getter 对 NULL 静默返回 0/false/null**(违反 ADO.NET 契约,漏判 `IsDBNull`
+  的调用方拿到错数据):`GetInt32/GetInt64/GetDouble/GetBoolean/GetString` 现在对 NULL
+  抛 InvalidCastException;`GetOrdinal` 补大小写不敏感回退(ADO.NET 惯例)。
+- 附带:手工建表无 AUTOINCREMENT 时 EF int 键回读 NULL 的既有测试前置按真实形态修正
+  (外部存量表主键几乎总带自增)。
+
+#### 修复(deploy 部署面)
+
+- **`.env.example` 三个变量从未进容器(静默无效配置)**:`DOCSQL_READ_TOKEN`(文档中的
+  最小权限凭据!)、`DOCSQL_MAX_CONN`、`DOCSQL_IDLE_TIMEOUT` 在两个 compose 的全部
+  `environment:` 块中均无引用——按示例配置只读令牌的用户实际拿到的是开放节点,只读客户端
+  验证失败;上限被静默忽略。两份 compose 的全部数据节点现在透传(空串与未设等价,server
+  默认值不变),`.env.example` 注释同步。
+- **healthcheck 无 `start_period`:大 WAL 节点恢复期被误判 unhealthy,`service_healthy`
+  依赖让整个集群 `up` 失败**:监听在 WAL 恢复+启动同步**之后**才绑定,5s×10 次的重试预算
+  约 50s——历史上真实出现过 9.5GB WAL(恢复远超 50s),此时 node-b/c/web 的
+  `depends_on: service_healthy` 会中止整个启动;prod 的 `restart: unless-stopped` 还会在
+  恢复中途反复重启容器。加 `start_period: 30s` + `retries: 60`(容忍约 5.5 分钟的正常
+  慢恢复)。
+- **Dockerfile 无依赖预热层**:每次源码修改都使 `COPY crates` 之后的所有层失效,依赖树
+  全量重下重编(本机网络断流环境下既慢又脆)。新增 stub 源预热层(RUN_TESTS=true 时含
+  测试依赖),源码修改只重建工作区成员。
+- **run-tests.sh 栈恢复丢失用户自己的环境**:恢复用户栈时一律 unset 覆盖变量——用
+  `DOCSQL_DEV_IMAGE_TAG=ci`/自定义数据前缀/账号门文件起的栈,恢复后静默变成 `:local`
+  默认形态(或直接 up 失败留下一片停摆)。改为入口快照、恢复时重放
+  (`DOCSQL_WEB_AUTH_FILE` 区分未设/空串:compose 对它用 `${VAR-}` 语义,空串=禁用账号门)。
+- **multinode-test.sh 直接调用会重建真实 dev 数据卷**:节点 D 卷删除/重建以
+  `DOCSQL_DEV_DATA_PREFIX` 默认展开,不经 run-tests.sh 直接运行即指向 `docsql-dev-data-d`
+  (真实数据)——未设置该前缀时现在拒绝运行并指回 run-tests.sh;12.5 的过时注释
+  (「c 无反熵追赶」已与 9.5/10.5 的修复章节矛盾)一并修正。
+- **reset-data.sh 漏自定义前缀的 dev 卷**:`DOCSQL_DEV_DATA_PREFIX` 自定义前缀创建的卷
+  在「删除全部 DocSQL 数据」后依然存活;按锚定前缀(`^docsql-dev-data-`/
+  `^docsql-dev-testdata-`)清扫补齐,不触及其它项目与 prod 的 `docsql-data-*`。
+
+#### 测试
+
+- .NET 新增回归 6 项:取消后同连接复用必须响亮失败(Client)、GetFieldValue 的
+  TimeSpan/DateTimeOffset 往返(Client+EF)、变量 StartsWith/Contains/EndsWith 翻译(EF)、
+  强类型 getter NULL 抛契约异常、GetOrdinal 大小写回退;dotnet 174(Client 102 + EF 60 +
+  Aspire 12)全绿。部署面经 compose 渲染校验 + 两个 compose 全键计数核对;部署测试
+  (`./deploy/run-tests.sh`,含镜像内 cargo 门禁 + single 34 + cluster 81)在本轮提交后实跑。
+
 ### 缺陷审查轮 14:Web 模块(REST API / 账号门 / 控制台前端)(2026-09-29)
 
 #### 修复(安全/可用性)

@@ -53,6 +53,13 @@ services:
       # is public on purpose (nothing secret on a loopback dev cluster);
       # production sets its own via docker-compose.prod.yml/.env.
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      # Least-privilege client credential + connection caps, passed through
+      # from .env (previously documented in .env.example but never wired —
+      # silently ignored). Empty string keeps the server defaults (open
+      # access / 1024 conns / no idle timeout), matching an unset value.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       # Automatic backups (logical SQL dumps under /data/backups, inside
       # the node's data volume). Empty = server default (daily, keep 7);
       # 0 disables. run-tests.sh overrides the interval for its assertions.
@@ -68,9 +75,15 @@ services:
       # DOCSQL_TOKEN fallback; EOF exits 0): the runtime image is distroless
       # and has no shell, so CMD-SHELL would silently fail.
       test: ["CMD", "docsql-cli", "connect", "node-a:7600"]
+      # The listener binds only AFTER WAL recovery + startup sync finish, so
+      # a big-WAL node is legitimately unreachable for a while: start_period
+      # keeps that grace out of the retry budget (nodes depending on this
+      # one via service_healthy would otherwise abort a slow-but-healthy
+      # cluster start).
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
 
   node-b:
     profiles: ["cluster"]
@@ -81,6 +94,10 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-c:7600"
       DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      # See node-a: empty values keep the server defaults.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -95,7 +112,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-b:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
 
   node-c:
     profiles: ["cluster"]
@@ -106,6 +124,10 @@ services:
       DOCSQL_PEERS: "node-a:7600,node-b:7600"
       DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      # See node-a: empty values keep the server defaults.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -120,7 +142,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-c:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
 
   # ---- profile: join ----------------------------------------------------
   # A fourth data node brought up against a running cluster: being fresh
@@ -141,6 +164,10 @@ services:
       DOCSQL_ADVERTISE: "${DOCSQL_ADVERTISE:-node-d:7600}"
       DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "dev-cluster-secret"
+      # See node-a: empty values keep the server defaults.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -155,7 +182,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-d:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
 
   # Web console (management tool; REST + UI on :7700). It stores nothing:
   # the first argument is the default managed node — every data operation
@@ -201,6 +229,10 @@ services:
     environment:
       # Automatic backups: same semantics as the cluster nodes above.
       DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
+      # See node-a: empty values keep the server defaults.
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
     ports:
@@ -212,7 +244,8 @@ services:
       test: ["CMD", "docsql-cli", "connect", "node-single:7600"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
+      start_period: 30s
 
   # Web console for the single node: manages node-single over the wire
   # protocol, so the UI and native-protocol clients on :17600 see the same

@@ -239,4 +239,67 @@ public sealed class AdoNetTests : IClassFixture<ServerFixture>
         Assert.Equal(System.DBNull.Value, reader.GetValue(1));
         Assert.False(reader.NextResult()); // single result set
     }
+
+    [Fact]
+    public void GetFieldValue_roundtrips_timespan_and_datetimeoffset()
+    {
+        // EF 映射把 TimeSpan 参数写成 "c" 文本、DateTimeOffset 走 $ts(UTC 毫秒);
+        // 此前 GetFieldValue 缺这两个分支,落到 Convert.ChangeType 直接抛
+        // "写得进、读不出"(string→TimeSpan / DateTime→DateTimeOffset 不支持)。
+        using var conn = Open();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        var ts = new TimeSpan(1, 2, 3, 4, 567);
+        var dto = new DateTimeOffset(2026, 9, 29, 8, 30, 5, TimeSpan.FromHours(8));
+        cmd.CommandText = "SELECT @ts, @dto";
+        cmd.Parameters.AddWithValue("ts", ts);
+        cmd.Parameters.AddWithValue("dto", dto);
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal(ts, reader.GetFieldValue<TimeSpan>(0));
+        // $ts 归一化 UTC:读回偏移为零,比较 UtcDateTime(毫秒精度)。
+        var back = reader.GetFieldValue<DateTimeOffset>(1);
+        Assert.Equal(dto.UtcDateTime, back.UtcDateTime);
+        Assert.Equal(TimeSpan.Zero, back.Offset);
+    }
+
+    [Fact]
+    public void Typed_getters_throw_on_null_instead_of_silent_defaults()
+    {
+        // ADO.NET 契约:强类型 getter 对 NULL 抛 InvalidCastException;
+        // 静默 0/false/null 会把漏判 IsDBNull 的调用方变成错数据。
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE IF NOT EXISTS null_t (n INT, s TEXT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "DELETE FROM null_t";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO null_t VALUES (NULL, NULL)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "SELECT n, s FROM null_t";
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Throws<InvalidCastException>(() => reader.GetInt64(0));
+        Assert.Throws<InvalidCastException>(() => reader.GetInt32(0));
+        Assert.Throws<InvalidCastException>(() => reader.GetDouble(0));
+        Assert.Throws<InvalidCastException>(() => reader.GetBoolean(0));
+        Assert.Throws<InvalidCastException>(() => reader.GetString(1));
+        // GetValue/IsDBNull 契约不变:NULL 仍是 DBNull,预检路径可用。
+        Assert.True(reader.IsDBNull(0));
+        Assert.Equal(System.DBNull.Value, reader.GetValue(0));
+    }
+
+    [Fact]
+    public void GetOrdinal_falls_back_to_case_insensitive_match()
+    {
+        // ADO.NET 惯例:精确匹配失败后大小写不敏感回退。
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 AS MixedCase";
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal(0, reader.GetOrdinal("MixedCase"));
+        Assert.Equal(0, reader.GetOrdinal("mixedcase"));
+        Assert.Equal(0, reader.GetOrdinal("MIXEDCASE"));
+        Assert.Throws<IndexOutOfRangeException>(() => reader.GetOrdinal("nope"));
+    }
 }
