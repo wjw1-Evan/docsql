@@ -35,6 +35,12 @@ COPY Cargo.toml Cargo.lock ./
 # any real source lands. Source edits then invalidate only the member
 # rebuild below, not the registry downloads / dependency compilation —
 # without this, every ./deploy/run-tests.sh build was a clean rebuild.
+# Member manifests must be real (the workspace cannot load stub members
+# without them); only src/ is stubbed.
+COPY crates/docsql-core/Cargo.toml crates/docsql-core/Cargo.toml
+COPY crates/docsql-server/Cargo.toml crates/docsql-server/Cargo.toml
+COPY crates/docsql-cli/Cargo.toml crates/docsql-cli/Cargo.toml
+COPY crates/docsql-web/Cargo.toml crates/docsql-web/Cargo.toml
 RUN set -e; \
   for c in core server cli web; do \
     mkdir -p "crates/docsql-$c/src"; \
