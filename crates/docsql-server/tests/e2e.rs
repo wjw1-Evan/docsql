@@ -7798,13 +7798,23 @@ async fn quorum_fence_blocks_writes_and_heals() {
     const TOK: &str = "quorum-cluster-tok-1";
     let (_dir, addr) = start_server_quorum(vec![a1.clone(), a2.clone()], TOK, 100, 3).await;
     let mut c = Client::connect(&addr).await;
-    // Startup debounce: misses < K, the node still accepts writes.
-    c.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
-    // Wait past the debounce window (3 × 100ms + margin).
-    tokio::time::sleep(Duration::from_millis(700)).await;
 
-    // Fenced: client write refused loudly; reads keep working; the status
-    // payload says so.
+    // Fenced after the debounce window: POLL for the transition (fixed
+    // sleeps race under CI timer stretch).
+    for _ in 0..500 {
+        let v = quorum_status(&addr, TOK).await;
+        if v["quorum"]["fenced"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let v = quorum_status(&addr, TOK).await;
+    assert_eq!(v["quorum"]["enabled"], true, "{}", v);
+    assert_eq!(v["quorum"]["members"], 3, "{}", v);
+    assert_eq!(v["quorum"]["visible"], 1, "{}", v);
+    assert_eq!(v["quorum"]["fenced"], true, "{}", v);
+
+    // Fenced: client write refused loudly; reads keep working.
     let r = c.sql("INSERT INTO q VALUES (1)").await;
     assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
     assert!(
@@ -7812,21 +7822,16 @@ async fn quorum_fence_blocks_writes_and_heals() {
         "{}",
         payload_str(&r)
     );
-    let v = quorum_status(&addr, TOK).await;
-    assert_eq!(v["quorum"]["enabled"], true, "{}", v);
-    assert_eq!(v["quorum"]["members"], 3, "{}", v);
-    assert_eq!(v["quorum"]["visible"], 1, "{}", v);
-    assert_eq!(v["quorum"]["fenced"], true, "{}", v);
     let r = c.sql("SELECT 1").await;
     assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
 
     // Heal: voting members come back (arbiters on the reserved addresses
-    // answer the very same probe), the fence lifts on the next cycle.
+    // answer the very same probe). The fence lifts on the FIRST majority
+    // cycle (2/3 suffices by design); poll for FULL healing before
+    // asserting the member count.
     start_arbiter(&a1, TOK).await;
     start_arbiter(&a2, TOK).await;
-    // The fence lifts on the FIRST majority cycle (2/3 suffices by
-    // design); poll for FULL healing before asserting the member count.
-    for _ in 0..100 {
+    for _ in 0..500 {
         let v = quorum_status(&addr, TOK).await;
         if v["quorum"]["visible"] == 3 {
             break;
@@ -7836,6 +7841,8 @@ async fn quorum_fence_blocks_writes_and_heals() {
     let v = quorum_status(&addr, TOK).await;
     assert_eq!(v["quorum"]["fenced"], false, "{}", v);
     assert_eq!(v["quorum"]["visible"], 3, "{}", v);
+    let r = c.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
     let r = c.sql("INSERT INTO q VALUES (1)").await;
     assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
 }
@@ -7848,16 +7855,26 @@ async fn quorum_debounce_survives_short_outages() {
     let a1 = l1.local_addr().unwrap().to_string();
     drop(l1);
     const TOK: &str = "quorum-cluster-tok-2";
-    // Fence point ≈ K × probe = 10 × 100ms = 1s after the probe loop
-    // starts; the write below lands well inside the window.
-    let (_dir, addr) = start_server_quorum(vec![a1, "127.0.0.1:1".to_string()], TOK, 100, 10).await;
+    // Fence point ≈ K × probe = 20 × 100ms = 2s after the probe loop
+    // starts: writes land well inside the window, and the K-cycle
+    // debounce is what a rolling restart relies on.
+    let (_dir, addr) = start_server_quorum(vec![a1, "127.0.0.1:1".to_string()], TOK, 100, 20).await;
     let mut c = Client::connect(&addr).await;
-    let r = c.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
-    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    // Not fenced right after start despite both members being dead from
+    // before boot: the misses have not reached K yet.
     let v = quorum_status(&addr, TOK).await;
     assert_eq!(v["quorum"]["fenced"], false, "{}", v);
-    // Past the window: 3 members, only self visible → fenced.
-    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    let r = c.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+
+    // Past the window: 3 members, only self visible → fenced, writes off.
+    for _ in 0..500 {
+        let v = quorum_status(&addr, TOK).await;
+        if v["quorum"]["fenced"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let v = quorum_status(&addr, TOK).await;
     assert_eq!(v["quorum"]["fenced"], true, "{}", v);
     let r = c.sql("INSERT INTO q VALUES (1)").await;
