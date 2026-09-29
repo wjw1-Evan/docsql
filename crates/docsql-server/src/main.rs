@@ -106,6 +106,26 @@
 //!     DOCSQL_BACKUP_S3_CA=<path>      CA bundle (PEM) verifying the
 //!                                     https storage endpoint; unset =
 //!                                     encrypt-only (logged at startup)
+//!     DOCSQL_QUORUM=1                 majority-visibility write fence
+//!                                     (design 004 §2): the node probes
+//!                                     its voting members and refuses
+//!                                     CLIENT writes while a majority is
+//!                                     invisible (reads/replication
+//!                                     unaffected). Off = the historical
+//!                                     any-node-writes semantics
+//!     DOCSQL_QUORUM_PROBE_MS=<n>      probe cycle (default 1000)
+//!     DOCSQL_QUORUM_K=<n>             misses before a member counts as
+//!                                     lost (default 3; the fence needs
+//!                                     roughly K probe cycles to trip)
+//!     DOCSQL_QUORUM_MEMBERS=<list>    voting-member override (comma
+//!                                     separated); empty = DOCSQL_PEERS
+//!     DOCSQL_QUORUM_ARBITERS=<list>   extra zero-data voting members
+//!     DOCSQL_ARBITER=1                arbiter mode: no data plane at
+//!                                     all — the process answers status
+//!                                     probes only (requires
+//!                                     DOCSQL_CLUSTER_TOKEN), giving a
+//!                                     2-node cluster a third failure
+//!                                     domain to vote with
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -256,6 +276,38 @@ fn config_from_env(
     // required values — a half-configured target must refuse to boot, not
     // silently keep backups local-only.
     let backup_s3 = docsql_server::s3::s3_config_from_env(&getenv)?;
+    // Majority-visibility write fence (design 004). Off = inert module.
+    let quorum = env_bool("DOCSQL_QUORUM", &getenv)?;
+    let quorum_probe_ms = env_num("DOCSQL_QUORUM_PROBE_MS", 1_000u64, &getenv)?;
+    if !(10..=600_000).contains(&quorum_probe_ms) {
+        return Err(format!(
+            "DOCSQL_QUORUM_PROBE_MS must be 10..=600000, got {quorum_probe_ms}"
+        ));
+    }
+    let quorum_k = env_num("DOCSQL_QUORUM_K", 3usize, &getenv)?;
+    if quorum_k == 0 || quorum_k > 1_000 {
+        return Err(format!("DOCSQL_QUORUM_K must be 1..=1000, got {quorum_k}"));
+    }
+    let split_members = |name: &str| -> Result<Vec<String>, String> {
+        match getenv(name) {
+            Some(v) => Ok(v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()),
+            None => Ok(Vec::new()),
+        }
+    };
+    let quorum_members = split_members("DOCSQL_QUORUM_MEMBERS")?;
+    let quorum_arbiters = split_members("DOCSQL_QUORUM_ARBITERS")?;
+    let arbiter = env_bool("DOCSQL_ARBITER", &getenv)?;
+    if arbiter && quorum {
+        return Err(
+            "DOCSQL_ARBITER and DOCSQL_QUORUM are mutually exclusive: an arbiter              votes but never fences"
+                .to_string(),
+        );
+    }
     let transport_key = match getenv("DOCSQL_KEY") {
         Some(k) if !k.trim().is_empty() => {
             let key =
@@ -292,6 +344,12 @@ fn config_from_env(
         backup_keep,
         backup_dir,
         backup_s3,
+        quorum,
+        quorum_probe_ms,
+        quorum_k,
+        quorum_members,
+        quorum_arbiters,
+        arbiter,
         statement_timeout_ms,
         tls_cert,
         tls_key,

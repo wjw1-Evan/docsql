@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+### 自动故障转移阶段 1:多数派写栅栏 + 仲裁者模式(2026-09-29)
+
+设计 004 §7 阶段 1 落地(默认关闭,`DOCSQL_QUORUM=1` 启用):
+
+- **探测循环**(`server/quorum.rs`):每周期并发探测全部仲裁成员(REQ_STATUS,
+  与 repair 探测同构);成员连续 K 个周期(`DOCSQL_QUORUM_K`,默认 3)失联才
+  记为丢失(1s×3 默认窗口,滚动重启不误伤);全程本地单调时钟,无跨节点时钟依赖。
+- **写门**:失多数派(可见×2 ≤ 成员数)的节点自动栅栏客户端写——SQL 写、
+  PUBLISH、TRIM、PROMOTE、backup trigger/restore 响亮报错
+  `quorum lost: {visible}/{members} members visible; writes fenced` 并计入
+  `docsql_writes_fenced_total`;**读、订阅、复制 apply 照常**;愈合在首个多数派
+  周期自动解除;进入/解除写同步日志。
+- **语义收益**:分区期间少数派零分叉写——快照采纳(覆盖语义)从"分区的常见
+  结局"退化为重启反熵的兜底,RPO=0;修复机制本身不变。
+- **仲裁者模式**(`DOCSQL_ARBITER=1`):零存储投票成员——内存库 + 连接循环
+  arbiter 门(除 AUTH/PING/STATUS 外全部拒绝),数据节点用与探测数据节点相同
+  的字节探测它;给 2 节点集群第三个独立故障域。
+- **可观测性**:REQ_STATUS 增 `quorum` {enabled/members/visible/fenced} 与
+  `arbiter` 字段;Prometheus `docsql_quorum_visible`/`docsql_writes_fenced_total`/
+  `docsql_quorum_probe_failures_total`。
+- **配置**:`DOCSQL_QUORUM_PROBE_MS`(10..=600000)/`DOCSQL_QUORUM_K`(1..=1000)
+  非法值拒绝启动;`DOCSQL_QUORUM_MEMBERS` 覆盖成员表(扇出仍以 PEERS 为准)、
+  `DOCSQL_QUORUM_ARBITERS` 追加仲裁者;`DOCSQL_ARBITER` 与 `DOCSQL_QUORUM`
+  互斥(仲裁者投票但从不栅栏)。
+- 测试:cargo e2e 新增 3 用例(失联→栅栏→读不受限→愈合→写恢复全链路、防抖
+  窗口内短失联不误伤、仲裁者身份载荷/数据面拒绝/参与投票),全量 949 绿。
+
 ### 自动故障转移设计定稿(docs/design/004)(2026-09-29)
 
 容灾路线的架构前置:**多数派写栅栏 + 自动 PROMOTE** 设计文档定稿

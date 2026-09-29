@@ -1,8 +1,17 @@
 # 设计说明:自动故障转移(多数派写栅栏 + 自动 PROMOTE)
 
-状态:**设计定稿,未实现**。阶段划分见 §7;阶段 1(对称集群写栅栏)是
-第一块可独立落地的增量。本文是权威设计;任何可用性/一致性语义相关改动
-先对照本文的语义矩阵(§6)。
+状态:**设计定稿;阶段 1(对称集群写栅栏 + 仲裁者)已全部落地**——
+`crates/docsql-server/src/quorum.rs`(可见性记账 + 探测循环)、写门五站
+(SQL 写/PUBLISH/TRIM/PROMOTE/backup trigger+restore,与 read_only 副本门
+同层)、REQ_STATUS `quorum` 字段、`docsql_writes_fenced_total`/
+`docsql_quorum_visible`/`docsql_quorum_probe_failures_total` 指标、
+`DOCSQL_ARBITER` 模式(handle_connection 加 arbiter 门,除
+AUTH/PING/STATUS 外全拒,内存库);配置 `DOCSQL_QUORUM`/
+`DOCSQL_QUORUM_PROBE_MS`/`DOCSQL_QUORUM_K`/`DOCSQL_QUORUM_MEMBERS`/
+`DOCSQL_QUORUM_ARBITERS`,默认关闭。§2 的开放问题按文中倾向拍板:仲裁者
+不参加摘要选举;`DOCSQL_QUORUM_MEMBERS` 覆盖 PEERS 的成员表语义(扇出仍
+以 PEERS 为准)。阶段 2(主从自动 PROMOTE)未开始,按 §4 推进。
+本文是权威设计;任何可用性/一致性语义相关改动先对照本文的语义矩阵(§6)。
 
 ## 0. 现状(精确事实)
 

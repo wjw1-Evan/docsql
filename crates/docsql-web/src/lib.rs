@@ -702,6 +702,27 @@ async fn api_metrics(
                 &node,
                 &m["backup_upload_failures_total"],
             );
+            // Quorum write fence (design 004): visible members (0 without
+            // DOCSQL_QUORUM) and the writes a fenced node has refused.
+            gauge(
+                &mut out,
+                "docsql_quorum_visible",
+                &node,
+                &m["quorum_visible"],
+                1.0,
+            );
+            counter(
+                &mut out,
+                "docsql_quorum_probe_failures_total",
+                &node,
+                &m["quorum_probe_failures_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_writes_fenced_total",
+                &node,
+                &m["writes_fenced_total"],
+            );
             counter(
                 &mut out,
                 "docsql_network_bytes_total",
@@ -2912,6 +2933,12 @@ mod tests {
             backup_keep: 0,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -3004,6 +3031,12 @@ mod tests {
             backup_keep: 7,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -3051,6 +3084,12 @@ mod tests {
             backup_keep: 7,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,

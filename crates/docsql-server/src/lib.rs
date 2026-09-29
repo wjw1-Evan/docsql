@@ -37,6 +37,7 @@ pub mod crypto;
 pub mod metrics;
 pub mod pubsub;
 pub mod querylog;
+pub mod quorum;
 pub mod s3;
 pub mod tls;
 
@@ -220,6 +221,13 @@ pub struct ServerState {
     pub backup_dir: PathBuf,
     /// Remote backup copy client; None = backups stay local-only.
     pub backup_s3: Option<s3::S3Client>,
+    /// Majority-visibility bookkeeping (design 004); None = feature off,
+    /// the write gate is inert.
+    pub quorum: Option<Arc<quorum::Quorum>>,
+    /// Probe cycle length for the quorum loop (milliseconds).
+    pub quorum_probe_ms: u64,
+    /// Arbiter mode: no data plane — status probes only.
+    pub arbiter: bool,
     /// Backup shared state: in-flight flag + last attempt outcome.
     /// Never held while acquiring `write_order`/the engine (see backup.rs).
     pub backup: Mutex<backup::BackupShared>,
@@ -520,6 +528,22 @@ pub struct ServerConfig {
     /// local-only. Every finished backup/incremental is additionally PUT
     /// here, and a restore whose local file is missing fetches it back.
     pub backup_s3: Option<s3::S3BackupConfig>,
+    /// Majority-visibility write fence (DOCSQL_QUORUM, design 004 §2).
+    /// Off = the historical any-node-writes semantics, byte for byte.
+    pub quorum: bool,
+    /// Probe cycle in milliseconds for the quorum loop
+    /// (DOCSQL_QUORUM_PROBE_MS, default 1000).
+    pub quorum_probe_ms: u64,
+    /// Misses before a member counts as lost (DOCSQL_QUORUM_K, default 3).
+    pub quorum_k: usize,
+    /// Voting-member override (DOCSQL_QUORUM_MEMBERS); empty = DOCSQL_PEERS.
+    pub quorum_members: Vec<String>,
+    /// Extra zero-data voting members (DOCSQL_QUORUM_ARBITERS).
+    pub quorum_arbiters: Vec<String>,
+    /// Arbiter mode (DOCSQL_ARBITER): no data plane at all — the process
+    /// answers status probes and nothing else, so 2-node clusters can vote
+    /// with a third, independent failure domain.
+    pub arbiter: bool,
     /// Per-statement wall-clock budget for CLIENT statements
     /// (DOCSQL_STATEMENT_TIMEOUT_MS; 0 = unlimited). Replication apply and
     /// restore replay are exempt — peers must apply what the origin
@@ -572,8 +596,14 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
     } else {
         None
     };
-    let mut db =
-        Database::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?;
+    let mut db = if cfg.arbiter {
+        // The arbiter holds no data (design 004 §4): an in-memory database
+        // satisfies the type, and the connection loop's arbiter gate keeps
+        // every data-plane frame away from it.
+        Database::in_memory().map_err(|e| std::io::Error::other(format!("arbiter db: {e}")))?
+    } else {
+        Database::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?
+    };
     db.set_async_commit(cfg.async_commit);
     pubsub::ensure_table(&mut db)
         .map_err(|e| std::io::Error::other(format!("pubsub store: {e}")))?;
@@ -595,6 +625,53 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         } else {
             peers.push(p);
         }
+    }
+    // Majority-visibility bookkeeping (design 004 §2): voting members =
+    // DOCSQL_PEERS (+ arbiters), or the DOCSQL_QUORUM_MEMBERS override,
+    // minus self entries. Without DOCSQL_QUORUM=1 the module stays
+    // entirely inert (no loop, no write gate).
+    let quorum = if cfg.quorum && !cfg.arbiter {
+        let mut members = if cfg.quorum_members.is_empty() {
+            peers.clone()
+        } else {
+            Vec::new()
+        };
+        if !cfg.quorum_members.is_empty() {
+            for m in &cfg.quorum_members {
+                if is_self_peer(&cfg.listen, m).await {
+                    eprintln!("ignoring self-referencing quorum member {m}");
+                } else {
+                    members.push(m.clone());
+                }
+            }
+        }
+        for a in &cfg.quorum_arbiters {
+            if is_self_peer(&cfg.listen, a).await {
+                eprintln!("ignoring self-referencing arbiter entry {a}");
+            } else {
+                members.push(a.clone());
+            }
+        }
+        members.sort();
+        members.dedup();
+        if members.is_empty() {
+            eprintln!(
+                "warning: DOCSQL_QUORUM enabled but no voting members configured — \
+                 this node alone is always a majority, the write gate stays inert"
+            );
+        }
+        Some(Arc::new(quorum::Quorum::new(members, cfg.quorum_k)))
+    } else {
+        None
+    };
+    if let (true, Some(_)) = (cfg.arbiter, cfg.cluster_token.as_ref()) {
+        eprintln!("arbiter mode: status probes only (no data plane)");
+    }
+    if let (true, None) = (cfg.arbiter, cfg.cluster_token.as_ref()) {
+        eprintln!(
+            "warning: arbiter mode without DOCSQL_CLUSTER_TOKEN — probes that \
+             authenticate with the cluster token will be refused"
+        );
     }
     if let (Some(cluster), Some(client)) = (&cfg.cluster_token, &cfg.auth_token) {
         if cluster == client {
@@ -702,6 +779,9 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         backup_keep: cfg.backup_keep,
         backup_dir,
         backup_s3,
+        quorum,
+        quorum_probe_ms: cfg.quorum_probe_ms,
+        arbiter: cfg.arbiter,
         backup: Mutex::new(backup::BackupShared::default()),
         restore_progress: std::sync::Arc::new(backup::RestoreProgress::default()),
         grants_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -781,12 +861,18 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             }
         });
     }
-    if cfg.backup_interval_secs > 0 {
+    if cfg.backup_interval_secs > 0 && !cfg.arbiter {
         // Automatic backups: a logical dump on a timer (first tick is
         // immediate, so a restart yields a fresh backup). Ticks during the
         // startup sync are skipped inside the task.
         let st = state.clone();
         tokio::spawn(backup::backup_task(st, cfg.backup_interval_secs));
+    }
+    if state.quorum.is_some() {
+        // Majority-visibility probe loop (design 004 §2.1): drives the
+        // write fence; see quorum.rs for the bookkeeping rules.
+        let st = state.clone();
+        tokio::spawn(quorum::quorum_task(st));
     }
     loop {
         let (stream, peer) = tokio::select! {
@@ -1723,6 +1809,25 @@ pub async fn handle_connection(
                     .await;
                 continue;
             }
+            // Arbiter mode (design 004 §4): this process holds no data and
+            // exists to be seen. Status probes (and the auth/ping that
+            // carries them) are the entire surface — every other frame
+            // refuses, so a voting member can never be mistaken for a
+            // data node.
+            if state.arbiter
+                && !matches!(
+                    frame.frame_type,
+                    proto::REQ_AUTH | proto::REQ_PING | proto::REQ_STATUS
+                )
+            {
+                let _ = tx
+                    .send(Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("arbiter: status probes only (no data plane)"),
+                    ))
+                    .await;
+                continue;
+            }
             // None = the handler already sent everything (subscribe
             // confirmation + replay) straight through the writer.
             let resp = match frame.frame_type {
@@ -1845,6 +1950,11 @@ pub async fn handle_connection(
                             proto::RESP_ERROR,
                             err_payload("PROMOTE requires the admin role"),
                         ))
+                    } else if let Some(denial) = quorum_write_denial(&state) {
+                        // A quorum-lost node promoting itself would trade a
+                        // fenced minority for an unguarded writer — lift the
+                        // fence first (design 004 §2.2).
+                        Some(Frame::new(proto::RESP_ERROR, err_payload(&denial)))
                     } else {
                         // Failover: leave replica mode. Mirrors the former KV
                         // PROMOTE command — clears read-only and detaches the
@@ -1868,6 +1978,22 @@ pub async fn handle_connection(
                     }
                 }
                 proto::REQ_STATUS if authed => {
+                    if state.arbiter {
+                        // Minimal identity payload: voters answer "here" and
+                        // nothing else (design 004 §4).
+                        Some(Frame::new(
+                            proto::RESP_STATUS,
+                            serde_json::to_vec(&serde_json::json!({
+                                "name": "docsql-arbiter",
+                                "node_id": state
+                                    .advertise
+                                    .clone()
+                                    .unwrap_or_else(|| state.listen.clone()),
+                                "arbiter": true,
+                            }))
+                            .unwrap_or_default(),
+                        ))
+                    } else {
                     // Topology, paths and journal windows are node-operational
                     // detail: user logins need the admin role for it (token
                     // connections are the operator's own credential).
@@ -1884,6 +2010,7 @@ pub async fn handle_connection(
                         let payload = serde_json::to_vec(&status_payload(&state).await)
                             .unwrap_or_else(|_| b"{}".to_vec());
                         Some(Frame::new(proto::RESP_STATUS, payload))
+                    }
                     }
                 }
                 proto::REQ_SESSIONS if authed => {
@@ -3147,6 +3274,13 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_ms": state.started.elapsed().as_millis() as u64,
         "read_only": state.read_only.load(std::sync::atomic::Ordering::SeqCst),
+        "arbiter": state.arbiter,
+        "quorum": {
+            "enabled": state.quorum.is_some(),
+            "members": state.quorum.as_ref().map(|q| q.member_count()).unwrap_or(0),
+            "visible": state.quorum.as_ref().map(|q| q.visible()).unwrap_or(0),
+            "fenced": state.quorum.as_ref().map(|q| q.fenced()).unwrap_or(false),
+        },
         "tls_listener": state.tls_listener,
         "in_transaction": db.in_transaction(),
         "peers": peers,
@@ -3567,6 +3701,14 @@ async fn execute_sql_inner(
             ),
             None,
         );
+    }
+    // Majority write fence (design 004 §2.2): a quorum-lost node is
+    // fenced exactly like a read-only replica — client writes refuse,
+    // replication-internal frames and reads pass.
+    if !is_replication && is_write {
+        if let Some(denial) = quorum_write_denial(state) {
+            return (Frame::new(proto::RESP_ERROR, err_payload(&denial)), None);
+        }
     }
     // The single global transaction belongs to the connection that opened
     // it: COMMIT/ROLLBACK/SAVEPOINT from anyone else would roll back or
@@ -4228,6 +4370,26 @@ pub(crate) fn fanout_auth(state: &ServerState) -> Option<&str> {
         .or(state.auth_token.as_deref())
 }
 
+/// Majority-visibility write fence (design 004 §2.2): a node that lost
+/// quorum refuses client writes. Same entry points as the read_only
+/// replica gate; replication-internal traffic and reads pass. Returns the
+/// denial text when fenced.
+fn quorum_write_denial(state: &ServerState) -> Option<String> {
+    let q = state.quorum.as_ref()?;
+    if !q.fenced() {
+        return None;
+    }
+    state
+        .metrics
+        .writes_fenced_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(format!(
+        "quorum lost: {}/{} members visible; writes fenced",
+        q.visible(),
+        q.member_count()
+    ))
+}
+
 /// Append one locally-committed write to the catch-up journal, trimming the
 /// bounded window on the amortized cadence. Journaling is UNCONDITIONAL for
 /// originated writes (autocommit and explicit-transaction drains alike):
@@ -4564,6 +4726,9 @@ async fn handle_publish(state: &Arc<ServerState>, frame: &Frame, is_replication:
             proto::RESP_ERROR,
             err_payload("read-only replica; PROMOTE to accept writes"),
         );
+    }
+    if let Some(denial) = quorum_write_denial(state) {
+        return Frame::new(proto::RESP_ERROR, err_payload(&denial));
     }
     let Some(_order) = lock_engine_for_write(state).await else {
         return Frame::new(
@@ -4942,6 +5107,9 @@ async fn handle_pubsub_cmd(
                     proto::RESP_ERROR,
                     err_payload("read-only replica; PROMOTE to accept writes"),
                 );
+            }
+            if let Some(denial) = quorum_write_denial(state) {
+                return Frame::new(proto::RESP_ERROR, err_payload(&denial));
             }
             let Some(_order) = lock_engine_for_write(state).await else {
                 return Frame::new(

@@ -40,6 +40,13 @@ pub struct Metrics {
     /// Remote backup copy uploads that failed; every failure is also in
     /// the sync log and the backup status payload.
     pub backup_upload_failures_total: AtomicU64,
+    /// Members currently visible to the quorum loop (design 004); 0
+    /// without DOCSQL_QUORUM. Gauge, refreshed each probe cycle.
+    pub quorum_visible: AtomicU64,
+    /// Probe cycles in which at least one voting member missed.
+    pub quorum_probe_failures_total: AtomicU64,
+    /// Client writes refused because the node was fenced (quorum lost).
+    pub writes_fenced_total: AtomicU64,
 }
 
 impl Metrics {
@@ -68,6 +75,9 @@ impl Metrics {
             "tls_handshake_failures_total": Self::u64(&self.tls_handshake_failures_total),
             "backup_uploads_total": Self::u64(&self.backup_uploads_total),
             "backup_upload_failures_total": Self::u64(&self.backup_upload_failures_total),
+            "quorum_visible": Self::u64(&self.quorum_visible),
+            "quorum_probe_failures_total": Self::u64(&self.quorum_probe_failures_total),
+            "writes_fenced_total": Self::u64(&self.writes_fenced_total),
         })
     }
 }

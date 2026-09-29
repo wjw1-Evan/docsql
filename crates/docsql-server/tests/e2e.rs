@@ -56,6 +56,12 @@ async fn start_server_sec(
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -102,6 +108,12 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -354,6 +366,12 @@ async fn keyed_transport_rejects_replayed_frame() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -922,6 +940,12 @@ async fn fanout_authenticates_with_cluster_token() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1015,6 +1039,12 @@ async fn default_fill_converges_across_peers() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1314,6 +1344,12 @@ async fn replication_and_failover() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1342,6 +1378,12 @@ async fn replication_and_failover() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1455,6 +1497,12 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             backup_keep: 7,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -1585,6 +1633,12 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             backup_keep: 7,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -1675,6 +1729,12 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1864,6 +1924,12 @@ async fn query_log_records_statements() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -2553,6 +2619,12 @@ async fn pubsub_cross_node_delivery() {
             backup_keep: 7,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2640,6 +2712,12 @@ async fn symmetric_cluster_guid_autogen_converges() {
             backup_keep: 7,
             backup_dir: None,
             backup_s3: None,
+            quorum: false,
+            quorum_probe_ms: 1_000,
+            quorum_k: 3,
+            quorum_members: Vec::new(),
+            quorum_arbiters: Vec::new(),
+            arbiter: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2787,6 +2865,12 @@ async fn logs_frame_over_wire() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -2973,6 +3057,12 @@ async fn spawn_node(
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3241,6 +3331,12 @@ async fn spawn_node_window(
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3302,6 +3398,12 @@ async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3841,6 +3943,12 @@ async fn start_server_pitr() -> (tempfile::TempDir, std::path::PathBuf, String) 
         backup_keep: 8,
         backup_dir: Some(backups.clone()),
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3885,6 +3993,12 @@ async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::Path
         backup_keep: keep,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -4832,6 +4946,12 @@ async fn backup_restore_refused_on_read_only_replica() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -4979,6 +5099,12 @@ async fn backup_dir_override_is_honored() {
         backup_keep: 7,
         backup_dir: Some(snaps.clone()),
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -5639,6 +5765,12 @@ async fn statement_timeout_kills_runaway_query_only() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 1,
         tls_cert: None,
         tls_key: None,
@@ -6221,6 +6353,12 @@ async fn transport_key_requires_sealed_frames() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -6364,6 +6502,12 @@ async fn garbage_peer_handshake_fails_loudly() {
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -6825,6 +6969,12 @@ async fn spawn_node_tls(
         backup_keep: 7,
         backup_dir: None,
         backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         statement_timeout_ms: 0,
         tls_cert: Some(cert),
         tls_key: Some(key),
@@ -7235,6 +7385,12 @@ async fn start_server_s3(
         backup_interval_secs: 3600,
         backup_keep: keep,
         backup_dir: Some(backups.clone()),
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
         backup_s3: Some(docsql_server::s3::S3BackupConfig {
             endpoint: format!("http://{mock_addr}"),
             bucket: "db-backups".into(),
@@ -7512,4 +7668,291 @@ async fn backup_s3_remote_copy_upload_fetch_and_retention() {
         .filter(|k| k.contains("/backup-") && k.ends_with(".sql.sha256"))
         .count();
     assert_eq!(stale_sidecars, 2, "every kept backup keeps its sidecar");
+}
+
+// ---- Majority-visibility write fence (design 004 §2, phase 1) ----------
+
+async fn start_server_quorum(
+    member_addrs: Vec<String>,
+    cluster_token: &str,
+    probe_ms: u64,
+    k: usize,
+) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("e2e.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(cluster_token.to_string()),
+        replicate_to: None,
+        peers: member_addrs,
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: true,
+        quorum_probe_ms: probe_ms,
+        quorum_k: k,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            return (dir, addr);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("server did not come up");
+}
+
+async fn start_arbiter(addr: &str, cluster_token: &str) {
+    let cfg = docsql_server::ServerConfig {
+        db_path: std::path::PathBuf::from("arbiter-unused.db"),
+        listen: addr.to_string(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(cluster_token.to_string()),
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: true,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("arbiter did not come up");
+}
+
+async fn quorum_status(addr: &str, token: &str) -> serde_json::Value {
+    // Probe-shaped: cluster-token AUTH puts the connection in peer role,
+    // and peer traffic carries FLAG_REPLICATION (what probe_frame sends).
+    let mut c = Client::connect(addr).await;
+    c.auth(token).await;
+    let mut f = Frame::new(proto::REQ_STATUS, vec![]);
+    f.flags = docsql_server::FLAG_REPLICATION;
+    c.send(&f).await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_STATUS, "{}", payload_str(&r));
+    serde_json::from_slice(&r.payload).unwrap()
+}
+
+/// Phase 1 of design 004: with two of three voting members dead, the node
+/// fences client writes after the debounce window while reads keep
+/// working; bringing members back (arbiters on the same addresses) lifts
+/// the fence and writes flow again. The fence is visible in REQ_STATUS.
+#[tokio::test]
+async fn quorum_fence_blocks_writes_and_heals() {
+    // Reserve two member ports, then leave them dead.
+    let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a1 = l1.local_addr().unwrap().to_string();
+    let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a2 = l2.local_addr().unwrap().to_string();
+    drop(l1);
+    drop(l2);
+    const TOK: &str = "quorum-cluster-tok-1";
+    let (_dir, addr) = start_server_quorum(vec![a1.clone(), a2.clone()], TOK, 100, 3).await;
+    let mut c = Client::connect(&addr).await;
+    // Startup debounce: misses < K, the node still accepts writes.
+    c.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
+    // Wait past the debounce window (3 × 100ms + margin).
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Fenced: client write refused loudly; reads keep working; the status
+    // payload says so.
+    let r = c.sql("INSERT INTO q VALUES (1)").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+    assert!(
+        payload_str(&r).contains("quorum lost"),
+        "{}",
+        payload_str(&r)
+    );
+    let v = quorum_status(&addr, TOK).await;
+    assert_eq!(v["quorum"]["enabled"], true, "{}", v);
+    assert_eq!(v["quorum"]["members"], 3, "{}", v);
+    assert_eq!(v["quorum"]["visible"], 1, "{}", v);
+    assert_eq!(v["quorum"]["fenced"], true, "{}", v);
+    let r = c.sql("SELECT 1").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+
+    // Heal: voting members come back (arbiters on the reserved addresses
+    // answer the very same probe), the fence lifts on the next cycle.
+    start_arbiter(&a1, TOK).await;
+    start_arbiter(&a2, TOK).await;
+    // The fence lifts on the FIRST majority cycle (2/3 suffices by
+    // design); poll for FULL healing before asserting the member count.
+    for _ in 0..100 {
+        let v = quorum_status(&addr, TOK).await;
+        if v["quorum"]["visible"] == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let v = quorum_status(&addr, TOK).await;
+    assert_eq!(v["quorum"]["fenced"], false, "{}", v);
+    assert_eq!(v["quorum"]["visible"], 3, "{}", v);
+    let r = c.sql("INSERT INTO q VALUES (1)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+}
+
+/// The debounce is what makes the fence survivable for rolling restarts:
+/// a member down for less than K cycles never trips it.
+#[tokio::test]
+async fn quorum_debounce_survives_short_outages() {
+    let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a1 = l1.local_addr().unwrap().to_string();
+    drop(l1);
+    const TOK: &str = "quorum-cluster-tok-2";
+    // Fence point ≈ K × probe = 10 × 100ms = 1s after the probe loop
+    // starts; the write below lands well inside the window.
+    let (_dir, addr) = start_server_quorum(vec![a1, "127.0.0.1:1".to_string()], TOK, 100, 10).await;
+    let mut c = Client::connect(&addr).await;
+    let r = c.sql("CREATE TABLE q (id INT PRIMARY KEY)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    let v = quorum_status(&addr, TOK).await;
+    assert_eq!(v["quorum"]["fenced"], false, "{}", v);
+    // Past the window: 3 members, only self visible → fenced.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    let v = quorum_status(&addr, TOK).await;
+    assert_eq!(v["quorum"]["fenced"], true, "{}", v);
+    let r = c.sql("INSERT INTO q VALUES (1)").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+}
+
+/// The arbiter is a voting member with no data plane: it authenticates
+/// with the cluster token, answers REQ_STATUS with an identity payload,
+/// and refuses every data-plane frame.
+#[tokio::test]
+async fn arbiter_answers_status_and_refuses_data_plane() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    const TOK: &str = "arbiter-cluster-tok";
+    start_arbiter(&addr, TOK).await;
+    // Data plane refuses on a plain anonymous connection (the arbiter gate
+    // runs before auth state matters).
+    let mut c = Client::connect(&addr).await;
+    let r = c.sql("SELECT 1").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+    assert!(
+        payload_str(&r).contains("status probes only"),
+        "{}",
+        payload_str(&r)
+    );
+
+    // Status answers with the arbiter identity payload — probe-shaped,
+    // cluster-token auth + replication flag.
+    let mut c = Client::connect(&addr).await;
+    assert_eq!(c.auth(TOK).await.frame_type, proto::RESP_AFFECTED);
+    let mut f = Frame::new(proto::REQ_STATUS, vec![]);
+    f.flags = docsql_server::FLAG_REPLICATION;
+    c.send(&f).await;
+    let r = c.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_STATUS, "{}", payload_str(&r));
+    let v: serde_json::Value = serde_json::from_slice(&r.payload).unwrap();
+    assert_eq!(v["arbiter"], true, "{}", v);
+    assert_eq!(v["name"], "docsql-arbiter", "{}", v);
+
+    // A quorum node votes with it: members = [self, arbiter] via the
+    // DOCSQL_QUORUM_MEMBERS override.
+    let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node_addr = l2.local_addr().unwrap().to_string();
+    drop(l2);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = docsql_server::ServerConfig {
+        db_path: dir.path().join("e2e.db"),
+        listen: node_addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(TOK.to_string()),
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: true,
+        quorum_probe_ms: 100,
+        quorum_k: 3,
+        quorum_members: vec![addr.clone()],
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    let mut node_up = false;
+    for _ in 0..100 {
+        if TcpStream::connect(&node_addr).await.is_ok() {
+            node_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(node_up, "quorum node did not come up");
+    // 2 members, both visible → majority → writes work; the quorum fields
+    // report the member count including self.
+    let v = quorum_status(&node_addr, TOK).await;
+    assert_eq!(v["quorum"]["members"], 2, "{}", v);
+    assert_eq!(v["quorum"]["visible"], 2, "{}", v);
+    assert_eq!(v["quorum"]["fenced"], false, "{}", v);
+    let mut c2 = Client::connect(&node_addr).await;
+    let r = c2.sql("CREATE TABLE ok (id INT)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
 }

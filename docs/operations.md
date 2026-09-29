@@ -148,6 +148,10 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_BACKUP_S3_ENDPOINT` / `_BUCKET` / `_ACCESS_KEY` / `_SECRET_KEY` | 无 | 远端备份副本目标(S3 兼容,四值同设同缺;`http://`/`https://` 均可);部分配置拒绝启动 |
 | `DOCSQL_BACKUP_S3_REGION` / `_PREFIX` / `_KEEP` / `_CA` | us-east-1 / 无 / 跟随本地 `DOCSQL_BACKUP_KEEP` / 无 | SigV4 区域 / 对象键前缀(多节点共用 bucket)/ 远端保留份数 / https 证书验证 CA 包(未设 = 只加密不验证并告警) |
 | `DOCSQL_LOG_FILE` / `DOCSQL_SLOW_MS` | 无 / 100 | 审计 JSONL 落盘 / 慢查询阈值(stderr) |
+| `DOCSQL_QUORUM` | 0 | 1 = 多数派可见性写栅栏(设计 004 §2):失多数派的节点自动拒绝客户端写(读/订阅/复制 apply 不受影响),分区不再产生会被修复覆盖的少数派写;愈合自动解除;进入/解除写审计日志 |
+| `DOCSQL_QUORUM_PROBE_MS` / `_K` | 1000 / 3 | 探测周期 / 成员失联防抖周期数(栅栏约 K×周期后触发,滚动重启不误伤);非法值拒绝启动 |
+| `DOCSQL_QUORUM_MEMBERS` / `_ARBITERS` | 无(跟随 PEERS)/ 无 | 仲裁成员表覆盖 / 追加零数据投票成员 |
+| `DOCSQL_ARBITER` | 0 | 1 = 仲裁者模式:零存储投票成员,只应答状态探测(需 `DOCSQL_CLUSTER_TOKEN`),给 2 节点集群第三个故障域;与 `DOCSQL_QUORUM` 互斥 |
 
 ### Web 控制台
 
