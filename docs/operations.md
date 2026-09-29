@@ -110,6 +110,9 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_READ_TOKEN` | 无 | 只读客户端凭据(可查不可写) |
 | `DOCSQL_CLUSTER_TOKEN` | 无 | 节点间凭据(复制帧仅接受节点身份) |
 | `DOCSQL_KEY` | 无 | 64 位 hex → AES-256-GCM 帧加密(客户端与节点间同用);全零 key 拒绝启动(公开密钥加密形同虚设,与弱 token 同策略) |
+| `DOCSQL_TLS_CERT` / `DOCSQL_TLS_KEY` | 无 | 数据面原生 TLS 监听(PEM 证书 + 私钥路径,两者必须成对,缺一半拒绝启动):接受连接先完成 TLS 握手再进协议,明文客户端响亮失败、无协议探测降级;协议帧与 `DOCSQL_KEY` 帧加密不变(可叠加) |
+| `DOCSQL_TLS_CONNECT` | 0 | 本节点发起的全部出站协议连接(扇出/追赶/join/hold/备份)走 TLS;目标必须同样启用 TLS 监听,明文目标握手即败。CLI 远程模式与 Web 控制台连节点用同一变量 |
+| `DOCSQL_TLS_CA` | 无 | 出站证书验证的 CA 包 PEM 路径;未设 = 只加密不验证(自签部署形态,启动告警明示);设置后做完整链 + 名称验证 |
 
 ### 资源与执行
 

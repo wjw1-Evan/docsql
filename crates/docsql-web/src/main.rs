@@ -97,6 +97,22 @@ fn config_from_env(
         }
     }
     let tls = tls_from_env(&getenv)?;
+    // Outbound node TLS: same env contract as the nodes themselves, so one
+    // compose environment turns the whole fleet TLS-only. Strict boolean
+    // spellings (a typo must refuse startup, not silently dial plaintext).
+    let tls_connect = match getenv("DOCSQL_TLS_CONNECT") {
+        Some(v) if !v.trim().is_empty() => match v.trim() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            other => {
+                return Err(format!(
+                    "DOCSQL_TLS_CONNECT: invalid boolean value {other:?} (expected 1/0/true/false)"
+                ))
+            }
+        },
+        _ => false,
+    };
+    let tls_ca = getenv("DOCSQL_TLS_CA").filter(|p| !p.is_empty());
     Ok(WebCfg {
         listen,
         token,
@@ -104,6 +120,8 @@ fn config_from_env(
         peers,
         upstream,
         tls,
+        tls_connect,
+        tls_ca,
     })
 }
 
@@ -117,6 +135,8 @@ struct WebCfg {
     peers: Vec<String>,
     upstream: Option<String>,
     tls: Option<docsql_web::TlsConfig>,
+    tls_connect: bool,
+    tls_ca: Option<String>,
 }
 
 impl WebCfg {
@@ -127,6 +147,8 @@ impl WebCfg {
             peers: self.peers,
             auth_file: self.auth_file,
             tls: self.tls,
+            tls_connect: self.tls_connect,
+            tls_ca: self.tls_ca,
         }
     }
 }
@@ -219,6 +241,28 @@ mod tests {
         assert!(config_from_env(&args(&[]), env(&[("DOCSQL_WEB_TLS_CERT", "/c")])).is_err());
         assert!(config_from_env(&args(&[]), env(&[("DOCSQL_WEB_TLS_KEY", "/k")])).is_err());
         assert!(config_from_env(&args(&[]), no_env).unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn outbound_tls_env_strict_spellings() {
+        let cfg = config_from_env(
+            &args(&[]),
+            env(&[("DOCSQL_TLS_CONNECT", "1"), ("DOCSQL_TLS_CA", "/ca.pem")]),
+        )
+        .unwrap();
+        assert!(cfg.tls_connect);
+        assert_eq!(cfg.tls_ca.as_deref(), Some("/ca.pem"));
+        // Off-spellings and empty values read as off (compose passthrough).
+        let cfg = config_from_env(&args(&[]), env(&[("DOCSQL_TLS_CONNECT", "")])).unwrap();
+        assert!(!cfg.tls_connect);
+        let cfg = config_from_env(&args(&[]), env(&[("DOCSQL_TLS_CONNECT", "0")])).unwrap();
+        assert!(!cfg.tls_connect);
+        // A typo refuses startup rather than silently dialing plaintext.
+        let err = match config_from_env(&args(&[]), env(&[("DOCSQL_TLS_CONNECT", "on")])) {
+            Err(e) => e,
+            Ok(_) => panic!("bad boolean spelling unexpectedly accepted"),
+        };
+        assert!(err.contains("DOCSQL_TLS_CONNECT"), "{err}");
     }
 
     #[test]

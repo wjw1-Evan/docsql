@@ -54,7 +54,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 pub mod auth;
 
@@ -94,6 +94,9 @@ pub struct WebState {
     /// the console's own fixed routes are named, everything else lumps
     /// under `/other` (a scanner probing random paths cannot grow the map).
     pub http_requests: Mutex<std::collections::HashMap<(String, String, u16), u64>>,
+    /// Outbound TLS dialer for every console→node leg (None = plain TCP;
+    /// built once from DOCSQL_TLS_CONNECT/DOCSQL_TLS_CA at startup).
+    pub node_tls: Option<TlsConnector>,
 }
 
 /// Shared auth surface: the credential file store, in-memory sessions, and
@@ -148,6 +151,12 @@ pub struct WebConfig {
     /// Native TLS for the console listener (PEM cert + key paths). `None` =
     /// plain HTTP (production behind a TLS-terminating reverse proxy).
     pub tls: Option<TlsConfig>,
+    /// Dial managed nodes over native TLS (`DOCSQL_TLS_CONNECT=1`) — the
+    /// console twin of the nodes' own outbound knob, for TLS-only fleets.
+    pub tls_connect: bool,
+    /// CA bundle verifying node certificates (`DOCSQL_TLS_CA`); unset =
+    /// encrypt-only posture (self-signed fleets).
+    pub tls_ca: Option<String>,
 }
 
 /// Native-TLS listener configuration (PEM cert + key paths,
@@ -186,6 +195,22 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         );
     }
     let tls = cfg.tls;
+    // Outbound node dialer: built once here so every console→node leg
+    // shares one config (and one startup warning).
+    let node_tls = if cfg.tls_connect {
+        let connector =
+            docsql_server::tls::load_tls_connector(cfg.tls_ca.as_deref().map(std::path::Path::new))
+                .map_err(std::io::Error::other)?;
+        if cfg.tls_ca.is_none() {
+            eprintln!(
+                "warning: DOCSQL_TLS_CONNECT without DOCSQL_TLS_CA — node connections \
+                 encrypt but do not verify certificates (self-signed posture)"
+            );
+        }
+        Some(connector)
+    } else {
+        None
+    };
     let secure_cookie = tls.is_some()
         || std::env::var("DOCSQL_WEB_COOKIE_SECURE")
             .ok()
@@ -202,6 +227,7 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
             .is_some_and(|v| v.trim() == "1"),
         secure_cookie,
         http_requests: Mutex::new(std::collections::HashMap::new()),
+        node_tls,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -344,32 +370,13 @@ fn accept_error_is_noise(e: &std::io::Error) -> bool {
 
 /// Load the PEM cert chain + private key into a TLS acceptor. Fails loudly
 /// at startup: a console asked to serve HTTPS must not silently fall back
-/// to plaintext.
+/// to plaintext. Delegates to the server crate's loader — one builder for
+/// the data plane and the console, one behavior.
 fn load_tls_acceptor(tls: &TlsConfig) -> std::io::Result<tokio_rustls::TlsAcceptor> {
-    use rustls::pki_types::CertificateDer;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(&tls.cert_path)?,
-    ))
-    .collect::<Result<_, _>>()
-    .map_err(|e| std::io::Error::other(format!("tls cert PEM: {e}")))?;
-    if certs.is_empty() {
-        return Err(std::io::Error::other(
-            "tls cert PEM contains no certificates",
-        ));
-    }
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(
-        &tls.key_path,
-    )?))?
-    .ok_or_else(|| std::io::Error::other("tls key PEM contains no private key"))?;
-    // ring provider: same crypto backend as the build image, no cmake.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| std::io::Error::other(format!("tls protocol versions: {e}")))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| std::io::Error::other(format!("tls config: {e}")))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+    docsql_server::tls::load_tls_acceptor(
+        std::path::Path::new(&tls.cert_path),
+        std::path::Path::new(&tls.key_path),
+    )
 }
 
 /// Resolve when the process is asked to terminate (SIGTERM / SIGINT).
@@ -573,12 +580,14 @@ async fn api_metrics(
         }
     }
     let mut set = tokio::task::JoinSet::new();
+    let tls = state.node_tls.clone();
     for addr in nodes {
         let token = state.token.clone();
+        let tls = tls.clone();
         set.spawn(async move {
             (
                 addr.clone(),
-                remote_status_full_probed(&addr, token.as_deref()).await,
+                remote_status_full_probed(&addr, token.as_deref(), tls.as_ref()).await,
             )
         });
     }
@@ -669,6 +678,14 @@ async fn api_metrics(
                 &node,
                 &m["auth_failures_total"],
             );
+            // 0 on plaintext nodes; a climbing rate on a TLS node means
+            // wrong-protocol clients or handshake bombs.
+            counter(
+                &mut out,
+                "docsql_tls_handshake_failures_total",
+                &node,
+                &m["tls_handshake_failures_total"],
+            );
             counter(
                 &mut out,
                 "docsql_network_bytes_total",
@@ -676,6 +693,14 @@ async fn api_metrics(
                 &m["bytes_in_total"],
             );
         }
+        // Fleet at a glance: is this node's data plane TLS-wrapped?
+        gauge(
+            &mut out,
+            "docsql_tls_listener",
+            &node,
+            &v["tls_listener"],
+            1.0,
+        );
         gauge(
             &mut out,
             "docsql_tables",
@@ -1320,7 +1345,13 @@ async fn api_sql(
         Err(e) => return Ok(Json(e)),
     };
     let started = Instant::now();
-    let out = remote_sql(&target, state.token.as_deref(), &body.sql).await;
+    let out = remote_sql(
+        &target,
+        state.token.as_deref(),
+        &body.sql,
+        state.node_tls.as_ref(),
+    )
+    .await;
     record_console_sql(
         &state.query_log,
         &target,
@@ -1518,12 +1549,14 @@ async fn api_users(
             let query = |sql: &'static str, table: &'static str| {
                 let addr = target.clone();
                 let token = state.token.clone();
+                let tls = state.node_tls.clone();
                 async move {
                     let payload = proto::encode_sql(sql).map_err(|e| e.to_string())?;
                     let f = node_roundtrip(
                         &addr,
                         token.as_deref(),
                         Frame::new(proto::REQ_SQL, payload),
+                        tls.as_ref(),
                     )
                     .await?;
                     match f.frame_type {
@@ -1675,6 +1708,7 @@ async fn api_users_action(
                 &target,
                 state.token.as_deref(),
                 Frame::new(proto::REQ_SQL, payload),
+                state.node_tls.as_ref(),
             )
             .await?;
             match f.frame_type {
@@ -1697,7 +1731,9 @@ async fn api_meta(
         return Err(code);
     }
     match target_for(&state, &params.node) {
-        Ok(addr) => Ok(Json(remote_meta(&addr, state.token.as_deref()).await)),
+        Ok(addr) => Ok(Json(
+            remote_meta(&addr, state.token.as_deref(), state.node_tls.as_ref()).await,
+        )),
         Err(e) => Ok(Json(e)),
     }
 }
@@ -1711,7 +1747,9 @@ async fn api_stats(
         return Err(code);
     }
     match target_for(&state, &params.node) {
-        Ok(addr) => Ok(Json(remote_stats(&addr, state.token.as_deref()).await)),
+        Ok(addr) => Ok(Json(
+            remote_stats(&addr, state.token.as_deref(), state.node_tls.as_ref()).await,
+        )),
         Err(e) => Ok(Json(e)),
     }
 }
@@ -1728,7 +1766,7 @@ const LOGS_RECV_CAP: usize = 4 * 1024 * 1024;
 /// Frame write with an explicit IO budget — shared skeleton of the probe
 /// and managed-node transports.
 async fn write_frame_timed(
-    stream: &mut TcpStream,
+    stream: &mut docsql_server::tls::BoxConn,
     frame: &Frame,
     timeout: std::time::Duration,
 ) -> std::io::Result<()> {
@@ -1740,7 +1778,7 @@ async fn write_frame_timed(
 
 /// Frame read with an explicit IO budget and allocation cap.
 async fn read_frame_timed(
-    stream: &mut TcpStream,
+    stream: &mut docsql_server::tls::BoxConn,
     timeout: std::time::Duration,
     cap: usize,
 ) -> std::io::Result<Frame> {
@@ -1761,11 +1799,17 @@ async fn read_frame_timed(
     Ok(f)
 }
 
-async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+async fn write_frame(
+    stream: &mut docsql_server::tls::BoxConn,
+    frame: &Frame,
+) -> std::io::Result<()> {
     write_frame_timed(stream, frame, PROBE_IO_TIMEOUT).await
 }
 
-async fn read_response_frame(stream: &mut TcpStream, cap: usize) -> std::io::Result<Frame> {
+async fn read_response_frame(
+    stream: &mut docsql_server::tls::BoxConn,
+    cap: usize,
+) -> std::io::Result<Frame> {
     read_frame_timed(stream, PROBE_IO_TIMEOUT, cap).await
 }
 
@@ -1773,7 +1817,7 @@ async fn read_response_frame(stream: &mut TcpStream, cap: usize) -> std::io::Res
 /// Shared by the status/log probes (the managed-node leg has its own richer
 /// error text in `node_connect`).
 async fn auth_on_stream(
-    stream: &mut TcpStream,
+    stream: &mut docsql_server::tls::BoxConn,
     token: Option<&str>,
     cap: usize,
 ) -> Result<(), (bool, String)> {
@@ -1799,11 +1843,17 @@ async fn auth_on_stream(
 
 /// Connect to a managed node within the probe budget. The error's bool is
 /// the reachability classification (`false`: the connection itself failed).
-async fn connect_probe_stream(addr: &str) -> Result<TcpStream, (bool, String)> {
-    tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|e| (false, e.to_string()))?
-        .map_err(|e| (false, e.to_string()))
+async fn connect_probe_stream(
+    addr: &str,
+    tls: Option<&TlsConnector>,
+) -> Result<docsql_server::tls::BoxConn, (bool, String)> {
+    tokio::time::timeout(
+        PROBE_CONNECT_TIMEOUT,
+        docsql_server::tls::dial_protocol(addr, tls),
+    )
+    .await
+    .map_err(|e| (false, e.to_string()))?
+    .map_err(|e| (false, e.to_string()))
 }
 
 /// One request/response exchange on an open probe connection. I/O failures
@@ -1811,7 +1861,7 @@ async fn connect_probe_stream(addr: &str) -> Result<TcpStream, (bool, String)> {
 /// caller wants for that case (the unauthenticated PING leg counts it as
 /// unreachable, the authenticated legs as reachable).
 async fn request_on_probe_stream(
-    stream: &mut TcpStream,
+    stream: &mut docsql_server::tls::BoxConn,
     frame: Frame,
     cap: usize,
     reachable: bool,
@@ -1828,8 +1878,12 @@ async fn request_on_probe_stream(
 /// when a token is configured) REQ_STATUS for the full report. The probe
 /// never writes to the node. Transport-encrypted nodes reject plaintext
 /// frames and surface as reachable with an explanatory error.
-pub async fn probe_node(addr: &str, token: Option<&str>) -> serde_json::Value {
-    match probe_node_inner(addr, token).await {
+pub async fn probe_node(
+    addr: &str,
+    token: Option<&str>,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
+    match probe_node_inner(addr, token, tls).await {
         Ok((latency_ms, status)) => serde_json::json!({
             "addr": addr,
             "reachable": true,
@@ -1852,8 +1906,9 @@ pub async fn probe_node(addr: &str, token: Option<&str>) -> serde_json::Value {
 async fn probe_node_inner(
     addr: &str,
     token: Option<&str>,
+    tls: Option<&TlsConnector>,
 ) -> Result<(f64, serde_json::Value), (bool, String)> {
-    let mut stream = connect_probe_stream(addr).await?;
+    let mut stream = connect_probe_stream(addr, tls).await?;
     // Liveness: PING needs no authenticated session.
     let started = Instant::now();
     let pong = request_on_probe_stream(
@@ -1902,6 +1957,7 @@ async fn api_cluster(
         return Err(code);
     }
     let token = state.token.clone();
+    let tls = state.node_tls.clone();
     // Probes run concurrently, collected in configured order.
     let handles: Vec<_> = state
         .peers
@@ -1909,7 +1965,8 @@ async fn api_cluster(
         .map(|addr| {
             let addr = addr.clone();
             let token = token.clone();
-            tokio::spawn(async move { probe_node(&addr, token.as_deref()).await })
+            let tls = tls.clone();
+            tokio::spawn(async move { probe_node(&addr, token.as_deref(), tls.as_ref()).await })
         })
         .collect();
     let mut nodes = Vec::with_capacity(handles.len());
@@ -1934,8 +1991,13 @@ async fn api_cluster(
 /// Fetch one node's logs report (REQ_LOGS, read-only like the status
 /// probe). `reachable` distinguishes "cannot connect" from "connected but
 /// refused AUTH / bad response".
-pub async fn fetch_node_logs(addr: &str, token: Option<&str>, limit: usize) -> serde_json::Value {
-    match fetch_node_logs_inner(addr, token, limit).await {
+pub async fn fetch_node_logs(
+    addr: &str,
+    token: Option<&str>,
+    limit: usize,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
+    match fetch_node_logs_inner(addr, token, limit, tls).await {
         Ok(logs) => serde_json::json!({
             "addr": addr,
             "reachable": true,
@@ -1955,8 +2017,9 @@ async fn fetch_node_logs_inner(
     addr: &str,
     token: Option<&str>,
     limit: usize,
+    tls: Option<&TlsConnector>,
 ) -> Result<serde_json::Value, (bool, String)> {
-    let mut stream = connect_probe_stream(addr).await?;
+    let mut stream = connect_probe_stream(addr, tls).await?;
     if let Err((reachable, message)) = auth_on_stream(&mut stream, token, LOGS_RECV_CAP).await {
         return Err((reachable, message));
     }
@@ -2004,6 +2067,7 @@ async fn api_logs(
     ))
     .unwrap_or_else(|_| serde_json::json!({"query": [], "sync": []}));
     let token = state.token.clone();
+    let tls = state.node_tls.clone();
     // Node fetches run concurrently, collected in configured order — same
     // pattern as the cluster probes.
     let handles: Vec<_> = state
@@ -2012,7 +2076,10 @@ async fn api_logs(
         .map(|addr| {
             let addr = addr.clone();
             let token = token.clone();
-            tokio::spawn(async move { fetch_node_logs(&addr, token.as_deref(), limit).await })
+            let tls = tls.clone();
+            tokio::spawn(async move {
+                fetch_node_logs(&addr, token.as_deref(), limit, tls.as_ref()).await
+            })
         })
         .collect();
     let mut nodes = Vec::with_capacity(handles.len());
@@ -2075,22 +2142,32 @@ const NODE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// round-trip untruncated.
 const NODE_RECV_CAP: usize = 64 * 1024 * 1024;
 
-async fn node_write_frame(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+async fn node_write_frame(
+    stream: &mut docsql_server::tls::BoxConn,
+    frame: &Frame,
+) -> std::io::Result<()> {
     write_frame_timed(stream, frame, NODE_IO_TIMEOUT).await
 }
 
-async fn node_read_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
+async fn node_read_frame(stream: &mut docsql_server::tls::BoxConn) -> std::io::Result<Frame> {
     read_frame_timed(stream, NODE_IO_TIMEOUT, NODE_RECV_CAP).await
 }
 
 /// Connect to a managed node and authenticate with the server's own
 /// DOCSQL_TOKEN (never a browser-supplied value). A missing token on an
 /// unauthenticated node is fine; a mismatch surfaces as an error.
-async fn node_connect(addr: &str, token: Option<&str>) -> Result<TcpStream, String> {
-    let mut stream = tokio::time::timeout(NODE_CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|e| format!("节点 {addr} 不可达: {e}"))?
-        .map_err(|e| format!("节点 {addr} 不可达: {e}"))?;
+async fn node_connect(
+    addr: &str,
+    token: Option<&str>,
+    tls: Option<&TlsConnector>,
+) -> Result<docsql_server::tls::BoxConn, String> {
+    let mut stream = tokio::time::timeout(
+        NODE_CONNECT_TIMEOUT,
+        docsql_server::tls::dial_protocol(addr, tls),
+    )
+    .await
+    .map_err(|e| format!("节点 {addr} 不可达: {e}"))?
+    .map_err(|e| format!("节点 {addr} 不可达: {e}"))?;
     if let Some(t) = token {
         node_write_frame(
             &mut stream,
@@ -2114,8 +2191,13 @@ async fn node_connect(addr: &str, token: Option<&str>) -> Result<TcpStream, Stri
 /// One managed-node round trip: send a frame, read the response frame.
 /// The shared skeleton of every single-frame `remote_*` proxy call; the
 /// console's Chinese error strings for the request/response legs live here.
-async fn node_roundtrip(addr: &str, token: Option<&str>, frame: Frame) -> Result<Frame, String> {
-    let mut stream = node_connect(addr, token).await?;
+async fn node_roundtrip(
+    addr: &str,
+    token: Option<&str>,
+    frame: Frame,
+    tls: Option<&TlsConnector>,
+) -> Result<Frame, String> {
+    let mut stream = node_connect(addr, token, tls).await?;
     node_write_frame(&mut stream, &frame)
         .await
         .map_err(|e| format!("节点 {addr} 请求失败: {e}"))?;
@@ -2144,7 +2226,12 @@ fn result_to_json(run: Result<serde_json::Value, String>) -> serde_json::Value {
 /// single error object instead.
 type BatchRun = Result<(Vec<serde_json::Value>, Option<(usize, String)>), String>;
 
-pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_json::Value {
+pub async fn remote_sql(
+    addr: &str,
+    token: Option<&str>,
+    sql: &str,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
     let stmts = match docsql_core::stmt::split_statements(sql) {
         Ok(s) => s,
         // Same parser + dialect as the engine, so the message matches what
@@ -2172,7 +2259,7 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(BATCH_DEADLINE_SECS);
     let run: BatchRun = async {
-        let mut stream = node_connect(addr, token).await?;
+        let mut stream = node_connect(addr, token, tls).await?;
         let mut outcomes = Vec::new();
         // Cumulative budget across the batch: each frame is capped at
         // 64 MiB, but a 2 MB request body can carry hundreds of statements
@@ -2264,10 +2351,14 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
 /// Fetch a managed node's object-explorer metadata (REQ_META). The server
 /// assembles it with the same `core::meta::build_meta` walk the console
 /// UI renders, so the payload is shape-stable for the frontend surface.
-pub async fn remote_meta(addr: &str, token: Option<&str>) -> serde_json::Value {
+pub async fn remote_meta(
+    addr: &str,
+    token: Option<&str>,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
     result_to_json(
         async {
-            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_META, vec![])).await?;
+            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_META, vec![]), tls).await?;
             if f.frame_type != proto::RESP_META {
                 return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
             }
@@ -2280,9 +2371,13 @@ pub async fn remote_meta(addr: &str, token: Option<&str>) -> serde_json::Value {
 
 /// Fetch a managed node's counters (REQ_STATUS) and map them onto the
 /// `/api/stats` shape, so the dashboard card builder works unchanged.
-pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value {
+pub async fn remote_stats(
+    addr: &str,
+    token: Option<&str>,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
     result_to_json(async {
-        let f = node_roundtrip(addr, token, Frame::new(proto::REQ_STATUS, vec![])).await?;
+        let f = node_roundtrip(addr, token, Frame::new(proto::REQ_STATUS, vec![]), tls).await?;
         if f.frame_type != proto::RESP_STATUS {
             return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
         }
@@ -2303,10 +2398,14 @@ pub async fn remote_stats(addr: &str, token: Option<&str>) -> serde_json::Value 
 /// The node's FULL REQ_STATUS report (raw payload, `error` key on any
 /// failure) — the /metrics scraper consumes every field, unlike the
 /// dashboard's projected [`remote_stats`].
-pub async fn remote_status_full(addr: &str, token: Option<&str>) -> serde_json::Value {
+pub async fn remote_status_full(
+    addr: &str,
+    token: Option<&str>,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
     result_to_json(
         async {
-            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_STATUS, vec![])).await?;
+            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_STATUS, vec![]), tls).await?;
             if f.frame_type != proto::RESP_STATUS {
                 return Err(format!("节点 {addr} 返回了意外帧: {:#06x}", f.frame_type));
             }
@@ -2322,8 +2421,12 @@ pub async fn remote_status_full(addr: &str, token: Option<&str>) -> serde_json::
 /// a wedged node must surface as `docsql_node_up 0` — not stall the whole
 /// scrape for the management channel's 90s IO budget. The probe path
 /// carries the same authenticated REQ_STATUS exchange.
-pub async fn remote_status_full_probed(addr: &str, token: Option<&str>) -> serde_json::Value {
-    match probe_node_inner(addr, token).await {
+pub async fn remote_status_full_probed(
+    addr: &str,
+    token: Option<&str>,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
+    match probe_node_inner(addr, token, tls).await {
         Ok((_, status)) => status,
         Err((_, message)) => serde_json::json!({ "error": message }),
     }
@@ -2333,13 +2436,19 @@ pub async fn remote_status_full_probed(addr: &str, token: Option<&str>) -> serde
 /// `trigger` is acknowledged when the node accepts the request; the backup
 /// itself completes asynchronously and its outcome shows up in the next
 /// `list` (or REQ_STATUS) poll.
-pub async fn remote_backup(addr: &str, token: Option<&str>, trigger: bool) -> serde_json::Value {
+pub async fn remote_backup(
+    addr: &str,
+    token: Option<&str>,
+    trigger: bool,
+    tls: Option<&TlsConnector>,
+) -> serde_json::Value {
     result_to_json(
         async {
             let action = if trigger { "trigger" } else { "list" };
             let payload =
                 serde_json::to_vec(&serde_json::json!({"action": action})).unwrap_or_default();
-            let f = node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload)).await?;
+            let f =
+                node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload), tls).await?;
             match f.frame_type {
                 proto::RESP_BACKUP => serde_json::from_slice(&f.payload)
                     .map_err(|e| format!("节点 {addr} 的 backup 载荷无法解析: {e}")),
@@ -2363,7 +2472,13 @@ async fn api_backup(
     }
     match target_for(&state, &params.node) {
         Ok(addr) => Ok(Json(
-            remote_backup(&addr, state.token.as_deref(), false).await,
+            remote_backup(
+                &addr,
+                state.token.as_deref(),
+                false,
+                state.node_tls.as_ref(),
+            )
+            .await,
         )),
         Err(e) => Ok(Json(e)),
     }
@@ -2393,7 +2508,7 @@ async fn api_backup_trigger(
     let node = body.node.or(params.node);
     match target_for(&state, &node) {
         Ok(addr) => Ok(Json(
-            remote_backup(&addr, state.token.as_deref(), true).await,
+            remote_backup(&addr, state.token.as_deref(), true, state.node_tls.as_ref()).await,
         )),
         Err(e) => Ok(Json(e)),
     }
@@ -2411,10 +2526,11 @@ pub async fn remote_backup_restore(
     addr: &str,
     token: Option<&str>,
     file: &str,
+    tls: Option<&TlsConnector>,
 ) -> Result<serde_json::Value, String> {
     let payload = serde_json::to_vec(&serde_json::json!({"action": "restore", "file": file}))
         .unwrap_or_default();
-    let f = node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload)).await?;
+    let f = node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload), tls).await?;
     match f.frame_type {
         proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
         proto::RESP_ERROR => Ok(serde_json::json!({
@@ -2461,7 +2577,14 @@ async fn api_backup_restore(
     }
     let node = body.node.clone().or(params.node);
     match target_for(&state, &node) {
-        Ok(addr) => match remote_backup_restore(&addr, state.token.as_deref(), &body.file).await {
+        Ok(addr) => match remote_backup_restore(
+            &addr,
+            state.token.as_deref(),
+            &body.file,
+            state.node_tls.as_ref(),
+        )
+        .await
+        {
             Ok(v) => Ok(Json(v)),
             Err(m) => Err((
                 StatusCode::BAD_GATEWAY,
@@ -2526,6 +2649,7 @@ mod tests {
             trust_proxy: false,
             secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
+            node_tls: None,
         };
         assert_eq!(resolve_node(&state, &None).unwrap(), None);
         assert_eq!(resolve_node(&state, &Some(String::new())).unwrap(), None);
@@ -2557,6 +2681,7 @@ mod tests {
             trust_proxy: false,
             secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
+            node_tls: None,
         };
         assert_eq!(target_for(&state, &None).unwrap(), "node-a:7600");
         assert_eq!(
@@ -2591,6 +2716,7 @@ mod tests {
             trust_proxy: false,
             secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
+            node_tls: None,
         };
         let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
         let mut headers = HeaderMap::new();
@@ -2631,6 +2757,7 @@ mod tests {
             trust_proxy: false,
             secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
+            node_tls: None,
         });
         let res = build_router(state)
             .oneshot(
@@ -2678,6 +2805,10 @@ mod tests {
             backup_keep: 0,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         };
         tokio::spawn(docsql_server::run(cfg));
         let mut up = false;
@@ -2699,6 +2830,7 @@ mod tests {
             trust_proxy: false,
             secure_cookie: false,
             http_requests: Mutex::new(std::collections::HashMap::new()),
+            node_tls: None,
         });
         let res = build_router(state)
             .oneshot(
@@ -2731,7 +2863,7 @@ mod tests {
     #[tokio::test]
     async fn probe_unreachable_node_reports_offline() {
         // Loopback port 1 refuses immediately.
-        let v = probe_node("127.0.0.1:1", None).await;
+        let v = probe_node("127.0.0.1:1", None, None).await;
         assert_eq!(v["reachable"], false);
         assert!(v["status"].is_null());
         assert!(!v["error"].as_str().unwrap().is_empty());
@@ -2764,6 +2896,10 @@ mod tests {
             backup_keep: 7,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         }));
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(&addr).await.is_ok() {
@@ -2771,7 +2907,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let v = probe_node(&addr, None).await;
+        let v = probe_node(&addr, None, None).await;
         assert_eq!(v["reachable"], true, "{v}");
         assert!(v["error"].is_null());
         assert_eq!(v["status"]["name"], "docsql");
@@ -2806,6 +2942,10 @@ mod tests {
             backup_keep: 7,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         };
         tokio::spawn(docsql_server::run(cfg));
         for _ in 0..100 {
@@ -2825,9 +2965,21 @@ mod tests {
         let addr = spawn_node(&dir, None).await;
 
         // Single statement keeps the legacy shape.
-        let r = remote_sql(&addr, None, "CREATE TABLE rt (id INT PRIMARY KEY, v TEXT)").await;
+        let r = remote_sql(
+            &addr,
+            None,
+            "CREATE TABLE rt (id INT PRIMARY KEY, v TEXT)",
+            None,
+        )
+        .await;
         assert_eq!(r["kind"], "affected", "{r}");
-        let r = remote_sql(&addr, None, "INSERT INTO rt VALUES (1, 'a'), (2, 'b')").await;
+        let r = remote_sql(
+            &addr,
+            None,
+            "INSERT INTO rt VALUES (1, 'a'), (2, 'b')",
+            None,
+        )
+        .await;
         assert_eq!(r["kind"], "affected");
         assert_eq!(r["count"], 2);
 
@@ -2836,6 +2988,7 @@ mod tests {
             &addr,
             None,
             "INSERT INTO rt VALUES (3, 'c'); INSERT INTO rt VALUES (4, 'd'); SELECT id FROM rt ORDER BY id",
+            None,
         )
         .await;
         assert_eq!(r["kind"], "batch", "{r}");
@@ -2851,6 +3004,7 @@ mod tests {
             &addr,
             None,
             "INSERT INTO rt VALUES (5, 'e'); SELECT * FROM nope",
+            None,
         )
         .await;
         assert_eq!(r["kind"], "batch");
@@ -2858,20 +3012,20 @@ mod tests {
         assert_eq!(r["results"].as_array().unwrap().len(), 1);
 
         // Single-statement error keeps the legacy error shape.
-        let r = remote_sql(&addr, None, "SELECT * FROM nope").await;
+        let r = remote_sql(&addr, None, "SELECT * FROM nope", None).await;
         assert_eq!(r["kind"], "error");
 
         // A parse error is caught before the wire (same parser).
-        let r = remote_sql(&addr, None, "SELECT FROM").await;
+        let r = remote_sql(&addr, None, "SELECT FROM", None).await;
         assert_eq!(r["kind"], "error");
 
         // Long statements must arrive untruncated (old REQ_SQL cap: 512).
         let long = "x".repeat(600);
         let sql = format!("INSERT INTO rt VALUES (9, '{long}')");
         assert!(sql.chars().count() > 512);
-        let r = remote_sql(&addr, None, &sql).await;
+        let r = remote_sql(&addr, None, &sql, None).await;
         assert_eq!(r["kind"], "affected", "{r}");
-        let r = remote_sql(&addr, None, "SELECT v FROM rt WHERE id = 9").await;
+        let r = remote_sql(&addr, None, "SELECT v FROM rt WHERE id = 9", None).await;
         assert_eq!(r["rows"][0][0].as_str().unwrap().len(), 600, "{r}");
     }
 
@@ -2879,7 +3033,7 @@ mod tests {
     /// 2 MiB body used to be able to carry ~130k round trips on one worker.
     #[tokio::test]
     async fn remote_sql_rejects_statement_count_over_cap() {
-        let r = remote_sql("127.0.0.1:1", None, &"SELECT 1;".repeat(10_001)).await;
+        let r = remote_sql("127.0.0.1:1", None, &"SELECT 1;".repeat(10_001), None).await;
         assert_eq!(r["kind"], "error", "{r}");
         assert!(
             r["message"].as_str().unwrap().contains("batch too large"),
@@ -2887,7 +3041,7 @@ mod tests {
         );
         // Just under the cap is not rejected on the cap (the unreachable
         // address error proves it got past the cap check).
-        let r = remote_sql("127.0.0.1:1", None, &"SELECT 1;".repeat(10_000)).await;
+        let r = remote_sql("127.0.0.1:1", None, &"SELECT 1;".repeat(10_000), None).await;
         assert_eq!(r["kind"], "error", "{r}");
         assert!(
             !r["message"].as_str().unwrap().contains("batch too large"),
@@ -2923,13 +3077,13 @@ mod tests {
     async fn remote_sql_auth_and_offline_errors() {
         let dir = tempfile::tempdir().unwrap();
         let addr = spawn_node(&dir, Some("sec")).await;
-        let r = remote_sql(&addr, Some("wrong"), "SELECT 1").await;
+        let r = remote_sql(&addr, Some("wrong"), "SELECT 1", None).await;
         assert_eq!(r["kind"], "error");
         assert!(r["message"].as_str().unwrap().contains("拒绝认证"), "{r}");
-        let r = remote_sql(&addr, Some("sec"), "SELECT 1").await;
+        let r = remote_sql(&addr, Some("sec"), "SELECT 1", None).await;
         assert_eq!(r["kind"], "rows", "{r}");
 
-        let r = remote_sql("127.0.0.1:1", None, "SELECT 1").await;
+        let r = remote_sql("127.0.0.1:1", None, "SELECT 1", None).await;
         assert_eq!(r["kind"], "error");
         assert!(r["message"].as_str().unwrap().contains("不可达"), "{r}");
     }
@@ -2940,10 +3094,10 @@ mod tests {
     async fn remote_meta_and_stats_mirror_local_shapes() {
         let dir = tempfile::tempdir().unwrap();
         let addr = spawn_node(&dir, None).await;
-        remote_sql(&addr, None, "CREATE TABLE rm (id INT PRIMARY KEY)").await;
-        remote_sql(&addr, None, "INSERT INTO rm VALUES (1)").await;
+        remote_sql(&addr, None, "CREATE TABLE rm (id INT PRIMARY KEY)", None).await;
+        remote_sql(&addr, None, "INSERT INTO rm VALUES (1)", None).await;
 
-        let m = remote_meta(&addr, None).await;
+        let m = remote_meta(&addr, None, None).await;
         assert!(m.get("error").is_none(), "{m}");
         assert_eq!(m["totals"]["tables"], 1);
         assert_eq!(m["totals"]["indexes"], 1); // id PK autoindex
@@ -2953,7 +3107,7 @@ mod tests {
         assert!(!m["tables"][0]["index_defs"].as_array().unwrap().is_empty());
         assert!(m["storage"]["page_size"].as_u64().is_some());
 
-        let s = remote_stats(&addr, None).await;
+        let s = remote_stats(&addr, None, None).await;
         assert!(s.get("error").is_none(), "{s}");
         assert_eq!(s["tables"], 1);
         assert!(s["page_size"].as_u64().is_some());

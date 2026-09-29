@@ -108,6 +108,7 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 
 - `DOCSQL_TOKEN` / `DOCSQL_READ_TOKEN` / `DOCSQL_CLUSTER_TOKEN`:客户端 / 只读 / 节点间凭据。匹配顺序 cluster→client→read;read 与 client 同值按 client;集群各节点 cluster token 必须同值且最好不同于 client(相同启动告警);未配置 cluster token = 旧行为。
 - `DOCSQL_KEY`:AES-256-GCM 帧加密(含 token 与数据,**帧头 type+flags 作为 AAD 绑定**,改标志即失效;对端响应同样解封——.NET 客户端与 Rust 服务端必须同版本);绑定非回环且未配置时启动告警(传输加密测试用它)。
+- `DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY`/`DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA`:数据面原生 TLS(监听 PEM 成对、出站拨号开关、可选 CA 验证);server/CLI/Web 共用 `DOCSQL_TLS_CONNECT` 出站语义,.NET 走连接串 `tls=true`;TLS 在 socket 层之下,协议帧与 `DOCSQL_KEY` 帧加密不变;改动连接层注意 `tls::BoxConn` 是全链路传输类型(handle_connection 与出站辅助函数)。
 - `DOCSQL_PEERS`:对称集群节点表;全新节点自动 join;web 用它做集群探测 + 节点切换白名单;指向自身的条目启动时忽略。
 - `DOCSQL_ADVERTISE`:join 时通告自身地址;不设置仍同步数据但不注册(注册只在内存)。
 - `DOCSQL_UPSTREAM`:web 默认管理节点(启动参数 > 此变量 > `DOCSQL_PEERS` 首条);未配置时数据端点报「未配置管理目标节点」。

@@ -69,6 +69,24 @@
 //!                                     runaway queries on the single
 //!                                     writer. Replication apply and
 //!                                     restore replay are exempt.
+//!     DOCSQL_TLS_CERT=<path>          native TLS on the data-plane
+//!     DOCSQL_TLS_KEY=<path>           listener (PEM pair, both or
+//!                                     neither): accepted connections
+//!                                     complete a TLS handshake before
+//!                                     any protocol frame. Plaintext
+//!                                     clients fail loudly (no
+//!                                     downgrade).
+//!     DOCSQL_TLS_CONNECT=1            dial every outbound peer
+//!                                     connection over TLS (fan-out,
+//!                                     catch-up, join/hold, backup);
+//!                                     targets must have their own
+//!                                     listener TLS configured
+//!     DOCSQL_TLS_CA=<path>            CA bundle (PEM) verifying
+//!                                     outbound peer certificates.
+//!                                     Unset = encrypt-only posture
+//!                                     (self-signed fleets; certificates
+//!                                     are not verified, logged at
+//!                                     startup)
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -83,10 +101,14 @@ async fn main() -> std::io::Result<()> {
     // Plaintext transport on a non-loopback bind exposes every frame —
     // including AUTH tokens and row data — to the local network. Warn
     // loudly at startup (national-security testing probes exactly this).
-    if !listen_is_loopback(&cfg.listen) && cfg.transport_key.is_none() {
+    // A TLS listener wraps the socket below the framing, so it counts as
+    // protected; the AES-GCM frame seal (DOCSQL_KEY) remains the
+    // alternative.
+    if !listen_is_loopback(&cfg.listen) && cfg.transport_key.is_none() && cfg.tls_cert.is_none() {
         eprintln!(
-            "warning: listening on a non-loopback address without DOCSQL_KEY — \
-             traffic is plaintext; set DOCSQL_KEY (and DOCSQL_TOKEN) for any exposed deployment"
+            "warning: listening on a non-loopback address without DOCSQL_KEY or \
+             DOCSQL_TLS_CERT/DOCSQL_TLS_KEY — traffic is plaintext; set one of them \
+             for any exposed deployment"
         );
     }
     docsql_server::run(cfg).await
@@ -164,6 +186,25 @@ fn config_from_env(
     // writable (fail-open on a security flag).
     let read_only = env_bool("DOCSQL_READ_ONLY", &getenv)?;
     let async_commit = env_bool("DOCSQL_ASYNC_COMMIT", &getenv)?;
+    let tls_connect = env_bool("DOCSQL_TLS_CONNECT", &getenv)?;
+    // Listener TLS: PEM pair, both or neither (the console's HTTPS gate
+    // uses the same rule). A half pair silently falling back to plaintext
+    // would be the one irrecoverable direction.
+    let tls_cert = getenv("DOCSQL_TLS_CERT")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+    let tls_key = getenv("DOCSQL_TLS_KEY")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+    match (&tls_cert, &tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("DOCSQL_TLS_CERT and DOCSQL_TLS_KEY must be set together".to_string());
+        }
+        _ => {}
+    }
+    let tls_ca = getenv("DOCSQL_TLS_CA")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
     let catchup_window = env_num("DOCSQL_CATCHUP_WINDOW", 100_000, &getenv)?;
     let backup_interval_secs = env_num("DOCSQL_BACKUP_INTERVAL_SECS", 86_400, &getenv)?;
     let backup_keep = env_num("DOCSQL_BACKUP_KEEP", 7, &getenv)?;
@@ -228,6 +269,10 @@ fn config_from_env(
         backup_keep,
         backup_dir,
         statement_timeout_ms,
+        tls_cert,
+        tls_key,
+        tls_connect,
+        tls_ca,
     })
 }
 
@@ -456,5 +501,53 @@ mod tests {
             err.contains("DOCSQL_MAX_CONN") && err.contains("nope"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn tls_env_pairing_and_flags() {
+        // Defaults: no TLS anywhere, exactly the historical behavior.
+        let cfg = config_from_env(&[], no_env).unwrap();
+        assert!(cfg.tls_cert.is_none());
+        assert!(cfg.tls_key.is_none());
+        assert!(!cfg.tls_connect);
+        assert!(cfg.tls_ca.is_none());
+        // A half pair refuses to boot (never a silent plaintext fallback).
+        let err = cfg_err(&[], env(&[("DOCSQL_TLS_CERT", "/c.pem")]));
+        assert!(err.contains("DOCSQL_TLS_CERT"), "err: {err}");
+        let err = cfg_err(&[], env(&[("DOCSQL_TLS_KEY", "/k.pem")]));
+        assert!(err.contains("DOCSQL_TLS_KEY"), "err: {err}");
+        // Full pair + outbound knob + CA parse through.
+        let cfg = config_from_env(
+            &[],
+            env(&[
+                ("DOCSQL_TLS_CERT", "/c.pem"),
+                ("DOCSQL_TLS_KEY", "/k.pem"),
+                ("DOCSQL_TLS_CONNECT", "1"),
+                ("DOCSQL_TLS_CA", "/ca.pem"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tls_cert.as_deref(),
+            Some(std::path::Path::new("/c.pem"))
+        );
+        assert_eq!(cfg.tls_key.as_deref(), Some(std::path::Path::new("/k.pem")));
+        assert!(cfg.tls_connect);
+        assert_eq!(cfg.tls_ca.as_deref(), Some(std::path::Path::new("/ca.pem")));
+        // Boolean spelling discipline applies to the TLS knob too.
+        let err = cfg_err(&[], env(&[("DOCSQL_TLS_CONNECT", "yes")]));
+        assert!(err.contains("DOCSQL_TLS_CONNECT"), "err: {err}");
+        // Empty values read as unset (compose-style passthrough).
+        let cfg = config_from_env(
+            &[],
+            env(&[
+                ("DOCSQL_TLS_CERT", ""),
+                ("DOCSQL_TLS_KEY", ""),
+                ("DOCSQL_TLS_CONNECT", ""),
+                ("DOCSQL_TLS_CA", ""),
+            ]),
+        )
+        .unwrap();
+        assert!(cfg.tls_cert.is_none() && cfg.tls_key.is_none() && !cfg.tls_connect);
     }
 }

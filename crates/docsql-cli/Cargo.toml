@@ -10,6 +10,11 @@ docsql-core = { path = "../docsql-core" }
 # Hidden password prompt (termios echo off on unix); already in the
 # dependency tree via tokio, so this adds no new vendor surface.
 libc = "0.2"
+# Native TLS client for remote mode (DOCSQL_TLS_CONNECT=1): sync rustls —
+# the CLI deliberately stays std-only (no tokio in the main deps); ring
+# provider, same version pin as the server/web TLS stacks.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 sqlparser = "0.62"

@@ -20,6 +20,17 @@
 //! `unsubscribe [ch];`, `punsubscribe [pat];`, `publish <ch> <msg...>;`,
 //! `pubsub channels|numsub|numpat|trim ...;`. Pushed messages print as
 //! `[pubsub] message <channel> #<id> <payload>` the moment they arrive.
+//!
+//! Remote-mode environment:
+//! - `DOCSQL_TOKEN` — node token when not passed positionally
+//! - `DOCSQL_PASSWORD` — password for `--user` login (else a hidden prompt)
+//! - `DOCSQL_TLS_CONNECT=1` — dial the node over native TLS (the node's
+//!   listener must have DOCSQL_TLS_CERT/KEY configured; compose
+//!   healthchecks inherit this from the container env)
+//! - `DOCSQL_TLS_CA=<path>` — CA bundle verifying the node certificate;
+//!   unset = encrypt-only posture (self-signed fleets)
+
+mod remotetls;
 
 use docsql_core::engine::{Database, ExecOutcome, QueryResult};
 use docsql_core::json::escape_str;
@@ -497,29 +508,69 @@ fn print_embedded_help() {
 /// delivery), everything else queues for the pending round trip. Without
 /// this, a push would be misread as the next command's response.
 struct Remote {
-    writer: std::net::TcpStream,
+    writer: Outbound,
     queue: std::sync::mpsc::Receiver<Frame>,
+}
+
+/// Transport half owned by the main thread: the plain TCP stream, or the
+/// TLS link (whose reader thread polls the shared session — see
+/// remotetls.rs).
+enum Outbound {
+    Plain(std::net::TcpStream),
+    Tls(remotetls::TlsLink),
+}
+
+impl Outbound {
+    fn send_frame(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Outbound::Plain(s) => s
+                .write_all(bytes)
+                .and_then(|_| s.flush())
+                .map_err(|e| e.to_string()),
+            Outbound::Tls(link) => link.send(bytes),
+        }
+    }
+}
+
+/// `DOCSQL_TLS_CONNECT` with the same spelling discipline as the server:
+/// anything but the documented values errors out instead of silently
+/// dialing plaintext.
+fn tls_env_enabled() -> Result<bool, String> {
+    match std::env::var("DOCSQL_TLS_CONNECT") {
+        Ok(v) if !v.trim().is_empty() => match v.trim() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            other => Err(format!(
+                "DOCSQL_TLS_CONNECT: invalid boolean value {other:?} (expected 1/0/true/false)"
+            )),
+        },
+        _ => Ok(false),
+    }
 }
 
 impl Remote {
     fn connect(addr: &str) -> Result<Remote, String> {
-        let stream = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
-        let reader = stream.try_clone().map_err(|e| e.to_string())?;
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        std::thread::spawn(move || reader_loop(reader, tx));
-        Ok(Remote {
-            writer: stream,
-            queue: rx,
-        })
+        let writer = if tls_env_enabled()? {
+            let ca = std::env::var("DOCSQL_TLS_CA")
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            let link = remotetls::TlsLink::connect(addr, ca.as_deref().map(std::path::Path::new))?;
+            link.spawn_reader(tx, print_push);
+            Outbound::Tls(link)
+        } else {
+            let stream = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
+            let reader = stream.try_clone().map_err(|e| e.to_string())?;
+            std::thread::spawn(move || reader_loop(reader, tx));
+            Outbound::Plain(stream)
+        };
+        Ok(Remote { writer, queue: rx })
     }
 
     /// Send one frame and wait for its response frame.
     fn round_trip(&mut self, frame: &Frame) -> Result<Frame, String> {
         let bytes = frame.encode().map_err(|e| e.to_string())?;
-        self.writer
-            .write_all(&bytes)
-            .and_then(|_| self.writer.flush())
-            .map_err(|e| e.to_string())?;
+        self.writer.send_frame(&bytes)?;
         // A server that accepts but never answers (wedged node, dead
         // middlebox) must fail the script with a nonzero exit instead of
         // hanging it forever. `DOCSQL_CLI_TIMEOUT_MS` overrides (0 =
@@ -1702,6 +1753,10 @@ mod tests {
             backup_keep: 0,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         }
     }
 

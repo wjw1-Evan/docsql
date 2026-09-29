@@ -31,6 +31,9 @@ pub struct Metrics {
     /// Wire bytes read from / written to sockets.
     pub bytes_in_total: AtomicU64,
     pub bytes_out_total: AtomicU64,
+    /// Failed TLS handshakes on the listener (wrong-protocol clients,
+    /// handshake bombs, broken middleboxes). Zero on a plaintext node.
+    pub tls_handshake_failures_total: AtomicU64,
 }
 
 impl Metrics {
@@ -56,6 +59,7 @@ impl Metrics {
             "auth_failures_total": Self::u64(&self.auth_failures_total),
             "bytes_in_total": Self::u64(&self.bytes_in_total),
             "bytes_out_total": Self::u64(&self.bytes_out_total),
+            "tls_handshake_failures_total": Self::u64(&self.tls_handshake_failures_total),
         })
     }
 }
@@ -77,6 +81,8 @@ mod tests {
         m.auth_failures_total.fetch_add(9, Ordering::Relaxed);
         m.bytes_in_total.fetch_add(11, Ordering::Relaxed);
         m.bytes_out_total.fetch_add(13, Ordering::Relaxed);
+        m.tls_handshake_failures_total
+            .fetch_add(1, Ordering::Relaxed);
         let s = m.snapshot_json();
         assert_eq!(s["connections_total"], 3);
         assert_eq!(s["connections_rejected_total"], 1);
@@ -89,5 +95,6 @@ mod tests {
         assert_eq!(s["auth_failures_total"], 9);
         assert_eq!(s["bytes_in_total"], 11);
         assert_eq!(s["bytes_out_total"], 13);
+        assert_eq!(s["tls_handshake_failures_total"], 1);
     }
 }

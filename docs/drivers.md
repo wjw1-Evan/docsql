@@ -54,6 +54,25 @@ await using var reader = await cmd.ExecuteReaderAsync();
   `DocsqlSubscriber` 专用连接 + 专职读线程(订阅必须独占连接),断线按最后 id 续传;
 - 服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM。**版本配套**:启用了传输加密的部署要求客户端与服务端同版本——每条加密连接以服务端随机挑战(RESP_HELLO)开头并绑定进 GCM AAD(防跨连接重放),跨版本连接会显式失败;升级时先升到同版本再滚动重启。
 
+### 原生 TLS(连接串开关)
+
+节点启用 `DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY` 后,连接串加 `tls=true` 即走原生 TLS
+(SslStream/rustls,协议帧不变):
+
+```
+host=node-a;port=7600;tls=true
+host=10.0.0.5;port=7600;tls=true;tls_ca=/certs/ca.pem;tls_host=db.internal
+```
+
+- `tls_ca=<PEM 路径>`:对该 CA 做完整链 + 名称验证;**未设 = 只加密不验证证书**
+  (自签部署形态,与服务端 `DOCSQL_TLS_CA` 未设时一致);
+- `tls_host=<名称>`:按 IP 连接而证书签给域名时,指定 SNI/校验名;
+- 明文客户端连 TLS 节点(或反之)握手即败,无降级;
+- `DocsqlSubscriber` 与连接池复用同一路径(池内重开不重复握手)。
+
+CLI 远程模式:`DOCSQL_TLS_CONNECT=1`(可选 `DOCSQL_TLS_CA`)后 `docsql connect <addr>`
+即走 TLS —— compose 健康检查在容器 env 里设置后自动生效。
+
 ### 参数绑定:服务端 prepared statements(默认路径)
 
 带参数的命令**不再在客户端拼接字面量**:`@name` 改写为 `?` 占位符,模板经 REQ_PREPARE

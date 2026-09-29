@@ -25,6 +25,13 @@
 #                     /data/backups inside the node's data volume.
 #   DOCSQL_BACKUP_KEEP  backups retained per node, oldest pruned
 #                     (default 7).
+#   DOCSQL_TLS_CERT / DOCSQL_TLS_KEY  native TLS on the data plane (PEM
+#                     pair, both or neither). Mount the certs and set both
+#                     on every node; plaintext clients then fail loudly.
+#   DOCSQL_TLS_CONNECT  1 = dial peers over TLS (set together with the
+#                     listener pair so the whole mesh is TLS-only).
+#   DOCSQL_TLS_CA  CA bundle PEM verifying peer certificates (unset =
+#                     encrypt-only, self-signed posture).
 #
 #   cp .env.example .env && edit, then pick a profile and up -d.
 #

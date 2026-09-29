@@ -2,6 +2,7 @@
 // Frame: magic "DSQ1" | flags:u16 | type:u16 | topology_version:u64 | len:u32 | payload
 
 using System.Buffers.Binary;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -95,12 +96,27 @@ public static class FrameExtensions
     }
 }
 
+/// <summary>TLS dial options for <see cref="ProtocolConnection"/> (connection
+/// string <c>tls</c>/<c>tls_ca</c>/<c>tls_host</c>). Null reference = dial
+/// plaintext (the historical behavior).</summary>
+public sealed class TlsOptions
+{
+    /// <summary>CA bundle PEM path. Null/empty = encrypt-only posture: the
+    /// certificate is NOT verified (self-signed fleets — same contract as
+    /// the server's DOCSQL_TLS_CA-unset outbound dial).</summary>
+    public string? CaPath { get; init; }
+
+    /// <summary>Override for the TLS target name (SNI + certificate name
+    /// check) when dialing by IP with a DNS-named certificate.</summary>
+    public string? HostName { get; init; }
+}
+
 public sealed class ProtocolConnection : IDisposable
 {
     private const ushort FlagEncrypted = 0x0004;
 
     private readonly TcpClient _tcp;
-    private readonly NetworkStream _stream;
+    private readonly Stream _stream;
     private readonly byte[] _header = new byte[20];
     private readonly byte[]? _key;
 
@@ -154,7 +170,8 @@ public sealed class ProtocolConnection : IDisposable
     private const int PreparedCapacity = 96;
 
     public ProtocolConnection(
-        string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000)
+        string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000,
+        TlsOptions? tls = null)
     {
         // The synchronous TcpClient ctor blocks for the OS connect timeout
         // (often 75s+) on unreachable hosts; bound it so callers fail fast.
@@ -174,7 +191,7 @@ public sealed class ProtocolConnection : IDisposable
             {
                 throw ae.GetBaseException();
             }
-            _stream = _tcp.GetStream();
+            _stream = WrapTlsSync(_tcp, host, port, tls, connectTimeoutMs);
             _key = key;
             _tcp.ReceiveTimeout = ReadTimeoutMs;
             ReadHandshake().Wait();
@@ -186,16 +203,105 @@ public sealed class ProtocolConnection : IDisposable
         }
     }
 
-    private ProtocolConnection(TcpClient connected, byte[]? key, bool handshakeDone = false)
+    private ProtocolConnection(TcpClient connected, Stream stream, byte[]? key)
     {
         _tcp = connected;
-        _stream = connected.GetStream();
+        _stream = stream;
         _key = key;
         _tcp.ReceiveTimeout = ReadTimeoutMs;
-        if (!handshakeDone)
+    }
+
+    /// <summary>Synchronous TLS wrap (bounded by the connect budget, mirroring
+    /// the TCP connect above). Null <paramref name="tls"/> passes the plain
+    /// network stream through.</summary>
+    private static Stream WrapTlsSync(
+        TcpClient tcp, string host, int port, TlsOptions? tls, int connectTimeoutMs)
+    {
+        if (tls is null)
         {
-            ReadHandshake().Wait();
+            return tcp.GetStream();
         }
+        var targetHost = string.IsNullOrEmpty(tls.HostName) ? host : tls.HostName;
+        var ssl = new SslStream(
+            tcp.GetStream(), leaveInnerStreamOpen: false, BuildValidator(tls.CaPath));
+        var auth = ssl.AuthenticateAsClientAsync(targetHost);
+        if (!auth.Wait(connectTimeoutMs))
+        {
+            ssl.Dispose();
+            throw new System.IO.IOException(
+                $"TLS handshake to {host}:{port} timed out after {connectTimeoutMs} ms");
+        }
+        try
+        {
+            auth.GetAwaiter().GetResult();
+        }
+        catch
+        {
+            ssl.Dispose();
+            throw;
+        }
+        return ssl;
+    }
+
+    /// <summary><see cref="WrapTlsSync"/> 的真异步形态:握手共享调用方的取消令牌
+    /// (连接超时/外部取消),不占线程。</summary>
+    private static async Task<Stream> WrapTlsAsync(
+        TcpClient tcp, string host, TlsOptions? tls, CancellationToken cancellationToken)
+    {
+        if (tls is null)
+        {
+            return tcp.GetStream();
+        }
+        var targetHost = string.IsNullOrEmpty(tls.HostName) ? host : tls.HostName;
+        var ssl = new SslStream(
+            tcp.GetStream(), leaveInnerStreamOpen: false, BuildValidator(tls.CaPath));
+        try
+        {
+            await ssl
+                .AuthenticateAsClientAsync(
+                    new SslClientAuthenticationOptions { TargetHost = targetHost },
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            ssl.Dispose();
+            throw;
+        }
+        return ssl;
+    }
+
+    /// <summary>Certificate validation policy: with a CA path, full chain +
+    /// name validation against that private trust anchor; without one,
+    /// accept any certificate (encrypt-only — the documented self-signed
+    /// posture; NOT a MITM defense, same trade-off as the Rust dialer).</summary>
+    private static System.Net.Security.RemoteCertificateValidationCallback BuildValidator(
+        string? caPath)
+    {
+        if (string.IsNullOrEmpty(caPath))
+        {
+            return (_, _, _, _) => true;
+        }
+        var roots = new System.Security.Cryptography.X509Certificates.X509Certificate2Collection();
+        roots.ImportFromPemFile(caPath);
+        if (roots.Count == 0)
+        {
+            throw new DocsqlException($"tls_ca '{caPath}' contains no certificates");
+        }
+        return (_, cert, chain, _) =>
+        {
+            if (cert is null || chain is null)
+            {
+                return false;
+            }
+            chain.ChainPolicy.TrustMode =
+                System.Security.Cryptography.X509Certificates.X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.CustomTrustStore.Clear();
+            chain.ChainPolicy.CustomTrustStore.AddRange(roots);
+            chain.ChainPolicy.RevocationMode =
+                System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck;
+            return chain.Build((System.Security.Cryptography.X509Certificates.X509Certificate2)cert);
+        };
     }
 
     private async System.Threading.Tasks.Task ReadHandshakeAsync(
@@ -240,10 +346,11 @@ public sealed class ProtocolConnection : IDisposable
 
     /// <summary>异步建连(真异步,不占线程):超时与外部取消共用一个令牌。
     /// 连接超时抛 <see cref="System.IO.IOException"/>,外部取消抛
-    /// OperationCanceledException —— 两者可据此区分。</summary>
+    /// OperationCanceledException —— 两者可据此区分。TLS 握手共享同一预算:
+    /// 半开的负载均衡/死节点不能把 OpenAsync 无限挂起。</summary>
     public static async Task<ProtocolConnection> ConnectAsync(
         string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000,
-        CancellationToken cancellationToken = default)
+        TlsOptions? tls = null, CancellationToken cancellationToken = default)
     {
         var tcp = new TcpClient();
         try
@@ -251,12 +358,12 @@ public sealed class ProtocolConnection : IDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(connectTimeoutMs);
             await tcp.ConnectAsync(host, port, cts.Token);
-            var conn = new ProtocolConnection(tcp, key, handshakeDone: true);
-            // The handshake read shares the SAME linked budget: without it a
-            // server (or half-open LB) that accepts but never sends the
-            // RespHello parked OpenAsync indefinitely — the connect timeout
-            // only covered the TCP handshake, and the default ReadFrameAsync
-            // token is none.
+            // The handshake (TLS wrap + RespHello read) shares the SAME
+            // linked budget: without it a server (or half-open LB) that
+            // accepts but never answers parked OpenAsync indefinitely —
+            // the connect timeout only covered the TCP handshake.
+            var stream = await WrapTlsAsync(tcp, host, tls, cts.Token).ConfigureAwait(false);
+            var conn = new ProtocolConnection(tcp, stream, key);
             await conn.ReadHandshakeAsync(cts.Token);
             return conn;
         }

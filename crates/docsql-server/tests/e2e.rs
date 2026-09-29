@@ -56,6 +56,10 @@ async fn start_server_sec(
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     // Wait for the port to accept.
@@ -97,6 +101,10 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -329,6 +337,10 @@ async fn keyed_transport_rejects_replayed_frame() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -446,14 +458,28 @@ async fn keyed_transport_rejects_replayed_frame() {
 }
 
 struct Client {
-    stream: TcpStream,
+    stream: docsql_server::tls::BoxConn,
     buf: Vec<u8>,
 }
 
 impl Client {
     async fn connect(addr: &str) -> Client {
         Client {
-            stream: TcpStream::connect(addr).await.unwrap(),
+            stream: Box::new(TcpStream::connect(addr).await.unwrap()),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Dial over native TLS with the encrypt-only posture (self-signed
+    /// test certificates): the TLS listener tests' client side.
+    async fn connect_tls(addr: &str) -> Client {
+        use rustls::pki_types::ServerName;
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
+        let tls = tokio_rustls::TlsConnector::from(test_tls_client_config());
+        let stream = tls.connect(name, tcp).await.unwrap();
+        Client {
+            stream: Box::new(stream),
             buf: Vec::new(),
         }
     }
@@ -878,6 +904,10 @@ async fn fanout_authenticates_with_cluster_token() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -966,6 +996,10 @@ async fn default_fill_converges_across_peers() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg_for(
         &a_addr,
@@ -1260,6 +1294,10 @@ async fn replication_and_failover() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     // Primary: forwards writes to the replica.
     force_fast_pbkdf2();
@@ -1283,6 +1321,10 @@ async fn replication_and_failover() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for addr in [&primary_addr, &replica_addr] {
         for _ in 0..100 {
@@ -1391,6 +1433,10 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             backup_keep: 7,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         }));
     }
     for addr in &addrs {
@@ -1516,6 +1562,10 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             backup_keep: 7,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         }));
     }
     for addr in &addrs {
@@ -1601,6 +1651,10 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
 
     // Two-node symmetric cluster; keep b's handle so the test can take it down.
@@ -1785,6 +1839,10 @@ async fn query_log_records_statements() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -2469,6 +2527,10 @@ async fn pubsub_cross_node_delivery() {
             backup_keep: 7,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         }));
     }
     for addr in &addrs {
@@ -2551,6 +2613,10 @@ async fn symmetric_cluster_guid_autogen_converges() {
             backup_keep: 7,
             backup_dir: None,
             statement_timeout_ms: 0,
+            tls_cert: None,
+            tls_key: None,
+            tls_connect: false,
+            tls_ca: None,
         }));
     }
     for addr in &addrs {
@@ -2693,6 +2759,10 @@ async fn logs_frame_over_wire() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     // a fans out to the live peer b and a dead address: both attempts must
     // show up in the sync log (ok and error respectively).
@@ -2874,6 +2944,10 @@ async fn spawn_node(
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -3137,6 +3211,10 @@ async fn spawn_node_window(
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..200 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -3193,6 +3271,10 @@ async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..200 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -3727,6 +3809,10 @@ async fn start_server_pitr() -> (tempfile::TempDir, std::path::PathBuf, String) 
         backup_keep: 8,
         backup_dir: Some(backups.clone()),
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -3766,6 +3852,10 @@ async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::Path
         backup_keep: keep,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -4708,6 +4798,10 @@ async fn backup_restore_refused_on_read_only_replica() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -4850,6 +4944,10 @@ async fn backup_dir_override_is_honored() {
         backup_keep: 7,
         backup_dir: Some(snaps.clone()),
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -5505,6 +5603,10 @@ async fn statement_timeout_kills_runaway_query_only() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 1,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -6082,6 +6184,10 @@ async fn transport_key_requires_sealed_frames() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     }));
     for _ in 0..100 {
         if TcpStream::connect(&addr).await.is_ok() {
@@ -6220,6 +6326,10 @@ async fn garbage_peer_handshake_fails_loudly() {
         backup_keep: 7,
         backup_dir: None,
         statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
     };
     tokio::spawn(docsql_server::run(cfg));
     for _ in 0..100 {
@@ -6578,4 +6688,202 @@ async fn pitr_target_before_base_snapshot_refused() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Native data-plane TLS (DOCSQL_TLS_CERT/KEY listener, DOCSQL_TLS_CONNECT
+// outbound dials)
+// ---------------------------------------------------------------------------
+
+/// Encrypt-only client config (accepts the self-signed test certificates —
+/// the posture the Rust dialer uses without DOCSQL_TLS_CA).
+fn test_tls_client_config() -> std::sync::Arc<rustls::ClientConfig> {
+    #[derive(Debug)]
+    struct AcceptAny(rustls::crypto::WebPkiSupportedAlgorithms);
+    impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.supported_schemes()
+        }
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny(
+            provider.signature_verification_algorithms,
+        )))
+        .with_no_client_auth();
+    std::sync::Arc::new(config)
+}
+
+/// Write a self-signed cert/key pair into `dir`; returns (cert, key) paths.
+fn write_self_signed(
+    dir: &tempfile::TempDir,
+    name: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = dir.path().join(format!("{name}-cert.pem"));
+    let key = dir.path().join(format!("{name}-key.pem"));
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.key_pair.serialize_pem()).unwrap();
+    (cert, key)
+}
+
+/// Like [`spawn_node`], with the listener TLS pair and the outbound TLS
+/// dial knob (self-signed posture: no CA).
+async fn spawn_node_tls(
+    dir: &tempfile::TempDir,
+    name: &str,
+    addr: &str,
+    peers: Vec<String>,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+) {
+    tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
+        db_path: dir.path().join(format!("{name}.db")),
+        listen: addr.to_string(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers,
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        statement_timeout_ms: 0,
+        tls_cert: Some(cert),
+        tls_key: Some(key),
+        tls_connect: true,
+        tls_ca: None,
+    }));
+    // TCP-level readiness: the listener accepts before the TLS handshake,
+    // so the plain connect probe still works here.
+    for _ in 0..100 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("tls node {name} did not come up");
+}
+
+#[tokio::test]
+async fn tls_listener_serves_protocol_and_refuses_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+    drop(l);
+    let (cert, key) = write_self_signed(&dir, "solo");
+    spawn_node_tls(&dir, "solo", &addr, vec![], cert, key).await;
+
+    // TLS client: full protocol round trip over the encrypted transport.
+    let mut c = Client::connect_tls(&addr).await;
+    let r = c.ping().await;
+    assert_eq!(r.frame_type, proto::RESP_PONG, "{}", payload_str(&r));
+    let r = c
+        .sql("CREATE TABLE tls_t (id INT PRIMARY KEY, v TEXT)")
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    let r = c.sql("INSERT INTO tls_t VALUES (1, '加密行')").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    let r = c.sql("SELECT COUNT(*) FROM tls_t").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    assert!(String::from_utf8_lossy(&r.payload).contains("[[1]]"));
+
+    // Plaintext client on the TLS listener: the handshake fails loudly —
+    // whatever comes back is a TLS alert, never a downgraded protocol
+    // frame. Read to EOF within a budget, then prove no frame decodes.
+    let mut raw = TcpStream::connect(&addr).await.unwrap();
+    let bytes = Frame::new(proto::REQ_PING, vec![]).encode().unwrap();
+    raw.write_all(&bytes).await.unwrap();
+    let mut all = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), raw.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => all.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert!(
+        all.is_empty() || Frame::decode(&all).is_err(),
+        "plaintext client got protocol data back from a TLS listener: {:?}",
+        all
+    );
+}
+
+#[tokio::test]
+async fn tls_cluster_replicates_over_tls_dials() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a, b) = (free(), free());
+    // Both nodes: TLS listener + TLS outbound dials — every leg of the
+    // bootstrap (hold/sync/release) and the write fan-out rides TLS.
+    let (ca_cert, ca_key) = write_self_signed(&dir, "ta");
+    let (cb_cert, cb_key) = write_self_signed(&dir, "tb");
+    spawn_node_tls(&dir, "ta", &a, vec![b.clone()], ca_cert, ca_key).await;
+    spawn_node_tls(&dir, "tb", &b, vec![a.clone()], cb_cert, cb_key).await;
+
+    let mut ca = Client::connect_tls(&a).await;
+    let r = ca
+        .sql("CREATE TABLE tls_rep (id INT PRIMARY KEY, src TEXT)")
+        .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    let r = ca.sql("INSERT INTO tls_rep VALUES (1, 'from-a')").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+
+    // The write must appear on B through the TLS fan-out (join/bootstrap
+    // runs in the background; poll with the TLS client).
+    let mut seen = false;
+    for _ in 0..500 {
+        let mut cb = Client::connect_tls(&b).await;
+        let r = cb.sql("SELECT COUNT(*) FROM tls_rep").await;
+        if r.frame_type == proto::RESP_ROWS && String::from_utf8_lossy(&r.payload).contains("[[1]]")
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(seen, "write did not replicate to the TLS peer");
 }

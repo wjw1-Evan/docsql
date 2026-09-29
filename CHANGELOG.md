@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+### 数据面原生 TLS(商用化路线 · 传输安全)(2026-09-29)
+
+此前数据面传输保护只有私有 AES-256-GCM 帧加密(`DOCSQL_KEY`)或 TLS 反代;本批次为
+SQL 协议引入标准 TLS(rustls / SslStream),**标准工具链与跨机房部署获得可对接的传输层**:
+
+- **节点监听**(`DOCSQL_TLS_CERT` + `DOCSQL_TLS_KEY`,PEM 成对、缺一半拒绝启动):接受连接
+  先完成 TLS 握手再进协议;明文客户端响亮失败,**无协议探测降级**;握手失败计数进
+  REQ_STATUS metrics 与 Prometheus(`docsql_tls_handshake_failures_total`),监听状态
+  `docsql_tls_listener` / status `tls_listener` 字段;TLS 在 socket 层之下,协议帧与
+  `DOCSQL_KEY` 帧加密语义不变、可叠加。
+- **出站拨号**(`DOCSQL_TLS_CONNECT=1`,可选 `DOCSQL_TLS_CA`):扇出/追赶/join/hold/备份
+  全部对端连接走 TLS;未配 CA = 只加密不验证(自签友好,启动告警明示),配 CA = 完整
+  链 + 名称验证。CLI 远程模式与 Web 控制台连节点共用同一变量(compose 健康检查自动跟随)。
+- **.NET 客户端**:连接串 `tls=true`(可选 `tls_ca=<PEM>`、`tls_host=<名称>`,按 IP 连接
+  而 DNS 证书时用);池化重开不重复握手;`DocsqlSubscriber` 同路径。
+- **CLI**:同步 rustls 客户端(会话 + 非阻塞轮询读写线程,专职读线程继续承接 RESP_PUSH
+  实时推送);best-effort close_notify。
+- **Web 控制台**:节点探测/日志/数据端点/备份/用户页全部走 TLS 拨号(与节点共用
+  `DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA`);其 HTTPS 监听的证书装载去重为 server 同一实现。
+- 连接处理层泛化:`TcpStream` → `tls::BoxConn`(server 入站/出站、web 节点客户端),
+  单一帧循环两种传输。
+- 测试:cargo 新增 TLS e2e 2 项(TLS 监听全功能 + 明文拒绝;双节点 TLS 集群 bootstrap +
+  写扇出复制)+ tls 模块单测 + 配置配对/布尔拼写测试;dotnet 新增 `TlsTests` 4 项
+  (TLS 往返含池化重开/明文拒绝/tls_ca 同证书验证通过/错误 CA 拒绝);CLI 经实机冒烟
+  (SQL 往返、订阅实时推送、明文拒绝)。文档同步(operations/security/drivers/features/
+  limitations/AGENTS/compose)。
+
 ### 缺陷审查轮 15:deploy 部署面 + .NET EF 提供程序/客户端剩余面(2026-09-29)
 
 #### 修复(.NET 客户端/EF 提供程序)

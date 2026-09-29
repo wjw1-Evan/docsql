@@ -83,6 +83,33 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
         set => this["pooling"] = value.ToString();
     }
 
+    /// <summary>用原生 TLS 连接节点(节点侧需 DOCSQL_TLS_CERT/KEY 监听)。默认 false:
+    /// 明文连接(历史行为)。TLS 帧内容不变 —— 加密在传输层之下。</summary>
+    public bool Tls
+    {
+        get => TryGetValue("tls", out var v)
+            ? (v as string ?? "").Equals("true", StringComparison.OrdinalIgnoreCase)
+                || (v as string ?? "").Equals("1", StringComparison.Ordinal)
+            : false;
+        set => this["tls"] = value ? "true" : "false";
+    }
+
+    /// <summary>TLS 证书验证的 CA 包 PEM 路径(tls_ca)。留空 = 只加密不验证证书
+    /// (自签部署形态,与服务端 DOCSQL_TLS_CA 未设时的出站形态一致)。</summary>
+    public string TlsCa
+    {
+        get => TryGetValue("tls_ca", out var v) ? (string)v : "";
+        set => this["tls_ca"] = value;
+    }
+
+    /// <summary>TLS SNI/证书校验名(tls_host):按 IP 连接而证书签给域名时,
+    /// 用它指定域名 —— 否则名称不匹配会让 tls_ca 验证失败。</summary>
+    public string TlsHostName
+    {
+        get => TryGetValue("tls_host", out var v) ? (string)v : "";
+        set => this["tls_host"] = value;
+    }
+
     /// <summary>每个池的物理连接总数上限(借出 + 空闲):池满时 Open 等待
     /// connect timeout 秒后报错(与 SqlClient 语义一致)。</summary>
     public int MaxPoolSize
@@ -456,7 +483,8 @@ public sealed class DocsqlConnection : DbConnection
     internal static ProtocolConnection ConnectAndAuth(
         DocsqlConnectionStringBuilder p, string? keyOverride, int timeoutMs)
     {
-        var proto = new ProtocolConnection(p.Host, p.Port, ParseKey(keyOverride ?? p.Key), timeoutMs);
+        var proto = new ProtocolConnection(
+            p.Host, p.Port, ParseKey(keyOverride ?? p.Key), timeoutMs, TlsOptionsOf(p));
         try
         {
             SendAuth(proto, p);
@@ -477,7 +505,8 @@ public sealed class DocsqlConnection : DbConnection
         CancellationToken cancellationToken)
     {
         var proto = await ProtocolConnection.ConnectAsync(
-                p.Host, p.Port, ParseKey(keyOverride ?? p.Key), timeoutMs, cancellationToken)
+                p.Host, p.Port, ParseKey(keyOverride ?? p.Key), timeoutMs, TlsOptionsOf(p),
+                cancellationToken)
             .ConfigureAwait(false);
         try
         {
@@ -498,6 +527,16 @@ public sealed class DocsqlConnection : DbConnection
             proto.Send(frame).EnsureOk("auth failed: ");
         }
     }
+
+    /// <summary>连接串 tls=true 时的 TLS 拨号参数;tls 未开 = null(明文,历史行为)。</summary>
+    internal static TlsOptions? TlsOptionsOf(DocsqlConnectionStringBuilder p) =>
+        p.Tls
+            ? new TlsOptions
+            {
+                CaPath = string.IsNullOrEmpty(p.TlsCa) ? null : p.TlsCa,
+                HostName = string.IsNullOrEmpty(p.TlsHostName) ? null : p.TlsHostName,
+            }
+            : null;
 
     private static async Task SendAuthAsync(
         ProtocolConnection proto, DocsqlConnectionStringBuilder p, CancellationToken ct)

@@ -65,6 +65,15 @@ services:
       # 0 disables. run-tests.sh overrides the interval for its assertions.
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS (all nodes of a cluster together): mount the
+      # PEM pair, set DOCSQL_TLS_CERT/KEY on every node and
+      # DOCSQL_TLS_CONNECT=1 so inter-node dials also ride TLS. The CLI
+      # healthcheck picks TLS up from DOCSQL_TLS_CONNECT automatically;
+      # .NET clients connect with "...;tls=true".
+      # DOCSQL_TLS_CERT: "/certs/cert.pem"
+      # DOCSQL_TLS_KEY: "/certs/key.pem"
+      # DOCSQL_TLS_CONNECT: "1"
+      # DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:17601:7600"
     volumes:

@@ -238,6 +238,8 @@ dependencies = [
  "docsql-core",
  "docsql-server",
  "libc",
+ "rustls",
+ "rustls-pemfile",
  "sqlparser",
  "tempfile",
  "tokio",
@@ -262,12 +264,16 @@ dependencies = [
  "aes-gcm",
  "docsql-core",
  "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "socket2",
  "sqlparser",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

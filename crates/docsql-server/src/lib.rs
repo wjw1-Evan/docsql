@@ -33,6 +33,7 @@ pub mod crypto;
 pub mod metrics;
 pub mod pubsub;
 pub mod querylog;
+pub mod tls;
 
 use docsql_core::engine::{AnyStmt, Database, ExecOutcome, TableDigest, TxControl};
 use docsql_core::now_ms;
@@ -177,6 +178,14 @@ pub struct ServerState {
     pub read_only: std::sync::atomic::AtomicBool,
     /// When set, every frame payload is sealed with AES-256-GCM.
     pub transport_key: Option<crypto::TransportKey>,
+    /// Outbound TLS dialer (DOCSQL_TLS_CONNECT=1): shared by every peer
+    /// leg (fan-out, catch-up, join/hold, backup) and by the web console's
+    /// node dials via the re-exported `tls::dial_protocol`. None = plain
+    /// TCP, the historical behavior.
+    pub tls_out: Option<tokio_rustls::TlsConnector>,
+    /// Whether the listener wraps accepted connections in TLS
+    /// (DOCSQL_TLS_CERT/KEY); surfaced in REQ_STATUS for fleet monitoring.
+    pub tls_listener: bool,
     /// Statement audit log (docsql_log view).
     pub query_log: querylog::QueryLog,
     /// Replication/sync event trail served by REQ_LOGS (write fan-out,
@@ -420,9 +429,52 @@ pub struct ServerConfig {
     /// confirmed regardless of their own speed, or clusters would diverge
     /// on slow nodes.
     pub statement_timeout_ms: u64,
+    /// TLS listener certificate PEM path (DOCSQL_TLS_CERT). Must pair with
+    /// `tls_key`; when set, accepted connections complete a TLS handshake
+    /// before any protocol frame — plaintext clients fail loudly.
+    pub tls_cert: Option<PathBuf>,
+    /// TLS listener private key PEM path (DOCSQL_TLS_KEY).
+    pub tls_key: Option<PathBuf>,
+    /// Dial outbound protocol connections over TLS (DOCSQL_TLS_CONNECT):
+    /// every peer leg this node initiates wraps the socket in TLS. Peers
+    /// must have their own listener TLS configured — a plaintext target
+    /// fails the handshake loudly, there is no downgrade.
+    pub tls_connect: bool,
+    /// Optional CA bundle PEM for outbound certificate verification
+    /// (DOCSQL_TLS_CA). None = encrypt-only posture (self-signed fleets);
+    /// Some = full chain + server-name verification against the anchor.
+    pub tls_ca: Option<PathBuf>,
 }
 
 pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
+    // TLS fail-fast: config_from_env already validates the pairing, but
+    // ServerConfig can be assembled directly (tests) — the runtime guard
+    // keeps a half-configured node from silently serving plaintext.
+    match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(std::io::Error::other(
+                "DOCSQL_TLS_CERT and DOCSQL_TLS_KEY must be set together",
+            ));
+        }
+        _ => {}
+    }
+    let tls_acceptor = match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(cert), Some(key)) => Some(tls::load_tls_acceptor(cert, key)?),
+        _ => None,
+    };
+    let tls_out = if cfg.tls_connect {
+        let connector = tls::load_tls_connector(cfg.tls_ca.as_deref())?;
+        if cfg.tls_ca.is_none() {
+            eprintln!(
+                "warning: DOCSQL_TLS_CONNECT without DOCSQL_TLS_CA — outbound TLS \
+                 encrypts but does not verify peer certificates (self-signed posture; \
+                 set DOCSQL_TLS_CA to a trust anchor to enable verification)"
+            );
+        }
+        Some(connector)
+    } else {
+        None
+    };
     let mut db =
         Database::open(&cfg.db_path).map_err(|e| std::io::Error::other(format!("open db: {e}")))?;
     db.set_async_commit(cfg.async_commit);
@@ -526,6 +578,8 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         listen: cfg.listen.clone(),
         read_only: std::sync::atomic::AtomicBool::new(cfg.read_only),
         transport_key: cfg.transport_key,
+        tls_out,
+        tls_listener: tls_acceptor.is_some(),
         query_log: querylog::QueryLog::new(),
         sync_log: querylog::SyncLog::new(1000),
         pubsub: pubsub::PubSub::new(),
@@ -659,7 +713,10 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
                     // exists yet (the RESP_HELLO challenge is the first
                     // frame of a fully accepted connection), and keyed
                     // clients accept an unencrypted RESP_ERROR before the
-                    // hello as a terminal connection-level failure.
+                    // hello as a terminal connection-level failure. On a
+                    // TLS listener this write is garbage to a TLS client —
+                    // its handshake fails either way, which is the loud
+                    // outcome we want.
                     let bytes = msg.encode().unwrap_or_default();
                     use tokio::io::AsyncWriteExt;
                     let _ = s.write_all(&bytes).await;
@@ -668,12 +725,42 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             },
             None => None,
         };
+        // TLS handshake AFTER the slot check (a flood cannot consume more
+        // handshake budgets than slots) and BEFORE the connection task: a
+        // failed handshake counts and drops the socket loudly — there is
+        // no protocol-detection fallback to plaintext.
+        let stream: tls::BoxConn = match &tls_acceptor {
+            None => Box::new(stream),
+            Some(acceptor) => {
+                match tokio::time::timeout(tls::TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                    .await
+                {
+                    Ok(Ok(s)) => Box::new(s),
+                    Ok(Err(e)) => {
+                        state
+                            .metrics
+                            .tls_handshake_failures_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("tls handshake from {peer} failed: {e}");
+                        continue;
+                    }
+                    Err(_) => {
+                        state
+                            .metrics
+                            .tls_handshake_failures_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("tls handshake from {peer} timed out");
+                        continue;
+                    }
+                }
+            }
+        };
         tokio::spawn(async move {
             state
                 .metrics
                 .connections_active
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let result = handle_connection(stream, state.clone()).await;
+            let result = handle_connection(stream, peer.to_string(), state.clone()).await;
             state
                 .metrics
                 .connections_active
@@ -816,7 +903,7 @@ async fn is_self_peer(listen: &str, peer: &str) -> bool {
 }
 
 struct Conn {
-    stream: tokio::net::tcp::OwnedReadHalf,
+    stream: tokio::io::ReadHalf<tls::BoxConn>,
     buf: Vec<u8>,
     /// Wire-byte accounting lives at the socket read: chunk size is the
     /// true network bytes (a decoded frame may span several reads).
@@ -1024,12 +1111,16 @@ async fn user_login_frame(
     }
 }
 
-pub async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let (rd, mut wr) = stream.into_split();
+pub async fn handle_connection(
+    stream: tls::BoxConn,
+    peer: String,
+    state: Arc<ServerState>,
+) -> std::io::Result<()> {
+    // Lock-based split (plain TCP used into_split's lock-free halves):
+    // TLS cannot hand out independent socket halves, and one shared
+    // transport type keeps a single frame loop. The bi-lock arbitrates
+    // reader-vs-writer at nanosecond scale against syscalls + fsync.
+    let (rd, mut wr) = tokio::io::split(stream);
     let mut conn = Conn {
         stream: rd,
         buf: Vec::new(),
@@ -2764,6 +2855,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_ms": state.started.elapsed().as_millis() as u64,
         "read_only": state.read_only.load(std::sync::atomic::Ordering::SeqCst),
+        "tls_listener": state.tls_listener,
         "in_transaction": db.in_transaction(),
         "peers": peers,
         "replicate_to": replicate_to,
@@ -3564,7 +3656,7 @@ pub(crate) const RECV_CAP: usize = 64 * 1024 * 1024;
 
 /// Read one response frame from an outbound connection.
 async fn read_response_frame_with_guard(
-    stream: &mut TcpStream,
+    stream: &mut tls::BoxConn,
     wire: WireKey<'_>,
     replay: &mut crypto::ReplayGuard,
 ) -> std::io::Result<Frame> {
@@ -3618,7 +3710,7 @@ pub(crate) type WireKey<'a> = Option<(&'a crypto::TransportKey, &'a [u8; 16])>;
 /// failure (e.g. the peer's connection-limit rejection) — surface its
 /// message instead of a framing error.
 async fn read_wire_hello(
-    stream: &mut TcpStream,
+    stream: &mut tls::BoxConn,
     key: Option<&crypto::TransportKey>,
 ) -> std::io::Result<[u8; 16]> {
     let Some(_) = key else {
@@ -3656,7 +3748,7 @@ async fn read_wire_hello(
 
 /// AUTH on a fresh peer connection when the server requires a token (the
 /// peer rejects everything else with "unauthorized").
-async fn auth_on(stream: &mut TcpStream, token: &str, wire: WireKey<'_>) -> std::io::Result<()> {
+async fn auth_on(stream: &mut tls::BoxConn, token: &str, wire: WireKey<'_>) -> std::io::Result<()> {
     let mut frame = Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec());
     if let Some((k, hello)) = wire {
         frame.flags |= crypto::FLAG_ENCRYPTED;
@@ -3676,13 +3768,15 @@ async fn auth_on(stream: &mut TcpStream, token: &str, wire: WireKey<'_>) -> std:
 }
 
 /// Connect, consume the keyed handshake and authenticate one outbound peer
-/// connection.
+/// connection. `tls` is the node's outbound dialer (DOCSQL_TLS_CONNECT):
+/// None = plain TCP.
 async fn open_peer_conn(
     target: &str,
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
-) -> std::io::Result<(TcpStream, [u8; 16])> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await??;
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> std::io::Result<(tls::BoxConn, [u8; 16])> {
+    let mut stream = tls::dial_protocol(target, tls).await?;
     let hello = read_wire_hello(&mut stream, key).await?;
     if let Some(token) = auth {
         let wire: WireKey = key.map(|k| (k, &hello));
@@ -3718,7 +3812,7 @@ fn replication_frame(frame_type: u16, payload: Vec<u8>, wire: WireKey<'_>) -> Fr
 }
 
 /// Encode + write + flush one frame under the IO timeout.
-async fn write_frame_on(stream: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+async fn write_frame_on(stream: &mut tls::BoxConn, frame: &Frame) -> std::io::Result<()> {
     let bytes = frame.encode().map_err(std::io::Error::other)?;
     tokio::time::timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
     tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
@@ -3728,11 +3822,11 @@ async fn write_frame_on(stream: &mut TcpStream, frame: &Frame) -> std::io::Resul
 /// Write one replication-internal frame and read its response. RESP_ERROR
 /// frames surface as `Err`. Encryption is per frame.
 async fn send_frame_on(
-    mut stream: TcpStream,
+    mut stream: tls::BoxConn,
     frame_type: u16,
     payload: &[u8],
     wire: WireKey<'_>,
-) -> std::io::Result<(Frame, TcpStream)> {
+) -> std::io::Result<(Frame, tls::BoxConn)> {
     let frame = replication_frame(frame_type, payload.to_vec(), wire);
     write_frame_on(&mut stream, &frame).await?;
     let mut replay = crypto::ReplayGuard::default();
@@ -3754,11 +3848,12 @@ async fn forward_write(
     node_id: &str,
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> std::io::Result<()> {
     match seq {
         None => {
             let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
-            forward_frame(target, proto::REQ_SQL, &payload, key, auth)
+            forward_frame(target, proto::REQ_SQL, &payload, key, auth, tls)
                 .await
                 .map(|_| ())
         }
@@ -3776,11 +3871,11 @@ async fn forward_write(
             // `forward_frame` (via `send_frame_on`) turns RESP_ERROR into
             // Err, hiding the one case the fallback must see — probe raw.
             let sequenced =
-                forward_frame_raw(target, proto::REQ_SQL_SEQ, &payload, key, auth).await;
+                forward_frame_raw(target, proto::REQ_SQL_SEQ, &payload, key, auth, tls).await;
             match sequenced {
                 Ok(resp) if resp.frame_type == proto::RESP_ERROR => {
                     let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
-                    forward_frame(target, proto::REQ_SQL, &payload, key, auth)
+                    forward_frame(target, proto::REQ_SQL, &payload, key, auth, tls)
                         .await
                         .map(|_| ())
                 }
@@ -3805,8 +3900,9 @@ pub(crate) async fn forward_frame(
     payload: &[u8],
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> std::io::Result<Frame> {
-    let (stream, hello) = open_peer_conn(target, key, auth).await?;
+    let (stream, hello) = open_peer_conn(target, key, auth, tls).await?;
     let wire: WireKey = key.map(|k| (k, &hello));
     let (resp, _stream) = send_frame_on(stream, frame_type, payload, wire).await?;
     Ok(resp)
@@ -3821,8 +3917,9 @@ async fn forward_frame_raw(
     payload: &[u8],
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> std::io::Result<Frame> {
-    let (mut stream, hello) = open_peer_conn(target, key, auth).await?;
+    let (mut stream, hello) = open_peer_conn(target, key, auth, tls).await?;
     let wire: WireKey = key.map(|k| (k, &hello));
     let frame = replication_frame(frame_type, payload.to_vec(), wire);
     write_frame_on(&mut stream, &frame).await?;
@@ -3979,6 +4076,7 @@ async fn note_fanout_success(state: &ServerState, target: &str) {
 pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u64>) {
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
+    let tls = state.tls_out.clone();
     let targets = fanout_targets(state).await;
     let now = std::time::Instant::now();
     let in_backoff: std::collections::HashSet<String> = {
@@ -3993,10 +4091,19 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u6
     for target in targets {
         let sql = sql.to_string();
         let auth = auth.clone();
+        let tls = tls.clone();
         let node_id = state.cluster_id.clone();
         let trial = in_backoff.contains(&target);
         tasks.spawn(async move {
-            let call = forward_write(&target, &sql, seq, &node_id, key.as_ref(), auth.as_deref());
+            let call = forward_write(
+                &target,
+                &sql,
+                seq,
+                &node_id,
+                key.as_ref(),
+                auth.as_deref(),
+                tls.as_ref(),
+            );
             // Backed-off peers still receive every write — just with a
             // short budget, so a restarted peer recovers immediately (its
             // answer clears the breaker) while a dead one cannot stretch
@@ -4604,6 +4711,7 @@ async fn forward_pubsub_all(
     };
     let auth = fanout_auth(state).map(String::from);
     let key = state.transport_key;
+    let tls = state.tls_out.clone();
     let targets = fanout_targets(state).await;
     // Same circuit breaker as the SQL fan-out: a partitioned peer must not
     // stretch every PUBLISH by the full connect/IO timeout (PUBLISH holds
@@ -4622,9 +4730,17 @@ async fn forward_pubsub_all(
     for target in targets {
         let payload = payload.to_vec();
         let auth = auth.clone();
+        let tls = tls.clone();
         let trial = in_backoff.contains(&target);
         tasks.spawn(async move {
-            let call = forward_frame(&target, frame_type, &payload, key.as_ref(), auth.as_deref());
+            let call = forward_frame(
+                &target,
+                frame_type,
+                &payload,
+                key.as_ref(),
+                auth.as_deref(),
+                tls.as_ref(),
+            );
             let res = if trial {
                 match tokio::time::timeout(FANOUT_TRIAL_BUDGET, call).await {
                     Ok(r) => r,
@@ -4752,11 +4868,9 @@ async fn hold_peer(
     advertise: &str,
 ) -> Result<u64, HoldFail> {
     let unreachable = |e: std::io::Error| HoldFail::Unreachable(e.to_string());
-    let mut stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(unreachable(e)),
-        Err(_) => return Err(HoldFail::Unreachable("connect timed out".into())),
-    };
+    let mut stream = tls::dial_protocol(target, state.tls_out.as_ref())
+        .await
+        .map_err(unreachable)?;
     let hello = read_wire_hello(&mut stream, state.transport_key.as_ref())
         .await
         .map_err(unreachable)?;
@@ -4862,6 +4976,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                 &clear,
                 st.transport_key.as_ref(),
                 fanout_auth(&st),
+                st.tls_out.as_ref(),
             )
             .await;
         }));
@@ -4914,6 +5029,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                         &id.to_le_bytes(),
                         state.transport_key.as_ref(),
                         fanout_auth(state),
+                        state.tls_out.as_ref(),
                     )
                     .await;
                 }
@@ -4988,6 +5104,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                 &id.to_le_bytes(),
                 st.transport_key.as_ref(),
                 fanout_auth(&st),
+                st.tls_out.as_ref(),
             )
             .await
             {
@@ -5209,8 +5326,13 @@ enum JoinApply {
 /// Ask one peer for the cluster state and return the dump script.
 async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<String> {
     let attempt = async {
-        let (mut stream, hello) =
-            open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+        let (mut stream, hello) = open_peer_conn(
+            peer,
+            state.transport_key.as_ref(),
+            fanout_auth(state),
+            state.tls_out.as_ref(),
+        )
+        .await?;
         let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
         let frame = replication_frame(
             proto::REQ_SYNC,
@@ -6255,8 +6377,13 @@ async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
 /// the response frame untouched — the caller validates the frame type and
 /// parses the payload. Shared by the digest/status probes.
 async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::io::Result<Frame> {
-    let (mut stream, hello) =
-        open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+    let (mut stream, hello) = open_peer_conn(
+        peer,
+        state.transport_key.as_ref(),
+        fanout_auth(state),
+        state.tls_out.as_ref(),
+    )
+    .await?;
     let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
     let frame = replication_frame(frame_type, vec![], wire);
     write_frame_on(&mut stream, &frame).await?;
@@ -6613,8 +6740,13 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
 /// the repair then falls back to snapshot adoption.
 async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std::io::Result<u64> {
     let attempt = async {
-        let (mut stream, hello) =
-            open_peer_conn(peer, state.transport_key.as_ref(), fanout_auth(state)).await?;
+        let (mut stream, hello) = open_peer_conn(
+            peer,
+            state.transport_key.as_ref(),
+            fanout_auth(state),
+            state.tls_out.as_ref(),
+        )
+        .await?;
         let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
         let frame = replication_frame(proto::REQ_CATCHUP, after.to_le_bytes().to_vec(), wire);
         write_frame_on(&mut stream, &frame).await?;

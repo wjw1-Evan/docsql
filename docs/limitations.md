@@ -30,6 +30,8 @@
   恢复后跨节点摘要收敛验证、集群反熵自愈;
 - 数据模型:精确 DECIMAL(28~29 位)与精确 TIMESTAMP(UTC 毫秒)为原生标量类型;
 - 安全:三凭据 + 数据库用户/角色(即时撤销)、登录锁定、**服务端参数化绑定(驱动默认路径)**、
+  **数据面原生 TLS**(`DOCSQL_TLS_CERT`/`KEY` 监听 + `DOCSQL_TLS_CONNECT`/`CA` 出站,
+  server/CLI/Web/.NET 全栈,自签友好的「只加密不验证」默认姿态)、
   **Web 控制台原生 TLS(rustls)**、等保三级能力对照;
 - 生态:.NET ADO.NET(连接池默认开启 + 服务端绑定)+ EF Core + Aspire 编排集成(NuGet/GitHub Packages 发布)、
   CLI(csv/json/脚本)、Web 控制台、单语言驱动之外的服务端 prepared statements 线协议(第二语言驱动的基础)。
@@ -42,7 +44,7 @@
    长查询不再卡写入;快照过旧(写流量把 WAL 推过硬阈值截断)时读取响亮报错可重试;
    附:JSON 路径索引、VACUUM(溢出链孤儿页回收);
 3. **性能**:EXPLAIN、统计信息(JOIN 等值 hash join 已落地,`bench_join` 基准);
-4. **数据安全**:TCP 协议层原生 TLS(控制台已原生支持;数据面走 AES-GCM 帧加密或 TLS 反代/加密卷);
+4. **数据安全**:~~TCP 协议层原生 TLS~~ 已落地(数据面 `DOCSQL_TLS_*` 全栈,见「已具备的商用面」);剩余:TDE(静态加密,部署加密卷替代);
 5. **生态**:Kafka/CDC 连接器、触发器、全文检索。
 
 以上边界均为**显式行为**(报错或文档化策略),不存在静默数据风险;未列出的 SQL 语法一律显式报错。

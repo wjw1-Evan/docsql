@@ -267,8 +267,11 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 - **登录锁定**:同 IP 60s 窗口 10 次失败锁 60s(token 与用户登录同桶,含 Web 登录门);
 - **审计**:语句审计(文本/耗时/行数/复制标记/错误,密码脱敏)+ 认证事件 + 同步日志;
   `DOCSQL_LOG_FILE` 落 JSONL;慢查询 `DOCSQL_SLOW_MS` 写 stderr;
-- **传输加密**:`DOCSQL_KEY`(64 hex)AES-256-GCM 帧加密;控制台原生 TLS(rustls)
-  或反代 + `DOCSQL_WEB_COOKIE_SECURE=1`;默认端口仅绑 127.0.0.1;
+- **传输加密**:`DOCSQL_KEY`(64 hex)AES-256-GCM 帧加密;**数据面原生 TLS**
+  (`DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY` 监听,`DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA` 出站,
+  明文与 TLS 互连即败、无降级;.NET 连接串 `tls=true`/`tls_ca`/`tls_host`,CLI 与
+  Web 控制台走 `DOCSQL_TLS_CONNECT`,可观测 `docsql_tls_listener`/`docsql_tls_handshake_failures_total`);
+  控制台原生 TLS(rustls)或反代 + `DOCSQL_WEB_COOKIE_SECURE=1`;默认端口仅绑 127.0.0.1;
 - **注入防护**:ADO.NET/EF 默认服务端参数绑定(`REQ_PREPARE/REQ_EXECUTE`,引号感知、
   字符串翻倍转义,取值无法逃逸字面量);
 - **Web 控制台账号门**:首次强制 setup,PBKDF2 凭据文件,HttpOnly 会话,改密码踢出其它会话,
@@ -345,7 +348,8 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 ## 11. 可观测性
 
 - `GET /healthz`(无门禁)、`GET /metrics`(Prometheus:`docsql_node_up`、语句/连接/字节/
-  认证失败计数、表与行数、存储/JOURNAL 指标、控制台自身请求计数)、`/api/stats`、`/api/cluster`;
+  认证失败计数、TLS 监听状态与握手失败计数(`docsql_tls_listener`/`docsql_tls_handshake_failures_total`)、
+  表与行数、存储/JOURNAL 指标、控制台自身请求计数)、`/api/stats`、`/api/cluster`;
 - `REQ_STATUS` 节点报告(uptime/只读/peers/存储/LSN/表总量/备份/运行时计数器);
 - 语句审计与慢查询日志;同步日志按目标记录复制成败与原因;
 - WAL 后台 checkpoint(软阈值 8MB 请求、硬阈值 64MB 流控),崩溃恢复自动重放。

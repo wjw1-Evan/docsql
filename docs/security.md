@@ -46,8 +46,9 @@ readonly=SELECT;自定义角色=授予的表级 DML。读目标按 AST 分类 fa
 
 ## 传输与静态数据
 
-- 传输:`DOCSQL_KEY`(64 hex)启用 AES-256-GCM 帧加密(token 与数据同密);绑定非回环地址未配置 key 时启动告警;
-  默认端口仅映射 127.0.0.1;Web 控制台生产部署置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`);
+- 传输:`DOCSQL_KEY`(64 hex)启用 AES-256-GCM 帧加密(token 与数据同密);**数据面原生 TLS**(`DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY`
+  监听 + `DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA` 出站,与 AES-GCM 帧加密可叠加,标准 TLS 工具链可对接);
+  绑定非回环地址未配置任一传输保护时启动告警;默认端口仅映射 127.0.0.1;Web 控制台生产部署置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`);
 - 静态:TDE 未内置(部署于加密卷之上);备份为明文 SQL + sha256 sidecar(防损坏/篡改,不保密——保护备份卷);
 - Web 控制台:首次使用强制设置账号(盐化 PBKDF2 存储,HttpOnly 会话 Cookie),
   改密码踢掉其它全部在线会话;浏览器不持有节点令牌(控制台以服务端 `DOCSQL_TOKEN`
@@ -73,7 +74,7 @@ readonly=SELECT;自定义角色=授予的表级 DML。读目标按 AST 分类 fa
 | 访问控制(最小权限) | `DOCSQL_READ_TOKEN` 只读身份:可查询、可订阅,一切持久化写在协议层拒绝;**数据库角色**:内置 `admin`/`readwrite`/`readonly` + 自定义角色表级 DML 授权(GRANT/REVOKE 即时生效,DDL 与管理操作仅 admin,读目标含子查询 fail-closed);存在任一用户后匿名连接关闭;副本模式 `DOCSQL_READ_ONLY=1` 整节点只读;Web 控制台独立 token 门禁 |
 | 安全审计 | 语句审计(`docsql_log` 环形缓冲,含语句文本/耗时/影响行数/是否复制/错误)、认证事件审计(成功与失败均记录,来源 IP + 授予身份/失败原因,web 控制台日志页可见)、`DOCSQL_LOG_FILE` 可同步落 JSONL 文件留存 |
 | 资源控制 | `DOCSQL_MAX_CONN` 并发连接数上限(默认 1024,超限立即拒绝不排队;0 = 不限);`DOCSQL_IDLE_TIMEOUT` 空闲会话超时(服务端主动断开,订阅客户端需定期 PING 保活);`DOCSQL_STATEMENT_TIMEOUT_MS` 客户端语句墙钟预算(超时即报错回滚;复制 apply 与恢复重放不受限,慢节点不偏离已确认写入);单帧 64MB 上限;对端 IO 预算(连接 3s/读写 10s);TCP keepalive + NODELAY(NAT/防火墙后的长会话不被静默掐断);`DOCSQL_PBKDF2_ITERATIONS` 新建凭据哈希迭代数(默认 210000;存量凭据按各自存储值校验,非法值拒绝启动) |
-| 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);每条 keyed 连接以服务端随机挑战(RESP_HELLO)开头并折入双向 GCM AAD——**跨连接重放录制的整段会话必因挑战不同而验签失败**,连接内另有单调计数器重放闸;数据文件/WAL/审计 JSONL 均以 0600 落盘(与备份同口径);绑定非回环地址且未配置 `DOCSQL_KEY` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1`;**Web 控制台原生 TLS**(`DOCSQL_WEB_TLS_CERT`/`DOCSQL_WEB_TLS_KEY`,rustls),或置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`) |
+| 传输保密性 | `DOCSQL_KEY` AES-256-GCM 帧加密(含认证 token 与数据);每条 keyed 连接以服务端随机挑战(RESP_HELLO)开头并折入双向 GCM AAD——**跨连接重放录制的整段会话必因挑战不同而验签失败**,连接内另有单调计数器重放闸;数据文件/WAL/审计 JSONL 均以 0600 落盘(与备份同口径);绑定非回环地址且未配置 `DOCSQL_KEY`/`DOCSQL_TLS_CERT` 时启动显式告警;默认端口映射仅绑定 `127.0.0.1`;**数据面原生 TLS**(`DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY` 监听 + `DOCSQL_TLS_CONNECT` 出站,`DOCSQL_TLS_CA` 启用证书验证,未设 = 只加密不验证并启动告警);**Web 控制台原生 TLS**(`DOCSQL_WEB_TLS_CERT`/`DOCSQL_WEB_TLS_KEY`,rustls),或置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`) |
 | SQL 注入防护 | **ADO.NET/EF Core 默认服务端参数绑定**(REQ_PREPARE/REQ_EXECUTE:占位符在服务端引号感知绑定,字符串值翻倍转义,任何取值都无法逃逸字面量);服务端不拼接外部输入;系统表 `_pubsub_messages` 对 SQL 客户端隐藏 |
 | 数据完整性 | WAL 先写日志后落数据、崩溃恢复;节点间复制依赖独立集群凭据防伪造 |
 | 口令策略 | 数据库用户、服务 token、Web 控制台账号三处统一策略:长度 ≥8 且拒绝单字符重复;PBKDF2 迭代默认 210000(`DOCSQL_PBKDF2_ITERATIONS` 低于 10000 时启动告警;存量凭据按各自存储值校验) |
