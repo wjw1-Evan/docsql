@@ -1752,6 +1752,7 @@ mod tests {
             backup_interval_secs: 0,
             backup_keep: 0,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,

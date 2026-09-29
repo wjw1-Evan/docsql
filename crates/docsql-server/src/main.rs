@@ -87,6 +87,25 @@
 //!                                     (self-signed fleets; certificates
 //!                                     are not verified, logged at
 //!                                     startup)
+//!     DOCSQL_BACKUP_S3_ENDPOINT=<url> Remote backup copy target
+//!     DOCSQL_BACKUP_S3_BUCKET=<name>  (S3-compatible object storage:
+//!     DOCSQL_BACKUP_S3_ACCESS_KEY=<>  AWS S3 / MinIO / gateways). All
+//!     DOCSQL_BACKUP_S3_SECRET_KEY=<>  four values set together or none —
+//!                                     a half-configured copy refuses to
+//!                                     boot. Every finished backup and
+//!                                     incremental segment is PUT to the
+//!                                     bucket (sha256 sidecar included);
+//!                                     a restore whose local file is
+//!                                     missing fetches it back first.
+//!     DOCSQL_BACKUP_S3_REGION=<r>     SigV4 region (default us-east-1)
+//!     DOCSQL_BACKUP_S3_PREFIX=<p>     optional key prefix (multi-node
+//!                                     fleets share one bucket)
+//!     DOCSQL_BACKUP_S3_KEEP=<n>       remote retention for full backups
+//!                                     (default: follows
+//!                                     DOCSQL_BACKUP_KEEP)
+//!     DOCSQL_BACKUP_S3_CA=<path>      CA bundle (PEM) verifying the
+//!                                     https storage endpoint; unset =
+//!                                     encrypt-only (logged at startup)
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -233,6 +252,10 @@ fn config_from_env(
     let backup_dir = getenv("DOCSQL_BACKUP_DIR")
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
+    // Remote backup copy (S3-compatible). All-or-nothing on the four
+    // required values — a half-configured target must refuse to boot, not
+    // silently keep backups local-only.
+    let backup_s3 = docsql_server::s3::s3_config_from_env(&getenv)?;
     let transport_key = match getenv("DOCSQL_KEY") {
         Some(k) if !k.trim().is_empty() => {
             let key =
@@ -268,6 +291,7 @@ fn config_from_env(
         backup_interval_secs,
         backup_keep,
         backup_dir,
+        backup_s3,
         statement_timeout_ms,
         tls_cert,
         tls_key,

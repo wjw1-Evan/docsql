@@ -82,6 +82,18 @@ docker compose --profile cluster --profile join up -d node-d
   窗口 = 本节点期刊保留:对称多写集群中他节点发起的写不在本节点期刊里,
   **集群级 PITR 需在承载全部写的主节点上执行**(主从拓扑天然满足)或以全量兜底;
 - **手动触发**:控制台「备份管理」页、`POST /api/backup` 或协议帧 `REQ_BACKUP`;
+- **远端备份副本(S3 兼容对象存储)**:配置 `DOCSQL_BACKUP_S3_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY`/`_SECRET_KEY`
+  (四个必须同时设置,缺一半拒绝启动)后,每份完成的备份与增量段(含 sha256 sidecar)自动 PUT 到
+  bucket(路径寻址,兼容 AWS S3/MinIO/S3 网关;`DOCSQL_BACKUP_S3_PREFIX` 可为多节点共用一个 bucket
+  按前缀隔离)。用途是**卷外灾备副本**——数据卷损坏不再连带丢掉唯一备份:
+  - 恢复时本地文件缺失(卷损)自动从远端回源:整份恢复拉回 base+sidecar;`"to"` 时间点恢复
+    连缺失的增量链一并拉回;下载文件走与本地备份相同的 sha256 强校验;
+  - 远端保留镜像本地 keep-N(`DOCSQL_BACKUP_S3_KEEP` 缺省跟随 `DOCSQL_BACKUP_KEEP`),只删
+    自己命名模式的对象且连带 sidecar;
+  - 上传在备份窗口内进行(引擎锁已全部释放),失败不影响已落盘的本地备份——结果进状态
+    `REQ_STATUS.backup.remote`、同步日志与 `docsql_backup_upload_failures_total` 指标;
+  - 传输:https 端点走 rustls(`DOCSQL_BACKUP_S3_CA` 设置则完整验证,未设 = 只加密不验证并启动
+    告警);签名 AWS SigV4;单对象 PUT 上限 5 GiB(不支持 multipart,超大库请分库或降频全量)。
 - **恢复**:备份是完整 SQL 脚本(多表 `DROP TABLE IF EXISTS` 开头,幂等),逐条经正常写路径
   重放并扇出全网,整体收敛到备份时点。语义:
   - 覆盖备份中包含的所有表(整表替换);备份后新建的表保留,如需完全对齐先手动删除;
@@ -133,6 +145,8 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_READ_ONLY` | 0 | 1 = 整节点只读副本 |
 | `DOCSQL_CATCHUP_WINDOW` | 100000 | 追赶日志保留条数(0 = 不限) |
 | `DOCSQL_BACKUP_INTERVAL_SECS` / `_KEEP` / `_DIR` | 86400 / 7 / `<db>/backups` | 自动备份节奏/保留份数/目录 |
+| `DOCSQL_BACKUP_S3_ENDPOINT` / `_BUCKET` / `_ACCESS_KEY` / `_SECRET_KEY` | 无 | 远端备份副本目标(S3 兼容,四值同设同缺;`http://`/`https://` 均可);部分配置拒绝启动 |
+| `DOCSQL_BACKUP_S3_REGION` / `_PREFIX` / `_KEEP` / `_CA` | us-east-1 / 无 / 跟随本地 `DOCSQL_BACKUP_KEEP` / 无 | SigV4 区域 / 对象键前缀(多节点共用 bucket)/ 远端保留份数 / https 证书验证 CA 包(未设 = 只加密不验证并告警) |
 | `DOCSQL_LOG_FILE` / `DOCSQL_SLOW_MS` | 无 / 100 | 审计 JSONL 落盘 / 慢查询阈值(stderr) |
 
 ### Web 控制台

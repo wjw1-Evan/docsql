@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+### 远端备份副本:备份/增量段自动复制到 S3 兼容对象存储,卷损可回源恢复(2026-09-29)
+
+商用化路线·数据安全批次的容灾补强:数据卷损坏不再连带丢掉唯一备份——
+
+- **S3 兼容远端副本**(`DOCSQL_BACKUP_S3_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY`/`_SECRET_KEY`,
+  四值同设同缺,部分配置拒绝启动):每份完成的备份**与增量段**(sha256 sidecar 随行)自动
+  PUT 到 bucket,路径寻址兼容 AWS S3/MinIO/S3 网关,`DOCSQL_BACKUP_S3_PREFIX` 支持多节点
+  共用一个 bucket;手写 SigV4 客户端零新增依赖(HMAC-SHA256 复用 kdf,签名正确性由
+  RFC 4231 校验过的独立向量钉住);https 端点走与数据面同源的 rustls
+  (`DOCSQL_BACKUP_S3_CA` 完整验证,未设 = 只加密不验证并启动告警)。
+- **卷损回源恢复**:恢复请求的本地文件缺失时自动从远端拉回——整份恢复拉 base+sidecar,
+  `"to"` 时间点恢复连缺失的增量链一并拉回;远端清单权威:远端存在的 sidecar 拉取失败即
+  拒绝恢复(绝不静默降级为未校验重放);下载文件走与本地备份相同的 sha256 强校验。
+- **远端保留**:镜像本地 keep-N(`DOCSQL_BACKUP_S3_KEEP` 缺省跟随 `DOCSQL_BACKUP_KEEP`),
+  只删自己命名模式且连带 sidecar;上传在备份窗口内(引擎锁已全部释放)进行,失败不损
+  已落盘的本地备份——结果进 `REQ_STATUS.backup.remote`、同步日志与
+  `docsql_backup_uploads_total`/`docsql_backup_upload_failures_total` 指标。
+- 测试:s3 单测 12(双独立向量/编码/endpoint/LIST XML/配置拒绝)+ e2e
+  `backup_s3_remote_copy_upload_fetch_and_retention`(进程内 mock S3:上传字节一致 +
+  签名头断言、状态暴露、增量上传、删本地卷后整份/时间点双路回源恢复、远端保留删除)。
+
 ### Web 管理端完善轮:活动会话监视 + KILL、结果导出、查询历史、慢查询过滤、PITR UI(2026-09-29)
 
 对标商业库管理端(SSMS 活动监视器 / Azure Data Studio)补齐运维与生产力面:

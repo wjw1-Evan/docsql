@@ -8,7 +8,7 @@ description = "DocSQL network server: SQL protocol + auth + replication"
 [dependencies]
 sqlparser = "0.62"
 docsql-core = { path = "../docsql-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal", "fs"] }
 # TCP keepalive/NODELAY on accepted connections (session survival across
 # NAT/firewall idle timeouts).
 socket2 = "0.6"

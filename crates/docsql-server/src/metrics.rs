@@ -34,6 +34,12 @@ pub struct Metrics {
     /// Failed TLS handshakes on the listener (wrong-protocol clients,
     /// handshake bombs, broken middleboxes). Zero on a plaintext node.
     pub tls_handshake_failures_total: AtomicU64,
+    /// Remote backup copy upload attempts (objects; full backups,
+    /// incrementals, sidecars) — DOCSQL_BACKUP_S3_*. Zero without one.
+    pub backup_uploads_total: AtomicU64,
+    /// Remote backup copy uploads that failed; every failure is also in
+    /// the sync log and the backup status payload.
+    pub backup_upload_failures_total: AtomicU64,
 }
 
 impl Metrics {
@@ -60,6 +66,8 @@ impl Metrics {
             "bytes_in_total": Self::u64(&self.bytes_in_total),
             "bytes_out_total": Self::u64(&self.bytes_out_total),
             "tls_handshake_failures_total": Self::u64(&self.tls_handshake_failures_total),
+            "backup_uploads_total": Self::u64(&self.backup_uploads_total),
+            "backup_upload_failures_total": Self::u64(&self.backup_upload_failures_total),
         })
     }
 }

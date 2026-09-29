@@ -687,6 +687,21 @@ async fn api_metrics(
                 &node,
                 &m["tls_handshake_failures_total"],
             );
+            // Remote backup copy health: uploads climbing with zero
+            // failures is the disaster-recovery posture working; a
+            // climbing failure rate means the bucket target is broken.
+            counter(
+                &mut out,
+                "docsql_backup_uploads_total",
+                &node,
+                &m["backup_uploads_total"],
+            );
+            counter(
+                &mut out,
+                "docsql_backup_upload_failures_total",
+                &node,
+                &m["backup_upload_failures_total"],
+            );
             counter(
                 &mut out,
                 "docsql_network_bytes_total",
@@ -2896,6 +2911,7 @@ mod tests {
             backup_interval_secs: 0,
             backup_keep: 0,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2987,6 +3003,7 @@ mod tests {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -3033,6 +3050,7 @@ mod tests {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,

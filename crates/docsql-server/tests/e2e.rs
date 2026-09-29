@@ -55,6 +55,7 @@ async fn start_server_sec(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -100,6 +101,7 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -351,6 +353,7 @@ async fn keyed_transport_rejects_replayed_frame() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -918,6 +921,7 @@ async fn fanout_authenticates_with_cluster_token() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1010,6 +1014,7 @@ async fn default_fill_converges_across_peers() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1308,6 +1313,7 @@ async fn replication_and_failover() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1335,6 +1341,7 @@ async fn replication_and_failover() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1447,6 +1454,7 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -1576,6 +1584,7 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -1665,6 +1674,7 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1853,6 +1863,7 @@ async fn query_log_records_statements() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -2541,6 +2552,7 @@ async fn pubsub_cross_node_delivery() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2627,6 +2639,7 @@ async fn symmetric_cluster_guid_autogen_converges() {
             backup_interval_secs: 0,
             backup_keep: 7,
             backup_dir: None,
+            backup_s3: None,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2773,6 +2786,7 @@ async fn logs_frame_over_wire() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -2958,6 +2972,7 @@ async fn spawn_node(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3225,6 +3240,7 @@ async fn spawn_node_window(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3285,6 +3301,7 @@ async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3823,6 +3840,7 @@ async fn start_server_pitr() -> (tempfile::TempDir, std::path::PathBuf, String) 
         backup_interval_secs: 3600,
         backup_keep: 8,
         backup_dir: Some(backups.clone()),
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3866,6 +3884,7 @@ async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::Path
         backup_interval_secs: 1,
         backup_keep: keep,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -4812,6 +4831,7 @@ async fn backup_restore_refused_on_read_only_replica() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -4958,6 +4978,7 @@ async fn backup_dir_override_is_honored() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: Some(snaps.clone()),
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -5617,6 +5638,7 @@ async fn statement_timeout_kills_runaway_query_only() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 1,
         tls_cert: None,
         tls_key: None,
@@ -6198,6 +6220,7 @@ async fn transport_key_requires_sealed_frames() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -6340,6 +6363,7 @@ async fn garbage_peer_handshake_fails_loudly() {
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -6800,6 +6824,7 @@ async fn spawn_node_tls(
         backup_interval_secs: 0,
         backup_keep: 7,
         backup_dir: None,
+        backup_s3: None,
         statement_timeout_ms: 0,
         tls_cert: Some(cert),
         tls_key: Some(key),
@@ -7019,4 +7044,472 @@ async fn sessions_frame_lists_and_kill_closes() {
         "{}",
         payload_str(&f)
     );
+}
+
+// ---- Remote backup copy (DOCSQL_BACKUP_S3_*) ---------------------------
+
+struct MockReq {
+    method: String,
+    path: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// In-process S3-compatible store: plain HTTP/1.1 over a local listener,
+/// one request per connection. Object keys are stored without the bucket
+/// segment (`/db-backups/fleet-a/x` → `fleet-a/x`), exactly the shape the
+/// client's LIST parsing expects to read back.
+#[derive(Clone)]
+struct MockS3 {
+    addr: String,
+    store: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<MockReq>>>,
+}
+
+fn mock_object_key(path: &str) -> String {
+    let p = path.trim_start_matches('/');
+    p.split_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(p)
+        .to_string()
+}
+
+async fn spawn_mock_s3() -> MockS3 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let store: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let requests: std::sync::Arc<std::sync::Mutex<Vec<MockReq>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (store2, requests2) = (store.clone(), requests.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = l.accept().await else {
+                break;
+            };
+            let (store, requests) = (store2.clone(), requests2.clone());
+            tokio::spawn(async move {
+                let mut sock = sock;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p;
+                    }
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let mut lines = head.lines();
+                let reqline = lines.next().unwrap_or_default().to_string();
+                let mut parts = reqline.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let (path, query) = match target.split_once('?') {
+                    Some((p, q)) => (p.to_string(), q.to_string()),
+                    None => (target.clone(), String::new()),
+                };
+                let mut headers = std::collections::HashMap::new();
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                    }
+                }
+                let clen: usize = headers
+                    .get("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut body: Vec<u8> = buf[head_end + 4..].to_vec();
+                while body.len() < clen {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..n]);
+                }
+                body.truncate(clen);
+                requests.lock().unwrap().push(MockReq {
+                    method: method.clone(),
+                    path: path.clone(),
+                    headers,
+                    body: body.clone(),
+                });
+                let key = mock_object_key(&path);
+                let resp: Vec<u8> = match method.as_str() {
+                    "PUT" => {
+                        store.lock().unwrap().insert(key, body);
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_vec()
+                    }
+                    "DELETE" => {
+                        store.lock().unwrap().remove(&key);
+                        b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n".to_vec()
+                    }
+                    "GET" if query.contains("list-type=2") => {
+                        let prefix = query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("prefix="))
+                            .unwrap_or("")
+                            .to_string();
+                        let keys: Vec<String> = store
+                            .lock()
+                            .unwrap()
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        let mut xml = String::from(
+                            "<?xml version=\"1.0\"?><ListBucketResult><IsTruncated>false</IsTruncated>",
+                        );
+                        for k in &keys {
+                            xml.push_str(&format!("<Contents><Key>{k}</Key></Contents>"));
+                        }
+                        xml.push_str("</ListBucketResult>");
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            xml.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(xml.as_bytes());
+                        r
+                    }
+                    "GET" => {
+                        let hit = store.lock().unwrap().get(&key).cloned();
+                        match hit {
+                            Some(bytes) => {
+                                let mut r = format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                    bytes.len()
+                                )
+                                .into_bytes();
+                                r.extend_from_slice(&bytes);
+                                r
+                            }
+                            None => b"HTTP/1.1 404 NoSuchKey\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+                        }
+                    }
+                    _ => b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_vec(),
+                };
+                sock.write_all(&resp).await.ok();
+            });
+        }
+    });
+    MockS3 {
+        addr,
+        store,
+        requests,
+    }
+}
+
+async fn start_server_s3(
+    mock_addr: &str,
+    keep: usize,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+    let db = dir.path().join("e2e.db");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = docsql_server::ServerConfig {
+        db_path: db,
+        listen: addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: None,
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 3600,
+        backup_keep: keep,
+        backup_dir: Some(backups.clone()),
+        backup_s3: Some(docsql_server::s3::S3BackupConfig {
+            endpoint: format!("http://{mock_addr}"),
+            bucket: "db-backups".into(),
+            access_key: "AKIDEXAMPLE".into(),
+            secret_key: "wJalr-test-secret-key".into(),
+            region: "us-east-1".into(),
+            prefix: "fleet-a".into(),
+            keep: 0,
+            ca: None,
+            tls: false,
+        }),
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    tokio::spawn(docsql_server::run(cfg));
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            return (dir, backups, addr);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("server did not come up");
+}
+
+/// Remote backup copy end to end: finished backups and incremental
+/// segments land in the bucket (sha256 sidecars included) over real
+/// SigV4-signed requests; remote retention mirrors keep-N; and a restore
+/// whose local copy vanished fetches the base — plus the whole
+/// incremental chain for a point-in-time target — back from the bucket
+/// before replaying. The mock S3 is an in-process HTTP server, so the
+/// wire bytes are what gets asserted.
+#[tokio::test]
+async fn backup_s3_remote_copy_upload_fetch_and_retention() {
+    let mock = spawn_mock_s3().await;
+    let (_dir, backups, addr) = start_server_s3(&mock.addr, 2).await;
+    let mut c = Client::connect(&addr).await;
+    c.sql("CREATE TABLE dr (id INT PRIMARY KEY, v TEXT)").await;
+    c.sql("INSERT INTO dr VALUES (1, 'survives')").await;
+
+    async fn trigger(addr: &str, body: &str) -> Frame {
+        let mut c = Client::connect(addr).await;
+        c.send(&Frame::new(proto::REQ_BACKUP, body.as_bytes().to_vec()))
+            .await;
+        c.recv().await
+    }
+    // Trigger/export with a bounded retry: a timer backup or a still-
+    // running prior op holds the flag; "already in progress" is a
+    // scheduling race, not a failure of the operation under test.
+    async fn trigger_wait(addr: &str, body: &str) -> Frame {
+        for _ in 0..100 {
+            let r = trigger(addr, body).await;
+            if !(r.frame_type == proto::RESP_ERROR
+                && payload_str(&r).contains("already in progress"))
+            {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("backup flag never freed up for {body}");
+    }
+    async fn wait_backup_idle(addr: &str) {
+        for _ in 0..500 {
+            let v = backup_list(addr, None).await;
+            if v["running"] == false && v["restore"]["running"] != true {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("backup did not go idle");
+    }
+    // The startup tick takes a full backup of the (empty) state with its
+    // uploads included — wait it out or the first trigger below collides
+    // with "backup already in progress" under suite load.
+    wait_backup_idle(&addr).await;
+    async fn wait_local_backup(backups: &std::path::Path) -> String {
+        for _ in 0..250 {
+            let mut names: Vec<String> = std::fs::read_dir(backups)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n.starts_with("backup-") && n.ends_with(".sql"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            if let Some(n) = names.pop() {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no local base backup appeared");
+    }
+    async fn wait_remote_key(mock: &MockS3, needle: &str) {
+        for _ in 0..250 {
+            if mock
+                .store
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.contains(needle))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("remote key containing {needle} never appeared");
+    }
+
+    // Full backup: the local pair AND its remote copy appear.
+    let r = trigger_wait(&addr, r#"{"action":"trigger"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    wait_backup_idle(&addr).await;
+    let base = wait_local_backup(&backups).await;
+    wait_remote_key(&mock, &format!("fleet-a/{base}")).await;
+    wait_remote_key(&mock, &format!("fleet-a/{base}.sha256")).await;
+
+    // The uploaded object is byte-identical to the local file, its
+    // x-amz-content-sha256 matches the bytes, and the request carries a
+    // genuine SigV4 authorization line. Scoped so the std-Mutex guard
+    // drops before the next await (clippy await_holding_lock is lexical).
+    let local_bytes = std::fs::read(backups.join(&base)).unwrap();
+    {
+        let reqs = mock.requests.lock().unwrap();
+        let put = reqs
+            .iter()
+            .find(|r| r.method == "PUT" && r.path == format!("/db-backups/fleet-a/{base}"))
+            .expect("base backup PUT not recorded");
+        assert_eq!(
+            put.body, local_bytes,
+            "uploaded bytes diverge from local file"
+        );
+        assert_eq!(
+            put.headers.get("x-amz-content-sha256").map(String::as_str),
+            Some(docsql_core::kdf::hex(&docsql_core::kdf::sha256(&put.body))).as_deref(),
+            "payload hash header must match the body"
+        );
+        let auth = put
+            .headers
+            .get("authorization")
+            .expect("no authorization header");
+        assert!(
+            auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+            "auth: {auth}"
+        );
+        assert!(
+            auth.contains("/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="),
+            "auth: {auth}"
+        );
+        let sig = auth.rsplit("Signature=").next().unwrap();
+        assert_eq!(sig.len(), 64, "signature must be 64 hex chars: {auth}");
+        assert_eq!(
+            put.headers.get("host").map(String::as_str),
+            Some(mock.addr.as_str()),
+            "host header must match the endpoint authority"
+        );
+    }
+
+    // Status payload carries the remote config + a healthy last upload.
+    let v = backup_list(&addr, None).await;
+    assert_eq!(v["remote"]["bucket"], "db-backups", "{}", v);
+    assert_eq!(v["remote"]["prefix"], "fleet-a", "{}", v);
+    assert_eq!(v["remote"]["last"]["ok"], true, "{}", v);
+
+    // Incremental segment rides along to the bucket too.
+    c.sql("INSERT INTO dr VALUES (2, 'second')").await;
+    let t_target = docsql_core::now_ms() as i64 + 60_000;
+    let r = trigger_wait(&addr, r#"{"action":"export"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    wait_remote_key(&mock, "fleet-a/incr-").await;
+    wait_remote_key(&mock, ".sql.sha256").await;
+
+    // Volume loss: the local backup directory is gone. A plain restore
+    // fetches the base (+ sidecar) from the bucket and replays it.
+    std::fs::remove_dir_all(&backups).unwrap();
+    let r = trigger(&addr, &format!(r#"{{"action":"restore","file":"{base}"}}"#)).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    for _ in 0..500 {
+        let v = backup_list(&addr, None).await;
+        if v["restore"]["running"] == false {
+            assert_eq!(v["restore"]["ok"], true, "{}", v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let row = c.sql("SELECT id, v FROM dr ORDER BY id").await;
+    assert_eq!(row.frame_type, proto::RESP_ROWS, "{}", payload_str(&row));
+    assert!(
+        payload_str(&row).contains("survives"),
+        "{}",
+        payload_str(&row)
+    );
+    assert!(
+        !payload_str(&row).contains("second"),
+        "plain restore must not replay the journal: {}",
+        payload_str(&row)
+    );
+    assert!(
+        backups.join(&base).is_file(),
+        "fetched base file must be materialized locally"
+    );
+
+    // Point-in-time restore fetches the missing incremental chain from
+    // the bucket as well: base + row-2 journal entry come back.
+    let iso = docsql_core::value::format_timestamp_ms(t_target);
+    let r = trigger(
+        &addr,
+        &format!(r#"{{"action":"restore","file":"{base}","to":"{iso}"}}"#),
+    )
+    .await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    for _ in 0..500 {
+        let v = backup_list(&addr, None).await;
+        if v["restore"]["running"] == false {
+            assert_eq!(v["restore"]["ok"], true, "{}", v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let row = c.sql("SELECT id, v FROM dr ORDER BY id").await;
+    assert!(
+        payload_str(&row).contains("second"),
+        "{}",
+        payload_str(&row)
+    );
+
+    // Remote retention mirrors keep=2: after a third and fourth backup the
+    // oldest remote full backup (and its sidecar) is deleted.
+    let r = trigger(&addr, r#"{"action":"trigger"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    wait_backup_idle(&addr).await;
+    let r = trigger(&addr, r#"{"action":"trigger"}"#).await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    wait_backup_idle(&addr).await;
+    for _ in 0..250 {
+        let count = mock
+            .store
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.contains("/backup-") && k.ends_with(".sql"))
+            .count();
+        if count == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let count = mock
+        .store
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|k| k.contains("/backup-") && k.ends_with(".sql"))
+        .count();
+    assert_eq!(
+        count, 2,
+        "remote retention must keep exactly 2 full backups"
+    );
+    assert!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "DELETE"),
+        "retention must delete the oldest remote backup"
+    );
+    // The deleted backup's sidecar went with it.
+    let stale_sidecars = mock
+        .store
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|k| k.contains("/backup-") && k.ends_with(".sql.sha256"))
+        .count();
+    assert_eq!(stale_sidecars, 2, "every kept backup keeps its sidecar");
 }

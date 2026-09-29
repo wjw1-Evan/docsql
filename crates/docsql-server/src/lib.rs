@@ -37,6 +37,7 @@ pub mod crypto;
 pub mod metrics;
 pub mod pubsub;
 pub mod querylog;
+pub mod s3;
 pub mod tls;
 
 use docsql_core::engine::{AnyStmt, Database, ExecOutcome, TableDigest, TxControl};
@@ -217,6 +218,8 @@ pub struct ServerState {
     pub backup_keep: usize,
     /// Backup directory (default `<db dir>/backups`).
     pub backup_dir: PathBuf,
+    /// Remote backup copy client; None = backups stay local-only.
+    pub backup_s3: Option<s3::S3Client>,
     /// Backup shared state: in-flight flag + last attempt outcome.
     /// Never held while acquiring `write_order`/the engine (see backup.rs).
     pub backup: Mutex<backup::BackupShared>,
@@ -513,6 +516,10 @@ pub struct ServerConfig {
     /// Backup directory override; None = `<db dir>/backups`
     /// (DOCSQL_BACKUP_DIR).
     pub backup_dir: Option<PathBuf>,
+    /// Remote backup copy target (DOCSQL_BACKUP_S3_*); None = backups stay
+    /// local-only. Every finished backup/incremental is additionally PUT
+    /// here, and a restore whose local file is missing fetches it back.
+    pub backup_s3: Option<s3::S3BackupConfig>,
     /// Per-statement wall-clock budget for CLIENT statements
     /// (DOCSQL_STATEMENT_TIMEOUT_MS; 0 = unlimited). Replication apply and
     /// restore replay are exempt — peers must apply what the origin
@@ -635,6 +642,21 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
              REQ_HOLD); configure tokens for any networked deployment"
         );
     }
+    // Remote backup copy client: a bad CA file fails here at startup — the
+    // nightly backup must not be the first place config problems surface.
+    let backup_s3 = match &cfg.backup_s3 {
+        Some(c) => {
+            if c.tls && c.ca.is_none() {
+                eprintln!(
+                    "warning: DOCSQL_BACKUP_S3_ENDPOINT is https without DOCSQL_BACKUP_S3_CA — \
+                     remote backup uploads encrypt but do not verify the storage certificate; \
+                     set DOCSQL_BACKUP_S3_CA to a trust anchor for full verification"
+                );
+            }
+            Some(s3::S3Client::new(c.clone())?)
+        }
+        None => None,
+    };
     let state = Arc::new(ServerState {
         db: std::sync::RwLock::new(db),
         metrics: metrics::Metrics::new(),
@@ -679,6 +701,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         backup_interval_secs: cfg.backup_interval_secs,
         backup_keep: cfg.backup_keep,
         backup_dir,
+        backup_s3,
         backup: Mutex::new(backup::BackupShared::default()),
         restore_progress: std::sync::Arc::new(backup::RestoreProgress::default()),
         grants_epoch: std::sync::atomic::AtomicU64::new(0),

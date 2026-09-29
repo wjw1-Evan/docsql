@@ -48,7 +48,9 @@ readonly=SELECT;自定义角色=授予的表级 DML。读目标按 AST 分类 fa
 
 - 传输:`DOCSQL_KEY`(64 hex)启用 AES-256-GCM 帧加密(token 与数据同密);**数据面原生 TLS**(`DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY`
   监听 + `DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA` 出站,与 AES-GCM 帧加密可叠加,标准 TLS 工具链可对接);
-  绑定非回环地址未配置任一传输保护时启动告警;默认端口仅映射 127.0.0.1;Web 控制台生产部署置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`);
+  **远端备份副本**(`DOCSQL_BACKUP_S3_*`)https 端点同样走 rustls——`DOCSQL_BACKUP_S3_CA` 设置则完整链 + 名称验证,
+  未设 = 只加密不验证并启动告警;SigV4 凭据只保存在节点进程内,状态载荷/日志只出现 endpoint/bucket/prefix;
+  绑定非回环地址未配置任一传输保护时启动显式告警;默认端口仅映射 127.0.0.1;Web 控制台生产部署置于 TLS 反代之后(`DOCSQL_WEB_COOKIE_SECURE=1`);
 - 静态:TDE 未内置(部署于加密卷之上);备份为明文 SQL + sha256 sidecar(防损坏/篡改,不保密——保护备份卷);
 - Web 控制台:首次使用强制设置账号(盐化 PBKDF2 存储,HttpOnly 会话 Cookie),
   改密码踢掉其它全部在线会话;浏览器不持有节点令牌(控制台以服务端 `DOCSQL_TOKEN`
@@ -78,7 +80,7 @@ readonly=SELECT;自定义角色=授予的表级 DML。读目标按 AST 分类 fa
 | SQL 注入防护 | **ADO.NET/EF Core 默认服务端参数绑定**(REQ_PREPARE/REQ_EXECUTE:占位符在服务端引号感知绑定,字符串值翻倍转义,任何取值都无法逃逸字面量);服务端不拼接外部输入;系统表 `_pubsub_messages` 对 SQL 客户端隐藏 |
 | 数据完整性 | WAL 先写日志后落数据、崩溃恢复;节点间复制依赖独立集群凭据防伪造 |
 | 口令策略 | 数据库用户、服务 token、Web 控制台账号三处统一策略:长度 ≥8 且拒绝单字符重复;PBKDF2 迭代默认 210000(`DOCSQL_PBKDF2_ITERATIONS` 低于 10000 时启动告警;存量凭据按各自存储值校验) |
-| 数据备份 | 自动定时备份(默认每日,`DOCSQL_BACKUP_INTERVAL_SECS`/`DOCSQL_BACKUP_KEEP` 可调):整库一致点逻辑快照,随数据卷持久;**每份备份带 sha256 校验和 sidecar,恢复前强校验**(损坏/被篡改的转储在重放前被拒,旧备份无 sidecar 仍可恢复);恢复为整库重放,控制台备份页可手动触发;备份成败计入审计日志。注意:备份与 `_cluster_log` 期刊包含用户口令的 PBKDF2 哈希(复制/恢复所需)——备份目录的访问边界即哈希的暴露边界,目录权限应与数据卷同口径 |
+| 数据备份 | 自动定时备份(默认每日,`DOCSQL_BACKUP_INTERVAL_SECS`/`DOCSQL_BACKUP_KEEP` 可调):整库一致点逻辑快照,随数据卷持久;**每份备份带 sha256 校验和 sidecar,恢复前强校验**(损坏/被篡改的转储在重放前被拒,旧备份无 sidecar 仍可恢复);**远端备份副本**(`DOCSQL_BACKUP_S3_*`):备份与增量段自动复制到 S3 兼容对象存储,数据卷损坏后可回源恢复(下载走同一强校验);恢复为整库重放,控制台备份页可手动触发;备份成败计入审计日志。注意:备份与 `_cluster_log` 期刊包含用户口令的 PBKDF2 哈希(复制/恢复所需)——备份目录与远端 bucket 的访问边界即哈希的暴露边界,目录权限/bucket 策略应与数据卷同口径 |
 
 已知边界:审计环形缓冲在内存(重启丢失,需要长期留存请启用 `DOCSQL_LOG_FILE` 外发);静态数据加密(TDE)暂未内置(可部署在加密卷之上);备份为明文逻辑快照(请保护备份目录/卷)。
 

@@ -41,6 +41,17 @@
 //! (a still-diverged node heals on its own restart repair). Restores are
 //! mutually exclusive cluster-wide: the initiating node probes every
 //! peer's status and refuses while one is already running there.
+//!
+//! Remote copy (DOCSQL_BACKUP_S3_*): every finished backup AND incremental
+//! segment is additionally PUT to an S3-compatible bucket (sha256 sidecar
+//! included), so a lost data volume cannot take the only backup with it —
+//! the remote pair is the off-volume recovery copy, and a restore whose
+//! local file is missing fetches base + incremental chain back before
+//! replaying. Uploads run inside the backup-operation window (all engine
+//! locks are already dropped) and never fail the local backup that has
+//! already fsynced — the outcome lands in the status payload, the sync
+//! log and a metric instead. Remote retention mirrors the local keep-N
+//! over the same naming patterns.
 
 use crate::querylog;
 use crate::{ConnRole, ServerState};
@@ -93,15 +104,29 @@ impl RestoreStatus {
     }
 }
 
+/// Outcome of the last remote-copy upload attempt (`DOCSQL_BACKUP_S3_*`),
+/// reported by REQ_BACKUP list / the status payload. Separate from
+/// [`BackupStatus`]: incremental uploads land here too, and a failed
+/// upload must not fail the local backup that already fsynced.
+#[derive(Clone, Debug)]
+pub struct RemoteUpload {
+    pub ts_ms: u64,
+    pub file: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
 /// Shared backup state: one backup/restore runs at a time (timer tick and
 /// manual triggers dedupe on the flags; a restore excludes a backup and
 /// vice versa — both contend for the same write path). `last` reports the
-/// newest backup attempt, `restore` the newest restore attempt.
+/// newest backup attempt, `restore` the newest restore attempt,
+/// `remote_last` the newest remote-copy upload (backup or incremental).
 #[derive(Default)]
 pub struct BackupShared {
     pub running: bool,
     pub last: Option<BackupStatus>,
     pub restore: Option<RestoreStatus>,
+    pub remote_last: Option<RemoteUpload>,
 }
 
 /// Live restore-replay counters, shared locklessly between the replay loop
@@ -173,23 +198,32 @@ async fn finish_backup(state: &Arc<ServerState>) -> Result<String, String> {
             error: Some(e.clone()),
         },
     };
-    querylog::sync_event(
-        &state.sync_log,
-        "backup",
-        "",
-        None,
-        status.ok,
-        match &status.error {
-            Some(e) => Some(e.clone()),
-            None => Some(format!(
-                "{} bytes written",
-                docsql_core::file_bytes(&state.backup_dir.join(&status.file))
-            )),
-        },
-    );
     let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
     b.running = false;
-    b.last = Some(status);
+    b.last = Some(status.clone());
+    // The sync-log trail must carry the remote-copy outcome: a nightly
+    // backup whose off-volume copy failed is exactly the failure an
+    // operator scans the logs page for.
+    let remote = b.remote_last.clone();
+    drop(b);
+    let bytes = if status.file.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} bytes written",
+            docsql_core::file_bytes(&state.backup_dir.join(&status.file))
+        )
+    };
+    let detail = match (&status.error, &remote) {
+        (Some(e), _) => Some(e.clone()),
+        (None, Some(r)) if !r.ok => Some(format!(
+            "{bytes}; REMOTE COPY FAILED: {}",
+            r.error.clone().unwrap_or_default()
+        )),
+        (None, Some(_)) => Some(format!("{bytes}; remote copy ok")),
+        (None, None) => Some(bytes),
+    };
+    querylog::sync_event(&state.sync_log, "backup", "", None, status.ok, detail);
     res
 }
 
@@ -241,7 +275,128 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     .map_err(|e| format!("backup checksum write: {e}"))?;
     std::fs::rename(&tmp, sidecar).map_err(|e| format!("backup checksum rename: {e}"))?;
     prune_backups(&state.backup_dir, state.backup_keep);
+    // Remote copy: the local pair is durable — push both objects to the
+    // bucket and mirror retention. Failures are recorded (metric, sync
+    // log, status payload), never fail the local backup.
+    if let Some(s3) = &state.backup_s3 {
+        let hex_digest = docsql_core::kdf::hex(&digest);
+        upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
+        if let Ok(sidecar_bytes) = std::fs::read(state.backup_dir.join(format!("{name}.sha256"))) {
+            upload_backup_bytes(state, s3, &format!("{name}.sha256"), &sidecar_bytes).await;
+        }
+        prune_remote(s3, state).await;
+    }
     Ok(name)
+}
+
+/// Upload one object and record the outcome in the shared state + the
+/// sync-log-visible metric counters. Loud by design: a remote copy that
+/// silently stopped working defeats its entire purpose.
+async fn upload_backup_file(
+    state: &Arc<ServerState>,
+    s3: &crate::s3::S3Client,
+    name: &str,
+    path: &Path,
+    sha256_hex: &str,
+) {
+    let key = s3.config().object_key(name);
+    let res = s3.put_file(&key, path, sha256_hex).await;
+    record_upload(state, name, res).await;
+}
+
+async fn upload_backup_bytes(
+    state: &Arc<ServerState>,
+    s3: &crate::s3::S3Client,
+    name: &str,
+    body: &[u8],
+) {
+    let key = s3.config().object_key(name);
+    let res = s3.put_bytes(&key, body).await;
+    record_upload(state, name, res).await;
+}
+
+async fn record_upload(state: &Arc<ServerState>, name: &str, res: Result<(), String>) {
+    use std::sync::atomic::Ordering;
+    state
+        .metrics
+        .backup_uploads_total
+        .fetch_add(1, Ordering::Relaxed);
+    if let Err(e) = &res {
+        state
+            .metrics
+            .backup_upload_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!("remote backup copy of {name} failed: {e}");
+    }
+    let entry = RemoteUpload {
+        ts_ms: now_ms(),
+        file: name.to_string(),
+        ok: res.is_ok(),
+        error: res.as_ref().err().cloned(),
+    };
+    state
+        .backup
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remote_last = Some(entry);
+}
+
+/// Mirror the local keep-N onto the remote prefix: full backups keep
+/// `effective_keep`, incrementals keep max(keep, 4) — the same clamps as
+/// the local pruner. Best effort: a failed listing or delete is logged
+/// and retried on the next backup. Deletion only ever considers keys
+/// matching the local naming patterns; newest-N by lexicographic order
+/// (== chronological, the same invariant next_stamp maintains locally).
+async fn prune_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
+    if let Err(e) = prune_remote_inner(s3, state).await {
+        eprintln!("remote backup retention failed: {e}");
+    }
+}
+
+async fn prune_remote_inner(
+    s3: &crate::s3::S3Client,
+    state: &Arc<ServerState>,
+) -> Result<(), String> {
+    let cfg = s3.config();
+    let keys = s3.list(&cfg.prefix).await?;
+    let keep = cfg.effective_keep(state.backup_keep);
+    prune_remote_class(s3, &keys, "backup-", keep).await?;
+    prune_remote_class(s3, &keys, "incr-", keep.max(4)).await?;
+    Ok(())
+}
+
+async fn prune_remote_class(
+    s3: &crate::s3::S3Client,
+    keys: &[String],
+    pattern_start: &str,
+    keep: usize,
+) -> Result<(), String> {
+    let mut victims: Vec<&String> = keys
+        .iter()
+        .filter(|k| {
+            key_file_name(k).is_some_and(|n| n.starts_with(pattern_start) && n.ends_with(".sql"))
+        })
+        .collect();
+    victims.sort();
+    let excess = victims.len().saturating_sub(keep);
+    for key in victims.into_iter().take(excess) {
+        if let Err(e) = s3.delete(key).await {
+            eprintln!("remote prune delete {key} failed: {e}");
+            continue;
+        }
+        let sidecar = format!("{key}.sha256");
+        if let Err(e) = s3.delete(&sidecar).await {
+            eprintln!("remote prune delete {sidecar} failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// File-name part of an object key (`fleet-a/backup-1.sql` →
+/// `backup-1.sql`).
+fn key_file_name(key: &str) -> Option<&str> {
+    let n = key.rsplit('/').next()?;
+    (!n.is_empty()).then_some(n)
 }
 
 /// Write bytes with owner-only permissions, fully synced before returning.
@@ -671,6 +826,17 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
     let sidecar = state.backup_dir.join(format!("{name}.sha256"));
     std::fs::rename(&tmp, sidecar).map_err(|e| format!("incr checksum rename: {e}"))?;
     prune_incr(&state.backup_dir, state.backup_keep.max(4));
+    // Remote copy rides along with the local write: a disaster-recovery
+    // restore to a point in time needs the base AND the whole incremental
+    // chain off-volume, so every new segment goes up as it lands.
+    if let Some(s3) = &state.backup_s3 {
+        let hex_digest = docsql_core::kdf::hex(&digest);
+        upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
+        if let Ok(sidecar_bytes) = std::fs::read(state.backup_dir.join(format!("{name}.sha256"))) {
+            upload_backup_bytes(state, s3, &format!("{name}.sha256"), &sidecar_bytes).await;
+        }
+        prune_remote(s3, state).await;
+    }
     Ok(())
 }
 
@@ -905,7 +1071,12 @@ pub(crate) async fn handle_backup(
                     ),
                 );
             }
-            if !state.backup_dir.join(&file).is_file() {
+            // Local copy may be gone (volume loss) while the remote copy
+            // survives: with a remote target configured, a missing file
+            // defers to the prefetch inside the restore task, which
+            // fetches it — or fails with a precise error when the remote
+            // copy does not have it either.
+            if !state.backup_dir.join(&file).is_file() && state.backup_s3.is_none() {
                 return Frame::new(
                     proto::RESP_ERROR,
                     crate::err_payload(&format!("restore: no such backup file {file}")),
@@ -1167,11 +1338,89 @@ async fn run_restore(
     res
 }
 
+/// Fetch backup assets from the remote copy target when they are missing
+/// locally: the requested base file (always) and the incremental chain
+/// (for a point-in-time target). The remote listing is authoritative —
+/// a sidecar that EXISTS remotely must come back, so a failed download
+/// of it fails the restore loudly instead of silently degrading to an
+/// unverified replay (the legacy missing-sidecar tolerance only applies
+/// to backups that predate checksums, not to network failures).
+async fn ensure_local_backup_assets(
+    state: &Arc<ServerState>,
+    file: &str,
+    target_ms: Option<i64>,
+) -> Result<(), String> {
+    let Some(s3) = &state.backup_s3 else {
+        if !state.backup_dir.join(file).is_file() {
+            return Err(format!("no such backup file {file}"));
+        }
+        return Ok(());
+    };
+    let cfg = s3.config();
+    let remote: std::collections::HashSet<String> =
+        s3.list(&cfg.prefix).await?.into_iter().collect();
+    let remote_has = |name: &str| remote.contains(&cfg.object_key(name));
+    if !state.backup_dir.join(file).is_file() {
+        if !remote_has(file) {
+            return Err(format!(
+                "restore: no such backup file {file} locally or in the remote copy"
+            ));
+        }
+        fetch_remote_object(state, s3, file).await?;
+    }
+    let base_sidecar = format!("{file}.sha256");
+    if !state.backup_dir.join(&base_sidecar).is_file() && remote_has(&base_sidecar) {
+        fetch_remote_object(state, s3, &base_sidecar).await?;
+    }
+    if target_ms.is_some() {
+        // Point-in-time replay needs the whole incremental chain, not just
+        // the segments this node still holds locally.
+        for key in &remote {
+            let Some(fname) = key_file_name(key) else {
+                continue;
+            };
+            if !(fname.starts_with("incr-") && fname.ends_with(".sql")) {
+                continue;
+            }
+            if !state.backup_dir.join(fname).is_file() {
+                fetch_remote_object(state, s3, fname).await?;
+            }
+            let sidecar = format!("{fname}.sha256");
+            if !state.backup_dir.join(&sidecar).is_file() && remote_has(&sidecar) {
+                fetch_remote_object(state, s3, &sidecar).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Download one object into the backup directory under its file name.
+async fn fetch_remote_object(
+    state: &Arc<ServerState>,
+    s3: &crate::s3::S3Client,
+    name: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(&state.backup_dir).map_err(|e| format!("backup dir: {e}"))?;
+    let key = s3.config().object_key(name);
+    let dest = state.backup_dir.join(name);
+    s3.get_file(&key, &dest)
+        .await
+        .map_err(|e| format!("remote copy fetch for {name}: {e}"))?;
+    eprintln!("restored {name} from the remote backup copy");
+    Ok(())
+}
+
 async fn restore_inner(
     state: &Arc<ServerState>,
     file: &str,
     target_ms: Option<i64>,
 ) -> Result<usize, String> {
+    // Disaster recovery first: pull base (+ incremental chain, for a
+    // point-in-time target) back from the remote copy when the local copy
+    // is missing. All of it runs before any engine lock; the checksum
+    // verification below then treats downloaded files exactly like local
+    // ones.
+    ensure_local_backup_assets(state, file, target_ms).await?;
     // Filesystem work before any engine lock: the script is O(data).
     // Integrity first: a sidecar mismatch refuses the whole-cluster replay
     // up front (missing sidecar = legacy backup, tolerated).
@@ -1265,6 +1514,24 @@ async fn restore_inner(
 pub fn backup_payload(state: &ServerState) -> Vec<u8> {
     let b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
     let files = list_backups(&state.backup_dir);
+    // Config summary only — endpoint/bucket/prefix/keep/tls; the access
+    // and secret keys never leave the process.
+    let remote = state.backup_s3.as_ref().map(|s3| {
+        let cfg = s3.config();
+        serde_json::json!({
+            "endpoint": cfg.endpoint,
+            "bucket": cfg.bucket,
+            "prefix": cfg.prefix,
+            "keep": cfg.effective_keep(state.backup_keep),
+            "tls": cfg.tls,
+            "last": b.remote_last.as_ref().map(|r| serde_json::json!({
+                "ts_ms": r.ts_ms,
+                "file": r.file,
+                "ok": r.ok,
+                "error": r.error,
+            })),
+        })
+    });
     let body = serde_json::json!({
         "dir": state.backup_dir.display().to_string(),
         "interval_secs": state.backup_interval_secs,
@@ -1272,6 +1539,7 @@ pub fn backup_payload(state: &ServerState) -> Vec<u8> {
         "running": b.running,
         "count": files.len(),
         "files": files,
+        "remote": remote,
         "last": b.last.as_ref().map(|l| serde_json::json!({
             "ts_ms": l.ts_ms,
             "file": l.file,

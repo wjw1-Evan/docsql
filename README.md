@@ -10,7 +10,7 @@ Rust 原生文档数据库:JSON 文档存储 + 完整 SQL + Web 管理控制台 
 - **持久化 pub/sub** — 消息先落盘(WAL)再推送,重启不丢;订阅可从 `earliest` / 指定 id 续传(at-least-once)
 - **DocSQL Studio** — SSMS 风格 Web 管理控制台(对象浏览器/查询工作台/集群监控/备份/用户管理),自身零存储
 - **.NET 栈** — `Docsql.Client`(ADO.NET)、`Docsql.EntityFrameworkCore`(原生 EF Core 提供程序,免迁移自动同步模型)、Aspire 编排三件套
-- **安全** — token / 数据库用户与角色 / 表级权限、AES-256-GCM 传输加密、登录锁定、审计日志、自动备份(带 sha256 校验)
+- **安全** — token / 数据库用户与角色 / 表级权限、AES-256-GCM 传输加密、登录锁定、审计日志、自动备份(带 sha256 校验)与 S3 远端备份副本
 
 各项能力的完整说明与示例见[功能总览](docs/features.md)。
 
@@ -52,7 +52,7 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 - **扩容**:起一个指向现有节点的全新容器(`join` profile)即自动拉取全量历史并注册进扇出网格
 - **自愈**:节点离线错过的写在重启时自动增量补齐,超出日志窗口转多数派快照采纳
 - **持久化**:数据在 external 卷,换镜像、重建容器乃至 `down -v` 都不丢
-- **备份**:默认每日自动备份(保留 7 份、带 sha256 校验),控制台或 `POST /api/backup` 可手动触发与一键恢复;支持 PITR 增量链
+- **备份**:默认每日自动备份(保留 7 份、带 sha256 校验),控制台或 `POST /api/backup` 可手动触发与一键恢复;支持 PITR 增量链;可选 S3 兼容远端备份副本(`DOCSQL_BACKUP_S3_*`),数据卷损坏后自动回源恢复
 
 ## .NET 与 Aspire
 
