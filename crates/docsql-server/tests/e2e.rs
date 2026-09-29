@@ -62,6 +62,7 @@ async fn start_server_sec(
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -114,6 +115,7 @@ async fn start_server_async_commit() -> (tempfile::TempDir, String) {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -372,6 +374,7 @@ async fn keyed_transport_rejects_replayed_frame() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -946,6 +949,7 @@ async fn fanout_authenticates_with_cluster_token() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1045,6 +1049,7 @@ async fn default_fill_converges_across_peers() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1350,6 +1355,7 @@ async fn replication_and_failover() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1384,6 +1390,7 @@ async fn replication_and_failover() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1503,6 +1510,7 @@ async fn symmetric_cluster_writes_on_any_node_visible_everywhere() {
             quorum_members: Vec::new(),
             quorum_arbiters: Vec::new(),
             arbiter: false,
+            auto_promote: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -1639,6 +1647,7 @@ async fn symmetric_cluster_transaction_writes_replicate_only_on_commit() {
             quorum_members: Vec::new(),
             quorum_arbiters: Vec::new(),
             arbiter: false,
+            auto_promote: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -1735,6 +1744,7 @@ async fn peer_offline_then_online_catches_up_missed_writes() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -1930,6 +1940,7 @@ async fn query_log_records_statements() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -2625,6 +2636,7 @@ async fn pubsub_cross_node_delivery() {
             quorum_members: Vec::new(),
             quorum_arbiters: Vec::new(),
             arbiter: false,
+            auto_promote: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2718,6 +2730,7 @@ async fn symmetric_cluster_guid_autogen_converges() {
             quorum_members: Vec::new(),
             quorum_arbiters: Vec::new(),
             arbiter: false,
+            auto_promote: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,
@@ -2871,6 +2884,7 @@ async fn logs_frame_over_wire() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3063,6 +3077,7 @@ async fn spawn_node(
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3337,6 +3352,7 @@ async fn spawn_node_window(
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3404,6 +3420,7 @@ async fn spawn_node_async(dir: &tempfile::TempDir, name: &str, addr: &str, peers
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3949,6 +3966,7 @@ async fn start_server_pitr() -> (tempfile::TempDir, std::path::PathBuf, String) 
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -3999,6 +4017,7 @@ async fn start_server_backup(keep: usize) -> (tempfile::TempDir, std::path::Path
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -4952,6 +4971,7 @@ async fn backup_restore_refused_on_read_only_replica() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -5105,6 +5125,7 @@ async fn backup_dir_override_is_honored() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -5771,6 +5792,7 @@ async fn statement_timeout_kills_runaway_query_only() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 1,
         tls_cert: None,
         tls_key: None,
@@ -6359,6 +6381,7 @@ async fn transport_key_requires_sealed_frames() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -6508,6 +6531,7 @@ async fn garbage_peer_handshake_fails_loudly() {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -6975,6 +6999,7 @@ async fn spawn_node_tls(
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: Some(cert),
         tls_key: Some(key),
@@ -7391,6 +7416,7 @@ async fn start_server_s3(
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         backup_s3: Some(docsql_server::s3::S3BackupConfig {
             endpoint: format!("http://{mock_addr}"),
             bucket: "db-backups".into(),
@@ -7710,6 +7736,7 @@ async fn start_server_quorum(
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -7753,6 +7780,7 @@ async fn start_arbiter(addr: &str, cluster_token: &str) {
         quorum_members: Vec::new(),
         quorum_arbiters: Vec::new(),
         arbiter: true,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -7947,6 +7975,7 @@ async fn arbiter_answers_status_and_refuses_data_plane() {
         quorum_members: vec![addr.clone()],
         quorum_arbiters: Vec::new(),
         arbiter: false,
+        auto_promote: false,
         statement_timeout_ms: 0,
         tls_cert: None,
         tls_key: None,
@@ -7971,5 +8000,350 @@ async fn arbiter_answers_status_and_refuses_data_plane() {
     assert_eq!(v["quorum"]["fenced"], false, "{}", v);
     let mut c2 = Client::connect(&node_addr).await;
     let r = c2.sql("CREATE TABLE ok (id INT)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+}
+
+// ---- Phase 2: auto-PROMOTE + primary-epoch demotion (design 004 §4) ----
+
+async fn start_node_with(cfg: docsql_server::ServerConfig) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = docsql_server::run(cfg).await;
+    })
+}
+
+async fn wait_listening(addr: &str) {
+    for _ in 0..100 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{addr} did not come up");
+}
+
+/// A read-only replica configured DOCSQL_AUTO_PROMOTE promotes itself when
+/// the primary has missed K probe cycles with a majority visible and the
+/// journal lag inside the catch-up window — and then owns its writes.
+#[tokio::test]
+async fn auto_promote_fires_on_primary_loss() {
+    const TOK: &str = "p2-cluster-tok";
+    // Primary on a reserved addr (its handle lets the test kill it).
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let primary_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    let p_cfg = docsql_server::ServerConfig {
+        db_path: std::path::PathBuf::from("p2-primary.db"),
+        listen: primary_addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(TOK.to_string()),
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        auto_promote: false,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    let p_handle = start_node_with(p_cfg).await;
+    wait_listening(&primary_addr).await;
+
+    // Voting members: primary + one arbiter (so the replica keeps a
+    // majority once the primary dies).
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let arb_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    start_arbiter(&arb_addr, TOK).await;
+
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let replica_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    let r_cfg = docsql_server::ServerConfig {
+        db_path: std::path::PathBuf::from("p2-replica.db"),
+        listen: replica_addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(TOK.to_string()),
+        replicate_to: Some(primary_addr.clone()),
+        peers: Vec::new(),
+        advertise: None,
+        read_only: true,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 1_000,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: true,
+        quorum_probe_ms: 100,
+        quorum_k: 15,
+        quorum_members: vec![primary_addr.clone(), arb_addr.clone()],
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        auto_promote: true,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    let _r = start_node_with(r_cfg).await;
+    wait_listening(&replica_addr).await;
+
+    // Replica starts read-only: client writes refused.
+    let mut c = Client::connect(&replica_addr).await;
+    let r = c.sql("CREATE TABLE t (id INT)").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+    let v = quorum_status(&replica_addr, TOK).await;
+    assert_eq!(v["read_only"], true, "{}", v);
+    assert_eq!(v["primary_epoch"], 0, "{}", v);
+
+    // Kill the primary; the replica must promote itself (lag is zero —
+    // the primary had no writes to orphan).
+    p_handle.abort();
+    for _ in 0..100 {
+        if TcpStream::connect(&primary_addr).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for _ in 0..200 {
+        let v = quorum_status(&replica_addr, TOK).await;
+        if v["read_only"] == false {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let v = quorum_status(&replica_addr, TOK).await;
+    assert_eq!(v["read_only"], false, "{}", v);
+    assert_eq!(v["primary_epoch"], 1, "{}", v);
+    assert_eq!(v["replicate_to"], serde_json::Value::Null, "{}", v);
+    // The promoted replica owns its writes (IF NOT EXISTS: under extreme
+    // load the promote can land before the first assertions ran).
+    let r = c.sql("CREATE TABLE IF NOT EXISTS t (id INT)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    let r = c.sql("INSERT INTO t VALUES (7)").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+}
+
+/// The lag guard: a replica whose journal is behind the primary's
+/// last-seen head beyond DOCSQL_CATCHUP_WINDOW must NOT promote — the
+/// writes the primary confirmed would be unreachable.
+#[tokio::test]
+async fn auto_promote_stays_readonly_when_lag_exceeds_window() {
+    const TOK: &str = "p2-lag-tok";
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let primary_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    let p_cfg = docsql_server::ServerConfig {
+        db_path: std::path::PathBuf::from("p2-lag-primary.db"),
+        listen: primary_addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(TOK.to_string()),
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: false,
+        quorum_probe_ms: 1_000,
+        quorum_k: 3,
+        quorum_members: Vec::new(),
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        auto_promote: false,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    let p_handle = start_node_with(p_cfg).await;
+    wait_listening(&primary_addr).await;
+
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let arb_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    start_arbiter(&arb_addr, TOK).await;
+
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let replica_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    let r_cfg = docsql_server::ServerConfig {
+        db_path: std::path::PathBuf::from("p2-lag-replica.db"),
+        listen: replica_addr.clone(),
+        auth_token: None,
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(TOK.to_string()),
+        replicate_to: Some(primary_addr.clone()),
+        peers: Vec::new(),
+        advertise: None,
+        read_only: true,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 5,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: true,
+        quorum_probe_ms: 100,
+        quorum_k: 15,
+        quorum_members: vec![primary_addr.clone(), arb_addr.clone()],
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        auto_promote: true,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    let _r = start_node_with(r_cfg).await;
+    wait_listening(&replica_addr).await;
+
+    // Ten writes land on the PRIMARY only; the replica's journal stays at
+    // zero, so its lag (10) exceeds the catch-up window (5).
+    let mut c = Client::connect(&primary_addr).await;
+    c.sql("CREATE TABLE w (id INT)").await;
+    for i in 0..10 {
+        c.sql(&format!("INSERT INTO w VALUES ({i})")).await;
+    }
+    // Let one probe cycle observe the primary's head before it dies.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    p_handle.abort();
+    for _ in 0..100 {
+        if TcpStream::connect(&primary_addr).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Well past the debounce window: still read-only, loudly.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let v = quorum_status(&replica_addr, TOK).await;
+    assert_eq!(v["read_only"], true, "{}", v);
+    assert_eq!(v["primary_epoch"], 0, "{}", v);
+    let mut c = Client::connect(&replica_addr).await;
+    let r = c.sql("INSERT INTO w VALUES (99)").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+    assert!(
+        payload_str(&r).contains("read-only replica"),
+        "{}",
+        payload_str(&r)
+    );
+}
+
+/// A recovered stale primary demotes on sight of a higher-epoch primary:
+/// read-only plus re-pointed at the winner, which stays writable.
+#[tokio::test]
+async fn stale_primary_demotes_on_higher_epoch() {
+    const TOK: &str = "p2-demote-tok";
+    // Two writable nodes, each in the other's voting member list.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let b_addr = l.local_addr().unwrap().to_string();
+    drop(l);
+    let mk = |listen: String, peer: String| docsql_server::ServerConfig {
+        db_path: std::path::PathBuf::from(format!("p2-{listen}.db")),
+        listen: listen.clone(),
+        auth_token: Some("b-admin-tok".to_string()),
+        read_token: None,
+        max_conn: 0,
+        idle_timeout_secs: 0,
+        auth_lock_threshold: 10,
+        cluster_token: Some(TOK.to_string()),
+        replicate_to: None,
+        peers: Vec::new(),
+        advertise: None,
+        read_only: false,
+        transport_key: None,
+        async_commit: false,
+        catchup_window: 0,
+        backup_interval_secs: 0,
+        backup_keep: 7,
+        backup_dir: None,
+        backup_s3: None,
+        quorum: true,
+        quorum_probe_ms: 100,
+        quorum_k: 3,
+        quorum_members: vec![peer],
+        quorum_arbiters: Vec::new(),
+        arbiter: false,
+        auto_promote: false,
+        statement_timeout_ms: 0,
+        tls_cert: None,
+        tls_key: None,
+        tls_connect: false,
+        tls_ca: None,
+    };
+    let _a = start_node_with(mk(a_addr.clone(), b_addr.clone())).await;
+    let _b = start_node_with(mk(b_addr.clone(), a_addr.clone())).await;
+    wait_listening(&a_addr).await;
+    wait_listening(&b_addr).await;
+
+    // B promotes (manual): epoch 1. A (epoch 0) must demote on sight.
+    let mut cb = Client::connect(&b_addr).await;
+    assert_eq!(
+        cb.auth("b-admin-tok").await.frame_type,
+        proto::RESP_AFFECTED
+    );
+    cb.send(&Frame::new(proto::REQ_PROMOTE, vec![])).await;
+    let r = cb.recv().await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+
+    for _ in 0..200 {
+        let v = quorum_status(&a_addr, TOK).await;
+        if v["read_only"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let v = quorum_status(&a_addr, TOK).await;
+    assert_eq!(v["read_only"], true, "{}", v);
+    assert_eq!(v["replicate_to"], serde_json::json!(b_addr), "{}", v);
+    // The demoted node refuses writes like any read-only replica.
+    let mut ca = Client::connect(&a_addr).await;
+    let r = ca.sql("INSERT INTO q VALUES (1)").await;
+    assert_eq!(r.frame_type, proto::RESP_ERROR, "{}", payload_str(&r));
+    // The winner stays writable.
+    let r = cb.sql("CREATE TABLE q (id INT)").await;
     assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
 }

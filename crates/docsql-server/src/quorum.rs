@@ -39,10 +39,29 @@ const PROBE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// always visible while the process runs). `misses` counts consecutive
 /// failed probe cycles; a member is lost at `>= k` (the design's
 /// debounce), healed by any single success.
+/// What the last successful probe of a member revealed (parsed from its
+/// REQ_STATUS payload). Missing fields degrade to defaults — older peers
+/// simply never look like primaries.
+#[derive(Clone, Debug)]
+pub struct MemberView {
+    pub epoch: u64,
+    pub read_only: bool,
+    pub forwarding: bool,
+    pub journal_head: Option<u64>,
+}
+
+impl MemberView {
+    /// An active primary: writable and not forwarding to anyone else.
+    pub fn is_active_primary(&self) -> bool {
+        !self.read_only && !self.forwarding
+    }
+}
+
 pub struct Quorum {
     members: Vec<String>,
     k: usize,
     misses: Mutex<HashMap<String, usize>>,
+    views: Mutex<HashMap<String, MemberView>>,
     fenced: AtomicBool,
     /// Cycles in which at least one member probe failed (observability).
     probe_failure_cycles: AtomicU64,
@@ -56,9 +75,42 @@ impl Quorum {
             members,
             k: k.max(1),
             misses: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
             fenced: AtomicBool::new(false),
             probe_failure_cycles: AtomicU64::new(0),
         }
+    }
+
+    /// Whether `member` has missed K consecutive cycles (the design's
+    /// debounce threshold) — the auto-PROMOTE trigger reads this for the
+    /// primary's address.
+    pub fn is_lost(&self, member: &str) -> bool {
+        let misses = self.misses.lock().unwrap_or_else(|p| p.into_inner());
+        misses.get(member).copied().unwrap_or(0) >= self.k
+    }
+
+    /// The journal head the member reported at its last successful probe
+    /// (auto-PROMOTE's lag guard reads this for the primary).
+    pub fn last_seen_head(&self, member: &str) -> Option<u64> {
+        let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        views.get(member).and_then(|v| v.journal_head)
+    }
+
+    fn record_view(&self, member: &str, view: MemberView) {
+        self.views
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(member.to_string(), view);
+    }
+
+    /// Snapshot of the last-seen member views (supervision reads).
+    fn member_views(&self) -> Vec<(String, MemberView)> {
+        self.views
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn member_count(&self) -> usize {
@@ -138,17 +190,23 @@ pub async fn quorum_task(state: Arc<ServerState>) {
                     crate::probe_frame(&st, &member, docsql_core::proto::REQ_STATUS).await
                 })
                 .await;
-                (member, probe.map(|r| r.is_ok()).unwrap_or(false))
+                (member, probe)
             }));
         }
         let mut any_failed = false;
         for probe in probes {
             match probe.await {
-                Ok((member, ok)) => {
+                Ok((member, outcome)) => {
+                    let ok = matches!(outcome, Ok(Ok(_)));
                     if !ok {
                         any_failed = true;
                     }
                     quorum.record(&member, ok);
+                    if let Ok(Ok(frame)) = outcome {
+                        if let Some(view) = parse_member_view(&frame) {
+                            quorum.record_view(&member, view);
+                        }
+                    }
                 }
                 // A probe task dying (join error) never answered this
                 // cycle: count the cycle as failed.
@@ -195,5 +253,126 @@ pub async fn quorum_task(state: Arc<ServerState>) {
                 Some(detail),
             );
         }
+        supervise(&state, &quorum).await;
     }
+}
+
+/// Parse the role-relevant slice of a member's REQ_STATUS payload.
+fn parse_member_view(frame: &docsql_core::proto::Frame) -> Option<MemberView> {
+    if frame.frame_type != docsql_core::proto::RESP_STATUS {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&frame.payload).ok()?;
+    Some(MemberView {
+        epoch: v["primary_epoch"].as_u64().unwrap_or(0),
+        read_only: v["read_only"].as_bool() == Some(true),
+        forwarding: v["replicate_to"].is_string(),
+        journal_head: v["journal_head"].as_u64(),
+    })
+}
+
+/// Role supervision (design 004 §4, phase 2), evaluated after every cycle:
+///
+/// **Auto-PROMOTE** — a read-only replica configured `DOCSQL_AUTO_PROMOTE`
+/// promotes itself when its primary has missed K cycles, a majority is
+/// visible, and its journal lag to the primary's last-seen head is within
+/// the catch-up window (otherwise the writes the old primary confirmed
+/// would be unreachable — stay read-only and warn once).
+///
+/// **Demotion** — an active primary that sees a HIGHER-epoch active
+/// primary demotes: read-only plus re-pointed at the winner. Equal epochs
+/// never demote (symmetric clusters all sit at 0 and are untouched); the
+/// equal-epoch split-brain window after independent manual promotions is
+/// the documented residual risk of the in-memory epoch (§4.3).
+async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
+    use std::sync::atomic::Ordering;
+    if state.arbiter {
+        return;
+    }
+    let self_epoch = state.primary_epoch.load(Ordering::SeqCst);
+    let read_only = state.read_only.load(Ordering::SeqCst);
+
+    // (a) Auto-PROMOTE.
+    if state.auto_promote && read_only {
+        if let Some(primary) = &state.primary_addr {
+            if quorum.is_lost(primary) && quorum.has_majority() {
+                // Lag guard: how far behind the primary's last-seen head
+                // are we? Zero window = unbounded (always acceptable).
+                let primary_head = quorum.last_seen_head(primary);
+                let lag_ok = match (primary_head, state.catchup_window) {
+                    (None, _) => false, // never saw the primary: cannot judge
+                    (Some(ph), 0) => ph >= local_journal_head(state),
+                    (Some(ph), window) => ph.saturating_sub(local_journal_head(state)) <= window,
+                };
+                if lag_ok {
+                    state.read_only.store(false, Ordering::SeqCst);
+                    *state.replicate_to.lock().await = None;
+                    let epoch = state.primary_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    let detail = format!(
+                        "auto: primary {primary} lost, majority visible, lag within                          window; epoch now {epoch}"
+                    );
+                    eprintln!("docsql-quorum: promoted ({detail})");
+                    crate::querylog::sync_event(
+                        &state.sync_log,
+                        "promote",
+                        primary,
+                        None,
+                        true,
+                        Some(detail),
+                    );
+                } else if !state.promote_lag_warned.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "docsql-quorum: primary {primary} lost but local journal is                          behind beyond DOCSQL_CATCHUP_WINDOW — staying read-only                          (promoting would orphan the writes the primary confirmed)"
+                    );
+                    crate::querylog::sync_event(
+                        &state.sync_log,
+                        "promote",
+                        primary,
+                        None,
+                        false,
+                        Some("auto: lag beyond catch-up window; staying read-only".into()),
+                    );
+                }
+            } else if quorum.last_seen_head(primary).is_some() {
+                // Primary reachable again: reset the once-per-episode warn.
+                state.promote_lag_warned.store(false, Ordering::SeqCst);
+            }
+        }
+        return; // a replica does not demote
+    }
+
+    // (b) Demotion of a stale primary.
+    if !read_only {
+        let forwarding = state.replicate_to.lock().await.is_some();
+        if !forwarding {
+            for (addr, view) in quorum.member_views() {
+                if view.is_active_primary() && view.epoch > self_epoch {
+                    state.read_only.store(true, Ordering::SeqCst);
+                    *state.replicate_to.lock().await = Some(addr.clone());
+                    let detail = format!(
+                        "higher-ranked primary visible: {addr} (epoch {} > {self_epoch}); \
+                         demoted to read-only replica and re-pointed",
+                        view.epoch
+                    );
+                    eprintln!("docsql-quorum: {detail}");
+                    crate::querylog::sync_event(
+                        &state.sync_log,
+                        "demote",
+                        &addr,
+                        None,
+                        true,
+                        Some(detail),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Local journal head (write-tier access: the call may lazily create the
+/// cluster tables, exactly like the status payload's own read).
+fn local_journal_head(state: &Arc<ServerState>) -> u64 {
+    let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+    db.journal_head().unwrap_or(0)
 }

@@ -302,6 +302,16 @@ fn config_from_env(
     let quorum_members = split_members("DOCSQL_QUORUM_MEMBERS")?;
     let quorum_arbiters = split_members("DOCSQL_QUORUM_ARBITERS")?;
     let arbiter = env_bool("DOCSQL_ARBITER", &getenv)?;
+    // Automatic PROMOTE rides the quorum probe loop (lost-primary trigger
+    // + majority visibility both come from it).
+    let auto_promote = env_bool("DOCSQL_AUTO_PROMOTE", &getenv)?;
+    if auto_promote && !quorum {
+        return Err(
+            "DOCSQL_AUTO_PROMOTE requires DOCSQL_QUORUM=1 (the lost-primary and \
+             majority signals come from the probe loop)"
+                .to_string(),
+        );
+    }
     if arbiter && quorum {
         return Err(
             "DOCSQL_ARBITER and DOCSQL_QUORUM are mutually exclusive: an arbiter              votes but never fences"
@@ -350,6 +360,7 @@ fn config_from_env(
         quorum_members,
         quorum_arbiters,
         arbiter,
+        auto_promote,
         statement_timeout_ms,
         tls_cert,
         tls_key,

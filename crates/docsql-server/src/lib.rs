@@ -224,6 +224,18 @@ pub struct ServerState {
     /// Majority-visibility bookkeeping (design 004); None = feature off,
     /// the write gate is inert.
     pub quorum: Option<Arc<quorum::Quorum>>,
+    /// Primary-role epoch (design 004 §4): incremented on every PROMOTE,
+    /// in-memory only (a restarted node has never promoted). Status-visible
+    /// so a recovered stale primary demotes itself.
+    pub primary_epoch: std::sync::atomic::AtomicU64,
+    /// The forwarding upstream as configured at startup: auto-PROMOTE's
+    /// lost-primary trigger reads this (PROMOTE detaches the live
+    /// replicate_to, the trigger must survive that).
+    pub primary_addr: Option<String>,
+    /// DOCSQL_AUTO_PROMOTE (requires the quorum loop).
+    pub auto_promote: bool,
+    /// Lag-guard warning is once per lost-primary episode.
+    pub promote_lag_warned: std::sync::atomic::AtomicBool,
     /// Probe cycle length for the quorum loop (milliseconds).
     pub quorum_probe_ms: u64,
     /// Arbiter mode: no data plane — status probes only.
@@ -544,6 +556,11 @@ pub struct ServerConfig {
     /// answers status probes and nothing else, so 2-node clusters can vote
     /// with a third, independent failure domain.
     pub arbiter: bool,
+    /// Automatic PROMOTE for read-only replicas (DOCSQL_AUTO_PROMOTE,
+    /// design 004 §4): promote when the primary missed K probe cycles, a
+    /// majority is visible, and the journal lag is within the catch-up
+    /// window. Requires DOCSQL_QUORUM.
+    pub auto_promote: bool,
     /// Per-statement wall-clock budget for CLIENT statements
     /// (DOCSQL_STATEMENT_TIMEOUT_MS; 0 = unlimited). Replication apply and
     /// restore replay are exempt — peers must apply what the origin
@@ -661,6 +678,13 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             );
         }
         Some(Arc::new(quorum::Quorum::new(members, cfg.quorum_k)))
+    } else {
+        None
+    };
+    // Auto-PROMOTE trigger basis: the primary as configured at startup
+    // (PROMOTE detaches the live replicate_to; the trigger survives that).
+    let primary_addr = if cfg.auto_promote {
+        cfg.replicate_to.clone()
     } else {
         None
     };
@@ -782,6 +806,10 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         quorum,
         quorum_probe_ms: cfg.quorum_probe_ms,
         arbiter: cfg.arbiter,
+        primary_epoch: std::sync::atomic::AtomicU64::new(0),
+        primary_addr,
+        auto_promote: cfg.auto_promote,
+        promote_lag_warned: std::sync::atomic::AtomicBool::new(false),
         backup: Mutex::new(backup::BackupShared::default()),
         restore_progress: std::sync::Arc::new(backup::RestoreProgress::default()),
         grants_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -1963,6 +1991,11 @@ pub async fn handle_connection(
                             .read_only
                             .store(false, std::sync::atomic::Ordering::SeqCst);
                         *state.replicate_to.lock().await = None;
+                        // Role epoch (design 004 §4): the promotion is
+                        // visible to stale primaries, which demote on sight.
+                        state
+                            .primary_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         querylog::sync_event(&state.sync_log, "promote", "", None, true, None);
                         // Failover changes who owns writes cluster-wide: the
                         // trail must say who pulled the trigger.
@@ -3275,6 +3308,7 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "uptime_ms": state.started.elapsed().as_millis() as u64,
         "read_only": state.read_only.load(std::sync::atomic::Ordering::SeqCst),
         "arbiter": state.arbiter,
+        "primary_epoch": state.primary_epoch.load(std::sync::atomic::Ordering::SeqCst),
         "quorum": {
             "enabled": state.quorum.is_some(),
             "members": state.quorum.as_ref().map(|q| q.member_count()).unwrap_or(0),

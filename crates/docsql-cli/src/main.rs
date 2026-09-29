@@ -1759,6 +1759,7 @@ mod tests {
             quorum_members: Vec::new(),
             quorum_arbiters: Vec::new(),
             arbiter: false,
+            auto_promote: false,
             statement_timeout_ms: 0,
             tls_cert: None,
             tls_key: None,

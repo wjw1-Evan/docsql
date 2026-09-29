@@ -11,6 +11,14 @@ AUTH/PING/STATUS 外全拒,内存库);配置 `DOCSQL_QUORUM`/
 `DOCSQL_QUORUM_ARBITERS`,默认关闭。§2 的开放问题按文中倾向拍板:仲裁者
 不参加摘要选举;`DOCSQL_QUORUM_MEMBERS` 覆盖 PEERS 的成员表语义(扇出仍
 以 PEERS 为准)。阶段 2(主从自动 PROMOTE)未开始,按 §4 推进。
+**阶段 2(主从自动 PROMOTE + primary_epoch 降级)已落地**:
+`DOCSQL_AUTO_PROMOTE=1`(要求 DOCSQL_QUORUM)的副本在「主失联 K 周期 + 多数派可见 +
+日志滞后 ≤ DOCSQL_CATCHUP_WINDOW(滞后超窗→保持只读并告警一次)」三条件下执行与手动
+PROMOTE 相同路径(epoch+1,sync_event 审计);REQ_STATUS 增 `primary_epoch`;PROMOTE(手动
+或自动)递增 epoch;活跃主探测到更高 epoch 的活跃主即降级(只读 + 重指向对方)。实现注意:
+比较只取「更高 epoch」,等值不动作——对称集群所有节点 epoch 恒 0,永不触发;独立手动提升造成
+的等值窗口是 §4.3 已文档化的残余风险。部署要求:主从对的成员表互相列出对方(或经
+DOCSQL_QUORUM_MEMBERS)+ 副本配仲裁者,使主失联后副本仍有多数派可见。
 本文是权威设计;任何可用性/一致性语义相关改动先对照本文的语义矩阵(§6)。
 
 ## 0. 现状(精确事实)

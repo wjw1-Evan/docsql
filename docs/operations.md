@@ -152,6 +152,7 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_QUORUM_PROBE_MS` / `_K` | 1000 / 3 | 探测周期 / 成员失联防抖周期数(栅栏约 K×周期后触发,滚动重启不误伤);非法值拒绝启动 |
 | `DOCSQL_QUORUM_MEMBERS` / `_ARBITERS` | 无(跟随 PEERS)/ 无 | 仲裁成员表覆盖 / 追加零数据投票成员 |
 | `DOCSQL_ARBITER` | 0 | 1 = 仲裁者模式:零存储投票成员,只应答状态探测(需 `DOCSQL_CLUSTER_TOKEN`),给 2 节点集群第三个故障域;与 `DOCSQL_QUORUM` 互斥 |
+| `DOCSQL_AUTO_PROMOTE` | 0 | 1 = 主从副本自动提升(设计 004 §4,需 `DOCSQL_QUORUM=1`):主失联 K 周期 + 多数派可见 + 日志滞后 ≤ `DOCSQL_CATCHUP_WINDOW` 三条件同时满足才执行(滞后超窗保持只读并告警);提升后 epoch+1,回归的旧主探测到更高 epoch 自动降级为只读并重指向新主;部署要求:主从对互相列入成员表 |
 
 ### Web 控制台
 
