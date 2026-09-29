@@ -276,6 +276,10 @@ pub struct IndexDef {
     pub name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    /// JSON path index (design 005): the single column in `columns` holds
+    /// JSON text; tree keys are values extracted at this path via the same
+    /// lookup `JSON_EXTRACT` uses. None = a plain column index.
+    pub path: Option<String>,
 }
 
 impl IndexDef {
@@ -5339,10 +5343,22 @@ impl Database {
                                                         .collect::<Vec<_>>(),
                                                     _ => vec![c.to_string()],
                                                 };
+                                                // Optional 5th element (design
+                                                // 005): the JSON path. Older
+                                                // catalogs lack it; readers
+                                                // that predate path indexes
+                                                // ignore the extra element, so
+                                                // the tuple stays bidirectionally
+                                                // compatible with zero migration.
+                                                let path = t
+                                                    .get(4)
+                                                    .and_then(|v| v.as_str())
+                                                    .map(String::from);
                                                 Some(IndexDef {
                                                     name: n.to_string(),
                                                     columns,
                                                     unique: u,
+                                                    path,
                                                 })
                                             }
                                             _ => None,
@@ -5607,14 +5623,21 @@ impl Database {
                         meta.index_defs
                             .iter()
                             .map(|d| {
-                                Value::Array(vec![
+                                let mut entry = vec![
                                     Value::Str(d.name.clone()),
                                     Value::Str(d.column().to_string()),
                                     Value::Bool(d.unique),
                                     Value::Array(
                                         d.columns.iter().map(|c| Value::Str(c.clone())).collect(),
                                     ),
-                                ])
+                                ];
+                                // 5th element only for path indexes: older
+                                // readers ignore it, so the tuple stays
+                                // compatible in both directions (design 005).
+                                if let Some(p) = &d.path {
+                                    entry.push(Value::Str(p.clone()));
+                                }
+                                Value::Array(entry)
                             })
                             .collect(),
                     ),
@@ -7154,16 +7177,24 @@ impl Database {
             ddl.push_str(&parts.join(",\n"));
             ddl.push_str("\n);\n");
             for d in &meta.index_defs {
+                // Path indexes (design 005) re-emit as the JSON_EXTRACT
+                // expression they were created from — replay parses it back
+                // through the same CREATE INDEX path.
+                let col_text = match &d.path {
+                    Some(p) => format!("JSON_EXTRACT({}, '{}')", quote_ident(&d.columns[0]), p),
+                    None => d
+                        .columns
+                        .iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
                 ddl.push_str(&format!(
                     "CREATE {}INDEX {} ON {} ({});\n",
                     if d.unique { "UNIQUE " } else { "" },
                     quote_ident(&d.name),
                     quote_ident(name),
-                    d.columns
-                        .iter()
-                        .map(|c| quote_ident(c))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    col_text
                 ));
             }
         }
@@ -7851,6 +7882,15 @@ impl Database {
                 .collect::<Vec<_>>(),
             &cols
                 .iter()
+                .map(|k| {
+                    meta.index_defs
+                        .iter()
+                        .find(|d| d.name == *k)
+                        .and_then(|d| d.path.clone())
+                })
+                .collect::<Vec<_>>(),
+            &cols
+                .iter()
                 .map(|c| meta.root_key_unique(c))
                 .collect::<Vec<_>>(),
         )?;
@@ -7901,15 +7941,15 @@ impl Database {
         pairs: &[(u64, Object)],
         root_keys: &[String],
         cols_per_key: &[Vec<String>],
+        paths_per_key: &[Option<String>],
         unique_keys: &[bool],
     ) -> Result<std::collections::BTreeMap<String, u32>> {
         let mut roots = std::collections::BTreeMap::new();
-        for (root_key, cols, unique) in root_keys
-            .iter()
-            .zip(cols_per_key.iter())
-            .zip(unique_keys.iter())
-            .map(|((k, c), u)| (k, c, *u))
-        {
+        for i in 0..root_keys.len() {
+            let root_key = &root_keys[i];
+            let cols = &cols_per_key[i];
+            let path = paths_per_key[i].as_deref();
+            let unique = unique_keys[i];
             let mut tree = BTree::create(&self.pager, tx).map_err(|e| index_err(root_key, e))?;
             for (loc, doc) in pairs {
                 // The backfill is the expensive half of CREATE INDEX on a big
@@ -7917,7 +7957,13 @@ impl Database {
                 // without a check here the statement was uninterruptible
                 // once it entered the tree builds.
                 self.stmt_deadline.check()?;
-                if let Some(v) = index_key_of(doc, cols) {
+                let key = match path {
+                    // JSON path index: extract from the column's JSON text
+                    // with the exact lookup JSON_EXTRACT uses (design 005).
+                    Some(p) => json_path_key(doc, &cols[0], p),
+                    None => index_key_of(doc, cols),
+                };
+                if let Some(v) = key {
                     tree.insert(&self.pager, tx, v, *loc, unique)
                         .map_err(|e| index_err(root_key, e))?;
                 }
@@ -8594,6 +8640,11 @@ impl Database {
             return err("CREATE INDEX requires at least one column");
         }
         let mut cols: Vec<String> = Vec::with_capacity(idx.columns.len());
+        // JSON path index (design 005): exactly one column of the form
+        // JSON_EXTRACT(col, '$.path'). Tree keys are values extracted from
+        // the column's JSON text — the same lookup JSON_EXTRACT evaluates
+        // at query time, so probes and inline evaluation cannot diverge.
+        let mut path: Option<String> = None;
         for c in &idx.columns {
             // Direction is part of the index definition: accepting DESC here
             // and silently building ASC (as before) creates an index whose
@@ -8601,6 +8652,25 @@ impl Database {
             // declared. Same refusal discipline as INCLUDE/WHERE/USING.
             if c.column.options.asc == Some(false) {
                 return err("descending indexes (CREATE INDEX ... DESC) are not supported");
+            }
+            if let SqlExpr::Function(f) = &c.column.expr {
+                let fname = f.name.to_string().to_uppercase();
+                if fname == "JSON_EXTRACT" {
+                    if path.is_some() || cols.len() > 1 {
+                        return err("a JSON path index is single-column: one JSON_EXTRACT(col, \
+                             '$.path') term per index");
+                    }
+                    let (col, p) = parse_json_index_column(f)?;
+                    if !meta.columns.contains(&col) {
+                        return err(format!("column {col} does not exist"));
+                    }
+                    cols.push(col);
+                    path = Some(p);
+                    continue;
+                }
+                return err(
+                    "expression indexes are not supported (only JSON_EXTRACT(col, '$.path'))",
+                );
             }
             let col = match &c.column.expr {
                 SqlExpr::Identifier(i) => i.value.clone(),
@@ -8614,7 +8684,23 @@ impl Database {
             }
             cols.push(col);
         }
-        let root_key = if cols.len() > 1 {
+        // UNIQUE path indexes are refused, not degraded: uniqueness
+        // enforcement is column-based (meta.unique / constraint_unique and
+        // the OR REPLACE displacement machinery do not know paths), and a
+        // tree-level-only unique would leave UPDATE displacements unguarded.
+        if idx.unique && path.is_some() {
+            return err(
+                "UNIQUE JSON path indexes are not supported (uniqueness enforcement \
+                 is column-based)",
+            );
+        }
+        let root_key = if path.is_some() {
+            // Path trees are keyed by extracted values, never column values:
+            // they always key by the index name and never reuse a column
+            // tree (a scalar tree on the same column has a different key
+            // shape; sharing one would mix value kinds in one tree).
+            iname.clone()
+        } else if cols.len() > 1 {
             iname.clone()
         } else {
             cols[0].clone()
@@ -8637,7 +8723,7 @@ impl Database {
         // is a different one.
         let mut reuse_root: Option<u32> = None;
         if let Some(&root) = meta.index_roots.get(&root_key) {
-            if meta.index_columns_of(&root_key) == cols {
+            if path.is_none() && meta.index_columns_of(&root_key) == cols {
                 reuse_root = Some(root);
             } else {
                 return err(format!(
@@ -8673,6 +8759,7 @@ impl Database {
                     &pairs,
                     std::slice::from_ref(&root_key),
                     &[cols.clone()],
+                    &[path.clone()],
                     &[idx.unique],
                 )?;
                 meta.index_roots.append(&mut roots);
@@ -8682,6 +8769,7 @@ impl Database {
             name: iname.clone(),
             columns: cols,
             unique: idx.unique,
+            path: path.clone(),
         });
         meta.indexes.push(iname);
         let prev_meta = self.tables.get(&table).cloned();
@@ -9270,6 +9358,7 @@ impl Database {
                                         .map(|c| if c == old { new.clone() } else { c.clone() })
                                         .collect(),
                                     unique: d.unique,
+                                    path: d.path.clone(),
                                 }
                             } else {
                                 d.clone()
@@ -10105,6 +10194,7 @@ impl Database {
                     .iter()
                     .map(|c| vec![c.clone()])
                     .collect::<Vec<_>>(),
+                &vec![None; constraint_cols.len()],
                 &vec![true; constraint_cols.len()],
             )?;
             self.commit_pager_tx(tx)?;
@@ -10578,7 +10668,7 @@ impl Database {
                 if indexed.contains(&spec.root_key) {
                     continue;
                 }
-                let Some(v) = index_key_of(&doc, &spec.cols) else {
+                let Some(v) = index_key_of_spec(&doc, spec) else {
                     continue;
                 };
                 let root = roots[&spec.root_key];
@@ -16922,9 +17012,15 @@ fn order_walk_index(
     if cols.iter().any(|c| !meta.not_null.contains(c)) {
         return None;
     }
-    meta.index_roots
-        .keys()
-        .find_map(|root| (meta.index_columns_of(root) == cols).then(|| (root.clone(), asc)))
+    meta.index_roots.keys().find_map(|root| {
+        // Path indexes (design 005) hold extracted values, not column
+        // values — an ORDER BY over the column name must not walk them.
+        let is_path = meta
+            .index_defs
+            .iter()
+            .any(|d| d.name == *root && d.path.is_some());
+        (!is_path && meta.index_columns_of(root) == cols).then(|| (root.clone(), asc))
+    })
 }
 
 /// Resolve a column reference (bare or table/alias-qualified) to an indexed
@@ -16946,6 +17042,16 @@ fn resolve_indexed_col(
         // `index_columns_of` alone is not enough: for an unknown key it
         // synthesizes `[key]`, which would accept any column name.
         if !meta.index_roots.contains_key(col) {
+            return None;
+        }
+        // A JSON path index keyed by the column's NAME (root_key == index
+        // name, design 005) holds extracted values, not column values —
+        // it must never serve a scalar column probe.
+        if meta
+            .index_defs
+            .iter()
+            .any(|d| d.name == col && d.path.is_some())
+        {
             return None;
         }
         let cols = meta.index_columns_of(col);
@@ -16976,6 +17082,36 @@ fn resolve_indexed_col(
 /// bool is true when the plan subsumes the whole condition — every conjunct
 /// is implied by the probe, so callers may trust the entry count and stop a
 /// window walk at the requested end (no residual re-filter).
+/// Collapse the collected range bounds (op, value) into ProbePlan's
+/// (lo, hi) pair: the lowest bound wins on each side (repeated
+/// inequalities narrow; the probe re-filters row-exactly anyway when the
+/// plan is inexact, and an exact plan cannot carry contradicting bounds
+/// because eq_conflict/path conflict detection refuses those shapes).
+fn path_bound(bounds: &[(BinaryOperator, Value)], lower: bool) -> Option<(Value, bool)> {
+    let mut best: Option<(Value, bool)> = None;
+    for (op, v) in bounds {
+        let inclusive = matches!(op, BinaryOperator::GtEq | BinaryOperator::LtEq);
+        let is_lower = matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq);
+        if is_lower != lower {
+            continue;
+        }
+        best = Some(match best {
+            None => (v.clone(), inclusive),
+            Some((bv, bi)) => {
+                let ord = Value::cmp_values(&bv, v);
+                if (lower && ord == std::cmp::Ordering::Greater)
+                    || (!lower && ord == std::cmp::Ordering::Less)
+                {
+                    (v.clone(), inclusive)
+                } else {
+                    (bv, bi)
+                }
+            }
+        });
+    }
+    best
+}
+
 fn probe_plan(
     cond: &SqlExpr,
     meta: &TableMeta,
@@ -16997,11 +17133,73 @@ fn probe_plan(
     let mut eq_conflict = false;
     let mut eq: Option<(String, Value)> = None;
     let mut range: Option<(String, Vec<(BinaryOperator, Value)>)> = None;
+    // JSON path conjuncts (design 005): JSON_EXTRACT(col,'$.p') op const.
+    // One (col, path) target per plan; a second distinct target or a mix
+    // with named-column conjuncts stays usable but inexact.
+    let mut path_target: Option<(String, String)> = None;
+    let mut path_eq: Option<Value> = None;
+    let mut path_range: Option<Vec<(BinaryOperator, Value)>> = None;
     for c in conjuncts {
         let SqlExpr::BinaryOp { left, op, right } = c else {
             opaque = true;
             continue;
         };
+        // JSON_EXTRACT(col, '$.p') OP const — or the mirror image.
+        let json_side = [left.as_ref(), right.as_ref()].into_iter().find(|e| {
+            matches!(e, SqlExpr::Function(f) if f.name.to_string().to_uppercase() == "JSON_EXTRACT")
+        });
+        if let Some(SqlExpr::Function(f)) = json_side {
+            let (Ok((pcol, ppath)), Ok(v)) = (
+                parse_json_index_column(f),
+                eval_const(if std::ptr::eq(left.as_ref(), json_side.unwrap()) {
+                    right
+                } else {
+                    left
+                }),
+            ) else {
+                opaque = true;
+                continue;
+            };
+            if matches!(v, Value::Null) {
+                opaque = true;
+                continue;
+            }
+            let target = (pcol, ppath);
+            let mut op = op.clone();
+            if !std::ptr::eq(left.as_ref(), json_side.unwrap()) {
+                let Some(m) = mirror_op(&op) else {
+                    opaque = true;
+                    continue;
+                };
+                op = m;
+            }
+            match &path_target {
+                Some(t) if t != &target => {
+                    opaque = true; // second distinct path target: inexact
+                    continue;
+                }
+                None => path_target = Some(target),
+                _ => {}
+            }
+            use BinaryOperator::*;
+            match op {
+                Eq => {
+                    if let Some(prev) = &path_eq {
+                        if Value::cmp_values(prev, &v) != Ordering::Equal {
+                            eq_conflict = true;
+                        }
+                    } else {
+                        path_eq = Some(v);
+                    }
+                }
+                Gt | GtEq | Lt | LtEq => match &mut path_range {
+                    Some(bounds) => bounds.push((op, v)),
+                    None => path_range = Some(vec![(op, v)]),
+                },
+                _ => opaque = true,
+            }
+            continue;
+        }
         // col OP lit, or lit OP col (mirrored)
         let (col_ref, op, lit, mirror) = match (left.as_ref(), right.as_ref()) {
             (SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_), r) => {
@@ -17081,6 +17279,33 @@ fn probe_plan(
         // Two different constants constrain the same column: no index probe
         // can be exact. Fall back to the full scan + residual filter.
         return None;
+    }
+    // JSON path probe (design 005 §3): a single-column index_def whose
+    // column AND path both match, with a live root. exact only when this
+    // path condition is the WHOLE plan — any other conjunct forces the
+    // residual filter (conservative-correct; the fast paths re-check).
+    if let Some((col, ppath)) = &path_target {
+        if let Some(def) = meta.index_defs.iter().find(|d| {
+            d.path.as_deref() == Some(ppath.as_str())
+                && d.columns.as_slice() == std::slice::from_ref(col)
+        }) {
+            if meta.index_roots.contains_key(&def.name)
+                && eq.is_none()
+                && range.is_none()
+                && eq_map.is_empty()
+            {
+                let exact = !opaque;
+                let plan = match (path_eq, path_range) {
+                    (Some(v), _) => ProbePlan::Eq(v),
+                    (None, Some(bounds)) => ProbePlan::Range {
+                        lo: path_bound(&bounds, true),
+                        hi: path_bound(&bounds, false),
+                    },
+                    (None, None) => return None,
+                };
+                return Some((def.name.clone(), plan, exact));
+            }
+        }
     }
     // Composite-index probe: longest equality prefix over the index columns
     // wins. Full-column equality is an exact key (Eq of the Array); a
@@ -17214,6 +17439,9 @@ struct IdxSpec {
     root_key: String,
     cols: Vec<String>,
     unique: bool,
+    /// JSON path index (design 005): keys come from
+    /// [`json_path_key`] over `cols[0]`'s JSON text, not the column value.
+    path: Option<String>,
 }
 
 /// Resolve [`IdxSpec`]s for every tree in `roots`, in root-key order
@@ -17227,6 +17455,11 @@ fn idx_specs(meta: &TableMeta, roots: &std::collections::BTreeMap<String, u32>) 
             // maintenance key. Keep it out of every write path.
             (!cols.is_empty()).then(|| IdxSpec {
                 root_key: k.clone(),
+                path: meta
+                    .index_defs
+                    .iter()
+                    .find(|d| d.name == *k)
+                    .and_then(|d| d.path.clone()),
                 cols,
                 unique: meta.root_key_unique(k),
             })
@@ -17250,7 +17483,7 @@ fn reindex_repoint(
         return err("index fixup: moved document not found");
     };
     for spec in specs {
-        if let Some(key) = index_key_of(doc, &spec.cols) {
+        if let Some(key) = index_key_of_spec(doc, spec) {
             let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
             let removed = tree
@@ -17277,6 +17510,115 @@ fn reindex_repoint(
 /// the columns in key order (ordered element-wise by `cmp_values`).
 /// `None` when any key column is missing or NULL — NULL does not enter
 /// indexes (composite rule: one NULL column skips the whole key).
+/// JSON path index key (design 005): parse the column's JSON text and
+/// walk `path` with the SAME lookup `JSON_EXTRACT` evaluates inline —
+/// extraction and query evaluation are one function, so probes cannot
+/// diverge from row-local semantics. Column missing / non-text value /
+/// malformed JSON / missing path → no key (the tree omits NULL keys, and
+/// `JSON_EXTRACT(...) = x` is never true when the extract is NULL, so a
+/// probe over this tree is semantically exact).
+fn json_path_key(doc: &Object, col: &str, path: &str) -> Option<Value> {
+    let Value::Str(text) = doc.get(col)? else {
+        return None;
+    };
+    let parsed = crate::json::from_str(text).ok()?;
+    let v = json_path_lookup(&parsed, path)?;
+    if matches!(v, Value::Null) {
+        return None;
+    }
+    Some(v.clone())
+}
+
+/// Key extraction for one maintenance spec: JSON path or plain column(s).
+fn index_key_of_spec(doc: &Object, spec: &IdxSpec) -> Option<Value> {
+    match &spec.path {
+        Some(p) => json_path_key(doc, &spec.cols[0], p),
+        None => index_key_of(doc, &spec.cols),
+    }
+}
+
+/// Validate a JSON index path (design 005 §2): `$` followed by `.key` /
+/// `[n]` segments only — the exact grammar [`json_path_lookup`] walks.
+/// Quotes and backslashes are refused so the path can be embedded in the
+/// dumped CREATE INDEX text without escaping.
+fn validate_json_index_path(path: &str) -> std::result::Result<(), String> {
+    let p = path.trim();
+    if !p.starts_with('$') {
+        return Err(format!(
+            "JSON index path {path:?} must start with '$' (e.g. '$.field[0].sub')"
+        ));
+    }
+    let rest = &p[1..];
+    if rest.is_empty() {
+        return Err(
+            "JSON index path must have at least one segment after '$' (e.g. '$.field')".into(),
+        );
+    }
+    let mut rest = rest;
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix('.') {
+            let end = stripped.find(['.', '[']).unwrap_or(stripped.len());
+            let key = &stripped[..end];
+            if key.is_empty() {
+                return Err(format!(
+                    "JSON index path {path:?} has an empty '.key' segment"
+                ));
+            }
+            if key.contains(['\'', '\\']) {
+                return Err(format!(
+                    "JSON index path {path:?} must not contain quotes or backslashes"
+                ));
+            }
+            rest = &stripped[end..];
+        } else if let Some(stripped) = rest.strip_prefix('[') {
+            let Some(end) = stripped.find(']') else {
+                return Err(format!("JSON index path {path:?} has an unterminated '[…'"));
+            };
+            if stripped[..end].parse::<usize>().is_err() {
+                return Err(format!(
+                    "JSON index path {path:?} has a non-numeric array index {:?}",
+                    &stripped[..end]
+                ));
+            }
+            rest = &stripped[end + 1..];
+        } else {
+            return Err(format!(
+                "JSON index path {path:?} has a malformed segment (expected '.key' or '[n]')"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse one CREATE INDEX column of the form JSON_EXTRACT(col, '$.path')
+/// into (column, path). Anything else in expression position errors loudly.
+fn parse_json_index_column(f: &sqlparser::ast::Function) -> Result<(String, String)> {
+    // Result here is the engine's alias (SqlError) — err() builds it.
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let args: Vec<&FunctionArg> = match &f.args {
+        FunctionArguments::List(list) => list.args.iter().collect(),
+        _ => return err("JSON_EXTRACT index column requires (col, '$.path') arguments"),
+    };
+    if args.len() != 2 {
+        return err(format!(
+            "JSON_EXTRACT index column requires exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let col = match args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Identifier(i))) => i.value.clone(),
+        _ => return err("JSON_EXTRACT index column's first argument must be a plain column name"),
+    };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(path_expr)) = args[1] else {
+        return err("JSON_EXTRACT index column's path must be a '$…' string literal");
+    };
+    let Value::Str(path) = eval_const(path_expr)? else {
+        return err("JSON_EXTRACT index column's path must be a '$…' string literal");
+    };
+    validate_json_index_path(&path).map_err(SqlError::Parse)?;
+    Ok((col, path))
+}
+
 fn index_key_of(doc: &Object, cols: &[String]) -> Option<Value> {
     if cols.is_empty() {
         // Orphaned tree with no resolvable column list: no key belongs to it.
@@ -17309,7 +17651,7 @@ fn reindex_remove(
     loc: u64,
 ) -> Result<()> {
     for spec in specs {
-        if let Some(key) = index_key_of(doc, &spec.cols) {
+        if let Some(key) = index_key_of_spec(doc, spec) {
             let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
             tree.delete_entry(pager, tx, &key, loc)
@@ -17334,7 +17676,7 @@ fn reindex_insert(
     loc: u64,
 ) -> Result<()> {
     for spec in specs {
-        if let Some(key) = index_key_of(doc, &spec.cols) {
+        if let Some(key) = index_key_of_spec(doc, spec) {
             let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
             tree.insert(pager, tx, key, loc, spec.unique)
@@ -26509,6 +26851,208 @@ mod tx_rollback_tests {
         );
         run(&mut db, "COMMIT");
         db
+    }
+
+    #[test]
+    fn json_path_index_dumps_and_replays() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE docs (id INT PRIMARY KEY, doc TEXT)");
+        run(&mut db, "INSERT INTO docs VALUES (1, '{\"name\":\"a\"}')");
+        run(&mut db, "INSERT INTO docs VALUES (2, '{\"name\":\"b\"}')");
+        run(
+            &mut db,
+            "CREATE INDEX ix_doc_name ON docs (JSON_EXTRACT(doc, '$.name'))",
+        );
+        let script = db.dump_script().unwrap();
+        assert!(
+            script.contains(
+                "CREATE INDEX \"ix_doc_name\" ON \"docs\" (JSON_EXTRACT(\"doc\", '$.name'))"
+            ),
+            "{script}"
+        );
+        // Replay into a fresh database; the probe must work identically.
+        let mut fresh = Database::in_memory().unwrap();
+        for stmt in script.split(';') {
+            if stmt.trim().is_empty() {
+                continue;
+            }
+            run(&mut fresh, stmt);
+        }
+        let r = rows(
+            &mut fresh,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'b'",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        // Catalog round trip: the path survives a reload.
+        assert!(fresh
+            .tables
+            .get("docs")
+            .unwrap()
+            .index_defs
+            .iter()
+            .any(|d| d.name == "ix_doc_name" && d.path.as_deref() == Some("$.name")));
+    }
+
+    #[test]
+    fn json_path_index_catalog_is_backward_compatible() {
+        // A pre-path-index catalog tuple (4 elements) parses with path=None,
+        // and a 5-element tuple parses with the path: the array form is
+        // positional with an optional tail, so old volumes open with zero
+        // migration and old readers ignore the extra element (design 005).
+        // The parser is exercised end to end by dump/replay above; here the
+        // struct contract is pinned directly.
+        use super::{validate_json_index_path, IndexDef};
+        let scalar = IndexDef {
+            name: "ix".into(),
+            columns: vec!["v".into()],
+            unique: false,
+            path: None,
+        };
+        assert!(scalar.path.is_none());
+        let path = IndexDef {
+            name: "ix".into(),
+            columns: vec!["doc".into()],
+            unique: false,
+            path: Some("$.a.b".into()),
+        };
+        assert_eq!(path.column(), "doc");
+        // Path validation grammar: the accepted/rejected shapes.
+        assert!(validate_json_index_path("$.a").is_ok());
+        assert!(validate_json_index_path("$.a[2].b").is_ok());
+        assert!(validate_json_index_path("a.b").is_err());
+        assert!(validate_json_index_path("$").is_err());
+        assert!(validate_json_index_path("$.a.").is_err());
+        assert!(validate_json_index_path("$.a[x]").is_err());
+        assert!(validate_json_index_path("$.a['b']").is_err());
+    }
+
+    #[test]
+    fn json_path_index_probes_equality_and_range() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE docs (id INT PRIMARY KEY, doc TEXT)");
+        for (i, name) in ["svc-1", "svc-2", "svc-3"].iter().enumerate() {
+            let doc = format!(
+                "{{\"name\":\"{name}\",\"level\":{},\"nest\":{{\"x\":{}}}}}",
+                i,
+                i + 10
+            );
+            run(
+                &mut db,
+                &format!(
+                    "INSERT INTO docs VALUES ({}, '{}')",
+                    i + 1,
+                    doc.replace("\'", "\'\'")
+                ),
+            );
+        }
+        // Malformed JSON and a doc missing the path: excluded from the tree,
+        // and correctly absent from equality results (NULL = x is false).
+        run(&mut db, "INSERT INTO docs VALUES (4, 'not json')");
+        run(&mut db, "INSERT INTO docs VALUES (5, '{\"other\":1}')");
+
+        run(
+            &mut db,
+            "CREATE INDEX ix_doc_name ON docs (JSON_EXTRACT(doc, '$.name'))",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-2'",
+        );
+        assert_eq!(r.rows.len(), 1, "{:?}", r.rows);
+        assert_eq!(r.rows[0][0], Value::Int(2));
+
+        // Mirrored literal.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE 'svc-3' = JSON_EXTRACT(doc, '$.name')",
+        );
+        assert_eq!(r.rows.len(), 1);
+
+        // Range on a nested path + array index.
+        run(
+            &mut db,
+            "CREATE INDEX ix_doc_nest ON docs (JSON_EXTRACT(doc, '$.nest.x'))",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.nest.x') >= 11",
+        );
+        assert_eq!(r.rows.len(), 2);
+
+        // EXPLAIN reports the probe through the path index.
+        let r = rows(
+            &mut db,
+            "EXPLAIN SELECT * FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-1'",
+        );
+        let detail = r
+            .rows
+            .iter()
+            .map(|row| row[1].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            detail.contains("INDEX PROBE ON docs USING ix_doc_name"),
+            "{detail}"
+        );
+
+        // AND with an opaque conjunct stays correct (residual filter).
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-1' AND id > 0",
+        );
+        assert_eq!(r.rows.len(), 1);
+
+        // UPDATE maintenance: change the extracted value, old key must go.
+        run(
+            &mut db,
+            "UPDATE docs SET doc = '{\"name\":\"svc-9\"}' WHERE id = 2",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-2'",
+        );
+        assert!(r.rows.is_empty(), "{:?}", r.rows);
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-9'",
+        );
+        assert_eq!(r.rows.len(), 1);
+        // DELETE removes the entry.
+        run(&mut db, "DELETE FROM docs WHERE id = 3");
+        let r = rows(
+            &mut db,
+            "SELECT id FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-3'",
+        );
+        assert!(r.rows.is_empty());
+
+        // Refusals: UNIQUE on a path, bogus path grammar, expression form.
+        assert!(db
+            .execute("CREATE UNIQUE INDEX u1 ON docs (JSON_EXTRACT(doc, '$.name'))")
+            .is_err());
+        assert!(db
+            .execute("CREATE INDEX u2 ON docs (JSON_EXTRACT(doc, 'name'))")
+            .is_err());
+        assert!(db
+            .execute("CREATE INDEX u3 ON docs (JSON_EXTRACT(doc, '$'))")
+            .is_err());
+        assert!(db.execute("CREATE INDEX u4 ON docs (UPPER(doc))").is_err());
+        assert!(db
+            .execute("CREATE INDEX u5 ON docs (JSON_EXTRACT(doc, '$.a'), other)")
+            .is_err());
+
+        // Path index must not hijack scalar column semantics (design 005 §5.2):
+        // ORDER BY doc and WHERE doc = … stay correct with a path index present.
+        run(&mut db, "CREATE TABLE s (id INT PRIMARY KEY, doc TEXT)");
+        run(&mut db, "INSERT INTO s VALUES (1, 'bbb')");
+        run(&mut db, "INSERT INTO s VALUES (2, 'aaa')");
+        run(
+            &mut db,
+            "CREATE INDEX s_path ON s (JSON_EXTRACT(doc, '$.k'))",
+        );
+        let r = rows(&mut db, "SELECT id FROM s ORDER BY doc");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)], vec![Value::Int(1)]]);
+        let r = rows(&mut db, "SELECT id FROM s WHERE doc = 'bbb'");
+        assert_eq!(r.rows.len(), 1);
     }
 
     #[test]

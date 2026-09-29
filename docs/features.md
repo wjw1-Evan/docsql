@@ -211,10 +211,11 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 | 自动索引 | PRIMARY KEY / 表声明 UNIQUE 随建表创建 B+ 树(`sqlite_autoindex_*`) |
 | 普通索引 | `CREATE INDEX` 单列;点查/范围探测走索引 |
 | 复合索引 | `CREATE INDEX idx ON t (a, b)`,键 = `Value::Array` 按列序;`a=? AND b=?` 点查、前导列前缀探测 |
+| JSON 路径索引 | `CREATE INDEX idx ON t (JSON_EXTRACT(doc, '$.a.b[0]'))`,树键 = 列内 JSON 文本的路径提取值;`WHERE JSON_EXTRACT(doc,'$.…') =/ constituency…` 等值与范围走索引探测(EXPLAIN 可见,dump 往返);UNIQUE 路径显式拒绝 |
 | 唯一索引 | `CREATE UNIQUE INDEX`;重复键在写入时拒绝 |
 | 约束唯一 | 表级单列 UNIQUE 与 `CREATE UNIQUE INDEX`(含复合)由引擎判重;DECIMAL 按数值、Int/Float 跨类型数值比较 |
 | 回收 | 模型/手工删索引即回收树;`DROP INDEX` 清理定义 |
-| 边界 | 无表达式索引、部分索引、JSON 路径索引;非前导列条件不走复合索引(结果仍正确) |
+| 边界 | 表达式索引(JSON_EXTRACT 以外)、部分索引不支持;非前导列条件不走复合索引(结果仍正确) |
 
 ## 5. 发布订阅(pub/sub,持久化)
 
@@ -383,7 +384,7 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 - 单写者引擎:全库写互斥(读不阻塞写);单文档 ≤16MiB;BLOB 无流式分块;
 - 精确 DECIMAL 有效数字 28~29 位;TIMESTAMP 精确到毫秒(无 TIME/INTERVAL 类型,区间用毫秒整数);
 - 无行级合并:集群修复以多数派快照覆盖少数方独有写;修复由重启触发;
-- 无表达式/部分/JSON 路径索引;查询优化器为规则式(无 EXPLAIN/统计信息);
+- 无表达式索引(JSON_EXTRACT 以外)/部分索引;查询优化器为规则式(EXPLAIN SELECT 计划行已有,无统计信息/CBO);
 - 备份为逻辑全量 + 增量 PITR(PITR 窗口 = 本节点期刊保留;对称集群跨节点写不在本节点期刊);
   无 TDE(部署加密卷替代);
 - 不支持 SQL 清单见 [SQL 参考 · 不支持的语法](sql-reference.md#不支持的语法)。

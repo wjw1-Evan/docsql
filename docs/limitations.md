@@ -8,7 +8,7 @@
 |---|---|---|
 | 单写者引擎 | 写路径全库互斥(有意设计,横向扩展靠集群分摊写入点);只读语句已 MVCC 快照化,**读不阻塞写、写不阻塞读** | 写吞吐仍是单线程串行;快照读依赖 WAL 保留窗口,极端写压下长读可响亮报「snapshot too old」 |
 | 单文档 ≤ 16MiB | 溢出页链已支持超页文档(旧 4KB 上限解除);BLOB 值(`x'hex'`/byte[] 映射)走 `Value::Bytes`,仍是整值读写 | 超过 16MiB 显式报错;无 BLOB 流式/分块读写(大文件请按块存多行) |
-| 单列之外的索引能力 | 多列(复合)索引已支持(复合 UNIQUE 判重、前导列等值探测);无表达式/部分/JSON 路径索引 | JSON 点读中非前导列条件走全表扫描(JSON_EXTRACT 不走索引) |
+| 单列之外的索引能力 | 多列(复合)索引已支持(复合 UNIQUE 判重、前导列等值探测);**JSON 路径索引已支持**(`CREATE INDEX … ON t (JSON_EXTRACT(col, '$.path'))`,等值/范围探测、dump 往返,设计见 [005](design/005-json-path-indexes.md)) | 表达式索引一般化/部分索引仍不支持;路径 UNIQUE 显式拒绝(唯一性执行是列级的) |
 | 精确 TIMESTAMP(UTC 毫秒) | 值模型含精确 DECIMAL(rust_decimal,28~29 位);TIMESTAMP 类型已落地:`TIMESTAMP '…'` 字面量、`NOW()`/`CURRENT_TIMESTAMP`、与字符串比较自动按时间解析(不可解析 → NULL)、索引探针自动提升字符串边界、`TIMESTAMP ± INT`(毫秒)与 `TIMESTAMP - TIMESTAMP`;年份域 0001..=9999,毫秒精度 | 无 TIME/INTERVAL 独立类型(区间用毫秒整数);时间戳与字符串在排序序带中不混排(混合列请显式 CAST);DECIMAL 有效数字上限 28~29 位 |
 | **小数字面量按 Float 解析** | `0.1`/`1.5` 等含小数点的字面量走 f64(二进制近似);DECIMAL 只经 `CAST('…' AS DECIMAL)`、线协议 `$dec` 标记或驱动参数获得。混合运算 Decimal 优先,但字面量先转 f64 会带近似误差 | `CAST('9.99' AS DECIMAL) + 0.1` 得 28 位近似而非 10.09;金融计算一律参数化传 DECIMAL 或显式 CAST,勿裸写字面量。字面量改按 Decimal 解析会与旧节点副本分叉(同文本不同语义),故为显式边界 |
 | **pub/sub 跨节点尽力而为** | 消息持久化(先落盘后推送)+ 实时扇出(失败退避重试)满足 at-least-once;但 `_pubsub_messages` 是系统表,不进摘要/快照/期刊修复——发布节点宕机期间错过的消息在其重连后**不会补投** | 单节点订阅者 at-least-once 成立(重订阅按 id 续推);跨节点「订阅者离线窗口」的消息缺口需业务侧按 id 对账发现。要求不丢消息的分发请以 SQL 写业务表 + pubsub 只作通知 |

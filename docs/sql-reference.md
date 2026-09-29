@@ -655,7 +655,7 @@ DROP VIEW active_users;
 
 ```sql
 CREATE [ UNIQUE ] INDEX [ IF NOT EXISTS ] index_name
-    ON table_name ( column [ , ...n ] )
+    ON table_name ( column | JSON_EXTRACT( column , '$path' ) [ , ...n ] )
 DROP INDEX [ IF EXISTS ] index_name [ , ...n ]
 ```
 
@@ -664,12 +664,12 @@ DROP INDEX [ IF EXISTS ] index_name [ , ...n ]
 | 参数 | 说明 |
 |---|---|
 | `UNIQUE` | 唯一索引；复合唯一按**完整键组合**判重，任一列 NULL 的行跳过整键（不判重） |
-| 列清单 | 仅限普通列名，按列序构成复合键（前导列等值可走索引探测） |
+| 列清单 | 普通列名按列序构成复合键（前导列等值可走索引探测）;或单个 `JSON_EXTRACT(col, '$.path')` 构成 **JSON 路径索引**（树键 = 列内 JSON 文本在路径上的提取值,`WHERE JSON_EXTRACT(col,'$.path') = / > / < …` 走索引探测,EXPLAIN 可见;路径仅 `.key`/`[n]` 段;UNIQUE 路径索引显式报错） |
 | `IF NOT EXISTS` | 同名索引已存在时静默返回 |
 
 ### 备注
 
-- 表达式索引、部分索引、JSON 路径索引不支持（显式报错）。
+- 表达式索引（JSON_EXTRACT 以外）、部分索引不支持（显式报错）。
 - `sqlite_autoindex_` 前缀为保留名；自动索引不可删除。
 - `DROP INDEX` 会把非唯一索引从 `sqlite_master` 移除，但底层 B+ 树保留继续服务非唯一探测。
 
@@ -679,6 +679,8 @@ DROP INDEX [ IF EXISTS ] index_name [ , ...n ]
 CREATE INDEX ix_users_age ON users (age);
 CREATE UNIQUE INDEX ux_org_name ON orgs (name);
 CREATE INDEX ix_orders_multi ON orders (user_id, created_at);
+CREATE INDEX ix_doc_name ON docs (JSON_EXTRACT(doc, '$.name'));
+SELECT * FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-7';  -- 走 ix_doc_name
 DROP INDEX ix_users_age;
 ```
 

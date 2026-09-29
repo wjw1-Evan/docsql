@@ -5,6 +5,29 @@
 
 ## [Unreleased]
 
+### JSON 路径索引:JSON_EXTRACT 走索引(2026-09-29)
+
+文档库核心性能项落地(设计 [docs/design/005-json-path-indexes.md](docs/design/005-json-path-indexes.md)):
+
+- **语法**:`CREATE INDEX ix ON docs (JSON_EXTRACT(doc, '$.a.b[0]'))`——单列表达式形,
+  路径仅 `.key`/`[n]` 段(建索引时校验;引号/反斜杠拒绝,保证 dump 文本安全);root_key 恒为
+  索引名,绝不复用列树(键形状不同)。
+- **键提取与查询同源**:树键 = 列内 JSON 文本经 `json_path_lookup` 提取(`json_path_key`),
+  与 `JSON_EXTRACT` 行内求值是同一函数——探测与逐行语义不会分叉;列缺失/非文本/坏 JSON/
+  路径缺失 → 键为 NULL 不进树(标量列 NULL 键同语义,等值探测因此语义完备)。
+- **probe_plan 识别**:`JSON_EXTRACT(col,'$.p') = / > / >= / < / <= 常量`(含镜像)按
+  (col,path) 收集,命中单列路径 def 且树存在即出 `ProbePlan::Eq/Range`;混合带 Timestamp
+  提升守卫原样生效(不可安全探测整体回退);exact 仅当该条件是唯一合取元,其余条件走残余
+  过滤兜底。**EXPLAIN 自动可见**(`INDEX PROBE ON docs USING <index>`)。
+- **正确性红线**:路径树永不充当列树——`resolve_indexed_col`/`order_walk_index`/标量同列
+  复用三处显式排除(`ORDER BY doc`/`WHERE doc=…` 若匹配路径树会用提取值当列值,静默错误);
+  UNIQUE+路径显式报错(唯一性执行机制是列级的,绝不静默降级)。
+- **catalog/dump**:index_defs 条目扩为可选第 5 元素(仅路径索引写入)——旧读新忽略多余
+  元素、新读旧缺省 None,双向零迁移;dump 重新 emit JSON_EXTRACT 表达式,恢复经同一 CREATE
+  解析,往返自洽;ALTER RENAME 透传 path。
+- 测试:等值/镜像/嵌套路径范围/EXPLAIN 行/AND 残余/UPDATE·DELETE 维护/拒绝面(UNIQUE/
+  语法/表达式/多列)/ORDER BY 与标量探测不误用/dump 往返重放/catalog 契约,全量 955 绿。
+
 ### 自动故障转移阶段 2:主从自动 PROMOTE + primary_epoch 降级(2026-09-29)
 
 设计 004 §4 落地(`DOCSQL_AUTO_PROMOTE=1`,要求 `DOCSQL_QUORUM=1`):
