@@ -358,6 +358,24 @@ async fn sql_roundtrip_over_http() {
 }
 
 #[tokio::test]
+async fn batch_statement_cap_is_an_in_band_error_over_http() {
+    let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
+    // 10_001 tiny statements (~90 KB body, far under the 2 MiB body cap):
+    // the console refuses the batch up front instead of grinding through
+    // ten thousand node round trips on one worker.
+    let r = sql(&addr, None, &"SELECT 1;".repeat(10_001)).await;
+    assert_eq!(r["kind"], "error", "{r}");
+    assert!(
+        r["message"].as_str().unwrap().contains("batch too large"),
+        "{r}"
+    );
+    // Just under the cap goes through normally.
+    let r = sql(&addr, None, &"SELECT 1;".repeat(3)).await;
+    assert_eq!(r["kind"], "batch", "{r}");
+    assert_eq!(r["results"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn typed_scalars_surface_dec_and_bytes_markers_over_http() {
     let (_dir, addr, _node) = start_stack(None, Vec::new()).await;
     // DECIMAL/BLOB responses carry the exact wire markers to JSON clients.

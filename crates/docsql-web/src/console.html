@@ -488,6 +488,15 @@ const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // 引用标识符转义:表名等进入 "..." 时,内嵌 " 必须加倍,否则注入/断句。
 const qident = (s) => String(s).replace(/"/g, '""');
+// localStorage 在「阻止所有 Cookie」/部分企业策略下访问即抛 SecurityError;
+// <head> 引导脚本与主题切换各自包了 try/catch,主脚本同样必须走助手 ——
+// 顶层裸读一旦抛错整个脚本不会执行,页面直接白屏。
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const lsDel = (k) => { try { localStorage.removeItem(k); } catch (e) {} };
+// 登录/设置遮罩是否挡在最前:轮询定时器据此停摆(遮罩后面刷错误 toast
+// 只会刷屏),遮罩幂等逻辑也以它为准。
+const authOverlayVisible = () => $('#auth-ov').style.display === 'flex';
 
 /* ================= 多语言(中文 / English)================= */
 // 源语言是中文:界面文本以中文字符串本身为键,EN 只维护英文翻译,缺失键
@@ -864,7 +873,7 @@ $('#lang-label').textContent = LANG === 'zh' ? 'EN' : '中';
 const api = {
   // 当前管理的节点('' = 默认节点,即控制台启动时指定的管理目标;
   // 否则为 DOCSQL_PEERS 中的地址)。
-  node: localStorage.getItem('docsql.node') || '',
+  node: lsGet('docsql.node') || '',
   headers() { return {'Content-Type': 'application/json'}; },
   async get(path) {
     if (this.node) path += (path.includes('?') ? '&' : '?') + 'node=' + encodeURIComponent(this.node);
@@ -927,6 +936,10 @@ const authGate = {
     return false;
   },
   show(mode, username) {
+    // 会话过期后每个轮询标签页的 401 都会走到这里:遮罩已在同一模式下
+    // 展示时直接返回 —— 否则 5 秒一次的轮询会不断清空正在输入的密码、
+    // 抢走焦点,登录表单根本打不完字。
+    if (authOverlayVisible() && this.mode === mode) return;
     this.mode = mode;
     if (username) this.lastUser = username;
     $('#auth-ov').style.display = 'flex';
@@ -969,6 +982,14 @@ const authGate = {
 // 「文件 → 修改账号…」:需当前密码(防被劫持的页面静默换凭据);改密码
 // 后其他已登录会话在服务端全部下线(keep_only),当前会话保留。新密码
 // 留空 = 只改用户名。密码不做 trim(口令前后空格有效)。
+// 写剪贴板并如实回报:writeText 是异步 Promise,窗口失焦/权限拒绝时
+// reject —— 不接 catch 会谎报成功并留下 unhandled rejection。
+function copyText(text, okMsg) {
+  if (!navigator.clipboard || !navigator.clipboard.writeText) { ui.toast(T('复制失败:浏览器不支持剪贴板'), true); return; }
+  navigator.clipboard.writeText(text)
+    .then(() => ui.toast(okMsg))
+    .catch(e => ui.toast(T('复制失败:{0}', e.message), true));
+}
 function accountDialog() {
   if (!authGate.active) return;
   const ov = showModal(`<div class="dialog" style="min-width:380px"><h3>${T('修改控制台账号')}</h3><div class="body">
@@ -1061,10 +1082,7 @@ function aboutDialog() {
       T('页面: {0}', location.href),
       T('浏览器: {0}', navigator.userAgent),
     ].join('\n');
-    if (!navigator.clipboard || !navigator.clipboard.writeText) { ui.toast(T('复制失败:浏览器不支持剪贴板'), true); return; }
-    navigator.clipboard.writeText(text)
-      .then(() => ui.toast(T('诊断信息已复制到剪贴板')))
-      .catch(e => ui.toast(T('复制失败:{0}', e.message), true));
+    copyText(text, T('诊断信息已复制到剪贴板'));
   };
 }
 
@@ -1159,16 +1177,18 @@ const nodes = {
   apply(addr) {
     if (api.node === addr) return;
     api.node = addr;
-    localStorage.setItem('docsql.node', addr);
+    lsSet('docsql.node', addr);
     // 切换目标后旧 meta 立即失效:标签先落到「节点 x」,等刷新回包再补版本。
     explorer.meta = null;
     explorer.unreachable = false;
     updateServerLabel();
     explorer.refresh();
-    // 已打开的仪表盘/数据页/备份页跟随切换到新目标节点。
+    // 已打开的仪表盘/数据页/备份页/用户页跟随切换到新目标节点(用户页
+    // 无轮询不会自愈:不重载就会拿旧节点的名单对新节点执行删除/改密)。
     tabs.byKind('dash').forEach(t => t.load && t.load());
     tabs.byKind('data').forEach(t => t.load && t.load());
     tabs.byKind('backup').forEach(t => t.load && t.load());
+    tabs.byKind('users').forEach(t => t.load && t.load());
   },
   async boot() {
     try {
@@ -1237,7 +1257,12 @@ function dialog(title, fields, okText, onOk) {
     const vals = {};
     fields.forEach(f => { vals[f.name] = $(`input[data-f="${f.name}"]`, ov).value.trim(); });
     try { await onOk(vals, (m) => { $('[data-err]', ov).textContent = m || ''; });
-      closeModal(); } catch (e) { /* handled */ }
+      closeModal(); } catch (e) {
+      // onOk 已自行呈现的错误按约定抛 'cancel'(弹窗保留、错误行已写好);
+      // 其余异常(节点不可达等传输层失败)不再静默吞掉 —— 否则弹窗原地
+      // 不动、毫无反馈,像「点了没反应」。
+      if (!e || e.message !== 'cancel') $('[data-err]', ov).textContent = (e && e.message) || String(e);
+    }
   };
   ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
 }
@@ -1762,7 +1787,7 @@ function indexDialog(tableName, def, oldName) {
   const cols = m && m.columns ? m.columns.map(c => c.name) : [];
   if (!cols.length) { ui.toast(T('表 {0} 没有声明列,无法管理索引', tableName), true); return; }
   const ov = showModal(`<div class="dialog"><h3>${editing ? T('修改索引') : T('新建索引')} — ${esc(tableName)}</h3><div class="body">
-    <div class="row"><label>${T('索引名')}</label><input type="text" data-f="name" value="${esc(def.name || '')}" placeholder="${esc(T('如 idx_{0}', esc(def.column || 'col')))}"></div>
+    <div class="row"><label>${T('索引名')}</label><input type="text" data-f="name" value="${esc(def.name || '')}" placeholder="${esc(T('如 idx_{0}', def.column || 'col'))}"></div>
     <div class="row"><label>${T('列')}</label><select data-f="col" style="flex:1">${cols.map(c => `<option${c === def.column ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
     <div class="row"><label>${T('唯一索引')}</label><label style="display:inline-flex;align-items:center;gap:5px;color:var(--txt);cursor:pointer">
       <input type="checkbox" data-f="uniq"${def.unique ? ' checked' : ''}>${T('UNIQUE(拒绝重复值;NULL 不算重复)')}</label></div>
@@ -1862,8 +1887,8 @@ const layout = {
     this.bindEditor();
     window.addEventListener('resize', () => this.onExplorerResize());
   },
-  _num(key) { const v = parseFloat(localStorage.getItem(key)); return Number.isFinite(v) && v > 0 ? v : 0; },
-  _ratio(key) { const v = parseFloat(localStorage.getItem(key)); return Number.isFinite(v) ? Math.min(0.9, Math.max(0.1, v)) : 0; },
+  _num(key) { const v = parseFloat(lsGet(key)); return Number.isFinite(v) && v > 0 ? v : 0; },
+  _ratio(key) { const v = parseFloat(lsGet(key)); return Number.isFinite(v) ? Math.min(0.9, Math.max(0.1, v)) : 0; },
 
   clampExplorer(w) {
     const max = Math.max(this.EXPLORER_MIN, Math.min(this.EXPLORER_MAX, innerWidth - this.EXPLORER_RESERVE));
@@ -1884,12 +1909,12 @@ const layout = {
         $('#explorer').style.width = this.clampExplorer(base + ev.clientX - startX) + 'px';
       }, () => {
         this.expW = this.clampExplorer($('#explorer').getBoundingClientRect().width);
-        localStorage.setItem('docsql.ui.explorerW', String(this.expW));
+        lsSet('docsql.ui.explorerW', String(this.expW));
       });
     });
     el.addEventListener('dblclick', () => {
       this.expW = 0;
-      localStorage.removeItem('docsql.ui.explorerW');
+      lsDel('docsql.ui.explorerW');
       this.applyExplorer();
       ui.toast(T('对象资源管理器宽度已恢复默认'));
     });
@@ -1922,14 +1947,14 @@ const layout = {
         this.editorRatio = h / total;
       };
       this._drag(el, e, 'resizing-y', (ev) => apply(ev.clientY), () => {
-        localStorage.setItem('docsql.ui.editorRatio', this.editorRatio.toFixed(4));
+        lsSet('docsql.ui.editorRatio', this.editorRatio.toFixed(4));
         this.applyEditorAll();
       });
     });
     $('#tabcontent').addEventListener('dblclick', (e) => {
       if (!e.target.closest('.splitter.h')) return;
       this.editorRatio = this.EDITOR_DEFAULT;
-      localStorage.removeItem('docsql.ui.editorRatio');
+      lsDel('docsql.ui.editorRatio');
       this.applyEditorAll();
       ui.toast(T('编辑器高度已恢复默认比例'));
     });
@@ -2059,12 +2084,56 @@ function makeEditor(container, initial) {
 }
 
 /* ================= 结果网格 ================= */
+// 排序取值:服务端精确标量以标记对象下发($ts/$dec/$bytes/$float),
+// 直接 String() 会得到 "[object Object]",DECIMAL/TIMESTAMP/BLOB 列点
+// 列头等于没反应。解包后按类型比较:n=数值(number/$ts;与 $dec 混排时
+// 统一降为双精度)、d=十进制文本(两侧同为 $dec 时按字符串精确比较)、
+// h=BLOB 十六进制(每字节 2 个 [0-9a-f],字典序即字节序)、s=其余文本。
+function cellSortKey(v) {
+  if (typeof v === 'number') return {t: 'n', v};
+  if (v !== null && typeof v === 'object') {
+    if (typeof v.$ts === 'number') return {t: 'n', v: v.$ts};
+    if (typeof v.$dec === 'string') return {t: 'd', v: v.$dec};
+    if (Array.isArray(v.$bytes))
+      return {t: 'h', v: v.$bytes.map(b => Number(b).toString(16).padStart(2, '0')).join('')};
+  }
+  return {t: 's', v: fmtCell(v)};
+}
+// 非负十进制文本的精确比较:去前导零、小数位右补零对齐。
+function cmpDecAbs(x, y) {
+  const [xi, xf] = x.split('.'), [yi, yf] = y.split('.');
+  const a = xi.replace(/^0+/, '') || '0', b = yi.replace(/^0+/, '') || '0';
+  if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+  if (a !== b) return a < b ? -1 : 1;
+  const fl = Math.max((xf || '').length, (yf || '').length);
+  const fa = (xf || '').padEnd(fl, '0'), fb = (yf || '').padEnd(fl, '0');
+  return fa === fb ? 0 : (fa < fb ? -1 : 1);
+}
+function cmpCells(x, y) {
+  const a = cellSortKey(x), b = cellSortKey(y);
+  if (a.t === 'n' || b.t === 'n')
+    return (a.t === 'n' ? a.v : Number(a.v)) - (b.t === 'n' ? b.v : Number(b.v));
+  if (a.t === 'd' && b.t === 'd') {
+    const na = a.v[0] === '-', nb = b.v[0] === '-';
+    if (na !== nb) return na ? -1 : 1;
+    const c = cmpDecAbs(na ? a.v.slice(1) : a.v, nb ? b.v.slice(1) : b.v);
+    return na ? -c : c;
+  }
+  if (a.t === 'h' && b.t === 'h') return a.v === b.v ? 0 : (a.v < b.v ? -1 : 1);
+  return String(a.v).localeCompare(String(b.v));
+}
+
 function renderGrid(container, cols, rows, opts) {
   opts = opts || {};
   const state = { sortCol: null, asc: true };
   const wrap = document.createElement('div');
   wrap.className = 'grid-wrap';
   container.appendChild(wrap);
+  // 渲染与单元格上限:结果帧最大 64 MiB,几十万行同步拼单个 innerHTML
+  // 会长冻结甚至打挂标签页;超大单元格的全文再复制进 title 属性会让
+  // 内存翻倍。超限截断并明示(排序/行操作只作用于已渲染部分)。
+  const RENDER_ROW_CAP = 5000, CELL_TEXT_CAP = 256, CELL_TITLE_CAP = 2048;
+  const capStr = (s, n) => s.length > n ? s.slice(0, n) + '…' : s;
   const draw = () => {
     let data = rows;
     if (state.sortCol !== null) {
@@ -2072,22 +2141,29 @@ function renderGrid(container, cols, rows, opts) {
       data = rows.slice().sort((a, b) => {
         const x = a[i], y = b[i];
         if (x === null) return 1; if (y === null) return -1;
-        if (typeof x === 'number' && typeof y === 'number') return state.asc ? x - y : y - x;
-        const c = String(x).localeCompare(String(y));
+        const c = cmpCells(x, y);
         return state.asc ? c : -c;
       });
     }
     const btns = opts.btns; // (row, ri) => [{label, title, cls, act}] per-row actions, or falsy
+    const shown = data.length > RENDER_ROW_CAP ? data.slice(0, RENDER_ROW_CAP) : data;
     const head = `<th class="rownum">#</th>` + cols.map((c, i) =>
       `<th data-ci="${i}" title="${esc(c)}">${esc(c)}${state.sortCol === i ? `<span class="sort-ind">${state.asc ? '▲' : '▼'}</span>` : ''}</th>`).join('') +
       (btns ? '<th class="rowact"></th>' : '');
-    const body = data.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
+    const body = shown.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
       `<td class="rownum">${ri + 1}</td>` +
-      row.map(v => `<td title="${v === null ? 'NULL' : esc(fmtCell(v))}">${v === null ? '<span class="null">NULL</span>' : esc(fmtCell(v))}</td>`).join('') +
+      row.map(v => {
+        if (v === null) return `<td title="NULL"><span class="null">NULL</span></td>`;
+        const txt = capStr(fmtCell(v), CELL_TEXT_CAP);
+        return `<td title="${esc(capStr(fmtCell(v), CELL_TITLE_CAP))}">${esc(txt)}</td>`;
+      }).join('') +
       (btns ? `<td class="rowact">${(btns(row, ri) || []).map((b, i) =>
         `<button data-bt="${ri}:${i}"${b.cls ? ` class="${esc(b.cls)}"` : ''}${b.title ? ` title="${esc(b.title)}"` : ''}>${esc(b.label)}</button>`).join('')}</td>` : '') +
       '</tr>').join('');
-    wrap.innerHTML = `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    const capNote = shown.length < data.length
+      ? `<tr><td class="rownum"></td><td colspan="${cols.length}" style="color:var(--txt3)">${T('结果共 {0} 行,超出渲染上限,仅显示前 {1} 行;排序与行操作仅作用于已显示部分,请用 LIMIT 收窄', data.length, RENDER_ROW_CAP)}</td>${btns ? '<td class="rowact"></td>' : ''}</tr>`
+      : '';
+    wrap.innerHTML = `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}${capNote}</tbody></table>`;
     $$('th[data-ci]', wrap).forEach(th => th.onclick = () => {
       const i = +th.dataset.ci;
       if (state.sortCol === i) { if (state.asc) state.asc = false; else { state.sortCol = null; } }
@@ -2167,11 +2243,15 @@ async function execQuery(t, selectedOnly) {
   const sql = (selectedOnly ? t.editor.selectedText() : t.editor.value).trim();
   if (!sql) { ui.toast(T('没有可执行的 SQL')); return; }
   t.clearOutput();
+  // 连按 F5/连点「执行」:后发请求淘汰先发,旧响应回来不得覆盖新结果。
+  t.execSeq = (t.execSeq || 0) + 1;
+  const seq = t.execSeq;
   ui.status(T('正在执行查询…'), 'busy');
   const t0 = performance.now();
   let data;
   try { data = await api.post('/api/sql', {sql}); }
-  catch (e) { t.msg(e.message, 'err'); ui.status(T('执行失败'), 'err'); return; }
+  catch (e) { if (seq === t.execSeq) { t.msg(e.message, 'err'); ui.status(T('执行失败'), 'err'); } return; }
+  if (seq !== t.execSeq) return;
   const ms = Math.max(1, Math.round(performance.now() - t0));
   const results = $('[data-rp="results"]', t.el);
   const renderOutcome = (o, idx) => {
@@ -2245,11 +2325,18 @@ function openDataTab(tableName, meta) {
     t.host = $('.grid-host', t.el);
     const range = () => { $('[data-range]', t.el).textContent = t.offset === 0 && t.total === 0 ? T('(空表)') : T('第 {0}–{1} 行,共 {2} 行', t.offset + 1, Math.min(t.offset + t.limit, t.total), t.total); };
     t.load = async () => {
+      // 快速连点翻页会产生并发在途请求:序号淘汰旧响应,并快照本场的
+      // 分页参数 —— 否则慢的旧响应最后落地,网格内容与行号标签/按钮
+      // 禁用态错位(甚至把新偏移渲染进旧页)。
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq, offset = t.offset, limit = t.limit;
       ui.status(T('正在加载 {0}…', tableName), 'busy');
       try {
         const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${qident(tableName)}"`});
+        if (seq !== t.reqSeq) return;
         t.total = count.kind === 'rows' ? +count.rows[0][0] : 0;
-        const r = await api.post('/api/sql', {sql: `SELECT * FROM "${qident(tableName)}" ORDER BY 1 LIMIT ${t.limit} OFFSET ${t.offset}`});
+        const r = await api.post('/api/sql', {sql: `SELECT * FROM "${qident(tableName)}" ORDER BY 1 LIMIT ${limit} OFFSET ${offset}`});
+        if (seq !== t.reqSeq) return;
         t.host.innerHTML = '';
         if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; return; }
         const keys = tableKeys(meta);
@@ -2415,7 +2502,7 @@ function openClusterTab() {
       } catch (e) { ui.toast(T('集群状态刷新失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生探测流量。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
     t.onClose = () => clearInterval(t.timer);
     t.load();
   });
@@ -2604,7 +2691,9 @@ const usersPage = {
       const body = asRole
         ? {action, role: name, name: target()}
         : {action, role: target(), name};
-      const r = await api.post('/api/users', body);
+      let r;
+      try { r = await api.post('/api/users', body); }
+      catch (e) { return err(e.message); }
       if (r.error) return err(r.error);
       ui.toast(T('已更新')); closeModal(); t.load();
     };
@@ -2686,7 +2775,9 @@ function openBackupTab() {
       <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在读取备份状态…</div></div>
     </div>`;
     $('[data-do="trigger"]', t.el).onclick = async (e) => {
-      const b = e.target;
+      // currentTarget:按钮内是 <span>,点到文字时 e.target 是 span,
+      // 对它设 disabled 无效,防重复触发形同虚设。
+      const b = e.currentTarget;
       b.disabled = true;
       try {
         const r = await api.post('/api/backup');
@@ -2707,13 +2798,13 @@ function openBackupTab() {
       dialog(T('恢复备份 {0} → {1}', name, targetLabel), [
         {name: 'confirm', label: T('输入 {0} 确认恢复到节点 {1}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。', name, targetLabel), ph: name, value: ''},
       ], T('确认恢复'), async (vals, err) => {
-        if (vals.confirm !== name) { err(T('输入与备份文件名不一致')); throw new Error('mismatch'); }
+        if (vals.confirm !== name) { err(T('输入与备份文件名不一致')); throw new Error('cancel'); }
         try {
           const r = await api.post('/api/backup/restore', {file: name, confirm: name, node: targetNode});
-          if (r.error) { err(r.error); throw new Error(r.error); }
+          if (r.error) { err(r.error); throw new Error('cancel'); }
           ui.toast(T('恢复已开始({0})', targetLabel));
           t.load();
-        } catch (e) { if (e.message !== 'mismatch') ui.toast(T('恢复触发失败:{0}', e.message), true); throw e; }
+        } catch (e) { if (e.message !== 'cancel') ui.toast(T('恢复触发失败:{0}', e.message), true); throw e; }
       });
     };
     t.render = (v) => {
@@ -2779,7 +2870,7 @@ function openBackupTab() {
       } catch (e) { ui.toast(T('备份状态读取失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生请求。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
     t.onClose = () => clearInterval(t.timer);
     t.load();
   });
@@ -2897,11 +2988,18 @@ function openLogsTab() {
             ok: e.ok !== false, error: e.detail || null,
           }));
         }
-        srcSel.innerHTML = opts.join('');
-        if (t.src !== 'all' && !opts.some(o => o.includes(`value="${t.src}"`))) {
-          t.src = 'all';
-          srcSel.value = 'all';
+        // 选项集合(值序列)作为重建签名:每 5s 的轮询都会走到这里,若
+        // 无条件整体替换 options,正在展开挑选的下拉会立即被合上;仅在
+        // 成员变化且焦点不在下拉上时重建(命中数随之冻结到下次重建)。
+        const sig = ['all', 'local', ...(data.nodes || []).filter(n => n.reachable && n.logs).map(n => n.addr)].join('|');
+        if (srcSel.dataset.sig !== sig && document.activeElement !== srcSel) {
+          srcSel.innerHTML = opts.join('');
+          srcSel.dataset.sig = sig;
         }
+        if (t.src !== 'all' && !sig.split('|').includes(t.src)) {
+          t.src = 'all';
+        }
+        srcSel.value = t.src;
         rows.sort((a, b) => b.ts - a.ts);
         t.rows = rows;
         t.offline = (data.nodes || []).filter(n => !n.reachable);
@@ -2909,7 +3007,7 @@ function openLogsTab() {
       } catch (e) { ui.toast(T('日志刷新失败:{0}', e.message), true); }
     };
     // 与集群页同策略:仅在 tab 激活时轮询。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t) t.load(); }, 5000);
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
     t.onClose = () => clearInterval(t.timer);
     t.load();
   });
@@ -3111,7 +3209,7 @@ const explorer = {
         ctx.open([
           {id: 'idxgen', label: T('编写索引脚本为 CREATE TO →'), act: () => autoIndexScript(tname, name, d)},
           '-',
-          {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
+          {id: 'copy', label: T('复制名称'), act: () => copyText(name, T('已复制:{0}', name))},
         ], x, y);
         return;
       }
@@ -3123,7 +3221,7 @@ const explorer = {
           openQueryTab(() => T('脚本: {0}', name), d ? indexCreateSql(tname, name, d.column, !!d.unique) + ';' : T('-- 未找到索引 {0} 的定义', name));
         }},
         '-',
-        {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
+        {id: 'copy', label: T('复制名称'), act: () => copyText(name, T('已复制:{0}', name))},
       ], x, y);
     } else if (kind === 'indexes') {
       ctx.open([
@@ -3135,12 +3233,12 @@ const explorer = {
       ctx.open([
         {id: 'top', label: T('选择前 1000 行'), act: () => q(`SELECT * FROM "${qident(name)}" LIMIT 1000;`, () => T('系统表: {0}', name))},
         '-',
-        {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
+        {id: 'copy', label: T('复制名称'), act: () => copyText(name, T('已复制:{0}', name))},
         {id: 'refresh', label: T('刷新'), act: () => this.refresh()},
       ], x, y);
     } else if (kind === 'column' || kind === 'key' || kind === 'sysview') {
       ctx.open([
-        {id: 'copy', label: T('复制名称'), act: () => { navigator.clipboard && navigator.clipboard.writeText(name); ui.toast(T('已复制:{0}', name)); }},
+        {id: 'copy', label: T('复制名称'), act: () => copyText(name, T('已复制:{0}', name))},
         ...(kind === 'sysview' ? [{id: 'sel', label: T('选择前 100 行'), act: () => q(`SELECT * FROM ${name} LIMIT 100;`, () => T('查询: {0}', name))}] : []),
       ], x, y);
     } else if (kind === 'tables') {
@@ -3278,7 +3376,14 @@ $$('.menu-drop [data-act]').forEach(item => {
 /* ================= 启动 ================= */
 // 控制台账号门激活时,先完成 设置/登录(startApp 由 authGate 回调),
 // 否则直接进入。
-function startApp() { layout.boot(); openDashboard(); explorer.refresh(); nodes.boot(); }
+function startApp() {
+  // 会话过期重登会再次走到这里:静态元素上的分隔条/resize 监听只应绑
+  // 一次,重跑会让拖动执行两遍、双击弹两个 toast(标签页本身未销毁,
+  // 无需重建仪表盘)。
+  if (startApp.started) return;
+  startApp.started = true;
+  layout.boot(); openDashboard(); explorer.refresh(); nodes.boot();
+}
 explorer.bind();
 (async () => { if (await authGate.boot()) startApp(); })();
 $('#auth-ok').onclick = () => authGate.submit();

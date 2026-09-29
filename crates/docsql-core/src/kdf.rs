@@ -148,6 +148,14 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
 }
 
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let (ipad, opad) = hmac_key_pads(key);
+    hmac_with_pads(&ipad, &opad, data)
+}
+
+/// HMAC key pads (RFC 2104): a key longer than the block size is replaced
+/// by its hash. Precomputable, so hot loops reusing one key don't pay
+/// O(|key|) every round.
+fn hmac_key_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
     let mut k = [0u8; 64];
     if key.len() > 64 {
         k[..32].copy_from_slice(&sha256(key));
@@ -160,27 +168,37 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
         ipad[i] ^= k[i];
         opad[i] ^= k[i];
     }
+    (ipad, opad)
+}
+
+fn hmac_with_pads(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 32] {
     let mut inner = Sha256::new();
-    inner.update(&ipad);
+    inner.update(ipad);
     inner.update(data);
     let ih = inner.finish();
     let mut outer = Sha256::new();
-    outer.update(&opad);
+    outer.update(opad);
     outer.update(&ih);
     outer.finish()
 }
 
 pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
     assert!(iterations >= 1, "PBKDF2 needs at least one iteration");
+    // The key pads must be computed once, outside the loop: recomputing them
+    // per iteration made every round O(|password|) — a 2 MiB password (the
+    // HTTP body cap) turned one 210k-round derivation into ~20 minutes of
+    // CPU, and the permit pool that bounds concurrent derivations could be
+    // pinned by two anonymous requests.
+    let (ipad, opad) = hmac_key_pads(password);
     let mut block_index: u32 = 1;
     let mut filled = 0;
     while filled < out.len() {
         let mut salted = salt.to_vec();
         salted.extend_from_slice(&block_index.to_be_bytes());
-        let mut u = hmac_sha256(password, &salted);
+        let mut u = hmac_with_pads(&ipad, &opad, &salted);
         let mut t = u;
         for _ in 1..iterations {
-            u = hmac_sha256(password, &u);
+            u = hmac_with_pads(&ipad, &opad, &u);
             for (tb, ub) in t.iter_mut().zip(u.iter()) {
                 *tb ^= ub;
             }
@@ -456,6 +474,76 @@ mod tests {
             hex(&long),
             "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9"
         );
+    }
+
+    #[test]
+    fn pbkdf2_long_password_known_answers() {
+        // Passwords over the 64-byte HMAC block size take the "hash key
+        // first" path. The pads are precomputed once per derivation (not per
+        // iteration); these vectors pin the output to the RFC-equivalent
+        // result around that boundary (generated with Python's
+        // hashlib.pbkdf2_hmac).
+        let mut out = [0u8; 32];
+        pbkdf2_hmac_sha256(&[b'A'; 100], b"salt", 1000, &mut out);
+        assert_eq!(
+            hex(&out),
+            "1591a0f5d2c62bb6541806ff5e4ae13af414c8fc0ce449376b399337bd3ee0d1"
+        );
+        // Exactly the block size: no key hashing.
+        pbkdf2_hmac_sha256(&[b'B'; 64], b"salt", 1000, &mut out);
+        assert_eq!(
+            hex(&out),
+            "0b0734988c3c8fcc926333716f8b8981a403ee72688c1c326478e7079a18190e"
+        );
+        // One byte over: key hashing kicks in.
+        pbkdf2_hmac_sha256(&[b'C'; 65], b"salt", 1000, &mut out);
+        assert_eq!(
+            hex(&out),
+            "3866490fa1a3af05fe7d69d79e5f5965dd24e1825268ac47a61bbb2cd834b8a2"
+        );
+        // Multi-byte UTF-8 (passwords are raw bytes, not chars).
+        let pw = "密码长度放大测试".repeat(20).into_bytes();
+        pbkdf2_hmac_sha256(&pw, b"salt", 1000, &mut out);
+        assert_eq!(
+            hex(&out),
+            "8b770b71916e410de06ace3e95f1e1398c3ffad9bb5a0f4f730ae2c3b92734a7"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_pad_precompute_matches_per_iteration_hmac() {
+        // Reference: derive with hmac_sha256 called per iteration (the old
+        // shape). Must match the pads-precomputed path bit for bit.
+        for pw in [
+            &b"short"[..],
+            &[b'K'; 64][..],
+            &[b'K'; 65][..],
+            &[b'K'; 512][..],
+        ] {
+            let (salt, iterations, len) = (b"nacl", 7u32, 40usize);
+            let mut expected = vec![0u8; len];
+            let mut block: u32 = 1;
+            let mut filled = 0;
+            while filled < len {
+                let mut salted = salt.to_vec();
+                salted.extend_from_slice(&block.to_be_bytes());
+                let mut u = hmac_sha256(pw, &salted);
+                let mut t = u;
+                for _ in 1..iterations {
+                    u = hmac_sha256(pw, &u);
+                    for (tb, ub) in t.iter_mut().zip(u.iter()) {
+                        *tb ^= ub;
+                    }
+                }
+                let take = (len - filled).min(32);
+                expected[filled..filled + take].copy_from_slice(&t[..take]);
+                filled += take;
+                block += 1;
+            }
+            let mut got = vec![0u8; len];
+            pbkdf2_hmac_sha256(pw, salt, iterations, &mut got);
+            assert_eq!(got, expected, "mismatch for password len {}", pw.len());
+        }
     }
 
     #[test]

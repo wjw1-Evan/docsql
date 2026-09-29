@@ -329,16 +329,21 @@ fn parse_creds(bytes: &[u8]) -> Result<Creds, String> {
         .map_err(|_| "corrupt credential file: hash len")?;
     // Missing count (hand-written file) defaults to the built-in default,
     // not the env override: a stored entry's count is the one it was
-    // hashed with.
-    let iterations = v["iterations"]
-        .as_u64()
-        .unwrap_or(docsql_core::kdf::PBKDF2_ITERATIONS as u64) as u32;
+    // hashed with. A present-but-non-numeric value (negative, float,
+    // string) is corrupt like any other tampering, not a silent default.
+    let raw_iterations = match v.get("iterations") {
+        None => docsql_core::kdf::PBKDF2_ITERATIONS as u64,
+        Some(n) => n.as_u64().ok_or("corrupt credential file: iterations")?,
+    };
     // A hand-edited 0 would hit pbkdf2_hmac_sha256's assert and panic the
     // login handler on every attempt; an astronomic value would turn each
     // login into a CPU burn — both are corrupt like any other tampering.
-    if !(1..=docsql_core::kdf::MAX_PBKDF2_ITERATIONS).contains(&iterations) {
+    // Validate in the u64 domain: narrowing first (`as u32`) would truncate
+    // 2^32+k to k and let an out-of-range value slip through as k.
+    if !(1..=docsql_core::kdf::MAX_PBKDF2_ITERATIONS as u64).contains(&raw_iterations) {
         return Err("corrupt credential file: iterations".into());
     }
+    let iterations = raw_iterations as u32;
     Ok(Creds {
         username,
         salt,
@@ -639,6 +644,16 @@ mod tests {
         );
         // A hand-edited 0 would panic the login handler downstream — refused.
         assert!(parse_creds(&creds("admin", &salt_hex, &hash_hex, json!(0))).is_err());
+        // 2^32 + k used to narrow (`as u32`) to k and pass the range check
+        // as a small work factor instead of failing closed.
+        assert!(parse_creds(&creds(
+            "admin",
+            &salt_hex,
+            &hash_hex,
+            json!(u64::from(u32::MAX) + 1000)
+        ))
+        .is_err());
+        assert!(parse_creds(&creds("admin", &salt_hex, &hash_hex, json!(-1))).is_err());
         // Missing or non-string fields, broken hex, wrong lengths.
         // (An empty username string still parses here — name policy is
         // setup's job; parse only guards the file's structural integrity.)

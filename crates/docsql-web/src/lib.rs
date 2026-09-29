@@ -212,14 +212,48 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
             let acceptor = load_tls_acceptor(&tls)?;
             let shutdown = shutdown_signal();
             tokio::pin!(shutdown);
+            // Connection handles for the shutdown drain (pruned so a
+            // long-lived console does not accumulate finished entries).
+            let mut conns: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             loop {
                 tokio::select! {
-                    _ = &mut shutdown => return Ok(()),
+                    _ = &mut shutdown => {
+                        // Same contract as the plain path's graceful
+                        // shutdown: stop accepting, give in-flight requests
+                        // a bounded drain window (orchestrators impose their
+                        // own stop timeout on top).
+                        let drain = async {
+                            for h in conns.drain(..) {
+                                let _ = h.await;
+                            }
+                        };
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            drain,
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     r = listener.accept() => {
-                        let (stream, peer) = r?;
+                        let (stream, peer) = match r {
+                            Ok(v) => v,
+                            // Mirror axum's accept loop: a transient error
+                            // must not kill the process — an unauthenticated
+                            // peer can exhaust fds (every accepted connection
+                            // holds one for its 30s handshake window), and
+                            // `?` on EMFILE turned that into a crash loop.
+                            Err(e) => {
+                                if accept_error_is_noise(&e) {
+                                    continue;
+                                }
+                                eprintln!("https accept error: {e}");
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        };
                         let acceptor = acceptor.clone();
                         let app = app.clone();
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             // Handshake deadline: `acceptor.accept` has no
                             // timeout of its own, so an unauthenticated peer
                             // could park a task + buffers indefinitely by
@@ -272,6 +306,10 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
                                 eprintln!("https connection error: {e}");
                             }
                         });
+                        conns.push(handle);
+                        if conns.len() > 4096 {
+                            conns.retain(|h| !h.is_finished());
+                        }
                     }
                 }
             }
@@ -289,6 +327,19 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
             .map_err(std::io::Error::other)
         }
     }
+}
+
+/// Accept-loop error triage: connection-aborted/reset/refused are protocol
+/// noise (a connection RST between handshake completion and accept) — retry
+/// immediately. Everything else (EMFILE, ENOMEM, …) is logged and the loop
+/// backs off for a second, mirroring axum's own accept-loop policy; neither
+/// class may escape the loop and kill the process.
+fn accept_error_is_noise(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused
+    )
 }
 
 /// Load the PEM cert chain + private key into a TLS acceptor. Fails loudly
@@ -1024,9 +1075,10 @@ async fn auth_login(
     let creds = a.creds_snapshot();
     let username = body.username.clone();
     let password = body.password.clone();
+    let verify_against = creds.clone();
     let ok = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        creds
+        verify_against
             .as_ref()
             .is_some_and(|c| auth::verify_creds(c, &username, &password))
     })
@@ -1043,6 +1095,19 @@ async fn auth_login(
         );
     }
     a.lockout.lock().unwrap().reset(source);
+    // The derivation ran lock-free for hundreds of milliseconds. A password
+    // change could have installed new credentials and run `keep_only` in
+    // that window; re-check the snapshot under the short lock so a login
+    // verified against the OLD credentials cannot mint a session after the
+    // rotation (it would slide for another 12h and defeat the kick). The
+    // client simply retries with the new password — no lockout entry, the
+    // password was not wrong.
+    if a.creds_snapshot().as_ref() != creds.as_ref() {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "用户名或密码不正确"}),
+        );
+    }
     let username = a.username().unwrap_or_default();
     let token = a.sessions.create();
     with_session_cookie(
@@ -1292,8 +1357,10 @@ async fn api_parse(
 // 其余输入一律拒绝。读侧仅运行四条固定 SELECT。
 
 /// 用户/角色名的字符集白名单(镜像引擎校验,前端给出友好错误)。
+/// 长度按字符数:白名单本就只收 ASCII(此时与字节数一致),非 ASCII 名
+/// 走字符集分支报错,不会再拿「22 个汉字 = 66 字节」去撞长度上限。
 fn valid_user_ident(name: &str) -> bool {
-    let n = name.len();
+    let n = name.chars().count();
     if n == 0 || n > 64 {
         return false;
     }
@@ -2087,6 +2154,23 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
     // (per-statement outcomes, first statement error) — transport failures
     // abort the whole call as a single error object.
     const BATCH_RESULT_BUDGET: usize = 64 * 1024 * 1024;
+    // Memory is bounded by the budget above, but time is not: a 2 MiB body
+    // can carry ~130k tiny statements, each an individual round trip (with
+    // its own IO timeout) on one node connection — one authenticated
+    // request could occupy a worker for minutes. Cap the statement count
+    // and the whole-batch wall clock.
+    const BATCH_MAX_STATEMENTS: usize = 10_000;
+    const BATCH_DEADLINE_SECS: u64 = 120;
+    if stmts.len() > BATCH_MAX_STATEMENTS {
+        return serde_json::json!({
+            "kind": "error",
+            "message": format!(
+                "batch too large: {n} statements (max {BATCH_MAX_STATEMENTS}); split the batch",
+                n = stmts.len()
+            ),
+        });
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(BATCH_DEADLINE_SECS);
     let run: BatchRun = async {
         let mut stream = node_connect(addr, token).await?;
         let mut outcomes = Vec::new();
@@ -2097,6 +2181,17 @@ pub async fn remote_sql(addr: &str, token: Option<&str>, sql: &str) -> serde_jso
         // console shared by every operator.
         let mut budget = BATCH_RESULT_BUDGET;
         for (i, stmt) in stmts.iter().enumerate() {
+            if std::time::Instant::now() > deadline {
+                return Ok((
+                    outcomes,
+                    Some((
+                        i,
+                        format!(
+                            "batch exceeded {BATCH_DEADLINE_SECS}s wall clock; narrow the query or split the batch"
+                        ),
+                    )),
+                ));
+            }
             let payload = proto::encode_sql(stmt).map_err(|e| e.to_string())?;
             node_write_frame(&mut stream, &Frame::new(proto::REQ_SQL, payload))
                 .await
@@ -2778,6 +2873,49 @@ mod tests {
         assert_eq!(r["kind"], "affected", "{r}");
         let r = remote_sql(&addr, None, "SELECT v FROM rt WHERE id = 9").await;
         assert_eq!(r["rows"][0][0].as_str().unwrap().len(), 600, "{r}");
+    }
+
+    /// The batch statement cap fires before any connection is opened — a
+    /// 2 MiB body used to be able to carry ~130k round trips on one worker.
+    #[tokio::test]
+    async fn remote_sql_rejects_statement_count_over_cap() {
+        let r = remote_sql("127.0.0.1:1", None, &"SELECT 1;".repeat(10_001)).await;
+        assert_eq!(r["kind"], "error", "{r}");
+        assert!(
+            r["message"].as_str().unwrap().contains("batch too large"),
+            "{r}"
+        );
+        // Just under the cap is not rejected on the cap (the unreachable
+        // address error proves it got past the cap check).
+        let r = remote_sql("127.0.0.1:1", None, &"SELECT 1;".repeat(10_000)).await;
+        assert_eq!(r["kind"], "error", "{r}");
+        assert!(
+            !r["message"].as_str().unwrap().contains("batch too large"),
+            "{r}"
+        );
+    }
+
+    /// Accept-loop triage: protocol noise retries immediately; resource
+    /// errors (EMFILE …) back off — neither may kill the process.
+    #[test]
+    fn accept_error_triage_classifies_noise() {
+        use std::io::ErrorKind;
+        assert!(accept_error_is_noise(&std::io::Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(accept_error_is_noise(&std::io::Error::from(
+            ErrorKind::ConnectionReset
+        )));
+        assert!(accept_error_is_noise(&std::io::Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+        // EMFILE (fd exhaustion) and friends must take the backoff branch.
+        assert!(!accept_error_is_noise(&std::io::Error::from_raw_os_error(
+            24
+        )));
+        assert!(!accept_error_is_noise(&std::io::Error::from(
+            ErrorKind::OutOfMemory
+        )));
     }
 
     /// Auth against token-protected nodes plus the offline-node error path.
