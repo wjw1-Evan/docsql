@@ -14,6 +14,10 @@
 //! - REQ_LOGS      → RESP_LOGS: recent statement-audit entries + sync
 //!   events (query-log ring + replication fan-out trail) for the web
 //!   console's logs page
+//! - REQ_SESSIONS  → RESP_ROWS: activity monitor — one row per live
+//!   connection (id/peer/identity/state/current statement), admin-only
+//! - REQ_KILL      → RESP_AFFECTED: close a connection by id after its
+//!   current statement (admin-only; self-kill refused)
 //! - REQ_BACKUP    → RESP_BACKUP: backup directory listing + last attempt,
 //!   or trigger one backup now (automatic backups run on a timer, see
 //!   backup.rs)
@@ -145,6 +149,12 @@ pub struct ServerState {
     /// one holder must not cascade into every later statement panicking on
     /// a poisoned mutex.
     pub tx_owner: std::sync::Mutex<Option<u64>>,
+    /// Live connections, keyed by the same per-connection id the pubsub
+    /// registry uses: the activity monitor (REQ_SESSIONS) reads it and
+    /// REQ_KILL flips the slot's kill flag. Entries are added at connection
+    /// start and removed on close (any exit path — the cleanup runs after
+    /// the frame loop, next to the pubsub deregistration).
+    pub(crate) sessions: tokio::sync::Mutex<std::collections::HashMap<u64, Arc<SessionSlot>>>,
     /// Serializes write execution together with its fan-out so peers apply
     /// writes in the order this node executed them (and the
     /// buffer-vs-forward classification is race-free). Shared as an Arc so
@@ -370,6 +380,86 @@ pub(crate) struct UserAuth {
     grants: docsql_core::useradmin::UserGrants,
 }
 
+/// One live connection's operator-visible state (REQ_SESSIONS) plus its
+/// kill switch (REQ_KILL). The slot is shared between the connection's
+/// frame loop (which updates `info` around statement execution) and the
+/// admin surface (which snapshots it / requests the kill).
+pub(crate) struct SessionSlot {
+    /// Kill request, as a watch channel rather than a bare flag+notify:
+    /// the value survives being set between the loop's flag check and the
+    /// select arm registration (a notify without a waiter would be lost
+    /// and the kill silently delayed to the idle timeout).
+    kill: tokio::sync::watch::Sender<bool>,
+    kill_wait: tokio::sync::watch::Receiver<bool>,
+    pub info: std::sync::Mutex<SessionInfo>,
+}
+
+/// Mutable per-connection snapshot fields. The std mutex is fine: every
+/// critical section is a plain field write/read, never held across await.
+#[derive(Clone)]
+pub(crate) struct SessionInfo {
+    pub peer: String,
+    /// Operator-facing credential label, updated at each AUTH transition:
+    /// "unauthenticated", "anonymous", "client token", "read-only token",
+    /// "cluster peer", "user <name>".
+    pub identity: String,
+    pub connected_at: std::time::Instant,
+    /// Statements executed on this connection (client traffic only —
+    /// replication applies do not ride the session snapshot).
+    pub statements: u64,
+    /// The statement currently executing (text + start), None while idle.
+    pub current: Option<(String, std::time::Instant)>,
+}
+
+impl SessionSlot {
+    fn new(peer: &str) -> Self {
+        let (kill, kill_wait) = tokio::sync::watch::channel(false);
+        SessionSlot {
+            kill,
+            kill_wait,
+            info: std::sync::Mutex::new(SessionInfo {
+                peer: peer.to_string(),
+                identity: "unauthenticated".into(),
+                connected_at: std::time::Instant::now(),
+                statements: 0,
+                current: None,
+            }),
+        }
+    }
+
+    fn is_killed(&self) -> bool {
+        *self.kill_wait.borrow()
+    }
+
+    /// REQ_KILL: marks the connection to close and wakes a blocked read.
+    fn request_kill(&self) {
+        let _ = self.kill.send(true);
+    }
+
+    /// Watcher for the read-side select (see `is_killed` for why watch).
+    fn kill_watcher(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.kill_wait.clone()
+    }
+
+    /// Update the identity label (idempotent, cheap).
+    fn set_identity(&self, identity: &str) {
+        let mut info = self.info.lock().unwrap_or_else(|p| p.into_inner());
+        info.identity = identity.to_string();
+    }
+
+    /// Mark a statement as running (display text capped at 256 chars).
+    fn start_statement(&self, sql: &str) {
+        let mut info = self.info.lock().unwrap_or_else(|p| p.into_inner());
+        info.current = Some((sql.chars().take(256).collect(), std::time::Instant::now()));
+    }
+
+    fn finish_statement(&self) {
+        let mut info = self.info.lock().unwrap_or_else(|p| p.into_inner());
+        info.current = None;
+        info.statements += 1;
+    }
+}
+
 pub struct ServerConfig {
     pub db_path: PathBuf,
     pub listen: String,
@@ -566,6 +656,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         apply_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         peer_backoff: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         tx_owner: std::sync::Mutex::new(None),
+        sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         write_order: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         holds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         next_hold_id: std::sync::atomic::AtomicU64::new(1),
@@ -1244,49 +1335,96 @@ pub async fn handle_connection(
     // Legacy anonymous access is judged at connection start: connections
     // that were legitimate when they opened (user-less node) keep working
     // — the operator bootstrap (CREATE USER + GRANT over one session)
-    // must not lock itself out mid-flight — while NEW anonymous
-    // connections close once users exist.
+    // must not lock itself out mid-flight — while NEW anonymous connections
+    // close once users exist.
     let anon_open = !state.has_users.load(std::sync::atomic::Ordering::SeqCst);
     // Auth-failure lockout: a source past the threshold is rejected unread
     // until the lockout elapses (identity-authentication failure handling).
     let source_ip = peer.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&peer);
+    // Activity-monitor registration: visible in REQ_SESSIONS from here
+    // until the cleanup after the frame loop. The initial identity label
+    // matches the pre-AUTH role (auth-disabled nodes open as clients).
+    let session = Arc::new(SessionSlot::new(&peer));
+    if role == ConnRole::Client && state.auth_token.is_none() {
+        session.set_identity("anonymous");
+    }
+    state.sessions.lock().await.insert(conn_id, session.clone());
     let result = async {
         loop {
-            let read = conn.read_frame();
-            let frame = if role == ConnRole::Unauthed {
-                // Pre-auth budget: an unauthenticated socket gets one
-                // bounded window to say AUTH — it must not pin its task
-                // and read buffer indefinitely.
-                match tokio::time::timeout(PRE_AUTH_TIMEOUT, read).await {
-                    Ok(f) => f?,
-                    Err(_) => {
-                        let _ = tx
-                            .send(Frame::new(
-                                proto::RESP_ERROR,
-                                err_payload("authentication timeout; reconnect"),
-                            ))
-                            .await;
-                        break;
-                    }
-                }
-            } else {
-                match state.idle_timeout {
-                    Some(t) => match tokio::time::timeout(t, read).await {
-                        Ok(f) => f?,
+            // REQ_KILL observed between iterations (e.g. set while a
+            // statement was finishing): close before reading another frame.
+            if session.is_killed() {
+                let _ = tx
+                    .send(Frame::new(
+                        proto::RESP_ERROR,
+                        err_payload("connection killed by administrator"),
+                    ))
+                    .await;
+                break;
+            }
+            // Captured by value: the async block stays pinned across the
+            // frame handling below, where `role` is reassigned by AUTH.
+            let unauthed = role == ConnRole::Unauthed;
+            let idle_timeout = state.idle_timeout;
+            let read_outcome = async {
+                if unauthed {
+                    // Pre-auth budget: an unauthenticated socket gets one
+                    // bounded window to say AUTH — it must not pin its task
+                    // and read buffer indefinitely.
+                    match tokio::time::timeout(PRE_AUTH_TIMEOUT, conn.read_frame()).await {
+                        Ok(f) => f,
                         Err(_) => {
                             let _ = tx
                                 .send(Frame::new(
                                     proto::RESP_ERROR,
-                                    err_payload("idle session timed out; reconnect"),
+                                    err_payload("authentication timeout; reconnect"),
                                 ))
                                 .await;
-                            break;
+                            Ok(None)
                         }
-                    },
-                    None => read.await?,
+                    }
+                } else {
+                    match idle_timeout {
+                        Some(t) => match tokio::time::timeout(t, conn.read_frame()).await {
+                            Ok(f) => f,
+                            Err(_) => {
+                                let _ = tx
+                                    .send(Frame::new(
+                                        proto::RESP_ERROR,
+                                        err_payload("idle session timed out; reconnect"),
+                                    ))
+                                    .await;
+                                Ok(None)
+                            }
+                        },
+                        None => conn.read_frame().await,
+                    }
                 }
             };
-            let Some(mut frame) = frame else { break };
+            let mut kill_waiter = session.kill_watcher();
+            tokio::pin!(read_outcome);
+            let frame = tokio::select! {
+                r = &mut read_outcome => r,
+                // KILL on a blocked read: an idle session must not wait out
+                // its idle/pre-auth budget to die. Watch semantics make the
+                // request visible even when it raced the arm registration.
+                changed = kill_waiter.changed() => {
+                    let _ = changed;
+                    if session.is_killed() {
+                        let _ = tx
+                            .send(Frame::new(
+                                proto::RESP_ERROR,
+                                err_payload("connection killed by administrator"),
+                            ))
+                            .await;
+                        Ok(None)
+                    } else {
+                        // Spurious wake (no kill request): keep waiting.
+                        (&mut read_outcome).await
+                    }
+                }
+            };
+            let Some(mut frame) = frame? else { break };
             if state.auth_lock_threshold > 0 {
                 let locked = {
                     let failures = state.auth_failures.lock().await;
@@ -1617,6 +1755,7 @@ pub async fn handle_connection(
                     if cluster_match {
                         role = ConnRole::Peer;
                         token_authed = true;
+                        session.set_identity("cluster peer");
                         state.auth_failures.lock().await.remove(source_ip);
                         audit(true, "cluster token accepted", &state);
                         Some(Frame::new(proto::RESP_AFFECTED, b"ok".to_vec()))
@@ -1633,6 +1772,9 @@ pub async fn handle_connection(
                             role = ConnRole::Client;
                             if client_match {
                                 token_authed = true;
+                                session.set_identity("client token");
+                            } else {
+                                session.set_identity("anonymous");
                             }
                             state.auth_failures.lock().await.remove(source_ip);
                             if state.auth_token.is_some() {
@@ -1642,6 +1784,7 @@ pub async fn handle_connection(
                         } else if read_match {
                             role = ConnRole::ReadOnly;
                             token_authed = true;
+                            session.set_identity("read-only token");
                             state.auth_failures.lock().await.remove(source_ip);
                             audit(true, "read token accepted", &state);
                             Some(Frame::new(proto::RESP_AFFECTED, b"ok(read-only)".to_vec()))
@@ -1665,6 +1808,7 @@ pub async fn handle_connection(
                         let (f, u) = user_login_frame(&state, source_ip, &frame.payload).await;
                         if let Some(u) = u {
                             role = ConnRole::Client;
+                            session.set_identity(&format!("user {}", u.name));
                             user_epoch =
                                 state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
                             user = Some(u);
@@ -1717,6 +1861,65 @@ pub async fn handle_connection(
                         let payload = serde_json::to_vec(&status_payload(&state).await)
                             .unwrap_or_else(|_| b"{}".to_vec());
                         Some(Frame::new(proto::RESP_STATUS, payload))
+                    }
+                }
+                proto::REQ_SESSIONS if authed => {
+                    // Activity monitor: seeing other connections' current
+                    // statements is admin-only (statement texts carry data
+                    // values; the audit-log rule applies).
+                    if role == ConnRole::ReadOnly
+                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("the session list requires the admin role"),
+                        ))
+                    } else {
+                        let payload = serde_json::to_vec(&sessions_payload(&state))
+                            .unwrap_or_else(|_| br#"{"columns":[],"rows":[]}"#.to_vec());
+                        Some(Frame::new(proto::RESP_ROWS, payload))
+                    }
+                }
+                proto::REQ_KILL if authed => {
+                    // Admin-only kill switch (see sessions_payload). Killing
+                    // your OWN connection is refused loudly — the operator
+                    // should disconnect instead, and the console must not be
+                    // able to sever the very leg it is managing through.
+                    if role == ConnRole::ReadOnly
+                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("killing connections requires the admin role"),
+                        ))
+                    } else if frame.payload.len() != 8 {
+                        Some(Frame::new(
+                            proto::RESP_ERROR,
+                            err_payload("kill: payload must be exactly one u64 connection id"),
+                        ))
+                    } else {
+                        let id = u64::from_le_bytes(frame.payload[..8].try_into().unwrap());
+                        if id == conn_id {
+                            Some(Frame::new(
+                                proto::RESP_ERROR,
+                                err_payload("refusing to kill your own connection; disconnect instead"),
+                            ))
+                        } else {
+                            let sessions = state.sessions.lock().await;
+                            match sessions.get(&id) {
+                                Some(slot) => {
+                                    slot.request_kill();
+                                    Some(Frame::new(
+                                        proto::RESP_AFFECTED,
+                                        b"kill scheduled".to_vec(),
+                                    ))
+                                }
+                                None => Some(Frame::new(
+                                    proto::RESP_ERROR,
+                                    err_payload("no such connection (it may have closed; refresh)"),
+                                )),
+                            }
+                        }
                     }
                 }
                 proto::REQ_LOGS if authed => {
@@ -1781,6 +1984,9 @@ pub async fn handle_connection(
                     // node switching). The frame itself is length-capped on
                     // read.
                     let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
+                    // Activity monitor: the statement runs synchronously
+                    // below, so "running" is exactly this span.
+                    session.start_statement(&sql);
                     let mut logged = false;
                     let resp = match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly) {
                         // 读日志的查询本身不写日志(避免读日志刷日志)。
@@ -2007,6 +2213,7 @@ pub async fn handle_connection(
                             frame.flags & FLAG_REPLICATION != 0,
                         );
                     }
+                    session.finish_statement();
                     Some(resp)
                 }
                 proto::REQ_PREPARE if authed => {
@@ -2340,7 +2547,9 @@ pub async fn handle_connection(
     }
     .await;
     // Connection gone: drop its subscriptions so publishes stop fanning
-    // out to a dead writer channel.
+    // out to a dead writer channel, and take it out of the activity
+    // monitor listing.
+    state.sessions.lock().await.remove(&conn_id);
     state.pubsub.remove_conn(conn_id).await;
     // If it owned the open transaction, roll that transaction back: nobody
     // can commit it anymore, and leaving it open would queue every later
@@ -2805,6 +3014,66 @@ async fn execute_read_sql(
 
 /// Assemble the REQ_STATUS payload: everything a monitoring console needs to
 /// judge node health and cluster convergence in one round trip.
+/// REQ_SESSIONS payload: one row per live connection (id, peer,
+/// identity, connected_ms, state, current_sql, current_ms, statements).
+/// Sync snapshots only — nothing here holds a lock across an await.
+fn sessions_payload(state: &ServerState) -> serde_json::Value {
+    let sessions = state.sessions.try_lock();
+    let Ok(sessions) = sessions else {
+        // A concurrent KILL holds the map only for a flag flip; an empty
+        // answer beats blocking the monitor.
+        return serde_json::json!({"columns": [], "rows": []});
+    };
+    let tx_owner = *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    let mut entries: Vec<(u64, SessionInfo)> = sessions
+        .iter()
+        .map(|(id, slot)| {
+            let info = slot.info.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            (*id, info)
+        })
+        .collect();
+    entries.sort_by_key(|(id, _)| *id);
+    let rows: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(id, info)| {
+            // A tx owner between statements is "in transaction", not idle —
+            // that is the state an operator needs to see before killing.
+            let state_label = if info.current.is_some() {
+                "running"
+            } else if tx_owner == Some(id) {
+                "in transaction"
+            } else {
+                "idle"
+            };
+            let (current_sql, current_ms) = match &info.current {
+                Some((sql, started)) => (
+                    serde_json::Value::String(sql.clone()),
+                    now.duration_since(*started).as_millis() as u64,
+                ),
+                None => (serde_json::Value::Null, 0),
+            };
+            serde_json::json!([
+                id,
+                info.peer,
+                info.identity,
+                now.duration_since(info.connected_at).as_millis() as u64,
+                state_label,
+                current_sql,
+                current_ms,
+                info.statements,
+            ])
+        })
+        .collect();
+    serde_json::json!({
+        "columns": [
+            "id", "peer", "identity", "connected_ms", "state",
+            "current_sql", "current_ms", "statements"
+        ],
+        "rows": rows,
+    })
+}
+
 pub async fn status_payload(state: &ServerState) -> serde_json::Value {
     let peers = state.peers.lock().await.clone();
     let replicate_to = state.replicate_to.lock().await.clone();

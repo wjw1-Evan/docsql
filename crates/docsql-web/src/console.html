@@ -409,6 +409,7 @@
   <div class="menu" data-menu><span><span data-i18n>视图</span></span><div class="menu-drop">
     <div data-act="refresh"><span data-i18n>刷新对象资源管理器</span><span class="kbd">Ctrl+R</span></div>
     <div data-act="dashboard"><span data-i18n>服务器仪表盘</span></div>
+    <div data-act="sessions"><span data-i18n>活动会话</span></div>
     <div data-act="cluster"><span data-i18n>集群状态</span></div>
     <div data-act="logs"><span data-i18n>日志</span></div>
     <div data-act="backup"><span data-i18n>备份管理</span></div>
@@ -755,6 +756,33 @@ const EN = {
   '输入 {0} 确认恢复到节点 {1}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。': 'Type {0} to confirm restoring to node {1}. The node replays this snapshot over the whole database: tables with the same name are reset to the backup point and every node in the cluster converges to that state; tables created after the backup are unaffected.',
   '确认恢复': 'Confirm Restore', '输入与备份文件名不一致': 'Input does not match the backup file name',
   '恢复已开始({0})': 'Restore started ({0})', '恢复触发失败:{0}': 'Failed to trigger restore: {0}',
+  /* —— 会话监视 / 导出 / 历史 / PITR —— */
+  '活动会话': 'Activity Monitor', '会话': 'Sessions', '连接': 'Connections',
+  '来源': 'Source', '身份': 'Identity', '当前语句': 'Current Statement',
+  '已运行': 'Running For', '语句数': 'Statements', '运行中': 'Running',
+  '空闲': 'Idle', '未认证': 'Unauthenticated', '集群节点': 'Cluster Peer',
+  '终止': 'Kill', '终止会话 {0}': 'Kill session {0}',
+  '终止该连接?正在执行的语句会先完成,随后连接关闭。': 'Kill this connection? A running statement finishes first, then the connection closes.',
+  '终止请求已发出({0})': 'Kill request sent ({0})',
+  '终止失败:{0}': 'Kill failed: {0}',
+  '会话列表读取失败:{0}': 'Failed to load sessions: {0}',
+  '共 {0} 个连接 · 运行中 {1} · 事务中 {2} · 空闲 {3}': '{0} connections · {1} running · {2} in transaction · {3} idle',
+  '当前节点没有其它连接。': 'No other connections on this node.',
+  '导出': 'Export', '导出当前结果': 'Export current results',
+  'CSV': 'CSV', 'JSON': 'JSON', 'INSERT': 'INSERT',
+  '没有可导出的结果集(先执行一条查询)。': 'No result set to export (run a query first).',
+  '目标表名': 'Target table name', '生成 INSERT 语句': 'Generate INSERT statements',
+  '表名不能为空': 'Table name required',
+  '已导出 {0} 行 → {1}': 'Exported {0} rows → {1}',
+  '历史': 'History', '查询历史': 'Query History',
+  '清空历史': 'Clear History', '没有历史记录(执行过的查询会出现在这里)。': 'No history yet — executed queries appear here.',
+  '{0} ms': '{0} ms', '耗时': 'Duration', '仅慢查询': 'Slow only',
+  '全部耗时': 'Any duration', '按耗时降序': 'Sort by duration',
+  '恢复到时间点(可选)': 'Restore to timestamp (optional)',
+  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)': 'Empty = full restore; an ISO timestamp (e.g. 2026-09-29T12:00:00Z) replays the journal chain up to that moment (increments come from this node\'s journal)',
+  '时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)': 'Cannot parse the timestamp (ISO expected, e.g. 2026-09-29T12:00:00Z)',
+  '时间点恢复已开始({0} → {1})': 'Point-in-time restore started ({0} → {1})',
+  '连接时长': 'Connected', '输入 KILL 确认': 'Type KILL to confirm', '已导出 {0} 行': 'Exported {0} rows',
   '节点不可达或拒绝请求,可切换节点后重试': 'The node is unreachable or rejected the request; switch nodes and retry',
   '尚无备份': 'No backups yet',
   '自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)': 'Auto-backup Interval (DOCSQL_BACKUP_INTERVAL_SECS)',
@@ -908,6 +936,67 @@ const api = {
     return body;
   }
 };
+
+/* ================= 结果导出 / 查询历史 ================= */
+// 下载文本为文件(Blob + a[download];不经服务端)。
+function downloadText(name, text) {
+  const url = URL.createObjectURL(new Blob([text], {type: 'text/plain;charset=utf-8'}));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+// RFC4180 CSV:含逗号/引号/换行的字段加引号,内嵌引号翻倍。
+function csvField(v) {
+  if (v === null || v === undefined) return '';
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function setsToCsv(sets) {
+  return sets.map(set => {
+    const lines = [set.columns.map(csvField).join(',')];
+    for (const row of set.rows) lines.push(row.map(csvField).join(','));
+    return lines.join('\r\n');
+  }).join('\r\n\r\n') + '\r\n';
+}
+function setToJsonObjects(set) {
+  return set.rows.map(row => {
+    const o = {};
+    set.columns.forEach((c, i) => { o[c] = row[i] === undefined ? null : row[i]; });
+    return o;
+  });
+}
+// SQL 字面量:NULL / 数字 / 布尔原样;对象(JSON 标记 $dec/$ts/$bytes 等)
+// 序列化为 JSON 文本入库 —— 精确标量重放请走备份而不是 INSERT 导出。
+function sqlLiteral(v) {
+  if (v === null || v === undefined) return 'NULL';
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  return "'" + s.replace(/'/g, "''") + "'";
+}
+function setsToInserts(sets, table) {
+  const q = '"' + String(table).replace(/"/g, '""') + '"';
+  const out = [];
+  for (const set of sets) {
+    const cols = set.columns.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(', ');
+    for (const row of set.rows) {
+      out.push(`INSERT INTO ${q} (${cols}) VALUES (${row.map(sqlLiteral).join(', ')});`);
+    }
+  }
+  return out.join('\n') + '\n';
+}
+// 查询历史(localStorage,上限 100 条):执行(含失败)都记录,便于重试。
+const QHIST_KEY = 'docsql.qhist';
+function qhistAll() { try { return JSON.parse(lsGet(QHIST_KEY) || '[]'); } catch { return []; } }
+function qhistPush(entry) {
+  const h = qhistAll();
+  h.unshift({sql: entry.sql.slice(0, 4000), ms: entry.ms, ok: entry.ok, ts: entry.ts});
+  // 序列化别漏:数组直接进 setItem 会被隐式 String() 成 "[object Object]",
+  // 下一次读取 JSON.parse 失败、历史静默清零(冒烟实测)。
+  lsSet(QHIST_KEY, JSON.stringify(h.slice(0, 100)));
+}
+function qhistClear() { lsDel(QHIST_KEY); }
 
 /* ================= 控制台账号(首次使用设置 + 登录 + 修改) ================= */
 // 服务端启用 DOCSQL_WEB_AUTH_FILE 时:第一次使用强制创建账号,之后每次
@@ -2202,6 +2291,11 @@ function openQueryTab(title, sql, autoRun) {
         <button data-do="parse" data-i18n-title title="Ctrl+F5 — 语法检查,不执行"><span data-i18n>分析</span></button>
         <button data-do="execsel" data-i18n-title title="仅执行选中文本"><span data-i18n>执行所选</span></button>
         <div class="sep"></div>
+        <button data-do="hist" data-i18n-title title="查询历史(localStorage,最多 100 条;点击重填编辑器)"><span data-i18n>历史</span></button>
+        <button data-do="exp-csv" data-i18n-title title="导出当前结果为 CSV(RFC 4180)"><span data-i18n>CSV</span></button>
+        <button data-do="exp-json" data-i18n-title title="导出当前结果为 JSON"><span data-i18n>JSON</span></button>
+        <button data-do="exp-ins" data-i18n-title title="生成 INSERT 语句"><span data-i18n>INSERT</span></button>
+        <div class="sep"></div>
         <span class="meta" data-i18n>F5 执行 · Ctrl+F5 分析 · 批量语句将依次执行并返回全部结果</span>
       </div>
       <div class="q-wrap"><div class="ed-host" style="flex:1.2;display:flex;min-height:90px;flex-direction:column"></div>
@@ -2234,6 +2328,59 @@ function openQueryTab(title, sql, autoRun) {
     $('[data-do="exec"]', t.el).onclick = () => execQuery(t);
     $('[data-do="parse"]', t.el).onclick = () => parseQuery(t);
     $('[data-do="execsel"]', t.el).onclick = () => execQuery(t, true);
+    // 导出作用于最近一次执行产生的结果集(全部 rows 结果;批处理多结果
+    // 全量导出)。没有结果集时提示,不产生空文件。
+    t.currentSets = [];
+    const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const exportSets = (fmt) => {
+      if (!t.currentSets.length) { ui.toast(T('没有可导出的结果集(先执行一条查询)。')); return; }
+      if (fmt === 'csv') {
+        downloadText(`docsql-results-${stamp()}.csv`, setsToCsv(t.currentSets));
+        ui.toast(T('已导出 {0} 行 → {1}', t.currentSets.reduce((n, x) => n + x.rows.length, 0), `docsql-results-${stamp()}.csv`));
+      } else if (fmt === 'json') {
+        const sets = t.currentSets;
+        const body = sets.length === 1 ? setToJsonObjects(sets[0]) : sets.map(setToJsonObjects);
+        downloadText(`docsql-results-${stamp()}.json`, JSON.stringify(body, null, 2) + '\n');
+        ui.toast(T('已导出 {0} 行 → {1}', sets.reduce((n, x) => n + x.rows.length, 0), `docsql-results-${stamp()}.json`));
+      }
+    };
+    $('[data-do="exp-csv"]', t.el).onclick = () => exportSets('csv');
+    $('[data-do="exp-json"]', t.el).onclick = () => exportSets('json');
+    $('[data-do="exp-ins"]', t.el).onclick = () => {
+      if (!t.currentSets.length) { ui.toast(T('没有可导出的结果集(先执行一条查询)。')); return; }
+      // 默认表名:从 SQL 里尽力提取 FROM/INTO 后的标识符。
+      const m = t.editor.value.match(/(?:from|into)\s+([A-Za-z_][\w$]*)/i);
+      dialog(T('生成 INSERT 语句'), [
+        {name: 'table', label: T('目标表名'), value: m ? m[1] : '', ph: 'table_name'},
+      ], T('确定'), async (vals, err) => {
+        if (!vals.table) { err(T('表名不能为空')); throw new Error('cancel'); }
+        downloadText(`docsql-inserts-${stamp()}.sql`, setsToInserts(t.currentSets, vals.table));
+        closeModal();
+        ui.toast(T('已导出 {0} 行 → {1}', t.currentSets.reduce((n, x) => n + x.rows.length, 0), `docsql-inserts-${stamp()}.sql`));
+      });
+    };
+    // 查询历史:模态列表,点击重填编辑器。
+    $('[data-do="hist"]', t.el).onclick = () => {
+      const h = qhistAll();
+      const rows = h.length
+        ? h.map((e, i) => `<tr data-h="${i}" style="cursor:pointer">
+            <td style="font-family:var(--mono)">${esc(new Date(e.ts).toTimeString().slice(0, 8))}</td>
+            <td>${e.ok ? '<span style="color:var(--ok)">✓</span>' : '<span style="color:var(--err)">✗</span>'} ${esc(String(e.ms))} ms</td>
+            <td style="max-width:480px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.sql)}">${esc(e.sql)}</td>
+          </tr>`).join('')
+        : `<tr><td colspan="3" style="color:var(--txt3)">${T('没有历史记录(执行过的查询会出现在这里)。')}</td></tr>`;
+      const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:860px"><h3>${T('查询历史')}</h3>
+        <div class="body" style="max-height:60vh;overflow:auto;padding:0">
+          <table class="grid"><thead><tr><th>${T('时间')}</th><th>${T('耗时')}</th><th>SQL</th></tr></thead><tbody>${rows}</tbody></table>
+        </div>
+        <div class="foot"><button data-cancel>${T('关闭')}</button><button data-clear>${T('清空历史')}</button></div></div>`);
+      $$('tr[data-h]', ov).forEach(tr => tr.onclick = () => {
+        t.editor.setValue(h[+tr.dataset.h].sql);
+        closeModal();
+        t.editor.focus();
+      });
+      $('[data-clear]', ov).onclick = () => { qhistClear(); closeModal(); t.editor.focus(); };
+    };
     t.onActivate = () => t.editor.focus();
     if (autoRun) execQuery(t);
   });
@@ -2243,6 +2390,8 @@ async function execQuery(t, selectedOnly) {
   const sql = (selectedOnly ? t.editor.selectedText() : t.editor.value).trim();
   if (!sql) { ui.toast(T('没有可执行的 SQL')); return; }
   t.clearOutput();
+  // 导出目标:本次执行产生的全部 rows 结果集(按钮栏消费)。
+  t.currentSets = [];
   // 连按 F5/连点「执行」:后发请求淘汰先发,旧响应回来不得覆盖新结果。
   t.execSeq = (t.execSeq || 0) + 1;
   const seq = t.execSeq;
@@ -2258,6 +2407,7 @@ async function execQuery(t, selectedOnly) {
     if (o.kind === 'rows') {
       if (idx !== undefined) { const lab = document.createElement('div'); lab.className = 'grid-label';
         lab.textContent = T('结果 {0}({1} 行)', idx + 1, o.rows.length); results.appendChild(lab); }
+      t.currentSets.push({columns: o.columns, rows: o.rows});
       renderGrid(results, o.columns, o.rows);
       t.msg(T('({0} 行)', o.rows.length) + (idx === undefined ? '' : T(' — 结果 {0}', idx + 1)), 'info');
     } else if (o.kind === 'affected') {
@@ -2280,6 +2430,8 @@ async function execQuery(t, selectedOnly) {
   const hasErr = data.kind === 'error' || (data.kind === 'batch' && data.error);
   if (hasErr) ui.status(T('查询完成(有错误)· 耗时 {0} ms · {1} 行', ms, rowCount), 'err');
   else ui.status(T('查询已成功执行 · 耗时 {0} ms · {1} 行', ms, rowCount));
+  // 历史记录成功与失败(失败重试是历史的高频用途)。截断在 qhistPush 内。
+  qhistPush({sql, ms, ok: !hasErr, ts: Date.now()});
   t.showResults();
 }
 
@@ -2320,6 +2472,8 @@ function openDataTab(tableName, meta) {
         <button data-do="edit" data-i18n-title title="编辑表结构(列编辑网格)"><span data-i18n>编辑表…</span></button>
         <button data-do="insert" class="primary" data-i18n-title title="插入文档(JSON)"><span data-i18n>插入文档…</span></button>
         <button data-do="query"><span data-i18n>生成查询</span></button>
+        <button data-do="exp-csv" data-i18n-title title="导出当前页为 CSV"><span data-i18n>CSV</span></button>
+        <button data-do="exp-json" data-i18n-title title="导出当前页为 JSON"><span data-i18n>JSON</span></button>
         <button data-do="drop" class="danger"><span data-i18n>删除表…</span></button>
       </div><div class="res-wrap"><div class="res-pane active grid-host" style="display:block"></div></div>`;
     t.host = $('.grid-host', t.el);
@@ -2339,6 +2493,9 @@ function openDataTab(tableName, meta) {
         if (seq !== t.reqSeq) return;
         t.host.innerHTML = '';
         if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; return; }
+        // 当前页快照:数据网格导出只导「正在看的这一页」(200 行/页,
+        // 全表导出走查询工作台的 LIMIT 查询 + 导出)。
+        t.pageSet = {columns: r.columns, rows: r.rows};
         const keys = tableKeys(meta);
         renderGrid(t.host, r.columns, r.rows, keys.length ? {
           onRowClick: row => { t.selected = row; },
@@ -2359,6 +2516,19 @@ function openDataTab(tableName, meta) {
     $('[data-do="edit"]', t.el).onclick = () => editTableDialog(tableName, explorer.tableMeta(tableName) || meta, t.load);
     $('[data-do="insert"]', t.el).onclick = () => insertDocDialog(tableName, meta, t.load);
     $('[data-do="query"]', t.el).onclick = () => openQueryTab(() => T('查询: {0}', tableName), `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
+    const exportPage = (fmt) => {
+      if (!t.pageSet || !t.pageSet.rows.length) { ui.toast(T('没有可导出的结果集(先执行一条查询)。')); return; }
+      const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const safe = String(tableName).replace(/[\\/:*?"<>|]/g, '_');
+      if (fmt === 'csv') {
+        downloadText(`${safe}-${t.offset}-${stamp()}.csv`, setsToCsv([t.pageSet]));
+      } else {
+        downloadText(`${safe}-${t.offset}-${stamp()}.json`, JSON.stringify(setToJsonObjects(t.pageSet), null, 2) + '\n');
+      }
+      ui.toast(T('已导出 {0} 行', t.pageSet.rows.length));
+    };
+    $('[data-do="exp-csv"]', t.el).onclick = () => exportPage('csv');
+    $('[data-do="exp-json"]', t.el).onclick = () => exportPage('json');
     $('[data-do="drop"]', t.el).onclick = () => dropTable(tableName, () => tabs.close(t));
     t.load();
   });
@@ -2502,6 +2672,109 @@ function openClusterTab() {
       } catch (e) { ui.toast(T('集群状态刷新失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生探测流量。
+    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
+    t.onClose = () => clearInterval(t.timer);
+    t.load();
+  });
+}
+
+/* ================= 活动会话(监视 + KILL)================= */
+// 受管节点的实时连接列表(GET /api/sessions → REQ_SESSIONS)与终止操作
+// (POST /api/sessions {"action":"kill"})。语句文本只取服务端截断后的
+// 256 字符;KILL 语义 = 当前语句完成后关闭(引擎不可抢占),弹窗里明示。
+function openSessionsTab() {
+  const titleOf = () => T('活动会话');
+  tabs.open('sessions', 'sessions', titleOf(), (t) => {
+    t.titleFn = titleOf;
+    t.auto = true;
+    t.el.innerHTML = `<div class="dash">
+      <h2 data-i18n>活动会话</h2>
+      <div class="sub" data-i18n>受管节点的实时连接 · GET/POST /api/sessions · 终止 = 当前语句完成后关闭连接</div>
+      <div class="dash-actions">
+        <button class="primary" data-do="refresh"><span data-i18n>刷新</span></button>
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
+          <input type="checkbox" data-do="auto" checked><span data-i18n>每 5 秒自动刷新</span></label>
+        <span class="meta" data-at style="color:var(--txt3)"></span>
+      </div>
+      <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在读取会话…</div></div>
+    </div>`;
+    $('[data-do="refresh"]', t.el).onclick = () => t.load();
+    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
+    const killSession = (row) => {
+      dialog(T('终止会话 {0}', row[0]), [
+        {name: 'confirm', label: T('终止该连接?正在执行的语句会先完成,随后连接关闭。') + ` (${esc(row[1])} · ${esc(row[2])})`, ph: 'KILL', value: ''},
+      ], T('终止'), async (vals, err) => {
+        if (vals.confirm !== 'KILL') { err(T('输入 KILL 确认')); throw new Error('cancel'); }
+        try {
+          const r = await api.post('/api/sessions', {action: 'kill', conn: row[0]});
+          if (r.error) { err(r.error); throw new Error('cancel'); }
+          closeModal();
+          ui.toast(T('终止请求已发出({0})', '#' + row[0]));
+          setTimeout(() => t.load(), 600);
+        } catch (e) { if (e.message !== 'cancel') ui.toast(T('终止失败:{0}', e.message), true); throw e; }
+      });
+    };
+    t.render = (v) => {
+      const body = $('[data-body]', t.el);
+      if (v.error) {
+        body.innerHTML = `<div class="card" style="max-width:600px"><div class="k" style="color:var(--err)">${esc(v.error)}</div></div>`;
+        return;
+      }
+      const cols = v.columns || [];
+      const rows = v.rows || [];
+      const idx = (name) => cols.indexOf(name);
+      // 服务端列序固定,但按名取防御未来加列。
+      const ci = {id: idx('id'), peer: idx('peer'), identity: idx('identity'),
+        connected: idx('connected_ms'), state: idx('state'), cur: idx('current_sql'),
+        curms: idx('current_ms'), stmts: idx('statements')};
+      const running = rows.filter(r => r[ci.state] === 'running').length;
+      const intx = rows.filter(r => r[ci.state] === 'in transaction').length;
+      const idle = rows.filter(r => r[ci.state] === 'idle').length;
+      let html = `<div style="padding:5px 10px;color:var(--txt3)">${T('共 {0} 个连接 · 运行中 {1} · 事务中 {2} · 空闲 {3}', rows.length, running, intx, idle)}</div>`;
+      if (!rows.length) {
+        html += `<div class="msg-list" style="color:var(--txt3)" data-i18n>当前节点没有其它连接。</div>`;
+      } else {
+        html += `<table class="grid"><thead><tr>
+          <th>ID</th><th>${T('来源')}</th><th>${T('身份')}</th><th>${T('状态')}</th>
+          <th>${T('当前语句')}</th><th>${T('已运行')}</th><th>${T('连接时长')}</th><th>${T('语句数')}</th><th>${T('操作')}</th>
+        </tr></thead><tbody>`;
+        const stateBadge = (st) => st === 'running'
+          ? `<span style="color:var(--warn);font-weight:600">▶ ${T('运行中')}</span>`
+          : st === 'in transaction'
+            ? `<span style="color:var(--err);font-weight:600">⏳ ${T('事务中')}</span>`
+            : `<span style="color:var(--txt3)">○ ${T('空闲')}</span>`;
+        for (const r of rows) {
+          const cur = r[ci.cur];
+          html += `<tr>
+            <td style="font-family:var(--mono)">${esc(r[ci.id])}</td>
+            <td style="font-family:var(--mono)">${esc(r[ci.peer])}</td>
+            <td>${esc(r[ci.identity])}</td>
+            <td>${stateBadge(r[ci.state])}</td>
+            <td style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(cur || '')}">${cur ? esc(cur) : '<span class="null">—</span>'}</td>
+            <td>${r[ci.state] === 'running' ? esc(r[ci.curms]) + ' ms' : '<span class="null">—</span>'}</td>
+            <td>${fmtDur(r[ci.connected])}</td>
+            <td>${esc(r[ci.stmts])}</td>
+            <td><button data-kill="${esc(r[ci.id])}" class="danger">${T('终止')}</button></td>
+          </tr>`;
+        }
+        html += '</tbody></table>';
+        body.innerHTML = html;
+        $$('[data-kill]', body).forEach(b => b.onclick = () => {
+          const row = rows.find(r => String(r[ci.id]) === b.dataset.kill);
+          if (row) killSession(row);
+        });
+        return;
+      }
+      body.innerHTML = html;
+    };
+    t.load = async () => {
+      try {
+        const data = await api.get('/api/sessions');
+        t.render(data);
+        $('[data-at]', t.el).textContent = T('上次刷新 {0}', new Date().toTimeString().slice(0, 8));
+      } catch (e) { ui.toast(T('会话列表读取失败:{0}', e.message), true); }
+    };
+    // 只在 tab 激活时轮询,后台 tab 不产生请求。
     t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
     t.onClose = () => clearInterval(t.timer);
     t.load();
@@ -2797,12 +3070,14 @@ function openBackupTab() {
       const targetLabel = targetNode || T('默认节点');
       dialog(T('恢复备份 {0} → {1}', name, targetLabel), [
         {name: 'confirm', label: T('输入 {0} 确认恢复到节点 {1}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。', name, targetLabel), ph: name, value: ''},
+        {name: 'to', label: T('恢复到时间点(可选)') + ' — ' + T('留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)'), ph: '2026-09-29T12:00:00Z', value: ''},
       ], T('确认恢复'), async (vals, err) => {
         if (vals.confirm !== name) { err(T('输入与备份文件名不一致')); throw new Error('cancel'); }
+        if (vals.to && isNaN(Date.parse(vals.to))) { err(T('时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)')); throw new Error('cancel'); }
         try {
-          const r = await api.post('/api/backup/restore', {file: name, confirm: name, node: targetNode});
+          const r = await api.post('/api/backup/restore', {file: name, confirm: name, node: targetNode, to: vals.to || undefined});
           if (r.error) { err(r.error); throw new Error('cancel'); }
-          ui.toast(T('恢复已开始({0})', targetLabel));
+          ui.toast(vals.to ? T('时间点恢复已开始({0} → {1})', targetLabel, vals.to) : T('恢复已开始({0})', targetLabel));
           t.load();
         } catch (e) { if (e.message !== 'cancel') ui.toast(T('恢复触发失败:{0}', e.message), true); throw e; }
       });
@@ -2900,6 +3175,13 @@ function openLogsTab() {
         <select data-do="src" data-i18n-title title="日志来源" style="max-width:170px"><option value="all" data-i18n>全部来源</option></select>
         <input type="text" data-do="q" data-i18n-ph placeholder="过滤:语句 / 错误 / 目标" style="width:160px">
         <select data-do="limit" data-i18n-title title="每来源拉取条数"><option value="100" data-i18n>100 条</option><option value="200" selected data-i18n>200 条</option><option value="500" data-i18n>500 条</option></select>
+        <select data-do="slow" data-i18n-title title="只看耗时达到阈值的数据日志">
+          <option value="0" selected data-i18n>全部耗时</option>
+          <option value="100">&gt; 100 ms</option><option value="500">&gt; 500 ms</option>
+          <option value="1000">&gt; 1 s</option><option value="5000">&gt; 5 s</option>
+        </select>
+        <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;color:var(--txt2)">
+          <input type="checkbox" data-do="sortms"><span data-i18n>按耗时降序</span></label>
         <div class="spacer"></div>
         <button class="primary" data-do="refresh"><span data-i18n>刷新</span></button>
         <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
@@ -2918,22 +3200,28 @@ function openLogsTab() {
       qTimer = setTimeout(() => { t.q = e.target.value.trim(); t.render(); }, 200);
     };
     $('[data-do="limit"]', t.el).onchange = (e) => { t.limit = +e.target.value; t.load(); };
+    // 慢查询阈值(毫秒,0=不过滤)与耗时排序:只作用于数据日志
+    // (同步事件无耗时)。排序在过滤后做,所见即所得。
+    $('[data-do="slow"]', t.el).onchange = (e) => { t.slowMs = +e.target.value; t.render(); };
+    $('[data-do="sortms"]', t.el).onchange = (e) => { t.sortMs = e.target.checked; t.render(); };
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
     $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     t.render = () => {
       const body = $('[data-body]', t.el);
       const counts = { data: 0, sync: 0, err: 0 };
       for (const r of t.rows) { counts[r.cat]++; if (!r.ok) counts.err++; }
-      const rows = t.rows.filter(r => {
+      let rows = t.rows.filter(r => {
         if ((t.cat === 'data' || t.cat === 'sync') && r.cat !== t.cat) return false;
         if (t.cat === 'err' && r.ok) return false;
         if (t.src !== 'all' && r.srcKey !== t.src) return false;
+        if (t.slowMs > 0 && !(r.cat === 'data' && r.ms != null && r.ms >= t.slowMs)) return false;
         if (t.q) {
           const hay = (r.text + ' ' + (r.error || '') + ' ' + (r.target || '')).toLowerCase();
           if (!hay.includes(t.q.toLowerCase())) return false;
         }
         return true;
       });
+      if (t.sortMs) rows = rows.slice().sort((a, b) => ((b.ms != null ? b.ms : -1) - (a.ms != null ? a.ms : -1)));
       let html = `<div style="padding:5px 10px;color:var(--txt3)">${T('共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}', t.rows.length, counts.data, counts.sync, counts.err)}`
         + (t.offline.length ? ` · <span style="color:var(--err)">${T('离线节点 {0} 个({1})', t.offline.length, t.offline.map(n => esc(n.addr)).join(', '))}</span>` : '') + '</div>';
       if (!rows.length) {
@@ -3252,6 +3540,7 @@ const explorer = {
         {id: 'newtable', label: T('新建表…'), act: () => newTableDialog()},
         {id: 'dash', label: T('服务器仪表盘'), act: () => openDashboard()},
         {id: 'users', label: T('用户与角色'), act: () => openUsersTab()},
+        {id: 'sessions', label: T('活动会话'), act: () => openSessionsTab()},
         {id: 'cluster', label: T('集群状态'), act: () => openClusterTab()},
         {id: 'logs', label: T('日志'), act: () => openLogsTab()},
         {id: 'backup', label: T('备份管理'), act: () => openBackupTab()},
@@ -3363,6 +3652,7 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'close-tab') { if (tabs.active) tabs.close(tabs.active); }
     else if (act === 'refresh') explorer.refresh();
     else if (act === 'dashboard') openDashboard();
+    else if (act === 'sessions') openSessionsTab();
     else if (act === 'users') openUsersTab();
     else if (act === 'cluster') openClusterTab();
     else if (act === 'logs') openLogsTab();

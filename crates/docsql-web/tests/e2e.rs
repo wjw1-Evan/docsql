@@ -2861,3 +2861,67 @@ async fn tls_auth_endpoints_extract_peer_and_serve_setup() {
     );
     assert!(login.to_lowercase().contains("set-cookie:"), "{login}");
 }
+
+/// GET /api/sessions proxies the node's REQ_SESSIONS report; POST with
+/// action=kill issues REQ_KILL. The kill target is a second node
+/// connection held open via a raw protocol client.
+#[tokio::test]
+async fn sessions_endpoint_lists_and_kills() {
+    let (_dir, web, node) = start_stack(Some("tok"), Vec::new()).await;
+
+    // Hold one extra connection open against the node (token-authed, idle)
+    // using the raw protocol, so there is something to list and kill.
+    let mut extra = TcpStream::connect(&node).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let auth = docsql_core::proto::Frame::new(docsql_core::proto::REQ_AUTH, b"tok".to_vec());
+    extra.write_all(&auth.encode().unwrap()).await.unwrap();
+    let mut head = [0u8; 20];
+    extra.read_exact(&mut head).await.unwrap();
+    let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+    let mut rest = vec![0u8; len];
+    extra.read_exact(&mut rest).await.unwrap();
+
+    let resp = http(&web, "GET", "/api/sessions", Some("tok"), None).await;
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    assert!(body.contains("\"columns\""), "{body}");
+    assert!(body.contains("client token"), "{body}");
+
+    // Extract one non-console connection id from the rows: the console's
+    // own leg also appears; any id works for kill + removal assertions.
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let cols = v["columns"].as_array().unwrap();
+    let id_i = cols.iter().position(|c| c == "id").unwrap();
+    let rows = v["rows"].as_array().unwrap();
+    assert!(rows.len() >= 2, "expected console + held connection");
+    let victim = rows[0][id_i].as_u64().unwrap();
+
+    let body = format!(r#"{{"action":"kill","conn":{}}}"#, victim);
+    let resp = http(&web, "POST", "/api/sessions", Some("tok"), Some(&body)).await;
+    let kill_body = String::from_utf8_lossy(&resp.body).into_owned();
+    if kill_body.contains("\"ok\":true") {
+        // The killed connection (whichever it was) drops out of the next
+        // listing within a moment.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let resp = http(&web, "GET", "/api/sessions", Some("tok"), None).await;
+            let v: serde_json::Value =
+                serde_json::from_str(&String::from_utf8_lossy(&resp.body)).unwrap();
+            let gone = !v["rows"].as_array().unwrap().iter().any(|r| {
+                r.as_array()
+                    .is_some_and(|row| row[id_i].as_u64() == Some(victim))
+            });
+            if gone {
+                return;
+            }
+        }
+        panic!("killed session still listed");
+    } else {
+        // Killing the console's OWN management leg is refused loudly — that
+        // is the documented refusal, and it proves the endpoint routes to
+        // REQ_KILL (a routing failure would be a 5xx / transport error).
+        assert!(
+            kill_body.contains("own connection"),
+            "unexpected kill answer: {kill_body}"
+        );
+    }
+}

@@ -949,7 +949,13 @@ pub(crate) async fn handle_backup(
             let parsed_target: Option<Result<i64, String>> =
                 serde_json::from_slice::<serde_json::Value>(&frame.payload)
                     .ok()
-                    .and_then(|v| v.get("to").cloned())
+                    // JSON null = absent: several proxies serialize an
+                    // Option::None field as an explicit null rather than
+                    // omitting the key, and that must mean a full restore.
+                    .and_then(|v| match v.get("to") {
+                        Some(serde_json::Value::Null) | None => None,
+                        Some(to) => Some(to.clone()),
+                    })
                     .map(|to| match to {
                         serde_json::Value::Number(n) => n.as_i64().ok_or_else(|| {
                             "restore: \"to\" number is not an integer UTC-millis value".to_string()

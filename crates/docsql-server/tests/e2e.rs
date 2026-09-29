@@ -6902,3 +6902,121 @@ async fn tls_cluster_replicates_over_tls_dials() {
     }
     assert!(seen, "write did not replicate to the TLS peer");
 }
+
+/// REQ_SESSIONS rows as (id, identity, statements).
+async fn list_sessions(c: &mut Client) -> Vec<(u64, String, u64)> {
+    c.send(&Frame::new(proto::REQ_SESSIONS, vec![])).await;
+    let f = c.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ROWS, "{}", payload_str(&f));
+    let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+    let cols = v["columns"].as_array().unwrap().clone();
+    let id_i = cols.iter().position(|c| c == "id").unwrap();
+    let ident_i = cols.iter().position(|c| c == "identity").unwrap();
+    let stmts_i = cols.iter().position(|c| c == "statements").unwrap();
+    v["rows"]
+        .as_array()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|row| {
+            (
+                row[id_i].as_u64().unwrap(),
+                row[ident_i].as_str().unwrap().to_string(),
+                row[stmts_i].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Activity monitor (REQ_SESSIONS) + kill switch (REQ_KILL): the admin
+/// listing shows every live connection with its identity/statement state,
+/// KILL closes the target promptly (idle session → immediate wake), and
+/// the self-kill / unknown-id paths refuse loudly.
+#[tokio::test]
+async fn sessions_frame_lists_and_kill_closes() {
+    let (_dir, addr) = start_server_sec(Some("tok"), Some("readonly1"), None, 0, 0, 10).await;
+    let mut a = Client::connect(&addr).await;
+    assert_eq!(a.auth("tok").await.frame_type, proto::RESP_AFFECTED);
+    // One statement on a: distinguishes its row from b's by counter.
+    let r = a.sql("SELECT 1").await;
+    assert_eq!(r.frame_type, proto::RESP_ROWS, "{}", payload_str(&r));
+    // b connects and stays idle.
+    let mut b = Client::connect(&addr).await;
+    assert_eq!(b.auth("tok").await.frame_type, proto::RESP_AFFECTED);
+
+    let rows = list_sessions(&mut a).await;
+    // Both connections are visible, both carry the token identity.
+    assert!(rows.len() >= 2, "sessions: {rows:?}");
+    assert!(
+        rows.iter().all(|(_, ident, _)| ident == "client token"),
+        "identities: {rows:?}"
+    );
+    // b is the idle row (0 statements); a has at least the SELECT above.
+    let b_id = rows
+        .iter()
+        .find(|(_, _, stmts)| *stmts == 0)
+        .map(|(id, _, _)| *id)
+        .expect("idle connection row");
+
+    // KILL b: acknowledged, and b's blocked read wakes with the explicit
+    // kill error (not a silent EOF).
+    a.send(&Frame::new(proto::REQ_KILL, b_id.to_le_bytes().to_vec()))
+        .await;
+    let f = a.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&f));
+    let f = b.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("killed by administrator"),
+        "{}",
+        payload_str(&f)
+    );
+
+    // Deregistration: the closed connection leaves the listing.
+    let rows = list_sessions(&mut a).await;
+    assert!(
+        !rows.iter().any(|(id, _, _)| *id == b_id),
+        "killed session still listed: {rows:?}"
+    );
+
+    // Self-kill and unknown id refuse loudly.
+    let rows = list_sessions(&mut a).await;
+    let a_id = rows.iter().map(|(id, _, _)| *id).max().unwrap();
+    a.send(&Frame::new(proto::REQ_KILL, a_id.to_le_bytes().to_vec()))
+        .await;
+    let f = a.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("own connection"),
+        "{}",
+        payload_str(&f)
+    );
+    a.send(&Frame::new(
+        proto::REQ_KILL,
+        999_999u64.to_le_bytes().to_vec(),
+    ))
+    .await;
+    let f = a.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("no such connection"),
+        "{}",
+        payload_str(&f)
+    );
+
+    // Malformed payload: exactly one u64 is accepted, anything else is an
+    // error, and the gate holds for read-only tokens.
+    a.send(&Frame::new(proto::REQ_KILL, vec![1, 2, 3])).await;
+    let f = a.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    let mut ro = Client::connect(&addr).await;
+    ro.auth("readonly1").await;
+    ro.send(&Frame::new(proto::REQ_SESSIONS, vec![])).await;
+    let f = ro.recv().await;
+    assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
+    assert!(
+        payload_str(&f).contains("admin role"),
+        "{}",
+        payload_str(&f)
+    );
+}

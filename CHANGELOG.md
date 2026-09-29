@@ -5,6 +5,31 @@
 
 ## [Unreleased]
 
+### Web 管理端完善轮:活动会话监视 + KILL、结果导出、查询历史、慢查询过滤、PITR UI(2026-09-29)
+
+对标商业库管理端(SSMS 活动监视器 / Azure Data Studio)补齐运维与生产力面:
+
+- **活动会话(新协议帧)**:`REQ_SESSIONS`(0x0019,admin)返回节点实时连接表
+  (id/来源/身份/状态/当前语句截断 256 字符/已运行毫秒/连接时长/语句数,RESP_ROWS 通用网格);
+  `REQ_KILL`(0x001A,admin)按 id 终止连接——**空闲连接立即唤醒关闭**(读等待 select 在
+  watch 通道上,无丢唤醒竞态),运行中语句完成后关闭(引擎不可抢占,弹窗明示);自杀/未知
+  id/畸形载荷响亮拒绝;连接清理段注销会话条目。服务端身份标签随 AUTH 流转(anonymous/
+  client token/read-only token/cluster peer/user <name>)。
+- **控制台「活动会话」页**(视图菜单 + 服务器右键):5s 自动刷新、状态徽章、
+  KILL 双重确认(输入 KILL);GET/POST `/api/sessions` 代理到受管节点。
+- **查询工作台**:结果导出 **CSV(RFC 4180)/ JSON / INSERT**(本次执行全部结果集,
+  INSERT 表名从 FROM/INTO 推断默认值、标识符引号转义、字符串单引号翻倍);**查询历史**
+  (localStorage 最近 100 条,成败+耗时,点击重填,可清空——修复:数组直写 localStorage 被
+  隐式字符串化成 "[object Object]" 导致历史静默清零)。
+- **表数据网格**:当前页 CSV/JSON 导出按钮。
+- **日志页**:慢查询阈值过滤(>100ms/500ms/1s/5s)+ 按耗时降序排序。
+- **备份页**:恢复对话框新增「恢复到时间点」ISO 时间戳字段(前端校验格式),
+  `/api/backup/restore` 透传 `to` → 节点 REQ_BACKUP 的 PITR 重放。
+- 浏览器端到端冒烟通过:会话列表/KILL 全流程(被杀连接从列表移除)、三格式导出内容、
+  历史记录与弹层、慢查询过滤、PITR 非法时间戳拒绝;cargo e2e 新增
+  `sessions_frame_lists_and_kill_closes`(列表/身份/终止/注销/自杀拒绝/只读 token 拒绝/
+  畸形载荷)、web e2e 新增 `sessions_endpoint_lists_and_kills`。
+
 ### 数据面原生 TLS(商用化路线 · 传输安全)(2026-09-29)
 
 此前数据面传输保护只有私有 AES-256-GCM 帧加密(`DOCSQL_KEY`)或 TLS 反代;本批次为

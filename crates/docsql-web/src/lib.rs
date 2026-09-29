@@ -460,6 +460,7 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/cluster", get(api_cluster))
         .route("/api/logs", get(api_logs))
         .route("/api/users", get(api_users).post(api_users_action))
+        .route("/api/sessions", get(api_sessions).post(api_sessions_kill))
         .route("/api/backup", get(api_backup).post(api_backup_trigger))
         .route("/api/backup/restore", post(api_backup_restore))
         .route("/api/auth/status", get(auth_status))
@@ -2527,9 +2528,16 @@ pub async fn remote_backup_restore(
     token: Option<&str>,
     file: &str,
     tls: Option<&TlsConnector>,
+    to: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let payload = serde_json::to_vec(&serde_json::json!({"action": "restore", "file": file}))
-        .unwrap_or_default();
+    // "to" (optional ISO timestamp) turns the restore into a PITR replay:
+    // base backup + this node's journal increments up to that moment.
+    // Omitted (not null) when absent — legacy peers predate the field.
+    let mut body = serde_json::json!({"action": "restore", "file": file});
+    if let Some(t) = to {
+        body["to"] = serde_json::json!(t);
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
     let f = node_roundtrip(addr, token, Frame::new(proto::REQ_BACKUP, payload), tls).await?;
     match f.frame_type {
         proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
@@ -2540,8 +2548,91 @@ pub async fn remote_backup_restore(
     }
 }
 
+/// GET /api/sessions: the managed node's live-connection report
+/// (REQ_SESSIONS). Admin-flavored data (statement texts), so with the
+/// account gate active it rides the same auth as every data endpoint.
+async fn api_sessions(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(params): Query<NodeParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    let out = result_to_json(
+        (async {
+            let target = target_for(&state, &params.node)
+                .map_err(|e| e["error"].as_str().unwrap_or_default().to_string())?;
+            let f = node_roundtrip(
+                &target,
+                state.token.as_deref(),
+                Frame::new(proto::REQ_SESSIONS, vec![]),
+                state.node_tls.as_ref(),
+            )
+            .await?;
+            match f.frame_type {
+                proto::RESP_ROWS => serde_json::from_slice(&f.payload)
+                    .map_err(|e| format!("节点 {target} 的会话载荷无法解析: {e}")),
+                proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
+                other => Err(format!("节点 {target} 返回了意外帧: {other:#06x}")),
+            }
+        })
+        .await,
+    );
+    Ok(Json(out))
+}
+
+#[derive(serde::Deserialize)]
+struct SessionsKillBody {
+    action: String,
+    /// Target connection id from the session list.
+    conn: u64,
+    node: Option<String>,
+}
+
+/// POST /api/sessions {"action":"kill","conn":<id>}: REQ_KILL on the
+/// managed node. In-band errors (no such connection, own connection)
+/// surface as {"error": …} like every data endpoint.
+async fn api_sessions_kill(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    body: Json<SessionsKillBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(code) = check_auth(&state, &headers) {
+        return Err(code);
+    }
+    if body.action != "kill" {
+        return Ok(Json(serde_json::json!({
+            "error": format!("未知动作 {}(仅支持 kill)", body.action)
+        })));
+    }
+    let out = result_to_json(
+        (async {
+            let target = target_for(&state, &body.node)
+                .map_err(|e| e["error"].as_str().unwrap_or_default().to_string())?;
+            let f = node_roundtrip(
+                &target,
+                state.token.as_deref(),
+                Frame::new(proto::REQ_KILL, body.conn.to_le_bytes().to_vec()),
+                state.node_tls.as_ref(),
+            )
+            .await?;
+            match f.frame_type {
+                proto::RESP_AFFECTED => Ok(serde_json::json!({"ok": true})),
+                proto::RESP_ERROR => Err(String::from_utf8_lossy(&f.payload).into_owned()),
+                other => Err(format!("节点 {target} 返回了意外帧: {other:#06x}")),
+            }
+        })
+        .await,
+    );
+    Ok(Json(out))
+}
+
 #[derive(serde::Deserialize)]
 struct BackupRestoreBody {
+    /// Optional ISO timestamp: replay the backup + journal increments only
+    /// up to this moment (PITR). Empty/absent = full restore.
+    pub to: Option<String>,
     /// The backup file name (bare `backup-*.sql` in the node's backup
     /// directory).
     file: String,
@@ -2582,6 +2673,7 @@ async fn api_backup_restore(
             state.token.as_deref(),
             &body.file,
             state.node_tls.as_ref(),
+            body.to.as_deref().filter(|t| !t.is_empty()),
         )
         .await
         {

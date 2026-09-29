@@ -134,6 +134,17 @@ pub const REQ_BACKUP: u16 = 0x0017;
 /// JSON `{"user","password"}`; success answers RESP_AFFECTED and the
 /// connection then carries the user's resolved privileges.
 pub const REQ_AUTH_USER: u16 = 0x0018;
+/// Activity monitor: admin-only listing of the node's live connections.
+/// Answer is a RESP_ROWS payload (JSON `{"columns","rows"}`) with one row
+/// per connection: id, peer, identity, connected_ms, state
+/// (running/idle/in transaction), current_sql, current_ms, statements.
+pub const REQ_SESSIONS: u16 = 0x0019;
+/// Admin-only kill switch. Payload is the target connection id (u64 LE,
+/// an id from REQ_SESSIONS). Marks the connection to close after its
+/// current statement finishes (engine statements are not pre-emptible);
+/// a blocked read is interrupted immediately. Answers RESP_AFFECTED or
+/// RESP_ERROR (no such connection / killing your own connection).
+pub const REQ_KILL: u16 = 0x001A;
 
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
