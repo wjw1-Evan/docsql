@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+### EXPLAIN SELECT:查询计划输出(只报不执行)(2026-09-29)
+
+商用化路线·性能面第一块垫脚石:操作员终于能回答"这条查询走不走索引"——
+
+- **计划行输出**(列 `plan`/`detail`),按 exec_select 同一决策阶梯生成:COUNT(*) 活槽计数快路径、
+  索引探测(`PROBE` 行带探测边界,`value_literal` 渲染)、有序索引窗口(树名/方向/SKIP/LIMIT/
+  是否残余 WHERE)、无索引 top-K 窗口(排序字段/窗口)、全堆扫描兜底;连接行报告 hash join(等值 ON)
+  或嵌套循环(非等值/无 ON),并标注 CROSS/OUTER APPLY;视图如实报告"展开于运行时,不冒充基表计划"。
+- **零重复执行**:计划前缀从 `ordered_index_window`/`unindexed_order_window` 抽出为
+  `ordered_window_plan`/`unindexed_window_plan`(含混合带采样这个唯一的读侧决策),执行器与
+  EXPLAIN 共用同一函数——计划与实际执行不分叉;`exec_select` 门禁改动必须同步(explain 模块头
+  注释已写明该约定)。窗口/探测消费的子句不再重复出现 SORT/FILTER 行。
+- **拒绝面响亮**:EXPLAIN ANALYZE/ESTIMATE/FORMAT/utility options/WITH/集合操作/非 SELECT
+  内层全部显式报错;`EXPLAIN QUERY PLAN`(SQLite 拼写)与 `verbose` 接受为同一输出。
+- **授权与只读路径**:`stmt_is_write` 将 EXPLAIN 归为读(不走写路径/不进期刊);`stmt_read_targets`
+  解包内层查询做 fail-closed 读目标分类(readonly 角色与表级 SELECT 授权语义一致);ReadView
+  (MVCC 快照读)直接支持 EXPLAIN——只读连接诊断计划正是目标受众。
+- 测试:engine 新增 `explain_select_reports_scan_strategies`(全部扫描策略/连接策略/拒绝面/
+  计划不执行的幂等断言)+ `read_view_executes_explain`(只读视图路径);既有窗口微分测试
+  (top-K 与通用排序一致、别名遮蔽)守护抽取后的执行器行为不变。
+
 ### 远端备份副本:备份/增量段自动复制到 S3 兼容对象存储,卷损可回源恢复(2026-09-29)
 
 商用化路线·数据安全批次的容灾补强:数据卷损坏不再连带丢掉唯一备份——

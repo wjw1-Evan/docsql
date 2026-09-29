@@ -837,13 +837,30 @@ impl ReadView {
     /// Execute a read-only statement as of this view's snapshot. Plain
     /// SELECT only — the same refusals as [`Database::execute_read`].
     pub fn execute(&self, sql: &str) -> Result<ExecOutcome> {
-        let q = Database::plain_read_query(&Database::parse_classified(sql)?)?;
+        let parsed = Database::parse_classified(sql)?;
         let cx = ReadCx {
             pager: &self.pager,
             tables: &self.catalog.0,
             deadline: &self.deadline,
             snap: Some(&self.snap),
         };
+        // EXPLAIN is a pure read — a readonly role diagnosing a plan is
+        // exactly the audience; the inner query's reads are what
+        // `stmt_read_targets` classifies for authorization.
+        if let AnyStmt::Sql(stmt) = &parsed.stmt {
+            if let Statement::Explain {
+                statement,
+                analyze,
+                estimate,
+                format,
+                options,
+                ..
+            } = stmt.as_ref()
+            {
+                return cx.explain_outer(statement, *analyze, *estimate, format, options);
+            }
+        }
+        let q = Database::plain_read_query(&parsed)?;
         cx.exec_query(q)
     }
 }
@@ -4132,19 +4149,44 @@ fn plain_table_factor(tf: &sqlparser::ast::TableFactor) -> bool {
         && alias.as_ref().is_none_or(|a| a.columns.is_empty())
 }
 
+/// Plan of the unindexed top-K window ([`ReadCx::unindexed_order_window`]):
+/// the planning prefix shared with EXPLAIN — no rows are touched.
+struct UnindexedWindowPlan {
+    table: String,
+    /// Per ORDER BY key: candidate field names (first hit wins), ASC?,
+    /// NULLS FIRST override.
+    keys: Vec<(Vec<String>, bool, Option<bool>)>,
+    skip: usize,
+    take: usize,
+}
+
+/// Plan of the ordered index window ([`ReadCx::ordered_index_window`]):
+/// the planning prefix (through the band-promoted probe bounds) shared
+/// with EXPLAIN — no rows are touched.
+struct OrderedWindowPlan {
+    table: String,
+    root_key: String,
+    asc: bool,
+    skip: usize,
+    take: usize,
+    /// The probe subsumes the whole WHERE: OFFSET rows are only counted,
+    /// never decoded.
+    exact: bool,
+    /// Band-promoted probe bounds; None = whole-tree walk.
+    probe: Option<ProbePlan>,
+}
+
 impl<'a> ReadCx<'a> {
-    /// Unindexed `ORDER BY <fields> LIMIT/OFFSET`: extract only the sort
-    /// fields from each document's encoded bytes (no full decode), keep the
-    /// best `skip+take` rows in a bounded heap, then materialize just those
-    /// documents. `None` (generic decode + sort) unless every ORDER BY key
-    /// is a bare top-level field, there is no WHERE, and the window is
-    /// bounded. Ties keep scan order, matching the stable generic sort.
-    fn unindexed_order_window(
+    /// Planning prefix of [`Self::unindexed_order_window`], shared with
+    /// EXPLAIN: every gate from the fast path's entry through the ORDER BY
+    /// key extraction — no row loading. `None` = this query does not take
+    /// the top-K window (caller falls through to the generic scan).
+    fn unindexed_window_plan(
         &self,
         select: &sqlparser::ast::Select,
         query: &Query,
         ctes: &Ctes,
-    ) -> Result<Option<Vec<Object>>> {
+    ) -> Result<Option<UnindexedWindowPlan>> {
         if !ctes.is_empty()
             || select.selection.is_some()
             || select.from.len() != 1
@@ -4158,9 +4200,10 @@ impl<'a> ReadCx<'a> {
         let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
             return Ok(None);
         };
-        let Some(meta) = self.real_table_meta(name) else {
+        if self.real_table_meta(name).is_none() {
             return Ok(None);
-        };
+        }
+        let table = obj_name(name);
         let Some(order_by) = &query.order_by else {
             return Ok(None);
         };
@@ -4176,9 +4219,7 @@ impl<'a> ReadCx<'a> {
         if take == usize::MAX {
             return Ok(None); // unbounded: every row is materialized anyway
         }
-        if take == 0 {
-            return Ok(Some(Vec::new()));
-        }
+        // take == 0 carries through: the executor returns an empty window.
         // Resolve every ORDER BY key to a source field, mirroring
         // `apply_order_limit`: an output-column name wins over the raw
         // expression, and a bare column ref (possibly qualified, with the
@@ -4226,6 +4267,41 @@ impl<'a> ReadCx<'a> {
             };
             keys.push((fields, o.options.asc.unwrap_or(true), o.options.nulls_first));
         }
+        Ok(Some(UnindexedWindowPlan {
+            table,
+            keys,
+            skip,
+            take,
+        }))
+    }
+}
+
+impl<'a> ReadCx<'a> {
+    /// Unindexed `ORDER BY <fields> LIMIT/OFFSET`: extract only the sort
+    /// fields from each document's encoded bytes (no full decode), keep the
+    /// best `skip+take` rows in a bounded heap, then materialize just those
+    /// documents. `None` (generic decode + sort) unless every ORDER BY key
+    /// is a bare top-level field, there is no WHERE, and the window is
+    /// bounded. Ties keep scan order, matching the stable generic sort.
+    fn unindexed_order_window(
+        &self,
+        select: &sqlparser::ast::Select,
+        query: &Query,
+        ctes: &Ctes,
+    ) -> Result<Option<Vec<Object>>> {
+        let Some(p) = self.unindexed_window_plan(select, query, ctes)? else {
+            return Ok(None);
+        };
+        if p.take == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let keys = p.keys;
+        let skip = p.skip;
+        let take = p.take;
+        // Plan resolved the table through real_table_meta; re-fetch by name.
+        let Some(meta) = self.tables.get(&p.table) else {
+            return Ok(None);
+        };
         let dirs: Vec<(bool, Option<bool>)> = keys.iter().map(|(_, asc, nf)| (*asc, *nf)).collect();
         let cap = skip.saturating_add(take);
         let heap = meta.heap_of();
@@ -4324,6 +4400,101 @@ impl<'a> ReadCx<'a> {
         query: &Query,
         ctes: &Ctes,
     ) -> Result<Option<Vec<Object>>> {
+        let Some(p) = self.ordered_window_plan(select, from, selection, order_by, query, ctes)?
+        else {
+            return Ok(None);
+        };
+        if p.take == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(meta) = self.tables.get(&p.table) else {
+            return Ok(None);
+        };
+        let root = meta.index_roots[&p.root_key];
+        let tree = BTree::open(root);
+        let tx = self.pager.begin_tx();
+        // An exact walk yields exactly the window rows in the ORDER BY
+        // direction, so it can stop collecting keys at the window's end;
+        // residual filters need the whole candidate range first.
+        let cap = p.exact.then(|| p.skip.saturating_add(p.take));
+        let pairs = match &p.probe {
+            None if p.asc => tree
+                .scan_limited(&self.reader(), &tx, cap)
+                .map_err(|e| index_err(&p.root_key, e))?,
+            None => tree
+                .scan_limited_rev(&self.reader(), &tx, cap)
+                .map_err(|e| index_err(&p.root_key, e))?,
+            // promote_plan_bounds 已在 plan 阶段把边界提升过,这里幂等无操作。
+            Some(plan) if p.asc => match self.probe_pairs(&p.root_key, &tree, &tx, plan, cap)? {
+                Some(pairs) => pairs,
+                None => {
+                    drop(tx);
+                    return Ok(None);
+                }
+            },
+            Some(plan) => match self.probe_pairs_rev(&p.root_key, &tree, &tx, plan, cap)? {
+                Some(pairs) => pairs,
+                None => {
+                    drop(tx);
+                    return Ok(None);
+                }
+            },
+        };
+        drop(tx);
+        let heap = meta.heap_of();
+        let reader = self.reader();
+        // Both walkers already yield pairs in the ORDER BY direction.
+        let locs: Vec<u64> = pairs.iter().map(|(_, loc)| *loc).collect();
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        for loc in locs {
+            // Exact walks return rows straight from the window: OFFSET rows
+            // need only be counted, never decoded.
+            if p.exact && skipped < p.skip {
+                skipped += 1;
+                continue;
+            }
+            let Some(doc) = heap.doc_at(&reader, loc)? else {
+                continue;
+            };
+            if !p.exact {
+                // Residual-filter scope (inexact probes re-check WHERE per
+                // row): built once, lazily, on the first residual row.
+                let outer_from = {
+                    let mut set = OuterFrom::new();
+                    from_list_names(from, &mut set);
+                    set
+                };
+                if !self.matches_in(selection, &doc, &outer_from)? {
+                    continue;
+                }
+            }
+            if skipped < p.skip {
+                skipped += 1;
+                continue;
+            }
+            out.push(doc);
+            if out.len() >= p.take {
+                break;
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Planning prefix of [`Self::ordered_index_window`], shared with
+    /// EXPLAIN: every gate from the fast path's entry through the
+    /// band-promoted probe bounds — no row loading (the band sampling
+    /// reads two leaf pages, mirroring the executor's fallback decision).
+    /// `None` = this query does not take the ordered window.
+    fn ordered_window_plan(
+        &self,
+        select: &sqlparser::ast::Select,
+        from: &[sqlparser::ast::TableWithJoins],
+        selection: &Option<SqlExpr>,
+        order_by: &Option<sqlparser::ast::OrderBy>,
+        query: &Query,
+        ctes: &Ctes,
+    ) -> Result<Option<OrderedWindowPlan>> {
         if !ctes.is_empty() || from.len() != 1 {
             return Ok(None);
         }
@@ -4338,13 +4509,6 @@ impl<'a> ReadCx<'a> {
             return Ok(None);
         };
         let tname = obj_name(name);
-        // Outer scope for correlated subqueries in a non-exact residual
-        // filter (an EXISTS conjunct makes every probe inexact).
-        let outer_from = {
-            let mut set = OuterFrom::new();
-            from_list_names(from, &mut set);
-            set
-        };
         if is_compat_view(&tname) {
             return Ok(None);
         }
@@ -4413,7 +4577,15 @@ impl<'a> ReadCx<'a> {
             return Ok(None);
         };
         if take == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(OrderedWindowPlan {
+                table: tname,
+                root_key,
+                asc,
+                skip,
+                take: 0,
+                exact: true,
+                probe: None,
+            }));
         }
         let root = meta.index_roots[&root_key];
         let tree = BTree::open(root);
@@ -4438,65 +4610,16 @@ impl<'a> ReadCx<'a> {
                 }
             },
         };
-
-        // An exact walk yields exactly the window rows in the ORDER BY
-        // direction, so it can stop collecting keys at the window's end;
-        // residual filters need the whole candidate range first.
-        let cap = exact.then(|| skip.saturating_add(take));
-        let pairs = match &plan {
-            None if asc => tree
-                .scan_limited(&self.reader(), &tx, cap)
-                .map_err(|e| index_err(&root_key, e))?,
-            None => tree
-                .scan_limited_rev(&self.reader(), &tx, cap)
-                .map_err(|e| index_err(&root_key, e))?,
-            // promote_plan_bounds 已在上方把边界提升过,这里幂等无操作。
-            Some(plan) if asc => match self.probe_pairs(&root_key, &tree, &tx, plan, cap)? {
-                Some(pairs) => pairs,
-                None => {
-                    drop(tx);
-                    return Ok(None);
-                }
-            },
-            Some(plan) => match self.probe_pairs_rev(&root_key, &tree, &tx, plan, cap)? {
-                Some(pairs) => pairs,
-                None => {
-                    drop(tx);
-                    return Ok(None);
-                }
-            },
-        };
         drop(tx);
-
-        let heap = meta.heap_of();
-        let reader = self.reader();
-        // Both walkers already yield pairs in the ORDER BY direction.
-        let locs: Vec<u64> = pairs.iter().map(|(_, loc)| *loc).collect();
-        let mut out = Vec::new();
-        let mut skipped = 0usize;
-        for loc in locs {
-            // Exact walks return rows straight from the window: OFFSET rows
-            // need only be counted, never decoded.
-            if exact && skipped < skip {
-                skipped += 1;
-                continue;
-            }
-            let Some(doc) = heap.doc_at(&reader, loc)? else {
-                continue;
-            };
-            if !exact && !self.matches_in(selection, &doc, &outer_from)? {
-                continue;
-            }
-            if skipped < skip {
-                skipped += 1;
-                continue;
-            }
-            out.push(doc);
-            if out.len() >= take {
-                break;
-            }
-        }
-        Ok(Some(out))
+        Ok(Some(OrderedWindowPlan {
+            table: tname,
+            root_key,
+            asc,
+            skip,
+            take,
+            exact,
+            probe: plan,
+        }))
     }
 
     fn table_pairs(&self, table: &str) -> Result<Vec<(u64, Object)>> {
@@ -4514,6 +4637,473 @@ impl<'a> ReadCx<'a> {
         }
         // The read-only tx has no staged pages: dropping it is the cleanup.
         Ok(out)
+    }
+}
+
+// ---- EXPLAIN SELECT -------------------------------------------------
+//
+// The plan ladder without execution: the rows describe what `exec_select`
+// WOULD do for this shape — same gates, same planning helpers — so an
+// operator can see index use / window eligibility / join strategy without
+// running an O(table) query. The mirrors are load-bearing: a gate added
+// to `exec_select` or the window planners must be mirrored here, and the
+// differential window tests plus the EXPLAIN suite pin both sides.
+
+/// Render a probe plan as an EXPLAIN `PROBE` row's detail text.
+fn probe_plan_text(root: &str, plan: &ProbePlan) -> String {
+    let lit = |v: &Value| value_literal(v).unwrap_or_else(|_| "?".to_string());
+    match plan {
+        ProbePlan::Eq(v) => format!("{root} = {}", lit(v)),
+        ProbePlan::Prefix(v) => format!("{root} key prefix {}", lit(v)),
+        ProbePlan::Range { lo, hi } => {
+            let mut parts: Vec<String> = Vec::new();
+            match lo {
+                Some((v, true)) => parts.push(format!(">= {}", lit(v))),
+                Some((v, false)) => parts.push(format!("> {}", lit(v))),
+                None => {}
+            }
+            match hi {
+                Some((v, true)) => parts.push(format!("<= {}", lit(v))),
+                Some((v, false)) => parts.push(format!("< {}", lit(v))),
+                None => {}
+            }
+            if parts.is_empty() {
+                format!("{root} (full range)")
+            } else {
+                format!("{root} {}", parts.join(" AND "))
+            }
+        }
+    }
+}
+
+impl<'a> ReadCx<'a> {
+    /// EXPLAIN entry (both dispatch sites: the write-path parser match and
+    /// the guardless read view): validates the EXPLAIN modifiers, then
+    /// plans the inner SELECT without executing it.
+    pub(crate) fn explain_outer(
+        &self,
+        statement: &Statement,
+        analyze: bool,
+        estimate: bool,
+        format: &Option<sqlparser::ast::AnalyzeFormatKind>,
+        options: &Option<Vec<sqlparser::ast::UtilityOption>>,
+    ) -> Result<ExecOutcome> {
+        if analyze {
+            return err("EXPLAIN ANALYZE is not supported (plan only)");
+        }
+        if estimate {
+            return err("EXPLAIN ESTIMATE is not supported");
+        }
+        if format.is_some() {
+            return err("EXPLAIN FORMAT is not supported");
+        }
+        if options.is_some() {
+            return err("EXPLAIN utility options are not supported");
+        }
+        // `EXPLAIN QUERY PLAN` (SQLite) and `verbose` are accepted as the
+        // same plan output; `DESC <stmt>` parses into the same variant.
+        match statement {
+            Statement::Query(q) => self.explain_query((**q).clone()),
+            _ => err("EXPLAIN supports SELECT queries only"),
+        }
+    }
+
+    fn explain_query(&self, query: Query) -> Result<ExecOutcome> {
+        reject_unsupported_query_clauses(&query)?;
+        if query.with.is_some() {
+            return err("EXPLAIN: WITH (CTE) planning is not supported");
+        }
+        let sqlparser::ast::SetExpr::Select(select) = &*query.body else {
+            return err("EXPLAIN supports a single SELECT (set operations are not planned)");
+        };
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        self.explain_select(&query, (**select).clone(), &mut rows)?;
+        Ok(ExecOutcome::Rows(QueryResult {
+            columns: vec!["plan".to_string(), "detail".to_string()],
+            rows,
+        }))
+    }
+
+    fn explain_row(out: &mut Vec<Vec<Value>>, op: &str, detail: String) {
+        out.push(vec![Value::Str(op.to_string()), Value::Str(detail)]);
+    }
+
+    fn explain_select(
+        &self,
+        query: &Query,
+        select: sqlparser::ast::Select,
+        out: &mut Vec<Vec<Value>>,
+    ) -> Result<()> {
+        reject_unsupported_select_clauses(&select)?;
+        let row = |out: &mut Vec<Vec<Value>>, op: &str, detail: String| {
+            Self::explain_row(out, op, detail);
+        };
+
+        // Aggregate detection mirrors exec_select.
+        let group_exprs: Vec<SqlExpr> = match &select.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
+            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
+        };
+        let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
+        let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
+        let has_window = !window_calls_of(&select.projection).is_empty();
+        let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
+
+        if select.from.is_empty() {
+            row(out, "SCAN", "no FROM — one constant row".to_string());
+            return Ok(());
+        }
+
+        let where_text = select.selection.as_ref().map(|c| format!("WHERE ({c})"));
+        let solo = select.from.len() == 1 && select.from[0].joins.is_empty();
+
+        if solo {
+            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &select.from[0].relation
+            {
+                let tname = obj_name(name);
+                if is_compat_view(&tname) {
+                    row(
+                        out,
+                        "SCAN",
+                        format!("compatibility view {tname} (virtual, no heap)"),
+                    );
+                } else if let Some(meta) = self.tables.get(&tname) {
+                    if meta.is_view() {
+                        row(
+                            out,
+                            "VIEW",
+                            format!(
+                                "{tname} — stored definition expanded at runtime; \
+                                 the base-table plan is not detailed"
+                            ),
+                        );
+                    } else if self.explain_count_star_gate(query, &select)? {
+                        row(
+                            out,
+                            "SCAN",
+                            format!("COUNT(*) ON {tname} — live slot count, no document decode"),
+                        );
+                        return Ok(());
+                    } else {
+                        self.explain_real_table_scan(
+                            query,
+                            &select,
+                            &tname,
+                            alias.as_ref().map(|a| a.name.value.clone()),
+                            is_aggregate,
+                            distinct_all,
+                            has_window,
+                            rownum_wanted,
+                            out,
+                        )?;
+                    }
+                } else {
+                    return err(format!("table {tname} does not exist"));
+                }
+            } else {
+                row(
+                    out,
+                    "SCAN",
+                    "non-plain FROM factor — executed at runtime (plan not detailed)".to_string(),
+                );
+            }
+        } else {
+            self.explain_join_shape(&select, out)?;
+        }
+
+        // Post-scan clause rows (the window paths consume WHERE + ORDER +
+        // LIMIT, which their SCAN rows already say).
+        let windowed = out
+            .iter()
+            .any(|r| r[1].as_str().is_some_and(|d| d.contains("WINDOW")));
+        if let Some(w) = &where_text {
+            if !windowed {
+                row(out, "FILTER", format!("{w} (row-local evaluation)"));
+            }
+        }
+        if query.order_by.is_some() && !windowed {
+            row(out, "SORT", "in-memory generic sort".to_string());
+        }
+        if (query.limit_clause.is_some() || query.fetch.is_some()) && !windowed {
+            row(out, "LIMIT", "applied after scanning/sorting".to_string());
+        }
+        if !distinct_all {
+            row(out, "DISTINCT", "dedup after scan".to_string());
+        }
+        if select.having.is_some() {
+            row(out, "HAVING", "post-aggregate filter".to_string());
+        }
+        if is_aggregate {
+            row(
+                out,
+                "AGGREGATE",
+                "grouped/aggregate execution path".to_string(),
+            );
+        }
+        if has_window {
+            row(
+                out,
+                "WINDOW",
+                "window functions force full rowset materialization (fast paths off)".to_string(),
+            );
+        }
+        if rownum_wanted {
+            row(
+                out,
+                "ROWNUM",
+                "numbered before WHERE (Oracle semantics)".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The scan rows for a solo REAL table: window fast paths, then the
+    /// index probe, then the full-scan fallback — in exec order.
+    #[allow(clippy::too_many_arguments)]
+    fn explain_real_table_scan(
+        &self,
+        query: &Query,
+        select: &sqlparser::ast::Select,
+        tname: &str,
+        alias: Option<String>,
+        is_aggregate: bool,
+        distinct_all: bool,
+        has_window: bool,
+        rownum_wanted: bool,
+        out: &mut Vec<Vec<Value>>,
+    ) -> Result<()> {
+        let row = |out: &mut Vec<Vec<Value>>, op: &str, detail: String| {
+            Self::explain_row(out, op, detail);
+        };
+        let meta = self.tables.get(tname).expect("caller resolved the table");
+        let ctes = Ctes::new();
+        let fast_eligible = !is_aggregate
+            && !rownum_wanted
+            && select.having.is_none()
+            && distinct_all
+            && !has_window;
+        if fast_eligible {
+            if let Some(p) = self.ordered_window_plan(
+                select,
+                &select.from,
+                &select.selection,
+                &query.order_by,
+                query,
+                &ctes,
+            )? {
+                row(
+                    out,
+                    "SCAN",
+                    format!(
+                        "ORDERED INDEX WINDOW ON {tname} USING {} {} SKIP {} LIMIT {}{}",
+                        p.root_key,
+                        if p.asc { "ASC" } else { "DESC" },
+                        p.skip,
+                        p.take,
+                        if p.exact { "" } else { " + residual WHERE" }
+                    ),
+                );
+                if let Some(plan) = &p.probe {
+                    row(out, "PROBE", probe_plan_text(&p.root_key, plan));
+                }
+                return Ok(());
+            }
+            if let Some(up) = self.unindexed_window_plan(select, query, &ctes)? {
+                let fields = up
+                    .keys
+                    .iter()
+                    .map(|(f, _, _)| f.first().cloned().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                row(
+                    out,
+                    "SCAN",
+                    format!(
+                        "TOP-K WINDOW ON {} BY {fields} SKIP {} LIMIT {}                          (encoded-byte key extraction)",
+                        up.table, up.skip, up.take
+                    ),
+                );
+                return Ok(());
+            }
+        }
+        // Index probe (load_from's fast path): solo plain real table with a
+        // WHERE whose AND-conjuncts the planner can subsume.
+        let akey = alias.as_deref();
+        if let Some(cond) = &select.selection {
+            if let Some((root, plan, exact)) = probe_plan(cond, meta, tname, akey) {
+                row(
+                    out,
+                    "SCAN",
+                    format!(
+                        "INDEX PROBE ON {tname} USING {root}{}",
+                        if exact { "" } else { " + residual WHERE" }
+                    ),
+                );
+                row(out, "PROBE", probe_plan_text(&root, &plan));
+                return Ok(());
+            }
+        }
+        row(out, "SCAN", format!("FULL HEAP SCAN ON {tname}"));
+        Ok(())
+    }
+
+    /// Join shapes: every side loads fully, then combines — the per-join
+    /// strategy (equi/hash vs nested loop) mirrors `join_rows`.
+    fn explain_join_shape(
+        &self,
+        select: &sqlparser::ast::Select,
+        out: &mut Vec<Vec<Value>>,
+    ) -> Result<()> {
+        let row = |out: &mut Vec<Vec<Value>>, op: &str, detail: String| {
+            Self::explain_row(out, op, detail);
+        };
+        for twj in &select.from {
+            let desc = self.explain_factor_desc(&twj.relation);
+            row(out, "SCAN", format!("JOIN SIDE FULL LOAD — {desc}"));
+            for j in &twj.joins {
+                let kind = match &j.join_operator {
+                    sqlparser::ast::JoinOperator::Inner(_) => "INNER",
+                    sqlparser::ast::JoinOperator::LeftOuter(_) => "LEFT",
+                    sqlparser::ast::JoinOperator::RightOuter(_) => "RIGHT",
+                    sqlparser::ast::JoinOperator::FullOuter(_) => "FULL",
+                    sqlparser::ast::JoinOperator::CrossJoin(_) => "CROSS",
+                    sqlparser::ast::JoinOperator::CrossApply => {
+                        row(
+                            out,
+                            "JOIN",
+                            "CROSS APPLY — right side per left row".to_string(),
+                        );
+                        continue;
+                    }
+                    sqlparser::ast::JoinOperator::OuterApply => {
+                        row(
+                            out,
+                            "JOIN",
+                            "OUTER APPLY — right side per left row".to_string(),
+                        );
+                        continue;
+                    }
+                    _ => "JOIN",
+                };
+                let right_desc = self.explain_factor_desc(&j.relation);
+                let right_key = match &j.relation {
+                    sqlparser::ast::TableFactor::Table { name, alias, .. } => alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| obj_name(name)),
+                    sqlparser::ast::TableFactor::Derived { alias, .. } => alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| "?".to_string()),
+                    _ => "?".to_string(),
+                };
+                // Same extraction the executor uses (the plain JOIN
+                // keyword parses as JoinOperator::Join).
+                let on = join_on_expr(&j.join_operator);
+                let strategy = match on {
+                    None => "nested loop (no ON)".to_string(),
+                    Some(e) => {
+                        if equi_plan(&right_key, e).is_some() {
+                            "hash join (equi ON)".to_string()
+                        } else {
+                            "nested loop (non-equi or unqualified ON)".to_string()
+                        }
+                    }
+                };
+                let on_text = on.map(|e| format!(" ON ({e})")).unwrap_or_default();
+                row(
+                    out,
+                    "JOIN",
+                    format!("{kind} {strategy}{on_text} — right side: {right_desc}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn explain_factor_desc(&self, tf: &sqlparser::ast::TableFactor) -> String {
+        match tf {
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                let tname = obj_name(name);
+                if is_compat_view(&tname) {
+                    format!("compatibility view {tname} (virtual)")
+                } else if self.tables.get(&tname).is_some_and(|m| m.is_view()) {
+                    format!("view {tname} (expanded at runtime)")
+                } else {
+                    let a = alias
+                        .as_ref()
+                        .map(|a| format!(" AS {}", a.name.value))
+                        .unwrap_or_default();
+                    format!("table {tname}{a}")
+                }
+            }
+            sqlparser::ast::TableFactor::Derived { alias, .. } => {
+                let a = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| "?".to_string());
+                format!("derived table {a} (subquery executed at runtime)")
+            }
+            sqlparser::ast::TableFactor::TableFunction { .. } => {
+                "table function (executed at runtime)".to_string()
+            }
+            _ => "subquery/NESTED factor (executed at runtime)".to_string(),
+        }
+    }
+
+    /// Pure-AST mirror of `try_count_star`'s eligibility gates (no heap
+    /// access): true when `SELECT COUNT(*) FROM <solo real table>` takes
+    /// the live-count fast path.
+    fn explain_count_star_gate(
+        &self,
+        query: &Query,
+        select: &sqlparser::ast::Select,
+    ) -> Result<bool> {
+        if select.selection.is_some()
+            || select.having.is_some()
+            || select.top.is_some()
+            || !matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All))
+            || query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || query.fetch.is_some()
+            || select.projection.len() != 1
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+        {
+            return Ok(false);
+        }
+        if !plain_table_factor(&select.from[0].relation) {
+            return Ok(false);
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return Ok(false);
+        };
+        let tname = obj_name(name);
+        let Some(meta) = self.tables.get(&tname).filter(|m| !m.is_view()) else {
+            return Ok(false);
+        };
+        let _ = meta;
+        let expr = match &select.projection[0] {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => return Ok(false),
+        };
+        let SqlExpr::Function(f) = expr else {
+            return Ok(false);
+        };
+        if !f.name.to_string().eq_ignore_ascii_case("count")
+            || f.filter.is_some()
+            || f.over.is_some()
+        {
+            return Ok(false);
+        }
+        use sqlparser::ast::{DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments};
+        Ok(matches!(&f.args, FunctionArguments::List(list) if {
+            !matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+                && list.args.len() == 1
+                && matches!(list.args[0], FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+        }))
     }
 }
 
@@ -5266,6 +5856,7 @@ impl Database {
         !matches!(
             stmt,
             Statement::Query(_)
+                | Statement::Explain { .. }
                 | Statement::Pragma { .. }
                 | Statement::StartTransaction { .. }
                 | Statement::Commit { .. }
@@ -5421,6 +6012,12 @@ impl Database {
         let mut out = Vec::new();
         match stmt {
             Statement::Query(q) => walk_query(q, &mut out)?,
+            // EXPLAIN reads exactly what its inner query reads (fail-closed
+            // on any inner shape the walker cannot classify).
+            Statement::Explain { statement, .. } => match statement.as_ref() {
+                Statement::Query(q) => walk_query(q, &mut out)?,
+                _ => return None,
+            },
             Statement::Insert(insert) => {
                 if let Some(source) = &insert.source {
                     walk_query(source, &mut out)?;
@@ -7064,6 +7661,16 @@ impl Database {
                 self.exec_merge(m.clone())
             }
             Statement::Query(q) => self.exec_query_cx(*q),
+            Statement::Explain {
+                statement,
+                analyze,
+                estimate,
+                format,
+                options,
+                ..
+            } => self
+                .read_cx()
+                .explain_outer(&statement, analyze, estimate, &format, &options),
             Statement::Truncate(tr) => {
                 // Empty the tables; shape (columns/constraints) is kept.
                 // Validate every target (existence, kind, FK children)
@@ -24974,8 +25581,147 @@ mod tx_rollback_tests {
         assert!(db
             .execute("CREATE MATERIALIZED VIEW v AS SELECT 1")
             .is_err());
-        assert!(db.execute("EXPLAIN SELECT 1").is_err());
+        // EXPLAIN SELECT 已升级为计划输出(只报不执行);ANALYZE 变体仍拒绝。
+        assert!(matches!(
+            db.execute("EXPLAIN SELECT 1"),
+            Ok(ExecOutcome::Rows(_))
+        ));
+        assert!(db.execute("EXPLAIN ANALYZE SELECT 1").is_err());
         assert!(db.execute("VACUUM").is_err());
+    }
+
+    #[test]
+    fn explain_select_reports_scan_strategies() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, name TEXT, n INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_t_n ON t (n)");
+        run(
+            &mut db,
+            "CREATE TABLE u (id INT PRIMARY KEY NOT NULL, t_id INT)",
+        );
+        for i in 1..=5 {
+            run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'n{i}', {i})"));
+            run(&mut db, &format!("INSERT INTO u VALUES ({i}, {i})"));
+        }
+
+        let plan = |db: &mut Database, sql: &str| -> (Vec<String>, Vec<(String, String)>) {
+            match db.execute(sql).unwrap() {
+                ExecOutcome::Rows(r) => {
+                    let cols = r.columns.clone();
+                    let pairs = r
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            (
+                                row[0].as_str().unwrap_or_default().to_string(),
+                                row[1].as_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect();
+                    (cols, pairs)
+                }
+                other => panic!("expected plan rows, got {other:?}"),
+            }
+        };
+        let has = |p: &[(String, String)], needle: &str| {
+            p.iter()
+                .any(|(op, d)| d.contains(needle) || op.contains(needle))
+        };
+
+        // 输出面:两列 plan/detail(不是查询结果本身)。
+        let (cols, _) = plan(&mut db, "EXPLAIN SELECT 1");
+        assert_eq!(cols, vec!["plan".to_string(), "detail".to_string()]);
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT 1");
+        assert!(has(&p, "no FROM"), "{p:?}");
+
+        // COUNT(*) 免解码活槽计数
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT COUNT(*) FROM t");
+        assert!(has(&p, "COUNT(*)"), "{p:?}");
+
+        // 无 WHERE/ORDER:全堆扫描
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT * FROM t");
+        assert!(has(&p, "FULL HEAP SCAN ON t"), "{p:?}");
+
+        // 索引探测(WHERE 等值)+ PROBE 行
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT * FROM t WHERE id = 3");
+        // 单列 PK 树的 root_key 就是列名(sqlite_autoindex_* 只是展示名)。
+        assert!(has(&p, "INDEX PROBE ON t USING id"), "{p:?}");
+        assert!(
+            p.iter()
+                .any(|(op, d)| op == "PROBE" && d.contains("id = 3")),
+            "{p:?}"
+        );
+
+        // 有序索引窗口(ORDER BY 索引键 + 常量 LIMIT)
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT name FROM t ORDER BY n LIMIT 10");
+        // 单列索引的 root_key = 列名(复合索引才是索引名)。
+        assert!(has(&p, "ORDERED INDEX WINDOW ON t USING n ASC"), "{p:?}");
+        assert!(has(&p, "LIMIT 10"), "{p:?}");
+        // 窗口消费了 ORDER/LIMIT:不再出现通用 SORT 行
+        assert!(!p.iter().any(|(op, _)| op == "SORT"), "{p:?}");
+
+        // 无索引 ORDER BY + 有界 LIMIT:top-K 窗口
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT name FROM t ORDER BY name LIMIT 3");
+        assert!(has(&p, "TOP-K WINDOW ON t BY name"), "{p:?}");
+        assert!(has(&p, "LIMIT 3"), "{p:?}");
+
+        // OFFSET 进入窗口描述
+        let (_, p) = plan(
+            &mut db,
+            "EXPLAIN SELECT name FROM t ORDER BY n LIMIT 5 OFFSET 20",
+        );
+        assert!(has(&p, "SKIP 20"), "{p:?}");
+
+        // 连接:等值 ON → hash join;非等值 → 嵌套循环
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT * FROM t JOIN u ON t.id = u.t_id");
+        assert!(
+            p.iter()
+                .any(|(op, d)| op == "JOIN" && d.contains("hash join")),
+            "{p:?}"
+        );
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT * FROM t JOIN u ON t.n < u.id");
+        assert!(
+            p.iter()
+                .any(|(op, d)| op == "JOIN" && d.contains("nested loop")),
+            "{p:?}"
+        );
+        // 连接两侧都报全量装载
+        assert!(has(&p, "JOIN SIDE FULL LOAD"), "{p:?}");
+
+        // 视图:如实报告展开,不冒充基表计划
+        run(&mut db, "CREATE VIEW v AS SELECT * FROM t WHERE id > 1");
+        let (_, p) = plan(&mut db, "EXPLAIN SELECT * FROM v");
+        assert!(has(&p, "expanded at runtime"), "{p:?}");
+
+        // 拒绝面:EXPLAIN 只计划 SELECT;ANALYZE/FORMAT/选项响亮拒绝
+        assert!(db
+            .execute("EXPLAIN INSERT INTO t VALUES (1, 'x', 1)")
+            .is_err());
+        assert!(db.execute("EXPLAIN UPDATE t SET n = 1").is_err());
+        assert!(db.execute("EXPLAIN DELETE FROM t").is_err());
+        assert!(db.execute("EXPLAIN FORMAT JSON SELECT 1").is_err());
+        assert!(db
+            .execute("EXPLAIN WITH c AS (SELECT 1) SELECT * FROM c")
+            .is_err());
+        assert!(db.execute("EXPLAIN SELECT 1 UNION SELECT 2").is_err());
+
+        // EXPLAIN 不执行:COUNT(*) 计划行不触碰数据,重复执行同一表计数不变
+        let before = match db.execute("SELECT COUNT(*) FROM t").unwrap() {
+            ExecOutcome::Rows(r) => r.rows,
+            other => panic!("{other:?}"),
+        };
+        for _ in 0..3 {
+            db.execute("EXPLAIN SELECT * FROM t WHERE n > 1 ORDER BY n LIMIT 2")
+                .unwrap();
+        }
+        let after = match db.execute("SELECT COUNT(*) FROM t").unwrap() {
+            ExecOutcome::Rows(r) => r.rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -28567,6 +29313,27 @@ mod read_view_tests {
         db.execute("COMMIT").unwrap();
         // After the transaction closes, fresh reads see the final state.
         assert_eq!(count(&db, "SELECT COUNT(*) FROM items"), 3);
+    }
+
+    #[test]
+    fn read_view_executes_explain_for_readonly_connections() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY NOT NULL, n INT NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        let view = db.read_view();
+        // EXPLAIN rides the read view: readonly roles may diagnose plans.
+        let out = view
+            .execute("EXPLAIN SELECT * FROM t WHERE id = 1")
+            .unwrap();
+        let ExecOutcome::Rows(r) = out else {
+            panic!("expected plan rows");
+        };
+        assert_eq!(r.columns, vec!["plan".to_string(), "detail".to_string()]);
+        let detail = r.rows[0][1].as_str().unwrap_or_default().to_string();
+        assert!(detail.contains("INDEX PROBE ON t USING id"), "{r:?}");
+        // DDL/DML still refuse on the read view.
+        assert!(view.execute("INSERT INTO t VALUES (2, 20)").is_err());
     }
 
     #[test]

@@ -17,7 +17,7 @@
 | ALTER TABLE 多操作非原子 | `ALTER TABLE … ADD/DROP/RENAME` 多个操作逐条独立提交,中途失败(后续操作被拒)时已提交的操作不回滚 | 变更单里每个操作单独校验后再提交;要原子性请一条语句一个操作 |
 | FK 目标唯一性建表不校验 | CREATE TABLE 不校验 REFERENCES 目标表/列存在且为 PK/UNIQUE(与 SQLite 一致,首个子插入才报错) | 目标非唯一时父侧删除检查可能误拒合法删除;建模期靠 schema 评审 |
 | 相关子查询(限定名、行级表面) | SELECT 的 WHERE/投影/ORDER BY 与 UPDATE·DELETE 的 WHERE/SET 逐行绑定外层行值求值;外层引用须限定名,内层同名别名遮蔽外层;JOIN ON/GROUP BY/HAVING 内相关、未限定外层引用显式报错,嵌套深度上限 8 | 嵌套循环成本 O(外层行 × 子查询);未限定外层引用按 schemaless 缺列语义读 NULL,须显式限定 |
-| 查询优化器原始 | 规则式索引探测(单表无 JOIN 时生效);JOIN 等值条件走 hash join(键按 `cmp_values` 归一化,索引是超集、ON 逐候选终裁;等值 JOIN 千行级表毫秒级完成),非等值/无限定列/交叉连接仍嵌套循环 | 非等值 JOIN 成本高;无 EXPLAIN |
+| 查询优化器原始 | 规则式索引探测(单表无 JOIN 时生效);JOIN 等值条件走 hash join(键按 `cmp_values` 归一化,索引是超集、ON 逐候选终裁;等值 JOIN 千行级表毫秒级完成),非等值/无限定列/交叉连接仍嵌套循环;**EXPLAIN SELECT** 输出扫描策略行(计数快路径/索引探测/有序索引窗口/top-K 窗口/全堆扫描 + hash/嵌套循环连接),只报不执行 | 非等值 JOIN 成本高;无统计信息/CBO |
 | 备份 + PITR | 全量 dump(带 journal-seq 锚点)+ 增量段 incr-*.sql(期刊条目 + 提交时间戳)+ `restore ... "to": <时间戳>`;期刊无条件记录(单节点也记) | PITR 窗口 = 期刊保留(本节点自身写);对称多写集群中,他节点发起的写不在本节点期刊里——**集群级 PITR 需在承载全部写的主节点上执行**(主从拓扑天然满足)或以全量兜底;大库备份/恢复 O(数据);恢复中途失败留下部分恢复态(converged=false 如实报告,重跑 restore 即可) |
 | EF 免迁移同步不校验列类型 | 校验覆盖 表/列存在性、索引名/列序/唯一性;引擎为无类型文档模型,`information_schema.columns.data_type` 恒为 ANY,列类型本就不持久化 | 改实体属性类型(TEXT→DECIMAL 等)不会被告警也不会生效于存量数据;类型变更属破坏性变更,需人工评估/迁移新表 |
 
