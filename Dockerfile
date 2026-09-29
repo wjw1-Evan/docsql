@@ -50,11 +50,17 @@ RUN set -e; \
   if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace --release --target "$HOST"; fi && \
   cargo build --release --target "$HOST" -p docsql-server -p docsql-cli -p docsql-web
 COPY crates ./crates
-# Test gate and build. The explicit --target is load-bearing even though it
-# equals the build host: only then does cargo scope the CARGO_TARGET_*_RUSTFLAGS
-# above to target units and keep proc-macro dylibs dynamic (their crate type
-# cannot link crt-static).
-RUN HOST=$(rustc -vV | sed -n 's/^host: //p') \
+# Test gate and build. The touch is load-bearing: BuildKit's COPY preserves
+# the sources' ORIGINAL mtimes — older than the stub files baked into the
+# warm-up layer below — so cargo can consider the workspace members "fresh"
+# and link the test binaries against the stub artifacts (E0422: ServerConfig
+# not found). Touching every member source forces the fresh check.
+# The explicit --target is load-bearing even though it equals the build
+# host: only then does cargo scope the CARGO_TARGET_*_RUSTFLAGS above to
+# target units and keep proc-macro dylibs dynamic (their crate type cannot
+# link crt-static).
+RUN find crates/*/src -name '*.rs' -exec touch {} + \
+  && HOST=$(rustc -vV | sed -n 's/^host: //p') \
   && if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace --release --target "$HOST"; fi \
   && cargo build --release --target "$HOST" -p docsql-server -p docsql-cli -p docsql-web \
   && mkdir -p /build/out \
