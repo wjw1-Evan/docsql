@@ -318,10 +318,16 @@ SELECT a IS DISTINCT FROM b FROM t;
 ```sql
 INSERT [ OR { REPLACE | IGNORE } ] INTO table_name [ ( column [ , ...n ] ) ]
     { VALUES ( expr [ , ...n ] ) [ , ...n ] | SELECT ... }
-    [ ON CONFLICT [ ( column [ , ...n ] ) | ON CONSTRAINT index_name ] DO NOTHING ]
+    [ ON CONFLICT [ ( column [ , ...n ] ) | ON CONSTRAINT index_name ]
+      { DO NOTHING | DO UPDATE SET assignment [ , ...n ] [ WHERE predicate ] } ]
     [ RETURNING { * | expr [ [ AS ] alias ] } [ , ...n ] ]
 
+INSERT INTO table_name ... ON DUPLICATE KEY UPDATE assignment [ , ...n ]   -- MySQL 拼写
+
 REPLACE INTO table_name ...          -- = INSERT OR REPLACE
+
+-- assignment: col = expr（expr 中裸列 = 冲突行的旧值,EXCLUDED.col = 候选行的值）
+
 ```
 
 ### 参数
@@ -332,7 +338,9 @@ REPLACE INTO table_name ...          -- = INSERT OR REPLACE
 | `VALUES` | 常量表达式，多行用逗号分隔；`VALUES` 中的子查询会被先求值 |
 | `SELECT` | `INSERT INTO t (...) SELECT ...`；**auto-GUID 表不支持**（随机会在对端分叉） |
 | `OR REPLACE` / `REPLACE INTO` | 唯一键冲突时**先删除冲突行再插入** |
-| `OR IGNORE` / `ON CONFLICT DO NOTHING` | 唯一键冲突时跳过该行；目标列（及 `ON CONSTRAINT index_name`）限定**只跳过该唯一约束**的冲突，命中其他唯一约束仍报错；不支持 `DO UPDATE` / `DO REPLACE` |
+| `OR IGNORE` / `ON CONFLICT DO NOTHING` | 唯一键冲突时跳过该行；目标列（及 `ON CONSTRAINT index_name`）限定**只跳过该唯一约束**的冲突，命中其他唯一约束仍报错 |
+| `ON CONFLICT … DO UPDATE` | **upsert**:冲突时原行按 SET 原地更新（PostgreSQL 语义,要求冲突目标；`EXCLUDED.col` = 候选行值,裸列 = 冲突行旧值；`WHERE` 过滤更新,false 时该行保持原像且候选行不插入;`ON CONSTRAINT` 可用 `sqlite_autoindex_<表>_<n>` 派生名）。受影响行数 = 插入 + 更新;`RETURNING` 同时覆盖两类行。定向语义:命中目标之外的唯一约束仍报错。多行批**顺序应用**(MySQL 语义:同一行可被后继行再次命中更新;PostgreSQL 会拒绝第二次命中)。`NEWID()/RAND()` 在 SET/WHERE 显式拒绝(重放会分叉);`NOW()` 族被语句级折叠为字面量(确定性)。auto-GUID/DEFAULT NOW 触发的回写保留 upsert 子句原样 |
+| `ON DUPLICATE KEY UPDATE` | MySQL 拼写的 upsert:**不带冲突目标**,任一唯一约束命中即更新(PK 先探测);`VALUES(col)` = 候选行值 |
 | `RETURNING` | 返回插入后的行（`*` 或表达式/别名） |
 
 ### 备注
@@ -1095,7 +1103,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |
 | 子查询/CTE | JOIN ON/GROUP BY/HAVING 内的相关引用、`APPLY` 子查询形式(未限定名的外层引用无法与缺列区分,读 NULL——请写限定名) |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
-| 事务/冲突 | `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`、`DEFAULT VALUES`、无匹配唯一约束的 `ON CONFLICT` 目标 |
+| 事务/冲突 | `DEFAULT VALUES`、`ON CONFLICT DO REPLACE`、无匹配唯一约束的 `ON CONFLICT` 目标;upsert-UPDATE 的 SET/WHERE 内子查询引用 `EXCLUDED`/`VALUES()` |
 | DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
 | T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
 | 分页 | `FETCH ... PERCENT` |

@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+### Upsert-UPDATE:`ON CONFLICT DO UPDATE` 与 `ON DUPLICATE KEY UPDATE`(2026-09-29)
+
+高频写入场景的刚需缺口关闭(此前显式报错)。两种拼写共用同一执行臂:
+
+- **PostgreSQL 拼写**:`INSERT … ON CONFLICT [(cols)|ON CONSTRAINT name] DO UPDATE SET col = expr, … [WHERE predicate]`——要求冲突目标(PG 语义);`EXCLUDED.col` = 候选行值,裸列 = 冲突行旧值;`WHERE` 为 false 时该行保持原像、候选行不插入;`ON CONSTRAINT` 可用 `sqlite_autoindex_<表>_<n>` 派生名(resolve 补派生名解析)。
+- **MySQL 拼写**:`ON DUPLICATE KEY UPDATE col = expr, …`——不带目标,任一唯一约束命中即更新(PK 先探测);`VALUES(col)` = 候选行值。
+- 执行:冲突探测与 DO NOTHING 共用(定向 scope 之外的唯一约束命中仍报错);命中行走两阶段索引维护(reindex_remove → heap.replace → moved 存活行 repoint → reindex_insert),受影响行数 = 插入 + 更新,`RETURNING` 按输入行序同时覆盖两类行;子侧 FK 整批校验(placed + 更新新像),父侧删除检查覆盖更新旧像,legacy 全集唯一检查把旧像换新像;CHECK/NOT NULL 经 meta.check 逐行生效。
+- **复制安全**:auto-GUID/DEFAULT NOW/NEWID 触发的 resolved_sql 回写现在把 `insert.on` 的 Display 文本接在 VALUES 后(此前只靠 OR 前缀,定向 `ON CONFLICT (a) DO NOTHING` 回放会被放大成 OR IGNORE——顺手修掉的既有偏差);多行批**顺序应用**,同一行可被后继行再次命中更新(MySQL 语义;PG 拒绝二次命中,文档明示);`NEWID()/RAND()` 在 SET/WHERE 显式拒绝,`NOW()` 族由语句级 fold 折叠为字面量(确定性);EXCLUDED/VALUES() 在 SET/WHERE 的**子查询体内**出现响亮拒绝(直接树内替换,子查询体不重写——绝不静默误解析到同名现有列)。
+- 测试:新增 13 项(基本 upsert/EXCLUDED 算术/WHERE 过滤含 EXCLUDED 谓词/多行顺序/定向外键冲突仍报错/唯一索引像双向维护/ON CONSTRAINT 派生名/MySQL 拼写含 VALUES()/RETURNING 两类行/回写保留 upsert 子句/FK 父子两侧/拒绝面:无目标·OR REPLACE 组合·OR IGNORE 组合·NEWID·ROWNUM·子查询 EXCLUDED·CHECK 违反即整语句回滚),全量 11 目标 0 失败;文档 sql-reference/features/AGENTS/CHANGELOG 同步。
+
 ### Python 驱动(DB-API 2.0,商用化路线 · 连接生态)(2026-09-29)
 
 路线图第 1 项「第二/第三语言驱动」的 Python 半边落地:`python/` 目录新增纯

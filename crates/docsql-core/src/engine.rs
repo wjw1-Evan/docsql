@@ -10391,7 +10391,10 @@ impl Database {
         }
         // Conflict policy: plain (error on duplicates), REPLACE INTO /
         // OR REPLACE (drop conflicting rows first), ON CONFLICT DO NOTHING /
-        // OR IGNORE (skip conflicting new rows).
+        // OR IGNORE (skip conflicting new rows), and the upsert-UPDATE
+        // forms: ON CONFLICT <target> DO UPDATE SET … [WHERE …]
+        // (PostgreSQL) / ON DUPLICATE KEY UPDATE … (MySQL) — the
+        // conflicting row is updated in place.
         let replace = insert.replace_into
             || matches!(insert.or, Some(sqlparser::ast::SqliteOnConflict::Replace));
         let do_nothing = matches!(
@@ -10399,16 +10402,72 @@ impl Database {
             Some(sqlparser::ast::OnInsert::OnConflict(ref c))
                 if matches!(c.action, sqlparser::ast::OnConflictAction::DoNothing)
         ) || matches!(insert.or, Some(sqlparser::ast::SqliteOnConflict::Ignore));
-        if let Some(sqlparser::ast::OnInsert::OnConflict(ref c)) = insert.on {
-            if matches!(c.action, sqlparser::ast::OnConflictAction::DoUpdate(_)) {
-                return err("ON CONFLICT DO UPDATE is not supported yet");
+        let (do_update, du_assignments, du_selection) = match &insert.on {
+            Some(sqlparser::ast::OnInsert::OnConflict(c)) => match &c.action {
+                sqlparser::ast::OnConflictAction::DoUpdate(du) => {
+                    (true, du.assignments.clone(), du.selection.clone())
+                }
+                _ => (false, Vec::new(), None),
+            },
+            Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) => {
+                (true, assignments.clone(), None)
             }
-        }
-        if matches!(
-            insert.on,
-            Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_))
-        ) {
-            return err("ON DUPLICATE KEY UPDATE is not supported");
+            _ => (false, Vec::new(), None),
+        };
+        if do_update {
+            if replace || do_nothing {
+                return err(
+                    "OR REPLACE / REPLACE INTO / OR IGNORE cannot combine with an upsert-UPDATE clause",
+                );
+            }
+            // Non-deterministic values in the update arm would diverge the
+            // cluster: peers replay the statement text verbatim (INSERT
+            // defaults are rewritten with resolved literals, the UPDATE arm
+            // has no such rewrite — same rule as UPDATE/DELETE/MERGE;
+            // wall clocks are exempt because the fold covers them).
+            for e in du_assignments
+                .iter()
+                .map(|a| &a.value)
+                .chain(du_selection.iter())
+            {
+                if calls_newid(e) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID() is not supported in DO UPDATE SET/WHERE                          (replication replay would diverge)",
+                    );
+                }
+            }
+            // Wall-clock functions in the arm are FOLDED to literals by the
+            // statement-level preprocessing (fold_wall_clocks rewrites the
+            // whole text, on-clause included), so they are accepted with
+            // deterministic replay — no guard here.
+            if refs_rownum_in(&du_assignments, &du_selection) {
+                return err("ROWNUM is not supported in DO UPDATE SET/WHERE");
+            }
+            // PostgreSQL requires the conflict target for DO UPDATE; the
+            // MySQL spelling is untargeted by definition (any unique key).
+            if matches!(
+                insert.on,
+                Some(sqlparser::ast::OnInsert::OnConflict(ref c))
+                    if c.conflict_target.is_none()
+            ) {
+                return err(
+                    "ON CONFLICT DO UPDATE requires a conflict target (PostgreSQL semantics) —                      name the unique key with ON CONFLICT (cols) / ON CONSTRAINT, or use the                      MySQL spelling ON DUPLICATE KEY UPDATE for any-key matching",
+                );
+            }
+            // EXCLUDED / VALUES() are rewritten only in the direct SET/WHERE
+            // trees; inside a subquery they would mis-resolve to the
+            // existing row's column — reject loudly instead.
+            for e in du_assignments
+                .iter()
+                .map(|a| &a.value)
+                .chain(du_selection.iter())
+            {
+                if upsert_proposed_in_subquery(e) {
+                    return err(
+                        "EXCLUDED / VALUES() inside a subquery of DO UPDATE SET/WHERE is not supported",
+                    );
+                }
+            }
         }
         // Replication-safe rewrite: the statement as written would let every
         // peer fill its own random GUIDs — or stamp its own clock for a
@@ -10452,6 +10511,12 @@ impl Database {
                 rendered.push(format!("({})", vals.join(", ")));
             }
             sql.push_str(&rendered.join(", "));
+            // Preserve the conflict clause verbatim: the OR-prefix only
+            // covers the SQLite spellings, and a targeted ON CONFLICT scope
+            // must not widen to OR IGNORE on replaying peers.
+            if let Some(on) = &insert.on {
+                sql.push_str(&on.to_string());
+            }
             self.resolved_sql = Some(sql);
         }
 
@@ -10493,7 +10558,7 @@ impl Database {
                 }
                 Some(sqlparser::ast::ConflictTarget::OnConstraint(name)) => {
                     let iname = obj_name(name);
-                    Some(resolve_conflict_constraint(&meta, &iname)?)
+                    Some(resolve_conflict_constraint(&meta, &table, &iname)?)
                 }
             },
             _ => None,
@@ -10603,41 +10668,144 @@ impl Database {
         // included: staged pages are visible to tree reads).
         let mut placed: Vec<(u64, Object)> = Vec::with_capacity(new_docs.len());
         let mut insert_failed: Option<SqlError> = None;
+        // Upsert-UPDATE state: rows updated in place during this statement
+        // (locator, pre-image, post-image) plus the RETURNING projection in
+        // input order (inserted and updated rows alike).
+        let mut updated: Vec<(u64, Object, Object)> = Vec::new();
+        let mut ret_docs: Vec<Object> = Vec::with_capacity(new_docs.len());
+        let mut du_outer = OuterFrom::new();
+        du_outer.insert(table.clone());
         'outer: for doc in new_docs.into_iter() {
-            if do_nothing {
+            // Conflict probe shared by skip (DO NOTHING / OR IGNORE) and
+            // upsert (DO UPDATE): locate the conflicting row's locator.
+            // Untargeted = any unique constraint (first hit wins, PK probes
+            // first); targeted = the named constraint's tree only — other
+            // keys' conflicts still error at the insert below.
+            let conflict_loc: Option<u64> = if !do_nothing && !do_update {
+                None
+            } else {
                 match &conflict_scope {
-                    // Untargeted: any unique constraint can skip the row.
                     None => {
+                        let mut hit = None;
                         for col in &indexed {
                             let Some(v) = doc.get(col) else { continue };
                             if matches!(v, Value::Null) {
                                 continue;
                             }
-                            if BTree::open(roots[col])
+                            if let Some(loc) = BTree::open(roots[col])
                                 .get(&PageReader::current(&self.pager), &tx, v)
                                 .map_err(|e| index_err(col, e))?
-                                .is_some()
                             {
-                                continue 'outer; // conflict: skip this row
+                                hit = Some(loc);
+                                break;
                             }
                         }
+                        hit
                     }
-                    // Targeted: only this constraint's conflicts are skipped;
-                    // a conflict on any other unique constraint still errors
-                    // (the insert below enforces it). The constraint's column
-                    // list resolves once per statement, not per row.
                     Some(root) => {
                         if let Some(key) = index_key_of(&doc, scope_cols.as_deref().unwrap()) {
-                            if BTree::open(roots[root.as_str()])
+                            BTree::open(roots[root.as_str()])
                                 .get(&PageReader::current(&self.pager), &tx, &key)
                                 .map_err(|e| index_err(root, e))?
-                                .is_some()
-                            {
-                                continue 'outer;
-                            }
+                        } else {
+                            None
                         }
                     }
                 }
+            };
+            if let Some(loc) = conflict_loc {
+                if do_nothing {
+                    continue 'outer; // conflict: skip this row
+                }
+                // ---- upsert arm: update the conflicting row in place ----
+                // PostgreSQL semantics: WHERE and SET see the OLD row for
+                // bare column references; EXCLUDED.col (and MySQL's
+                // VALUES(col)) carry the candidate row's values.
+                let page = crate::heap::unpack_loc(loc).0;
+                let before = heap.page_docs(&PageReader::current(&self.pager), &tx, page)?;
+                let Some((_, existing)) = before.iter().find(|(l, _)| *l == loc) else {
+                    self.pager.abort_tx(tx)?;
+                    return err(format!(
+                        "upsert: conflicting row vanished mid-statement (locator {loc:#x})"
+                    ));
+                };
+                if let Some(sel) = &du_selection {
+                    let mut sel = sel.clone();
+                    subst_upsert_proposed(&mut sel, &doc)?;
+                    if !self.matches_cx_in(&Some(sel), existing, &du_outer)? {
+                        // WHERE filtered the update out: the row keeps its
+                        // image and the candidate is not inserted (PG).
+                        continue 'outer;
+                    }
+                }
+                let mut subst = du_assignments.clone();
+                for a in &mut subst {
+                    subst_upsert_proposed(&mut a.value, &doc)?;
+                }
+                let new_vals = match self.eval_assignments_cx(&subst, existing, &du_outer) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.pager.abort_tx(tx)?;
+                        return Err(e);
+                    }
+                };
+                let mut merged = existing.clone();
+                for (col_name, v) in new_vals {
+                    merged.insert(col_name, v);
+                }
+                if let Err(e) = meta.check(&merged) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
+                // Two-phase index maintenance for THIS row: drop its old
+                // entries, write the new image, repoint the in-page repack's
+                // moved survivors, insert the new entries. Later batch rows
+                // see the updated trees (sequential upsert semantics, as in
+                // MySQL; PostgreSQL would reject a second touch instead).
+                if let Err(e) =
+                    reindex_remove(&self.pager, &mut tx, &idx_specs, &mut roots, existing, loc)
+                {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
+                let out = match heap.replace(&self.pager, &mut tx, loc, &merged) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.pager.abort_tx(tx)?;
+                        return Err(e.into());
+                    }
+                };
+                for (old_l, new_l) in &out.moved {
+                    if *old_l == loc {
+                        continue; // this row's own slot: entries removed above
+                    }
+                    if let Err(e) = reindex_repoint(
+                        &self.pager,
+                        &mut tx,
+                        &idx_specs,
+                        &mut roots,
+                        &before,
+                        *old_l,
+                        *new_l,
+                    ) {
+                        self.pager.abort_tx(tx)?;
+                        return Err(e);
+                    }
+                }
+                if let Err(e) = reindex_insert(
+                    &self.pager,
+                    &mut tx,
+                    &idx_specs,
+                    &mut roots,
+                    &merged,
+                    out.placed,
+                ) {
+                    self.pager.abort_tx(tx)?;
+                    return Err(e);
+                }
+                updated.push((loc, existing.clone(), merged.clone()));
+                ret_docs.push(merged);
+                continue 'outer;
             }
             let loc = match heap.insert(&self.pager, &mut tx, &doc) {
                 Ok(l) => l,
@@ -10679,6 +10847,9 @@ impl Database {
                     roots.insert(spec.root_key.clone(), tree.root);
                 }
             }
+            if insert.returning.is_some() {
+                ret_docs.push(doc.clone());
+            }
             placed.push((loc, doc));
         }
         if let Some(e) = insert_failed {
@@ -10691,8 +10862,11 @@ impl Database {
         // legitimize a child that lands alone (dangling reference).
         // Self-references resolve against the placed batch itself;
         // statement-internal references count, including forward ones.
-        if !meta.foreign_keys.is_empty() && !placed.is_empty() {
-            let final_docs: Vec<Object> = placed.iter().map(|(_, d)| d.clone()).collect();
+        // Upsert-UPDATE rows join the final set: their new images must
+        // reference existing parents like any inserted row.
+        if !meta.foreign_keys.is_empty() && (!placed.is_empty() || !updated.is_empty()) {
+            let mut final_docs: Vec<Object> = placed.iter().map(|(_, d)| d.clone()).collect();
+            final_docs.extend(updated.iter().map(|(_, _, n)| n.clone()));
             for doc in &final_docs {
                 // A big INSERT ... SELECT walks this per placed row: keep the
                 // statement timeout armed like every other row loop.
@@ -10701,6 +10875,17 @@ impl Database {
                     self.pager.abort_tx(tx)?;
                     return Err(e);
                 }
+            }
+        }
+        // Parent-side FK for upsert-updated rows: the old image's key
+        // values disappear exactly like a DELETE's and must not be
+        // referenced by children (new images already checked above).
+        if !updated.is_empty() {
+            let olds: Vec<Object> = updated.iter().map(|(_, o, _)| o.clone()).collect();
+            let news: Vec<Object> = updated.iter().map(|(_, _, n)| n.clone()).collect();
+            if let Err(e) = self.check_fk_parent_delete(&table, &olds, &news) {
+                self.pager.abort_tx(tx)?;
+                return Err(e);
             }
         }
         // Legacy files whose constraint columns predate trees keep the
@@ -10715,7 +10900,7 @@ impl Database {
             .iter()
             .chain(meta.unique.iter())
             .all(|c| indexed.contains(c));
-        if has_constraints && !all_treed && !placed.is_empty() {
+        if has_constraints && !all_treed && (!placed.is_empty() || !updated.is_empty()) {
             // A failed scan must abort, not silently skip the unique check.
             let mut combined = match (Heap {
                 pages: meta.pages.clone(),
@@ -10730,13 +10915,32 @@ impl Database {
                     return Err(e.into());
                 }
             };
+            if !updated.is_empty() {
+                // The scan sees the PRE-statement table: updated rows carry
+                // their old images here. Swap them for the new images
+                // (encoding-compare removes exactly the one old row — its
+                // unique-key values are distinct per row, so byte-identical
+                // duplicates of an old image cannot exist).
+                let olds: std::collections::HashSet<Vec<u8>> = updated
+                    .iter()
+                    .filter_map(|(_, o, _)| encode::encode_to_vec(&Value::Object(o.clone())).ok())
+                    .collect();
+                combined.retain(|d| {
+                    !encode::encode_to_vec(&Value::Object(d.clone()))
+                        .map(|k| olds.contains(&k))
+                        .unwrap_or(false)
+                });
+                combined.extend(updated.iter().map(|(_, _, n)| n.clone()));
+            }
             combined.extend(placed.iter().map(|(_, d)| d.clone()));
             if let Err(e) = meta.check_unique(&combined) {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
             }
         }
-        let count = placed.len() as u64;
+        // Affected = inserted + upsert-updated rows (PostgreSQL reports the
+        // union the same way).
+        let count = (placed.len() + updated.len()) as u64;
         // Emptied heap pages are released inside this transaction so later
         // statements reuse them instead of growing the file.
         for p in std::mem::take(&mut heap.dropped) {
@@ -10775,9 +10979,8 @@ impl Database {
                 .filter_map(|v| v.as_i64())
                 .max();
         }
-        new_docs = placed.into_iter().map(|(_, d)| d).collect();
         if let Some(ret) = &insert.returning {
-            return project_returning(ret, &new_docs);
+            return project_returning(ret, &ret_docs);
         }
         Ok(ExecOutcome::Affected(count))
     }
@@ -11564,7 +11767,25 @@ fn resolve_conflict_columns(meta: &TableMeta, cols: &[String]) -> Result<String>
 }
 
 /// Root key of the unique index `ON CONFLICT ON CONSTRAINT name` names.
-fn resolve_conflict_constraint(meta: &TableMeta, name: &str) -> Result<String> {
+fn resolve_conflict_constraint(meta: &TableMeta, table: &str, name: &str) -> Result<String> {
+    // PK / table-declared UNIQUE constraints surface as derived
+    // `sqlite_autoindex_<table>_<n>` names (PK first) — resolvable here
+    // even though they are never persisted in the catalog.
+    let prefix = format!("sqlite_autoindex_{table}_");
+    if let Some(n) = name.strip_prefix(&prefix) {
+        if let Some(i) = n.parse::<usize>().ok().filter(|i| *i >= 1) {
+            let mut cols: Vec<&String> = Vec::new();
+            for c in meta.primary_key.iter().chain(meta.constraint_unique.iter()) {
+                if !cols.contains(&c) {
+                    cols.push(c);
+                }
+            }
+            if let Some(c) = cols.get(i - 1) {
+                return Ok((*c).clone());
+            }
+        }
+        return err(format!("constraint {name} does not exist"));
+    }
     let Some(def) = meta.index_defs.iter().find(|d| d.name == name) else {
         return err(format!("constraint {name} does not exist"));
     };
@@ -16920,6 +17141,217 @@ fn value_to_literal(v: Value) -> Result<SqlExpr> {
         }
         other => return err(format!("cannot inline value as literal: {other:?}")),
     })
+}
+
+/// Substitute the proposed-row references in a DO UPDATE SET/WHERE tree:
+/// `EXCLUDED.col` (PostgreSQL) and `VALUES(col)` (MySQL) become literals of
+/// the candidate row's values. Descends the DIRECT expression tree only —
+/// a subquery body mentioning the proposed row is rejected afterwards
+/// (see [`upsert_proposed_in_subquery`]), so a reference can never
+/// silently mis-resolve to the existing row's same-named column.
+fn subst_upsert_proposed(e: &mut SqlExpr, proposed: &Object) -> Result<()> {
+    match e {
+        SqlExpr::CompoundIdentifier(parts)
+            if parts.len() >= 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") =>
+        {
+            let leaf = parts.last().map(|p| p.value.clone()).unwrap_or_default();
+            let v = proposed.get(&leaf).cloned().unwrap_or(Value::Null);
+            *e = value_to_literal(v)?;
+        }
+        SqlExpr::Function(f) if is_values_call(f) => {
+            let col = values_call_column(f);
+            let v = proposed.get(&col).cloned().unwrap_or(Value::Null);
+            *e = value_to_literal(v)?;
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            subst_upsert_proposed(left, proposed)?;
+            subst_upsert_proposed(right, proposed)?;
+        }
+        SqlExpr::UnaryOp { expr, .. } => subst_upsert_proposed(expr, proposed)?,
+        SqlExpr::Nested(inner) => subst_upsert_proposed(inner, proposed)?,
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            subst_upsert_proposed(expr, proposed)?;
+            subst_upsert_proposed(low, proposed)?;
+            subst_upsert_proposed(high, proposed)?;
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            subst_upsert_proposed(l, proposed)?;
+            subst_upsert_proposed(r, proposed)?;
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            subst_upsert_proposed(expr, proposed)?;
+            subst_upsert_proposed(pattern, proposed)?;
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            subst_upsert_proposed(expr, proposed)?;
+            for item in list {
+                subst_upsert_proposed(item, proposed)?;
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                subst_upsert_proposed(op, proposed)?;
+            }
+            for w in conditions.iter_mut() {
+                subst_upsert_proposed(&mut w.condition, proposed)?;
+                subst_upsert_proposed(&mut w.result, proposed)?;
+            }
+            if let Some(el) = else_result {
+                subst_upsert_proposed(el, proposed)?;
+            }
+        }
+        SqlExpr::Cast { expr, .. } => subst_upsert_proposed(expr, proposed)?,
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        subst_upsert_proposed(inner, proposed)?;
+                    }
+                }
+            }
+            if let Some(filter) = &mut f.filter {
+                subst_upsert_proposed(filter, proposed)?;
+            }
+        }
+        // Subquery bodies stay untouched (checked by the caller).
+        SqlExpr::InSubquery { expr, .. } => subst_upsert_proposed(expr, proposed)?,
+        SqlExpr::AnyOp { left, .. } | SqlExpr::AllOp { left, .. } => {
+            subst_upsert_proposed(left, proposed)?
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `VALUES(col)` — the MySQL proposed-row reference, parsed as a function.
+/// Recognizes exactly `VALUES(<single column>)`; anything else is a normal
+/// function (and stays one).
+fn is_values_call(f: &sqlparser::ast::Function) -> bool {
+    f.name.0.last().is_some_and(|p| {
+        p.as_ident()
+            .is_some_and(|i| i.value.eq_ignore_ascii_case("VALUES"))
+    }) && matches!(
+        &f.args,
+        sqlparser::ast::FunctionArguments::List(list)
+            if list.args.len() == 1
+                && matches!(
+                    list.args.first(),
+                    Some(sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(
+                            SqlExpr::Identifier(_)
+                        )
+                    ))
+                )
+    )
+}
+
+fn values_call_column(f: &sqlparser::ast::Function) -> String {
+    match &f.args {
+        sqlparser::ast::FunctionArguments::List(list) if list.args.len() == 1 => {
+            match list.args.first() {
+                Some(sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(SqlExpr::Identifier(i)),
+                )) => i.value.clone(),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// True when a DO UPDATE SET/WHERE tree still references the proposed row
+/// AFTER the direct-tree substitution — i.e. inside a subquery body, which
+/// the driver does not rewrite. Subquery bodies are probed textually
+/// (uppercased rendering); a false positive from a string literal is a
+/// loud error, never a silent mis-resolution.
+fn upsert_proposed_in_subquery(e: &SqlExpr) -> bool {
+    let subquery_text = |q: &sqlparser::ast::Query| -> bool {
+        let t = q.to_string().to_ascii_uppercase();
+        t.contains("EXCLUDED") || t.contains("VALUES(")
+    };
+    match e {
+        SqlExpr::Subquery(q) => subquery_text(q),
+        SqlExpr::Exists { subquery: q, .. } => subquery_text(q),
+        SqlExpr::InSubquery { expr, subquery, .. } => {
+            upsert_proposed_in_subquery(expr) || subquery_text(subquery)
+        }
+        SqlExpr::AnyOp { left, right, .. } | SqlExpr::AllOp { left, right, .. } => {
+            upsert_proposed_in_subquery(left) || upsert_proposed_in_subquery(right)
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            upsert_proposed_in_subquery(left) || upsert_proposed_in_subquery(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } => upsert_proposed_in_subquery(expr),
+        SqlExpr::Nested(inner) => upsert_proposed_in_subquery(inner),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            upsert_proposed_in_subquery(expr)
+                || upsert_proposed_in_subquery(low)
+                || upsert_proposed_in_subquery(high)
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            upsert_proposed_in_subquery(l) || upsert_proposed_in_subquery(r)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            upsert_proposed_in_subquery(expr) || upsert_proposed_in_subquery(pattern)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            upsert_proposed_in_subquery(expr) || list.iter().any(upsert_proposed_in_subquery)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|x| upsert_proposed_in_subquery(x))
+                || conditions.iter().any(|w| {
+                    upsert_proposed_in_subquery(&w.condition)
+                        || upsert_proposed_in_subquery(&w.result)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|x| upsert_proposed_in_subquery(x))
+        }
+        SqlExpr::Cast { expr, .. } => upsert_proposed_in_subquery(expr),
+        SqlExpr::Function(f) => {
+            let args_hit = match &f.args {
+                sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|a| {
+                    matches!(
+                        a,
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner)
+                        ) if upsert_proposed_in_subquery(inner)
+                    )
+                }),
+                _ => false,
+            };
+            args_hit
+                || f.filter
+                    .as_ref()
+                    .is_some_and(|x| upsert_proposed_in_subquery(x))
+        }
+        _ => false,
+    }
+}
+
+/// ROWNUM guard for the DO UPDATE arm (same rule as UPDATE): assignments
+/// and the WHERE predicate see no row stream to number.
+fn refs_rownum_in(assignments: &[sqlparser::ast::Assignment], selection: &Option<SqlExpr>) -> bool {
+    assignments.iter().any(|a| refs_rownum(&a.value)) || selection.as_ref().is_some_and(refs_rownum)
 }
 
 /// Map a B+ tree error to a SQL error; duplicate hits become the familiar
@@ -22463,10 +22895,8 @@ mod tests {
                 "INSERT INTO t VALUES (1, 1) ON CONFLICT (a) DO NOTHING",
                 "no unique constraint",
             ),
-            (
-                "INSERT INTO t VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET b = 1",
-                "DO UPDATE",
-            ),
+            // DO UPDATE is now supported (see the upsert tests below); on a
+            // constraint-less table its target resolution is what errors.
         ] {
             let e = db.execute(sql).unwrap_err();
             assert!(e.to_string().contains(want), "sql={sql} error={e}");
@@ -22576,6 +23006,316 @@ mod tests {
             .execute("INSERT INTO t VALUES (3, 'c') ON CONFLICT (v, id) DO NOTHING")
             .unwrap_err();
         assert!(e.to_string().contains("no unique constraint"), "{e}");
+    }
+
+    // ---- upsert-UPDATE (ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE) ----
+
+    #[test]
+    fn on_conflict_do_update_updates_the_conflicting_row() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT, n INT)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a', 10)");
+        // Insert a NEW row: unaffected by the upsert arm.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (2, 'b', 5) ON CONFLICT (id) DO UPDATE SET n = n + 1",
+        );
+        // Conflict on id=1: updated in place (EXCLUDED carries the
+        // candidate's values, bare columns the existing row's).
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 'z', 7) ON CONFLICT (id) DO UPDATE \
+             SET v = EXCLUDED.v, n = n + EXCLUDED.n",
+        );
+        let r = rows(&mut db, "SELECT id, v, n FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Str("z".into()), Value::Int(17)],
+                vec![Value::Int(2), Value::Str("b".into()), Value::Int(5)],
+            ]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_where_filters_the_update() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 1)");
+        // WHERE false: the row keeps its image, nothing is inserted.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET n = 99 WHERE n > 100",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT id, n FROM t").rows,
+            vec![vec![Value::Int(1), Value::Int(1)]]
+        );
+        // WHERE true (EXCLUDED visible in the predicate): applied.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n \
+             WHERE EXCLUDED.n > n",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT id, n FROM t").rows,
+            vec![vec![Value::Int(1), Value::Int(99)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_multi_row_is_sequential() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 0)");
+        // Both candidates target id=1: the second sees the first's effect
+        // (MySQL ON DUPLICATE KEY semantics; PostgreSQL would reject a
+        // second touch of the same row).
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 1), (1, 2) ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.n",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT n FROM t").rows,
+            vec![vec![Value::Int(3)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_targeted_other_keys_still_error() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        // Conflict on the UNIQUE column while the target names the PK:
+        // the upsert arm must not swallow it (directed-conflict contract).
+        let e = db
+            .execute("INSERT INTO t VALUES (2, 'a') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE constraint"), "{e}");
+    }
+
+    #[test]
+    fn on_conflict_do_update_maintains_unique_index_images() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT UNIQUE, n INT)",
+        );
+        run(&mut db, "CREATE INDEX ix_n ON t(n)");
+        run(&mut db, "INSERT INTO t VALUES (1, 100, 1), (2, 200, 2)");
+        // Upsert rewrites the key k=100 → k=150: the unique tree must
+        // follow both directions.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 150, 9) ON CONFLICT (id) DO UPDATE SET k = EXCLUDED.k, n = EXCLUDED.n",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT id FROM t WHERE k = 150").rows,
+            vec![vec![Value::Int(1)]]
+        );
+        assert!(rows(&mut db, "SELECT id FROM t WHERE k = 100")
+            .rows
+            .is_empty());
+        // The freed key accepts a fresh insert.
+        run(&mut db, "INSERT INTO t VALUES (3, 100, 3)");
+        assert_eq!(
+            rows(&mut db, "SELECT n FROM t WHERE k = 100").rows,
+            vec![vec![Value::Int(3)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_on_constraint_spelling() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 1)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT ON CONSTRAINT sqlite_autoindex_t_1 \
+             DO UPDATE SET n = EXCLUDED.n",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT n FROM t").rows,
+            vec![vec![Value::Int(2)]]
+        );
+    }
+
+    #[test]
+    fn on_duplicate_key_update_mysql_spelling() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10)");
+        // MySQL: any unique key matches (no target); VALUES(col) carries
+        // the proposed value.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 5) ON DUPLICATE KEY UPDATE n = n + VALUES(n)",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT n FROM t").rows,
+            vec![vec![Value::Int(15)]]
+        );
+        // Untargeted also catches a second unique column's conflict.
+        run(&mut db, "CREATE TABLE u (a INT PRIMARY KEY, b INT UNIQUE)");
+        run(&mut db, "INSERT INTO u VALUES (1, 7)");
+        run(
+            &mut db,
+            "INSERT INTO u VALUES (9, 7) ON DUPLICATE KEY UPDATE b = 8",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT a, b FROM u").rows,
+            vec![vec![Value::Int(1), Value::Int(8)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_returning_covers_updated_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 1)");
+        let outcome = db
+            .execute(
+                "INSERT INTO t VALUES (1, 2), (3, 3) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n RETURNING id, n",
+            )
+            .unwrap();
+        let ExecOutcome::Rows(r) = outcome else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(2)],
+                vec![Value::Int(3), Value::Int(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_resolved_sql_preserves_the_clause() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id GUID AUTOINCREMENT PRIMARY KEY, k INT UNIQUE, n INT)",
+        );
+        // Auto-GUID fills a default → the statement is rewritten for
+        // replay; the upsert clause must survive the rewrite verbatim.
+        run(
+            &mut db,
+            "INSERT INTO t (k, n) VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t (k, n) VALUES (1, 7) ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT n FROM t").rows,
+            vec![vec![Value::Int(7)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_fk_checks_cover_updated_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE parent (id INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+        );
+        run(&mut db, "INSERT INTO parent VALUES (1), (2)");
+        run(&mut db, "INSERT INTO child VALUES (1, 1)");
+        // Updating the referenced parent key away must refuse (parent-side
+        // FK, same contract as DELETE).
+        let e = db
+            .execute(
+                "INSERT INTO parent VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id + 2",
+            )
+            .unwrap_err();
+        assert!(e.to_string().to_lowercase().contains("foreign"), "{e}");
+        // Updating the child's reference to a live parent is fine.
+        run(
+            &mut db,
+            "INSERT INTO child VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET pid = EXCLUDED.pid",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT pid FROM child").rows,
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_rejects_nonsense_loudly() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        // PG requires the conflict target for DO UPDATE.
+        let e = db
+            .execute("INSERT INTO t VALUES (1, 'b') ON CONFLICT DO UPDATE SET v = 'x'")
+            .unwrap_err();
+        assert!(e.to_string().contains("requires a conflict target"), "{e}");
+        // OR REPLACE cannot combine.
+        let e = db
+            .execute(
+                "INSERT OR REPLACE INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = 'x'",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("cannot combine"), "{e}");
+        // OR IGNORE cannot combine.
+        let e = db
+            .execute(
+                "INSERT OR IGNORE INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = 'x'",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("cannot combine"), "{e}");
+        // NEWID() in the update arm would diverge replay.
+        let e = db
+            .execute("INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = NEWID()")
+            .unwrap_err();
+        assert!(e.to_string().contains("NEWID"), "{e}");
+        // Wall-clock functions in the arm are FOLDED to literals by the
+        // statement-level preprocessing (deterministic replay) — accepted.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = 'x-' || NOW()",
+        );
+        assert!(rows(&mut db, "SELECT v FROM t WHERE id = 1").rows[0][0]
+            .to_string()
+            .starts_with("x-"));
+        // ROWNUM has no row stream here.
+        let e = db
+            .execute("INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = 'x' WHERE ROWNUM <= 1")
+            .unwrap_err();
+        assert!(e.to_string().contains("ROWNUM"), "{e}");
+        // EXCLUDED inside a subquery of the update arm: not rewritten.
+        let e = db
+            .execute(
+                "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = 'x' \
+                 WHERE id IN (SELECT id FROM t WHERE v = EXCLUDED.v)",
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("EXCLUDED"), "{e}");
+        // CHECK constraint on the merged image: enforced, statement aborts.
+        run(
+            &mut db,
+            "CREATE TABLE c (id INT PRIMARY KEY, q INT CHECK (q >= 0))",
+        );
+        run(&mut db, "INSERT INTO c VALUES (1, 1)");
+        let e = db
+            .execute("INSERT INTO c VALUES (1, -5) ON CONFLICT (id) DO UPDATE SET q = EXCLUDED.q")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("CHECK") || e.to_string().contains("check"),
+            "{e}"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT q FROM c").rows,
+            vec![vec![Value::Int(1)]]
+        );
     }
 
     #[test]

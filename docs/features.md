@@ -88,7 +88,12 @@ WHEN MATCHED THEN UPDATE SET qty = feed.qty
 WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (feed.sku, feed.qty);
 ```
 
-- 批量 `VALUES`、`RETURNING`(INSERT/UPDATE/DELETE)、`INSERT … SELECT`(auto-GUID 表除外);
+- 批量 `VALUES`、`RETURNING`(INSERT/UPDATE/DELETE;upsert-UPDATE 的 RETURNING 覆盖插入与更新两类行)、`INSERT … SELECT`(auto-GUID 表除外);
+- **upsert-UPDATE**:`ON CONFLICT [(cols)|ON CONSTRAINT] DO UPDATE SET … [WHERE …]`(PostgreSQL 语义,
+  要求冲突目标,`EXCLUDED.col` 引用候选行)与 `ON DUPLICATE KEY UPDATE …`(MySQL 拼写,任意唯一键,
+  `VALUES(col)` 引用候选行)——冲突行原位更新,受影响行数 = 插入 + 更新;多行批顺序应用(同行可被再次命中,
+  与 PostgreSQL 的"拒绝二次命中"不同,文档明示);定向冲突之外的唯一约束命中仍报错;NEWID()/RAND() 在
+  SET/WHERE 显式拒绝,NOW() 族折叠为字面量;回写(auto-GUID/DEFAULT NOW)保留 upsert 子句;
 - `MERGE` 单语句原子、随复制扇出;限制(谓词/WHERE 子句/源侧 CTE)见 SQL 参考。
 
 ### 3.3 查询
@@ -134,7 +139,7 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 - 不支持(均显式报错,不静默吞掉):`WINDOW`/`QUALIFY`、自定义窗口帧、`DISTINCT ON`、
   `WITH RECURSIVE`、`NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`、`TOP ... PERCENT`、
-  `ON CONFLICT DO UPDATE`、`ON DUPLICATE KEY UPDATE`;
+  `ON CONFLICT DO REPLACE`;
   T-SQL 专有形式(变量 `@p`/`@@ROWCOUNT`、`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、
   `IDENTITY(1,1)`、`CROSS/OUTER APPLY`、`PIVOT`、`sys.*`、存储过程/`IF`/`WHILE` 等过程层)同样报错;
 - **T-SQL 表达式层已支持**(见 SQL 参考 · T-SQL 兼容面):`SELECT TOP [WITH TIES]`、
