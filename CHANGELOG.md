@@ -5,6 +5,36 @@
 
 ## [Unreleased]
 
+### Python 驱动(DB-API 2.0,商用化路线 · 连接生态)(2026-09-29)
+
+路线图第 1 项「第二/第三语言驱动」的 Python 半边落地:`python/` 目录新增纯
+标准库 DB-API 2.0 驱动,直接对话 v1 二进制协议,零运行时依赖:
+
+- 帧编解码(`_proto.py`)完整复刻 proto.rs 头格式(magic/flags/type/
+  topology/len 全 LE);SQL 载荷走引擎 `Value::Str` 编码(tag 0x04 + u32 LE
+  长度前缀,非裸文本——实现时实测抓到);
+- `qmark` 参数服务端绑定:REQ_PREPARE 按连接缓存(96 上限,超限逐个
+  REQ_CLOSE_STMT)+ REQ_EXECUTE;绑定值永远无法改变语句文本(注入面与
+  .NET 同一关闭机制,e2e 钉住);
+- 精确标量双向:`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP
+  (`$ts`,值域外保持原始对象与服务器解码一致)、`bytes`↔BLOB(`$bytes`)、
+  非有限浮点 `$float`;超 int64 整数自动走 `$dec` 防精度塌陷;
+- 原生 TLS(stdlib ssl):`tls_ca` 验证 / 只加密不验证 / 按 IP 连接的
+  `tls_hostname` 覆盖;`DOCSQL_KEY` 帧加密经可选 `cryptography` 实现
+  (nonce=连接前缀+单调计数器,AAD=type+flags+challenge,入向重放闸,
+  与 Rust/.NET 三方对称);
+- `docsql.Subscriber`:pub/sub 专用连接 + 专职读线程,断线自动重连并从
+  每频道最后收到 id 之后续传(服务器 `id > from` 语义,不丢不重);
+- `autocommit` 默认 True 并文档化偏离理由(单写者网络库,隐式事务停写
+  路径);`autocommit=False` 为 psycopg2 风格隐式块(DDL 也在事务内,
+  回滚撤销建表——测试钉住);
+- 错误层级:DB-API 标准族 + 文本启发式映射(UNIQUE/FOREIGN→
+  IntegrityError,parse/syntax→ProgrammingError 等);
+- 测试:pytest 29 用例(起真实 server:CRUD/精确类型往返/WHERE 匹配/
+  注入拒绝/事务回滚含 DDL/认证失败开门红/TLS 三形态/DOCSQL_KEY 双向/
+  pub/sub 实时+按 id 续传+glob),全部绿;CI 增 `python` job(cargo build
+  server + pytest);文档 drivers/features/AGENTS/python README 同步。
+
 ### JSON 路径索引:JSON_EXTRACT 走索引(2026-09-29)
 
 文档库核心性能项落地(设计 [docs/design/005-json-path-indexes.md](docs/design/005-json-path-indexes.md)):

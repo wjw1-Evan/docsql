@@ -24,3 +24,11 @@ coverage2/
 *.profraw
 # zcode agent session artifacts (plans etc.)
 .zcode/
+
+# Python driver
+__pycache__/
+*.py[cod]
+.pytest_cache/
+python/.venv/
+python/dist/
+python/*.egg-info/

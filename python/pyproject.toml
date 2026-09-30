@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docsql"
+version = "0.1.0"
+description = "DocSQL database driver: DB-API 2.0 over the v1 binary protocol"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "DocSQL contributors" }]
+keywords = ["docsql", "database", "dbapi", "driver", "json"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+]
+# No runtime dependencies by design: TLS uses the stdlib ssl module.
+# DOCSQL_KEY (AES-GCM frame sealing) additionally supports the optional
+# 'cryptography' package; native TLS is the recommended transport security.
+dependencies = []
+
+[project.optional-dependencies]
+crypto = ["cryptography>=41"]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/wjw1-Evan/docsql"
+
+[tool.setuptools.packages.find]
+include = ["docsql*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

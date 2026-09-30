@@ -14,6 +14,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 | `crates/docsql-web` | REST API + 内嵌单页控制台(`console.html` 经 `include_str!`) |
 | `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/AspireSample(AppHost 示例) |
 | `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile;`run-tests.sh` 部署测试入口 |
+| `python/` | DB-API 2.0 Python 驱动(纯标准库;`qmark` 服务端绑定 + 精确标量 `$dec`/`$ts`/`$bytes` + TLS/`DOCSQL_KEY` + `Subscriber` 断线续传);pytest 起真实 server(`cargo build -p docsql-server` 先行) |
 
 关键文件:`core/engine.rs`(SQL 执行器/约束/事务/写单元,最大文件)、`core/btree.rs`、`core/encode.rs`+`core/value.rs`、`core/guid.rs`、`core/useradmin.rs`+`core/kdf.rs`(数据库用户/角色 + PBKDF2)、`core/meta.rs`、`core/stmt.rs`、`core/tsql.rs`(T-SQL 兼容层:preprocess/函数族/表值函数)、`core/tsql_batch.rs`(T-SQL 批解释器:@变量/IF/WHILE/@@ROWCOUNT,逐连接会话),`core/proto.rs`、`server/lib.rs`(连接循环/全部 REQ_* 帧/join-repair,模块头注释权威)、`server/pubsub.rs`(锁顺序权威)、`server/querylog.rs`、`server/backup.rs`、`web/lib.rs`、`web/auth.rs`、`web/console.html`、`dotnet/Docsql.Client/AdoNet.cs`、`DocsqlSubscriber.cs`。基准:`crates/docsql-core/examples/bench*.rs`。
 
@@ -44,7 +45,7 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile single up -d   
 ```
 
 - compose 必须带 profile(不带 = 空操作);数据卷 external,`down -v` 不清数据;清数据唯一入口 `./deploy/reset-data.sh`;首次部署需先建卷(见 README);`run-tests.sh` 跑在一次性 `docsql-dev-testdata-*` 卷上(`DOCSQL_DEV_DATA_PREFIX` 覆盖卷名前缀),不动 dev 数据卷与账号卷,结束时恢复原 stack。
-- 测试布局:Rust 单测在各模块内;e2e 在 `crates/docsql-server/tests/e2e.rs`(pub/sub、join/repair、备份恢复、故障转移)与 `crates/docsql-web/tests/e2e.rs`(真实 HTTP);.NET 为两个 xUnit 套件;部署测试 `deploy/single-test.sh` / `deploy/multinode-test.sh`。
+- 测试布局:Rust 单测在各模块内;e2e 在 `crates/docsql-server/tests/e2e.rs`(pub/sub、join/repair、备份恢复、故障转移)与 `crates/docsql-web/tests/e2e.rs`(真实 HTTP);.NET 为两个 xUnit 套件;Python 驱动为 pytest 套件(`python/tests`,CI 有同名 job);部署测试 `deploy/single-test.sh` / `deploy/multinode-test.sh`。
 - CI `.github/workflows/docker-image.yml`(Rust 1.98.1 / .NET 10)执行同样门禁 + 覆盖门禁(`deploy/coverage.sh`) + dotnet 测试 → 多架构镜像 → main 分支部署测试;CI 失败等同门禁失败。
 - NuGet 发布:`.github/workflows/nuget-publish.yml` 在 push `v*` tag(或手动)时 pack 四个 .NET 包并推 GitHub Packages(`dotnet/Docsql.sln` 含 Aspire 包与测试;Aspire 测试不起容器,CI 直接可跑)。`dotnet/samples/AspireSample` 刻意不入 sln:它引用 GitHub Packages 的已发布包(演示真实用户用法),本地构建需配源凭据(`nuget.config` 已声明源,凭据放用户级或按示例 README 注入);CI 在 dotnet job 用 `GITHUB_TOKEN` 认证后单独构建该示例,fork PR 跳过。包版本在四个 csproj 各自的 `<Version>`(Docsql.Client/Docsql.EntityFrameworkCore/Docsql.Aspire.Hosting/Docsql.Aspire.Client);示例钉版本在 `dotnet/samples/AspireSample/Directory.Build.props` 的 `DocsqlPackageVersion`,升版时同步。
 

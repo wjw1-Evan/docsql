@@ -357,6 +357,7 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 | EF Core(`Docsql.EntityFrameworkCore`) | 原生提供程序(不依赖 SQLite):EnsureCreated + 惰性建表 + 模型/索引(含复合)自动同步、LINQ/Include、`decimal`→DECIMAL、`byte[]`→BLOB、`DateOnly/TimeOnly`、`List.Contains`→IN、字符串方法→LIKE;**实体集合属性 `List<T>`(JSON 数组)的 `Contains` 翻译为 `JSON_ARRAY_CONTAINS`(常量/跨列/取反/数值元素)**;`Dictionary<string,object>` 映射为 JSON 文本(读写与变更跟踪,成员不参与 SQL 翻译);`Database.Migrate()` 显式报错 |
 | Aspire | `AddDocsql` / `AddDocsqlCluster` / `WithWebConsole` / `WithDataVolume` + 消费侧 `AddDocsqlConnection` / `AddDocsqlDbContext`;见 [Aspire 指南](aspire.md) |
 | CLI(`docsql-cli`) | 嵌入式(直接开数据文件)与远程 shell;`--csv`/`--json` 导出;`-f script.sql` 批量(快速失败);内联 pub/sub 命令;`--user` 登录(密码走环境/提示) |
+| Python(`python/`,DB-API 2.0) | 纯标准库 DB-API 2.0 驱动:`qmark` 参数**服务端绑定**、`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、`bytes`↔BLOB(`$bytes`)、原生 TLS(stdlib ssl,`tls_ca` 可选验证)、原生 pub/sub `Subscriber`(专用连接 + 专职读线程 + 断线按最后 id 续传)、`DOCSQL_KEY` 帧加密(`cryptography` 选装);pytest 29 用例起真实 server 全绿 |
 | 线协议(自研驱动) | v1 二进制一句话一帧;`REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT` 服务端绑定;复制帧、`REQ_STATUS`、`REQ_BACKUP`、订阅帧;参数支持 `$dec`/`$bytes` 精确标记;帧定义见 `core/proto.rs` 模块头 |
 
 ## 11. 可观测性

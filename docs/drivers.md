@@ -73,6 +73,39 @@ host=10.0.0.5;port=7600;tls=true;tls_ca=/certs/ca.pem;tls_host=db.internal
 CLI 远程模式:`DOCSQL_TLS_CONNECT=1`(可选 `DOCSQL_TLS_CA`)后 `docsql connect <addr>`
 即走 TLS —— compose 健康检查在容器 env 里设置后自动生效。
 
+### Python 驱动(DB-API 2.0)
+
+`python/` 目录自带纯标准库的 DB-API 2.0 驱动(第二语言驱动,直接对话 v1
+二进制协议;详见 `python/README.md`):
+
+```python
+import docsql
+from decimal import Decimal
+from datetime import datetime, timezone
+
+with docsql.connect(host="127.0.0.1", port=7600, token="...",
+                    tls=True, tls_ca="/certs/ca.pem") as conn:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO t VALUES (?, ?, ?)",
+                    (1, "alice", Decimal("9.99")))
+        cur.execute("SELECT * FROM t WHERE ts > ?",
+                    (datetime(2026, 1, 1, tzinfo=timezone.utc),))
+        rows = cur.fetchall()
+```
+
+- `paramstyle="qmark"`:模板 REQ_PREPARE 注册一次、REQ_EXECUTE 服务端绑定
+  (与 .NET 同一注入关闭机制);prepared 模板按连接缓存(上限 96,超限
+  REQ_CLOSE_STMT 逐个注销);
+- 精确标量:`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、
+  `bytes`↔BLOB(`$bytes`);超 int64 的整数自动走 `$dec`;
+- `autocommit` 默认 **True**(单写者网络库,隐式事务会停住全局写路径;
+  DB-API 偏离已在文档明示),`autocommit=False` 为 psycopg2 风格隐式块;
+- 原生 TLS 用 stdlib `ssl`(`tls_ca` 缺省 = 只加密不验证,自签形态);
+  `DOCSQL_KEY` 帧加密需 `pip install docsql[crypto]`(cryptography 选装);
+- `docsql.Subscriber`:持久 pub/sub 专用连接 + 专职读线程,断线自动重连
+  并从每频道最后收到的 id 之后续传(`id > from`,不丢不重);
+- 错误层级:DB-API 标准族,映射基于服务端错误文本启发式。
+
 ### 参数绑定:服务端 prepared statements(默认路径)
 
 带参数的命令**不再在客户端拼接字面量**:`@name` 改写为 `?` 占位符,模板经 REQ_PREPARE
