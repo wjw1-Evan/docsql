@@ -2333,7 +2333,7 @@ pub async fn handle_connection(
                                                 )
                                         });
                                     if read_eligible {
-                                        execute_read_sql(&state, &effective, stmt_deadline).await
+                                        execute_read_sql(&state, &effective, stmt_deadline, user.as_ref()).await
                                     } else {
                                         let (resp, identity) = execute_sql_with_identity(
                                             &state,
@@ -3183,7 +3183,32 @@ async fn execute_read_sql(
     state: &Arc<ServerState>,
     sql: &str,
     deadline: Option<std::time::Instant>,
+    user: Option<&UserAuth>,
 ) -> Frame {
+    // Row-filter enforcement for the MVCC read tier (execute_sql_inner
+    // does the same for every other user-carrying path; a statement goes
+    // through exactly one of the two).
+    let sql_owned;
+    let sql = if let Some(u) = user {
+        if !u.grants.admin && !u.grants.row_filters.is_empty() {
+            let db = state.db.read().unwrap_or_else(|p| p.into_inner());
+            match apply_row_filters(&db, sql, &u.grants.row_filters) {
+                Ok(t) => {
+                    drop(db);
+                    sql_owned = t;
+                    &sql_owned
+                }
+                Err(m) => {
+                    drop(db);
+                    return outcome_frame(Err::<ExecOutcome, _>(m));
+                }
+            }
+        } else {
+            sql
+        }
+    } else {
+        sql
+    };
     let view = {
         let db = state.db.read().unwrap_or_else(|p| p.into_inner());
         db.read_view()
@@ -3383,6 +3408,291 @@ fn readable_by_all(t: &str) -> bool {
 /// Per-statement privilege check for username/password connections.
 /// Token/anonymous-legacy connections never reach here. Fails closed: a
 /// query shape the read-target walker cannot fully classify is denied.
+/// Row-filter enforcement (`GRANT SELECT ON t WHERE <pred> …`): rewrite
+/// the statement TEXT so each filtered table's predicate rides as an
+/// ordinary WHERE conjunct. The engine then treats the filter like any
+/// predicate — the COUNT/window/probe fast paths stay semantically exact —
+/// and the journal/peer replay carry the FILTERED text, so replays without
+/// a user identity reproduce exactly what the origin executed.
+///
+/// Scope (everything else refuses loudly when a filtered table is
+/// involved — fail-closed, never a silent bypass):
+/// - single-table SELECT (no JOINs / set ops / WITH);
+/// - INSERT whose source is such a SELECT (the source is rewritten);
+/// - single-table UPDATE / DELETE (predicate ANDed into WHERE);
+/// - EXPLAIN over a single-table SELECT.
+///
+/// Subquery or view occurrences of a filtered table are caught by an
+/// occurrence-count check (deep read targets vs rewritten positions) and
+/// a transitive view-base scan.
+fn apply_row_filters(
+    db: &docsql_core::engine::Database,
+    sql: &str,
+    filters: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<String, String> {
+    use sqlparser::ast::{Expr as E, SetExpr, Statement, TableFactor};
+    let lower = |s: &str| s.to_ascii_lowercase();
+    let filtered: std::collections::BTreeSet<String> = filters.keys().map(|k| lower(k)).collect();
+    if filtered.is_empty() {
+        return Ok(sql.to_string());
+    }
+    // Shapes the SQL parser or the classifier cannot fully handle (T-SQL
+    // batches reach execution through the interpreter; exotic reads): the
+    // raw text mentioning a filtered table refuses — fail-closed, never a
+    // silent bypass through an unparseable statement.
+    let mentions_filtered = || {
+        let low = sql.to_ascii_lowercase();
+        filtered.iter().any(|t| contains_word_ci(&low, t))
+    };
+    let parsed = match Database::parse_classified(sql) {
+        Ok(p) => p,
+        Err(_) => {
+            return if mentions_filtered() {
+                Err("row filters: statement shape cannot be classified; refusing".to_string())
+            } else {
+                Ok(sql.to_string())
+            };
+        }
+    };
+    let AnyStmt::Sql(stmt) = &parsed.stmt else {
+        return if mentions_filtered() {
+            Err("row filters apply to SQL statements only".into())
+        } else {
+            Ok(sql.to_string())
+        };
+    };
+    // Deep read targets (per-occurrence): the coverage proof below needs
+    // duplicates preserved. UPDATE/DELETE target tables join the set —
+    // they are WRITE targets, but their rows are exactly what a filter on
+    // them must protect (without this the early-exit below silently
+    // skipped `UPDATE sales SET … WHERE …`).
+    let mut targets = match Database::stmt_read_targets(stmt) {
+        Some(t) => t,
+        None => {
+            return if mentions_filtered() {
+                Err("row filters: statement shape cannot be classified; refusing".to_string())
+            } else {
+                Ok(sql.to_string())
+            };
+        }
+    };
+    match stmt.as_ref() {
+        Statement::Update(u) => {
+            if let TableFactor::Table { name, .. } = &u.table.relation {
+                targets.push(docsql_core::engine::table_ref_name(&name.clone()));
+            }
+        }
+        Statement::Delete(d) => {
+            // Both spellings: plain `DELETE FROM t` parses as WithKeyword
+            // in sqlparser 0.62 (WithoutKeyword is the MySQL `DELETE t
+            // FROM …` form).
+            let factors = match &d.from {
+                sqlparser::ast::FromTable::WithoutKeyword(v) => v,
+                sqlparser::ast::FromTable::WithFromKeyword(v) => v,
+            };
+            for f in factors {
+                if let TableFactor::Table { name, .. } = &f.relation {
+                    targets.push(docsql_core::engine::table_ref_name(&name.clone()));
+                }
+            }
+        }
+        _ => {}
+    }
+    // Views over filtered tables: a view is its reader's permission
+    // boundary, but a row filter on a BASE table must survive through it —
+    // the rewrite cannot see inside the stored definition, so access is
+    // refused (fail-closed).
+    for t in &targets {
+        let mut queue = vec![t.clone()];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut depth = 0usize;
+        while let Some(v) = queue.pop() {
+            if !seen.insert(v.clone()) {
+                continue;
+            }
+            if let Some(bases) = db.view_base_tables(&v) {
+                depth += 1;
+                if depth > 16 {
+                    return Err("row filters: view chain too deep to verify".into());
+                }
+                for b in bases {
+                    if filtered.contains(&lower(&b)) {
+                        return Err(format!(
+                            "view {t} reads row-filtered table {b};                              row filters cannot protect it through the view"
+                        ));
+                    }
+                    queue.push(b);
+                }
+            }
+        }
+    }
+    // Nothing filtered is referenced: the statement passes untouched.
+    if !targets.iter().any(|t| filtered.contains(&lower(t))) {
+        return Ok(sql.to_string());
+    }
+    let lookup = |t: &str| -> Option<E> {
+        let preds = filters
+            .iter()
+            .find(|(k, _)| lower(k) == lower(t))
+            .map(|(_, v)| v)?;
+        let mut parts = preds
+            .iter()
+            .map(|p| docsql_core::engine::parse_expr_text(p))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let mut acc = parts.remove(0);
+        while let Some(next) = parts.pop() {
+            acc = E::BinaryOp {
+                left: Box::new(acc),
+                op: sqlparser::ast::BinaryOperator::Or,
+                right: Box::new(next),
+            };
+        }
+        Some(acc)
+    };
+    fn and_into_sel(old: Option<E>, pred: E) -> E {
+        match old {
+            Some(left) => E::BinaryOp {
+                left: Box::new(left),
+                op: sqlparser::ast::BinaryOperator::And,
+                right: Box::new(pred),
+            },
+            None => pred,
+        }
+    }
+    // Rewrite ONE top-level plain table factor: single-table SELECT shape.
+    // JOINs / derived tables / set operations fall through untouched; the
+    // coverage check below refuses them when they reference a filtered
+    // table (fail-closed).
+    fn rewrite_select_factor(
+        select: &mut sqlparser::ast::Select,
+        filters: &std::collections::BTreeMap<String, Vec<String>>,
+        rewritten_tables: &mut Vec<String>,
+    ) {
+        if select.from.len() != 1 {
+            return;
+        }
+        let twj = &mut select.from[0];
+        if !twj.joins.is_empty() {
+            return;
+        }
+        let table = match &twj.relation {
+            TableFactor::Table { name, .. } => docsql_core::engine::table_ref_name(&name.clone()),
+            _ => return,
+        };
+        let Some(preds) = filters
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&table))
+            .map(|(_, v)| v)
+        else {
+            return;
+        };
+        let Ok(mut parts) = preds
+            .iter()
+            .map(|p| docsql_core::engine::parse_expr_text(p))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return; // validated at GRANT time; unreachable in practice
+        };
+        let mut acc = parts.remove(0);
+        while let Some(next) = parts.pop() {
+            acc = E::BinaryOp {
+                left: Box::new(acc),
+                op: sqlparser::ast::BinaryOperator::Or,
+                right: Box::new(next),
+            };
+        }
+        select.selection = Some(and_into_sel(select.selection.take(), acc));
+        rewritten_tables.push(table.to_ascii_lowercase());
+    }
+    let mut rewritten_tables: Vec<String> = Vec::new();
+    let mut new_stmt = (**stmt).clone();
+    match &mut new_stmt {
+        Statement::Query(q) => {
+            if let SetExpr::Select(select) = q.body.as_mut() {
+                rewrite_select_factor(select.as_mut(), filters, &mut rewritten_tables);
+            }
+        }
+        Statement::Insert(ins) => {
+            if let Some(source) = &mut ins.source {
+                if let SetExpr::Select(select) = source.body.as_mut() {
+                    rewrite_select_factor(select.as_mut(), filters, &mut rewritten_tables);
+                }
+            }
+        }
+        Statement::Update(u) => {
+            let table = match &u.table.relation {
+                TableFactor::Table { name, .. } => {
+                    docsql_core::engine::table_ref_name(&name.clone())
+                }
+                _ => String::new(),
+            };
+            if let Some(pred) = lookup(&table) {
+                u.selection = Some(and_into_sel(u.selection.take(), pred));
+                rewritten_tables.push(table.to_ascii_lowercase());
+            }
+        }
+        Statement::Delete(d) => {
+            // Same two-spellings rule as the mention set above.
+            let factors = match &mut d.from {
+                sqlparser::ast::FromTable::WithoutKeyword(v) => v,
+                sqlparser::ast::FromTable::WithFromKeyword(v) => v,
+            };
+            if factors.len() == 1 && factors[0].joins.is_empty() {
+                if let TableFactor::Table { name, .. } = &factors[0].relation {
+                    let table = docsql_core::engine::table_ref_name(name);
+                    if let Some(pred) = lookup(&table) {
+                        d.selection = Some(and_into_sel(d.selection.take(), pred));
+                        rewritten_tables.push(table.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    // Coverage proof: every filtered table's DEEP occurrence count must be
+    // exactly the number of top-level rewrites — one more occurrence
+    // anywhere (subquery, JOIN side, second UNION arm) is an unfilterable
+    // read and refuses the statement.
+    for t in &filtered {
+        let deep = targets.iter().filter(|x| lower(x) == *t).count();
+        let top = rewritten_tables.iter().filter(|x| x.as_str() == *t).count();
+        if deep > top {
+            return Err(format!(
+                "row filter on {t}: the statement reads {t} in a position row filters                  cannot protect (subquery / JOIN / view / set operation); rewrite the                  statement or use an unrestricted grant"
+            ));
+        }
+    }
+    let rewritten_text = new_stmt.to_string();
+    // The serialized AST must re-parse (peers and the journal consume the
+    // text); a round-trip failure is a loud error, not a bypass.
+    Database::parse_classified(&rewritten_text).map_err(|e| e.to_string())?;
+    Ok(rewritten_text)
+}
+
+/// ASCII-case-insensitive word-boundary containment (`t` as a whole word
+/// in `text`, which arrives lowercased).
+fn contains_word_ci(text: &str, word: &str) -> bool {
+    let wb = word.as_bytes();
+    let tb = text.as_bytes();
+    if wb.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i + wb.len() <= tb.len() {
+        if &tb[i..i + wb.len()] == wb {
+            let before_ok = i == 0 || !tb[i - 1].is_ascii_alphanumeric();
+            let after = tb.get(i + wb.len()).copied();
+            let after_ok = after.is_none_or(|c| !c.is_ascii_alphanumeric());
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn authorize_statement(
     db: Option<&docsql_core::engine::Database>,
     stmt: &AnyStmt,
@@ -3462,6 +3772,44 @@ fn authorize_statement(
                             "SELECT on table {t} requires the readonly/readwrite role \
                              or a table grant"
                         ));
+                    }
+                }
+                // Column-restricted grants (`GRANT SELECT (a, b) ON t`):
+                // every read target must be attributable to a single-table
+                // SELECT whose referenced columns are all granted. Anything
+                // else (wildcards, joins, subqueries, multi-table and
+                // unattributable shapes) refuses — fail-closed, never a
+                // silent widening.
+                if targets.iter().any(|t| g.is_restricted_select(t)) {
+                    match docsql_core::engine::single_table_select_refs(s) {
+                        Some((table, cols)) => {
+                            for rt in &targets {
+                                if !g.is_restricted_select(rt) {
+                                    continue;
+                                }
+                                if !rt.eq_ignore_ascii_case(&table) {
+                                    return Err(format!(
+                                        "SELECT on {rt} with column-restricted grants requires \
+                                         a single-table SELECT of exactly that table"
+                                    ));
+                                }
+                                let granted = g.granted_cols(rt);
+                                for c in &cols {
+                                    if !granted.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                                        return Err(format!(
+                                            "SELECT on column {c} of {table} is not granted \
+                                             (the grant lists its columns)"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            return Err("this statement shape cannot be authorized against \
+                                 column-restricted grants (wildcards, joins, subqueries, \
+                                 multi-table statements and EXPLAIN are not attributable)"
+                                .into());
+                        }
                     }
                 }
                 return Ok(());
@@ -3660,6 +4008,32 @@ async fn execute_sql_inner(
     user: Option<&UserAuth>,
     stmt_deadline: Option<std::time::Instant>,
 ) -> (Frame, Option<i64>) {
+    // Row-filter enforcement BEFORE the single parse: the rewritten text is
+    // what executes, is logged, journals and replays to peers (a replica
+    // replaying the journal without a user identity reproduces exactly what
+    // the origin executed). The read tier does the same inside
+    // execute_read_sql — a statement goes through exactly one of the two.
+    let sql_owned;
+    let sql = if let Some(u) = user {
+        if !u.grants.admin && !u.grants.row_filters.is_empty() {
+            let db_ref = state.db.read().unwrap_or_else(|p| p.into_inner());
+            match apply_row_filters(&db_ref, sql, &u.grants.row_filters) {
+                Ok(t) => {
+                    drop(db_ref);
+                    sql_owned = t;
+                    &sql_owned
+                }
+                Err(m) => {
+                    drop(db_ref);
+                    return (Frame::new(proto::RESP_ERROR, err_payload(&m)), None);
+                }
+            }
+        } else {
+            sql
+        }
+    } else {
+        sql
+    };
     // One parse for the whole round-trip: the AST executes at the bottom,
     // the classification routes the request here (parse errors surface with
     // the same message `execute` would have produced).
@@ -7287,6 +7661,259 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
 
 #[cfg(test)]
 mod security_tests {
+    // ---- column-restricted grants: authorize_statement enforcement ----
+
+    fn col_grants_db() -> docsql_core::engine::Database {
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE sales (id INT, region TEXT, amount INT)",
+            "INSERT INTO sales VALUES (1, 'east', 10), (2, 'west', 20), (3, 'east', 30)",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        db
+    }
+
+    fn grants_with(
+        admin: bool,
+        readonly: bool,
+        cols: &[(&str, &[&str])],
+        filters: &[(&str, &str)],
+    ) -> docsql_core::useradmin::UserGrants {
+        let mut g = docsql_core::useradmin::UserGrants {
+            admin,
+            readonly,
+            ..Default::default()
+        };
+        for (t, list) in cols {
+            g.table_cols.insert(
+                (*t).to_string(),
+                list.iter().map(|c| c.to_string()).collect(),
+            );
+            g.table_privs
+                .insert((*t).to_string(), docsql_core::useradmin::PRIV_SELECT);
+        }
+        for (t, pred) in filters {
+            g.row_filters
+                .entry((*t).to_string())
+                .or_default()
+                .push(pred.to_string());
+        }
+        g
+    }
+
+    fn auth(
+        db: &docsql_core::engine::Database,
+        sql: &str,
+        g: &docsql_core::useradmin::UserGrants,
+    ) -> Result<(), String> {
+        let p = Database::parse_classified(sql).unwrap();
+        authorize_statement(Some(db), &p.stmt, &p.tx, p.is_write, g)
+    }
+
+    #[test]
+    fn column_restricted_grant_authorizes_only_attributable_refs() {
+        let db = col_grants_db();
+        let g = grants_with(false, false, &[("sales", &["id", "amount"])], &[]);
+        // Granted columns pass.
+        auth(&db, "SELECT id, amount FROM sales", &g).unwrap();
+        auth(&db, "SELECT amount FROM sales WHERE id = 1", &g).unwrap();
+        auth(&db, "SELECT SUM(amount) FROM sales GROUP BY id", &g).unwrap();
+        // A restricted column refuses.
+        let e = auth(&db, "SELECT region FROM sales", &g).unwrap_err();
+        assert!(e.contains("not granted"), "{e}");
+        // Wildcards are unattributable — refuse (fail-closed).
+        let e = auth(&db, "SELECT * FROM sales", &g).unwrap_err();
+        assert!(e.contains("cannot be authorized"), "{e}");
+        // Joins / subqueries / other tables refuse.
+        let e = auth(&db, "SELECT id FROM sales JOIN sales ON 1 = 1", &g).unwrap_err();
+        assert!(
+            e.contains("cannot be authorized") || e.contains("single-table"),
+            "{e}"
+        );
+        let e = auth(
+            &db,
+            "SELECT id FROM sales WHERE region IN (SELECT region FROM sales)",
+            &g,
+        )
+        .unwrap_err();
+        assert!(e.contains("cannot be authorized"), "{e}");
+        // COUNT(*) reads every column: refused as an unattributable shape.
+        let e = auth(&db, "SELECT COUNT(*) FROM sales", &g).unwrap_err();
+        assert!(e.contains("cannot be authorized"), "{e}");
+    }
+
+    #[test]
+    fn column_restricted_grant_multi_table_and_explain_refuse() {
+        let mut db = col_grants_db();
+        db.execute("CREATE TABLE other (id INT)").unwrap();
+        let g = grants_with(false, false, &[("sales", &["id"])], &[]);
+        // EXPLAIN of a restricted table: unattributable shape.
+        let e = auth(&db, "EXPLAIN SELECT id FROM sales", &g).unwrap_err();
+        assert!(e.contains("cannot be authorized"), "{e}");
+        // Writes against a restricted-SELECT table still go through the
+        // DML path (no SELECT involvement).
+        let p = Database::parse_classified("INSERT INTO sales VALUES (9, 'x', 9)").unwrap();
+        let mut gg = grants_with(false, false, &[("sales", &["id"])], &[]);
+        gg.table_privs.insert("sales".into(), 0b1111);
+        assert!(authorize_statement(Some(&db), &p.stmt, &p.tx, p.is_write, &gg).is_ok());
+        let _ = g;
+    }
+
+    #[test]
+    fn blanket_grants_void_column_restrictions() {
+        let db = col_grants_db();
+        // readonly role: resolve_grants returns no restriction maps at all
+        // (the fixture mirrors that — no cols for the blanket role).
+        let g = grants_with(false, true, &[], &[]);
+        auth(&db, "SELECT * FROM sales", &g).unwrap();
+        // A plain (unrestricted) table grant does the same via resolve —
+        // represented here by an empty cols map with the priv bit set.
+        let mut g2 = docsql_core::useradmin::UserGrants {
+            name: "u".into(),
+            admin: false,
+            readonly: false,
+            readwrite: false,
+            table_privs: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("sales".to_string(), docsql_core::useradmin::PRIV_SELECT);
+                m
+            },
+            table_cols: Default::default(),
+            row_filters: Default::default(),
+        };
+        auth(&db, "SELECT * FROM sales", &g2).unwrap();
+        let _ = &mut g2;
+    }
+
+    // ---- row filters: apply_row_filters rewrite + enforcement ----
+
+    fn filters_db() -> docsql_core::engine::Database {
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE sales (id INT, region TEXT, amount INT)",
+            "INSERT INTO sales VALUES (1, 'east', 10), (2, 'west', 20), (3, 'east', 30)",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        db
+    }
+
+    fn filtered(text: &str) -> String {
+        let db = filters_db();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("sales".to_string(), vec!["region = 'east'".to_string()]);
+        apply_row_filters(&db, text, &m).unwrap()
+    }
+
+    fn filtered_rows(text: &str) -> Vec<Vec<docsql_core::value::Value>> {
+        let db = filters_db();
+        let rewritten = {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("sales".to_string(), vec!["region = 'east'".to_string()]);
+            apply_row_filters(&db, text, &m).unwrap()
+        };
+        match db.execute_read(&rewritten).unwrap() {
+            docsql_core::engine::ExecOutcome::Rows(r) => r.rows,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_filter_rewrites_select_and_counts() {
+        let out = filtered("SELECT id FROM sales ORDER BY id");
+        assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
+        // Semantics through the engine: only east rows survive — including
+        // the COUNT(*) fast path (the predicate rides in the WHERE).
+        assert_eq!(filtered_rows("SELECT COUNT(*) FROM sales").len(), 1);
+        let rows = filtered_rows("SELECT id FROM sales ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![docsql_core::value::Value::Int(1)],
+                vec![docsql_core::value::Value::Int(3)]
+            ]
+        );
+    }
+
+    #[test]
+    fn row_filter_rewrites_update_delete_and_insert_source() {
+        let out = filtered("UPDATE sales SET amount = 0 WHERE id = 2");
+        assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
+        assert!(out.to_lowercase().contains("id = 2"), "{out}");
+        let out = filtered("DELETE FROM sales");
+        assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
+        let out = filtered("INSERT INTO audit SELECT id FROM sales");
+        assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
+    }
+
+    #[test]
+    fn row_filter_refuses_unprotectable_shapes() {
+        let mut db = filters_db();
+        db.execute("CREATE TABLE other (id INT)").unwrap();
+        db.execute("CREATE VIEW v AS SELECT * FROM sales").unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("sales".to_string(), vec!["region = 'east'".to_string()]);
+        let run = |sql: &str| apply_row_filters(&db, sql, &m).is_err();
+        // JOIN referencing the filtered table.
+        assert!(run("SELECT s.id FROM sales s JOIN other o ON 1 = 1"));
+        assert!(run("SELECT id FROM sales JOIN other ON 1 = 1"));
+        // Subquery occurrence.
+        assert!(run("SELECT (SELECT COUNT(*) FROM sales) FROM other"));
+        assert!(run(
+            "SELECT id FROM other WHERE id IN (SELECT id FROM sales)"
+        ));
+        // Set operations.
+        assert!(run("SELECT id FROM other UNION SELECT id FROM sales"));
+        // View over the filtered table (transitively).
+        assert!(run("SELECT * FROM v"));
+        // UPDATE ... FROM another table is NOT a bypass: the filter ANDs
+        // into the WHERE, so every candidate sales row still satisfies it.
+        let out = apply_row_filters(
+            &db,
+            "UPDATE sales SET id = 1 FROM other WHERE other.id = sales.id",
+            &m,
+        )
+        .unwrap();
+        assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
+        // T-SQL-ish unparseable text mentioning the table.
+        assert!(run("DECLARE @x INT; SELECT id FROM sales"));
+        // Unrelated statements pass through untouched.
+        let keep = apply_row_filters(&db, "SELECT * FROM other", &m).unwrap();
+        assert_eq!(keep, "SELECT * FROM other");
+    }
+
+    #[test]
+    fn row_filter_parse_failure_without_mention_passes_through() {
+        let db = filters_db();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("sales".to_string(), vec!["region = 'east'".to_string()]);
+        let keep = apply_row_filters(&db, "DECLARE @x INT", &m).unwrap();
+        assert_eq!(keep, "DECLARE @x INT");
+    }
+
+    #[test]
+    fn row_filter_and_column_grants_coexist_via_resolve() {
+        let mut db = col_grants_db();
+        for sql in [
+            "CREATE USER carol PASSWORD 'pw12345678'",
+            "GRANT SELECT (id) ON sales WHERE region = 'east' TO carol",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let g = docsql_core::useradmin::resolve_grants(&mut db, "carol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.granted_cols("sales"), &["id".to_string()]);
+        assert_eq!(g.filters_for("sales"), &["region = 'east'".to_string()]);
+        // The filter rewrite applies for this user's SELECT.
+        let mut m = g.filter_map();
+        let rewritten = apply_row_filters(&db, "SELECT id FROM sales", &m).unwrap();
+        m.clear();
+        drop(m);
+        assert!(rewritten.to_lowercase().contains("region = 'east'"));
+    }
+
     use super::*;
 
     #[test]

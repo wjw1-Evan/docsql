@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+### 列级授权 + 行级过滤(RLS)(商用化路线 · 企业安全)(2026-09-29)
+
+`GRANT`/`REVOKE` 家族扩展两个限定维度,定义随集群复制、纪元即时生效:
+
+- **语法**:`GRANT SELECT (col, …) ON t TO …`(列清单)与
+  `GRANT SELECT ON t WHERE <谓词> TO …`(行过滤器);谓词文本在 tokenize 前按
+  最后一个顶层 `TO` 切出(引号/括号感知,字符串字面量里的 TO 不误切),其余语句走
+  原解析器(括号 token 为此新增)。两种限定可组合(`GRANT SELECT (id) ON t WHERE …`)。
+- **列级强制**(authorize_statement):受限用户的每条 SELECT 须可归属为该表的单表
+  SELECT(`single_table_select_refs`:无 JOIN/集合/WITH/别名/表函数;通配符投影、
+  `COUNT(*)` 通配、子查询、EXPLAIN 一律不可归属)且引用列全部在授予清单内,否则拒绝。
+- **行级强制**(服务端执行管线入口 `apply_row_filters`):把过滤表谓词 AND 进 WHERE
+  后按普通文本执行 —— COUNT(*) 活槽计数、索引窗口等快路径语义自动精确;**审计日志与
+  journal/扇出携带改写后文本**,对端无身份重放结果逐字节一致。UPDATE/DELETE 的目标表
+  并入提及集(否则早退跳过过滤——实现期实测抓到的洞);DELETE FROM 在 sqlparser 0.62
+  解析为 `FromTable::WithFromKeyword`(两变体都接)。过滤表经视图(传递闭包)/子查询/
+  JOIN/集合操作出现的语句拒绝:深读目标出现计数 vs 顶层改写数的覆盖证明,差一即拒;
+  解析失败(T-SQL 批等)原文提及过滤表同样拒绝。
+- **resolve 语义**:多条过滤 OR 合并;admin/readonly/readwrite 角色不落地限制表;
+  同表的 plain SELECT 授权使列限制与行过滤双双失效(权限并集)。授权行去重改精确形状
+  (plain 与 qualified 互不去重——子集去重曾吞掉后到的 plain grant,resolve 测试钉住)。
+  dump/join 快照按规范化文本携带限定授权,重放自洽(dump 测试钉住)。
+- 测试:useradmin 21 项 + server security_tests 27 项(列归属正反例/通配/JOIN/子查询/
+  EXPLAIN/写路径不受影响/角色 void/过滤 SELECT·COUNT·UPDATE·DELETE·INSERT 源改写/
+  不可保护形状八类拒绝/T-SQL 不可解析提及/列+行并存 resolve);全量 11 目标 0 失败。
+  文档 features/security/AGENTS/CHANGELOG 同步。
+
 ### Upsert-UPDATE:`ON CONFLICT DO UPDATE` 与 `ON DUPLICATE KEY UPDATE`(2026-09-29)
 
 高频写入场景的刚需缺口关闭(此前显式报错)。两种拼写共用同一执行臂:

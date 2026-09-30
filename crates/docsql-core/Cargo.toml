@@ -12,5 +12,8 @@ tempfile.workspace = true
 rust_decimal.workspace = true
 num-traits.workspace = true
 sqlparser = "0.62"
+# Column lists on SELECT grants serialize as JSON arrays inside the
+# schemaless grant rows (identifiers may contain commas; CSV would lie).
+serde_json = "1"
 
 

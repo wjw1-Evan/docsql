@@ -483,7 +483,7 @@ impl TableMeta {
 
 /// Parse a standalone SQL expression (constraint/DEFAULT bodies stored in
 /// the catalog as text).
-fn parse_expr_text(s: &str) -> Result<SqlExpr> {
+pub fn parse_expr_text(s: &str) -> Result<SqlExpr> {
     let mut parser = Parser::new(&GenericDialect {})
         .try_with_sql(s)
         .map_err(|e| SqlError::Parse(e.to_string()))?;
@@ -498,7 +498,7 @@ fn parse_expr_text(s: &str) -> Result<SqlExpr> {
 /// nodes and instants, so a stored DEFAULT or CHECK carrying it must be
 /// resolved per row on the writing node and shipped as a literal (red
 /// line: non-deterministic generated values are fixed by the writer).
-fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
+pub(crate) fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
             let n = f.name.to_string().to_ascii_lowercase();
@@ -5972,6 +5972,12 @@ impl Database {
     /// must fail closed on None. Views are a SELECT permission boundary
     /// (a grant on the view hides its bases), but a write reading THROUGH
     /// a view still needs the base grants.
+    /// True when the named catalog object is a view (view definition
+    /// present). Missing objects are not views.
+    pub fn object_is_view(&self, name: &str) -> bool {
+        self.tables.get(name).is_some_and(|m| m.is_view())
+    }
+
     pub fn view_base_tables(&self, name: &str) -> Option<Vec<String>> {
         let meta = self.tables.get(name)?;
         let sql = meta.view_sql.as_ref()?;
@@ -12929,7 +12935,7 @@ fn is_agg_fn(f: &sqlparser::ast::Function) -> bool {
 
 /// True when the expression calls NEWID()/NEWSEQUENTIALID() at any depth.
 /// Mirrors the expression shapes `rewrite_windows`/`walk_expr` cover.
-fn calls_newid(e: &SqlExpr) -> bool {
+pub(crate) fn calls_newid(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
             let n = f.name.to_string().to_uppercase();
@@ -14022,6 +14028,13 @@ fn ensure_not_view(kind: &str, table: &str, meta: &TableMeta) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Leaf table name of an ObjectName (last part). Crate-internal callers
+/// use [`obj_name`]; the server's row-filter rewrite reaches it through
+/// [`table_ref_name`].
+pub fn table_ref_name(name: &ObjectName) -> String {
+    obj_name(name)
 }
 
 fn obj_name(name: &ObjectName) -> String {
@@ -17352,6 +17365,117 @@ fn upsert_proposed_in_subquery(e: &SqlExpr) -> bool {
 /// and the WHERE predicate see no row stream to number.
 fn refs_rownum_in(assignments: &[sqlparser::ast::Assignment], selection: &Option<SqlExpr>) -> bool {
     assignments.iter().any(|a| refs_rownum(&a.value)) || selection.as_ref().is_some_and(refs_rownum)
+}
+
+/// Column-restricted grant support: for a single-table SELECT (no joins,
+/// no set operations, no WITH, no table functions) return the table name
+/// plus every column the statement references. `None` = the shape cannot
+/// be attributed (wildcards, subqueries whose columns would need deeper
+/// analysis, exotic clauses) — callers must treat None as fail-closed and
+/// refuse the statement for column-restricted grants.
+pub fn single_table_select_refs(stmt: &Statement) -> Option<(String, Vec<String>)> {
+    use sqlparser::ast::{GroupByExpr, OrderByKind, SelectItem, SetExpr, TableFactor};
+    let Statement::Query(q) = stmt else {
+        return None;
+    };
+    if q.with.is_some() {
+        return None;
+    }
+    // LIMIT/OFFSET/FETCH reference no columns; ORDER BY may.
+    let SetExpr::Select(select) = q.body.as_ref() else {
+        return None;
+    };
+    if select.from.len() != 1 {
+        return None;
+    }
+    let twj = &select.from[0];
+    if !twj.joins.is_empty() {
+        return None;
+    }
+    let sqlparser::ast::TableWithJoins { relation, .. } = twj;
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        ..
+    } = relation
+    else {
+        return None;
+    };
+    if alias.is_some() {
+        // An alias renames the row namespace; a column-restricted grant
+        // qualifies only the plain single-table spelling.
+        return None;
+    }
+    // A wildcard function argument (COUNT(*)) reads every column of every
+    // row — as unattributable as `SELECT *`.
+    fn expr_has_star(e: &SqlExpr) -> bool {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+        match e {
+            SqlExpr::Function(f) => match &f.args {
+                FunctionArguments::List(list) => list.args.iter().any(|a| {
+                    matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+                        || matches!(
+                            a,
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))
+                                if expr_has_star(inner)
+                        )
+                }),
+                _ => false,
+            },
+            SqlExpr::BinaryOp { left, right, .. } => expr_has_star(left) || expr_has_star(right),
+            SqlExpr::UnaryOp { expr, .. } => expr_has_star(expr),
+            SqlExpr::Nested(inner) => expr_has_star(inner),
+            _ => false,
+        }
+    }
+    let table = obj_name(name);
+    let mut out = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => {
+                if expr_has_star(e) {
+                    return None;
+                }
+                column_refs(e, &mut out)?;
+            }
+            SelectItem::ExprWithAlias { expr, .. } => {
+                if expr_has_star(expr) {
+                    return None;
+                }
+                column_refs(expr, &mut out)?;
+            }
+            // `*` / `t.*` read every column: not attributable to a subset.
+            _ => return None,
+        }
+    }
+    if let Some(sel) = &select.selection {
+        column_refs(sel, &mut out)?;
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => {
+            for e in exprs {
+                column_refs(e, &mut out)?;
+            }
+        }
+        GroupByExpr::All(_) => return None,
+    }
+    if let Some(having) = &select.having {
+        column_refs(having, &mut out)?;
+    }
+    if let Some(ob) = &q.order_by {
+        if let OrderByKind::Expressions(exprs) = &ob.kind {
+            for oe in exprs {
+                column_refs(&oe.expr, &mut out)?;
+            }
+        }
+    }
+    if let Some(limit) = &q.limit_clause {
+        // LIMIT/OFFSET carry no column refs; ANY other decoration (LOCK
+        // etc.) is unsupported-shape territory.
+        let _ = limit;
+    }
+    Some((table, out))
 }
 
 /// Map a B+ tree error to a SQL error; duplicate hits become the familiar

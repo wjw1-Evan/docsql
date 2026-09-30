@@ -274,6 +274,14 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 - **数据库用户与角色**:`CREATE/ALTER/DROP USER`、`CREATE/DROP ROLE`、`GRANT/REVOKE`
   (内置 `admin`/`readwrite`/`readonly` + 自定义角色表级 DML);定义随集群复制,
   授权以纪元逐帧刷新,**即时生效**;密码 PBKDF2-HMAC-SHA256(210000 轮),明文不离开执行节点;
+- **列级授权与行级过滤**:`GRANT SELECT (col, …) ON t …` 限定可见列(仅限单表 SELECT:
+  通配符/JOIN/子查询/EXPLAIN/多表语句对受限授权不可归属,一律拒绝 —— fail-closed),
+  `GRANT SELECT ON t WHERE <谓词> TO …` 行级过滤(OR 合并多条 grant;谓词在 GRANT 时校验:
+  拒绝子查询与 NEWID/RAND/NOW 族;未知列按 NULL 求值 = 隐藏行,fail-closed)。强制点在
+  服务端语句管线:过滤谓词改写进 WHERE 后引擎当普通谓词执行(COUNT(*) 快路径/索引窗口
+  语义精确),**日志与复制扇出携带改写后文本**(对端无身份重放复现完全一致的结果);
+  过滤表经视图/子查询/JOIN/集合操作出现即拒绝(出现计数覆盖证明);admin/readonly/readwrite
+  角色不受限;普通(无列/无过滤)SELECT grant 使同表的限制失效(权限并集语义);
 - **登录锁定**:同 IP 60s 窗口 10 次失败锁 60s(token 与用户登录同桶,含 Web 登录门);
 - **审计**:语句审计(文本/耗时/行数/复制标记/错误,密码脱敏)+ 认证事件 + 同步日志;
   `DOCSQL_LOG_FILE` 落 JSONL;慢查询 `DOCSQL_SLOW_MS` 写 stderr;

@@ -32,6 +32,28 @@ DROP USER analyst;                              -- 级联清理授权与成员�
 权限面:admin=全部(DDL/用户管理/备份恢复/PROMOTE);readwrite=表 DML + PUBLISH/TRIM;
 readonly=SELECT;自定义角色=授予的表级 DML。读目标按 AST 分类 fail-closed(无法分类即拒)。
 
+### 列级授权与行级过滤(RLS)
+
+```sql
+GRANT SELECT (id, region) ON sales TO analyst;              -- 只见这两列
+GRANT SELECT ON sales WHERE region = 'east' TO east_team;   -- 只见东区行
+GRANT SELECT (id) ON sales WHERE amount > 0 TO carol;       -- 列 + 行同时限定
+REVOKE SELECT ON sales FROM analyst;                        -- 即时生效(纪元刷新)
+```
+
+- **列级**:授权后该用户的 SELECT 必须是**该表的单表 SELECT** 且引用列全部在授予清单内;
+  `SELECT *`/JOIN/子查询/EXPLAIN/多表语句对受限授权不可归属 —— 一律拒绝(fail-closed,
+  绝不静默放宽)。admin/readonly/readwrite 角色不受限;同表的普通(无列清单)SELECT 授权
+  使列限制失效(权限并集语义)。
+- **行级**:谓词在 GRANT 时校验(须可解析为单表达式;拒绝子查询与 NEWID/RAND/NOW 族;
+  列名不做目录校验 —— 无类型模型下未知列求值为 NULL,即**隐藏行**,方向安全)。多条过滤
+  授权 OR 合并。强制点在服务端语句管线:谓词改写进 WHERE 后引擎按普通谓词执行(COUNT(*)
+  活槽计数/索引窗口等快路径语义精确),**审计日志与复制扇出携带改写后文本** —— 对端重放
+  无用户身份也得到逐字节一致的结果。过滤表经视图(传递闭包)/子查询/JOIN/集合操作出现的
+  语句一律拒绝(深读目标出现计数 vs 顶层改写数的覆盖证明,差一即拒)。
+- 与列限制并存的行过滤同时生效(两个维度独立校验);两类授权定义随集群复制,dump/join
+  快照按规范化文本携带,重放自洽。
+
 ## 登录失败锁定
 
 同一来源 IP 60 秒窗口内认证失败 10 次(token 与用户登录同桶)即锁定 60 秒,期间任何凭据(含正确值)均拒绝;

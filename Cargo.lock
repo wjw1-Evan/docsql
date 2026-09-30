@@ -252,6 +252,7 @@ dependencies = [
  "num-traits",
  "rust_decimal",
  "serde",
+ "serde_json",
  "sqlparser",
  "tempfile",
  "thiserror",

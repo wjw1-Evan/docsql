@@ -21,7 +21,7 @@
 use crate::engine::{Database, ExecOutcome, SqlError};
 use crate::kdf;
 use crate::value::Object;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const USERS_TABLE: &str = "docsql_users";
 pub const ROLES_TABLE: &str = "docsql_roles";
@@ -115,6 +115,12 @@ pub enum UserAdminStmt {
         privileges: Vec<TablePriv>,
         tables: Vec<String>,
         to: Vec<String>,
+        /// Column-restricted SELECT (`GRANT SELECT (a, b) ON t`). Empty =
+        /// all columns. SELECT grants only (enforced at exec time).
+        cols: Vec<String>,
+        /// Row filter (`GRANT SELECT ON t WHERE <expr>`): predicate text
+        /// stored verbatim, evaluated per row for non-admin connections.
+        row_filter: Option<String>,
     },
     RevokeTable {
         privileges: Vec<TablePriv>,
@@ -130,6 +136,8 @@ enum Tok {
     Word(String),
     Str(String),
     Comma,
+    LParen,
+    RParen,
 }
 
 fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
@@ -202,6 +210,16 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
+        if c == '(' {
+            out.push(Tok::LParen);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            out.push(Tok::RParen);
+            i += 1;
+            continue;
+        }
         if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
             let mut v = String::new();
             while i < chars.len()
@@ -229,7 +247,122 @@ pub fn parse(sql: &str) -> Option<Result<UserAdminStmt, String>> {
     if !head_is_user_admin(trimmed) {
         return None;
     }
+    // Row-filter grant form: `GRANT SELECT ON t WHERE <predicate> TO u`.
+    // The predicate is arbitrary expression TEXT the fixed tokenizer
+    // cannot carry (operators, parens, dotted names), so it is captured
+    // verbatim before tokenization: the SPLIT POINT is the LAST top-level
+    // `TO` (quote/paren aware) — grantees never contain TO, and a bare
+    // column named `to` inside the predicate always precedes it.
+    if starts_with_word(trimmed, "GRANT")
+        && find_top_level_word(trimmed, "WHERE", 0, false).is_some()
+        && trimmed.to_ascii_uppercase().contains(" ON ")
+    {
+        return Some(parse_grant_with_filter(trimmed));
+    }
     Some(tokenize(trimmed).and_then(parse_tokens))
+}
+
+fn starts_with_word(sql: &str, word: &str) -> bool {
+    sql.split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case(word))
+}
+
+/// Quote/paren-aware scan for a word token at top level; returns the byte
+/// offset of the word's start.
+fn find_top_level_word(sql: &str, word: &str, from: usize, last: bool) -> Option<usize> {
+    let b = sql.as_bytes();
+    let mut i = from;
+    let mut depth = 0usize;
+    let mut hit: Option<usize> = None;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                // '' is the escaped quote (SQL doubling).
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && is_word_start(b, i) => {
+                let start = i;
+                while i < b.len() && is_word_byte(b[i]) {
+                    i += 1;
+                }
+                if b[start..i].eq_ignore_ascii_case(word.as_bytes()) {
+                    hit = Some(start);
+                    if !last {
+                        return hit;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    hit
+}
+
+fn is_word_start(b: &[u8], i: usize) -> bool {
+    b[i].is_ascii_alphabetic() || b[i] == b'_' || b[i] == b'$'
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn parse_grant_with_filter(sql: &str) -> Result<UserAdminStmt, String> {
+    let where_at = find_top_level_word(sql, "WHERE", 0, false)
+        .ok_or_else(|| "WHERE without a position".to_string())?;
+    let to_at = find_top_level_word(sql, "TO", where_at, true)
+        .ok_or_else(|| "GRANT ... WHERE requires TO <grantee> after the predicate".to_string())?;
+    let predicate = sql[where_at + "WHERE".len()..to_at].trim();
+    if predicate.is_empty() {
+        return Err("row filter predicate is empty".into());
+    }
+    let prefix = &sql[..where_at];
+    let suffix = &sql[to_at..]; // starts with TO
+    let mut toks = tokenize(prefix)?;
+    toks.extend(tokenize(suffix)?);
+    match parse_tokens(toks)? {
+        UserAdminStmt::GrantTable {
+            privileges,
+            tables,
+            to,
+            cols,
+            ..
+        } => Ok(UserAdminStmt::GrantTable {
+            privileges,
+            tables,
+            to,
+            cols,
+            row_filter: Some(predicate.to_string()),
+        }),
+        other => Err(format!("row filters apply to table grants, not {other:?}")),
+    }
 }
 
 fn head_is_user_admin(sql: &str) -> bool {
@@ -407,6 +540,18 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
     );
     if is_priv_form {
         let privileges = c.priv_list()?;
+        // Column-restricted form: `GRANT SELECT (a, b) ON t ...` — the
+        // list attaches to the whole privilege list (SELECT-only is
+        // enforced at exec time).
+        let mut cols = Vec::new();
+        if matches!(c.peek(), Some(Tok::LParen)) {
+            c.next();
+            cols = c.name_list_raw()?;
+            match c.next() {
+                Some(Tok::RParen) => {}
+                other => return Err(format!("expected ')' after column list, found {other:?}")),
+            }
+        }
         c.kw("ON")?;
         if let Some(Tok::Word(w)) = c.peek() {
             if w.eq_ignore_ascii_case("TABLE") {
@@ -422,6 +567,8 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
                 privileges,
                 tables,
                 to: names,
+                cols,
+                row_filter: None,
             }
         } else {
             UserAdminStmt::RevokeTable {
@@ -492,10 +639,24 @@ pub fn render(stmt: &UserAdminStmt, password: &str) -> String {
             privileges,
             tables,
             to,
+            cols,
+            row_filter,
         } => format!(
-            "GRANT {} ON {} TO {}",
+            "GRANT {}{} ON {}{} TO {}",
             priv_names(privileges),
+            if cols.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
+                )
+            },
             tables.iter().map(|t| q(t)).collect::<Vec<_>>().join(", "),
+            match row_filter {
+                Some(pred) => format!(" WHERE {pred}"),
+                None => String::new(),
+            },
             to.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")
         ),
         UserAdminStmt::RevokeTable {
@@ -709,15 +870,167 @@ fn grant_priv_row(
     grantee: &str,
     priv_: &TablePriv,
     tbl: &str,
+    cols: &[String],
+    row_filter: Option<&str>,
 ) -> Result<(), SqlError> {
-    insert_row(
-        db,
-        GRANTS_TABLE,
-        &[("grantee", grantee), ("priv", priv_.name()), ("tbl", tbl)],
-    )
+    let cols_json = if cols.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(cols).unwrap_or_else(|_| "[]".to_string()))
+    };
+    let mut fields: Vec<(&str, &str)> =
+        vec![("grantee", grantee), ("priv", priv_.name()), ("tbl", tbl)];
+    if let Some(cj) = &cols_json {
+        fields.push(("cols", cj.as_str()));
+    }
+    if let Some(pred) = row_filter {
+        fields.push(("filter", pred));
+    }
+    // Dedup is EXACT-SHAPE, never the (grantee, priv, tbl) subset: a plain
+    // SELECT grant and a SELECT(id)-with-filter grant are DIFFERENT
+    // privilege sets (the plain one voids the restrictions at resolve
+    // time), so re-granting one must not swallow the other. Plain rows
+    // dedup against plain rows; qualified rows carry their full shape.
+    let plain: Vec<(&str, &str)> = fields.iter().take(3).copied().collect();
+    if cols.is_empty() && row_filter.is_none() {
+        let rows = table_rows(db, GRANTS_TABLE);
+        let duplicate = rows.iter().any(|d| {
+            plain
+                .iter()
+                .all(|(c, v)| d.get(*c).and_then(|x| x.as_str()) == Some(*v))
+                && d.get("cols").is_none()
+                && d.get("filter").is_none()
+        });
+        if duplicate {
+            return Ok(());
+        }
+        let names = fields
+            .iter()
+            .map(|(c, _)| *c)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = fields
+            .iter()
+            .map(|(_, v)| lit(v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        db.execute(&format!(
+            "INSERT INTO {} ({names}) VALUES ({values})",
+            q(GRANTS_TABLE)
+        ))?;
+        return Ok(());
+    }
+    let rows = table_rows(db, GRANTS_TABLE);
+    let duplicate = rows.iter().any(|d| {
+        plain
+            .iter()
+            .all(|(c, v)| d.get(*c).and_then(|x| x.as_str()) == Some(*v))
+            && d.get("cols").and_then(|x| x.as_str()) == cols_json.as_deref()
+            && d.get("filter").and_then(|x| x.as_str()) == row_filter
+    });
+    if duplicate {
+        return Ok(());
+    }
+    let names = fields
+        .iter()
+        .map(|(c, _)| *c)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = fields
+        .iter()
+        .map(|(_, v)| lit(v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    db.execute(&format!(
+        "INSERT INTO {} ({names}) VALUES ({values})",
+        q(GRANTS_TABLE)
+    ))?;
+    Ok(())
 }
 
 impl Database {
+    /// True when the named catalog object is a view.
+    fn table_is_view(&self, name: &str) -> bool {
+        self.object_is_view(name)
+    }
+
+    /// Validate a row-filter predicate at GRANT time: it must parse as a
+    /// single expression, carry no subqueries (per-row evaluation happens
+    /// inside the table scan — a subquery there is both a perf trap and a
+    /// scope hazard) and no volatile functions (NEWID()/RAND() would
+    /// diverge replay; wall clocks would freeze at grant time through the
+    /// fold). Column names are NOT validated against the catalog: the
+    /// model is schemaless, and an unknown column evaluates to NULL —
+    /// the fail-closed direction (rows hide, never leak).
+    pub(crate) fn validate_row_filter(&mut self, _table: &str, pred: &str) -> Result<(), SqlError> {
+        let expr = crate::engine::parse_expr_text(pred)
+            .map_err(|e| err_str(format!("row filter is not a valid expression: {e}")))?;
+        let volatile = |e: &sqlparser::ast::Expr| {
+            crate::engine::calls_newid(e) || crate::engine::expr_calls_wall_clock(e)
+        };
+        fn scan(
+            e: &sqlparser::ast::Expr,
+            volatile: &dyn Fn(&sqlparser::ast::Expr) -> bool,
+        ) -> Option<String> {
+            use sqlparser::ast::Expr as E;
+            match e {
+                E::Subquery(_) | E::Exists { .. } => {
+                    Some("subqueries are not supported in row filters".into())
+                }
+                E::InSubquery { .. } => {
+                    Some("IN (SELECT …) is not supported in row filters".into())
+                }
+                E::AnyOp { .. } | E::AllOp { .. } => {
+                    Some("quantified comparisons are not supported in row filters".into())
+                }
+                other if volatile(other) => Some(
+                    "volatile functions (NEWID/RAND/NOW family) are not supported in row filters"
+                        .into(),
+                ),
+                E::BinaryOp { left, right, .. } => {
+                    scan(left, volatile).or_else(|| scan(right, volatile))
+                }
+                E::UnaryOp { expr, .. } => scan(expr, volatile),
+                E::Nested(inner) => scan(inner, volatile),
+                E::Between {
+                    expr, low, high, ..
+                } => scan(expr, volatile)
+                    .or_else(|| scan(low, volatile))
+                    .or_else(|| scan(high, volatile)),
+                E::IsDistinctFrom(l, r) | E::IsNotDistinctFrom(l, r) => {
+                    scan(l, volatile).or_else(|| scan(r, volatile))
+                }
+                E::Like { expr, pattern, .. } | E::ILike { expr, pattern, .. } => {
+                    scan(expr, volatile).or_else(|| scan(pattern, volatile))
+                }
+                E::InList { expr, list, .. } => {
+                    scan(expr, volatile).or_else(|| list.iter().find_map(|i| scan(i, volatile)))
+                }
+                E::Cast { expr, .. } => scan(expr, volatile),
+                sqlparser::ast::Expr::Function(f) => {
+                    if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                        for a in &list.args {
+                            if let sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(inner),
+                            ) = a
+                            {
+                                if let Some(m) = scan(inner, volatile) {
+                                    return Some(m);
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+        if let Some(m) = scan(&expr, &volatile) {
+            return Err(err_str(format!("row filter: {m}")));
+        }
+        Ok(())
+    }
+
     /// Create the user/role storage tables and seed the built-in roles.
     /// Idempotent; the tables are regular (replicated) tables with reserved
     /// names (the `internal_ddl` flag lets this DDL past the reserved-name
@@ -923,10 +1236,36 @@ impl Database {
                 privileges,
                 tables,
                 to,
+                cols,
+                row_filter,
             } => {
                 for t in tables {
                     if !self.table_exists(t) || is_user_table(t) {
                         return Err(err_str(format!("table {t} does not exist")));
+                    }
+                    // Column lists and row filters are SELECT-only and
+                    // table-only: they are evaluated per referenced
+                    // column / per scanned row, and a view is itself the
+                    // permission boundary for its readers.
+                    if (cols.is_empty() && row_filter.is_none())
+                        || matches!(privileges.as_slice(), [TablePriv::Select])
+                    {
+                        // ok
+                    } else {
+                        return Err(err_str(
+                            "column lists and row filters apply to single-privilege SELECT grants only".to_string(),
+                        ));
+                    }
+                    if (cols.is_empty() && row_filter.is_none()) && self.table_is_view(t) {
+                        continue;
+                    }
+                    if self.table_is_view(t) {
+                        return Err(err_str(
+                            "column lists and row filters apply to tables, not views".to_string(),
+                        ));
+                    }
+                    if let Some(pred) = row_filter {
+                        self.validate_row_filter(t, pred)?;
                     }
                 }
                 let users = self.user_names()?;
@@ -939,7 +1278,7 @@ impl Database {
                 for g in to {
                     for t in tables {
                         for p in privileges {
-                            grant_priv_row(self, g, p, t)?;
+                            grant_priv_row(self, g, p, t, cols, row_filter.as_deref())?;
                         }
                     }
                 }
@@ -1013,6 +1352,16 @@ pub struct UserGrants {
     pub readonly: bool,
     /// Per-table DML bits (PRIV_*) from custom grants (direct or via roles).
     pub table_privs: BTreeMap<String, u8>,
+    /// Column-restricted SELECT grants: table -> UNION of the granted
+    /// column lists (case as granted). Only meaningful when the user has
+    /// NO unrestricted SELECT grant on that table (roles/blanket grants
+    /// void the restriction — privilege union semantics).
+    pub table_cols: BTreeMap<String, Vec<String>>,
+    /// Row filters (`GRANT SELECT ON t WHERE <pred>`): table -> every
+    /// matching predicate text. OR-joined at enforcement; empty = no
+    /// filtering. Admin/readonly/readwrite roles never consult these for
+    /// their blanket access (see `resolve_grants`).
+    pub row_filters: BTreeMap<String, Vec<String>>,
 }
 
 impl UserGrants {
@@ -1033,6 +1382,43 @@ impl UserGrants {
                 .iter()
                 .find(|(t, _)| t.eq_ignore_ascii_case(table))
                 .is_some_and(|(_, b)| b & bit != 0)
+    }
+
+    /// True when the user's SELECT on this table is column-restricted
+    /// (`resolve_grants` drops the entry when an unrestricted grant
+    /// exists, so presence in the map IS the restriction).
+    pub fn is_restricted_select(&self, table: &str) -> bool {
+        self.table_cols
+            .keys()
+            .any(|t| t.eq_ignore_ascii_case(table))
+    }
+
+    /// Granted column list for a restricted table (case as granted).
+    pub fn granted_cols(&self, table: &str) -> &[String] {
+        self.table_cols
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case(table))
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Row filters for a table (OR-joined at enforcement); empty = none.
+    pub fn filters_for(&self, table: &str) -> &[String] {
+        self.row_filters
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case(table))
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The active row-filter map for enforcement: filtered table (lower-
+    /// cased) -> predicates. Empty unless this user carries explicit
+    /// filtered SELECT grants (blanket roles never land here).
+    pub fn filter_map(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.row_filters
+            .iter()
+            .map(|(t, v)| (t.to_ascii_lowercase(), v.clone()))
+            .collect()
     }
 }
 
@@ -1062,6 +1448,8 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
         readwrite: false,
         readonly: false,
         table_privs: BTreeMap::new(),
+        table_cols: BTreeMap::new(),
+        row_filters: BTreeMap::new(),
     };
     for r in &roles {
         match r.as_str() {
@@ -1070,6 +1458,14 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
             "readonly" => out.readonly = true,
             _ => {}
         }
+    }
+    // Unrestricted SELECT grants (blanket roles included) void column
+    // restrictions on that table — privileges are a union.
+    let mut unrestricted: BTreeSet<String> = BTreeSet::new();
+    if out.readonly || out.readwrite {
+        // Blanket read access: no column restriction and no row filter can
+        // narrow it (filters attach to explicit SELECT grants only).
+        return Ok(Some(out));
     }
     for d in db.table_docs_cx(GRANTS_TABLE).unwrap_or_default() {
         let (Some(grantee), Some(priv_name), Some(tbl)) = (
@@ -1082,9 +1478,45 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
         if !roles.iter().any(|r| r == grantee) {
             continue;
         }
-        if let Some(p) = TablePriv::parse(priv_name) {
-            *out.table_privs.entry(tbl.to_string()).or_insert(0) |= p.bit();
+        let Some(p) = TablePriv::parse(priv_name) else {
+            continue;
+        };
+        *out.table_privs.entry(tbl.to_string()).or_insert(0) |= p.bit();
+        let cols: Option<Vec<String>> = d
+            .get("cols")
+            .and_then(|v| v.as_str())
+            .and_then(|text| serde_json::from_str(text).ok());
+        let filter = d.get("filter").and_then(|v| v.as_str()).map(String::from);
+        if p == TablePriv::Select {
+            // A cols+filter grant restricts BOTH dimensions; a filter
+            // without a column list leaves columns unrestricted, and a
+            // plain grant (neither field) is the unrestricted form.
+            if let Some(pred) = &filter {
+                out.row_filters
+                    .entry(tbl.to_string())
+                    .or_default()
+                    .push(pred.clone());
+            }
+            if let Some(list) = &cols {
+                if !list.is_empty() {
+                    let entry = out.table_cols.entry(tbl.to_string()).or_default();
+                    for c in list {
+                        if !entry.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                            entry.push(c.clone());
+                        }
+                    }
+                }
+            }
+            if cols.is_none() && filter.is_none() {
+                unrestricted.insert(tbl.to_string());
+            }
         }
+    }
+    // Unrestricted SELECT voids both restriction dimensions (privileges
+    // are a union — a narrower grant cannot narrow a wider one).
+    for t in unrestricted {
+        out.table_cols.remove(&t);
+        out.row_filters.remove(&t);
     }
     Ok(Some(out))
 }
@@ -1120,7 +1552,10 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
         out.push(format!("GRANT {} TO {}", q(role), q(member)));
     }
     // Aggregate per (grantee, table) for deterministic, compact output.
+    // Column lists and row filters do NOT aggregate: they qualify one
+    // SELECT grant each and render as their own statements.
     let mut grants: BTreeMap<(String, String), u8> = BTreeMap::new();
+    let mut qualified: Vec<(String, String, Vec<String>, Option<String>)> = Vec::new();
     for d in db.table_docs_cx(GRANTS_TABLE).unwrap_or_default() {
         let (Some(grantee), Some(priv_name), Some(tbl)) = (
             d.get("grantee").and_then(|v| v.as_str()),
@@ -1129,11 +1564,43 @@ pub fn dump_user_statements(db: &mut Database) -> Result<Vec<String>, SqlError> 
         ) else {
             continue;
         };
-        if let Some(p) = TablePriv::parse(priv_name) {
-            *grants
-                .entry((grantee.to_string(), tbl.to_string()))
-                .or_insert(0) |= p.bit();
+        let cols: Vec<String> = d
+            .get("cols")
+            .and_then(|v| v.as_str())
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or_default();
+        let filter = d.get("filter").and_then(|v| v.as_str()).map(String::from);
+        if (cols.is_empty() && filter.is_none())
+            || TablePriv::parse(priv_name) != Some(TablePriv::Select)
+        {
+            if let Some(p) = TablePriv::parse(priv_name) {
+                *grants
+                    .entry((grantee.to_string(), tbl.to_string()))
+                    .or_insert(0) |= p.bit();
+            }
+            continue;
         }
+        qualified.push((grantee.to_string(), tbl.to_string(), cols, filter));
+    }
+    qualified.sort();
+    for (grantee, tbl, cols, pred) in qualified {
+        let col_part = if cols.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let filter_part = match pred {
+            Some(pred) => format!(" WHERE {pred}"),
+            None => String::new(),
+        };
+        out.push(format!(
+            "GRANT SELECT{col_part} ON {}{filter_part} TO {}",
+            q(&tbl),
+            q(&grantee)
+        ));
     }
     for ((grantee, tbl), bits) in grants {
         let privs: Vec<TablePriv> = [
@@ -1175,6 +1642,156 @@ mod tests {
         assert!(matches!(parse("DROP ROLE \"clerk"), Some(Err(_))));
         // 闭合的正常形态不受影响。
         assert!(matches!(parse("DROP USER \"alice\""), Some(Ok(_))));
+    }
+
+    #[test]
+    fn parse_column_and_filter_grants() {
+        // Column-restricted SELECT.
+        match parse("GRANT SELECT (id, Name) ON sales TO alice") {
+            Some(Ok(UserAdminStmt::GrantTable {
+                privileges,
+                tables,
+                to,
+                cols,
+                row_filter,
+            })) => {
+                assert_eq!(privileges, vec![TablePriv::Select]);
+                assert_eq!(tables, vec!["sales"]);
+                assert_eq!(to, vec!["alice"]);
+                assert_eq!(cols, vec!["id", "Name"]);
+                assert_eq!(row_filter, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Row filter: predicate captured verbatim (the fixed tokenizer
+        // cannot carry operators/dotted names).
+        match parse("GRANT SELECT ON sales WHERE region = 'east' AND sales.qty > 0 TO alice") {
+            Some(Ok(UserAdminStmt::GrantTable {
+                cols, row_filter, ..
+            })) => {
+                assert!(cols.is_empty());
+                assert_eq!(
+                    row_filter.as_deref(),
+                    Some("region = 'east' AND sales.qty > 0")
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Cols + filter combine; a string literal containing " TO " does
+        // not derail the split (quote-aware scan).
+        match parse("GRANT SELECT (id) ON t WHERE note = 'send TO bob' TO carol") {
+            Some(Ok(UserAdminStmt::GrantTable {
+                cols, row_filter, ..
+            })) => {
+                assert_eq!(cols, vec!["id"]);
+                assert_eq!(row_filter.as_deref(), Some("note = 'send TO bob'"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // REVOKE never takes the filter form (split only runs for GRANT).
+        assert!(matches!(
+            parse("REVOKE SELECT ON t FROM u"),
+            Some(Ok(UserAdminStmt::RevokeTable { .. }))
+        ));
+        // Missing TO / empty predicate refuse loudly.
+        assert!(matches!(
+            parse("GRANT SELECT ON t WHERE x > 0"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse("GRANT SELECT ON t WHERE TO u"),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn render_round_trips_qualified_grants() {
+        let stmt = match parse("GRANT SELECT (a, b) ON mytbl WHERE x > 0 TO alice") {
+            Some(Ok(s)) => s,
+            other => panic!("{other:?}"),
+        };
+        let text = render(&stmt, "");
+        assert_eq!(
+            text,
+            "GRANT SELECT (\"a\", \"b\") ON \"mytbl\" WHERE x > 0 TO \"alice\""
+        );
+        // The rendered form re-parses to the same statement.
+        match parse(&text) {
+            Some(Ok(other)) => assert_eq!(other, stmt),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_union_and_restriction_semantics() {
+        let mut db = Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE sales (id INT, region TEXT, amount INT)",
+            "CREATE USER alice PASSWORD 'pw12345678'",
+            "CREATE USER bob PASSWORD 'pw12345678'",
+            "CREATE USER carol PASSWORD 'pw12345678'",
+            "GRANT SELECT (id, amount) ON sales TO alice",
+            "GRANT SELECT ON sales WHERE region = 'east' TO bob",
+            "GRANT SELECT (id) ON sales WHERE region = 'west' TO carol",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let g = resolve_grants(&mut db, "alice").unwrap().unwrap();
+        assert!(g.is_restricted_select("sales"));
+        assert_eq!(
+            g.granted_cols("sales"),
+            &["id".to_string(), "amount".to_string()]
+        );
+        assert!(g.filters_for("sales").is_empty());
+
+        let g = resolve_grants(&mut db, "bob").unwrap().unwrap();
+        assert!(!g.is_restricted_select("sales"));
+        assert_eq!(g.filters_for("sales"), &["region = 'east'".to_string()]);
+        assert_eq!(g.filter_map().get("sales").map(|v| v.len()), Some(1));
+
+        // Cols + filter restrict BOTH dimensions.
+        let g = resolve_grants(&mut db, "carol").unwrap().unwrap();
+        assert!(g.is_restricted_select("sales"));
+        assert_eq!(g.granted_cols("sales"), &["id".to_string()]);
+        assert_eq!(g.filters_for("sales"), &["region = 'west'".to_string()]);
+
+        // A later unrestricted grant voids both restrictions.
+        db.execute("GRANT SELECT ON sales TO carol").unwrap();
+        let g = resolve_grants(&mut db, "carol").unwrap().unwrap();
+        assert!(!g.is_restricted_select("sales"));
+        assert!(g.filters_for("sales").is_empty());
+
+        // Blanket roles never carry restrictions.
+        db.execute("GRANT readonly TO alice").unwrap();
+        let g = resolve_grants(&mut db, "alice").unwrap().unwrap();
+        assert!(g.readonly);
+        assert!(!g.is_restricted_select("sales"));
+        assert!(g.row_filters.is_empty());
+    }
+
+    #[test]
+    fn dump_replays_qualified_grants() {
+        let mut db = Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE sales (id INT, region TEXT)",
+            "CREATE USER alice PASSWORD 'pw12345678'",
+            "GRANT SELECT (id) ON sales TO alice",
+            "GRANT SELECT ON sales WHERE region = 'east' TO alice",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let dumped = dump_user_statements(&mut db).unwrap();
+        // Replay through the normal statement family: the state survives.
+        let mut fresh = Database::in_memory().unwrap();
+        fresh
+            .execute("CREATE TABLE sales (id INT, region TEXT)")
+            .unwrap();
+        for sql in dumped {
+            fresh.execute(&sql).unwrap();
+        }
+        let g = resolve_grants(&mut fresh, "alice").unwrap().unwrap();
+        assert_eq!(g.granted_cols("sales"), &["id".to_string()]);
+        assert_eq!(g.filters_for("sales"), &["region = 'east'".to_string()]);
     }
 
     #[test]
@@ -1240,6 +1857,8 @@ mod tests {
                     privileges: vec![TablePriv::Select, TablePriv::Delete],
                     tables: vec!["t1".into(), "t2".into()],
                     to: vec!["analyst".into()],
+                    cols: Vec::new(),
+                    row_filter: None,
                 },
             ),
             (
@@ -1253,6 +1872,8 @@ mod tests {
                     ],
                     tables: vec!["t".into()],
                     to: vec!["alice".into()],
+                    cols: Vec::new(),
+                    row_filter: None,
                 },
             ),
             (
