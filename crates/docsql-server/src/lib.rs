@@ -5929,7 +5929,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                 querylog::sync_event(
                     &state.sync_log,
                     "join-hold",
-                    &target,
+                    target,
                     None,
                     true,
                     Some(format!("skipped, unreachable: {detail}")),
@@ -5944,7 +5944,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                 querylog::sync_event(
                     &state.sync_log,
                     "join-hold",
-                    &target,
+                    target,
                     None,
                     false,
                     Some(detail.clone()),
