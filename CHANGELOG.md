@@ -5,6 +5,72 @@
 
 ## [Unreleased]
 
+### 全模块缺陷审查修复(存储/SQL/兼容层/服务器/Web·CLI/.NET/Python/CI)(2026-10-01)
+
+对全部功能模块做了一轮系统缺陷审查,每项发现先在源码核实再修复,回归测试落各模块内:
+
+- **SQL 内核**:`NOW_MS()` 此前逃逸全部「墙上时钟确定性」门禁(折叠器词级匹配只认
+  `now`/`current_timestamp`,而廉价预筛的子串却能命中 `now_ms`——折叠分支空转放行原文),
+  journal/扇出携带原调用使每个重放节点按各自时钟赋值,CHECK 约束与行级过滤谓词同样漂移;
+  现与 `NOW()` 一致在写入节点折叠为字面量(语句与行过滤器谓词双双钉住)。分组路径
+  (`GROUP BY`/GROUPING SETS/ROLLUP)此前完全忽略 `SELECT DISTINCT`(重复行不去重、
+  `DISTINCT ON` 静默放行),现按与通用路径同一编码判重在 ORDER BY/LIMIT 前折叠。
+  `SELECT *` 走 ORDER BY 索引窗口快路径时列集只从窗口内行推导,窗口外行独有的字段
+  静默丢失(列形状随索引存在性漂移),通配符现回退通用路径。ROLLBACK 的持久化顺序与
+  COMMIT 不对称(先拆台后 fsync),失败时留"无事务可回滚+内存/磁盘错位"的楔死态;
+  现改为先持久后拆台,失败保持事务打开、内存视图回退。
+- **存储层**:B+ 树节点解析不校验 cell 键长字段与实际编码长度一致(klen 被位翻转增大时
+  静默错解析,后续写回把损坏"洗白"成合法页),现响亮报 Corrupt。WAL `commit()` 在
+  fence 已入页缓存后 COMMIT 追加失败不 poison——撕裂崩溃可复活已回滚事务;现同
+  fsync 失败一样 fail-stop。
+- **T-SQL 批解释器**:`WHILE 1 = 1 BEGIN END`(空体)绕过语句预算无限自旋,单语句
+  楔死一个 CPU 核且不感知断连;预算现按循环迭代计。`is_insert_statement` 的 `&str`
+  切片在多字节字符上 panic(一条 emoji 语句击杀连接/嵌入式进程),改字节切片。
+- **服务器**:显式事务缓冲的字节记账在 COMMIT 后不清零——服务器生命周期内累计缓冲
+  超 64MB 后全部显式事务被"transaction buffer exceeded"拒绝,现 drain 时归零。出向
+  加密连接对每个响应用全新重放闸,截获的 AUTH 应答可跨位重放伪造扇出 ACK(漏写直到
+  重启 repair 才收敛),现整连接共享一个 ReplayGuard。join 的 REQ_HOLD 循环串行执行
+  把服务端写冻结拉长为 peers × IO 超时,现与开扫/释放一致并发(Busy 中止也并发释放
+  全部已授予 hold)。`is_self_peer` 对 0.0.0.0 通配监听误判"非自身"(getaddrinfo 不
+  展开通配地址),节点可把自己注册进 peer 表每条写双应用;本机地址判定改用 UDP bind
+  探测(不发包),且要求端口与监听口一致(同机不同端口是多节点开发布局,不算自身)。
+- **quorum/备份**:quorum 栅栏误拒复制内部 PUBLISH/TRIM(少数派节点的
+  `_pubsub_messages` 永久分叉——系统表无摘要/journal 兜底),补 `!is_replication`;
+  backup 的 trigger/export/restore 此前完全无 quorum 栅栏(restore 走到第一条重放语句
+  才失败并短暂占住集群互斥),现进门禁。PITR 增量导出的 epoch 复检在 rename 之前可被
+  抢占,采纳清扫又看不见 `.tmp` 文件——已被作废的 journal 文本能落地复活,现 rename 后
+  二次复检(不一致即删)+ 清扫覆盖 `.tmp`。S3 远端副本改校验和先行:sidecar 未落地就
+  不传对象(半失败不再留下"无校验和的对象"——恢复侧无法与 legacy 对象区分而未验证重放)。
+- **Web 控制台 / CLI**:控制台 CSV 导出补公式注入防护(`=`/`+`/`-`/`@`/制表符/回车
+  开头加引号前缀,与 CLI 的 `csv_cell` 同一规则——存储型 `=WEBSERVICE(...)` 不再在
+  分析员机器上执行)。CLI 表格渲染的列名(可来自带转义序列的引号标识符/别名)此前
+  未经终端清理,现与单元格同一 sanitize。
+- **.NET 驱动**:标量标记解码与服务端 `decode_marker`/Python 驱动对称——仅恰好单键
+  且可解析的对象才解码(`{"$dec":…,"limit":10}` 这类用户文档不再被静默改型,不可解析
+  值不再炸掉整条查询,`$ts` 域检查对齐)。入向重放闸先推水位后验 GCM 标签(伪造大计数
+  帧毒化闸门),改先验签后推进;解密/重放失败现在毒化连接(此前未标 Broken 可归还池)。
+  连接归还池时重置读超时(下一位借用者的保活 PING 不再沿用上一位的 CommandTimeout)。
+- **Python 驱动**:读超时不再留下"活着的"连接(服务端仍会送出迟到应答,复用即应答
+  错位一帧——静默错数据),超时/IO 失败一律毒化;`timeout` 属性改写透 socket(此前
+  静默无效)。`Subscriber` 空闲读改为轮询 + PING 保活(此前每 ~15s 自伤断连循环,且
+  断连窗口内无锚频道的消息永久丢失);重订阅排空循环不再吞 `RESP_ERROR`(订阅失效
+  无声),改响亮失败重试;TLS/协议异常不再杀死读线程(`ProtocolError` 归入 DB-API
+  `InterfaceError` 族,`SSLError` 映射 `OperationalError`);控制帧写入并入写锁(并发
+  subscribe 不再交错损坏请求流)、`queue.Empty` 映射为 DB-API 错误、订阅拒绝映射语句
+  错误族;`ping(reconnect=True)` 不再静默吞掉未决事务(commit 响亮报"事务已随连接
+  回滚")并失效游标的 prepared 句柄缓存;Sealer 计数器加锁(并发 seal 不再可能复用
+  nonce)、`open` 改先验签后推水位。超出 DECIMAL 值域的整数/Decimal 绑定改在客户端
+  响亮拒绝(此前服务端静默降级为文本字面量)。
+- **CI**:docker-image 流水线补 python 驱动测试 job(rust 工具链 + `cargo build
+  -p docsql-server` + pytest,并入 build 的 needs)——AGENTS 早已声明该 job,实际从未
+  落盘。run-tests.sh 早失败(构建/端口等待)时不再误停用户的开发栈(接管标志门控
+  EXIT 恢复逻辑)。
+- 测试:Rust 侧新增 btree klen 损坏/NOW_MS 折叠与行过滤器/分组 DISTINCT/索引窗口
+  通配符列集/WHILE 空体预算/UTF-8 切片/脱敏边界/TxPending 记账/is_self_peer 通配/
+  增量清扫 `.tmp` 等回归;.NET 新增标记对称用例;Python 新增 6 项回归(超时毒化/
+  保活/重连事务语义/大整数/错误族)。全量 cargo test 0 失败,dotnet 三套件绿,
+  pytest 35 绿。
+
 ### 列级授权 + 行级过滤(RLS)(商用化路线 · 企业安全)(2026-09-29)
 
 `GRANT`/`REVOKE` 家族扩展两个限定维度,定义随集群复制、纪元即时生效:

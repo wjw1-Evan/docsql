@@ -11,6 +11,8 @@ replication/join frames are node-internal and intentionally absent.
 
 import struct
 
+from .errors import InterfaceError
+
 MAGIC = 0x31515344  # "DSQ1"
 # magic:u32 | flags:u16 | frame_type:u16 | topology_version:u64 | len:u32
 HEADER = struct.Struct("<IHHQI")
@@ -45,12 +47,14 @@ RESP_PREPARED = 0x010E
 RESP_HELLO = 0x010F
 
 
-class ProtocolError(Exception):
+class ProtocolError(InterfaceError):
     """A framing-level failure (bad magic, oversized frame, EOF mid-frame).
 
     The connection is unusable after one of these; callers must discard it.
-    Not exported as a DB-API exception — it signals a broken transport, and
-    the connection layer maps it onto InterfaceError.
+    Subclasses the DB-API InterfaceError so every ``except Error`` recovery
+    path (subscriber reconnect loops, ``ping(reconnect=True)``) sees it —
+    as a plain ``Exception`` it used to escape those handlers and kill the
+    reader thread.
     """
 
 

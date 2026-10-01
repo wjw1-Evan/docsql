@@ -15,12 +15,23 @@ own executor. An exception escaping a callback is logged, never fatal.
 
 import json
 import queue
+import sys
 import threading
 import time
 
 from . import _proto
 from .connection import connect
-from .errors import Error, InterfaceError
+from .errors import OperationalError, map_server_error
+
+# Keepalive cadence: poll the socket for a frame every _POLL_SECONDS and
+# send a PING once _KEEPALIVE_POLLS consecutive polls came back idle
+# (~15 s of silence). Without it the reader used to block on a plain read
+# until the connection timeout fired, treat the timeout as a dead link and
+# churn a reconnect cycle every ~15 s on quiet channels — self-inflicted
+# disconnects with on_disconnect noise, and a real message-loss window
+# while resubscribing.
+_POLL_SECONDS = 5.0
+_KEEPALIVE_POLLS = 3
 
 
 class Subscriber:
@@ -55,6 +66,10 @@ class Subscriber:
         self._last_id = {}    # channel -> newest delivered id
         self._replies = queue.Queue()
         self._write_lock = threading.Lock()
+        # True while a control round trip (subscribe/unsubscribe) is between
+        # its request and its reply: the reader must not inject a keepalive
+        # PING then, or its PONG could be mistaken for the control reply.
+        self._control_busy = False
         self._closed = threading.Event()
         self._conn = None
         self._reader = threading.Thread(target=self._run, name="docsql-subscriber", daemon=True)
@@ -111,15 +126,31 @@ class Subscriber:
     def _control(self, frame_type, body):
         payload = json.dumps(body).encode("utf-8")
         with self._write_lock:
-            self._conn._transport.write_frame(frame_type, payload)
-            while True:
-                _flags, ftype, rpayload = self._replies.get(timeout=10)
-                if ftype == _proto.RESP_PUSH:
-                    self._dispatch(rpayload)
-                    continue
-                if ftype == _proto.RESP_ERROR:
-                    raise InterfaceError(rpayload.decode("utf-8", "replace"))
-                break
+            self._control_busy = True
+            try:
+                self._conn._transport.write_frame(frame_type, payload)
+                while True:
+                    try:
+                        _flags, ftype, rpayload = self._replies.get(timeout=10)
+                    except queue.Empty as e:
+                        # A bare queue.Empty is not a DB-API error and used
+                        # to leak straight to the caller.
+                        raise OperationalError(
+                            "subscriber control reply timed out (no frame within 10s)"
+                        ) from e
+                    if ftype == _proto.RESP_PUSH:
+                        self._dispatch(rpayload)
+                        continue
+                    if ftype == _proto.RESP_PONG:
+                        continue  # keepalive echo racing our request
+                    if ftype == _proto.RESP_ERROR:
+                        # A server-side rejection is a statement error, not a
+                        # transport failure — InterfaceError would wrongly
+                        # declare the whole connection dead.
+                        raise map_server_error(rpayload.decode("utf-8", "replace"))
+                    break
+            finally:
+                self._control_busy = False
 
     def _dispatch(self, payload):
         try:
@@ -160,12 +191,28 @@ class Subscriber:
                 # Loop: keep reading on the fresh connection.
 
     def _read_frames(self):
+        idle_polls = 0
         while not self._closed.is_set():
-            _flags, ftype, payload = self._conn._transport.read_frame()
+            got = self._conn._transport.read_frame_poll(_POLL_SECONDS)
+            if got is None:
+                idle_polls += 1
+                if idle_polls >= _KEEPALIVE_POLLS and not self._control_busy:
+                    idle_polls = 0
+                    # Idle keepalive: proves the connection (and beats
+                    # DOCSQL_IDLE_TIMEOUT). The PONG echo is dropped below;
+                    # never sent while a control round trip may claim it.
+                    with self._write_lock:
+                        if not self._conn._transport._closed:
+                            self._conn._transport.write_frame(_proto.REQ_PING, b"")
+                continue
+            idle_polls = 0
+            _flags, ftype, payload = got
             if ftype == _proto.RESP_PUSH:
                 self._dispatch(payload)
+            elif ftype == _proto.RESP_PONG:
+                pass  # keepalive echo (the resubscribe drain has its own PONG)
             else:
-                self._replies.put((_flags, ftype, payload))
+                self._replies.put(got)
 
     def _resubscribe(self):
         """Reconnect and replay the missed tail; False when the node stays
@@ -178,35 +225,68 @@ class Subscriber:
             delay = min(delay * 2, 8.0)
             try:
                 self._conn = connect(**self._conn_kwargs)
-            except Error:
+            except Exception:
+                # Transport-level failures too (TLS handshake, protocol
+                # garbage): catching only Error used to let them escape the
+                # reader thread entirely, killing the subscriber silently.
                 continue
             try:
-                # Resubscribes resume strictly after the newest id seen on
-                # the channel (server replays id > from).
-                for channel in list(self._channels):
-                    resume = self._last_id.get(channel, self._channels[channel])
-                    body = {"channel": channel, "from": _from_str(resume)}
-                    self._conn._transport.write_frame(
-                        _proto.REQ_SUBSCRIBE, json.dumps(body).encode("utf-8")
-                    )
-                for pattern in list(self._patterns):
-                    body = {"pattern": pattern, "from": _from_str(self._patterns[pattern])}
-                    self._conn._transport.write_frame(
-                        _proto.REQ_PSUBSCRIBE, json.dumps(body).encode("utf-8")
-                    )
-                # A PING marks the end of the confirmation batch: drain the
-                # confirms (and any replay pushes) until the PONG lands,
-                # then hand the socket back to the reader loop.
-                self._conn._transport.write_frame(_proto.REQ_PING, b"")
-                while True:
-                    _flags, ftype, payload = self._conn._transport.read_frame()
-                    if ftype == _proto.RESP_PUSH:
-                        self._dispatch(payload)
-                    elif ftype == _proto.RESP_PONG:
-                        return True
-                    # RESP_AFFECTED subscribe confirmations pass silently.
-            except Error:
+                # The write+drain holds the write lock: a concurrent
+                # subscribe() interleaving its own frames on the raw socket
+                # used to corrupt both request streams.
+                with self._write_lock:
+                    self._control_busy = True
+                    try:
+                        # Resubscribes resume strictly after the newest id
+                        # seen on the channel (server replays id > from).
+                        # A channel with no delivered anchor falls back to
+                        # its requested from — messages published inside
+                        # this reconnect window are only recoverable with
+                        # an explicit numeric from_.
+                        for channel in list(self._channels):
+                            resume = self._last_id.get(channel, self._channels[channel])
+                            body = {"channel": channel, "from": _from_str(resume)}
+                            self._conn._transport.write_frame(
+                                _proto.REQ_SUBSCRIBE, json.dumps(body).encode("utf-8")
+                            )
+                        for pattern in list(self._patterns):
+                            body = {"pattern": pattern, "from": _from_str(self._patterns[pattern])}
+                            self._conn._transport.write_frame(
+                                _proto.REQ_PSUBSCRIBE, json.dumps(body).encode("utf-8")
+                            )
+                        # A PING marks the end of the confirmation batch:
+                        # drain the confirms (and any replay pushes) until
+                        # the PONG lands, then hand the socket back to the
+                        # reader loop.
+                        self._conn._transport.write_frame(_proto.REQ_PING, b"")
+                        while True:
+                            _flags, ftype, payload = self._conn._transport.read_frame()
+                            if ftype == _proto.RESP_PUSH:
+                                self._dispatch(payload)
+                            elif ftype == _proto.RESP_PONG:
+                                return True
+                            elif ftype == _proto.RESP_ERROR:
+                                # A channel failed to re-register (authz
+                                # change, bad payload): swallowing this
+                                # left the subscriber silently deaf on a
+                                # channel it still believes in. Fail the
+                                # attempt loudly and retry.
+                                text = payload.decode("utf-8", "replace")
+                                print(
+                                    f"docsql.Subscriber: resubscribe rejected: {text}",
+                                    file=sys.stderr,
+                                )
+                                return False
+                            # RESP_AFFECTED subscribe confirmations pass silently.
+                    finally:
+                        self._control_busy = False
+            except Exception:
                 continue
+        print(
+            "docsql.Subscriber: reconnect budget exhausted; reader thread exiting "
+            "(call close() and construct a new Subscriber to retry)",
+            file=sys.stderr,
+        )
         return False
 
 

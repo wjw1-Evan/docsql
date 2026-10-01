@@ -280,9 +280,19 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     // log, status payload), never fail the local backup.
     if let Some(s3) = &state.backup_s3 {
         let hex_digest = docsql_core::kdf::hex(&digest);
-        upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
-        if let Ok(sidecar_bytes) = std::fs::read(state.backup_dir.join(format!("{name}.sha256"))) {
-            upload_backup_bytes(state, s3, &format!("{name}.sha256"), &sidecar_bytes).await;
+        // Checksum-FIRST, and the object only follows a LANDED checksum:
+        // a backup object without its sidecar is indistinguishable from a
+        // pre-checksum-era legacy object on the restore side (which then
+        // replays it unverified), while an orphaned sidecar is harmless —
+        // the next tick retries the pair.
+        let sidecar_landed = match std::fs::read(state.backup_dir.join(format!("{name}.sha256"))) {
+            Ok(bytes) => upload_backup_bytes(state, s3, &format!("{name}.sha256"), &bytes)
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
+        if sidecar_landed {
+            upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
         }
         prune_remote(s3, state).await;
     }
@@ -301,7 +311,7 @@ async fn upload_backup_file(
 ) {
     let key = s3.config().object_key(name);
     let res = s3.put_file(&key, path, sha256_hex).await;
-    record_upload(state, name, res).await;
+    record_upload(state, name, &res).await;
 }
 
 async fn upload_backup_bytes(
@@ -309,13 +319,14 @@ async fn upload_backup_bytes(
     s3: &crate::s3::S3Client,
     name: &str,
     body: &[u8],
-) {
+) -> Result<(), String> {
     let key = s3.config().object_key(name);
     let res = s3.put_bytes(&key, body).await;
-    record_upload(state, name, res).await;
+    record_upload(state, name, &res).await;
+    res
 }
 
-async fn record_upload(state: &Arc<ServerState>, name: &str, res: Result<(), String>) {
+async fn record_upload(state: &Arc<ServerState>, name: &str, res: &Result<(), String>) {
     use std::sync::atomic::Ordering;
     state
         .metrics
@@ -816,6 +827,21 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
         );
     }
     std::fs::rename(&tmp, state.backup_dir.join(&name)).map_err(|e| format!("incr rename: {e}"))?;
+    // Second epoch check AFTER the rename: the pre-rename check above can
+    // be preempted right before the rename lands, and an adoption sweeping
+    // in that gap only ever saw the `.tmp` name. If the epoch moved, the
+    // file (and its sidecar-to-be) must not survive — remove and fail the
+    // export; PITR restarts from the next full backup.
+    if state.pitr_epoch.load(std::sync::atomic::Ordering::SeqCst) != read_epoch {
+        let _ = std::fs::remove_file(state.backup_dir.join(&name));
+        let _ = std::fs::remove_file(state.backup_dir.join(format!("{name}.sha256.tmp")));
+        let _ = std::fs::remove_file(state.backup_dir.join(format!("{name}.sha256")));
+        return Err(
+            "journal was voided by a snapshot adoption during the export; \
+             the incremental was discarded (PITR restarts from the next full backup)"
+                .into(),
+        );
+    }
     let digest = docsql_core::kdf::sha256(&bytes);
     let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
     write_private(
@@ -829,11 +855,18 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
     // Remote copy rides along with the local write: a disaster-recovery
     // restore to a point in time needs the base AND the whole incremental
     // chain off-volume, so every new segment goes up as it lands.
+    // Checksum-first for the same reason as the full backup: an incremental
+    // object without its sidecar would restore unverified.
     if let Some(s3) = &state.backup_s3 {
         let hex_digest = docsql_core::kdf::hex(&digest);
-        upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
-        if let Ok(sidecar_bytes) = std::fs::read(state.backup_dir.join(format!("{name}.sha256"))) {
-            upload_backup_bytes(state, s3, &format!("{name}.sha256"), &sidecar_bytes).await;
+        let sidecar_landed = match std::fs::read(state.backup_dir.join(format!("{name}.sha256"))) {
+            Ok(bytes) => upload_backup_bytes(state, s3, &format!("{name}.sha256"), &bytes)
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
+        if sidecar_landed {
+            upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
         }
         prune_remote(s3, state).await;
     }
@@ -868,7 +901,12 @@ pub(crate) fn invalidate_incremental_exports(dir: &Path) {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with("incr-") && (name.ends_with(".sql") || name.ends_with(".sql.sha256")) {
+        // `.tmp` suffixes included: an export mid-write adopts only its
+        // temporary names, and a sweep blind to them let a preempted export
+        // rename a resurrectable file back to life after the adoption.
+        if name.starts_with("incr-")
+            && (name.ends_with(".sql") || name.ends_with(".sql.sha256") || name.ends_with(".tmp"))
+        {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -951,6 +989,11 @@ pub(crate) async fn handle_backup(
                     crate::err_payload("read-only token; writes are not permitted"),
                 );
             }
+            // Quorum fence, same layer as the SQL/PUBLISH/TRIM/PROMOTE gates
+            // (design 004: a fenced node must not mint new snapshots).
+            if let Some(denial) = crate::quorum_write_denial(state) {
+                return Frame::new(proto::RESP_ERROR, crate::err_payload(&denial));
+            }
             if user.is_some_and(|u| !u.grants.admin) {
                 return Frame::new(
                     proto::RESP_ERROR,
@@ -1000,6 +1043,11 @@ pub(crate) async fn handle_backup(
                     proto::RESP_ERROR,
                     crate::err_payload("read-only token; writes are not permitted"),
                 );
+            }
+            // Quorum fence: an export writes durable files from a journal a
+            // fenced node must not vouch for.
+            if let Some(denial) = crate::quorum_write_denial(state) {
+                return Frame::new(proto::RESP_ERROR, crate::err_payload(&denial));
             }
             if user.is_some_and(|u| !u.grants.admin) {
                 return Frame::new(
@@ -1052,6 +1100,13 @@ pub(crate) async fn handle_backup(
                     proto::RESP_ERROR,
                     crate::err_payload("read-only replica; PROMOTE to accept writes"),
                 );
+            }
+            // Quorum fence up front: a fenced node used to pass every gate
+            // here and die on the first replayed statement instead — a
+            // dirty "started then failed" restore path that briefly held
+            // the cluster-wide restore mutex.
+            if let Some(denial) = crate::quorum_write_denial(state) {
+                return Frame::new(proto::RESP_ERROR, crate::err_payload(&denial));
             }
             let file = serde_json::from_slice::<serde_json::Value>(&frame.payload)
                 .ok()
@@ -1693,6 +1748,8 @@ mod tests {
             "incr-1.sql.sha256",
             "incr-2.sql",
             "incr-2.sql.sha256",
+            "incr-2.sql.tmp",
+            "incr-2.sql.sha256.tmp",
             "incr-notes.txt",
             "backup-2.sql.tmp",
         ] {

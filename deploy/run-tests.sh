@@ -56,7 +56,14 @@ fi
 # Always runs (test failure, Ctrl-C, success): stop the test stack, drop its
 # throwaway volumes, then put the user's stack back exactly as it was. The
 # teardown deliberately avoids `down -v`, so no user volume is ever removed.
+# TOOK_OVER gates the whole handler: an early failure (build error, port
+# wait) happens BEFORE this script stops the user's dev stack — running the
+# teardown then would needlessly bounce a healthy stack (down + re-up).
+TOOK_OVER=0
 restore_user_stack() {
+  if [ "$TOOK_OVER" -ne 1 ]; then
+    return 0
+  fi
   # The suites run after a `cd ..` to the repo root: compose needs the
   # deploy directory (compose file + .env) for this cleanup.
   cd "$DEPLOY_DIR"
@@ -93,6 +100,8 @@ if [ -z "${DOCSQL_DEV_IMAGE_TAG:-}" ]; then
 fi
 echo "== stop the running dev stack (data volumes untouched) =="
 docker compose --profile single --profile cluster --profile join down --remove-orphans >/dev/null 2>&1 || true
+# From here on the user's stack is down and the exit handler owes a restore.
+TOOK_OVER=1
 echo "== create fresh throwaway test volumes (${DOCSQL_DEV_DATA_PREFIX}-*) =="
 for s in $DATA_SUFFIXES; do
   v="${DOCSQL_DEV_DATA_PREFIX}-${s}"

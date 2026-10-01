@@ -309,8 +309,19 @@ impl TxPending {
     /// duplicate wins, matching `rollback_to` and the engine.
     pub fn release(&mut self, name: &str) {
         if let Some(pos) = self.marks.iter().rposition(|(n, _)| n == name) {
-            self.marks.truncate(pos);
+            self.marks.truncate(pos + 1);
         }
+    }
+
+    /// COMMIT drain: hand over the buffered writes and reset ALL accounting
+    /// (marks and byte budget). `bytes` used to survive every drain, so a
+    /// server's lifetime total of buffered SQL text counted against the
+    /// per-transaction cap until every explicit transaction was rejected
+    /// with "transaction buffer exceeded".
+    pub fn take_writes(&mut self) -> Vec<String> {
+        self.marks.clear();
+        self.bytes = 0;
+        std::mem::take(&mut self.writes)
     }
 
     pub fn clear(&mut self) {
@@ -1096,6 +1107,17 @@ fn set_tcp_keepalive(s: TcpStream) -> TcpStream {
 /// malformed address.
 const SELF_PEER_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Does this machine own `ip`? A UDP bind to `(ip, 0)` succeeds exactly for
+/// local addresses and sends no packets. Unlike name resolution this sees
+/// through a wildcard listen: `lookup_host("0.0.0.0:port")` answers only
+/// `0.0.0.0` itself, never the interface addresses, so the old
+/// set-intersection missed a joiner advertising its own LAN IP while
+/// listening on 0.0.0.0 — registering itself as its own peer and
+/// double-applying every write.
+fn ip_is_local(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0)).is_ok()
+}
+
 async fn is_self_peer(listen: &str, peer: &str) -> bool {
     if listen.eq_ignore_ascii_case(peer) {
         return true;
@@ -1111,13 +1133,12 @@ async fn is_self_peer(listen: &str, peer: &str) -> bool {
             Ok(Ok(a)) => a.collect::<Vec<_>>(),
             _ => return false,
         };
-    // A loopback advertisement with our listen port is us; so is any
-    // address that resolves to the same socket as our own listen address
-    // (the joiner advertising its LAN IP while listen says 0.0.0.0 must
-    // not register itself as its own peer and double-apply its writes).
+    // The peer is us when its address lives on this machine AND targets our
+    // own listen port; the same IP with a DIFFERENT port is another node on
+    // a shared host (dev setups deliberately run several that way).
     if peer_addrs
         .iter()
-        .any(|a| a.port() == port && a.ip().is_loopback())
+        .any(|a| a.port() == port && (a.ip().is_loopback() || ip_is_local(a.ip())))
     {
         return true;
     }
@@ -4590,7 +4611,12 @@ async fn read_wire_hello(
 
 /// AUTH on a fresh peer connection when the server requires a token (the
 /// peer rejects everything else with "unauthorized").
-async fn auth_on(stream: &mut tls::BoxConn, token: &str, wire: WireKey<'_>) -> std::io::Result<()> {
+async fn auth_on(
+    stream: &mut tls::BoxConn,
+    token: &str,
+    wire: WireKey<'_>,
+    replay: &mut crypto::ReplayGuard,
+) -> std::io::Result<()> {
     let mut frame = Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec());
     if let Some((k, hello)) = wire {
         frame.flags |= crypto::FLAG_ENCRYPTED;
@@ -4598,8 +4624,7 @@ async fn auth_on(stream: &mut tls::BoxConn, token: &str, wire: WireKey<'_>) -> s
             .map_err(std::io::Error::other)?;
     }
     write_frame_on(stream, &frame).await?;
-    let mut replay = crypto::ReplayGuard::default();
-    let resp = read_response_frame_with_guard(stream, wire, &mut replay).await?;
+    let resp = read_response_frame_with_guard(stream, wire, replay).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "peer rejected AUTH: {}",
@@ -4611,20 +4636,25 @@ async fn auth_on(stream: &mut tls::BoxConn, token: &str, wire: WireKey<'_>) -> s
 
 /// Connect, consume the keyed handshake and authenticate one outbound peer
 /// connection. `tls` is the node's outbound dialer (DOCSQL_TLS_CONNECT):
-/// None = plain TCP.
+/// None = plain TCP. The returned ReplayGuard covers the WHOLE connection
+/// (AUTH response included): a fresh guard accepts any nonce for its first
+/// frame, so per-response guards used to let a captured AUTH-ok frame be
+/// replayed as a later request's answer — a forged fan-out ACK under
+/// DOCSQL_KEY without TLS.
 async fn open_peer_conn(
     target: &str,
     key: Option<&crypto::TransportKey>,
     auth: Option<&str>,
     tls: Option<&tokio_rustls::TlsConnector>,
-) -> std::io::Result<(tls::BoxConn, [u8; 16])> {
+) -> std::io::Result<(tls::BoxConn, [u8; 16], crypto::ReplayGuard)> {
     let mut stream = tls::dial_protocol(target, tls).await?;
     let hello = read_wire_hello(&mut stream, key).await?;
+    let mut replay = crypto::ReplayGuard::default();
     if let Some(token) = auth {
         let wire: WireKey = key.map(|k| (k, &hello));
-        auth_on(&mut stream, token, wire).await?;
+        auth_on(&mut stream, token, wire, &mut replay).await?;
     }
-    Ok((stream, hello))
+    Ok((stream, hello, replay))
 }
 
 /// Build a replication-internal frame: FLAG_REPLICATION plus transport
@@ -4662,17 +4692,18 @@ async fn write_frame_on(stream: &mut tls::BoxConn, frame: &Frame) -> std::io::Re
 }
 
 /// Write one replication-internal frame and read its response. RESP_ERROR
-/// frames surface as `Err`. Encryption is per frame.
+/// frames surface as `Err`. Encryption is per frame; the replay guard is
+/// per CONNECTION (see `open_peer_conn`).
 async fn send_frame_on(
     mut stream: tls::BoxConn,
     frame_type: u16,
     payload: &[u8],
     wire: WireKey<'_>,
+    replay: &mut crypto::ReplayGuard,
 ) -> std::io::Result<(Frame, tls::BoxConn)> {
     let frame = replication_frame(frame_type, payload.to_vec(), wire);
     write_frame_on(&mut stream, &frame).await?;
-    let mut replay = crypto::ReplayGuard::default();
-    let resp = read_response_frame_with_guard(&mut stream, wire, &mut replay).await?;
+    let resp = read_response_frame_with_guard(&mut stream, wire, replay).await?;
     if resp.frame_type == proto::RESP_ERROR {
         return Err(std::io::Error::other(format!(
             "replica rejected: {}",
@@ -4744,9 +4775,9 @@ pub(crate) async fn forward_frame(
     auth: Option<&str>,
     tls: Option<&tokio_rustls::TlsConnector>,
 ) -> std::io::Result<Frame> {
-    let (stream, hello) = open_peer_conn(target, key, auth, tls).await?;
+    let (stream, hello, mut replay) = open_peer_conn(target, key, auth, tls).await?;
     let wire: WireKey = key.map(|k| (k, &hello));
-    let (resp, _stream) = send_frame_on(stream, frame_type, payload, wire).await?;
+    let (resp, _stream) = send_frame_on(stream, frame_type, payload, wire, &mut replay).await?;
     Ok(resp)
 }
 
@@ -4761,11 +4792,10 @@ async fn forward_frame_raw(
     auth: Option<&str>,
     tls: Option<&tokio_rustls::TlsConnector>,
 ) -> std::io::Result<Frame> {
-    let (mut stream, hello) = open_peer_conn(target, key, auth, tls).await?;
+    let (mut stream, hello, mut replay) = open_peer_conn(target, key, auth, tls).await?;
     let wire: WireKey = key.map(|k| (k, &hello));
     let frame = replication_frame(frame_type, payload.to_vec(), wire);
     write_frame_on(&mut stream, &frame).await?;
-    let mut replay = crypto::ReplayGuard::default();
     read_response_frame_with_guard(&mut stream, wire, &mut replay).await
 }
 
@@ -5019,10 +5049,10 @@ pub async fn forward_sql_all(state: &Arc<ServerState>, sql: &str, seq: Option<u6
 /// must not silently vanish from point-in-time restore. Only the FAN-OUT
 /// below depends on having a target.
 pub async fn drain_tx_pending(state: &Arc<ServerState>) {
-    let mut pending = state.tx_pending.lock().await;
-    let writes = std::mem::take(&mut pending.writes);
-    pending.marks.clear();
-    drop(pending);
+    let writes = {
+        let mut pending = state.tx_pending.lock().await;
+        pending.take_writes()
+    };
     let seqs: Vec<Option<u64>> = if !writes.is_empty() {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
         let mut unit = db.write_unit();
@@ -5135,8 +5165,14 @@ async fn handle_publish(state: &Arc<ServerState>, frame: &Frame, is_replication:
             err_payload("read-only replica; PROMOTE to accept writes"),
         );
     }
-    if let Some(denial) = quorum_write_denial(state) {
-        return Frame::new(proto::RESP_ERROR, err_payload(&denial));
+    // Same fence shape as `execute_sql_inner`: replication-internal PUBLISH
+    // passes (the message was already accepted by a majority-side node;
+    // rejecting it here would permanently fork `_pubsub_messages`, which no
+    // digest/snapshot/journal ever repairs).
+    if !is_replication {
+        if let Some(denial) = quorum_write_denial(state) {
+            return Frame::new(proto::RESP_ERROR, err_payload(&denial));
+        }
     }
     let Some(_order) = lock_engine_for_write(state).await else {
         return Frame::new(
@@ -5516,8 +5552,13 @@ async fn handle_pubsub_cmd(
                     err_payload("read-only replica; PROMOTE to accept writes"),
                 );
             }
-            if let Some(denial) = quorum_write_denial(state) {
-                return Frame::new(proto::RESP_ERROR, err_payload(&denial));
+            // Replication TRIM passes the quorum fence (same shape as the
+            // SQL and PUBLISH gates): a fenced minority node refusing it
+            // would fork retention state with no repair path.
+            if !is_replication {
+                if let Some(denial) = quorum_write_denial(state) {
+                    return Frame::new(proto::RESP_ERROR, err_payload(&denial));
+                }
             }
             let Some(_order) = lock_engine_for_write(state).await else {
                 return Frame::new(
@@ -5743,8 +5784,9 @@ async fn hold_peer(
         .await
         .map_err(unreachable)?;
     let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
+    let mut replay = crypto::ReplayGuard::default();
     if let Some(token) = fanout_auth(state) {
-        auth_on(&mut stream, token, wire)
+        auth_on(&mut stream, token, wire, &mut replay)
             .await
             .map_err(|e| HoldFail::Busy(format!("auth: {e}")))?;
     }
@@ -5756,7 +5798,6 @@ async fn hold_peer(
     }
     // The peer accepted the connection: if it now fails to answer in time
     // it is busy (alive, writes possibly in flight) — never "unreachable".
-    let mut replay = crypto::ReplayGuard::default();
     let resp = read_response_frame_with_guard(&mut stream, wire, &mut replay)
         .await
         .map_err(|e| HoldFail::Busy(format!("no hold answer: {e}")))?;
@@ -5852,9 +5893,27 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
     for j in sweep {
         let _ = j.await;
     }
+    // Holds go out CONCURRENTLY, like the sweeps and releases around them:
+    // a peer that accepts TCP but never answers costs its full IO timeout,
+    // and a serial hold loop held this node's write path for
+    // (peers × timeout). Every result is still collected before deciding —
+    // bailing on the first Busy would strand holds the other tasks granted.
+    let mut holds = Vec::new();
+    for target in &targets {
+        let st = state.clone();
+        let target = target.clone();
+        let adv = advertise.clone();
+        holds.push(tokio::spawn(
+            async move { hold_peer(&st, &target, &adv).await },
+        ));
+    }
     let mut held: Vec<(String, u64)> = Vec::new();
-    for target in targets {
-        let hold = hold_peer(state, &target, &advertise).await;
+    let mut busy: Option<String> = None;
+    for (target, handle) in targets.iter().zip(holds) {
+        let hold = match handle.await {
+            Ok(r) => r,
+            Err(e) => Err(HoldFail::Busy(format!("hold task failed: {e}"))),
+        };
         match hold {
             Ok(id) => {
                 held.push((target.clone(), id));
@@ -5880,7 +5939,7 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                 // The peer is alive but could not freeze its write path in
                 // time — writes may be in flight that would land after the
                 // snapshot and never reach the joiner. Abort the whole
-                // attempt (releasing the holds taken so far) and retry.
+                // attempt (releasing every hold taken) and retry.
                 eprintln!("sync: hold on {target} failed ({detail}); aborting this attempt");
                 querylog::sync_event(
                     &state.sync_log,
@@ -5890,20 +5949,32 @@ async fn handle_sync(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Sender<
                     false,
                     Some(detail.clone()),
                 );
-                for (t, id) in &held {
-                    let _ = forward_frame(
-                        t,
-                        proto::REQ_RELEASE,
-                        &id.to_le_bytes(),
-                        state.transport_key.as_ref(),
-                        fanout_auth(state),
-                        state.tls_out.as_ref(),
-                    )
-                    .await;
-                }
-                return abort(format!("sync: quiesce failed ({detail}); retry")).await;
+                busy = busy.or(Some(detail));
             }
         }
+    }
+    if let Some(detail) = busy {
+        let mut releases = Vec::new();
+        for (t, id) in &held {
+            let st = state.clone();
+            let t = t.clone();
+            let id = *id;
+            releases.push(tokio::spawn(async move {
+                let _ = forward_frame(
+                    &t,
+                    proto::REQ_RELEASE,
+                    &id.to_le_bytes(),
+                    st.transport_key.as_ref(),
+                    fanout_auth(&st),
+                    st.tls_out.as_ref(),
+                )
+                .await;
+            }));
+        }
+        for r in releases {
+            let _ = r.await;
+        }
+        return abort(format!("sync: quiesce failed ({detail}); retry")).await;
     }
     // Capture with the mesh quiesced. The engine lock alone is enough
     // here: write_order stops new local writes, the holds stopped the
@@ -6194,7 +6265,7 @@ enum JoinApply {
 /// Ask one peer for the cluster state and return the dump script.
 async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<String> {
     let attempt = async {
-        let (mut stream, hello) = open_peer_conn(
+        let (mut stream, hello, mut replay) = open_peer_conn(
             peer,
             state.transport_key.as_ref(),
             fanout_auth(state),
@@ -6213,7 +6284,6 @@ async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<S
         );
         write_frame_on(&mut stream, &frame).await?;
         let mut script = String::new();
-        let mut replay = crypto::ReplayGuard::default();
         loop {
             let f = read_response_frame_with_guard(&mut stream, wire, &mut replay).await?;
             match f.frame_type {
@@ -7245,7 +7315,7 @@ async fn verify_join_convergence(state: &Arc<ServerState>, peers: Vec<String>) {
 /// the response frame untouched — the caller validates the frame type and
 /// parses the payload. Shared by the digest/status probes.
 async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::io::Result<Frame> {
-    let (mut stream, hello) = open_peer_conn(
+    let (mut stream, hello, mut replay) = open_peer_conn(
         peer,
         state.transport_key.as_ref(),
         fanout_auth(state),
@@ -7255,7 +7325,6 @@ async fn probe_frame(state: &ServerState, peer: &str, frame_type: u16) -> std::i
     let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
     let frame = replication_frame(frame_type, vec![], wire);
     write_frame_on(&mut stream, &frame).await?;
-    let mut replay = crypto::ReplayGuard::default();
     read_response_frame_with_guard(&mut stream, wire, &mut replay).await
 }
 
@@ -7608,7 +7677,7 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
 /// the repair then falls back to snapshot adoption.
 async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std::io::Result<u64> {
     let attempt = async {
-        let (mut stream, hello) = open_peer_conn(
+        let (mut stream, hello, mut replay) = open_peer_conn(
             peer,
             state.transport_key.as_ref(),
             fanout_auth(state),
@@ -7618,7 +7687,6 @@ async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std:
         let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
         let frame = replication_frame(proto::REQ_CATCHUP, after.to_le_bytes().to_vec(), wire);
         write_frame_on(&mut stream, &frame).await?;
-        let mut replay = crypto::ReplayGuard::default();
         loop {
             let f = tokio::time::timeout(
                 IO_TIMEOUT,
@@ -7709,6 +7777,27 @@ mod security_tests {
     ) -> Result<(), String> {
         let p = Database::parse_classified(sql).unwrap();
         authorize_statement(Some(db), &p.stmt, &p.tx, p.is_write, g)
+    }
+
+    #[test]
+    fn tx_pending_drain_resets_byte_budget() {
+        // Regression: the COMMIT drain took the writes but never reset the
+        // byte accounting, so the server's lifetime total of buffered SQL
+        // text counted against the per-transaction cap — after 64 MiB of
+        // cumulative explicit-transaction traffic every BEGIN..COMMIT was
+        // rejected with "transaction buffer exceeded".
+        let mut p = TxPending::new();
+        let chunk = "x".repeat(MAX_TX_PENDING_BYTES / 4);
+        for _ in 0..3 {
+            for _ in 0..4 {
+                assert!(p.check_room(chunk.len()));
+                p.push(chunk.clone());
+            }
+            assert!(!p.check_room(chunk.len()), "cap reached");
+            let drained = p.take_writes();
+            assert_eq!(drained.len(), 4);
+            assert!(p.check_room(chunk.len()), "budget must reset on drain");
+        }
     }
 
     #[test]
@@ -8080,6 +8169,32 @@ mod security_tests {
         // 解析失败的 listen 串保守返回 false,不 panic。
         assert!(!is_self_peer("not an addr", "127.0.0.1:7600").await);
         assert!(!is_self_peer("0.0.0.0:7600", "definitely not an addr").await);
+    }
+
+    #[tokio::test]
+    async fn is_self_peer_matches_own_lan_ip_behind_wildcard_listen() {
+        // Regression: a 0.0.0.0 listen never resolves to the interface
+        // addresses, so a node advertising its own LAN IP used to slip past
+        // the self check and register itself as its own peer — every write
+        // double-applied. Local-address ownership is proven by a UDP bind.
+        let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+            return;
+        };
+        if sock.connect("8.8.8.8:80").is_err() {
+            return; // no route to choose an interface address; nothing to prove
+        }
+        let Ok(local) = sock.local_addr() else {
+            return;
+        };
+        if local.ip().is_loopback() {
+            return; // CI box without a routable interface
+        }
+        let same_port = std::net::SocketAddr::new(local.ip(), 7600);
+        assert!(is_self_peer("0.0.0.0:7600", &same_port.to_string()).await);
+        // Same machine, different port: a distinct node (dev setups run
+        // several on one host) — must NOT count as self.
+        let other_port = std::net::SocketAddr::new(local.ip(), 7601);
+        assert!(!is_self_peer("0.0.0.0:7600", &other_port.to_string()).await);
     }
 
     #[test]

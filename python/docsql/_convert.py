@@ -19,6 +19,8 @@ import struct
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from .errors import DataError
+
 # The engine's TIMESTAMP domain (year 0001..=9999, see core/value.rs).
 # Out-of-domain markers stay plain dicts — the same policy the server's
 # decoder applies (there is no canonical text form to round-trip them).
@@ -29,6 +31,21 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+# rust_decimal's maximum unscaled value (2^96 - 1): anything beyond it
+# cannot parse server-side, where the $dec fallback silently binds the whole
+# marker object as a TEXT literal — reject loudly here instead.
+_DEC_MAX = 2**96 - 1
+
+
+def _exact_decimal_text(value):
+    """Text for a Decimal-typed bind, rejecting the out-of-domain silently."""
+    if value > _DEC_MAX or value < -_DEC_MAX:
+        raise DataError(
+            f"{value} exceeds DECIMAL precision (max {_DEC_MAX}); "
+            "bind it as a string or scale it down"
+        )
+    return str(value)
 
 
 def rows_from_payload(payload):
@@ -90,10 +107,11 @@ def param_json(value):
         return "true" if value else "false"
     if isinstance(value, int):
         # Outside int64 a bare JSON number would decay to an IEEE double
-        # server-side; route through the exact $dec path instead.
+        # server-side; route through the exact $dec path instead (rejecting
+        # the values even $dec cannot represent — see _exact_decimal_text).
         if _INT64_MIN <= value <= _INT64_MAX:
             return str(value)
-        return '{"$dec":"' + str(value) + '"}'
+        return '{"$dec":"' + _exact_decimal_text(value) + '"}'
     if isinstance(value, float):
         if value != value:  # NaN
             return '{"$float":"NaN"}'
@@ -103,7 +121,7 @@ def param_json(value):
             return '{"$float":"-inf"}'
         return _dump_json(value)
     if isinstance(value, Decimal):
-        return '{"$dec":"' + str(value) + '"}'
+        return '{"$dec":"' + _exact_decimal_text(value) + '"}'
     if isinstance(value, datetime):
         return '{"$ts":' + str(ts_ms(value)) + "}"
     if isinstance(value, (bytes, bytearray, memoryview)):

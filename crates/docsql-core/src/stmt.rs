@@ -312,8 +312,18 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
                     j
                 };
                 let empty_call = b.get(j) == Some(&b'(') && close > j;
-                if (word == b"now" || word == b"sysdate") && empty_call {
-                    out.push_str(if word == b"now" { &ts_lit } else { &str_lit });
+                if (word == b"now" || word == b"now_ms" || word == b"sysdate") && empty_call {
+                    // `now_ms` folds to the same TIMESTAMP literal: without
+                    // this arm the word-level match never sees it (the word
+                    // is `now_ms`, not `now`) while `mentions_wall_clock`'s
+                    // substring pre-filter does — the fold branch would run,
+                    // match nothing, and pass the raw call to the journal,
+                    // letting every replay peer stamp its own clock.
+                    out.push_str(if word == b"sysdate" {
+                        &str_lit
+                    } else {
+                        &ts_lit
+                    });
                     folded = true;
                     i = close;
                 } else if word == b"current_timestamp" && empty_call {
@@ -584,6 +594,13 @@ mod tests {
         assert!(folded.contains("消息"), "{folded}");
         // Non-folding text is None.
         assert!(fold_wall_clocks("SELECT 1", 0).is_none());
+        // NOW_MS(): one word containing `now` — the prefilter matched while
+        // the word-level matcher skipped it, letting the raw call through.
+        let folded = fold_wall_clocks("INSERT INTO t VALUES (NOW_MS())", 0).expect("now_ms folded");
+        assert!(folded.contains("CAST("), "{folded}");
+        assert!(!folded.contains("NOW_MS"), "{folded}");
+        // A column literally named now_ms stays verbatim.
+        assert!(fold_wall_clocks("SELECT now_ms FROM t", 0).is_none());
     }
 
     #[test]

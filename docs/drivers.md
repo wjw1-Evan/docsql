@@ -97,14 +97,21 @@ with docsql.connect(host="127.0.0.1", port=7600, token="...",
   (与 .NET 同一注入关闭机制);prepared 模板按连接缓存(上限 96,超限
   REQ_CLOSE_STMT 逐个注销);
 - 精确标量:`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、
-  `bytes`↔BLOB(`$bytes`);超 int64 的整数自动走 `$dec`;
+  `bytes`↔BLOB(`$bytes`);超 int64 的整数自动走 `$dec`,超出 DECIMAL 值域
+  (2^96-1)的整数/`Decimal` 绑定时客户端即抛 `DataError`(不再静默降级为文本);
 - `autocommit` 默认 **True**(单写者网络库,隐式事务会停住全局写路径;
   DB-API 偏离已在文档明示),`autocommit=False` 为 psycopg2 风格隐式块;
+- 读/写超时会**毒化连接**(服务端仍会送出迟到应答,复用会让下一条语句拿到
+  上一条的结果——静默错位一帧);捕获超时后重连,不要复用旧连接对象执行;
 - 原生 TLS 用 stdlib `ssl`(`tls_ca` 缺省 = 只加密不验证,自签形态);
   `DOCSQL_KEY` 帧加密需 `pip install docsql[crypto]`(cryptography 选装);
-- `docsql.Subscriber`:持久 pub/sub 专用连接 + 专职读线程,断线自动重连
-  并从每频道最后收到的 id 之后续传(`id > from`,不丢不重);
-- 错误层级:DB-API 标准族,映射基于服务端错误文本启发式。
+- `docsql.Subscriber`:持久 pub/sub 专用连接 + 专职读线程,空闲自动 PING 保活
+  (应对 `DOCSQL_IDLE_TIMEOUT`),断线自动重连并从每频道最后收到的 id 之后
+  续传(`id > from`,不丢不重;从未投递过消息的频道断连窗口内的消息仅显式
+  数字 `from_` 可恢复);`ping(reconnect=True)` 重连后未决事务响亮报错
+  (服务端已在断连时回滚),游标的 prepared 缓存自动失效重编;
+- 错误层级:DB-API 标准族,映射基于服务端错误文本启发式;协议级
+  `ProtocolError` 属 `InterfaceError` 子类(传输失效,连接必须弃用)。
 
 ### 参数绑定:服务端 prepared statements(默认路径)
 

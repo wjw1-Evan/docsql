@@ -505,6 +505,7 @@ pub(crate) fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
             if matches!(
                 n.as_str(),
                 "now"
+                    | "now_ms"
                     | "sysdate"
                     | "current_timestamp"
                     | "getdate"
@@ -1874,6 +1875,33 @@ impl<'a> ReadCx<'a> {
                 out.push(row);
             }
         }
+        // DISTINCT applies to the projected rows here too: when GROUP BY
+        // keys are finer than the projection (or GROUPING SETS repeat a
+        // shape) duplicate output rows must fold — the plain path does the
+        // same at this position, by encoded row identity. DISTINCT ON stays
+        // an explicit unsupported feature instead of silently passing.
+        let out = match &select.distinct {
+            Some(sqlparser::ast::Distinct::On(cols)) => {
+                return err(format!(
+                    "DISTINCT ON is not supported: {}",
+                    cols.iter().map(expr_name).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            Some(sqlparser::ast::Distinct::Distinct) => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut kept = Vec::with_capacity(out.len());
+                for row in out {
+                    self.deadline.check()?;
+                    let key = encode::encode_to_vec(&Value::Array(row.clone()))
+                        .map_err(SqlError::Encode)?;
+                    if seen.insert(key) {
+                        kept.push(row);
+                    }
+                }
+                kept
+            }
+            None | Some(sqlparser::ast::Distinct::All) => out,
+        };
         let out = self.apply_order_limit(query, out, &columns, None, None)?;
         Ok(ExecOutcome::Rows(QueryResult { columns, rows: out }))
     }
@@ -4528,6 +4556,20 @@ impl<'a> ReadCx<'a> {
         if exprs.is_empty() {
             return Ok(None);
         }
+        // `SELECT *`(含 `*, expr`)的输出列集是「全部过滤行」的字段并集
+        // (通用路径在 LIMIT 之前推导,空集时退化为声明列);窗口快路径
+        // 只装载 skip+take 行,并集会丢掉只存在于窗口之外行的字段——列
+        // 形状随 ORDER BY 列有无索引而漂移。通配符一律回退通用路径(与
+        // unindexed top-K 窗口同一门禁)。
+        if select.projection.iter().any(|i| {
+            matches!(
+                i,
+                sqlparser::ast::SelectItem::Wildcard(_)
+                    | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+            )
+        }) {
+            return Ok(None);
+        }
         // 输出列名优先(与 apply_order_limit 同一解析序):ORDER BY 键名命中
         // 投影别名时,通用路径按该输出列的值排序;索引窗口按同名表列走
         // 树序 —— 只有输出列表达式恰是同一裸列引用时两者才一致,否则
@@ -5781,13 +5823,25 @@ impl Database {
                     crate::pager::UndoOp::Realloc(_) => {}
                 }
             }
-            self.tables = snap.tables;
-            self.autoinc_cache = snap.autoinc;
-            if sync_catalog {
-                self.save_catalog_into(&mut tx)?;
+            // Publish AFTER durability (the mirror of COMMIT's
+            // durability-first order): the restored view must be installed
+            // for the catalog write below, but a failed commit reverts it —
+            // otherwise the in-memory catalog leads the pager with a view
+            // whose rollback never became durable, and the next
+            // `save_catalog` would persist the mix.
+            let prev_tables = std::mem::replace(&mut self.tables, snap.tables);
+            let prev_autoinc = std::mem::replace(&mut self.autoinc_cache, snap.autoinc);
+            let result = if sync_catalog {
+                self.save_catalog_into(&mut tx)
+                    .and_then(|_| self.commit_pager_tx(tx))
+            } else {
+                self.commit_pager_tx(tx)
+            };
+            if result.is_err() {
+                self.tables = prev_tables;
+                self.autoinc_cache = prev_autoinc;
             }
-            self.commit_pager_tx(tx)?;
-            Ok(())
+            result.map(|_| ())
         };
         let result = replay();
         self.pager.resume_undo();
@@ -5795,16 +5849,27 @@ impl Database {
     }
 
     fn rollback_tx(&mut self) -> Result<ExecOutcome> {
-        let Some(snap) = self.tx_snapshot.take() else {
+        if self.tx_snapshot.is_none() {
             return err("no transaction in progress");
-        };
-        self.savepoints.clear();
+        }
+        // Durability FIRST, teardown after (mirrors COMMIT above): taking
+        // the snapshot before the undo-replay commit used to leave a failed
+        // ROLLBACK wedged — retry hit "no transaction in progress" while
+        // the engine held neither the rolled-back pages nor a consistent
+        // catalog. On failure the transaction stays open and the error is
+        // loud; teardown only runs once the restore is durable.
         let undo = self.pager.take_undo();
         // 先把本事务各语句的 deferred 提交显式作废:没有这组 ABORT 帧,
         // 恢复事务的同步提交会先落 FENCE,撕裂崩溃停在「FENCE 已持久、
         // 恢复事务 COMMIT 未持久」窗口时,整个已回滚事务会复活。
         self.pager.abort_deferred()?;
+        let snap = self
+            .tx_snapshot
+            .clone()
+            .expect("checked above; single writer keeps it in place");
         self.restore_transaction(snap, undo, true)?;
+        let _ = self.tx_snapshot.take();
+        self.savepoints.clear();
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -22625,6 +22690,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordered_index_window_wildcard_keeps_full_field_union() {
+        // Regression: the wildcard's column set is the union over ALL
+        // filtered rows (the generic path derives it before LIMIT); the
+        // index window loaded only the skip+take rows, so a field living
+        // solely in a skipped row vanished from `SELECT *` — the output
+        // shape drifted with whether the ORDER BY column had an index.
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, a INT NOT NULL, name TEXT)",
+        );
+        run(&mut db, "CREATE INDEX i_a ON t(a)");
+        run(&mut db, "INSERT INTO t VALUES (1,1,'x'),(2,2,'y')");
+        run(
+            &mut db,
+            "INSERT INTO t (id,a,name,extra) VALUES (3,3,'z','surprise')",
+        );
+        let fast = rows(&mut db, "SELECT * FROM t ORDER BY a LIMIT 2");
+        let generic = rows(&mut db, "SELECT * FROM t WHERE 1 = 1 ORDER BY a LIMIT 2");
+        assert_eq!(fast.columns, generic.columns);
+        assert!(
+            fast.columns.contains(&"extra".to_string()),
+            "columns: {:?}",
+            fast.columns
+        );
+    }
+
+    #[test]
+    fn grouped_select_honors_distinct() {
+        // Regression: the grouped path used to ignore `select.distinct`
+        // entirely — GROUP BY keys finer than the projection returned
+        // duplicate rows, and DISTINCT ON passed silently where the plain
+        // path reports it unsupported.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE g (a INT, b INT)");
+        run(&mut db, "INSERT INTO g VALUES (1,1),(1,2),(2,1),(2,2)");
+        let r = rows(&mut db, "SELECT DISTINCT a, COUNT(*) FROM g GROUP BY a, b");
+        assert_eq!(r.rows.len(), 2, "{:?}", r.rows);
+        let r = rows(&mut db, "SELECT DISTINCT COUNT(*) FROM g GROUP BY a");
+        assert_eq!(r.rows.len(), 1, "{:?}", r.rows);
+        assert!(db
+            .execute("SELECT DISTINCT ON (a) COUNT(*) FROM g GROUP BY a")
+            .is_err());
+    }
+
     // ---- standard clause matrix ----
 
     #[test]
@@ -25638,6 +25749,24 @@ mod tests {
         // node would evaluate a different instant.
         assert!(db
             .execute("CREATE TABLE bad (x TIMESTAMP, CHECK (x < NOW()))")
+            .is_err());
+        // NOW_MS() used to escape every wall-clock gate: the fold scanner
+        // word-matches `now`/`current_timestamp` while the cheap prefilter
+        // substring-matches `now` too — the fold branch ran, matched nothing,
+        // and journaled the raw call for every replay peer to re-stamp.
+        run(
+            &mut db,
+            "CREATE TABLE nm (id INT, ts TIMESTAMP DEFAULT NOW_MS())",
+        );
+        run(&mut db, "INSERT INTO nm (id) VALUES (1)");
+        let resolved = db.take_resolved_sql().unwrap();
+        assert!(resolved.contains("AS TIMESTAMP"), "{resolved}");
+        assert!(!resolved.contains("NOW_MS()"), "{resolved}");
+        run(&mut db, "INSERT INTO nm VALUES (2, NOW_MS())");
+        let resolved = db.take_resolved_sql().unwrap();
+        assert!(!resolved.contains("NOW_MS()"), "{resolved}");
+        assert!(db
+            .execute("CREATE TABLE badnm (x TIMESTAMP, CHECK (x < NOW_MS()))")
             .is_err());
         // MERGE has no canonical rewrite; applying a wall-clock DEFAULT
         // through it would silently diverge replicas — explicit refusal.

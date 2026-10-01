@@ -77,7 +77,13 @@ REVOKE SELECT ON sales FROM analyst;                        -- 即时生效(纪�
 - Web 控制台:首次使用强制设置账号(盐化 PBKDF2 存储,HttpOnly 会话 Cookie),
   改密码踢掉其它全部在线会话;浏览器不持有节点令牌(控制台以服务端 `DOCSQL_TOKEN`
   连接节点,该 token 也可作程序化 API 旁路);
-  `node` 参数受 `DOCSQL_PEERS` 白名单约束(SSRF 防护)。
+  `node` 参数受 `DOCSQL_PEERS` 白名单约束(SSRF 防护);
+  CSV 导出带公式注入防护(`=`/`+`/`-`/`@`/制表符/回车开头的单元格加引号前缀中和,
+  与 CLI 导出同一规则——数据库写入者存储的 `=WEBSERVICE(...)` 不会在分析员的
+  电子表格软件中执行);
+- `DOCSQL_KEY` 帧加密的重放防护双向对称:入向逐帧校验 nonce 单调;出向连接
+  (扇出/探测/备份/join)整连接共享一个重放闸——截获的早期应答帧无法跨位重放
+  伪造扇出确认。
 
 ## 审计
 

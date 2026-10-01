@@ -343,8 +343,24 @@ impl Wal {
     /// commit, and dropping their redo would roll the data file back to an
     /// older image on recovery.
     pub fn commit(&mut self, txid: u64) -> Result<u64> {
-        self.fence()?;
-        let lsn = self.append(KIND_COMMIT, txid, &[])?;
+        let fence_lsn = self.fence()?;
+        let lsn = match self.append(KIND_COMMIT, txid, &[]) {
+            Ok(lsn) => lsn,
+            Err(e) => {
+                // A real fence frame is already in the page cache and may
+                // reach disk via kernel writeback while the caller treats
+                // this commit as failed. The fence consumed the deferred
+                // txid list, so a later `abort_deferred` has nothing left to
+                // void and recovery could resurrect a transaction the live
+                // engine rolled back. Fail-stop, same rationale as `sync`.
+                if fence_lsn > 0 {
+                    self.poisoned = Some(
+                        "WAL append failed after fence; on-disk durability is ambiguous".into(),
+                    );
+                }
+                return Err(e);
+            }
+        };
         self.last_commit_lsn = self.last_commit_lsn.max(lsn);
         self.sync()?;
         Ok(lsn)

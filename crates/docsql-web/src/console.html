@@ -947,10 +947,14 @@ function downloadText(name, text) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 // RFC4180 CSV:含逗号/引号/换行的字段加引号,内嵌引号翻倍。
+// 公式注入防护与 CLI 的 csv_cell 同一规则:以 = + - @(或制表符/回车,
+// Excel 同样当作公式引导符)开头的单元格加单引号前缀中和——任何写入者
+// 存储的 =WEBSERVICE(...) 不得在分析员机器上执行。
 function csvField(v) {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  const guarded = /^[=+\-@\t\r]/.test(s) ? "'" + s : s;
+  return /[",\n\r]/.test(guarded) ? '"' + guarded.replace(/"/g, '""') + '"' : guarded;
 }
 function setsToCsv(sets) {
   return sets.map(set => {

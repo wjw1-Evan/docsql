@@ -310,6 +310,11 @@ impl TsqlSession {
             }
             Stmt::While { cond, body } => {
                 loop {
+                    // Charge the budget per ITERATION, not just per inner
+                    // statement: an empty body (`WHILE 1 = 1 BEGIN END`)
+                    // executes zero statements per lap and used to spin
+                    // forever — the loop itself is the work.
+                    *budget = budget.checked_sub(1).ok_or_else(batch_budget_hit)?;
                     if !self.eval_cond(exec, &cond).await? {
                         break;
                     }
@@ -2161,8 +2166,13 @@ fn strip_outer_parens(text: &str) -> Option<&str> {
 /// statement's identity snapshot must reach the session.
 pub fn is_insert_statement(sql: &str) -> bool {
     let i = leading_trivia_end(sql);
-    (sql.len() >= i + 6 && sql[i..i + 6].eq_ignore_ascii_case("INSERT"))
-        || (sql.len() >= i + 5 && sql[i..i + 5].eq_ignore_ascii_case("MERGE"))
+    // Byte slices, never `&str` slicing: the length guard alone does not
+    // guarantee a char boundary — `sql[i..i + 6]` panicked when the 6th
+    // byte landed inside a multi-byte character (a plain emoji statement
+    // took the connection down).
+    let b = sql.as_bytes();
+    (b.len() >= i + 6 && b[i..i + 6].eq_ignore_ascii_case(b"INSERT"))
+        || (b.len() >= i + 5 && b[i..i + 5].eq_ignore_ascii_case(b"MERGE"))
 }
 
 /// Byte offset of the first real token after leading whitespace and
@@ -2541,6 +2551,27 @@ mod tests {
         // Runaway loop hits the budget.
         let e = run_script(&mut s, &mut db, "WHILE 1 = 1\nBEGIN\n  SET @i = @i\nEND").unwrap_err();
         assert!(e.to_string().contains("budget"), "{e}");
+        // Regression: an EMPTY body runs zero statements per lap, so the
+        // per-statement budget never fired — the connection spun one CPU
+        // core forever. The loop iteration itself is charged now.
+        let e = run_script(&mut s, &mut db, "WHILE 1 = 1 BEGIN END").unwrap_err();
+        assert!(e.to_string().contains("budget"), "{e}");
+    }
+
+    #[test]
+    fn is_insert_statement_never_panics_on_multibyte() {
+        // Regression: the length guard alone did not guarantee a char
+        // boundary — slicing `sql[i..i + 6]` panicked when the 6th byte
+        // landed inside an emoji, taking the connection (or the embedded
+        // CLI process) down on one statement.
+        assert!(!is_insert_statement("😀😀😀;"));
+        assert!(!is_insert_statement("😀😀😀\nSELECT 1"));
+        assert!(!is_insert_statement("émage"));
+        assert!(is_insert_statement("INSERT INTO t VALUES (1)"));
+        assert!(is_insert_statement(
+            "  /* c */ MERGE INTO t USING s ON 1 = 1"
+        ));
+        assert!(!is_insert_statement("SELECT 1"));
     }
 
     #[test]

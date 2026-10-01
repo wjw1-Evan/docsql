@@ -301,6 +301,11 @@ internal static class ConnectionPool
             proto.Dispose();
             return;
         }
+        // Reset the read budget before pooling: Execute() stamps its
+        // CommandTimeout onto the PHYSICAL connection, and the next
+        // borrower's liveness PING would otherwise wait on the previous
+        // user's budget (up to hours) against a black-holed peer.
+        proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
         slot.Idle.Enqueue(proto);
         slot.Permits.Release();
         // 并发归还可能让空闲数越过 MaxSize:自愈裁剪,物理连接总数不超上限。
@@ -1252,24 +1257,55 @@ public sealed class DocsqlDataReader : DbDataReader
 
     private static object? MarkerToValue(JsonElement e)
     {
-        if (e.TryGetProperty("$dec", out var dec) && dec.ValueKind == JsonValueKind.String)
+        // Mirror the server's decode_marker (and the Python driver's hook)
+        // exactly: a marker counts only when the object holds EXACTLY that
+        // one key AND the value parses. User documents may legitimately
+        // contain "$dec"-shaped fields beside other data — probing single
+        // properties on multi-key objects silently retyped them, and an
+        // unparseable value threw out of the reader constructor, failing
+        // the whole result set. Every failure path falls back to the raw
+        // object text, never throws.
+        bool singleKey = e.EnumerateObject().Count() == 1;
+        if (singleKey
+            && e.TryGetProperty("$dec", out var dec)
+            && dec.ValueKind == JsonValueKind.String
+            && decimal.TryParse(
+                dec.GetString(),
+                NumberStyles.Number,
+                CultureInfo.InvariantCulture,
+                out var dv))
         {
-            return decimal.Parse(dec.GetString()!, CultureInfo.InvariantCulture);
+            return dv;
         }
-        // TIMESTAMP: UTC milliseconds (engine stores i64 ms, year 0001-9999).
+        // TIMESTAMP: UTC milliseconds (engine stores i64 ms, year 0001-9999;
+        // out-of-domain values stay raw — same fail-safe as the server).
         // Surfaced as UTC DateTime so existing readers keep working; the
         // engine is millisecond-precision, sub-ms digits do not round-trip.
-        if (e.TryGetProperty("$ts", out var ts) && ts.ValueKind == JsonValueKind.Number)
+        const long TsMinMs = -62_135_596_800_000;
+        const long TsMaxMs = 253_402_300_799_999;
+        if (singleKey
+            && e.TryGetProperty("$ts", out var ts)
+            && ts.ValueKind == JsonValueKind.Number
+            && ts.TryGetInt64(out var ms)
+            && ms is >= TsMinMs and <= TsMaxMs)
         {
-            return DateTimeOffset.FromUnixTimeMilliseconds(ts.GetInt64()).UtcDateTime;
+            return DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
         }
-        if (e.TryGetProperty("$bytes", out var bytes) && bytes.ValueKind == JsonValueKind.Array)
+        if (singleKey
+            && e.TryGetProperty("$bytes", out var bytes)
+            && bytes.ValueKind == JsonValueKind.Array)
         {
             var b = new byte[bytes.GetArrayLength()];
             int i = 0;
             foreach (var x in bytes.EnumerateArray())
             {
-                b[i++] = x.GetByte();
+                // Any non-byte item keeps the WHOLE object raw, matching
+                // decode_marker's mid-array fallback.
+                if (x.ValueKind != JsonValueKind.Number || !x.TryGetByte(out var by))
+                {
+                    return e.GetRawText();
+                }
+                b[i++] = by;
             }
             return b;
         }
@@ -1277,11 +1313,13 @@ public sealed class DocsqlDataReader : DbDataReader
         // emit them as JSON numbers): NaN/inf/-inf map straight onto the
         // double constants so GetDouble works instead of handing the caller
         // the raw marker string.
-        if (e.TryGetProperty("$float", out var f) && f.ValueKind == JsonValueKind.String)
+        if (singleKey
+            && e.TryGetProperty("$float", out var f)
+            && f.ValueKind == JsonValueKind.String)
         {
             return f.GetString() switch
             {
-                "NaN" => double.NaN,
+                "NaN" => (object)double.NaN,
                 "inf" or "+inf" or "Infinity" => double.PositiveInfinity,
                 "-inf" or "-Infinity" => double.NegativeInfinity,
                 _ => e.GetRawText(),

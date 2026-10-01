@@ -13,6 +13,7 @@ TLS (`tls=True`), which needs no third-party dependency.
 
 import os
 import struct
+import threading
 
 from ._proto import ProtocolError
 
@@ -48,6 +49,11 @@ class Sealer:
         self._cipher = _AESGCM(key_bytes)
         self._prefix = os.urandom(8)
         self._counter = 0
+        # The counter increment must be atomic: a control thread and the
+        # reader thread sealing concurrently used to race the read-modify-
+        # write and could mint the SAME (prefix, counter) nonce twice —
+        # GCM nonce reuse exposes the keystream.
+        self._seal_lock = threading.Lock()
         # Inbound replay guard (see the server's ReplayGuard): seals from
         # one peer share a prefix and carry strictly increasing counters;
         # a captured frame replayed on this connection must be rejected
@@ -60,15 +66,16 @@ class Sealer:
         return struct.pack("<HH", frame_type, flags) + challenge
 
     def seal(self, frame_type, flags, plaintext, challenge):
-        self._counter += 1
-        if self._counter > 0xFFFF_FFFF:
-            raise ProtocolError(
-                "nonce counter exhausted (>2^32 frames on this connection); reconnect"
+        with self._seal_lock:
+            self._counter += 1
+            if self._counter > 0xFFFF_FFFF:
+                raise ProtocolError(
+                    "nonce counter exhausted (>2^32 frames on this connection); reconnect"
+                )
+            nonce = self._prefix + struct.pack("<I", self._counter)
+            sealed = self._cipher.encrypt(
+                nonce, plaintext, self._aad(frame_type, flags, challenge)
             )
-        nonce = self._prefix + struct.pack("<I", self._counter)
-        sealed = self._cipher.encrypt(
-            nonce, plaintext, self._aad(frame_type, flags, challenge)
-        )
         return nonce + sealed
 
     def open(self, frame_type, flags, sealed, challenge):
@@ -83,7 +90,13 @@ class Sealer:
             raise ProtocolError("peer nonce prefix changed mid-connection")
         if counter <= self._peer_last:
             raise ProtocolError("replayed or reordered frame rejected (nonce counter)")
-        self._peer_last = counter
-        return self._cipher.decrypt(
+        # Verify-THEN-advance: the watermark only moves after the GCM tag
+        # validates. Advancing first let a forged inflated-counter frame
+        # poison the guard and get every later legitimate frame rejected as
+        # a replay. (A genuinely replayed frame keeps its valid tag and is
+        # still caught by the counter check above.)
+        plaintext = self._cipher.decrypt(
             nonce, ct, self._aad(frame_type, flags, challenge)
         )
+        self._peer_last = counter
+        return plaintext

@@ -135,7 +135,14 @@ public sealed class ProtocolConnection : IDisposable
     /// CommandTimeout a silent no-op on the sync path (the async path passes
     /// the budget explicitly and was unaffected).
     /// </remarks>
-    private int _readTimeoutMs = 30_000;
+    /// <summary>
+    /// The default per-read budget, reapplied when a pooled connection is
+    /// returned: the liveness PING on the next checkout must not inherit
+    /// the PREVIOUS borrower's CommandTimeout — a stale hour-long budget on
+    /// a black-holed peer hung pool checkout for exactly that long.
+    /// </summary>
+    internal const int DefaultReadTimeoutMs = 30_000;
+    private int _readTimeoutMs = DefaultReadTimeoutMs;
     public int ReadTimeoutMs
     {
         get => _readTimeoutMs;
@@ -487,6 +494,13 @@ public sealed class ProtocolConnection : IDisposable
             }
             throw;
         }
+        catch (DocsqlException)
+        {
+            // 解密/重放闸失败(Assemble):帧流已被篡改或错位,与 IO 失败同一
+            // 毒化纪律 —— 不置 Broken 时 Close() 会把这条连接原样归还池。
+            BreakConnection();
+            throw;
+        }
     }
 
     /// <summary><see cref="Send"/> 的真异步形态。取消只到语句边界:一帧发到
@@ -528,6 +542,13 @@ public sealed class ProtocolConnection : IDisposable
         catch (OperationCanceledException)
         {
             // 外部令牌取消,同上:帧流错位,弃用连接后原样上抛。
+            BreakConnection();
+            throw;
+        }
+        catch (DocsqlException)
+        {
+            // 解密/重放闸失败(Assemble):同 Send 的毒化纪律,防止
+            // Close() 把帧流不可信的连接归还池。
             BreakConnection();
             throw;
         }
@@ -700,8 +721,16 @@ public sealed class ProtocolConnection : IDisposable
         {
             if (_key is null)
                 throw new DocsqlException("服务端返回加密帧但客户端未配置 key");
-            CheckReplay(payload);
+            // Verify-THEN-advance: the replay watermark only moves after the
+            // GCM tag validates. A forged frame carrying an inflated counter
+            // used to advance the watermark first and fail the tag check
+            // second — every later legitimate frame was then rejected as a
+            // replay on a connection that was still pooled. (A genuinely
+            // replayed frame keeps its valid tag and is still caught by the
+            // counter check below.)
+            var sealed_ = payload;
             payload = Unseal(_key, type, flags, payload);
+            CheckReplay(sealed_);
         }
         return new Frame(type, flags, topo, payload);
     }

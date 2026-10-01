@@ -199,6 +199,23 @@ impl BTree {
         BTree { root }
     }
 
+    // Decode one cell key at `pos`. The stored `klen` is authoritative for the
+    // next cell's offset: a decode that consumed fewer bytes than `klen`
+    // means the length field is damaged (decode_prefix deliberately tolerates
+    // trailing bytes) — mis-parsing here would shift every following cell and
+    // a later write_node would re-serialize the garbage, laundering the
+    // corruption into a structurally valid page. Loud Corrupt instead.
+    fn decode_cell_key(page: &[u8], pos: usize, klen: usize) -> Result<(Value, usize)> {
+        let buf = page
+            .get(pos..pos + klen)
+            .ok_or(BTreeError::Corrupt("truncated node cell"))?;
+        let (k, used) = encode::decode_prefix(buf)?;
+        if used != klen {
+            return Err(BTreeError::Corrupt("node cell key length mismatch"));
+        }
+        Ok((k, used))
+    }
+
     fn read_node(reader: &PageReader, tx: &Tx, id: u32) -> Result<Node> {
         // Owned page copy: btree reads run on `&Pager` (MVCC stage A shared
         // readers / stage B snapshot readers). A 4 KiB copy per node visit is
@@ -220,7 +237,7 @@ impl BTree {
                     let klen =
                         u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
+                    let (k, used) = Self::decode_cell_key(&page, pos, klen)?;
                     pos += used;
                     let val = u64::from_le_bytes(take(&page, pos, 8)?.try_into().unwrap());
                     pos += 8;
@@ -236,7 +253,7 @@ impl BTree {
                     let klen =
                         u16::from_le_bytes(take(&page, pos, 2)?.try_into().unwrap()) as usize;
                     pos += 2;
-                    let (k, used) = encode::decode_prefix(take(&page, pos, klen)?)?;
+                    let (k, used) = Self::decode_cell_key(&page, pos, klen)?;
                     pos += used;
                     let child = u32::from_le_bytes(take(&page, pos, 4)?.try_into().unwrap());
                     pos += 4;
@@ -1089,6 +1106,36 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn inflated_klen_is_loudly_corrupt() {
+        // A damaged cell length header (klen larger than the encoded key)
+        // used to silently mis-parse every following cell — decode_prefix
+        // deliberately tolerates trailing bytes — and the next write_node
+        // would re-serialize that garbage, laundering the corruption into a
+        // structurally valid page.
+        let (_d, pager) = fresh("bt-klen.db");
+        let mut tx = pager.begin_tx();
+        let mut tree = BTree::create(&pager, &mut tx).unwrap();
+        for i in 0..10i64 {
+            tree.insert(&pager, &mut tx, Value::Int(i), i as u64, false)
+                .unwrap();
+        }
+        let root = tree.root;
+        pager.commit_tx(tx).unwrap();
+        let mut tx = pager.begin_tx();
+        let true_len = u16::from_le_bytes([pager.read_page(root).unwrap()[3], 0]);
+        pager
+            .write_page(&mut tx, root, 3, &(true_len + 2).to_le_bytes())
+            .unwrap();
+        pager.commit_tx(tx).unwrap();
+        let tx = pager.begin_tx();
+        let reader = PageReader::current(&pager);
+        assert!(matches!(
+            BTree::read_node(&reader, &tx, root),
+            Err(BTreeError::Corrupt(_))
+        ));
     }
 
     #[test]

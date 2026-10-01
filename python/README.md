@@ -77,22 +77,32 @@ sub.close()
 ```
 
 订阅使用专用连接 + 专职读线程(订阅连接是流式推送,不能复用一问一答
-连接)。断线自动重连并**从每频道最后收到的 id 之后续传**(服务器语义
-`id > from`,不丢不重);glob 模式订阅(`psubscribe`)重连后从 latest。
+连接)。**空闲自动 PING 保活**(应对 `DOCSQL_IDLE_TIMEOUT`);断线自动重连并
+**从每频道最后收到的 id 之后续传**(服务器语义 `id > from`,不丢不重);glob
+模式订阅(`psubscribe`)重连后从 latest。从未投递过消息的频道(尚无 id 锚点)
+在断连窗口内发布的消息,只有显式数字 `from_` 才能覆盖——需要严格不丢的频道
+请用 `from_=<id>` 或 `"earliest"` 订阅。
+
+`conn.ping(reconnect=True)` 断线透明重连:未决事务会响亮报错(服务端已在
+断连时回滚,commit 不会假装成功),游标缓存的 prepared 句柄自动失效并在
+下次参数化执行时重编。读/写超时同样毒化连接(服务端仍会送出迟到应答,
+复用会让下一条语句拿到上一条的结果)——捕获超时后请重连,不要复用旧连接。
 
 ## 错误层级
 
-DB-API 标准:`Error` → `InterfaceError`(传输层,连接作废)/
-`DatabaseError`(→ `DataError` / `OperationalError` / `IntegrityError` /
-`InternalError` / `ProgrammingError` / `NotSupportedError`)。映射基于
-服务端错误文本的启发式,未识别的文本抛 `DatabaseError`。
+DB-API 标准:`Error` → `InterfaceError`(传输层,连接作废;协议级
+`ProtocolError` 是它的子类)/ `DatabaseError`(→ `DataError` /
+`OperationalError` / `IntegrityError` / `InternalError` / `ProgrammingError` /
+`NotSupportedError`)。映射基于服务端错误文本的启发式,未识别的文本抛
+`DatabaseError`。绑定超出 DECIMAL 值域(2^96-1)的整数/`Decimal` 在客户端
+即抛 `DataError`。
 
 ## 运行测试
 
 ```bash
 cargo build -p docsql-server        # 仓库根;测试会启动 debug 二进制
 pip install pytest cryptography
-python -m pytest python/tests -q    # 29 用例
+python -m pytest python/tests -q    # 35 用例
 ```
 
 测试自备自签证书(`tests/fixtures/`,SAN 含 localhost 与 127.0.0.1),

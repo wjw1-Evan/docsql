@@ -74,7 +74,10 @@ def connect(
     - ``key``: legacy AES-256-GCM frame sealing (DOCSQL_KEY hex). Requires
       the optional ``cryptography`` package; prefer ``tls`` on new
       deployments.
-    - ``timeout``: seconds for connect AND each read/write operation.
+    - ``timeout``: seconds for connect AND each read/write operation. A
+      timeout POISONS the connection (the server still answers the timed-
+      out statement later — a reused socket would misalign requests and
+      replies by one frame); reconnect after catching it.
     """
     return Connection(
         host=host,
@@ -93,12 +96,22 @@ def connect(
 
 class _Transport:
     """One connected socket: framed reads/writes, optional TLS, optional
-    AES-GCM sealing. Owns the round-trip lock."""
+    AES-GCM sealing. Owns the round-trip lock.
+
+    Any read/write failure (timeout included) POISONS the transport: the
+    server still completes the in-flight statement and writes its reply,
+    so a live-looking socket after a timeout would hand the NEXT round
+    trip a stale answer (silent one-frame misalignment). Every later use
+    raises InterfaceError until the application reconnects.
+    """
 
     def __init__(self, host, port, tls, tls_ca, tls_hostname, key, timeout):
         self._lock = threading.Lock()
         self._closed = False
-        self.timeout = timeout
+        self._timeout = timeout  # create_connection already applied it
+        # Partial-frame buffer for `read_frame_poll` (keepalive loops read
+        # with a bounded wait; a header may arrive without its payload).
+        self._poll_buf = bytearray()
         try:
             raw = socket.create_connection((host, port), timeout=timeout)
         except OSError as e:
@@ -126,12 +139,42 @@ class _Transport:
                 self._read_hello()
             else:
                 self._sealer = None
+        except ssl.SSLError as e:
+            # TLS handshake / certificate failures are reconnectable
+            # conditions, not a broken Transport (none exists yet) — map
+            # them or they escape every `except Error` recovery path and
+            # kill subscriber reader threads.
+            self._shutdown_sock()
+            raise OperationalError(f"TLS handshake with {host}:{port} failed: {e}") from e
         except Exception:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+            self._shutdown_sock()
             raise
+
+    def _shutdown_sock(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    @property
+    def timeout(self):
+        """Per-operation socket timeout. The setter pushes into the socket:
+        a plain attribute used to make later assignments silent no-ops (the
+        recv timeout kept the connect-time value)."""
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value):
+        self._timeout = value
+        try:
+            self._sock.settimeout(value)
+        except OSError:
+            pass
+
+    def _poison(self):
+        """Mark unusable and drop the socket (see the class docstring)."""
+        self._closed = True
+        self._shutdown_sock()
 
     # -- socket plumbing ---------------------------------------------------
     def _read_exact(self, n):
@@ -140,10 +183,13 @@ class _Transport:
             try:
                 chunk = self._sock.recv(n - len(buf))
             except (socket.timeout, TimeoutError) as e:
+                self._poison()
                 raise OperationalError(f"read timed out after {self.timeout}s") from e
             except OSError as e:
+                self._poison()
                 raise InterfaceError(f"connection lost during read: {e}") from e
             if not chunk:
+                self._poison()
                 raise InterfaceError("connection closed by server")
             buf.extend(chunk)
         return bytes(buf)
@@ -157,11 +203,8 @@ class _Transport:
             )
         self._challenge = payload
 
-    def read_frame(self):
-        """Read one frame; returns (flags, frame_type, payload). Not sealed
-        responses are rejected on keyed connections, mirroring the server."""
-        flags, frame_type, length = _proto.decode_header(self._read_exact(_proto.HEADER_LEN))
-        payload = self._read_exact(length)
+    def _finalize_frame(self, flags, frame_type, payload):
+        """Shared tail of both read paths: unseal keyed frames."""
         if self._sealer is not None:
             if not flags & _proto.FLAG_ENCRYPTED:
                 raise InterfaceError(
@@ -169,9 +212,58 @@ class _Transport:
                 )
             try:
                 payload = self._sealer.open(frame_type, flags, payload, self._challenge)
+            except Error:
+                self._poison()
+                raise
             except Exception as e:
+                self._poison()
                 raise InterfaceError(f"frame decryption failed: {e}") from e
         return flags, frame_type, payload
+
+    def read_frame(self):
+        """Read one frame; returns (flags, frame_type, payload). Not sealed
+        responses are rejected on keyed connections, mirroring the server."""
+        flags, frame_type, length = _proto.decode_header(self._read_exact(_proto.HEADER_LEN))
+        payload = self._read_exact(length)
+        return self._finalize_frame(flags, frame_type, payload)
+
+    def read_frame_poll(self, poll_seconds):
+        """Read one frame with a bounded wait; None when the poll interval
+        elapses fully idle. For subscription keepalive loops, where an idle
+        poll means "time to PING", not "dead connection" — partial frames
+        stay buffered across polls. Errors poison exactly like read_frame.
+        Only the owning reader thread may call this."""
+        while True:
+            if len(self._poll_buf) >= _proto.HEADER_LEN:
+                header = bytes(self._poll_buf[: _proto.HEADER_LEN])
+                flags, frame_type, length = _proto.decode_header(header)
+                if len(self._poll_buf) >= _proto.HEADER_LEN + length:
+                    payload = bytes(
+                        self._poll_buf[_proto.HEADER_LEN : _proto.HEADER_LEN + length]
+                    )
+                    del self._poll_buf[: _proto.HEADER_LEN + length]
+                    return self._finalize_frame(flags, frame_type, payload)
+            try:
+                self._sock.settimeout(poll_seconds)
+                chunk = self._sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                if len(self._poll_buf) > 0:
+                    # A partial frame is in flight: keep waiting for the
+                    # rest rather than reporting idle.
+                    continue
+                return None
+            except OSError as e:
+                self._poison()
+                raise InterfaceError(f"connection lost during read: {e}") from e
+            finally:
+                try:
+                    self._sock.settimeout(self.timeout)
+                except OSError:
+                    pass
+            if not chunk:
+                self._poison()
+                raise InterfaceError("connection closed by server")
+            self._poll_buf.extend(chunk)
 
     def write_frame(self, frame_type, payload, flags=0):
         if self._closed:
@@ -183,8 +275,10 @@ class _Transport:
         try:
             self._sock.sendall(wire)
         except (socket.timeout, TimeoutError) as e:
+            self._poison()
             raise OperationalError(f"write timed out after {self.timeout}s") from e
         except OSError as e:
+            self._poison()
             raise InterfaceError(f"connection lost during write: {e}") from e
 
     def round_trip(self, frame_type, payload, flags=0):
@@ -244,6 +338,10 @@ class Connection:
         )
         self._cursors = set()
         self._tx_open = False
+        # Set when a reconnect dropped an open transaction: the server
+        # rolled it back on disconnect, so a later commit() must NOT claim
+        # success (the caller would believe durable what was discarded).
+        self._tx_lost = False
         self._closed = False
         try:
             self._authenticate(kwargs)
@@ -282,12 +380,21 @@ class Connection:
     def commit(self):
         if self.autocommit:
             return
+        if self._tx_lost:
+            self._tx_lost = False
+            raise OperationalError(
+                "transaction lost: the connection dropped and the server rolled "
+                "the open transaction back; retry the work on the new connection"
+            )
         if self._tx_open:
             self._end_tx("COMMIT")
 
     def rollback(self):
         if self.autocommit:
             return
+        # A lost transaction is already rolled back server-side; a further
+        # ROLLBACK would lie about having undone something. Just clear.
+        self._tx_lost = False
         if self._tx_open:
             self._end_tx("ROLLBACK")
 
@@ -320,15 +427,28 @@ class Connection:
     def ping(self, reconnect=False):
         """Keepalive probe (subscriptions need periodic PING when the node
         sets DOCSQL_IDLE_TIMEOUT). ``reconnect=True`` retries once on a
-        lost connection with the original parameters."""
+        lost connection with the original parameters: prepared-statement
+        handles (per-connection server state) are invalidated and an open
+        transaction is reported lost — the server rolled it back on
+        disconnect, and a silent no-op commit() would hide that."""
         if reconnect:
             try:
                 self._transport.round_trip(_proto.REQ_PING, b"")
                 return
-            except Error:
-                self.close()
+            except Exception:
+                # Targeted swap, not a whole-object replace: cursors stay
+                # usable, but their prepared-statement handles (per-
+                # connection SERVER state) died with the old socket — clear
+                # the caches so the next bound execute re-prepares instead
+                # of failing on an unknown handle.
+                tx_lost = self._tx_open or self._tx_lost
+                self._transport.close()
                 fresh = connect(**self._kwargs)
-                self.__dict__.update(fresh.__dict__)
+                self._transport = fresh._transport
+                for cur in self._cursors:
+                    cur._prepared.clear()
+                self._tx_open = False
+                self._tx_lost = tx_lost
                 return
         self._transport.round_trip(_proto.REQ_PING, b"")
 
@@ -385,6 +505,9 @@ class Cursor:
             )
             _check(ftype, payload)
             self._conn._tx_open = True
+            # A new transaction supersedes any lost one: its commit will be
+            # real, so the loss must not fail it retroactively.
+            self._conn._tx_lost = False
         if parameters is None:
             ftype, payload = self._transport_round_trip_sql(operation)
         else:

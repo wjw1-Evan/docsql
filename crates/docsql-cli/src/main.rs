@@ -1279,7 +1279,12 @@ pub fn render_rows(r: &QueryResult) -> String {
     }
     // Widths count CHARS while the pad below pads chars: measuring bytes
     // left CJK cells ragged (a 3-char/9-byte string padded as 9).
-    let mut widths: Vec<usize> = r.columns.iter().map(|c| c.chars().count()).collect();
+    // Column names are wire data too (a quoted identifier or alias can
+    // carry escape sequences) — headers take the same sanitizer as the
+    // cells, and the widths follow the SANITIZED text so the grid stays
+    // aligned.
+    let headers: Vec<String> = r.columns.iter().map(|c| sanitize_terminal(c)).collect();
+    let mut widths: Vec<usize> = headers.iter().map(|c| c.chars().count()).collect();
     let cells: Vec<Vec<String>> = r
         .rows
         .iter()
@@ -1307,8 +1312,7 @@ pub fn render_rows(r: &QueryResult) -> String {
         .map(|w| "-".repeat(w + 2))
         .collect::<Vec<_>>()
         .join("+");
-    let header: String = r
-        .columns
+    let header: String = headers
         .iter()
         .zip(&widths)
         .map(|(c, w)| format!(" {c:<w$}"))
@@ -1406,6 +1410,22 @@ mod tests {
             Format::Table,
             true,
         );
+    }
+
+    #[test]
+    fn render_rows_sanitizes_header_escape_sequences() {
+        // Regression: the header rendered column names verbatim while the
+        // cells were sanitized — a quoted identifier or alias carrying an
+        // OSC/ANSI sequence reached the terminal raw (title rewrite, OSC 52
+        // clipboard grab).
+        let r = QueryResult {
+            columns: vec!["\x1b]0;pwned\x07id".into(), "ok".into()],
+            rows: vec![vec![Value::Int(1), Value::Int(2)]],
+        };
+        let out = render_rows(&r);
+        assert!(!out.contains("\x1b"), "{out:?}");
+        assert!(out.contains("id"), "{out}");
+        assert!(out.contains("ok"), "{out}");
     }
 
     #[test]

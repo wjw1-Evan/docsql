@@ -711,7 +711,13 @@ pub fn redact_sql(sql: &str) -> String {
         let boundary_ok = |i: usize| -> bool {
             match sql[..i].chars().next_back() {
                 None => true,
-                Some(c) => !(c.is_alphanumeric() || c == '_' || c == '$' || c == '\'' || c == '.'),
+                // ASCII word characters only, mirroring the tokenizer's
+                // charset: a non-ASCII letter before PASSWORD can only come
+                // from a statement the tokenizer will reject, and the audit
+                // log must mask the plaintext anyway (fail closed).
+                Some(c) => {
+                    !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '\'' || c == '.')
+                }
             }
         };
         if starts_with_ci(bytes, i, "PASSWORD") && boundary_ok(i) {
@@ -1723,6 +1729,33 @@ mod tests {
     }
 
     #[test]
+    fn row_filter_wall_clocks_fold_and_random_rejects() {
+        // Wall-clock calls in a row filter freeze at grant time through the
+        // fold — the accepted (pre-existing NOW()) semantics; the journal /
+        // fan-out must carry the folded literal, never the raw call, or every
+        // replay peer re-stamps its own clock and applies the filter to a
+        // different row set. NOW_MS() used to escape the fold entirely (the
+        // word `now_ms` never matched the fold's word list while the cheap
+        // prefilter substring hit) and rode the grant raw. RAND() is not
+        // foldable and must reject loudly.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT, ts TIMESTAMP)").unwrap();
+        db.execute("CREATE USER eve PASSWORD 'pw12345678'").unwrap();
+        for sql in [
+            "GRANT SELECT ON t WHERE ts >= NOW() TO eve",
+            "GRANT SELECT ON t WHERE ts >= NOW_MS() TO eve",
+        ] {
+            db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let resolved = db.take_resolved_sql().unwrap();
+            assert!(resolved.contains("AS TIMESTAMP"), "{resolved}");
+            assert!(!resolved.to_uppercase().contains("NOW"), "{resolved}");
+        }
+        assert!(db
+            .execute("GRANT SELECT ON t WHERE ts >= RAND() TO eve")
+            .is_err());
+    }
+
+    #[test]
     fn resolve_union_and_restriction_semantics() {
         let mut db = Database::in_memory().unwrap();
         for sql in [
@@ -1969,6 +2002,20 @@ mod tests {
         // the clause): db.password is a reference, not a keyword boundary.
         let sel = "SELECT db.password FROM t";
         assert_eq!(redact_sql(sel), sel);
+    }
+
+    #[test]
+    fn redact_masks_keyword_after_non_ascii_letter() {
+        // Regression: the boundary predicate used Unicode
+        // `is_alphanumeric` while the tokenizer's word charset is ASCII —
+        // `xéPASSWORD '…'` (which the tokenizer rejects) logged its
+        // plaintext verbatim. Rejected statements still reach the audit
+        // log, so the mask must fail closed on the ASCII charset.
+        let sql = "CREATE USER xéPASSWORD 's3cret-pw12'";
+        let redacted = redact_sql(sql);
+        assert!(!redacted.contains("s3cret-pw12"), "{redacted}");
+        // The statement itself still refuses to parse.
+        assert!(parse(sql).is_some_and(|r| r.is_err()));
     }
 
     #[test]

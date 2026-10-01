@@ -89,6 +89,53 @@ public sealed class AdoNetTests : IClassFixture<ServerFixture>
     }
 
     [Fact]
+    public void Marker_shaped_user_objects_stay_raw_unless_exact()
+    {
+        // Symmetry with the server's decode_marker (and the Python hook): a
+        // marker counts only when the object holds EXACTLY that one key and
+        // the value parses. The reader used to probe single properties on
+        // ANY object — multi-key documents were silently retyped (decimal
+        // instead of the stored JSON), and an unparseable value threw out
+        // of the reader constructor, failing the whole result set.
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+
+        // Exact single-key marker still decodes (the pinned positive path).
+        cmd.CommandText = "SELECT JSON_EXTRACT('{\"$dec\":\"1.5\"}', '$')";
+        using (var r = cmd.ExecuteReader())
+        {
+            Assert.True(r.Read());
+            Assert.Equal(1.5m, r.GetValue(0));
+        }
+
+        // Multi-key: a user document that merely CONTAINS a $dec field.
+        cmd.CommandText = "SELECT JSON_EXTRACT('{\"$dec\":\"1.5\",\"limit\":10}', '$')";
+        using (var r = cmd.ExecuteReader())
+        {
+            Assert.True(r.Read());
+            var raw = r.GetString(0);
+            Assert.Contains("$dec", raw);
+            Assert.Contains("limit", raw);
+        }
+
+        // Single key, unparseable value: raw text, never an exception.
+        cmd.CommandText = "SELECT JSON_EXTRACT('{\"$dec\":\"nope\"}', '$')";
+        using (var r = cmd.ExecuteReader())
+        {
+            Assert.True(r.Read());
+            Assert.Contains("nope", r.GetString(0));
+        }
+
+        // Out-of-domain $ts stays raw (FromUnixTimeMilliseconds would throw).
+        cmd.CommandText = "SELECT JSON_EXTRACT('{\"$ts\":999999999999999}', '$')";
+        using (var r = cmd.ExecuteReader())
+        {
+            Assert.True(r.Read());
+            Assert.Contains("$ts", r.GetString(0));
+        }
+    }
+
+    [Fact]
     public void ExecuteScalar_returns_first_column()
     {
         using var conn = Open();
