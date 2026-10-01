@@ -259,7 +259,7 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     let tmp = state.backup_dir.join(format!("{name}.tmp"));
     write_private_two(&tmp, header.as_bytes(), body.as_bytes())
         .map_err(|e| format!("backup write: {e}"))?;
-    std::fs::rename(&tmp, state.backup_dir.join(&name))
+    rename_synced(&tmp, &state.backup_dir.join(&name))
         .map_err(|e| format!("backup rename: {e}"))?;
     // Integrity sidecar (sha256sum format: "<hex>  <name>"), written
     // alongside the file it covers. Restore verifies it before replaying —
@@ -273,7 +273,7 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
         format!("{}  {}\n", docsql_core::kdf::hex(&digest), name).as_bytes(),
     )
     .map_err(|e| format!("backup checksum write: {e}"))?;
-    std::fs::rename(&tmp, sidecar).map_err(|e| format!("backup checksum rename: {e}"))?;
+    rename_synced(&tmp, &sidecar).map_err(|e| format!("backup checksum rename: {e}"))?;
     prune_backups(&state.backup_dir, state.backup_keep);
     // Remote copy: the local pair is durable — push both objects to the
     // bucket and mirror retention. Failures are recorded (metric, sync
@@ -294,6 +294,7 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
         if sidecar_landed {
             upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
         }
+        reconcile_remote(s3, state).await;
         prune_remote(s3, state).await;
     }
     Ok(name)
@@ -408,6 +409,65 @@ async fn prune_remote_class(
 fn key_file_name(key: &str) -> Option<&str> {
     let n = key.rsplit('/').next()?;
     (!n.is_empty()).then_some(n)
+}
+
+/// `fs::rename` plus a parent-directory fsync: on journaling filesystems a
+/// rename can be visible without being durable, and a crash landing there
+/// drops the NEW name entirely (the file data itself was synced before the
+/// rename). The backup/sidecar pair's "the name exists ⇒ the checksum
+/// story holds" contract needs the directory entry durable too.
+pub(crate) fn rename_synced(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, dest)?;
+    if let Some(dir) = dest.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            // Best effort: filesystems without directory fsync semantics
+            // (or unsupported open-on-dir) simply keep the old behavior.
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Re-upload local backup assets the remote copy is missing. A failed PUT
+/// used to be lost for good: the next tick's cursor had already advanced
+/// past the file and no code path ever revisited the name — the newest
+/// full/segment stayed local-only until local keep-N pruned it too, and
+/// then existed nowhere. Best effort like `prune_remote`; the next tick
+/// retries. A `.sql` object's digest comes from its local sidecar, so the
+/// checksum-first ordering survives reconciliation.
+async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
+    let cfg = s3.config();
+    let Ok(keys) = s3.list(&cfg.prefix).await else {
+        return;
+    };
+    let remote: std::collections::HashSet<String> = keys.into_iter().collect();
+    let Ok(entries) = std::fs::read_dir(&state.backup_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        let tracked = (name.starts_with("backup-") || name.starts_with("incr-"))
+            && (name.ends_with(".sha256") || name.ends_with(".sql"));
+        if !tracked || remote.contains(&cfg.object_key(&name)) {
+            continue;
+        }
+        if name.ends_with(".sha256") {
+            if let Ok(bytes) = std::fs::read(e.path()) {
+                let _ = upload_backup_bytes(state, s3, &name, &bytes).await;
+            }
+            continue;
+        }
+        let Ok(sidecar) = std::fs::read_to_string(state.backup_dir.join(format!("{name}.sha256")))
+        else {
+            continue; // pruned pair or legacy file: nothing to reconcile
+        };
+        let Some(hex) = sidecar.split_whitespace().next() else {
+            continue;
+        };
+        let _ = upload_backup_file(state, s3, &name, &e.path(), hex).await;
+    }
 }
 
 /// Write bytes with owner-only permissions, fully synced before returning.
@@ -826,7 +886,7 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
                 .into(),
         );
     }
-    std::fs::rename(&tmp, state.backup_dir.join(&name)).map_err(|e| format!("incr rename: {e}"))?;
+    rename_synced(&tmp, &state.backup_dir.join(&name)).map_err(|e| format!("incr rename: {e}"))?;
     // Second epoch check AFTER the rename: the pre-rename check above can
     // be preempted right before the rename lands, and an adoption sweeping
     // in that gap only ever saw the `.tmp` name. If the epoch moved, the
@@ -850,7 +910,7 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
     )
     .map_err(|e| format!("incr checksum write: {e}"))?;
     let sidecar = state.backup_dir.join(format!("{name}.sha256"));
-    std::fs::rename(&tmp, sidecar).map_err(|e| format!("incr checksum rename: {e}"))?;
+    rename_synced(&tmp, &sidecar).map_err(|e| format!("incr checksum rename: {e}"))?;
     prune_incr(&state.backup_dir, state.backup_keep.max(4));
     // Remote copy rides along with the local write: a disaster-recovery
     // restore to a point in time needs the base AND the whole incremental
@@ -868,6 +928,7 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
         if sidecar_landed {
             upload_backup_file(state, s3, &name, &state.backup_dir.join(&name), &hex_digest).await;
         }
+        reconcile_remote(s3, state).await;
         prune_remote(s3, state).await;
     }
     Ok(())

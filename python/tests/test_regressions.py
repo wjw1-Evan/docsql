@@ -133,3 +133,57 @@ def test_control_maps_server_rejection_to_database_error(server):
             sub._control(0x0021, ["x"])
     finally:
         sub.close()
+
+
+def test_prepared_cache_is_shared_across_cursors(conn):
+    # 服务端 prepared 句柄是连接级状态:游标级缓存曾让每个短命游标都重新
+    # prepare 同一模板,句柄泄漏到服务端 1024 上限后,该连接的所有参数化
+    # 执行永久失败。连接级共享缓存下,上千个游标共用一个句柄。
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS prep_t (v INT)")
+        cur.execute("DELETE FROM prep_t")
+    for i in range(1100):
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO prep_t VALUES (?)", (i,))
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM prep_t")
+        assert cur.fetchall() == [(1100,)]
+    assert len(conn._prepared) == 1
+
+
+def test_nan_and_overwide_decimal_binds_raise_data_error(conn):
+    # NaN 的 Decimal 曾在值域比较处抛 InvalidOperation(非 DB-API 异常)
+    # 泄漏出 execute();38 位小数(尾数装不进 2^96)曾静默把整个标记对象
+    # 按 TEXT 绑定 —— 现在都在客户端响亮拒绝。
+    from datetime import datetime, timezone
+
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", (Decimal("NaN"),))
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", (Decimal("sNaN"),))
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", (Decimal("0." + "1" * 38),))
+    with pytest.raises(DataError):
+        # 科学计数法的小值(str 会给 1E-29)在服务端走有损路径,同样拒。
+        conn.cursor().execute("SELECT ?", (Decimal("1E-29"),))
+    # 对照:值域内的 Decimal 与超 int64 的整数仍正常。
+    with conn.cursor() as cur:
+        cur.execute("SELECT ?", (Decimal("123.45"),))
+        assert cur.fetchall()[0][0] == Decimal("123.45")
+        big = 2**64
+        cur.execute("SELECT ?", (big,))
+        assert cur.fetchall()[0][0] == big
+
+
+def test_out_of_domain_datetime_bind_raises_data_error(conn):
+    # 9999-12-31 23:59:59.999999 的毫秒取整恰好越过引擎值域上界 1 毫秒:
+    # 服务端会把它当普通对象回退成 TEXT 绑定(静默类型损坏),现在客户端拒绝。
+    from datetime import datetime, timezone
+
+    edge = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", (edge,))
+    ok = datetime(9999, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute("SELECT ?", (ok,))
+        assert cur.fetchall()[0][0] == ok

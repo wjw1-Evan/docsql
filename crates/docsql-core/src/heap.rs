@@ -434,8 +434,16 @@ impl Heap {
                 }
                 let bytes = slot_document_bytes(reader, None, pid, &page, off, len)?;
                 let (v, _) = encode::decode_prefix(&bytes)?;
-                if let Value::Object(o) = v {
-                    out.push(o);
+                match v {
+                    Value::Object(o) => out.push(o),
+                    // `insert` only ever stores object roots: a scalar root
+                    // can only be corruption. Skipping it here silently
+                    // dropped the row while `live_count` still counted the
+                    // slot — COUNT(*) and scans disagreed. Loud, like every
+                    // other corrupt-page path.
+                    _ => {
+                        return Err(HeapError::Page(pid, "non-object document root"));
+                    }
                 }
             }
         }
@@ -504,8 +512,9 @@ impl Heap {
             }
             let bytes = slot_document_bytes(reader, Some(tx), page, &buf, off, len)?;
             let (v, _) = encode::decode_prefix(&bytes)?;
-            if let Value::Object(o) = v {
-                out.push((pack_loc(page, i), o));
+            match v {
+                Value::Object(o) => out.push((pack_loc(page, i), o)),
+                _ => return Err(HeapError::Page(page, "non-object document root")),
             }
         }
         Ok(out)
@@ -525,10 +534,14 @@ impl Heap {
         }
         let bytes = slot_document_bytes(reader, None, page, &buf, off, len)?;
         let (v, _) = encode::decode_prefix(&bytes)?;
-        Ok(Some(match v {
-            Value::Object(o) => o,
-            other => Object::from([("_doc".into(), other)]),
-        }))
+        match v {
+            Value::Object(o) => Ok(Some(o)),
+            // Same loud corruption rule as `scan`: object roots only. The
+            // old `{"_doc": …}` wrapper papered over corrupt scalar roots
+            // at exactly one read path while the scans rejected/skipped
+            // them elsewhere.
+            _ => Err(HeapError::Page(page, "non-object document root")),
+        }
     }
 
     /// Append a document; extends the heap with a new page when needed.

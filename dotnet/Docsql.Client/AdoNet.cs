@@ -194,8 +194,13 @@ internal static class ConnectionPool
     internal static Slot SlotOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
         Pools.GetOrAdd(KeyOf(p, keyOverride), _ => new Slot(p.MaxPoolSize));
 
-    private static readonly Frame PingFrame =
-        new(FrameType.ReqPing, 0, 0, Array.Empty<byte>());
+    /// <summary>借出即重置:T-SQL 会话状态(@变量/@@IDENTITY/@@ROWCOUNT)挂在
+    /// 物理连接上,随连接入池存活 —— 不重置的话,下一个借出者继承上一位的
+    /// 变量(重复 DECLARE 报错、@@IDENTITY 读到别人的值)。往返本身同时完成
+    /// 验活(应答到达即 TCP 与帧通路完好);对端不认识该帧时按死连接处理,
+    /// 换新建连接(新连接天然是干净会话)。</summary>
+    private static readonly Frame SessionResetFrame =
+        new(FrameType.ReqSessionReset, 0, 0, Array.Empty<byte>());
 
     /// <summary>借出前验活:PING 一次往返通过才算命中;死连接就地丢弃(其借出
     /// 名额早已在归还时释放,这里无需动信号量)。</summary>
@@ -205,9 +210,8 @@ internal static class ConnectionPool
         {
             try
             {
-                // PING 在服务器上无需认证:一次往返即可证明 TCP 活着且帧通路完好。
-                var pong = proto.Send(PingFrame);
-                if (pong.Type == FrameType.RespPong)
+                var resp = proto.Send(SessionResetFrame);
+                if (resp.Type == FrameType.RespAffected)
                 {
                     Interlocked.Increment(ref Hits);
                     return proto;
@@ -268,8 +272,8 @@ internal static class ConnectionPool
             {
                 try
                 {
-                    var pong = await proto.SendAsync(PingFrame, cancellationToken).ConfigureAwait(false);
-                    if (pong.Type == FrameType.RespPong)
+                    var pong = await proto.SendAsync(SessionResetFrame, cancellationToken).ConfigureAwait(false);
+                    if (pong.Type == FrameType.RespAffected)
                     {
                         Interlocked.Increment(ref Hits);
                         return proto;
@@ -649,6 +653,14 @@ public sealed class DocsqlConnection : DbConnection
                 ConnectionPool.Return(_poolSlot, proto);
             }
         }
+        // The physical connection — and any open transaction on it — is
+        // gone (discarded above, rolled back server-side on disconnect). A
+        // stale InTransaction=true on this CLOSED object leaked into the
+        // next Open(): every later Close then physically discarded its
+        // pooled connection (the pool was silently bypassed forever), and
+        // a straggler DocsqlTransaction could still COMMIT/ROLLBACK over
+        // whatever physical connection the reopen rented next.
+        InTransaction = false;
         _poolSlot = null;
         _state = ConnectionState.Closed;
     }
@@ -1269,9 +1281,14 @@ public sealed class DocsqlDataReader : DbDataReader
         if (singleKey
             && e.TryGetProperty("$dec", out var dec)
             && dec.ValueKind == JsonValueKind.String
+            // NumberStyles.Number includes AllowThousands, which neither
+            // rust_decimal (from_str) nor Python's Decimal accept: with it,
+            // a user document literally {"$dec":"1,234"} re-typed into a
+            // DECIMAL here while staying a plain object on the other two
+            // stacks — silently divergent materialization.
             && decimal.TryParse(
                 dec.GetString(),
-                NumberStyles.Number,
+                NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint,
                 CultureInfo.InvariantCulture,
                 out var dv))
         {
@@ -1481,7 +1498,8 @@ public sealed class DocsqlDataReader : DbDataReader
 
     public override object this[string name] => GetValue(GetOrdinal(name))!;
 
-    public override short GetInt16(int ordinal) => Convert.ToInt16(CurrentRow[ordinal]);
+    public override short GetInt16(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToInt16(v, CultureInfo.InvariantCulture));
 
 
     public override System.Data.DataTable GetSchemaTable()
@@ -1506,14 +1524,17 @@ public sealed class DocsqlDataReader : DbDataReader
     public override string GetDataTypeName(int ordinal) => GetFieldType(ordinal).Name;
 
     public override Type GetFieldType(int ordinal) => _types[ordinal];
-    public override char GetChar(int ordinal) => Convert.ToChar(CurrentRow[ordinal]);
-    public override byte GetByte(int ordinal) => Convert.ToByte(CurrentRow[ordinal]);
+    public override char GetChar(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToChar(v, CultureInfo.InvariantCulture));
+    public override byte GetByte(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToByte(v, CultureInfo.InvariantCulture));
     public override Guid GetGuid(int ordinal) => Guid.Parse(GetString(ordinal));
-    public override float GetFloat(int ordinal) => Convert.ToSingle(CurrentRow[ordinal]);
+    public override float GetFloat(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToSingle(v, CultureInfo.InvariantCulture));
     public override decimal GetDecimal(int ordinal) =>
-        Convert.ToDecimal(CurrentRow[ordinal], CultureInfo.InvariantCulture);
+        NonNull(ordinal, v => Convert.ToDecimal(v, CultureInfo.InvariantCulture));
     public override DateTime GetDateTime(int ordinal) =>
-        Convert.ToDateTime(CurrentRow[ordinal], CultureInfo.InvariantCulture);
+        NonNull(ordinal, v => Convert.ToDateTime(v, CultureInfo.InvariantCulture));
     public override long GetBytes(
         int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
@@ -1545,12 +1566,17 @@ public sealed class DocsqlDataReader : DbDataReader
 public sealed class DocsqlTransaction : DbTransaction
 {
     private readonly DocsqlConnection _conn;
+    /// <summary>BEGIN 落在这条物理连接上:之后 _conn 被 Close/重 Open 换过物理连接时,
+    /// 本事务早已随旧连接断开而回滚 —— 迟到的 Commit/Rollback 绝不能再打到
+    /// 新租的连接上(会无声回滚别人的事务)。</summary>
+    private readonly ProtocolConnection _protoAtBegin;
     private bool _done;
 
     public DocsqlTransaction(DocsqlConnection conn, IsolationLevel iso)
     {
         _conn = conn;
         IsolationLevel = iso;
+        _protoAtBegin = conn.Proto!;
         Run("BEGIN");
         // 事务归属这条物理连接:InTransaction 期间 Close 把连接物理丢弃
         // 而不是归还池(残留事务不可能泄漏给下一个借出者)。
@@ -1588,11 +1614,22 @@ public sealed class DocsqlTransaction : DbTransaction
         string savePointName, CancellationToken cancellationToken = default) =>
         await RunAsync($"RELEASE SAVEPOINT {QuoteIdent(savePointName)}", cancellationToken).ConfigureAwait(false);
 
+    /// <summary>事务归属的物理连接是否仍是被 BEGIN 的那条。</summary>
+    private bool StillOwnsConnection =>
+        ReferenceEquals(_conn.Proto, _protoAtBegin);
+
     public override void Commit()
     {
         if (_done)
         {
             throw new InvalidOperationException("transaction already finished");
+        }
+        if (!StillOwnsConnection)
+        {
+            _done = true;
+            throw new InvalidOperationException(
+                "the transaction's connection was closed and reopened; the server " +
+                "rolled the transaction back when its connection dropped");
         }
         Run("COMMIT");
         _done = true;
@@ -1604,6 +1641,13 @@ public sealed class DocsqlTransaction : DbTransaction
         if (_done)
         {
             throw new InvalidOperationException("transaction already finished");
+        }
+        if (!StillOwnsConnection)
+        {
+            _done = true;
+            throw new InvalidOperationException(
+                "the transaction's connection was closed and reopened; the server " +
+                "rolled the transaction back when its connection dropped");
         }
         Run("ROLLBACK");
         _done = true;
@@ -1640,9 +1684,19 @@ public sealed class DocsqlTransaction : DbTransaction
         if (!_done)
         {
             _done = true;
+            if (!StillOwnsConnection)
+            {
+                // The connection object was closed and the physical wire
+                // replaced: the server already rolled this transaction back
+                // on disconnect, and InTransaction now belongs to whatever
+                // transaction the reopened connection started — touch
+                // neither.
+                base.Dispose(disposing);
+                return;
+            }
             try
             {
-                _conn.Proto.Send(new Frame(
+                _protoAtBegin.Send(new Frame(
                     FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql("ROLLBACK")));
             }
             catch

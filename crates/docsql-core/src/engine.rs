@@ -543,6 +543,22 @@ pub(crate) fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
         SqlExpr::InList { expr, list, .. } => {
             expr_calls_wall_clock(expr) || list.iter().any(expr_calls_wall_clock)
         }
+        // A wall-clock call inside a CASE branch (e.g. GETDATE(1), which the
+        // text-level fold cannot reduce) must still trip this check — same
+        // coverage `calls_newid` already has.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_calls_wall_clock)
+                || conditions.iter().any(|w| {
+                    expr_calls_wall_clock(&w.condition) || expr_calls_wall_clock(&w.result)
+                })
+                || else_result.as_deref().is_some_and(expr_calls_wall_clock)
+        }
+        SqlExpr::Tuple(items) => items.iter().any(expr_calls_wall_clock),
         _ => false,
     }
 }
@@ -3736,29 +3752,34 @@ impl<'a> ReadCx<'a> {
         tx: &crate::pager::Tx,
         plan: &ProbePlan,
     ) -> Result<Option<(ProbePlan, bool)>> {
-        let promotes = |v: &Value| -> bool {
-            matches!(v, Value::Str(s) if crate::value::parse_timestamp_ms(s).is_some())
-        };
+        // ANY string bound (parseable or not) enters the band analysis: an
+        // unparseable one used to short-circuit the pre-check as "cannot
+        // promote", leaving an exact plan whose raw `k < Str` filter passes
+        // EVERY Timestamp key (Timestamps rank below Strs) — the coercing
+        // predicate evaluates such a comparison as NULL/unknown and excludes
+        // the row, so the window silently returned rows WHERE should have
+        // dropped. Whether the string can actually lift is decided per band
+        // below.
+        let is_str = |v: &Value| -> bool { matches!(v, Value::Str(_)) };
         fn bound_elements(v: &Value) -> Option<&[Value]> {
             match v {
                 Value::Array(items) if !items.is_empty() => Some(items),
                 _ => None,
             }
         }
-        // Cheap pre-check: no parseable-string bound anywhere (scalar or in
-        // a composite Array) → the plan is untouched and the two leaf reads
+        // Cheap pre-check: no string bound anywhere (scalar or in a
+        // composite Array) → the plan is untouched and the two leaf reads
         // are not paid.
         let has_str_bound =
             match plan {
                 ProbePlan::Eq(v) | ProbePlan::Prefix(v) => {
-                    promotes(v) || bound_elements(v).is_some_and(|items| items.iter().any(promotes))
+                    is_str(v) || bound_elements(v).is_some_and(|items| items.iter().any(is_str))
                 }
                 ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
                     .into_iter()
                     .flatten()
                     .any(|(v, _)| {
-                        promotes(v)
-                            || bound_elements(v).is_some_and(|items| items.iter().any(promotes))
+                        is_str(v) || bound_elements(v).is_some_and(|items| items.iter().any(is_str))
                     }),
             };
         // A TIMESTAMP-typed bound (TIMESTAMP '…' literal / CAST fold) needs
@@ -3830,18 +3851,28 @@ impl<'a> ReadCx<'a> {
         };
         // 一致才可判:该位要么纯 Timestamp(提升)、要么纯 Str(保留字面量,
         // 与 cmp_coerced 的 Str↔Str 明文比较一致);两极不一致 = 混合带。
-        // 只需检查边界里携带可解析时间戳字符串的位 —— 其它位的带型与
-        // 该边界的比较语义无关(Int 位永远不会被提升)。
+        // 只需检查边界里携带字符串的位 —— 其它位的带型与该边界的比较
+        // 语义无关(Int 位永远不会被提升)。
         let str_positions = |v: &Value| -> Vec<usize> {
             match v {
                 Value::Array(items) => items
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| promotes(e))
+                    .filter(|(_, e)| is_str(e))
                     .map(|(i, _)| i)
                     .collect(),
-                other if promotes(other) => vec![0],
+                other if is_str(other) => vec![0],
                 _ => Vec::new(),
+            }
+        };
+        // Can the string at position i of `v` actually lift to a Timestamp?
+        let parseable_at = |v: &Value, i: usize| -> bool {
+            match v {
+                Value::Array(items) => items.get(i).is_some_and(
+                    |e| matches!(e, Value::Str(s) if crate::value::parse_timestamp_ms(s).is_some()),
+                ),
+                Value::Str(s) => i == 0 && crate::value::parse_timestamp_ms(s).is_some(),
+                _ => false,
             }
         };
         let safe_at = |i: usize| band_ts_at(i) || band_str_at(i);
@@ -3854,7 +3885,11 @@ impl<'a> ReadCx<'a> {
                         if !band_str_at(i) {
                             return Ok(None);
                         }
-                    } else if !safe_at(i) {
+                    } else if !(band_str_at(0) || (band_ts_at(0) && parseable_at(v, 0))) {
+                        // Timestamp 带上的字符串边界只有真提升成
+                        // Timestamp 才与谓词同义;不可解析字符串对每个
+                        // Timestamp 键都判 NULL/未知 —— 原样保留字面量会让
+                        // 探针/窗口放进谓词必然排除的行,只能整体回退。
                         return Ok(None);
                     }
                 }
@@ -3867,13 +3902,18 @@ impl<'a> ReadCx<'a> {
                 }
             }
             ProbePlan::Range { lo, hi } => {
-                for i in [lo.as_ref(), hi.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|(v, _)| str_positions(v))
-                {
-                    if !safe_at(i) {
-                        return Ok(None);
+                for (v, _) in [lo.as_ref(), hi.as_ref()].into_iter().flatten() {
+                    for i in str_positions(v) {
+                        if !safe_at(i) {
+                            return Ok(None);
+                        }
+                        // Timestamp 带上的字符串边界必须真能提升;不可解析
+                        // 字符串对每个 Timestamp 键判 NULL/未知,原样保留
+                        // 会让探针放进(或吃掉)谓词必然排除/包含的行。
+                        // 纯 Str 带保留字面量即可,与谓词的 Str↔Str 比较一致。
+                        if band_ts_at(i) && !parseable_at(v, i) {
+                            return Ok(None);
+                        }
                     }
                 }
                 for i in [lo.as_ref(), hi.as_ref()]
@@ -4755,6 +4795,11 @@ impl<'a> ReadCx<'a> {
     }
 
     fn explain_query(&self, query: Query) -> Result<ExecOutcome> {
+        // Same preprocessing order as `exec_query_body`: `SELECT TOP (n)`
+        // rewrites into LIMIT before the clause gates run, so EXPLAIN must
+        // not reject (by skipping the rewrite) a statement that executes
+        // fine.
+        let query = rewrite_tsql_top(query)?;
         reject_unsupported_query_clauses(&query)?;
         if query.with.is_some() {
             return err("EXPLAIN: WITH (CTE) planning is not supported");
@@ -4787,7 +4832,18 @@ impl<'a> ReadCx<'a> {
 
         // Aggregate detection mirrors exec_select.
         let group_exprs: Vec<SqlExpr> = match &select.group_by {
-            sqlparser::ast::GroupByExpr::Expressions(e, _) => e.clone(),
+            sqlparser::ast::GroupByExpr::Expressions(e, modifiers) => {
+                // Mirror the executor's refusal: exec_select rejects
+                // non-empty modifiers, so a plan that silently dropped them
+                // would describe a query that never runs.
+                if !modifiers.is_empty() {
+                    return err(
+                        "GROUP BY modifiers (WITH ROLLUP/CUBE/TOTALS) are not supported \
+                         (use GROUP BY ROLLUP(...)/CUBE(...))",
+                    );
+                }
+                e.clone()
+            }
             sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
         };
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
@@ -5803,22 +5859,27 @@ impl Database {
     fn restore_transaction(
         &mut self,
         snap: TableSnapshot,
-        undo: Vec<crate::pager::UndoOp>,
+        undo: &mut [crate::pager::UndoOp],
         sync_catalog: bool,
     ) -> Result<()> {
         self.pager.pause_undo();
         let replay = || -> Result<()> {
             let mut tx = self.pager.begin_tx();
-            for op in undo.into_iter().rev() {
-                match op {
+            // By index, never consuming: a mid-replay failure must leave the
+            // journal intact so a retried ROLLBACK still restores the pages.
+            // `into_iter()` here used to drop every op on the first error —
+            // the retry then "restored" only the catalog snapshot while the
+            // transaction's page images stayed applied.
+            for idx in (0..undo.len()).rev() {
+                match &undo[idx] {
                     crate::pager::UndoOp::Set(id, image) => {
-                        self.pager.write_page(&mut tx, id, 0, &image)?;
+                        self.pager.write_page(&mut tx, *id, 0, image)?;
                     }
                     crate::pager::UndoOp::Alloc(id) => {
-                        self.pager.free_page(&mut tx, id)?;
+                        self.pager.free_page(&mut tx, *id)?;
                     }
                     crate::pager::UndoOp::Free(id) => {
-                        self.pager.reserve_page(id);
+                        self.pager.reserve_page(*id);
                     }
                     crate::pager::UndoOp::Realloc(_) => {}
                 }
@@ -5858,16 +5919,26 @@ impl Database {
         // the engine held neither the rolled-back pages nor a consistent
         // catalog. On failure the transaction stays open and the error is
         // loud; teardown only runs once the restore is durable.
-        let undo = self.pager.take_undo();
+        // Take the journal only AFTER the deferred commits are voided:
+        // abort_deferred failing (I/O error on the ABORT append) used to
+        // drop the just-taken undo journal — a retried ROLLBACK then found
+        // an empty journal and "succeeded" after restoring nothing but the
+        // in-memory catalog, leaving the transaction's page images applied.
         // 先把本事务各语句的 deferred 提交显式作废:没有这组 ABORT 帧,
         // 恢复事务的同步提交会先落 FENCE,撕裂崩溃停在「FENCE 已持久、
         // 恢复事务 COMMIT 未持久」窗口时,整个已回滚事务会复活。
         self.pager.abort_deferred()?;
+        let mut undo = self.pager.take_undo();
         let snap = self
             .tx_snapshot
             .clone()
             .expect("checked above; single writer keeps it in place");
-        self.restore_transaction(snap, undo, true)?;
+        if let Err(e) = self.restore_transaction(snap, &mut undo, true) {
+            // Put the journal back: the transaction stays open and the
+            // retry must replay the same ops, not an empty tail.
+            self.pager.restore_undo_journal(undo);
+            return Err(e);
+        }
         let _ = self.tx_snapshot.take();
         self.savepoints.clear();
         Ok(ExecOutcome::Affected(0))
@@ -5915,11 +5986,17 @@ impl Database {
         let snap = self.savepoints[pos].1.clone();
         let mark = self.savepoints[pos].2;
         self.savepoints.truncate(pos);
-        let undo = self.pager.take_undo_to(mark);
+        let mut undo = self.pager.take_undo_to(mark);
         // The transaction stays open: no catalog save is needed (the journal
         // replay already restored the catalog pages; the in-memory map comes
         // from the snapshot). `sync_catalog=false` keeps this cheap.
-        self.restore_transaction(snap, undo, false)?;
+        if let Err(e) = self.restore_transaction(snap, &mut undo, false) {
+            // Reattach the tail: a failed ROLLBACK TO must leave the journal
+            // whole for the retry (and a later full ROLLBACK), exactly like
+            // the full-ROLLBACK path.
+            self.pager.reattach_undo_tail(undo);
+            return Err(e);
+        }
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -10248,15 +10325,20 @@ impl Database {
             }
         }
         // Constraint columns get their B+ trees right away: duplicate
-        // enforcement and index probes depend on them existing.
+        // enforcement and index probes depend on them existing. The trees
+        // ride the SAME write unit as the catalog entry (the shape
+        // `exec_create_index` settled on): committing the tree first and
+        // saving the catalog in a second transaction left a crash window
+        // holding a committed tree no catalog references — those pages would
+        // leak for good, nothing would ever free them.
         let constraint_cols: Vec<String> = meta
             .primary_key
             .iter()
             .chain(meta.unique.iter())
             .cloned()
             .collect();
+        let mut tx = self.pager.begin_tx();
         if !constraint_cols.is_empty() {
-            let mut tx = self.pager.begin_tx();
             let roots = self.build_trees(
                 &mut tx,
                 &[],
@@ -10268,11 +10350,19 @@ impl Database {
                 &vec![None; constraint_cols.len()],
                 &vec![true; constraint_cols.len()],
             )?;
-            self.commit_pager_tx(tx)?;
             meta.index_roots = roots;
         }
         self.tables.insert(name.clone(), std::sync::Arc::new(meta));
-        self.save_catalog()?;
+        if let Err(e) = self
+            .save_catalog_into(&mut tx)
+            .and_then(|()| self.commit_pager_tx(tx))
+        {
+            // The tx dropped without committing: staged tree pages went back
+            // to the reusable pool, and the in-memory entry must not keep
+            // pointing at them.
+            self.tables.remove(&name);
+            return Err(e);
+        }
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -10552,7 +10642,13 @@ impl Database {
             .source
             .as_ref()
             .is_some_and(|s| crate::stmt::mentions_nondet_call(&s.to_string()));
-        if guid_filled || default_clock_filled || source_calls_nondet {
+        // A zero-row INSERT ... SELECT (e.g. NEWID() in the source under a
+        // false WHERE) must NOT enter the rewrite: with no documents the
+        // canonical form below degenerates to `INSERT INTO t () VALUES ` —
+        // unparseable text that rode the journal and broke every replaying
+        // peer. The original statement replays identically (deterministically
+        // empty) on each node, so keeping it is replication-safe.
+        if (guid_filled || default_clock_filled || source_calls_nondet) && !new_docs.is_empty() {
             let policy = if replace {
                 "OR REPLACE "
             } else if do_nothing {
@@ -10676,6 +10772,7 @@ impl Database {
 
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
+        let mut displaced_docs: Vec<Object> = Vec::new();
         if replace && !indexed.is_empty() {
             for n in &new_docs {
                 for col in &indexed {
@@ -10704,7 +10801,7 @@ impl Database {
             // Rows displaced by OR REPLACE are parent-side deletions: their
             // referenced keys must not vanish silently (same contract as
             // DELETE). New rows that keep the same key are replacements.
-            let displaced_docs: Vec<Object> = displaced
+            displaced_docs = displaced
                 .iter()
                 .filter_map(|loc| {
                     before
@@ -10953,7 +11050,15 @@ impl Database {
         // referenced by children (new images already checked above).
         if !updated.is_empty() {
             let olds: Vec<Object> = updated.iter().map(|(_, o, _)| o.clone()).collect();
-            let news: Vec<Object> = updated.iter().map(|(_, _, n)| n.clone()).collect();
+            // `news` is the "keys that still exist after this statement"
+            // set: rows PLACED by the same batch can re-supply a key the
+            // updated rows vacated (INSERT INTO p VALUES (1),(1) ON CONFLICT
+            // (id) DO UPDATE SET id = 99 — the second (1) no longer conflicts
+            // and lands as a plain insert). Counting only the updated images
+            // false-errored children referencing a key that is still present
+            // through the placed row.
+            let mut news: Vec<Object> = updated.iter().map(|(_, _, n)| n.clone()).collect();
+            news.extend(placed.iter().map(|(_, d)| d.clone()));
             if let Err(e) = self.check_fk_parent_delete(&table, &olds, &news) {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
@@ -11002,6 +11107,24 @@ impl Database {
                         .unwrap_or(false)
                 });
                 combined.extend(updated.iter().map(|(_, _, n)| n.clone()));
+            }
+            if !displaced_docs.is_empty() {
+                // The no-tx scan also still sees OR REPLACE's displaced rows
+                // (their deletions are staged in THIS tx): keep them and the
+                // displaced old image pairs with its own replacement, making
+                // check_unique false-error on the very keys REPLACE displaced.
+                // Same encoding-compare argument as `updated`: byte-identical
+                // duplicates of a displaced image cannot coexist in a table
+                // that has constraints at all.
+                let gone: std::collections::HashSet<Vec<u8>> = displaced_docs
+                    .iter()
+                    .filter_map(|d| encode::encode_to_vec(&Value::Object(d.clone())).ok())
+                    .collect();
+                combined.retain(|d| {
+                    !encode::encode_to_vec(&Value::Object(d.clone()))
+                        .map(|k| gone.contains(&k))
+                        .unwrap_or(false)
+                });
             }
             combined.extend(placed.iter().map(|(_, d)| d.clone()));
             if let Err(e) = meta.check_unique(&combined) {
@@ -14604,9 +14727,15 @@ fn outer_row_value(doc: &Object, qualifier: &str, rest: &[sqlparser::ast::Ident]
         .collect::<Vec<_>>()
         .join(".");
     let full = format!("{qualifier}.{rest}");
-    match lookup_col(doc, &full) {
-        Ok(Value::Null) => lookup_col(doc, &rest).unwrap_or(Value::Null),
-        v => v.unwrap_or(Value::Null),
+    // Only a genuinely MISSING qualified key falls back to the bare name
+    // (solo-table rows carry bare keys). `lookup_col` cannot tell an
+    // explicit NULL from a missing column — both are Ok(Null) — so routing
+    // Ok(Null) through the fallback let a joined row's explicit
+    // `alias.col = NULL` resolve to a DIFFERENT alias's same-named column
+    // in correlated subqueries.
+    match doc.get(&full) {
+        Some(v) => v.clone(),
+        None => lookup_col(doc, &rest).unwrap_or(Value::Null),
     }
 }
 
@@ -17286,6 +17415,64 @@ fn subst_upsert_proposed(e: &mut SqlExpr, proposed: &Object) -> Result<()> {
             }
         }
         SqlExpr::Cast { expr, .. } => subst_upsert_proposed(expr, proposed)?,
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
+            subst_upsert_proposed(inner, proposed)?
+        }
+        SqlExpr::Floor { expr, .. } | SqlExpr::Ceil { expr, .. } => {
+            subst_upsert_proposed(expr, proposed)?
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            subst_upsert_proposed(expr, proposed)?;
+            if let Some(f) = substring_from {
+                subst_upsert_proposed(f, proposed)?;
+            }
+            if let Some(f) = substring_for {
+                subst_upsert_proposed(f, proposed)?;
+            }
+        }
+        SqlExpr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            subst_upsert_proposed(expr, proposed)?;
+            if let Some(w) = trim_what {
+                subst_upsert_proposed(w, proposed)?;
+            }
+            if let Some(chars) = trim_characters {
+                for c in chars {
+                    subst_upsert_proposed(c, proposed)?;
+                }
+            }
+        }
+        SqlExpr::Position { expr, r#in } => {
+            subst_upsert_proposed(expr, proposed)?;
+            subst_upsert_proposed(r#in, proposed)?;
+        }
+        SqlExpr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            subst_upsert_proposed(expr, proposed)?;
+            subst_upsert_proposed(overlay_what, proposed)?;
+            subst_upsert_proposed(overlay_from, proposed)?;
+            if let Some(f) = overlay_for {
+                subst_upsert_proposed(f, proposed)?;
+            }
+        }
+        SqlExpr::Tuple(items) => {
+            for item in items {
+                subst_upsert_proposed(item, proposed)?;
+            }
+        }
         SqlExpr::Function(f) => {
             if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
                 for a in &mut list.args {
@@ -23407,6 +23594,160 @@ mod tests {
             rows(&mut db, "SELECT a, b FROM u").rows,
             vec![vec![Value::Int(1), Value::Int(8)]]
         );
+    }
+
+    /// EXCLUDED/VALUES() 在 FLOOR/SUBSTRING/TRIM/IS NULL 等专属 AST 节点里
+    /// 曾不被替换,静默解析到已存在行的同名列(候选行的值被丢弃)。
+    #[test]
+    fn on_conflict_do_update_substitutes_excluded_in_special_nodes() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, q INT, flag TEXT)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 10, 'x')");
+        // FLOOR(EXCLUDED.q / 2):候选 q=5 → 2;旧行 q=10 → 5(错值)。
+        run(
+            &mut db,
+            "INSERT INTO t (id, q) VALUES (1, 5) ON CONFLICT (id) DO UPDATE \
+             SET q = FLOOR(EXCLUDED.q / 2)",
+        );
+        let r = rows(&mut db, "SELECT q FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+
+        // WHERE 臂里的 TRIM(EXCLUDED.flag) 同理:候选 'x' 命中才更新。
+        run(
+            &mut db,
+            "INSERT INTO t (id, q, flag) VALUES (1, 7, 'x') ON CONFLICT (id) DO UPDATE \
+             SET q = EXCLUDED.q WHERE TRIM(EXCLUDED.flag) = 'x'",
+        );
+        let r = rows(&mut db, "SELECT q FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(7)]]);
+
+        // IS NULL / SUBSTRING 节点也不再漏替换。
+        run(
+            &mut db,
+            "INSERT INTO t (id, q, flag) VALUES (1, 9, 'x') ON CONFLICT (id) DO UPDATE \
+             SET q = EXCLUDED.q, flag = SUBSTRING(EXCLUDED.flag FROM 1) \
+             WHERE EXCLUDED.q IS NOT NULL",
+        );
+        let r = rows(&mut db, "SELECT q, flag FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(9), Value::Str("x".into())]]);
+    }
+
+    /// 零行 INSERT ... SELECT NEWID():回写曾退化成 `INSERT INTO t () VALUES `
+    /// (不可解析文本)并进 journal/扇出,重放节点永久失败。
+    #[test]
+    fn zero_row_insert_select_with_nondet_keeps_original_sql() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id TEXT PRIMARY KEY)");
+        run(&mut db, "CREATE TABLE src (x INT)");
+        run(
+            &mut db,
+            "INSERT INTO t (id) SELECT NEWID() FROM src WHERE 1 = 0",
+        );
+        assert!(
+            db.take_resolved_sql().is_none(),
+            "zero-row nondet INSERT must NOT be rewritten into a degenerate canonical form"
+        );
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+    }
+
+    /// 同批 placed 行重新供给了被 upsert 更新腾出的父键:父侧 FK 检查
+    /// 曾只看 updated 的新像,把这种批次误报 FOREIGN KEY failed。
+    #[test]
+    fn upsert_parent_fk_accepts_key_resupplied_by_placed_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+        run(&mut db, "CREATE TABLE c (pid INT REFERENCES p(id))");
+        run(&mut db, "INSERT INTO p VALUES (1)");
+        run(&mut db, "INSERT INTO c VALUES (1)");
+        run(
+            &mut db,
+            "INSERT INTO p (id) VALUES (1), (1) ON CONFLICT (id) DO UPDATE SET id = 99",
+        );
+        // 终态:p 里 99(更新像)与 1(第二行落为普通插入)并存,c.pid=1 仍可解析。
+        let r = rows(&mut db, "SELECT id FROM p ORDER BY id");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(99)]]);
+        let r = rows(&mut db, "SELECT COUNT(*) FROM c WHERE pid = 1");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    /// 不可解析时间戳字符串的有序索引窗口:谓词按 cmp_coerced 判 NULL/未知
+    /// (0 行),窗口曾因 raw Timestamp<Str 比较放进全部行——结果随索引
+    /// 存在性漂移。
+    #[test]
+    fn unparseable_timestamp_bound_matches_scan_semantics_with_index() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX i_ts ON t (ts)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, TIMESTAMP '2026-01-01T00:00:00Z'), \
+             (2, TIMESTAMP '2026-06-01T00:00:00Z'), (3, TIMESTAMP '2026-12-01T00:00:00Z')",
+        );
+        // 无索引路径(比较两侧经 cmp_coerced):不可解析 → NULL → 不成立。
+        run(&mut db, "DROP INDEX i_ts");
+        let plain = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts < '2026-13-01' ORDER BY ts",
+        );
+        assert_eq!(plain.rows, Vec::<Vec<Value>>::new());
+        // 有索引 + ORDER BY ts LIMIT:必须与扫描路径同答案。
+        run(&mut db, "CREATE INDEX i_ts ON t (ts)");
+        let windowed = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts < '2026-13-01' ORDER BY ts LIMIT 2",
+        );
+        assert_eq!(windowed.rows, Vec::<Vec<Value>>::new());
+        // 可解析边界仍走提升,行为不变。
+        let hit = rows(
+            &mut db,
+            "SELECT id FROM t WHERE ts < '2026-07-01T00:00:00Z' ORDER BY ts LIMIT 2",
+        );
+        assert_eq!(hit.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    /// 相关子查询里外层别名的显式 NULL 列:曾因 lookup_col 的 NULL=缺失
+    /// 不可区分而回退裸名,JOIN 行上解析到另一个别名的同名列。
+    #[test]
+    fn correlated_subquery_explicit_null_does_not_leak_other_alias() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (k INT, x INT)");
+        run(&mut db, "CREATE TABLE b (k INT, x INT)");
+        run(&mut db, "CREATE TABLE s (y INT)");
+        run(&mut db, "INSERT INTO a VALUES (1, NULL)");
+        run(&mut db, "INSERT INTO b VALUES (1, 5)");
+        run(&mut db, "INSERT INTO s VALUES (5)");
+        let r = rows(
+            &mut db,
+            "SELECT z.x FROM a AS z JOIN b ON z.k = b.k \
+             WHERE EXISTS (SELECT 1 FROM s WHERE s.y = z.x)",
+        );
+        // z.x 是 NULL:s.y = NULL 不成立 → 0 行;曾返回 1 行(z.x 借道 b.x=5)。
+        assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    }
+
+    /// EXPLAIN 与执行器门禁同步:`SELECT TOP (n)` 执行路径会改写成 LIMIT,
+    /// EXPLAIN 曾直接拒;GROUP BY WITH ROLLUP 执行被拒,EXPLAIN 曾静默丢
+    /// 修饰符给出一个永远不会跑的计划。
+    #[test]
+    fn explain_matches_executor_gates() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)");
+        // TOP:normally executes; EXPLAIN must plan it, not reject it.
+        let r = rows(&mut db, "EXPLAIN SELECT TOP (2) id FROM t ORDER BY id");
+        assert_eq!(r.columns, vec!["plan".to_string(), "detail".to_string()]);
+        // WITH ROLLUP modifier: the executor refuses it; EXPLAIN must too.
+        match db.execute("EXPLAIN SELECT v, COUNT(*) FROM t GROUP BY v WITH ROLLUP") {
+            Err(_) => {}
+            Ok(_) => panic!("EXPLAIN must refuse GROUP BY modifiers like the executor"),
+        }
     }
 
     #[test]

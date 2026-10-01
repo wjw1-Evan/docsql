@@ -14,6 +14,18 @@ set -eu
 cd "$(dirname "$0")"
 DEPLOY_DIR="$PWD"
 
+# Mutual exclusion: two concurrent runs share the fixed project name,
+# container names and test volumes — the second `compose down` would rip
+# the stack out from under the first suite. flock is a Linux CI staple but
+# optional on macOS dev boxes.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>>"${TMPDIR:-/tmp}/docsql-run-tests.lock"
+  if ! flock -n 9; then
+    echo "another run-tests.sh is already running; refusing to share the dev stack" >&2
+    exit 1
+  fi
+fi
+
 # Snapshot the caller's own env BEFORE the test overrides below replace it:
 # the restored stack must come back with the user's image tag / data prefix /
 # token / auth file, not the deployment defaults. DOCSQL_WEB_AUTH_FILE needs

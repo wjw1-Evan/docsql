@@ -133,10 +133,28 @@ class Subscriber:
                     try:
                         _flags, ftype, rpayload = self._replies.get(timeout=10)
                     except queue.Empty as e:
-                        # A bare queue.Empty is not a DB-API error and used
-                        # to leak straight to the caller.
+                        # The reply may still land later — and from that
+                        # moment the queue can no longer be matched to
+                        # requests (a late ACK would be consumed as the
+                        # NEXT operation's reply: a one-off control
+                        # desync). Drain anything pending and POISON the
+                        # transport: the reader loop then reconnects and
+                        # resubscribes every recorded channel from its last
+                        # seen id. This channel is NOT recorded (the
+                        # subscribe did not complete) — retry it explicitly.
+                        while True:
+                            try:
+                                self._replies.get_nowait()
+                            except queue.Empty:
+                                break
+                        try:
+                            self._conn._transport._poison()
+                        except Exception:
+                            pass
                         raise OperationalError(
-                            "subscriber control reply timed out (no frame within 10s)"
+                            "subscriber control reply timed out (no frame within 10s); "
+                            "connection poisoned — the reader loop reconnects and "
+                            "resubscribes recorded channels, retry this call"
                         ) from e
                     if ftype == _proto.RESP_PUSH:
                         self._dispatch(rpayload)

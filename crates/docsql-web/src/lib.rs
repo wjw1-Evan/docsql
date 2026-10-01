@@ -1164,14 +1164,30 @@ async fn auth_login(
     // rotation (it would slide for another 12h and defeat the kick). The
     // client simply retries with the new password — no lockout entry, the
     // password was not wrong.
-    if a.creds_snapshot().as_ref() != creds.as_ref() {
-        return json_response(
-            StatusCode::UNAUTHORIZED,
-            json!({"error": "用户名或密码不正确"}),
-        );
-    }
-    let username = a.username().unwrap_or_default();
-    let token = a.sessions.create();
+    let token = {
+        // Re-check AND mint the session as ONE critical section under the
+        // store mutex: `install_change` runs under this same lock, so a
+        // password rotation cannot slip between the re-check and the
+        // session creation. Without this, a login verified against the OLD
+        // password could mint a session AFTER the rotation's `keep_only`
+        // swept sessions — surviving the kick and sliding for another 12h.
+        // When the re-check passes here, the queued rotation's keep_only
+        // still runs afterwards and kills this session too, which is the
+        // documented rotation semantics.
+        let store = a.store.lock().unwrap();
+        if store.creds_snapshot().as_ref() != creds.as_ref() {
+            drop(store);
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "用户名或密码不正确"}),
+            );
+        }
+        a.sessions.create()
+    };
+    let username = creds
+        .as_ref()
+        .map(|c| c.username.clone())
+        .unwrap_or_default();
     with_session_cookie(
         &state,
         json_response(StatusCode::OK, json!({"ok": true, "username": username})),

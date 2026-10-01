@@ -446,7 +446,18 @@ impl Wal {
         let mut i = 0;
         while i < self.deferred_txids.len() {
             let txid = self.deferred_txids[i];
-            self.append(KIND_ABORT, txid, &[])?;
+            if let Err(e) = self.append(KIND_ABORT, txid, &[]) {
+                // Partial failure: some ABORTs sit in the page cache, the
+                // rest were never written — a later fence (a COMMIT after
+                // the failed ROLLBACK) would legitimize exactly the
+                // transactions this call is voiding, splitting the live
+                // catalog from any later recovery. Fail-stop like
+                // `commit`'s post-fence append failure does; a restart
+                // replays whatever actually reached the disk.
+                self.poisoned =
+                    Some("WAL abort append failed; on-disk rollback state is ambiguous".into());
+                return Err(e);
+            }
             i += 1;
         }
         self.deferred_txids.clear();

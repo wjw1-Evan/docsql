@@ -63,6 +63,13 @@ services:
       # to each other automatically during replication fan-out).
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_CLUSTER_TOKEN: "${DOCSQL_CLUSTER_TOKEN:-}"
+      # Least-privilege client credential + connection caps from .env, same
+      # as every other node (node-a used to miss these three: a read-token
+      # client authenticated on 4/5 nodes and failed on the first — the web
+      # console's default management target).
+      DOCSQL_READ_TOKEN: "${DOCSQL_READ_TOKEN:-}"
+      DOCSQL_MAX_CONN: "${DOCSQL_MAX_CONN:-}"
+      DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       # Automatic backups (logical SQL dumps under /data/backups, inside the
       # node's data volume). Empty = server default (daily, keep 7); 0
       # disables. See .env.example.

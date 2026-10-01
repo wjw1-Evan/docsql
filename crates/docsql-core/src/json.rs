@@ -382,7 +382,7 @@ impl<'a> Parser<'a> {
                     Some(b'u') => {
                         let cp = self.hex4()?;
                         // Surrogate pair handling.
-                        let ch = if (0xD800..0xDC00).contains(&cp) {
+                        if (0xD800..0xDC00).contains(&cp) {
                             // Peek, don't bump: a lone high surrogate followed
                             // by any other escape must not consume it — bumping
                             // ahead would silently drop up to two input bytes
@@ -392,31 +392,39 @@ impl<'a> Parser<'a> {
                                 if self.peek() == Some(b'u') {
                                     self.bump();
                                     let lo = self.hex4()?;
-                                    if !(0xDC00..0xE000).contains(&lo) {
-                                        // Not a low surrogate: the pair arithmetic
-                                        // would underflow — substitute instead.
-                                        '\u{FFFD}'
-                                    } else {
+                                    if (0xDC00..0xE000).contains(&lo) {
                                         let combined =
                                             0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                        char::from_u32(combined).unwrap_or('\u{FFFD}')
+                                        out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
+                                    } else {
+                                        // Not a low surrogate: the pair
+                                        // arithmetic would underflow —
+                                        // substitute for the high one. The
+                                        // second \uXXXX escape was fully
+                                        // consumed though, and still
+                                        // contributes its OWN character:
+                                        // dropping it silently shrank the
+                                        // string ("\ud83d\u0041" used to
+                                        // yield one char instead of
+                                        // FFFD + 'A').
+                                        out.push('\u{FFFD}');
+                                        out.push(char::from_u32(lo).unwrap_or('\u{FFFD}'));
                                     }
                                 } else {
                                     // Put the escape start back: the outer loop
                                     // must still parse whatever escape follows.
                                     self.pos -= 1;
-                                    '\u{FFFD}'
+                                    out.push('\u{FFFD}');
                                 }
                             } else {
-                                '\u{FFFD}'
+                                out.push('\u{FFFD}');
                             }
                         } else if (0xDC00..0xE000).contains(&cp) {
                             // Lone low surrogate is not a scalar value.
-                            '\u{FFFD}'
+                            out.push('\u{FFFD}');
                         } else {
-                            char::from_u32(cp).unwrap_or('\u{FFFD}')
-                        };
-                        out.push(ch);
+                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                        }
                     }
                     _ => return Err(JsonError::BadEscape(self.pos)),
                 },
@@ -490,6 +498,22 @@ mod tests {
         // newline escape after the unpaired surrogate has to survive.
         let v = from_str(r#""a\ud83d\nb""#).unwrap();
         assert_eq!(v, Value::Str("a\u{FFFD}\nb".into()));
+    }
+
+    /// 高代理项后跟「是 \u 转义但不是低代理」的形态:第二个转义曾连同其
+    /// 字符一起被丢弃(("\ud83d\u0041" 解出单字符),现在 FFFD + 'A'。
+    #[test]
+    fn lone_high_surrogate_then_non_low_escape_keeps_both() {
+        let v = crate::json::from_str(r#""\ud83d\u0041""#).unwrap();
+        let s = v.as_str().unwrap();
+        assert_eq!(s.chars().count(), 2, "chars: {s:?}");
+        assert_eq!(s.chars().next(), Some('\u{FFFD}'));
+        assert_eq!(s.chars().nth(1), Some('A'));
+        // 两个高代理:第二个也按 FFFD 保留。
+        let v = crate::json::from_str(r#""\ud83d\ud83d""#).unwrap();
+        let s = v.as_str().unwrap();
+        assert_eq!(s.chars().count(), 2);
+        assert!(s.chars().all(|c| c == '\u{FFFD}'));
     }
 
     #[test]

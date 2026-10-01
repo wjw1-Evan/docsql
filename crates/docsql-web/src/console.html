@@ -3557,13 +3557,22 @@ const explorer = {
   createScript(m) {
     // 标识符一律加引号(与建表/编辑对话框同一纪律):表/列名含空格、
     // 引号或分号时,裸拼的脚本轻则解析失败,重则被整段执行成注入。
-    const cols = m.columns.map(c => {
-      let s = `  "${qident(c.name)}" ${c.data_type || 'ANY'}`;
+    // 节点侧来的 data_type/default 是自由文本(对称复制下可来自任意可写
+  // 节点):脚本要拿到别的集群回放,这两个字段不能原样拼进 DDL ——
+  // 类型白名单化,DEFAULT 携带语句边界符/换行/注释标记时整个丢弃。
+  const safeType = t => (/^[A-Za-z0-9_ ()]{1,32}$/.test(String(t)) ? String(t) : 'ANY');
+  const safeDefault = d => {
+    const v = String(d);
+    return (v && !/[\r\n;]|--|\/\*/.test(v)) ? v : null;
+  };
+  const cols = m.columns.map(c => {
+      let s = `  "${qident(c.name)}" ${safeType(c.data_type)}`;
       if (c.primary_key) s += ' PRIMARY KEY';
       if (c.unique) s += ' UNIQUE';
       if (!c.nullable) s += ' NOT NULL';
       if (c.autoinc) s += ' AUTOINCREMENT';
-      if (c.default) s += ` DEFAULT ${c.default}`;
+      const def = safeDefault(c.default);
+      if (def) s += ` DEFAULT ${def}`;
       return s;
     }).join(',\n');
     // 表名进注释前剥掉换行:否则一个含换行的表名能把注释提前收线,

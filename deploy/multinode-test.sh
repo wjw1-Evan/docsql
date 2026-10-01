@@ -367,8 +367,16 @@ wait_row_d() {
 }
 ( cd "$(dirname "$0")" && docker compose --profile cluster --profile join stop node-d >/dev/null 2>&1 || true
   docker compose --profile cluster --profile join rm -f node-d >/dev/null 2>&1 || true
-  docker volume rm -f "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-d" >/dev/null 2>&1 || true
-  docker volume create "${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-d" >/dev/null
+  dvol="${DOCSQL_DEV_DATA_PREFIX:-docsql-dev-data}-d"
+  docker volume rm -f "$dvol" >/dev/null 2>&1 || true
+  # `volume create` is idempotent over a leftover: a failed rm used to boot
+  # node-d on STALE data (non-empty nodes skip bootstrap), and the join
+  # assertions then passed against last run's residue — a false green.
+  if docker volume inspect "$dvol" >/dev/null 2>&1; then
+    echo "FATAL: volume $dvol survived rm; refusing to test on stale data" >&2
+    exit 1
+  fi
+  docker volume create "$dvol" >/dev/null
   DOCSQL_DEV_IMAGE_TAG="${DOCSQL_DEV_IMAGE_TAG:-local}" docker compose --profile cluster --profile join up -d node-d >/dev/null )
 ok_d=""
 for _ in $(seq 1 60); do

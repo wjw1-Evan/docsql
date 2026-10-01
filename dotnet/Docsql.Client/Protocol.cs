@@ -44,6 +44,8 @@ public enum FrameType : ushort
     ReqRelease = 0x0012,
     /// <summary>对象浏览器元数据(与 web /api/meta 同构)。</summary>
     ReqMeta = 0x0013,
+    /// <summary>重置连接级 T-SQL 会话(@变量/@@IDENTITY):池借出时随验活一起发送。</summary>
+    ReqSessionReset = 0x001B,
     RespRows = 0x0101,
     RespAffected = 0x0102,
     RespError = 0x0103,

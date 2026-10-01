@@ -359,38 +359,119 @@ impl Value {
     }
 }
 
-/// Decimal ↔ f64 order: NaN ranks above everything (matching the Float/Float
-/// rule), ±infinity sits beyond the finite decimal range.
+/// Decimal ↔ f64 order, computed EXACTLY. NaN ranks above everything and
+/// ±infinity beyond the finite range (matching the Float/Float rule).
+///
+/// The old implementation converted the f64 through
+/// `Decimal::from_f64_retain` and compared decimals — but that conversion
+/// rounds to the absolute 1e-28 grid, so for |f| < ~4.5e-13 (where a
+/// double's ulp drops below the grid step) distinct adjacent doubles
+/// collapsed onto one grid point: `cmp(d, f1) == cmp(d, f2) == Equal` while
+/// `cmp(f1, f2) == Less`. Equality stopped being transitive across
+/// Decimal/Float, which breaks every binary search and sort that relies on
+/// `cmp_values` being a total order (see `cmp_int_f64` for the same rule).
+/// Instead both sides are decomposed to exact (integer mantissa, powers of
+/// two and five) form and compared with shift arithmetic — no rounded
+/// conversion anywhere.
 fn cmp_decimal_f64(d: &Decimal, f: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if f.is_nan() {
         return Ordering::Less; // d < NaN
     }
-    match Decimal::from_f64_retain(f) {
-        Some(fd) => {
-            if fd.is_zero() && f != 0.0 {
-                // 下溢:非零浮点小到 Decimal 装不下时 from_f64_retain 给
-                // Some(0),让 Decimal(0) 与 1e-30 判等 —— 序失去传递性,
-                // 唯一判定/树内定位全部失真。拆开按量级比:
-                // · d == 0:零小于任何正次正规、大于任何负次正规;
-                // · 非零 d:量级 ≥ 1e-28 严格大于 |f|,正 d 恒大、负 d 恒小。
-                if d.is_zero() {
-                    return if f > 0.0 {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    };
-                }
-                return if d.is_sign_negative() {
+    if f.is_infinite() {
+        return if f > 0.0 {
+            Ordering::Less // d < +inf (Decimal is always finite)
+        } else {
+            Ordering::Greater
+        };
+    }
+    let neg_d = d.is_sign_negative();
+    let zero_d = d.is_zero();
+    let zero_f = f == 0.0;
+    if zero_d || zero_f {
+        return match (zero_d, zero_f) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if f > 0.0 {
                     Ordering::Less
                 } else {
                     Ordering::Greater
-                };
+                }
             }
-            d.cmp(&fd)
+            (false, true) => {
+                if neg_d {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            _ => unreachable!("covered by the outer if"),
+        };
+    }
+    let neg_f = f.is_sign_negative();
+    if neg_d != neg_f {
+        return if neg_d {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let mag = cmp_decimal_f64_mag(d, f);
+    if neg_d {
+        mag.reverse()
+    } else {
+        mag
+    }
+}
+
+/// |d| vs |f| for nonzero finite values. |d| = D / 10^s with D = mantissa,
+/// s = scale ≤ 28; |f| = m · 2^e with m an odd integer < 2^53. Multiply
+/// both sides by 10^s = 2^s·5^s: D vs (m·5^s) · 2^(e+s), i.e. two integer
+/// mantissas under power-of-two scaling — exact in u128 (m·5^s < 2^119).
+fn cmp_decimal_f64_mag(d: &Decimal, f: f64) -> std::cmp::Ordering {
+    /// 5^0 ..= 5^28 (5^28 < 2^66, so m·5^s < 2^53·2^66 < 2^119).
+    const FIVE_POW: [u128; 29] = {
+        let mut t = [1u128; 29];
+        let mut i = 1;
+        while i < 29 {
+            t[i] = t[i - 1] * 5;
+            i += 1;
         }
-        None if f > 0.0 => Ordering::Less, // d < +inf
-        None => Ordering::Greater,         // d > -inf
+        t
+    };
+    /// a vs b·2^j for j ≥ 0, both a and b nonzero.
+    fn cmp_times_pow2(a: u128, b: u128, j: u32) -> std::cmp::Ordering {
+        let bits_a = 128 - a.leading_zeros();
+        let bits_b = 128 - b.leading_zeros();
+        match bits_a.cmp(&(bits_b + j)) {
+            std::cmp::Ordering::Equal => {
+                // Same magnitude class: b << j has bits_b + j = bits_a ≤ 128
+                // significant bits, so the shifted value fits a u128.
+                a.cmp(&(b << j))
+            }
+            other => other,
+        }
+    }
+    let dd = d.mantissa().unsigned_abs();
+    let s = d.scale() as usize; // 0..=28 by construction
+    let bits = f.to_bits();
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & 0xf_ffff_ffff_ffff;
+    let (mut m, mut e) = if exp_bits == 0 {
+        (frac as u128, -1074i32) // subnormal
+    } else {
+        ((frac | (1u64 << 52)) as u128, exp_bits - 1075)
+    };
+    while m % 2 == 0 {
+        m /= 2;
+        e += 1;
+    }
+    let a5 = m * FIVE_POW[s];
+    let shift = e + s as i32;
+    if shift >= 0 {
+        cmp_times_pow2(dd, a5, shift as u32)
+    } else {
+        cmp_times_pow2(a5, dd, (-shift) as u32).reverse()
     }
 }
 
@@ -503,6 +584,68 @@ mod tests {
         assert_eq!(
             Value::cmp_values(&Value::Float(tiny_pos), &Value::Float(1e-29)),
             Less
+        );
+    }
+
+    /// 小量级区(< ~4.5e-13,双精度 ulp 低于 Decimal 的 1e-28 网格)曾因
+    /// from_f64_retain 的舍入让「相邻的两个 double 都等于同一个 Decimal」
+    /// —— Decimal/Float/Float 三者相等关系不可传递,排序与树内定位失真。
+    /// 精确分解比较后,同一 Decimal 对相邻 double 必须给出同号(或相等)的
+    /// 严格序,且不再出现 Equal。
+    #[test]
+    fn decimal_vs_adjacent_small_floats_stays_transitive() {
+        use std::cmp::Ordering::*;
+        let d = Decimal::from_i128_with_scale(1, 13); // 0.0000000000001 (1e-13)
+        let f1 = 1e-13f64;
+        let f2 = f64::from_bits(f1.to_bits() + 1);
+        let f0 = f64::from_bits(f1.to_bits() - 1);
+        assert_eq!(
+            Value::cmp_values(&Value::Float(f0), &Value::Float(f1)),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Float(f1), &Value::Float(f2)),
+            Less
+        );
+        let c1 = Value::cmp_values(&Value::Decimal(d), &Value::Float(f1));
+        let c2 = Value::cmp_values(&Value::Decimal(d), &Value::Float(f2));
+        let c0 = Value::cmp_values(&Value::Decimal(d), &Value::Float(f0));
+        // 1e-13 的最近 double 在其上、前一个在其下:f0 < d < f1 < f2。
+        // 旧实现在这里给出 c1==Equal && c2==Equal(与 f1<f2 矛盾)。
+        assert_eq!(c0, Greater);
+        assert_eq!(c1, Less);
+        assert_eq!(c2, Less);
+        // 常见可精确表示值仍相等;0.1 的最近 double 严格大于十进制 0.1。
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::new(15, 1)), &Value::Float(1.5)),
+            Equal
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::new(1, 1)), &Value::Float(0.1)),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::new(1, 1)), &Value::Float(-0.1)),
+            Greater
+        );
+        // ±0 与 ±inf 的边界。
+        assert_eq!(
+            Value::cmp_values(&Value::Decimal(Decimal::ZERO), &Value::Float(-0.0)),
+            Equal
+        );
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Decimal(Decimal::new(1, 0)),
+                &Value::Float(f64::INFINITY)
+            ),
+            Less
+        );
+        assert_eq!(
+            Value::cmp_values(
+                &Value::Decimal(Decimal::new(-1, 0)),
+                &Value::Float(f64::NEG_INFINITY)
+            ),
+            Greater
         );
     }
 

@@ -39,13 +39,42 @@ _DEC_MAX = 2**96 - 1
 
 
 def _exact_decimal_text(value):
-    """Text for a Decimal-typed bind, rejecting the out-of-domain silently."""
-    if value > _DEC_MAX or value < -_DEC_MAX:
+    """Text for a Decimal-typed bind, rejecting the out-of-domain loudly.
+
+    The server parses $dec with rust_decimal's exact string path: unscaled
+    mantissa <= 2^96-1 AND scale <= 28. A magnitude-only check used to pass
+    38-digit sub-unity fractions whose mantissa cannot fit — the server's
+    marker fallback then bound the whole marker OBJECT as a TEXT literal
+    (silent type corruption). NaN/sNaN are rejected first: they raise
+    InvalidOperation on comparisons, which used to escape execute() as a
+    non-DB-API exception."""
+    if isinstance(value, int):
+        # The > int64 integer route: whole digits only, no scale concerns.
+        if value > _DEC_MAX or value < -_DEC_MAX:
+            raise DataError(
+                f"{value} exceeds DECIMAL precision (max {_DEC_MAX}); "
+                "bind it as a string or scale it down"
+            )
+        return str(value)
+    if not value.is_finite():
         raise DataError(
-            f"{value} exceeds DECIMAL precision (max {_DEC_MAX}); "
-            "bind it as a string or scale it down"
+            f"{value} is not a finite decimal; DECIMAL binds reject NaN/Infinity"
         )
-    return str(value)
+    _sign, digits, exp = value.as_tuple()
+    digit_text = "".join(map(str, digits)) or "0"
+    if exp >= 0:
+        mantissa, scale = int(digit_text) * 10**exp, 0
+    else:
+        mantissa, scale = int(digit_text), -exp
+    if scale > 28 or mantissa > _DEC_MAX:
+        raise DataError(
+            f"{value} exceeds DECIMAL precision (28 significant digits, "
+            f"max {_DEC_MAX}); bind it as a string or scale it down"
+        )
+    # Plain fixed-point text: rust_decimal's FromStr only takes the LOSSY
+    # scientific path for e/E spellings (str(Decimal) goes scientific below
+    # ~1e-6 / above ~1e16).
+    return format(value, "f")
 
 
 def rows_from_payload(payload):
@@ -123,7 +152,17 @@ def param_json(value):
     if isinstance(value, Decimal):
         return '{"$dec":"' + _exact_decimal_text(value) + '"}'
     if isinstance(value, datetime):
-        return '{"$ts":' + str(ts_ms(value)) + "}"
+        ms = ts_ms(value)
+        if not (TIMESTAMP_MIN_MS <= ms <= TIMESTAMP_MAX_MS):
+            # The server keeps out-of-domain $ts markers as plain objects,
+            # which then bind as TEXT — silent type corruption on a legal
+            # Python datetime (e.g. 9999-12-31 23:59:59.999999+ rounds one
+            # millisecond past the domain edge). Reject at the bind.
+            raise DataError(
+                f"{value} is outside the engine TIMESTAMP domain "
+                "(0001-01-01..9999-12-31 UTC); store it as a string"
+            )
+        return '{"$ts":' + str(ms) + "}"
     if isinstance(value, (bytes, bytearray, memoryview)):
         return '{"$bytes":[' + ",".join(str(b) for b in bytes(value)) + "]}"
     if isinstance(value, str):

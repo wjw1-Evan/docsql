@@ -48,6 +48,11 @@ pub struct MemberView {
     pub read_only: bool,
     pub forwarding: bool,
     pub journal_head: Option<u64>,
+    /// The member's cluster node id (`cluster_id` in its status payload):
+    /// the lag guard needs it to read the LOCAL applied position FOR THAT
+    /// ORIGIN (`_cluster_pos`), which is what "how far behind the primary
+    /// are we" actually means.
+    pub node_id: Option<String>,
 }
 
 impl MemberView {
@@ -94,6 +99,12 @@ impl Quorum {
     pub fn last_seen_head(&self, member: &str) -> Option<u64> {
         let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
         views.get(member).and_then(|v| v.journal_head)
+    }
+
+    /// The member's whole last-seen view (lag guard needs the node id too).
+    pub fn view_of(&self, member: &str) -> Option<MemberView> {
+        let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        views.get(member).cloned()
     }
 
     fn record_view(&self, member: &str, view: MemberView) {
@@ -268,6 +279,7 @@ fn parse_member_view(frame: &docsql_core::proto::Frame) -> Option<MemberView> {
         read_only: v["read_only"].as_bool() == Some(true),
         forwarding: v["replicate_to"].is_string(),
         journal_head: v["journal_head"].as_u64(),
+        node_id: v["cluster_id"].as_str().map(String::from),
     })
 }
 
@@ -292,17 +304,34 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
     let self_epoch = state.primary_epoch.load(Ordering::SeqCst);
     let read_only = state.read_only.load(Ordering::SeqCst);
 
-    // (a) Auto-PROMOTE.
-    if state.auto_promote && read_only {
+    // (a) Auto-PROMOTE. Frozen after a demotion re-pointed us at a higher
+    // epoch primary: the lost-primary trigger still watches the STARTUP
+    // primary address, so an unfrozen loop would re-promote against the
+    // dead old primary and let (b) demote it again every cycle — epoch
+    // inflation and a client-visible read-only/write flap. Restart (or a
+    // manual PROMOTE) is the only unfreeze.
+    if state.auto_promote && read_only && !state.auto_promote_frozen.load(Ordering::SeqCst) {
         if let Some(primary) = &state.primary_addr {
             if quorum.is_lost(primary) && quorum.has_majority() {
-                // Lag guard: how far behind the primary's last-seen head
-                // are we? Zero window = unbounded (always acceptable).
-                let primary_head = quorum.last_seen_head(primary);
-                let lag_ok = match (primary_head, state.catchup_window) {
-                    (None, _) => false, // never saw the primary: cannot judge
-                    (Some(ph), 0) => ph >= local_journal_head(state),
-                    (Some(ph), window) => ph.saturating_sub(local_journal_head(state)) <= window,
+                // Lag guard: how far behind the primary's last-seen head is
+                // the APPLIED position for the primary's ORIGIN
+                // (`_cluster_pos`)? The local journal head counts only this
+                // node's OWN writes — a pure replica's head is always 0, so
+                // a busy primary pushed the guard over the window forever
+                // (never promoted), and a previously-writable replica's
+                // stale head could pass the guard while it was actually
+                // far behind. Zero window = unbounded (always acceptable).
+                let view = quorum.view_of(primary);
+                let primary_head = view.as_ref().and_then(|v| v.journal_head);
+                let primary_origin = view.as_ref().and_then(|v| v.node_id.clone());
+                let lag_ok = match (primary_head, primary_origin, state.catchup_window) {
+                    (None, _, _) | (_, None, _) => false, // never saw the primary/its identity: cannot judge
+                    (Some(ph), Some(origin), 0) => {
+                        ph >= applied_position(state, &origin).unwrap_or(0)
+                    }
+                    (Some(ph), Some(origin), window) => {
+                        ph.saturating_sub(applied_position(state, &origin).unwrap_or(0)) <= window
+                    }
                 };
                 if lag_ok {
                     state.read_only.store(false, Ordering::SeqCst);
@@ -349,6 +378,9 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                 if view.is_active_primary() && view.epoch > self_epoch {
                     state.read_only.store(true, Ordering::SeqCst);
                     *state.replicate_to.lock().await = Some(addr.clone());
+                    // The mesh outranks us: freeze self-promotion for this
+                    // process (see the (a) gate comment).
+                    state.auto_promote_frozen.store(true, Ordering::SeqCst);
                     let detail = format!(
                         "higher-ranked primary visible: {addr} (epoch {} > {self_epoch}); \
                          demoted to read-only replica and re-pointed",
@@ -370,9 +402,11 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
     }
 }
 
-/// Local journal head (write-tier access: the call may lazily create the
-/// cluster tables, exactly like the status payload's own read).
-fn local_journal_head(state: &Arc<ServerState>) -> u64 {
+/// The local APPLIED position for `origin` (write-tier access: the call
+/// may lazily create the cluster tables, exactly like the status payload's
+/// own read). None = this node has never applied/replay-seeded anything
+/// from that origin.
+fn applied_position(state: &Arc<ServerState>, origin: &str) -> Option<u64> {
     let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-    db.journal_head().unwrap_or(0)
+    db.position_get(origin).ok().flatten()
 }

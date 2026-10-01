@@ -255,7 +255,13 @@ pub fn parse(sql: &str) -> Option<Result<UserAdminStmt, String>> {
     // column named `to` inside the predicate always precedes it.
     if starts_with_word(trimmed, "GRANT")
         && find_top_level_word(trimmed, "WHERE", 0, false).is_some()
-        && trimmed.to_ascii_uppercase().contains(" ON ")
+        // Word-level ON detection, not a literal " ON " substring: scripts
+        // freely use newlines/tabs between clauses, and the tokenizer
+        // accepts any Unicode whitespace — a substring prefilter rejected
+        // legal multi-line grants with a misleading tokenizer error. The
+        // quote/paren-aware word scan still keeps a role literally named
+        // WHERE/ON from misrouting.
+        && find_top_level_word(trimmed, "ON", 0, true).is_some()
     {
         return Some(parse_grant_with_filter(trimmed));
     }
@@ -746,6 +752,50 @@ pub fn redact_sql(sql: &str) -> String {
                     i = end;
                     continue;
                 }
+            } else {
+                // Fail-closed for malformed forms: PASSWORD followed by
+                // something that is not a plain literal (PASSWORD='x',
+                // PASSWORD /*c*/ 'x', PASSWORD N'x') will be REJECTED by the
+                // tokenizer — but rejected statements still reach the audit
+                // log, and the user's intended plaintext rides in a literal
+                // shortly after the keyword. Scan a short assignment-ish
+                // prefix (whitespace, '=', N/n, comments) for that literal
+                // and mask it; any other character stops the scan so
+                // ordinary queries mentioning a `password` COLUMN keep
+                // their literals verbatim.
+                let mut k = j;
+                let mut mask_end: Option<usize> = None;
+                loop {
+                    let rest = &sql[k..];
+                    let Some(c) = rest.chars().next() else { break };
+                    if c.is_whitespace() || c == '=' || c == 'N' || c == 'n' {
+                        k += c.len_utf8();
+                    } else if rest.starts_with("/*") {
+                        match rest.find("*/") {
+                            Some(p) => k += p + 2,
+                            None => break,
+                        }
+                    } else if rest.starts_with("--") {
+                        match rest.find('\n') {
+                            Some(p) => k += p + 1,
+                            None => break,
+                        }
+                    } else if c == '\'' {
+                        let (end, closed) = crate::stmt::sql_literal_end(sql, k);
+                        let value = &sql[k + 1..if closed { end - 1 } else { bytes.len() }];
+                        if !kdf::is_stored_form(value) {
+                            mask_end = Some(end);
+                        }
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(end) = mask_end {
+                    out.push_str("PASSWORD '***'");
+                    i = end;
+                    continue;
+                }
             }
         }
         // advance by one CHARACTER (multibyte safety)
@@ -1012,18 +1062,64 @@ impl Database {
                 E::InList { expr, list, .. } => {
                     scan(expr, volatile).or_else(|| list.iter().find_map(|i| scan(i, volatile)))
                 }
+                E::Case {
+                    operand,
+                    conditions,
+                    else_result,
+                    ..
+                } => {
+                    // CASE is a first-class container: a subquery (or a
+                    // volatile call) hidden in a WHEN/THEN/ELSE branch used
+                    // to slip past this scan, pass GRANT-time validation,
+                    // and then execute per-row inside the user's filtered
+                    // scans — reading tables the grantee has no access to.
+                    if let Some(op) = operand {
+                        if let Some(m) = scan(op, volatile) {
+                            return Some(m);
+                        }
+                    }
+                    for w in conditions {
+                        if let Some(m) = scan(&w.condition, volatile) {
+                            return Some(m);
+                        }
+                        if let Some(m) = scan(&w.result, volatile) {
+                            return Some(m);
+                        }
+                    }
+                    if let Some(el) = else_result {
+                        if let Some(m) = scan(el, volatile) {
+                            return Some(m);
+                        }
+                    }
+                    None
+                }
+                E::Tuple(items) => items.iter().find_map(|i| scan(i, volatile)),
                 E::Cast { expr, .. } => scan(expr, volatile),
                 sqlparser::ast::Expr::Function(f) => {
                     if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
                         for a in &list.args {
-                            if let sqlparser::ast::FunctionArg::Unnamed(
-                                sqlparser::ast::FunctionArgExpr::Expr(inner),
-                            ) = a
-                            {
-                                if let Some(m) = scan(inner, volatile) {
-                                    return Some(m);
+                            match a {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(inner),
+                                ) => {
+                                    if let Some(m) = scan(inner, volatile) {
+                                        return Some(m);
+                                    }
                                 }
+                                sqlparser::ast::FunctionArg::Named { .. } => {
+                                    return Some(
+                                        "named function arguments are not supported in row filters"
+                                            .into(),
+                                    )
+                                }
+                                _ => {}
                             }
+                        }
+                    }
+                    // Aggregate FILTER (WHERE …) is another expression slot.
+                    if let Some(filter) = &f.filter {
+                        if let Some(m) = scan(filter, volatile) {
+                            return Some(m);
                         }
                     }
                     None
@@ -1753,6 +1849,58 @@ mod tests {
         assert!(db
             .execute("GRANT SELECT ON t WHERE ts >= RAND() TO eve")
             .is_err());
+    }
+
+    /// 行过滤器的 GRANT 校验曾漏 Expr::Case:子查询藏进 WHEN/THEN/ELSE
+    /// 分支即可绕过校验落库,并在受限用户的逐行求值里读取无权表。
+    #[test]
+    fn row_filter_rejects_subquery_hidden_in_case() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE sales (id INT, region TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE secret (x INT)").unwrap();
+        db.execute("CREATE USER eve PASSWORD 'pw12345678'").unwrap();
+        let sql = "GRANT SELECT ON sales TO eve WHERE \
+             (CASE WHEN region = 'east' THEN 1 ELSE (SELECT COUNT(*) FROM secret) END) = 1";
+        assert!(
+            db.execute(sql).is_err(),
+            "a subquery inside CASE must be rejected at GRANT time"
+        );
+        // 对照:直白形态同样被拒。
+        assert!(db
+            .execute("GRANT SELECT ON sales TO eve WHERE id IN (SELECT x FROM secret)")
+            .is_err());
+    }
+
+    /// `PASSWORD=` / `PASSWORD /*c*/ 'x'` / `PASSWORD N'x'` 等畸形形态会被
+    /// tokenizer 拒绝,但被拒语句同样进审计日志:掩码必须 fail-closed 地
+    /// 盖住其后紧跟的字面量,而普通查询里提到 password 列不受误伤。
+    #[test]
+    fn redact_masks_malformed_password_assignment_forms() {
+        for sql in [
+            "CREATE USER eve PASSWORD='s3cret-pw12'",
+            "CREATE USER eve PASSWORD /* why */ 's3cret-pw12'",
+            "CREATE USER eve PASSWORD N's3cret-pw12'",
+        ] {
+            let redacted = redact_sql(sql);
+            assert!(!redacted.contains("s3cret-pw12"), "{sql} -> {redacted}");
+            assert!(redacted.contains("PASSWORD '***'"), "{sql} -> {redacted}");
+        }
+        // 不是赋值形态:password 列后的普通字面量原样保留。
+        let sel = "SELECT password FROM t WHERE note = 'my PASSWORD is fine'";
+        assert_eq!(redact_sql(sel), sel);
+    }
+
+    /// 过滤式 GRANT 的路由预筛曾是字面 " ON " 子串:换行/制表符分隔的合法
+    /// 授权被误导进 tokenizer 路径、以误导性错误被拒。
+    #[test]
+    fn grant_with_filter_accepts_any_whitespace_between_clauses() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE sales (id INT, region TEXT)")
+            .unwrap();
+        db.execute("CREATE USER eve PASSWORD 'pw12345678'").unwrap();
+        db.execute("GRANT SELECT\n\tON sales\nWHERE region = 'east'\nTO eve")
+            .unwrap_or_else(|e| panic!("multi-line grant must parse: {e}"));
     }
 
     #[test]

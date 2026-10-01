@@ -316,7 +316,8 @@ impl S3Client {
         let res = stream_body_to_file(&mut conn, &tmp, len, leftover).await;
         match res {
             Ok(()) => {
-                std::fs::rename(&tmp, dest).map_err(|e| format!("s3 get {key}: rename: {e}"))?;
+                crate::backup::rename_synced(&tmp, dest)
+                    .map_err(|e| format!("s3 get {key}: rename: {e}"))?;
                 Ok(len)
             }
             Err(e) => {
@@ -415,7 +416,18 @@ fn endpoint_parts(endpoint: &str) -> Result<(String, u16, String), String> {
         "http" => 80,
         other => return Err(format!("s3 endpoint scheme {other:?} is not http/https")),
     };
-    let authority = rest.split('/').next().unwrap_or(rest).to_string();
+    if rest.contains('/') {
+        // A path component used to be silently dropped (`gw.example.com/s3`
+        // signed and PUT against `gw.example.com`), surfacing far from the
+        // misconfiguration as per-upload 404/signature errors. Reject at
+        // startup instead; DOCSQL_BACKUP_S3_PREFIX is the supported spelling
+        // for key prefixes.
+        return Err(format!(
+            "s3 endpoint {endpoint:?} carries a path component; use host[:port] \
+             (set DOCSQL_BACKUP_S3_PREFIX for key prefixes)"
+        ));
+    }
+    let authority = rest.to_string();
     let authority_view: &str = &authority;
     // [v6]:port, host:port, bare host.
     if let Some(rest) = authority_view.strip_prefix('[') {

@@ -109,7 +109,7 @@ with docsql.connect(host="127.0.0.1", port=7600, token="...",
   (应对 `DOCSQL_IDLE_TIMEOUT`),断线自动重连并从每频道最后收到的 id 之后
   续传(`id > from`,不丢不重;从未投递过消息的频道断连窗口内的消息仅显式
   数字 `from_` 可恢复);`ping(reconnect=True)` 重连后未决事务响亮报错
-  (服务端已在断连时回滚),游标的 prepared 缓存自动失效重编;
+  (服务端已在断连时回滚),连接级 prepared 缓存自动失效重编(句柄随物理连接存活,短命游标共享同一缓存);
 - 错误层级:DB-API 标准族,映射基于服务端错误文本启发式;协议级
   `ProtocolError` 属 `InterfaceError` 子类(传输失效,连接必须弃用)。
 
@@ -131,6 +131,8 @@ with docsql.connect(host="127.0.0.1", port=7600, token="...",
 - **事务安全**:事务未了结就 `Close()` 的连接被物理丢弃(服务器对断连自动 ROLLBACK),
   残留事务不可能泄漏给下一个借出者;
 - 池化连接的服务端 prepared 句柄缓存随物理连接有效,复用零成本;
+- **借出即重置 T-SQL 会话**:@变量/`@@IDENTITY`/`@@ROWCOUNT` 挂在物理连接上,借出
+  验活时以 `REQ_SESSION_RESET` 一并清零(下一位借出者不继承上一位的会话状态);
 - 开关:`pooling=false`(直连模式);`max pool size=N`(池上限,默认 100);
 - `ClearPool()` / `ClearAllPools()` 物理清空空闲连接;
 - **真异步**:`OpenAsync`/`ExecuteReaderAsync`/`ExecuteNonQueryAsync`/`ExecuteScalarAsync`/

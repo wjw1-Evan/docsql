@@ -26,6 +26,8 @@ import socket
 import ssl
 import threading
 
+import time
+
 from . import _proto
 from ._proto import sql_payload
 from ._convert import execute_payload, rows_from_payload, ts_ms
@@ -46,6 +48,9 @@ threadsafety = 1
 paramstyle = "qmark"
 
 _PREPARED_CAPACITY = 96
+# How long a PARTIAL frame may sit unread before the poll loop declares
+# the link dead (mid-frame peer death leaves no EOF — only silence).
+_PARTIAL_FRAME_MAX_WAIT = 30.0
 
 
 def connect(
@@ -112,6 +117,9 @@ class _Transport:
         # Partial-frame buffer for `read_frame_poll` (keepalive loops read
         # with a bounded wait; a header may arrive without its payload).
         self._poll_buf = bytearray()
+        # When the current partial frame started waiting (see
+        # _PARTIAL_FRAME_MAX_WAIT): None while the buffer is empty.
+        self._partial_since = None
         try:
             raw = socket.create_connection((host, port), timeout=timeout)
         except OSError as e:
@@ -242,6 +250,7 @@ class _Transport:
                         self._poll_buf[_proto.HEADER_LEN : _proto.HEADER_LEN + length]
                     )
                     del self._poll_buf[: _proto.HEADER_LEN + length]
+                    self._partial_since = None
                     return self._finalize_frame(flags, frame_type, payload)
             try:
                 self._sock.settimeout(poll_seconds)
@@ -249,8 +258,22 @@ class _Transport:
             except (socket.timeout, TimeoutError):
                 if len(self._poll_buf) > 0:
                     # A partial frame is in flight: keep waiting for the
-                    # rest rather than reporting idle.
+                    # rest rather than reporting idle — but never forever.
+                    # A peer dying mid-frame leaves the stream truncated;
+                    # an unbounded wait silenced the idle signal (and with
+                    # it the keepalive PING) while the subscriber merely
+                    # LOOKED alive.
+                    now = time.monotonic()
+                    if self._partial_since is None:
+                        self._partial_since = now
+                    elif now - self._partial_since > _PARTIAL_FRAME_MAX_WAIT:
+                        self._poison()
+                        raise InterfaceError(
+                            "transport stalled mid-frame for over "
+                            f"{_PARTIAL_FRAME_MAX_WAIT:.0f}s; connection poisoned"
+                        )
                     continue
+                self._partial_since = None
                 return None
             except OSError as e:
                 self._poison()
@@ -337,6 +360,12 @@ class Connection:
             timeout=kwargs.get("timeout", 15.0),
         )
         self._cursors = set()
+        # Server-side prepared handles are PER-CONNECTION state; the client
+        # cache lives here too so every cursor shares it. A per-cursor cache
+        # re-prepared the same template for each short-lived cursor and
+        # leaked handles until the server's per-connection cap hard-blocked
+        # every further prepare on this wire.
+        self._prepared = {}
         self._tx_open = False
         # Set when a reconnect dropped an open transaction: the server
         # rolled it back on disconnect, so a later commit() must NOT claim
@@ -375,6 +404,17 @@ class Connection:
         for cur in list(self._cursors):
             cur._closed = True
         self._cursors.clear()
+        # Release prepared handles while the wire still answers (the server
+        # frees them on disconnect anyway; this just keeps the accounting
+        # clean). Best effort — a poisoned transport raises below anyway.
+        try:
+            for h in self._prepared.values():
+                self._transport.round_trip(
+                    _proto.REQ_CLOSE_STMT, b'{"handle":%d}' % h
+                )
+        except Exception:
+            pass
+        self._prepared.clear()
         self._transport.close()
 
     def commit(self):
@@ -445,8 +485,9 @@ class Connection:
                 self._transport.close()
                 fresh = connect(**self._kwargs)
                 self._transport = fresh._transport
-                for cur in self._cursors:
-                    cur._prepared.clear()
+                # Handles died with the old socket — the cache is
+                # connection-level now; drop it once, not per cursor.
+                self._prepared.clear()
                 self._tx_open = False
                 self._tx_lost = tx_lost
                 return
@@ -485,7 +526,6 @@ class Cursor:
         self._rows = []
         self._pos = 0
         self.rowcount = -1
-        self._prepared = {}
 
     # -- statement execution -----------------------------------------------
     def execute(self, operation, parameters=None):
@@ -538,15 +578,16 @@ class Cursor:
         self.rowcount = -1 if saw_rows else total
 
     def _prepare(self, template):
-        handle = self._prepared.get(template)
-        if handle is not None:
-            return handle
-        if len(self._prepared) >= _PREPARED_CAPACITY:
-            for h in self._prepared.values():
+        # See Connection._prepared: one shared per-connection handle cache.
+        cached = self._conn._prepared.get(template)
+        if cached is not None:
+            return cached
+        if len(self._conn._prepared) >= _PREPARED_CAPACITY:
+            for h in self._conn._prepared.values():
                 self._conn._transport.round_trip(
                     _proto.REQ_CLOSE_STMT, b'{"handle":%d}' % h
                 )
-            self._prepared.clear()
+            self._conn._prepared.clear()
         ftype, payload = self._conn._transport.round_trip(
             _proto.REQ_PREPARE, sql_payload(template)
         )
@@ -554,7 +595,7 @@ class Cursor:
         import json
 
         handle = json.loads(payload.decode("utf-8"))["handle"]
-        self._prepared[template] = handle
+        self._conn._prepared[template] = handle
         return handle
 
     # -- fetching ------------------------------------------------------------

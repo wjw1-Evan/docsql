@@ -55,11 +55,13 @@ def test_prepared_template_is_reused(conn):
         _table(cur, "py_prep")
         template = "INSERT INTO py_prep (id, v) VALUES (?, ?)"
         cur.execute(template, (1, "a"))
-        assert template in cur._prepared
-        handle = cur._prepared[template]
+        # The handle cache is CONNECTION-level (server handles are
+        # per-connection state; a per-cursor cache leaked them).
+        assert template in conn._prepared
+        handle = conn._prepared[template]
         cur.execute(template, (2, "b"))
         # The template is registered once and reused (same handle).
-        assert cur._prepared[template] == handle
+        assert conn._prepared[template] == handle
         cur.execute("SELECT COUNT(*) FROM py_prep")
         assert cur.fetchone() == (2,)
 

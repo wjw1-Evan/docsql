@@ -776,15 +776,24 @@ impl Pager {
             let u = lock(&self.undo);
             u.active && !u.replaying && u.freed.contains(&id)
         };
-        {
+        let needs_realloc_image = was_freed && {
+            let u = lock(&self.undo);
+            u.active && !u.replaying && !u.recorded.contains(&id)
+        };
+        if needs_realloc_image {
+            // Fetch the pre-image BEFORE touching `recorded`: an I/O error
+            // here must not leave a ghost entry — the page would then never
+            // get an undo pre-image again for the rest of the transaction,
+            // and ROLLBACK would restore a page the restored catalog reads.
+            let image = self.current_page_image(id)?;
             let mut u = lock(&self.undo);
-            if u.active && !u.replaying && was_freed && u.recorded.insert(id) {
-                drop(u);
-                let image = self.current_page_image(id)?;
-                let mut u = lock(&self.undo);
+            if u.active && !u.replaying && u.recorded.insert(id) {
                 u.ops.push(UndoOp::Set(id, image));
                 u.ops.push(UndoOp::Realloc(id));
-            } else if u.active && !u.replaying && !was_freed {
+            }
+        } else {
+            let mut u = lock(&self.undo);
+            if u.active && !u.replaying && !was_freed {
                 u.ops.push(UndoOp::Alloc(id));
             }
         }
@@ -897,6 +906,49 @@ impl Pager {
         u.recorded.clear();
         u.freed.clear();
         ops
+    }
+
+    /// Put a journal back after a FAILED rollback: the transaction stays
+    /// open, so recording resumes and a retried ROLLBACK replays the same
+    /// ops instead of an empty tail. Rebuilds the recording sets the same
+    /// way [`Pager::take_undo_to`] does.
+    pub fn restore_undo_journal(&self, ops: Vec<UndoOp>) {
+        let mut u = lock(&self.undo);
+        u.recorded = ops
+            .iter()
+            .filter_map(|op| match op {
+                UndoOp::Set(id, _) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        u.freed = ops
+            .iter()
+            .filter_map(|op| match op {
+                UndoOp::Free(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        u.ops = ops;
+        u.active = true;
+    }
+
+    /// Reattach a `take_undo_to` tail after a FAILED ROLLBACK TO SAVEPOINT.
+    /// Appending (not replacing) keeps the head that survived the split.
+    pub fn reattach_undo_tail(&self, tail: Vec<UndoOp>) {
+        let mut u = lock(&self.undo);
+        for op in tail {
+            match &op {
+                UndoOp::Set(id, _) => {
+                    u.recorded.insert(*id);
+                }
+                UndoOp::Free(id) => {
+                    u.freed.insert(*id);
+                }
+                _ => {}
+            }
+            u.ops.push(op);
+        }
+        u.active = true;
     }
 
     /// Suppress undo recording while a rollback replay writes pre-images

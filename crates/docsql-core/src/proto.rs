@@ -146,6 +146,13 @@ pub const REQ_SESSIONS: u16 = 0x0019;
 /// RESP_ERROR (no such connection / killing your own connection).
 pub const REQ_KILL: u16 = 0x001A;
 
+/// Reset the connection-scoped T-SQL batch session (@variables,
+/// @@IDENTITY/@@ROWCOUNT, error code). Pooled client drivers send it when
+/// a physical connection is RE-BORROWED: the session state lives on the
+/// TCP connection, so without a reset the next borrower inherits the
+/// previous one's variables (duplicate-DECLARE errors, stale identity).
+pub const REQ_SESSION_RESET: u16 = 0x001B;
+
 // Response frame types.
 pub const RESP_ROWS: u16 = 0x0101;
 pub const RESP_AFFECTED: u16 = 0x0102;

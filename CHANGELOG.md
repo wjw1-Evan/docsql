@@ -5,6 +5,79 @@
 
 ## [Unreleased]
 
+### 第二轮全模块缺陷审查修复(2026-10-01)
+
+对全部模块再做一轮系统审查(14 路并行→逐条源码核实→修复+回归落各模块内;Rust 全量
+1000 用例、.NET 183、Python 38 绿):
+
+- **存储层**:ROLLBACK 失败路径曾把 undo 日志随局部变量丢弃——重试回滚拿到空日志,
+  "成功"地只还原内存目录而页面像保持事务内状态(静默半回滚);现失败保留日志重放
+  (含 ROLLBACK TO 的尾部回填)。`allocate_page` 的 Realloc 记账先改 `recorded` 再取
+  前像,I/O 失败留下幽灵条目使该页此后永不记录前像;现先取像后记账。堆扫描/定位读
+  对"非对象根"槽位三处行为不一(scan 静默跳行、live_count 计数、doc_at 包装),按
+  "损坏只许响亮报错"统一为报错。
+- **值系统**:Decimal↔Float 比较经 `from_f64_retain` 的 1e-28 网格舍入,|f| < ~4.5e-13
+  时相邻 double 同判等——相等关系不可传递(全序破坏,排序/唯一判定/树内定位失真);
+  现按整数尾数×幂的精确分解比较。
+- **SQL 内核**:upsert 的 `EXCLUDED`/`VALUES()` 替换不进 FLOOR/CEIL/SUBSTRING/TRIM/
+  POSITION/OVERLAY/IS NULL/TUPLE 节点,候选行值静默解析到旧行同名列;零行
+  `INSERT ... SELECT NEWID()` 回写退化成 `INSERT INTO t () VALUES `(不可解析文本进
+  journal,重放节点永久失败);建表约束树与目录分两个写单元落盘(崩溃窗口泄漏树页);
+  upsert 父侧 FK 不计同批 placed 行(键"腾出又补上"误报);legacy 全集唯一检查不剔除
+  OR REPLACE 位移行(假阳性 UNIQUE 失败)。不可解析时间戳字符串边界绕过带型检查,
+  exact 有序索引窗口放进 WHERE 应排除的行(结果随索引存在性漂移);相关子查询里外层
+  别名的显式 NULL 列回退裸名解析到其它别名同名列;EXPLAIN 与执行器两处失同步
+  (`SELECT TOP` 被拒、`WITH ROLLUP` 静默丢弃)。
+- **T-SQL/JSON**:`SET @n = 5 -- note` 尾注释吞掉求值包装的右括号(DECLARE/SET/PRINT
+  解析失败);GO 分块深度扫描的 CASE 跳过不看字符串字面量(`'end'` 提前闭合 CASE 后
+  光标错位,@变量越 GO 存活、重新 DECLARE 误报重复);孤立高代理项后跟非低代理的
+  `\uXXXX` 转义丢字符。
+- **用户/安全**:行过滤器 GRANT 校验不进 CASE/TUPLE/聚合 FILTER,子查询可藏进
+  WHEN/THEN 绕过校验落库并在受限用户会话逐行执行;`redact_sql` 对 `PASSWORD=`/
+  `PASSWORD /*注释*/ 'x'`/`PASSWORD N'x'` 畸形形态 fail-open(被拒语句的明文密码仍进
+  审计日志);过滤式 GRANT 的路由预筛要求字面 `" ON "` 空格(多行 SQL 被误导进
+  tokenizer 报错)。
+- **服务器**:匿名收口门漏 `REQ_SESSIONS`/`REQ_KILL`(无 token 且已有用户的节点上,
+  未认证连接可读全部会话的实时语句文本并杀任意连接);用户登录的授权解析与纪元采样
+  非原子(撤销恰落在窗口内时会话带着"旧权限+新纪元"永久跳过刷新);行过滤语句的查询
+  日志记的是过滤前原文(与"改写后文本进日志与复制扇出"红线不符),现三处记录点均记
+  实际执行文本。repair 的"任一对端一致即收敛"捷径使均分/少数派分歧永久固化(4 节点
+  两个 {A,B}|{C,D} 各自收敛,永不对账),删除捷径让全部探测流入多数派选举。
+  AUTO_PROMOTE 滞后守卫用本节点自有 journal 计数当基准(纯副本恒为 0,繁忙主下永不
+  提升;曾可写节点换主后可带 9 万条滞后提升),改用对主源的应用位点;降级重指向后
+  自动提升不再按启动主地址反复触发(冻结至重启,防每周期提升/降级震荡)。新增
+  `REQ_SESSION_RESET` 帧:池化驱动借出物理连接时重置 T-SQL 会话。
+- **备份/S3**:远端副本上传失败永不重试(游标已越过该文件,本地 keep-N 清理后该份
+  备份本地远端皆无),每轮 tick 现对账补传;endpoint 携带路径成分曾静默丢弃(签名
+  全错、排障误导),启动即拒;rename 后补父目录 fsync(断电窗口不再丢"最新一份全量"
+  的名字)。
+- **Web 控制台**:登录的凭据复查与会话签发非原子(轮换恰落在窗口内时,旧密码验证的
+  登录能在 keep_only 清扫后仍造出会话、滑行 12h),现同锁内完成;对象浏览器的
+  "编写表脚本"把节点侧 `data_type`/`default` 自由文本原样拼进 DDL(恶意/受损节点可
+  注入语句到回放端),类型白名单化、带语句边界的 DEFAULT 整体丢弃。
+- **CLI**:裸 `BEGIN;`/`BEGIN WORK;` 被当 T-SQL 块开始符(交互式事务后所有语句被扣住
+  不执行直到 END/EOF);管道 stdin 模式出错仍退出 0(CI 假成功);三处错误帧载荷绕过
+  终端消毒(ANSI/OSC 注入直打操作员终端);`--user` 出现在 `connect` 之前被当数据库名
+  静默创建 `--user` 库文件;round_trip 预算被每条推送重置(持续推送的频道让防挂死保
+  护永久失效)、裸 TCP 写无超时;无 DOCSQL_PASSWORD 且 stdin 为管道时密码提示吞掉
+  SQL 首行。
+- **.NET**:连接池归还不清 T-SQL 会话(下一位借出者继承 @变量/@@IDENTITY:重复
+  DECLARE 报错、身份值错读),借出时改发会话重置帧;`Close()` 不清 `InTransaction`
+  (重开后每次 Close 物理丢弃连接绕过池,陈旧事务对象可 COMMIT/ROLLBACK 下一位借出者
+  的事务),加代际守卫;六个强类型 getter 遇 NULL 静默返回 0/min-value(漏 NonNull
+  契约);`$dec` 标记解析允许千分位(与 Rust/Python 三方不对称,同文档静默改型)。
+- **Python**:prepared 缓存挂在游标上而服务端句柄是连接级(短命游标泄漏句柄至 1024
+  上限后连接上所有参数化执行永久失败),缓存上移到连接;订阅控制超时不清队列不毒化
+  (迟到的应答被下一次控制当自己的应答=静默错位一帧),毒化连接交由重连恢复;半帧
+  等待无上限(对端死在帧中间时保活 PING 永久静默、订阅者假活),30s 上限后毒化;
+  NaN/超 28 位小数 Decimal 与超值域 datetime 绑定均在客户端响亮拒绝(原为泄漏
+  InvalidOperation 或静默按 TEXT 绑定)。
+- **部署/CI**:prod compose 的 node-a 缺 `DOCSQL_READ_TOKEN`/`DOCSQL_MAX_CONN`/
+  `DOCSQL_IDLE_TIMEOUT` 透传(同凭据 4/5 节点生效);NuGet 发布补 tag=csproj=样例钉版
+  三方一致性门禁(`--skip-duplicate` 曾让忘升版的发布全绿);CI 样例 restore 重试循环
+  吞退出码;run-tests.sh 加互斥锁;multinode 的 node-d 卷重建补"rm 后残留必须中止"
+  守卫(残留旧数据可让 join 断言假绿)。
+
 ### 全模块缺陷审查修复(存储/SQL/兼容层/服务器/Web·CLI/.NET/Python/CI)(2026-10-01)
 
 对全部功能模块做了一轮系统缺陷审查,每项发现先在源码核实再修复,回归测试落各模块内:

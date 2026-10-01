@@ -232,6 +232,11 @@ pub struct ServerState {
     /// lost-primary trigger reads this (PROMOTE detaches the live
     /// replicate_to, the trigger must survive that).
     pub primary_addr: Option<String>,
+    /// Set when a quorum demotion re-points this node at a higher-epoch
+    /// primary: auto-PROMOTE stays frozen for the process lifetime after
+    /// that (the trigger still watches the startup primary; unfrozen it
+    /// would flap promote/demote every probe cycle). Restart unfreezes.
+    pub auto_promote_frozen: std::sync::atomic::AtomicBool,
     /// DOCSQL_AUTO_PROMOTE (requires the quorum loop).
     pub auto_promote: bool,
     /// Lag-guard warning is once per lost-primary episode.
@@ -819,6 +824,7 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
         arbiter: cfg.arbiter,
         primary_epoch: std::sync::atomic::AtomicU64::new(0),
         primary_addr,
+        auto_promote_frozen: std::sync::atomic::AtomicBool::new(false),
         auto_promote: cfg.auto_promote,
         promote_lag_warned: std::sync::atomic::AtomicBool::new(false),
         backup: Mutex::new(backup::BackupShared::default()),
@@ -1254,7 +1260,7 @@ async fn user_login_frame(
     state: &Arc<ServerState>,
     source_ip: &str,
     payload: &[u8],
-) -> (Frame, Option<UserAuth>) {
+) -> (Frame, Option<UserAuth>, u64) {
     let bad = || Frame::new(proto::RESP_ERROR, err_payload("bad username or password"));
     let parsed: std::result::Result<(String, String), String> = (|| {
         let v: serde_json::Value =
@@ -1269,7 +1275,7 @@ async fn user_login_frame(
     })();
     let (name, pw) = match parsed {
         Ok(c) => c,
-        Err(m) => return (Frame::new(proto::RESP_ERROR, err_payload(&m)), None),
+        Err(m) => return (Frame::new(proto::RESP_ERROR, err_payload(&m)), None, 0),
     };
     if name.is_empty()
         || name.len() > 64
@@ -1277,7 +1283,7 @@ async fn user_login_frame(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
     {
-        return (bad(), None);
+        return (bad(), None, 0);
     }
     let stored = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
@@ -1300,6 +1306,7 @@ async fn user_login_frame(
                         err_payload("authentication timeout; reconnect"),
                     ),
                     None,
+                    0,
                 );
             }
         };
@@ -1328,13 +1335,23 @@ async fn user_login_frame(
             false,
             Some("user login failed".into()),
         );
-        return (bad(), None);
+        return (bad(), None, 0);
     }
-    let grants = {
+    let (grants, grants_epoch_now) = {
         let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-        docsql_core::useradmin::resolve_grants(&mut db, &name)
+        // Sample the grants epoch INSIDE the critical section that resolves
+        // the grants: a REVOKE applies under this lock and bumps the epoch
+        // only after releasing it, so the "old grants + new epoch" pair
+        // (which would skip every per-frame refresh forever) cannot be
+        // assembled here — seeing the new epoch implies the revoke already
+        // landed in the resolved grants.
+        let g = docsql_core::useradmin::resolve_grants(&mut db, &name)
             .ok()
-            .flatten()
+            .flatten();
+        (
+            g,
+            state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        )
     };
     match grants {
         Some(g) => {
@@ -1353,10 +1370,11 @@ async fn user_login_frame(
                     format!("ok(user:{name})").into_bytes(),
                 ),
                 Some(UserAuth { name, grants: g }),
+                grants_epoch_now,
             )
         }
         // Raced with DROP USER between verify and resolve.
-        None => (bad(), None),
+        None => (bad(), None, 0),
     }
 }
 
@@ -1816,6 +1834,9 @@ pub async fn handle_connection(
                         | proto::REQ_LOGS
                         | proto::REQ_SUBSCRIBE
                         | proto::REQ_PSUBSCRIBE
+                        | proto::REQ_SESSIONS
+                        | proto::REQ_KILL
+                        | proto::REQ_SESSION_RESET
                 )
             {
                 let _ = tx
@@ -1982,12 +2003,15 @@ pub async fn handle_connection(
                             err_payload("already authenticated; reconnect to switch identity"),
                         ))
                     } else {
-                        let (f, u) = user_login_frame(&state, source_ip, &frame.payload).await;
+                        let (f, u, epoch) =
+                            user_login_frame(&state, source_ip, &frame.payload).await;
                         if let Some(u) = u {
                             role = ConnRole::Client;
                             session.set_identity(&format!("user {}", u.name));
-                            user_epoch =
-                                state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                            // Locked to the grants the login resolved (see
+                            // user_login_frame): the per-frame refresh then
+                            // catches any REVOKE that lands after this point.
+                            user_epoch = epoch;
                             user = Some(u);
                         }
                         Some(f)
@@ -2066,6 +2090,16 @@ pub async fn handle_connection(
                         Some(Frame::new(proto::RESP_STATUS, payload))
                     }
                     }
+                }
+                proto::REQ_SESSION_RESET if authed => {
+                    // Pooled drivers reset the T-SQL batch session when a
+                    // physical connection is re-borrowed (see proto.rs):
+                    // the alternative — carrying the previous borrower's
+                    // @variables/@@IDENTITY across the pool — surfaces as
+                    // duplicate-DECLARE errors and silently wrong identity
+                    // values.
+                    tsql_session = docsql_core::tsql_batch::TsqlSession::new();
+                    Some(Frame::new(proto::RESP_AFFECTED, b"session reset".to_vec()))
                 }
                 proto::REQ_SESSIONS if authed => {
                     // Activity monitor: seeing other connections' current
@@ -2192,6 +2226,9 @@ pub async fn handle_connection(
                     // below, so "running" is exactly this span.
                     session.start_statement(&sql);
                     let mut logged = false;
+                    // Post-row-filter text when a filter rewrote the
+                    // statement (None = record the user's original).
+                    let mut logged_effective: Option<String> = None;
                     let resp = match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly) {
                         // 读日志的查询本身不写日志(避免读日志刷日志)。
                         Some(f) => f,
@@ -2354,7 +2391,14 @@ pub async fn handle_connection(
                                                 )
                                         });
                                     if read_eligible {
-                                        execute_read_sql(&state, &effective, stmt_deadline, user.as_ref()).await
+                                        execute_read_sql(
+                                            &state,
+                                            &effective,
+                                            stmt_deadline,
+                                            user.as_ref(),
+                                            &mut logged_effective,
+                                        )
+                                        .await
                                     } else {
                                         let (resp, identity) = execute_sql_with_identity(
                                             &state,
@@ -2373,6 +2417,7 @@ pub async fn handle_connection(
                                             // header bit.
                                             user.as_ref(),
                                             stmt_deadline,
+                                            &mut logged_effective,
                                         )
                                         .await;
                                         // The fast path bypasses the T-SQL
@@ -2411,7 +2456,7 @@ pub async fn handle_connection(
                         querylog::record(
                             &state,
                             &peer,
-                            &sql,
+                            logged_effective.as_deref().unwrap_or(&sql),
                             started.elapsed().as_secs_f64() * 1000.0,
                             &resp,
                             frame.flags & FLAG_REPLICATION != 0,
@@ -2479,33 +2524,35 @@ pub async fn handle_connection(
                         ),
                         None => (Err("execute: unknown statement handle".to_string()), String::new()),
                     };
-                    match rendered {
-                        Ok(sql) => {
-                            let started = std::time::Instant::now();
-                            let deadline = state
-                                .statement_timeout
-                                .map(|t| std::time::Instant::now() + t);
-                            let (resp, logged) =
-                                match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly)
-                                {
-                                // 读日志的查询本身不写日志(避免读日志刷日志)。
-                                Some(f) => ((f, None), false),
-                                None => (
-                                    execute_sql_with_identity(
-                                        &state,
-                                        &sql,
-                                        false,
-                                        false,
-                                        Some(conn_id),
-                                        false,
-                                        None,
-                                        user.as_ref(),
-                                        deadline,
-                                    )
-                                    .await,
-                                    true,
-                                ),
-                            };
+                        match rendered {
+                            Ok(sql) => {
+                                let started = std::time::Instant::now();
+                                let deadline = state
+                                    .statement_timeout
+                                    .map(|t| std::time::Instant::now() + t);
+                                let mut exec_logged_sql: Option<String> = None;
+                                let (resp, logged) =
+                                    match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly)
+                                    {
+                                    // 读日志的查询本身不写日志(避免读日志刷日志)。
+                                    Some(f) => ((f, None), false),
+                                    None => (
+                                        execute_sql_with_identity(
+                                            &state,
+                                            &sql,
+                                            false,
+                                            false,
+                                            Some(conn_id),
+                                            false,
+                                            None,
+                                            user.as_ref(),
+                                            deadline,
+                                            &mut exec_logged_sql,
+                                        )
+                                        .await,
+                                        true,
+                                    ),
+                                };
                             let (resp, identity) = resp;
                             // Same session bookkeeping as the REQ_SQL fast
                             // path: a parameterized INSERT owns the
@@ -2523,7 +2570,10 @@ pub async fn handle_connection(
                                 querylog::record(
                                     &state,
                                     &peer,
-                                    &log_sql,
+                                    // A row-filter rewrite wins over the
+                                    // template display: the log must show
+                                    // the enforced statement.
+                                    exec_logged_sql.as_deref().unwrap_or(&log_sql),
                                     started.elapsed().as_secs_f64() * 1000.0,
                                     &resp,
                                     false,
@@ -3073,6 +3123,7 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
                     None => (sql.clone(), false),
                 }
             };
+            let mut exec_logged_sql: Option<String> = None;
             let (frame, identity) = execute_sql_with_identity(
                 state,
                 &effective,
@@ -3083,13 +3134,14 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
                 None,
                 user,
                 deadline,
+                &mut exec_logged_sql,
             )
             .await;
             self.stmt_identity = identity.map(docsql_core::Value::Int);
             querylog::record(
                 state,
                 &peer,
-                &sql,
+                exec_logged_sql.as_deref().unwrap_or(&sql),
                 started.elapsed().as_secs_f64() * 1000.0,
                 &frame,
                 false,
@@ -3205,6 +3257,7 @@ async fn execute_read_sql(
     sql: &str,
     deadline: Option<std::time::Instant>,
     user: Option<&UserAuth>,
+    logged_sql: &mut Option<String>,
 ) -> Frame {
     // Row-filter enforcement for the MVCC read tier (execute_sql_inner
     // does the same for every other user-carrying path; a statement goes
@@ -3217,6 +3270,7 @@ async fn execute_read_sql(
                 Ok(t) => {
                     drop(db);
                     sql_owned = t;
+                    *logged_sql = Some(sql_owned.clone());
                     &sql_owned
                 }
                 Err(m) => {
@@ -3966,6 +4020,7 @@ async fn execute_sql(
         seq_pos,
         user,
         stmt_deadline,
+        &mut None,
     )
     .await
     .0
@@ -3986,6 +4041,7 @@ async fn execute_sql_with_identity(
     seq_pos: Option<(&str, u64)>,
     user: Option<&UserAuth>,
     stmt_deadline: Option<std::time::Instant>,
+    logged_sql: &mut Option<String>,
 ) -> (Frame, Option<i64>) {
     #![allow(clippy::too_many_arguments)]
 
@@ -4006,6 +4062,7 @@ async fn execute_sql_with_identity(
         seq_pos,
         user,
         stmt_deadline,
+        logged_sql,
     )
     .await;
     if resp.frame_type == proto::RESP_ERROR {
@@ -4028,6 +4085,11 @@ async fn execute_sql_inner(
     seq_pos: Option<(&str, u64)>,
     user: Option<&UserAuth>,
     stmt_deadline: Option<std::time::Instant>,
+    // Set to the POST-ROW-FILTER text when a row filter rewrote the
+    // statement, so the query log records what actually executed (the
+    // journal/fan-out already carry the rewritten text; the log used to
+    // keep the user's original, hiding the enforced predicate).
+    logged_sql: &mut Option<String>,
 ) -> (Frame, Option<i64>) {
     // Row-filter enforcement BEFORE the single parse: the rewritten text is
     // what executes, is logged, journals and replays to peers (a replica
@@ -4042,6 +4104,7 @@ async fn execute_sql_inner(
                 Ok(t) => {
                     drop(db_ref);
                     sql_owned = t;
+                    *logged_sql = Some(sql_owned.clone());
                     &sql_owned
                 }
                 Err(m) => {
@@ -6839,10 +6902,13 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                 break;
             }
         };
-        if reports.iter().any(|(_, d)| d == &local) {
-            drain_sync_queue(&state, false).await;
-            return;
-        }
+        // No "any peer agrees with local" shortcut here: on an even split
+        // (A,B | C,D) both sides have one agreeing peer, and returning early
+        // on each restart would freeze the split forever — `decide_repair`
+        // exists precisely so the LOCAL GROUP must win the election (its
+        // `winner.3 && agreeing_peers > 0` Converged branch is this check's
+        // correct form). Every reachable peer report flows on to the
+        // catch-up plan and the election below.
 
         // Phase 1 — incremental catch-up ("sync exactly what's missing"):
         // when every peer reports its journal window and every position is

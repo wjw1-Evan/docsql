@@ -349,4 +349,85 @@ public sealed class AdoNetTests : IClassFixture<ServerFixture>
         Assert.Equal(0, reader.GetOrdinal("MIXEDCASE"));
         Assert.Throws<IndexOutOfRangeException>(() => reader.GetOrdinal("nope"));
     }
+    [Fact]
+    public void Typed_getters_throw_on_null_decimal_datetime_and_narrow_types()
+    {
+        // GetDecimal/GetDateTime/GetInt16/GetByte/GetChar/GetFloat 曾静默返回
+        // 0m/DateTime.MinValue/0(漏掉 NonNull 包装,漏判 IsDBNull 的调用方拿到
+        // 错数据而非异常)。
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE IF NOT EXISTS null_wide (d DECIMAL, ts TIMESTAMP, i INT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "DELETE FROM null_wide";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO null_wide VALUES (NULL, NULL, NULL)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "SELECT d, ts, i FROM null_wide";
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Throws<InvalidCastException>(() => reader.GetDecimal(0));
+        Assert.Throws<InvalidCastException>(() => reader.GetDateTime(1));
+        Assert.Throws<InvalidCastException>(() => reader.GetInt16(2));
+        Assert.Throws<InvalidCastException>(() => reader.GetByte(2));
+        Assert.Throws<InvalidCastException>(() => reader.GetChar(2));
+        Assert.Throws<InvalidCastException>(() => reader.GetFloat(2));
+    }
+
+    [Fact]
+    public void Dec_marker_with_thousands_separator_stays_raw()
+    {
+        // {"$dec":"1,234"} 是合法的单键文档:rust_decimal 与 Python Decimal 都
+        // 拒收千分位 —— .NET 若用 NumberStyles.Number(AllowThousands)解析成
+        // 1234m 即三方不对称(同文档在 .NET 是 decimal、Python 是 dict)。
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT JSON_EXTRACT('{\"$dec\":\"1,234\"}', '$')";
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.False(reader.GetValue(0) is decimal, $"must not re-type: {reader.GetValue(0)}");
+        // 对照:无千分位仍解码为 decimal。
+        cmd.CommandText = "SELECT JSON_EXTRACT('{\"$dec\":\"1234.5\"}', '$')";
+        using var reader2 = cmd.ExecuteReader();
+        Assert.True(reader2.Read());
+        Assert.Equal(1234.5m, reader2.GetDecimal(0));
+    }
+
+    [Fact]
+    public void Close_mid_transaction_does_not_leak_into_reopened_connection()
+    {
+        var conn = Open();
+        var tx = conn.BeginTransaction();
+        conn.Close();
+        // 重开租到新物理连接:陈旧事务对象必须拒绝(它的连接已断,事务已在
+        // 服务端回滚),且不得触碰新连接上的任何事务。
+        conn.Open();
+        Assert.Throws<InvalidOperationException>(() => tx.Commit());
+        var tx2 = conn.BeginTransaction();
+        tx2.Commit();
+        // InTransaction 已随 Close 清零:再次 Close 走归还而不是物理丢弃。
+        conn.Close();
+        conn.Dispose();
+    }
+
+    [Fact]
+    public void Pooled_connection_resets_tsql_session_state()
+    {
+        // A 借出者留下 @变量;B 借到同一条物理连接必须拿到干净会话 —— 否则
+        // 同名 DECLARE 报 "already been declared"、@@IDENTITY 读到别人的值。
+        var a = Open();
+        using (a)
+        {
+            using var cmd = a.CreateCommand();
+            cmd.CommandText = "DECLARE @marker INT = 42";
+            cmd.ExecuteNonQuery();
+        }
+        var b = Open();
+        using (b)
+        {
+            using var cmd = b.CreateCommand();
+            cmd.CommandText = "DECLARE @marker INT = 7";
+            cmd.ExecuteNonQuery(); // 同名再声明:会话已重置,必须成功
+        }
+    }
 }

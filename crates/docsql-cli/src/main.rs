@@ -112,7 +112,20 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
                 None => return Err(format!("{a} requires a script path")),
             },
             // Connect-scoped flag: consumed by the connect branch below.
-            "--user" => rest.push(a),
+            // Anything else is a usage error — pushing it into `rest` at
+            // top level made `docsql --user alice connect h:1` open an
+            // EMBEDDED database literally named "--user" (the same family
+            // as the old `--help` file bug).
+            "--user" => {
+                if rest.first().map(String::as_str) == Some("connect") {
+                    rest.push(a);
+                } else {
+                    return Err(format!(
+                        "--user belongs after `connect <addr>`\n\n{}",
+                        usage()
+                    ));
+                }
+            }
             _ if a.starts_with('-') => {
                 return Err(format!("unknown option {a}\n\n{}", usage()));
             }
@@ -203,7 +216,19 @@ fn main() {
             });
             println!("DocSQL — type SQL statements ending with ';', quit with exit;");
             let stdin = std::io::BufReader::new(std::io::stdin().lock());
-            run_embedded(&mut db, format, script.as_deref(), stdin);
+            // Two orthogonal flags (see run_embedded): stdin REPL
+            // semantics vs batch fail-fast error codes.
+            let interactive = script.is_none();
+            let fail_fast =
+                script.is_some() || !std::io::IsTerminal::is_terminal(&std::io::stdin());
+            run_embedded(
+                &mut db,
+                format,
+                script.as_deref(),
+                stdin,
+                interactive,
+                fail_fast,
+            );
         }
     }
 }
@@ -271,14 +296,25 @@ fn statements_ready(sql: &str) -> bool {
                         while j < b.len() && b[j].is_ascii_whitespace() {
                             j += 1;
                         }
-                        let is_tran = ["tran", "transaction", "distributed"].iter().any(|kw| {
-                            let kb = kw.as_bytes();
-                            b.len() >= j + kb.len()
-                                && &lb[j..j + kb.len()] == kb
-                                && (b.len() == j + kb.len()
-                                    || !(b[j + kb.len()].is_ascii_alphanumeric()
-                                        || b[j + kb.len()] == b'_'))
-                        });
+                        // `BEGIN;` / `BEGIN WORK;` are the DOCUMENTED
+                        // transaction spellings, not block openers: the
+                        // engine's own parse_batch treats bare BEGIN as the
+                        // transaction statement (a block only opens when a
+                        // matching END lies ahead). Without this the shell
+                        // sat silently on every statement after a bare
+                        // `BEGIN;` until an `END` or EOF arrived.
+                        let bare_tran = b.get(j) == Some(&b';');
+                        let is_tran = bare_tran
+                            || ["tran", "transaction", "distributed", "work"]
+                                .iter()
+                                .any(|kw| {
+                                    let kb = kw.as_bytes();
+                                    b.len() >= j + kb.len()
+                                        && &lb[j..j + kb.len()] == kb
+                                        && (b.len() == j + kb.len()
+                                            || !(b[j + kb.len()].is_ascii_alphanumeric()
+                                                || b[j + kb.len()] == b'_'))
+                                });
                         if !is_tran {
                             begin_depth += 1;
                         }
@@ -380,6 +416,14 @@ fn run_embedded(
     format: Format,
     script: Option<&str>,
     input: impl std::io::Read,
+    // stdin REPL semantics: `exit;`/`help;` sentinels and the EOF flush.
+    // Stays on for PIPED stdin — every deployment helper drives the shell
+    // through heredocs ending in `exit;`.
+    interactive: bool,
+    // An SQL error exits non-zero: -f scripts AND piped-stdin batch runs
+    // (`docsql app.db < migrate.sql` used to exit 0; CI read a false
+    // success). A terminal session keeps the REPL alive.
+    fail_fast: bool,
 ) {
     let source: Box<dyn std::io::Read> = match script {
         Some(p) => match std::fs::File::open(p) {
@@ -391,7 +435,6 @@ fn run_embedded(
         },
         None => Box::new(input),
     };
-    let interactive = script.is_none();
     let mut stmt = String::new();
     let mut done = false;
     let mut tsql = docsql_core::tsql_batch::TsqlSession::new();
@@ -417,12 +460,12 @@ fn run_embedded(
         if !statements_ready(&stmt) {
             continue;
         }
-        run_embedded_chunk(db, &mut tsql, &stmt, format, interactive);
+        run_embedded_chunk(db, &mut tsql, &stmt, format, !fail_fast);
         stmt.clear();
     }
     // Scripts tolerate a missing final `;`.
     if !done && !stmt.trim().is_empty() {
-        run_embedded_chunk(db, &mut tsql, &stmt, format, interactive);
+        run_embedded_chunk(db, &mut tsql, &stmt, format, !fail_fast);
     }
 }
 
@@ -523,10 +566,16 @@ enum Outbound {
 impl Outbound {
     fn send_frame(&mut self, bytes: &[u8]) -> Result<(), String> {
         match self {
-            Outbound::Plain(s) => s
-                .write_all(bytes)
-                .and_then(|_| s.flush())
-                .map_err(|e| e.to_string()),
+            Outbound::Plain(s) => {
+                // A peer that stops reading must not wedge the writer
+                // forever (statement larger than the socket buffer): the
+                // TLS side already carries a 10s flush budget — keep the
+                // two transports aligned.
+                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+                s.write_all(bytes)
+                    .and_then(|_| s.flush())
+                    .map_err(|e| e.to_string())
+            }
             Outbound::Tls(link) => link.send(bytes),
         }
     }
@@ -585,13 +634,22 @@ impl Remote {
             },
             _ => Some(std::time::Duration::from_secs(600)),
         };
+        // One ABSOLUTE deadline for the whole round trip: per-iteration
+        // `recv_timeout(budget)` restarted the clock on every pushed
+        // frame, so a server that streams RESP_PUSH forever (live channel
+        // traffic) kept the loop alive indefinitely and wedged the script
+        // the budget exists to protect.
+        let deadline = budget.map(|t| std::time::Instant::now() + t);
         loop {
-            let got = match budget {
-                Some(t) => match self.queue.recv_timeout(t) {
-                    Ok(f) => Some(Ok(f)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(Err(())),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                },
+            let got = match deadline {
+                Some(dl) => {
+                    let remaining = dl.saturating_duration_since(std::time::Instant::now());
+                    match self.queue.recv_timeout(remaining) {
+                        Ok(f) => Some(Ok(f)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(Err(())),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    }
+                }
                 None => match self.queue.recv() {
                     Ok(f) => Some(Ok(f)),
                     Err(_) => Some(Err(())),
@@ -726,7 +784,10 @@ fn auth(remote: &mut Remote, token: &str) -> bool {
     match remote.round_trip(&Frame::new(proto::REQ_AUTH, token.as_bytes().to_vec())) {
         Ok(f) if f.frame_type != proto::RESP_ERROR => true,
         Ok(f) => {
-            eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
+            eprintln!(
+                "auth failed: {}",
+                sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+            );
             false
         }
         Err(e) => {
@@ -779,6 +840,16 @@ fn auth_user(remote: &mut Remote, user: &str) -> bool {
     let password = match std::env::var("DOCSQL_PASSWORD") {
         Ok(p) if !p.is_empty() => p,
         _ => {
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                // stdin belongs to the piped SQL (`docsql connect h:1 --user
+                // u < script.sql`): reading the password from it used to
+                // CONSUME the script's first line as a failed password.
+                eprintln!(
+                    "no password available: DOCSQL_PASSWORD is unset and stdin is not \
+                     a terminal (it carries the SQL input); set DOCSQL_PASSWORD"
+                );
+                return false;
+            }
             eprint!("password for {user}: ");
             let _ = std::io::stderr().flush();
             let line = match read_password_hidden() {
@@ -799,7 +870,10 @@ fn auth_user(remote: &mut Remote, user: &str) -> bool {
     match remote.round_trip(&Frame::new(proto::REQ_AUTH_USER, body.into_bytes())) {
         Ok(f) if f.frame_type != proto::RESP_ERROR => true,
         Ok(f) => {
-            eprintln!("auth failed: {}", String::from_utf8_lossy(&f.payload));
+            eprintln!(
+                "auth failed: {}",
+                sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+            );
             false
         }
         Err(e) => {
@@ -954,7 +1028,10 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> bo
     };
     match remote.round_trip(&Frame::new(frame_type, payload)) {
         Ok(f) if f.frame_type == proto::RESP_ERROR => {
-            eprintln!("error: {}", String::from_utf8_lossy(&f.payload));
+            eprintln!(
+                "error: {}",
+                sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+            );
         }
         Ok(f) => {
             if f.frame_type == proto::RESP_AFFECTED {
@@ -1014,7 +1091,11 @@ fn remote_shell(
         },
         None => Box::new(std::io::stdin()),
     };
+    // Same split as the embedded mode: the `exit;` sentinel stays active
+    // for piped stdin (deployment helpers end every heredoc with it), while
+    // an SQL error fails fast outside a terminal.
     let interactive = script.is_none();
+    let fail_fast = !interactive || !std::io::IsTerminal::is_terminal(&std::io::stdin());
     let mut stmt = String::new();
     let mut stmt_failed = false;
     for line in std::io::BufReader::new(source).lines() {
@@ -1073,7 +1154,7 @@ fn remote_shell(
             let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&stmt).unwrap());
             match remote.round_trip(&frame) {
                 Ok(f) => {
-                    if !print_frame(&f, format) && !interactive {
+                    if !print_frame(&f, format) && fail_fast {
                         std::process::exit(1);
                     }
                     stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
@@ -1095,7 +1176,7 @@ fn remote_shell(
                     std::process::exit(1);
                 }
             };
-            if !print_frame(&f, format) && !interactive {
+            if !print_frame(&f, format) && fail_fast {
                 std::process::exit(1);
             }
             stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
@@ -1108,7 +1189,7 @@ fn remote_shell(
             let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&part).unwrap());
             match remote.round_trip(&frame) {
                 Ok(f) => {
-                    if !print_frame(&f, format) && !interactive {
+                    if !print_frame(&f, format) && fail_fast {
                         std::process::exit(1);
                     }
                     stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
@@ -1125,7 +1206,7 @@ fn remote_shell(
     }
     // Interactive sessions end normally even after earlier SQL errors;
     // scripts surface the failure in their exit status.
-    if stmt_failed && !interactive {
+    if stmt_failed && fail_fast {
         std::process::exit(1);
     }
 }
@@ -1617,6 +1698,8 @@ mod tests {
             Format::Csv,
             Some(path.to_str().unwrap()),
             std::io::empty(),
+            false,
+            true,
         );
         // The dangling INSERT (no final `;`) still executed.
         match db.execute("SELECT COUNT(*) FROM t").unwrap() {
@@ -1945,7 +2028,7 @@ mod tests {
              exit;\n\
              INSERT INTO t VALUES (2, 'after-exit-ignored');\n",
         );
-        run_embedded(&mut db, Format::Table, None, input);
+        run_embedded(&mut db, Format::Table, None, input, true, false);
         match db.execute("SELECT COUNT(*) FROM t").unwrap() {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
             other => panic!("{other:?}"),
@@ -1953,7 +2036,7 @@ mod tests {
         // 交互模式在 EOF 处理悬挂语句(无结尾分号也执行)。
         let mut db2 = Database::in_memory().unwrap();
         let input2 = std::io::Cursor::new("CREATE TABLE u (id INT);\nINSERT INTO u VALUES (9)\n");
-        run_embedded(&mut db2, Format::Csv, None, input2);
+        run_embedded(&mut db2, Format::Csv, None, input2, true, false);
         match db2.execute("SELECT COUNT(*) FROM u").unwrap() {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
             other => panic!("{other:?}"),
@@ -2157,6 +2240,17 @@ mod statement_ready_tests {
     fn semicolons_inside_literals_do_not_terminate() {
         assert!(!statements_ready("INSERT INTO d VALUES ('line1;"));
         assert!(statements_ready("INSERT INTO d VALUES ('line1; line2');"));
+        // 裸 BEGIN;/BEGIN WORK; 是文档化的事务语句,不是 T-SQL 块开始符:
+        // 曾被计入 begin_depth,交互式事务后的每条语句都被扣住不执行。
+        assert!(statements_ready("BEGIN;"));
+        assert!(statements_ready("BEGIN WORK;"));
+        assert!(statements_ready(
+            "BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;"
+        ));
+        assert!(statements_ready("begin transaction;\nSELECT 1;"));
+        // 真正的块仍要等到 END。
+        assert!(!statements_ready("BEGIN\nSELECT 1;"));
+        assert!(statements_ready("BEGIN\nSELECT 1;\nEND;"));
         assert!(!statements_ready("SELECT 'a''b;"));
         assert!(statements_ready("SELECT 'a''b;';"));
         assert!(!statements_ready("SELECT \"ready?;"));

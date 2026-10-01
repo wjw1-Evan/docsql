@@ -247,7 +247,7 @@ impl TsqlSession {
                     }
                     let value = match init {
                         Some(expr) => {
-                            let rendered = self.substitute(&format!("SELECT ({expr})"))?;
+                            let rendered = self.substitute(&format!("SELECT (\n{expr}\n)"))?;
                             self.eval_tracked(exec, &rendered)
                                 .await?
                                 .and_then(|row| row.into_iter().next())
@@ -275,7 +275,7 @@ impl TsqlSession {
                 Ok(None)
             }
             Stmt::SetOne(name, expr) => {
-                let rendered = self.substitute(&format!("SELECT ({expr})"))?;
+                let rendered = self.substitute(&format!("SELECT (\n{expr}\n)"))?;
                 let v = self
                     .eval_tracked(exec, &rendered)
                     .await?
@@ -285,7 +285,7 @@ impl TsqlSession {
                 Ok(None)
             }
             Stmt::Print(expr) => {
-                let rendered = self.substitute(&format!("SELECT ({expr})"))?;
+                let rendered = self.substitute(&format!("SELECT (\n{expr}\n)"))?;
                 let v = self
                     .eval_tracked(exec, &rendered)
                     .await?
@@ -796,6 +796,79 @@ fn is_word_in(word: &[u8], list: &[&str]) -> bool {
     list.iter().any(|w| w.as_bytes() == word)
 }
 
+/// Skip a CASE … END expression: `j` points just past the leading `case`
+/// word (in `sql`, with its ASCII-lowercased bytes in `lower`). Returns the
+/// offset just past the matching `end`, or None when the input ends inside
+/// the expression. Quote ('' doubling), quoted-identifier, bracket,
+/// line-comment and block-comment aware — words inside literals must not
+/// move the CASE nesting.
+fn skip_case_expr(sql: &str, lower: &[u8], mut j: usize) -> Option<usize> {
+    let b = sql.as_bytes();
+    let lb = lower;
+    let mut nesting = 1i32;
+    while j < b.len() {
+        match b[j] {
+            b'\'' => {
+                let (end, _) = stmt::sql_literal_end(sql, j);
+                j = end;
+                continue;
+            }
+            b'"' | b'`' | b'[' => {
+                let close = match b[j] {
+                    b'[' => b']',
+                    other => other,
+                };
+                j += 1;
+                while j < b.len() {
+                    if b[j] == close {
+                        if b.get(j + 1) == Some(&close) {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                continue;
+            }
+            b'-' if b.get(j + 1) == Some(&b'-') => {
+                while j < b.len() && b[j] != b'\n' {
+                    j += 1;
+                }
+            }
+            b'/' if b.get(j + 1) == Some(&b'*') => {
+                j += 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(b.len());
+            }
+            c if c.is_ascii_alphabetic() => {
+                let mut k = j;
+                while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+                    k += 1;
+                }
+                match &lb[j..k] {
+                    b"case" => nesting += 1,
+                    b"end" => {
+                        nesting -= 1;
+                        if nesting == 0 {
+                            return Some(k);
+                        }
+                    }
+                    _ => {}
+                }
+                j = k;
+                continue;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Net BEGIN…END depth of a batch chunk (quote/comment/bracket aware).
 /// Only used to keep `;`-split chunks of one T-SQL block together; BEGIN
 /// TRAN/TRANSACTION is excluded exactly like the block scanners.
@@ -871,23 +944,18 @@ fn batch_begin_depth(s: &str) -> i32 {
                     b"case" => {
                         // CASE … END is expression syntax: its END must not
                         // bring the block depth back to zero (a chunk ending
-                        // inside an open block must keep merging).
-                        let mut case_nesting = 1i32;
-                        while i < b.len() && case_nesting > 0 {
-                            if lb[i].is_ascii_alphabetic() {
-                                let s = i;
-                                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_')
-                                {
-                                    i += 1;
-                                }
-                                match &lb[s..i] {
-                                    b"case" => case_nesting += 1,
-                                    b"end" => case_nesting -= 1,
-                                    _ => {}
-                                }
-                                continue;
-                            }
-                            i += 1;
+                        // inside an open block must keep merging). Skip it
+                        // with the SAME quote/comment/bracket-aware scanner
+                        // the parser uses — the previous inline loop was
+                        // literal-blind, so an 'end' INSIDE a string literal
+                        // closed the CASE early, desynchronized the cursor
+                        // into the middle of the literal, and mis-counted
+                        // whole blocks (GO chunks then merged across batches
+                        // while @variables survived and fresh DECLAREs
+                        // false-errored as duplicates).
+                        match skip_case_expr(s, lb, i) {
+                            Some(next) => i = next,
+                            None => i = b.len(),
                         }
                     }
                     b"end" if depth > 0 => depth -= 1,
@@ -1837,71 +1905,8 @@ impl<'a> Parser<'a> {
     /// matching END (None when unbalanced). Cursor-based twin of
     /// [`Self::skip_case_block`] for the non-mutating block-shape scans:
     /// a CASE expression's END must never be counted as a block END.
-    fn skip_case_from(&self, mut j: usize) -> Option<usize> {
-        let b = self.b;
-        let lb = self.lb();
-        let mut nesting = 1i32;
-        while j < b.len() {
-            match b[j] {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(self.sql, j);
-                    j = end;
-                    continue;
-                }
-                b'"' | b'`' | b'[' => {
-                    let close = match b[j] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    j += 1;
-                    while j < b.len() {
-                        if b[j] == close {
-                            if b.get(j + 1) == Some(&close) {
-                                j += 2;
-                                continue;
-                            }
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    continue;
-                }
-                b'-' if b.get(j + 1) == Some(&b'-') => {
-                    while j < b.len() && b[j] != b'\n' {
-                        j += 1;
-                    }
-                }
-                b'/' if b.get(j + 1) == Some(&b'*') => {
-                    j += 2;
-                    while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                        j += 1;
-                    }
-                    j = (j + 2).min(b.len());
-                }
-                c if c.is_ascii_alphabetic() => {
-                    let mut k = j;
-                    while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
-                        k += 1;
-                    }
-                    match &lb[j..k] {
-                        b"case" => nesting += 1,
-                        b"end" => {
-                            nesting -= 1;
-                            if nesting == 0 {
-                                return Some(k);
-                            }
-                        }
-                        _ => {}
-                    }
-                    j = k;
-                    continue;
-                }
-                _ => {}
-            }
-            j += 1;
-        }
-        None
+    fn skip_case_from(&self, j: usize) -> Option<usize> {
+        skip_case_expr(self.sql, self.lb(), j)
     }
 
     fn parse_if(&mut self, depth: usize) -> Result<Stmt> {
@@ -2719,6 +2724,39 @@ mod tests {
         // GO separates batches inside one script; variables do NOT cross.
         let out = run_script(&mut s, &mut db, "DECLARE @x INT = 9\nGO\nSELECT @x");
         assert!(out.is_err(), "vars do not cross GO: {out:?}");
+    }
+
+    /// `SET @n = 5 -- note`:表达式尾部的行注释曾随表达式一起进了
+    /// `SELECT ({expr})` 包装,把闭合括号吞进注释,整条 DECLARE/SET/PRINT
+    /// 解析失败。
+    #[test]
+    fn assign_expr_with_trailing_line_comment_parses() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        let out = run_script(&mut s, &mut db, "SET @n = 5 -- note\nSELECT @n AS v").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(5));
+        // DECLARE 的 initializer 与 PRINT 同形态。
+        let out = run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @m INT = 7 -- init\nPRINT 'x' -- tail\nSELECT @m AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(7));
+    }
+
+    /// `batch_begin_depth` 的内联 CASE 扫描曾不跳字符串字面量:'end' 字面量
+    /// 提前闭合 CASE、光标错位进字面量中部,块深度算错后 GO 前后的 chunk
+    /// 被错误合并 —— @x 越过 GO 存活,GO 后的重新 DECLARE 被误报重复。
+    #[test]
+    fn case_with_end_literal_does_not_merge_across_go() {
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE t (v INT)").unwrap();
+        db.db.execute("INSERT INTO t VALUES (1)").unwrap();
+        let script = "DECLARE @x INT = 1\nIF @x = 1\nBEGIN\nSELECT CASE WHEN @x = 1 THEN 'end' ELSE 'x' END AS v;\nEND\nGO\nDECLARE @x INT = 2\nSELECT @x AS v";
+        let out = run_script(&mut s, &mut db, script).unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(2));
     }
 
     #[test]
