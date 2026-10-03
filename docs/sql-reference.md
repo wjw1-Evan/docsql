@@ -113,7 +113,7 @@ SELECT ts + 1500, ts - ts2 FROM t;              -- ± 毫秒整数 / 毫秒差(I
 ```
 
 - **谓词提升**：`WHERE ts > '2026-…'` 与字符串比较按时间自动解析（不可解析 → NULL，不报错）；`BETWEEN`/`IN`/`CASE`/`IS DISTINCT FROM` 同语义。与字面量（报错）不同，这是对**列数据宽容**的读语义；
-- **索引**：索引探针自动把字符串边界提升为 Timestamp 边界（采样确认带内值全为 Timestamp 时），`WHERE ts > '2026-…'` 走索引；
+- **索引**：索引探针自动把字符串边界提升为 Timestamp 边界（采样确认带内值全为 Timestamp 时），`WHERE ts > '2026-…'` 与 `ts IN ('…', '…')`、`ts BETWEEN '…' AND '…'` 走索引；
 - **排序**：Timestamp 自成排序带，**不与 Str 混排**（`cmp_values` 的带序：数值 < Timestamp < Str < Bytes）；混合列请显式 `CAST` 统一；
 - **算术**：`TIMESTAMP ± INT`（毫秒）、`TIMESTAMP - TIMESTAMP`（毫秒差）；`TIMESTAMP + TIMESTAMP` 类型错误 → NULL；无独立 `TIME`/`INTERVAL` 类型（区间用毫秒整数表达）；
 - **wire 协议**：响应/参数用 `{"$ts": 毫秒}` 标记精确往返（.NET 客户端 `DateTime`/`DateTimeOffset` 参数默认走 `$ts`，`timestampformat=iso` 为旧服务器兼容开关）；
@@ -220,7 +220,7 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 
 ### SELECT 备注
 
-- **执行与优化**：`ORDER BY <索引键> + 常量 LIMIT/OFFSET` 走索引序窗口（首屏/深页只装载窗口内文档）；无索引但有界 LIMIT 走键提取 top-K；`SELECT COUNT(*) FROM t`（无 WHERE/GROUP BY/ORDER/LIMIT）走免解码活槽计数。查询计划为规则式，无 `EXPLAIN`。
+- **执行与优化**：`WHERE <索引列> = v` 与 `IN (常量列表)`（含 `IN (SELECT …)` 改写产物）走索引多探针（逐键定位，散布键不退化为区间）；`BETWEEN`/区间不等式与 `LIKE '前缀%'`（`_`、`[…]`、中段 `%`、`ILIKE` 除外）走索引带探针 —— 探针是超集，残余条件照常逐行过滤，结果与全扫一致；`ORDER BY <索引键> + 常量 LIMIT/OFFSET` 走索引序窗口（首屏/深页只装载窗口内文档）；无索引但有界 LIMIT 走键提取 top-K；`SELECT COUNT(*) FROM t`（无 WHERE/GROUP BY/ORDER/LIMIT）走免解码活槽计数。`EXPLAIN SELECT` 输出所选计划（窗口/探针/全扫）。
 - **分组扩展**：`ROLLUP(a,b)` 展开为 `(a,b),(a),()`；`CUBE(a,b)` 展开为全部子集；`GROUPING SETS` 为显式列表；多项扩展按笛卡尔积组合；重复/嵌套分组集合报错，CUBE 上限 12 个元素。缺失分组键在输出行中为 `NULL`，用 `GROUPING()` 区分。
 - **聚合修饰**：`COUNT/SUM/... ( [DISTINCT] expr ) [ FILTER (WHERE condition) ]`；`FILTER` 先过滤行再做 DISTINCT 与聚合。
 - **集合运算**：两臂列数必须一致（列名取左）；`UNION`/`INTERSECT`/`EXCEPT` 默认去重，`ALL` 保留多重集（`INTERSECT ALL`/`EXCEPT ALL` 按最小计数）。

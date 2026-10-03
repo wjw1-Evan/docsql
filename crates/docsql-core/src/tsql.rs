@@ -896,6 +896,28 @@ fn tokenize_like(pat: &str, esc: Option<char>) -> Vec<LikeTok> {
     toks
 }
 
+/// Longest literal prefix of a LIKE pattern whose remainder is exactly one
+/// trailing `%` run: `Some(prefix)` only when the token stream is Literals*
+/// followed by a single AnyRun in last position (≥1 literal). A `_`, a
+/// `[...]` class, an interior `%`, or no trailing `%` at all returns None —
+/// those shapes stay on the generic row filter. Escapes are already resolved
+/// by the tokenizer, so `a\%b%` (ESCAPE '\') yields the literal prefix
+/// `a%b`. The caller turns the prefix into an index band `[prefix,
+/// successor)`; every string matching `prefix || '%'` sorts inside it
+/// (cmp_values ranks Str byte-wise, UTF-8 order == code point order).
+pub fn like_literal_prefix(pat: &str, esc: Option<char>) -> Option<String> {
+    let toks = tokenize_like(pat, esc);
+    let mut prefix = String::new();
+    for (i, tok) in toks.iter().enumerate() {
+        match tok {
+            LikeTok::Literal(c) => prefix.push(*c),
+            LikeTok::AnyRun if i + 1 == toks.len() && !prefix.is_empty() => return Some(prefix),
+            _ => return None,
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Date/time core (UTC milliseconds, T-SQL dateparts)
 // ---------------------------------------------------------------------------

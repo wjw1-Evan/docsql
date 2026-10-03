@@ -3993,6 +3993,7 @@ impl<'a> ReadCx<'a> {
                 ProbePlan::Eq(v) | ProbePlan::Prefix(v) => {
                     is_str(v) || bound_elements(v).is_some_and(|items| items.iter().any(is_str))
                 }
+                ProbePlan::In(vals) => vals.iter().any(is_str),
                 ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
                     .into_iter()
                     .flatten()
@@ -4020,6 +4021,7 @@ impl<'a> ReadCx<'a> {
         };
         let has_ts_bound = match plan {
             ProbePlan::Eq(v) | ProbePlan::Prefix(v) => !ts_positions(v).is_empty(),
+            ProbePlan::In(vals) => vals.iter().any(|v| !ts_positions(v).is_empty()),
             ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
                 .into_iter()
                 .flatten()
@@ -4119,6 +4121,22 @@ impl<'a> ReadCx<'a> {
                     }
                 }
             }
+            // IN 的每个元素都是一次独立 Eq 探测(位置 0),逐元素套用
+            // Eq 的首元素规则:任一元素与带型不谐即整体回退。
+            ProbePlan::In(vals) => {
+                for v in vals {
+                    for i in str_positions(v) {
+                        if !(band_str_at(i) || (band_ts_at(i) && parseable_at(v, i))) {
+                            return Ok(None);
+                        }
+                    }
+                    for i in ts_positions(v) {
+                        if !band_ts_at(i) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
             ProbePlan::Range { lo, hi } => {
                 for (v, _) in [lo.as_ref(), hi.as_ref()].into_iter().flatten() {
                     for i in str_positions(v) {
@@ -4188,6 +4206,9 @@ impl<'a> ReadCx<'a> {
         let out = match &plan {
             ProbePlan::Eq(v) => ProbePlan::Eq(promote(v, &mut promoted_any)),
             ProbePlan::Prefix(v) => ProbePlan::Prefix(promote(v, &mut promoted_any)),
+            ProbePlan::In(vals) => {
+                ProbePlan::In(vals.iter().map(|v| promote(v, &mut promoted_any)).collect())
+            }
             ProbePlan::Range { lo, hi } => ProbePlan::Range {
                 lo: lo
                     .as_ref()
@@ -4250,6 +4271,33 @@ impl<'a> ReadCx<'a> {
                 tree.range_prefix_limited(&reader, tx, pfx, None)
                     .map_err(|e| index_err(col, e))?
             }
+            ProbePlan::In(vals) => {
+                // Multi-probe equality set: one bounded Eq walk per element
+                // (the cap per element still covers the global first `max` —
+                // each element contributes its smallest keys), merged back
+                // into key order because window plans trust it. Distinct
+                // elements probe disjoint runs; repeated list entries
+                // double-report the same run and dedupe away here.
+                let mut pairs: Vec<(Value, u64)> = Vec::new();
+                for v in vals {
+                    self.deadline.check()?;
+                    let mut p = tree
+                        .range_bounded_limited(&reader, tx, v, Some((v, true)), max)
+                        .map_err(|e| index_err(col, e))?;
+                    p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
+                    pairs.append(&mut p);
+                }
+                // 按 (键, locator) 全对排序:重复列表元素探出的同键同
+                // locator 对必须相邻才能去重;cmp_values 相等的键可以是
+                // 两行(Int(3)/Float(3.0) 同判等,AGENTS 红线 #2),按键
+                // 单独去重会丢掉非唯一树的合法同行键。
+                pairs.sort_by(|a, b| Value::cmp_values(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
+                pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                if let Some(m) = max {
+                    pairs.truncate(m);
+                }
+                pairs
+            }
             ProbePlan::Range { lo, hi } => {
                 let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
                 let mut pairs = match &lo {
@@ -4307,6 +4355,34 @@ impl<'a> ReadCx<'a> {
                 };
                 tree.range_prefix_rev_limited(&reader, tx, pfx, None)
                     .map_err(|e| index_err(col, e))?
+            }
+            ProbePlan::In(vals) => {
+                // Descending mirror of the In probe: one bounded Eq walk per
+                // element (each takes the element's LAST keys under the cap —
+                // their union covers the global last `max`), merged into
+                // descending key order for the DESC window.
+                let mut pairs: Vec<(Value, u64)> = Vec::new();
+                for v in vals {
+                    self.deadline.check()?;
+                    let mut p = tree
+                        .range_bounded_rev_limited(
+                            &reader,
+                            tx,
+                            Some((v, true)),
+                            Some((v, true)),
+                            max,
+                        )
+                        .map_err(|e| index_err(col, e))?;
+                    p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
+                    pairs.append(&mut p);
+                }
+                // 降序镜像:同键段内按 locator 定序,同对相邻可去重。
+                pairs.sort_by(|a, b| Value::cmp_values(&b.0, &a.0).then_with(|| a.1.cmp(&b.1)));
+                pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                if let Some(m) = max {
+                    pairs.truncate(m);
+                }
+                pairs
             }
             ProbePlan::Range { lo, hi } => {
                 let lo_ref = lo.as_ref().map(|(v, incl)| (v, *incl));
@@ -4959,6 +5035,21 @@ fn probe_plan_text(root: &str, plan: &ProbePlan) -> String {
     match plan {
         ProbePlan::Eq(v) => format!("{root} = {}", lit(v)),
         ProbePlan::Prefix(v) => format!("{root} key prefix {}", lit(v)),
+        ProbePlan::In(vals) => {
+            // A rewritten IN (SELECT …) can carry thousands of literals —
+            // the EXPLAIN row summarizes instead of echoing them all.
+            const SHOW: usize = 16;
+            let items = vals.iter().map(&lit).collect::<Vec<_>>();
+            if items.len() <= SHOW {
+                format!("{root} IN ({})", items.join(", "))
+            } else {
+                format!(
+                    "{root} IN ({}, … +{} more)",
+                    items[..SHOW].join(", "),
+                    items.len() - SHOW
+                )
+            }
+        }
         ProbePlan::Range { lo, hi } => {
             let mut parts: Vec<String> = Vec::new();
             match lo {
@@ -18085,6 +18176,25 @@ enum ProbePlan {
         lo: Option<(Value, bool)>,
         hi: Option<(Value, bool)>,
     },
+    /// Equality set (`col IN (…)` / rewritten `IN (SELECT …)`): one bounded
+    /// Eq walk per element, merged back into key order. Distinct elements
+    /// probe disjoint key runs (a row holds one column value), so the merge
+    /// only has to dedupe repeated list entries.
+    In(Vec<Value>),
+}
+
+/// Smallest string sorting after every string starting with `prefix`: the
+/// last character incremented (`abc` → `abd`). A trailing char::MAX has no
+/// successor — incrementing an earlier character instead (`ab\u{10FFFF}` →
+/// `ac`) would cut the prefix off, since the prefix itself sorts above the
+/// carried bound; the caller then walks open-ended and lets the residual
+/// filter drop the tail.
+fn str_prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let next = char::from_u32(last as u32 + 1)?;
+    chars.push(next);
+    Some(chars.into_iter().collect())
 }
 
 /// Flatten the top-level AND chain of a WHERE expression.
@@ -18280,7 +18390,159 @@ fn probe_plan(
     let mut path_target: Option<(String, String)> = None;
     let mut path_eq: Option<Value> = None;
     let mut path_range: Option<Vec<(BinaryOperator, Value)>> = None;
+    // Scalar equality set: `col IN (…)` on a single-column tree. One target
+    // per plan; a second IN list rides the residual filter (inexact).
+    let mut in_target: Option<(String, Vec<Value>)> = None;
     for c in conjuncts {
+        // col BETWEEN low AND high — a closed range on one indexed column,
+        // exactly the two inclusive bounds the Range plan already walks.
+        // NOT BETWEEN and NULL bounds stay opaque (NULL never matches, the
+        // residual filter decides).
+        if let SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } = c
+        {
+            if *negated {
+                opaque = true;
+                continue;
+            }
+            let name = match expr.as_ref() {
+                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(expr),
+                _ => {
+                    opaque = true;
+                    continue;
+                }
+            };
+            let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+                opaque = true;
+                continue;
+            };
+            let (Ok(lo), Ok(hi)) = (eval_const(low), eval_const(high)) else {
+                opaque = true;
+                continue;
+            };
+            if matches!(lo, Value::Null) || matches!(hi, Value::Null) {
+                opaque = true;
+                continue;
+            }
+            match &mut range {
+                Some((c2, bounds)) if *c2 == col => {
+                    bounds.push((BinaryOperator::GtEq, lo));
+                    bounds.push((BinaryOperator::LtEq, hi));
+                }
+                None => {
+                    range = Some((
+                        col,
+                        vec![(BinaryOperator::GtEq, lo), (BinaryOperator::LtEq, hi)],
+                    ));
+                }
+                _ => opaque = true,
+            }
+            continue;
+        }
+        // col IN (list of constants): the multi-probe plan. NULL elements
+        // never match (the tree holds no NULL keys) and are dropped without
+        // costing exactness; non-constant elements forfeit the probe.
+        if let SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } = c
+        {
+            if *negated {
+                opaque = true;
+                continue;
+            }
+            let name = match expr.as_ref() {
+                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(expr),
+                _ => {
+                    opaque = true;
+                    continue;
+                }
+            };
+            let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+                opaque = true;
+                continue;
+            };
+            let mut vals = Vec::with_capacity(list.len());
+            for el in list {
+                match eval_const(el) {
+                    Ok(Value::Null) => {}
+                    Ok(v) => vals.push(v),
+                    Err(_) => {
+                        vals.clear();
+                        break;
+                    }
+                }
+            }
+            if vals.is_empty() {
+                opaque = true;
+                continue;
+            }
+            match &mut in_target {
+                None => in_target = Some((col, vals)),
+                Some(_) => opaque = true, // second IN list: rides the residual filter
+            }
+            continue;
+        }
+        // col LIKE 'literal-prefix%' — a Str band [prefix, successor) on a
+        // single-column tree. `_`, `[...]` classes, interior `%` and ILIKE
+        // stay opaque; a prefix ending at char::MAX has no finite successor
+        // and probes open-ended (inexact — the residual filter drops the
+        // tail beyond the prefix run).
+        if let SqlExpr::Like {
+            expr,
+            pattern,
+            escape_char,
+            negated,
+            ..
+        } = c
+        {
+            if *negated {
+                opaque = true;
+                continue;
+            }
+            let name = match expr.as_ref() {
+                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(expr),
+                _ => {
+                    opaque = true;
+                    continue;
+                }
+            };
+            let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+                opaque = true;
+                continue;
+            };
+            let esc = escape_char.as_ref().and_then(|v| match &v.value {
+                sqlparser::ast::Value::SingleQuotedString(s) => s.chars().next(),
+                _ => None,
+            });
+            let Ok(Value::Str(pat)) = eval_const(pattern) else {
+                opaque = true;
+                continue;
+            };
+            let Some(prefix) = crate::tsql::like_literal_prefix(&pat, esc) else {
+                opaque = true;
+                continue;
+            };
+            let hi = str_prefix_successor(&prefix);
+            if hi.is_none() {
+                opaque = true;
+            }
+            let mut bounds = vec![(BinaryOperator::GtEq, Value::Str(prefix))];
+            if let Some(h) = hi {
+                bounds.push((BinaryOperator::Lt, Value::Str(h)));
+            }
+            match &mut range {
+                Some((c2, prev)) if *c2 == col => prev.append(&mut bounds),
+                None => range = Some((col, bounds)),
+                _ => opaque = true,
+            }
+            continue;
+        }
         let SqlExpr::BinaryOp { left, op, right } = c else {
             opaque = true;
             continue;
@@ -18434,6 +18696,7 @@ fn probe_plan(
                 && eq.is_none()
                 && range.is_none()
                 && eq_map.is_empty()
+                && in_target.is_none()
             {
                 let exact = !opaque;
                 let plan = match (path_eq, path_range) {
@@ -18495,18 +18758,37 @@ fn probe_plan(
             } else {
                 ProbePlan::Prefix(Value::Array(prefix))
             };
-            let exact = !opaque && range.is_none() && covered(&cols[..prefix_len], &eq_map);
+            let exact = !opaque
+                && range.is_none()
+                && in_target.is_none()
+                && covered(&cols[..prefix_len], &eq_map);
             return Some((root_key, plan, exact));
         }
     }
     if let Some((col, v)) = eq {
         let exact = !opaque
             && range.is_none()
+            && in_target.is_none()
             && eq_map.len() == 1
             && eq_map.iter().all(|(k, ev)| {
                 unqualified_col(k, table, alias).as_deref() == Some(&col) && *ev == v
             });
         return Some((col, ProbePlan::Eq(v), exact));
+    }
+    // Equality-set probe: `col IN (…)` on a single-column tree, one bounded
+    // Eq walk per element. NULL elements never match (the tree holds no NULL
+    // keys), so the probe subsumes its conjunct exactly; equality/range
+    // conjuncts it cannot carry stay in the residual filter and demote
+    // exactness. An In plan beats a range when both exist — the list is
+    // usually the tighter shape.
+    if let Some((icol, ivals)) = &in_target {
+        if eq.is_none() && path_target.is_none() {
+            let exact = !opaque && range.is_none() && eq_map.is_empty();
+            return Some((icol.clone(), ProbePlan::In(ivals.clone()), exact));
+        }
+        // Unconsumed: the winning plan keeps the IN list in the residual
+        // filter — inexact.
+        opaque = true;
     }
     let (col, bounds) = range?;
     let mut lo: Option<(Value, bool)> = None;
@@ -18554,7 +18836,7 @@ fn probe_plan(
     if lo.is_none() && hi.is_none() {
         return None;
     }
-    let exact = !opaque && eq_map.is_empty();
+    let exact = !opaque && eq_map.is_empty() && in_target.is_none();
     Some((col, ProbePlan::Range { lo, hi }, exact))
 }
 
@@ -26004,6 +26286,399 @@ mod tests {
             ExecOutcome::Affected(n) => assert_eq!(n, 3),
             other => panic!("expected affected, got {other:?}"),
         }
+    }
+
+    // ---- 谓词探针计划:IN / BETWEEN / LIKE 前缀(探针=超集,残余过滤兜底)----
+
+    #[test]
+    fn like_literal_prefix_and_prefix_successor() {
+        // 纯函数:token 流 Literals* + 尾部单个 AnyRun 才有前缀。
+        assert_eq!(
+            crate::tsql::like_literal_prefix("abc%", None),
+            Some("abc".to_string())
+        );
+        // 无尾部 %:精确匹配不走带探针;其余形状一律 None。
+        assert_eq!(crate::tsql::like_literal_prefix("abc", None), None);
+        assert_eq!(crate::tsql::like_literal_prefix("%abc", None), None);
+        assert_eq!(crate::tsql::like_literal_prefix("a%b", None), None);
+        assert_eq!(crate::tsql::like_literal_prefix("a_b%", None), None);
+        assert_eq!(crate::tsql::like_literal_prefix("a[bc]%", None), None);
+        assert_eq!(crate::tsql::like_literal_prefix("", None), None);
+        // 转义在 tokenizer 内已解析:转义 % 是字面量成员。
+        assert_eq!(
+            crate::tsql::like_literal_prefix("a\\%b%", Some('\\')),
+            Some("a%b".to_string())
+        );
+        assert_eq!(crate::tsql::like_literal_prefix("\\%", Some('\\')), None);
+        // 前缀后继:末字符 +1;末位 char::MAX 无有限后继。
+        assert_eq!(str_prefix_successor("abc"), Some("abd".to_string()));
+        assert_eq!(str_prefix_successor("a"), Some("b".to_string()));
+        assert_eq!(str_prefix_successor("\u{10FFFF}"), None);
+        // 尾位 MAX 进位会把前缀自己裁掉(前缀 > 进位界),必须 None。
+        assert_eq!(str_prefix_successor("ab\u{10FFFF}"), None);
+    }
+
+    /// 双生表差分骨架:同一行集上,索引列与无索引列的同一谓词必须同答
+    /// (结果不得依赖索引存在性,红线 #18)。
+    #[test]
+    fn in_between_like_probe_parity_with_scan() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE pt (id INT PRIMARY KEY NOT NULL, v INT, s TEXT, p INT, ps TEXT)",
+        );
+        run(&mut db, "CREATE INDEX ix_pt_v ON pt (v)");
+        run(&mut db, "CREATE INDEX ix_pt_s ON pt (s)");
+        for i in 1..=300 {
+            let v = if i % 17 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("{}", i % 10)
+            };
+            let s = if i % 23 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'name{}'", i % 10)
+            };
+            run(
+                &mut db,
+                &format!("INSERT INTO pt VALUES ({i}, {v}, {s}, {v}, {s})"),
+            );
+        }
+        let parity = |db: &mut Database, pred_v: &str, pred_p: &str| {
+            let a = rows(db, &format!("SELECT id FROM pt WHERE {pred_v} ORDER BY id")).rows;
+            let b = rows(db, &format!("SELECT id FROM pt WHERE {pred_p} ORDER BY id")).rows;
+            assert_eq!(a, b, "索引列({pred_v})与无索引列({pred_p})必须同答");
+        };
+        parity(&mut db, "v IN (3, 7)", "p IN (3, 7)");
+        // 重复元素:探针整对去重,行不得翻倍。
+        parity(&mut db, "v IN (3, 3, 7, 3)", "p IN (3, 3, 7, 3)");
+        // cmp 判等的跨类型元素(Int/Float 同值)也不得重复计行。
+        parity(&mut db, "v IN (3, 3.0)", "p IN (3, 3.0)");
+        // NULL 元素永不匹配,不进探针。
+        parity(&mut db, "v IN (3, NULL)", "p IN (3, NULL)");
+        // 全 NULL 列表:谓词恒未知。
+        parity(&mut db, "v IN (NULL)", "p IN (NULL)");
+        parity(&mut db, "v BETWEEN 2 AND 4", "p BETWEEN 2 AND 4");
+        parity(&mut db, "v BETWEEN 4 AND 2", "p BETWEEN 4 AND 2");
+        parity(&mut db, "v NOT BETWEEN 2 AND 4", "p NOT BETWEEN 2 AND 4");
+        parity(
+            &mut db,
+            "v > 2 AND v BETWEEN 1 AND 4",
+            "p > 2 AND p BETWEEN 1 AND 4",
+        );
+        parity(&mut db, "s LIKE 'name3%'", "ps LIKE 'name3%'");
+        // 中段 % / _ / 字符类 / ILIKE / NOT LIKE:保持全扫,结果同答。
+        parity(&mut db, "s LIKE 'n%3%'", "ps LIKE 'n%3%'");
+        parity(&mut db, "s LIKE 'name_'", "ps LIKE 'name_'");
+        parity(&mut db, "s LIKE 'name[35]'", "ps LIKE 'name[35]'");
+        parity(&mut db, "s ILIKE 'NAME3%'", "ps ILIKE 'NAME3%'");
+        parity(&mut db, "s NOT LIKE 'name3%'", "ps NOT LIKE 'name3%'");
+        // 转义前缀:字面量 % 进前缀。
+        parity(
+            &mut db,
+            "s LIKE 'name\\_3%' ESCAPE '\\'",
+            "ps LIKE 'name\\_3%' ESCAPE '\\'",
+        );
+        // IN 与等值/范围混合:计划只消费一臂,其余走残余过滤。
+        parity(&mut db, "v IN (1, 2) AND v > 1", "p IN (1, 2) AND p > 1");
+        parity(&mut db, "v = 3 AND v IN (3, 4)", "p = 3 AND p IN (3, 4)");
+        parity(&mut db, "v IN (1, 2) OR v = 3", "p IN (1, 2) OR p = 3");
+        // IN (SELECT …) 预 pass 改写成字面量 InList 后同路。
+        parity(
+            &mut db,
+            "v IN (SELECT p FROM pt WHERE id <= 12)",
+            "p IN (SELECT p FROM pt WHERE id <= 12)",
+        );
+        // UPDATE/DELETE 快路径(index_probe_cx)同探针,影响行数同答。
+        let affected = |db: &mut Database, sql: &str| match run(db, sql) {
+            ExecOutcome::Affected(n) => n,
+            other => panic!("expected affected, got {other:?}"),
+        };
+        let n_idx = affected(&mut db, "UPDATE pt SET v = v WHERE v BETWEEN 2 AND 3");
+        let n_scan = affected(&mut db, "UPDATE pt SET p = p WHERE p BETWEEN 2 AND 3");
+        assert_eq!(n_idx, n_scan);
+        // 两条 DELETE 各自独立事务:p 镜像 v,同事务连跑会让第一条删掉
+        // 第二条的匹配行。
+        run(&mut db, "BEGIN");
+        let n_idx = affected(&mut db, "DELETE FROM pt WHERE v IN (8, 9)");
+        run(&mut db, "ROLLBACK");
+        run(&mut db, "BEGIN");
+        let n_scan = affected(&mut db, "DELETE FROM pt WHERE p IN (8, 9)");
+        run(&mut db, "ROLLBACK");
+        assert_eq!(n_idx, n_scan);
+    }
+
+    #[test]
+    fn in_between_like_probe_plans_in_explain() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE pt (id INT PRIMARY KEY NOT NULL, v INT NOT NULL, s TEXT NOT NULL, p INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_pt_v ON pt (v)");
+        run(&mut db, "CREATE INDEX ix_pt_s ON pt (s)");
+        for i in 1..=40 {
+            run(
+                &mut db,
+                &format!(
+                    "INSERT INTO pt VALUES ({i}, {}, 'name{}', {})",
+                    i % 10,
+                    i % 10,
+                    i % 10
+                ),
+            );
+        }
+        let details = |db: &mut Database, sql: &str| -> Vec<String> {
+            match run(db, sql) {
+                ExecOutcome::Rows(r) => r
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                    .collect(),
+                other => panic!("expected plan rows, got {other:?}"),
+            }
+        };
+        let has = |d: &[String], needle: &str| d.iter().any(|l| l.contains(needle));
+        // IN 多探针:PROBE 行 + 无残余(exact)。
+        let d = details(&mut db, "EXPLAIN SELECT * FROM pt WHERE v IN (3, 7)");
+        assert!(has(&d, "INDEX PROBE ON pt USING v"), "{d:?}");
+        assert!(has(&d, "IN (3, 7)"), "{d:?}");
+        assert!(!has(&d, "residual"), "{d:?}");
+        // 大列表摘要显示。
+        let big: Vec<String> = (0..30).map(|i| i.to_string()).collect();
+        let d = details(
+            &mut db,
+            &format!("EXPLAIN SELECT * FROM pt WHERE v IN ({})", big.join(", ")),
+        );
+        assert!(has(&d, "+14 more"), "{d:?}");
+        // 混合 conjunct:探针 + 残余。
+        let d = details(
+            &mut db,
+            "EXPLAIN SELECT * FROM pt WHERE v IN (3, 7) AND p > 1",
+        );
+        assert!(has(&d, "INDEX PROBE"), "{d:?}");
+        assert!(has(&d, "residual WHERE"), "{d:?}");
+        // BETWEEN 闭区间。
+        let d = details(&mut db, "EXPLAIN SELECT * FROM pt WHERE v BETWEEN 2 AND 4");
+        assert!(has(&d, "INDEX PROBE ON pt USING v"), "{d:?}");
+        assert!(has(&d, ">= 2"), "{d:?}");
+        assert!(has(&d, "<= 4"), "{d:?}");
+        // LIKE 前缀带。
+        let d = details(&mut db, "EXPLAIN SELECT * FROM pt WHERE s LIKE 'name3%'");
+        assert!(has(&d, "INDEX PROBE ON pt USING s"), "{d:?}");
+        assert!(has(&d, ">= 'name3'"), "{d:?}");
+        assert!(has(&d, "< 'name4'"), "{d:?}");
+        // IN (SELECT …) 在执行期由预 pass 改写成字面量 InList 后走探针
+        // (见 parity 测试);EXPLAIN 镜像不执行子查询,报告的是改写前
+        // 形状 —— 这是镜像的既有边界,不是探针缺席。
+        let d = details(
+            &mut db,
+            "EXPLAIN SELECT * FROM pt WHERE v IN (SELECT v FROM pt WHERE id <= 5)",
+        );
+        assert!(has(&d, "FULL HEAP SCAN ON pt"), "{d:?}");
+        // 不消费的形状保持全扫:NOT IN / 中段 % / ILIKE / 非索引列。
+        for sql in [
+            "EXPLAIN SELECT * FROM pt WHERE v NOT IN (3, 7)",
+            "EXPLAIN SELECT * FROM pt WHERE s LIKE 'n%3%'",
+            "EXPLAIN SELECT * FROM pt WHERE s ILIKE 'NAME3%'",
+            "EXPLAIN SELECT * FROM pt WHERE p IN (3, 7)",
+        ] {
+            let d = details(&mut db, sql);
+            assert!(has(&d, "FULL HEAP SCAN ON pt"), "{sql} -> {d:?}");
+        }
+    }
+
+    #[test]
+    fn in_between_probe_windows_asc_desc_exact_and_residual() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE wn (id INT PRIMARY KEY NOT NULL, v INT NOT NULL, p INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_wn_v ON wn (v)");
+        for i in 1..=200 {
+            run(
+                &mut db,
+                &format!("INSERT INTO wn VALUES ({i}, {}, {})", i % 7, i % 7),
+            );
+        }
+        let parity = |db: &mut Database, sql_v: &str, sql_p: &str| {
+            let a = rows(db, sql_v).rows;
+            let b = rows(db, sql_p).rows;
+            assert_eq!(a, b, "窗口结果不得依赖索引存在性:\n{sql_v}\n{sql_p}");
+        };
+        // ASC/DESC 窗口 + In(exact:探针消费整个 WHERE,cap 截断)。
+        parity(
+            &mut db,
+            "SELECT id FROM wn WHERE v IN (3, 5) ORDER BY id LIMIT 10",
+            "SELECT id FROM wn WHERE p IN (3, 5) ORDER BY id LIMIT 10",
+        );
+        parity(
+            &mut db,
+            "SELECT id FROM wn WHERE v IN (3, 5) ORDER BY id DESC LIMIT 10 OFFSET 8",
+            "SELECT id FROM wn WHERE p IN (3, 5) ORDER BY id DESC LIMIT 10 OFFSET 8",
+        );
+        // 树序窗口:ORDER BY 探针键自身。
+        parity(
+            &mut db,
+            "SELECT id FROM wn WHERE v IN (3, 5) ORDER BY v LIMIT 12",
+            "SELECT id FROM wn WHERE p IN (3, 5) ORDER BY p LIMIT 12",
+        );
+        // BETWEEN 闭区间 + DESC 窗口 + OFFSET。
+        parity(
+            &mut db,
+            "SELECT id FROM wn WHERE v BETWEEN 2 AND 4 ORDER BY id DESC LIMIT 15 OFFSET 5",
+            "SELECT id FROM wn WHERE p BETWEEN 2 AND 4 ORDER BY id DESC LIMIT 15 OFFSET 5",
+        );
+        // 非 exact(残余 conjunct 在场)窗口走全候选 + 逐行过滤。
+        parity(
+            &mut db,
+            "SELECT id FROM wn WHERE v IN (1, 2) AND id % 3 = 0 ORDER BY id LIMIT 9",
+            "SELECT id FROM wn WHERE p IN (1, 2) AND id % 3 = 0 ORDER BY id LIMIT 9",
+        );
+    }
+
+    #[test]
+    fn like_prefix_probe_open_ended_and_class_fallback() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE ls (id INT PRIMARY KEY NOT NULL, s TEXT NOT NULL, ps TEXT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_ls_s ON ls (s)");
+        run(
+            &mut db,
+            "INSERT INTO ls VALUES (1, 'x\u{10FFFF}a', 'x\u{10FFFF}a')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO ls VALUES (2, 'x\u{10FFFF}b', 'x\u{10FFFF}b')",
+        );
+        run(&mut db, "INSERT INTO ls VALUES (3, 'ya', 'ya')");
+        // 前缀止于 char::MAX:无有限后继 → 开放右界探针(残余过滤收尾),
+        // 结果必须与无索引列一致。
+        let parity = |db: &mut Database, sql_v: &str, sql_p: &str| {
+            let a = rows(db, sql_v).rows;
+            let b = rows(db, sql_p).rows;
+            assert_eq!(a, b, "开放右界探针结果不得依赖索引存在性");
+        };
+        parity(
+            &mut db,
+            "SELECT id FROM ls WHERE s LIKE 'x\u{10FFFF}%'",
+            "SELECT id FROM ls WHERE ps LIKE 'x\u{10FFFF}%'",
+        );
+    }
+
+    #[test]
+    fn in_between_probes_respect_timestamp_band() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE tt (id INT PRIMARY KEY NOT NULL, ts TEXT, p TEXT)",
+        );
+        run(&mut db, "CREATE INDEX ix_tt_ts ON tt (ts)");
+        let stamps = [
+            "TIMESTAMP '2021-01-01T00:00:00Z'",
+            "TIMESTAMP '2021-06-01T00:00:00Z'",
+            "TIMESTAMP '2022-01-01T00:00:00Z'",
+            "TIMESTAMP '2022-01-01T00:00:00Z'",
+            "TIMESTAMP '2023-01-01T00:00:00Z'",
+        ];
+        for (i, st) in stamps.iter().enumerate() {
+            let id = i + 1;
+            run(
+                &mut db,
+                &format!("INSERT INTO tt VALUES ({id}, {st}, {st})"),
+            );
+        }
+        // 纯 Timestamp 带上的 IN(可解析字符串元素真提升)与 BETWEEN
+        // (字符串界提升):双生列差分。
+        let parity = |db: &mut Database, sql_v: &str, sql_p: &str| {
+            let a = rows(db, sql_v).rows;
+            let b = rows(db, sql_p).rows;
+            assert_eq!(
+                a, b,
+                "Timestamp 带探针结果不得依赖索引存在性:\n{sql_v}\n{sql_p}"
+            );
+        };
+        parity(
+            &mut db,
+            "SELECT id FROM tt WHERE ts IN ('2021-06-01T00:00:00Z', '2023-01-01T00:00:00Z') ORDER BY id",
+            "SELECT id FROM tt WHERE p IN ('2021-06-01T00:00:00Z', '2023-01-01T00:00:00Z') ORDER BY id",
+        );
+        parity(
+            &mut db,
+            "SELECT id FROM tt WHERE ts BETWEEN '2021-06-01T00:00:00Z' AND '2022-01-01T00:00:00Z' ORDER BY id",
+            "SELECT id FROM tt WHERE p BETWEEN '2021-06-01T00:00:00Z' AND '2022-01-01T00:00:00Z' ORDER BY id",
+        );
+        // 不可解析字符串元素/前缀:探针回退全扫,残余过滤给出谓词语义
+        // (对每个 Timestamp 键判未知 → 空结果)。
+        parity(
+            &mut db,
+            "SELECT id FROM tt WHERE ts IN ('nope') ORDER BY id",
+            "SELECT id FROM tt WHERE p IN ('nope') ORDER BY id",
+        );
+        parity(
+            &mut db,
+            "SELECT id FROM tt WHERE ts LIKE '2021%' ORDER BY id",
+            "SELECT id FROM tt WHERE p LIKE '2021%' ORDER BY id",
+        );
+        assert!(rows(&mut db, "SELECT id FROM tt WHERE ts LIKE '2021%'")
+            .rows
+            .is_empty());
+        // 混合带(Timestamp 与 Str 共存):整体回退,一行不丢。
+        run(&mut db, "INSERT INTO tt VALUES (9, 'zzz', 'zzz')");
+        parity(
+            &mut db,
+            "SELECT id FROM tt WHERE ts IN (TIMESTAMP '2021-01-01T00:00:00Z', 'zzz') ORDER BY id",
+            "SELECT id FROM tt WHERE p IN (TIMESTAMP '2021-01-01T00:00:00Z', 'zzz') ORDER BY id",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM tt WHERE ts IN (TIMESTAMP '2021-01-01T00:00:00Z', 'zzz') ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(9)]]);
+    }
+
+    #[test]
+    fn in_probe_with_composite_prefix_and_duplicate_keys() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE ci (id INT PRIMARY KEY NOT NULL, a INT NOT NULL, b INT NOT NULL, x INT NOT NULL, y INT NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_ci_ab ON ci (a, b)");
+        for i in 1..=60 {
+            let (a, b) = (i % 3, i % 4);
+            run(
+                &mut db,
+                &format!("INSERT INTO ci VALUES ({i}, {a}, {b}, {a}, {b})"),
+            );
+        }
+        // 复合前缀 + IN:Prefix 计划消费 a=1,b IN 保留在残余过滤(非 exact),
+        // 结果与无索引双生列一致。
+        let a = rows(
+            &mut db,
+            "SELECT id FROM ci WHERE a = 1 AND b IN (2, 3) ORDER BY id",
+        )
+        .rows;
+        let b = rows(
+            &mut db,
+            "SELECT id FROM ci WHERE x = 1 AND y IN (2, 3) ORDER BY id",
+        )
+        .rows;
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 10); // a∈{1}, b∈{2,3}:每 12 个 id 命中 2 个 → 60/12*2
+                                 // 非唯一树同键多行:v IN 单值必须返回全部同键行(整对去重不丢行)。
+        run(&mut db, "CREATE INDEX ix_ci_a ON ci (a)");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM ci WHERE a IN (1)").rows;
+        assert_eq!(r, vec![vec![Value::Int(20)]]);
     }
 
     #[test]
