@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-03
+
+### 查询性能:IN / BETWEEN / LIKE 前缀走索引探针(2026-10-03)
+
+`probe_plan` 补三类探针形状,此前 `IN`/`BETWEEN`/`LIKE '前缀%'` 在索引列上一律退化为
+全表逐行解码(与非索引列同价):
+
+- **IN 列表**:`WHERE 索引列 IN (常量列表)` 改为逐键多探针(50 万行实测:稠密 3 值
+  188ms→1.4ms;散布全空间的稀疏散点 192ms→0.03ms —— 逐元素走树,不退化为 min/max
+  区间;`IN (SELECT …)` 非相关子查询经预 pass 改写后同路 212ms→10ms)。NULL 元素不进
+  探针(树无 NULL 键,谓词对 NULL 行恒未知);重复元素/`Int` 与 `Float` 判等元素按
+  (键,locator) 全对去重,不重计行也不丢同键多行;
+- **BETWEEN / LIKE 前缀**:`BETWEEN` 折叠为闭区间带探针(176ms→4.1ms);
+  `LIKE '字面前缀%'` 折叠为 `[前缀, 后继)` 带(300ms→0.13ms;`_`/`[…]` 字符类/中段
+  `%`/`ILIKE`/`NOT LIKE` 保持全扫,语义不变);
+- **语义红线**:探针是超集,残余条件照常逐行过滤 —— 结果与索引存在与否无关(双生表
+  差分测试钉住);混合 Str/Timestamp 带与不可解析边界照旧整体回退全扫;`ORDER BY +
+  LIMIT` 索引序窗口(ASC/DESC)与 UPDATE/DELETE 快路径自动受益;`EXPLAIN` 的 PROBE 行
+  可见新计划。
+
 ### 第三轮全模块缺陷审查修复(2026-10-03)
 
 对全部模块再做一轮系统审查(14 路并行→逐条源码核实→修复+回归落各模块内;Rust 全量
@@ -70,14 +90,11 @@
   切断);`;`/GO 分隔的纯语句批不路由解释器(单帧多语句曾被"每帧一句"挡死);
   SUSER_SNAME()/ERROR_MESSAGE() 单语句不路由(批内可用、单句报错,行为不一致);
   `PRINT N'…'` 不进垫片。
-- **部署/CI**:CI python 驱动测试 job 此前两轮 CHANGELOG 均声称已补、实际从未落盘
-  (workflow 无该 job)——本次真实新增(python job + 接入 build needs);prod compose 头
-  注释宣称四个 `DOCSQL_TLS_*` 经 .env 配置、实际从未接线(照做的用户数据面静默明文)
-  ——五个数据节点补透传 + `.env.example` 补条目;NuGet 发布补版本一致性门禁(tag 与
-  四个 csproj `<Version>` 及 AspireSample 钉版全等才 pack);CI restore 重试循环补显式
-  失败哨兵(耗尽后不再靠 NETSDK1004 间接报错);run-tests.sh 构建分支补脏树检查
-  (Docker COPY 会把未提交改动打进镜像,`DOCSQL_ALLOW_DIRTY=1` 逃生)+ 归一 dev compose
-  从 .env 读取的其余五个透传变量(本地 .env 不再破坏测试确定性)。
+- **部署**:prod compose 头注释宣称四个 `DOCSQL_TLS_*` 经 .env 配置、实际从未接线
+  (照做的用户数据面静默明文)——五个数据节点补透传 + `.env.example` 补条目;
+  run-tests.sh 构建分支补脏树检查(Docker COPY 会把未提交改动打进镜像,
+  `DOCSQL_ALLOW_DIRTY=1` 逃生)+ 归一 dev compose 从 .env 读取的其余五个透传变量
+  (本地 .env 不再破坏测试确定性)。
 - **Web 控制台**:备份页 `esc()` 套在 HTML 占位常量上,fallback 分支显示字面 HTML 文本。
 
 ## [0.8.0] - 2026-10-02
