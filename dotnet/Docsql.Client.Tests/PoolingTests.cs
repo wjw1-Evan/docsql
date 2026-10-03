@@ -259,4 +259,27 @@ public sealed class ServerSideBindingTests : IClassFixture<ServerFixture>
         // 连接仍可用(错误不毒化物理连接)。
         Assert.Equal(1L, Scalar(conn, "SELECT 1", ("x", 1)));
     }
+
+[Fact]
+public void Pool_key_separates_tls_shapes()
+{
+    // 第三轮回归:池键曾漏 TLS 形态——同 host/port/凭据下 tls=true 与
+    // tls=false 的连接串共用物理连接,「加密」会话静默跑明文。
+    var b = new DocsqlConnectionStringBuilder();
+    b.ConnectionString = "host=h;port=1;password=pw";
+    var plain = b;
+    b = new DocsqlConnectionStringBuilder();
+    b.ConnectionString = "host=h;port=1;password=pw;tls=true";
+    var tls = b;
+    Assert.NotEqual(ConnectionPool.KeyOf(plain, null), ConnectionPool.KeyOf(tls, null));
+    b = new DocsqlConnectionStringBuilder();
+    b.ConnectionString = "host=h;port=1;password=pw;tls=true;tls_ca=/a.pem";
+    var ca1 = b;
+    b = new DocsqlConnectionStringBuilder();
+    b.ConnectionString = "host=h;port=1;password=pw;tls=true;tls_ca=/b.pem";
+    var ca2 = b;
+    Assert.NotEqual(ConnectionPool.KeyOf(ca1, null), ConnectionPool.KeyOf(ca2, null));
+    Assert.Equal(ConnectionPool.KeyOf(plain, null), ConnectionPool.KeyOf(plain, null));
+}
+
 }

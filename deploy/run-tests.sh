@@ -37,6 +37,14 @@ USER_DEV_TOKEN="${DOCSQL_DEV_TOKEN:-}"
 USER_BACKUP_INTERVAL="${DOCSQL_BACKUP_INTERVAL_SECS:-}"
 USER_WEB_AUTH_FILE="${DOCSQL_WEB_AUTH_FILE:-}"
 HAD_WEB_AUTH_FILE="${DOCSQL_WEB_AUTH_FILE+set}"
+# The dev compose reads these from deploy/.env as well: a locally present
+# .env (recommended for prod deployments) would otherwise leak non-default
+# values into the test stack and break its determinism from outside.
+USER_READ_TOKEN="${DOCSQL_READ_TOKEN:-}"
+USER_MAX_CONN="${DOCSQL_MAX_CONN:-}"
+USER_IDLE_TIMEOUT="${DOCSQL_IDLE_TIMEOUT:-}"
+USER_BACKUP_KEEP="${DOCSQL_BACKUP_KEEP:-}"
+USER_ADVERTISE="${DOCSQL_ADVERTISE:-}"
 
 # Test-stack overrides (never the user's config): raw unauthenticated curls
 # need the console account gate off, and the client token stays empty for
@@ -46,6 +54,12 @@ export DOCSQL_WEB_AUTH_FILE=""
 export DOCSQL_DEV_TOKEN=""
 export DOCSQL_BACKUP_INTERVAL_SECS="5"
 export DOCSQL_DEV_DATA_PREFIX="docsql-dev-testdata"
+# Neutralize the rest of the .env passthroughs (empty = server defaults).
+export DOCSQL_READ_TOKEN=""
+export DOCSQL_MAX_CONN=""
+export DOCSQL_IDLE_TIMEOUT=""
+export DOCSQL_BACKUP_KEEP=""
+export DOCSQL_ADVERTISE=""
 
 TAG="${DOCSQL_DEV_IMAGE_TAG:-local}"
 PROFILES="--profile single --profile cluster"
@@ -95,6 +109,11 @@ restore_user_stack() {
     export DOCSQL_DEV_DATA_PREFIX="$USER_DATA_PREFIX"
     export DOCSQL_DEV_TOKEN="$USER_DEV_TOKEN"
     export DOCSQL_BACKUP_INTERVAL_SECS="$USER_BACKUP_INTERVAL"
+    export DOCSQL_READ_TOKEN="$USER_READ_TOKEN"
+    export DOCSQL_MAX_CONN="$USER_MAX_CONN"
+    export DOCSQL_IDLE_TIMEOUT="$USER_IDLE_TIMEOUT"
+    export DOCSQL_BACKUP_KEEP="$USER_BACKUP_KEEP"
+    export DOCSQL_ADVERTISE="$USER_ADVERTISE"
     if [ "$HAD_WEB_AUTH_FILE" = set ]; then
       export DOCSQL_WEB_AUTH_FILE="$USER_WEB_AUTH_FILE"
     else
@@ -107,6 +126,15 @@ restore_user_stack() {
 trap restore_user_stack EXIT
 
 if [ -z "${DOCSQL_DEV_IMAGE_TAG:-}" ]; then
+  # The image build COPYs the WORKING TREE (not any git commit): staged or
+  # untracked changes ride into the image, so a green run here can certify
+  # a tree state that the subsequent push does not contain. Refuse (with
+  # an escape hatch for intentional dirty-tree experiments).
+  if [ "${DOCSQL_ALLOW_DIRTY:-}" != 1 ] && ! git -C "$DEPLOY_DIR/.." diff --quiet 2>/dev/null      || [ "${DOCSQL_ALLOW_DIRTY:-}" != 1 ] && [ -n "$(git -C "$DEPLOY_DIR/.." status --porcelain 2>/dev/null)" ]; then
+    echo "ERROR: working tree is dirty — the test image would contain uncommitted changes." >&2
+    echo "       Commit/stash first, or set DOCSQL_ALLOW_DIRTY=1 to test the dirty tree anyway." >&2
+    exit 1
+  fi
   echo "== build local image (ghcr.io/wjw1-evan/docsql:${TAG}; in-build cargo test gate) =="
   DOCSQL_DEV_IMAGE_TAG="$TAG" docker compose $PROFILES build >/dev/null
 fi

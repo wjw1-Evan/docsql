@@ -487,9 +487,17 @@ impl SessionSlot {
     }
 
     /// Mark a statement as running (display text capped at 256 chars).
+    /// The text goes through `redact_sql` first: REQ_SESSIONS exposes it
+    /// to admins, and a `CREATE USER … PASSWORD '…'` mid-flight must not
+    /// leak its plaintext through the monitoring surface (same rule the
+    /// audit log already enforces).
     fn start_statement(&self, sql: &str) {
         let mut info = self.info.lock().unwrap_or_else(|p| p.into_inner());
-        info.current = Some((sql.chars().take(256).collect(), std::time::Instant::now()));
+        let redacted = docsql_core::useradmin::redact_sql(sql);
+        info.current = Some((
+            redacted.chars().take(256).collect(),
+            std::time::Instant::now(),
+        ));
     }
 
     fn finish_statement(&self) {
@@ -1767,12 +1775,19 @@ pub async fn handle_connection(
                 && state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst) != user_epoch
             {
                 let name = user.as_ref().expect("checked just above").name.clone();
+                // Sample the epoch INSIDE the same critical section as the
+                // resolve — a REVOKE committing between the resolve and an
+                // outside load would pair pre-revoke grants with a
+                // post-revoke epoch and skip every later refresh for this
+                // session (same race the login path already closes).
                 let refreshed = {
                     let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-                    docsql_core::useradmin::resolve_grants(&mut db, &name)
-                        .ok()
-                        .flatten()
-                        .map(|g| UserAuth { name, grants: g })
+                    let grants =
+                        docsql_core::useradmin::resolve_grants(&mut db, &name)
+                            .ok()
+                            .flatten();
+                    let epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    grants.map(|g| (UserAuth { name, grants: g }, epoch))
                 };
                 if refreshed.is_none() {
                     // The account was dropped (or its grants became
@@ -1789,8 +1804,10 @@ pub async fn handle_connection(
                         .await;
                     break;
                 }
-                user = refreshed;
-                user_epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                let (auth, epoch) =
+                    refreshed.expect("none case breaks above before reaching here");
+                user = Some(auth);
+                user_epoch = epoch;
             }
             // Once at least one database user exists, legacy anonymous
             // (token-less) access closes: every client-facing data frame
@@ -3541,7 +3558,7 @@ fn apply_row_filters(
     // they are WRITE targets, but their rows are exactly what a filter on
     // them must protect (without this the early-exit below silently
     // skipped `UPDATE sales SET … WHERE …`).
-    let mut targets = match Database::stmt_read_targets(stmt) {
+    let mut targets = match Database::stmt_read_target_occurrences(stmt) {
         Some(t) => t,
         None => {
             return if mentions_filtered() {
@@ -4525,23 +4542,36 @@ async fn execute_sql_inner(
     // never observe writes this node later undoes. COMMIT/EXEC drain the
     // buffer in execution order, mixing SQL and KV writes alike.
     if !is_replication {
-        // Commit/rollback release the owner and buffer even when the
-        // statement failed: the engine discards its snapshot before the WAL
-        // fsync, so a kept owner would make the next COMMIT error with "no
-        // transaction in progress" while tx_pending could never drain —
-        // every later write then queues behind a transaction that no longer
-        // exists. A failed COMMIT clears the buffer without draining (the
-        // writes were never durably committed, so peers must not see them).
+        // Commit/rollback release the owner and buffer — UNLESS the engine
+        // kept the transaction open (a failed WAL fsync on COMMIT, or a
+        // failed undo replay on ROLLBACK: the engine tears down only after
+        // durability/restore succeed and documents "retry is possible").
+        // In that state the owner and buffered writes must survive so the
+        // client can retry or the disconnect cleanup can roll back;
+        // clearing them unconditionally left an open engine transaction
+        // nobody owned, wedging every later write (client, replication
+        // apply, PUBLISH) behind the 30s busy loop until restart. A failed
+        // COMMIT on a closed transaction still clears the buffer without
+        // draining (the writes were never durably committed, so peers must
+        // not see them).
         if matches!(tx_kind, TxControl::Commit) {
-            *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            if outcome.is_ok() {
-                drain_tx_pending(state).await;
+            if in_tx {
+                // Engine transaction still open: owner + tx_pending stay.
             } else {
-                state.tx_pending.lock().await.clear();
+                *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                if outcome.is_ok() {
+                    drain_tx_pending(state).await;
+                } else {
+                    state.tx_pending.lock().await.clear();
+                }
             }
         } else if matches!(tx_kind, TxControl::Rollback { savepoint: None }) {
-            *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            state.tx_pending.lock().await.clear();
+            if in_tx {
+                // Undo replay failed, transaction still open for retry.
+            } else {
+                *state.tx_owner.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                state.tx_pending.lock().await.clear();
+            }
         }
     }
     if !is_replication && outcome.is_ok() {
@@ -4809,7 +4839,15 @@ async fn forward_write(
             let sequenced =
                 forward_frame_raw(target, proto::REQ_SQL_SEQ, &payload, key, auth, tls).await;
             match sequenced {
-                Ok(resp) if resp.frame_type == proto::RESP_ERROR => {
+                // Fall back ONLY for the legacy-peer shape ("unsupported
+                // frame"): re-resending any other rejection as a plain
+                // REQ_SQL replayed rejected writes (origin-cap bypass,
+                // SQL errors) and doubled the 30s replication wait when
+                // the peer was busy inside a client transaction.
+                Ok(resp)
+                    if resp.frame_type == proto::RESP_ERROR
+                        && resp.payload.as_slice() == b"unsupported frame" =>
+                {
                     let payload = proto::encode_sql(sql).map_err(std::io::Error::other)?;
                     forward_frame(target, proto::REQ_SQL, &payload, key, auth, tls)
                         .await
@@ -4993,7 +5031,7 @@ fn transport_failure(e: &std::io::Error) -> bool {
 }
 
 /// Record one fan-out outcome for `target`: success clears the breaker,
-/// transport failures extend the backoff (2s doubling to 60s).
+/// transport failures extend the backoff (2s doubling, capped at 32s).
 async fn note_fanout_failure(state: &ServerState, target: &str, e: &std::io::Error) {
     if !transport_failure(e) {
         return;
@@ -6947,7 +6985,17 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                             db.digests()
                         };
                         if let Ok(fresh_local) = fresh_local {
-                            if fresh.iter().any(|(_, d)| d == &fresh_local) {
+                            // Convergence must be the ELECTION's verdict
+                            // (local group wins decide_repair), not "any
+                            // single peer agrees": in an even split
+                            // {A,B}=X | {C,D}=Y, catching up to B alone
+                            // left A==B and this shortcut declared
+                            // convergence — freezing the split exactly the
+                            // way the (removed) loop-top shortcut did.
+                            if matches!(
+                                decide_repair(&fresh_local, &fresh),
+                                RepairDecision::Converged
+                            ) {
                                 eprintln!(
                                     "rejoin repair: incremental catch-up complete — \
                                      cluster converged without a snapshot"
@@ -8036,6 +8084,29 @@ mod security_tests {
         // Unrelated statements pass through untouched.
         let keep = apply_row_filters(&db, "SELECT * FROM other", &m).unwrap();
         assert_eq!(keep, "SELECT * FROM other");
+    }
+
+    #[test]
+    fn row_filter_same_table_twice_is_refused() {
+        // 第三轮:读目标集合曾按表名去重,同表第二次出现(子查询位)把
+        // deep 计数压回 top——子查询位完全逃过过滤,secret 逐字出线。
+        let mut db = filters_db();
+        db.execute("ALTER TABLE sales ADD COLUMN secret TEXT")
+            .unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("sales".to_string(), vec!["region = 'east'".to_string()]);
+        for sql in [
+            "SELECT (SELECT secret FROM sales WHERE id = 42) FROM sales",
+            "SELECT id FROM sales WHERE secret = (SELECT secret FROM sales WHERE id = 42)",
+        ] {
+            assert!(
+                apply_row_filters(&db, sql, &m).is_err(),
+                "same-table second read must be refused: {sql}"
+            );
+        }
+        // 对照:单次出现照常改写。
+        let out = apply_row_filters(&db, "SELECT id FROM sales", &m).unwrap();
+        assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
     }
 
     #[test]

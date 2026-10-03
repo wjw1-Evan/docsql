@@ -145,7 +145,12 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
         let mut it = rest.iter().skip(2);
         while let Some(a) = it.next() {
             if a == "--user" {
-                user = it.next().cloned();
+                // A missing value must not silently downgrade the session
+                // to anonymous/token auth — fail the command instead.
+                user =
+                    Some(it.next().cloned().ok_or_else(|| {
+                        format!("connect: --user requires a name\n\n{}", usage())
+                    })?);
             } else if a.starts_with('-') {
                 return Err(format!("unknown option {a}\n\n{}", usage()));
             } else {
@@ -444,16 +449,24 @@ fn run_embedded(
             std::process::exit(1);
         });
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        // A blank line BETWEEN statements is skipped; inside a buffered
+        // multi-line statement it is literal payload — string literals
+        // span lines and dumps reproduce blank lines verbatim, so eating
+        // them mid-statement silently corrupted stored documents.
+        if trimmed.is_empty() && stmt.trim().is_empty() {
             continue;
         }
-        if interactive && (trimmed == "exit;" || trimmed == "exit") {
-            done = true;
-            break;
-        }
-        if trimmed == "help;" || trimmed == "help" {
-            print_embedded_help();
-            continue;
+        // Same buffer gate for the sentinels: a line that happens to be
+        // `help`/`exit;` inside a literal must stay data.
+        if stmt.trim().is_empty() {
+            if interactive && (trimmed == "exit;" || trimmed == "exit") {
+                done = true;
+                break;
+            }
+            if trimmed == "help;" || trimmed == "help" {
+                print_embedded_help();
+                continue;
+            }
         }
         stmt.push_str(&line);
         stmt.push('\n');
@@ -597,6 +610,21 @@ fn tls_env_enabled() -> Result<bool, String> {
     }
 }
 
+/// `TcpStream::connect` has no deadline: a firewalled (DROP) target wedges
+/// the CLI in OS-level SYN retries (~75s) regardless of every other timeout.
+fn tcp_connect_bounded(addr: &str) -> Result<std::net::TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut last = String::from("invalid address");
+    for sa in addr.to_socket_addrs().map_err(|e| e.to_string())? {
+        match std::net::TcpStream::connect_timeout(&sa, CONNECT_BUDGET) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("connect {addr}: {last}"))
+}
+
 impl Remote {
     fn connect(addr: &str) -> Result<Remote, String> {
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
@@ -608,7 +636,7 @@ impl Remote {
             link.spawn_reader(tx, print_push);
             Outbound::Tls(link)
         } else {
-            let stream = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
+            let stream = tcp_connect_bounded(addr)?;
             let reader = stream.try_clone().map_err(|e| e.to_string())?;
             std::thread::spawn(move || reader_loop(reader, tx));
             Outbound::Plain(stream)
@@ -1104,15 +1132,20 @@ fn remote_shell(
             std::process::exit(1);
         });
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        // Same rules as the embedded loop: blank lines and sentinels are
+        // only skipped/recognized BETWEEN statements, never inside a
+        // buffered multi-line literal.
+        if trimmed.is_empty() && stmt.trim().is_empty() {
             continue;
         }
-        if interactive && (trimmed == "exit" || trimmed == "exit;") {
-            break;
-        }
-        if trimmed == "help;" || trimmed == "help" {
-            print_remote_help();
-            continue;
+        if stmt.trim().is_empty() {
+            if interactive && (trimmed == "exit" || trimmed == "exit;") {
+                break;
+            }
+            if trimmed == "help;" || trimmed == "help" {
+                print_remote_help();
+                continue;
+            }
         }
         // Inline AUTH / pub-sub commands are TOP-LEVEL commands only: they
         // are recognized while no statement text is buffered. Matching
@@ -1254,6 +1287,9 @@ fn print_frame(f: &Frame, format: Format) -> bool {
                 print_rows(&QueryResult { columns, rows }, format);
             } else {
                 eprintln!("protocol error: undecodable rows payload");
+                // The whole result block is lost: a zero exit would report
+                // success to a pipeline that received a partial dataset.
+                return false;
             }
             true
         }
@@ -1983,8 +2019,10 @@ mod tests {
             &Frame::new(proto::RESP_AFFECTED, 3u64.to_le_bytes().to_vec()),
             Format::Table
         ));
-        // A malformed RESP_ROWS payload must not panic the shell.
-        assert!(print_frame(
+        // A malformed RESP_ROWS payload must not panic the shell — and a
+        // lost result block is a failure (a zero exit would report success
+        // to a pipeline that received nothing).
+        assert!(!print_frame(
             &Frame::new(proto::RESP_ROWS, b"not json".to_vec()),
             Format::Table
         ));
@@ -1992,12 +2030,11 @@ mod tests {
 
     #[test]
     fn parse_args_user_flag_without_value() {
-        // `connect h:1 --user` — the missing value makes --user None and the
-        // bare "connect" path still resolves (parses without panicking).
-        let (_, _, user, _, _) = as_remote(
-            parse_args(["connect", "h:1", "--user"].into_iter().map(String::from)).unwrap(),
-        );
-        assert!(user.is_none());
+        // `connect h:1 --user` — the missing value must fail the command:
+        // silently downgrading to anonymous/token auth changed the whole
+        // session's identity.
+        let out = parse_args(["connect", "h:1", "--user"].into_iter().map(String::from));
+        assert!(out.is_err(), "missing --user value must be a usage error");
     }
 
     #[test]
@@ -2229,6 +2266,59 @@ mod tests {
             &Frame::new(proto::RESP_ROWS, payload),
             Format::Csv
         ));
+    }
+    #[test]
+    fn blank_lines_inside_literals_are_preserved() {
+        // 第三轮:语句中间的空行曾被子无条件丢弃——多行字符串字面量的
+        // 空白行被静默删除,存库值与输入不一致(备份回放同样损坏)。
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        db.execute("CREATE TABLE d (v TEXT)").unwrap();
+        run_embedded(
+            &mut db,
+            Format::Csv,
+            None,
+            std::io::Cursor::new("INSERT INTO d VALUES ('para one\n\npara two');\n"),
+            true,
+            true,
+        );
+        let out = db.execute("SELECT LENGTH(v) AS n FROM d").unwrap();
+        let docsql_core::engine::ExecOutcome::Rows(r) = out else {
+            panic!("rows");
+        };
+        // 'para one\n\npara two' = 18 chars; a dropped blank line gives 17.
+        assert_eq!(r.rows[0][0], docsql_core::value::Value::Int(18), "{r:?}");
+    }
+
+    #[test]
+    fn sentinels_inside_literals_stay_data() {
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        db.execute("CREATE TABLE d (v TEXT)").unwrap();
+        run_embedded(
+            &mut db,
+            Format::Csv,
+            None,
+            std::io::Cursor::new(
+                "INSERT INTO d VALUES ('a\nhelp\nb');\nINSERT INTO d VALUES ('x');\n",
+            ),
+            true,
+            true,
+        );
+        let out = db.execute("SELECT COUNT(*) AS n FROM d").unwrap();
+        let docsql_core::engine::ExecOutcome::Rows(r) = out else {
+            panic!("rows");
+        };
+        // The literal `help` line must not be swallowed as the help
+        // command (both rows land, and the stored value keeps the line).
+        assert_eq!(r.rows[0][0], docsql_core::value::Value::Int(2), "{r:?}");
+        let out = db.execute("SELECT v FROM d LIMIT 1").unwrap();
+        let docsql_core::engine::ExecOutcome::Rows(r) = out else {
+            panic!("rows");
+        };
+        assert_eq!(
+            r.rows[0][0],
+            docsql_core::value::Value::Str("a\nhelp\nb".into()),
+            "{r:?}"
+        );
     }
 }
 

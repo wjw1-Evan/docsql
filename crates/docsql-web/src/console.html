@@ -3104,7 +3104,7 @@ function openBackupTab() {
         : (iv % 86400 === 0 ? `${iv / 86400}<small> ${T('天')}</small>` : `${iv}<small> ${T('秒')}</small>`);
       const cards = [
         [ivHtml, T('自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)')],
-        [`${esc(v.keep === undefined ? dash : v.keep)}<small> ${T('份')}</small>`, T('保留份数(DOCSQL_BACKUP_KEEP)')],
+        [`${v.keep === undefined ? dash : esc(v.keep)}<small> ${T('份')}</small>`, T('保留份数(DOCSQL_BACKUP_KEEP)')],
         [`${esc(v.count || 0)}<small> ${T('份')}</small>`, T('现有备份')],
         [v.running ? `<span style="color:var(--warn)">${T('进行中…')}</span>` : lastHtml, T('最近一次')],
       ];
@@ -3128,7 +3128,7 @@ function openBackupTab() {
       if (!files.length) {
         html += `<div class="card" style="max-width:680px">
           <div class="v" style="font-size:15px">${T('暂无备份')}</div>
-          <div class="k" style="line-height:1.7">${T('节点尚未产生备份文件(目录:{0})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。备份是完整的 SQL 快照(DROP + CREATE + INSERT);恢复时整库重放该快照,同名表还原为备份时点并扇出到集群全网。', esc(v.dir || dash))}</div></div>`;
+          <div class="k" style="line-height:1.7">${T('节点尚未产生备份文件(目录:{0})。自动备份默认每日一次(0 关闭),也可点「立即备份」手动触发。备份是完整的 SQL 快照(DROP + CREATE + INSERT);恢复时整库重放该快照,同名表还原为备份时点并扇出到集群全网。', (v.dir ? esc(v.dir) : dash))}</div></div>`;
       } else {
         html += `<table class="grid"><thead><tr><th>${T('备份文件')}</th><th>${T('大小')}</th><th>${T('时间')}</th><th>${T('操作')}</th></tr></thead><tbody>` +
           files.map(f => `<tr>

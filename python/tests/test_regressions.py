@@ -187,3 +187,35 @@ def test_out_of_domain_datetime_bind_raises_data_error(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT ?", (ok,))
         assert cur.fetchall()[0][0] == ok
+
+
+def test_nested_nonfinite_float_in_document_raises_data_error(conn):
+    # 第三轮:文档参数内嵌非有限浮点曾在 json.dumps 处抛裸 ValueError
+    # (非 DB-API 异常)泄漏出 execute()——顶层 NaN 早就是 DataError,嵌套
+    # 形态必须同语义(否则绕过用户代码的 except Error 恢复路径)。
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", ({"a": float("nan")},))
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", ({"a": float("inf")},))
+    with pytest.raises(DataError):
+        conn.cursor().execute("SELECT ?", ([1.0, float("-inf")],))
+
+
+def test_subscriber_tracks_last_id_only_for_subscribed_channels():
+    # 第三轮:模式投递(pmessage)也记 _last_id 且永不清理——高基数频道名
+    # 的长命订阅进程内存无界增长,而这些条目是死重(模式续传不用它们)。
+    import docsql.subscriber as sub
+
+    st = sub.Subscriber.__new__(sub.Subscriber)
+    st._channels = {"wanted": None}
+    st._last_id = {}
+
+    def on_msg(msg):
+        pass
+
+    import json as _json
+
+    st._on_message = on_msg
+    st._dispatch(_json.dumps({"channel": "wanted", "id": 5}).encode())
+    st._dispatch(_json.dumps({"channel": "user-42-events", "id": 9}).encode())
+    assert st._last_id == {"wanted": 5}

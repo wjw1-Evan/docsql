@@ -188,7 +188,13 @@ internal static class ConnectionPool
         var creds = string.Join('\u0001', p.User, p.Password, p.Token, keyOverride ?? p.Key);
         var digest = Convert.ToHexString(
             System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(creds)));
-        return string.Join('\u0001', p.Host, p.Port, digest, p.MaxPoolSize);
+        // TLS shape is a property of the PHYSICAL wire: two connection
+        // strings differing only in tls=true/tls=false must never share a
+        // pooled connection — borrowing across them silently ran the
+        // "encrypted" session over plaintext (or failed handshakes the
+        // other way around).
+        return string.Join('\u0001', p.Host, p.Port, digest, p.MaxPoolSize,
+            p.Tls, p.TlsCa, p.TlsHostName);
     }
 
     internal static Slot SlotOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
@@ -1591,32 +1597,67 @@ public sealed class DocsqlTransaction : DbTransaction
     protected override DbConnection DbConnection => _conn;
 
     /// <summary>建保存点。</summary>
-    public override void Save(string savePointName) => Run($"SAVEPOINT {QuoteIdent(savePointName)}");
+    public override void Save(string savePointName)
+    {
+        EnsureOwnsConnection();
+        Run($"SAVEPOINT {QuoteIdent(savePointName)}");
+    }
 
     /// <summary>回滚到保存点。注意引擎语义:ROLLBACK TO 会把命名保存点自身也
     /// 丢弃(异于 SQLite/PG)—— 回滚后该保存点已消费,勿再 Release 同名保存点;
     /// 需要再次回滚就先重新 Save。</summary>
-    public override void Rollback(string savePointName) => Run($"ROLLBACK TO {QuoteIdent(savePointName)}");
+    public override void Rollback(string savePointName)
+    {
+        EnsureOwnsConnection();
+        Run($"ROLLBACK TO {QuoteIdent(savePointName)}");
+    }
 
     /// <summary>释放保存点。</summary>
-    public override void Release(string savePointName) => Run($"RELEASE SAVEPOINT {QuoteIdent(savePointName)}");
+    public override void Release(string savePointName)
+    {
+        EnsureOwnsConnection();
+        Run($"RELEASE SAVEPOINT {QuoteIdent(savePointName)}");
+    }
 
     public override async Task SaveAsync(
-        string savePointName, CancellationToken cancellationToken = default) =>
+        string savePointName, CancellationToken cancellationToken = default)
+    {
+        EnsureOwnsConnection();
         await RunAsync($"SAVEPOINT {QuoteIdent(savePointName)}", cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>同 <see cref="Rollback(string)"/>:引擎把保存点自身一并丢弃。</summary>
     public override async Task RollbackAsync(
-        string savePointName, CancellationToken cancellationToken = default) =>
+        string savePointName, CancellationToken cancellationToken = default)
+    {
+        EnsureOwnsConnection();
         await RunAsync($"ROLLBACK TO {QuoteIdent(savePointName)}", cancellationToken).ConfigureAwait(false);
+    }
 
     public override async Task ReleaseAsync(
-        string savePointName, CancellationToken cancellationToken = default) =>
+        string savePointName, CancellationToken cancellationToken = default)
+    {
+        EnsureOwnsConnection();
         await RunAsync($"RELEASE SAVEPOINT {QuoteIdent(savePointName)}", cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>事务归属的物理连接是否仍是被 BEGIN 的那条。</summary>
     private bool StillOwnsConnection =>
         ReferenceEquals(_conn.Proto, _protoAtBegin);
+
+    /// <summary>物理连接换代守卫:Close/Open 之后连接对象可能租到另一条物理线
+    /// (原线断连时服务端已回滚本事务)。此后的任何事务帧 —— COMMIT、ROLLBACK、
+    /// SAVEPOINT 族 —— 都会作用到新线上的"别人的事务",必须拒绝。EF Core 只走
+    /// 异步事务路径,故异步重载与保存点族与同步 Commit/Rollback 同守卫。</summary>
+    private void EnsureOwnsConnection()
+    {
+        if (!StillOwnsConnection)
+        {
+            throw new InvalidOperationException(
+                "the transaction's connection was closed and reopened; the server " +
+                "rolled the transaction back when its connection dropped");
+        }
+    }
 
     public override void Commit()
     {
@@ -1660,6 +1701,13 @@ public sealed class DocsqlTransaction : DbTransaction
         {
             throw new InvalidOperationException("transaction already finished");
         }
+        if (!StillOwnsConnection)
+        {
+            _done = true;
+            throw new InvalidOperationException(
+                "the transaction's connection was closed and reopened; the server " +
+                "rolled the transaction back when its connection dropped");
+        }
         await RunAsync("COMMIT", cancellationToken).ConfigureAwait(false);
         _done = true;
         _conn.InTransaction = false;
@@ -1670,6 +1718,13 @@ public sealed class DocsqlTransaction : DbTransaction
         if (_done)
         {
             throw new InvalidOperationException("transaction already finished");
+        }
+        if (!StillOwnsConnection)
+        {
+            _done = true;
+            throw new InvalidOperationException(
+                "the transaction's connection was closed and reopened; the server " +
+                "rolled the transaction back when its connection dropped");
         }
         await RunAsync("ROLLBACK", cancellationToken).ConfigureAwait(false);
         _done = true;

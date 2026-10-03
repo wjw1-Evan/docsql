@@ -421,6 +421,20 @@ fn tombstone(page: &mut [u8], i: usize) {
 }
 
 impl Heap {
+    /// Loud guard against corrupted locators: an index entry pointing
+    /// outside this heap's page list would otherwise read — or, on the
+    /// write paths, tombstone/repack and write back — ANOTHER table's heap
+    /// page, silently destroying unrelated data. Same error tier as the
+    /// `slot out of range` checks: corruption must fail loudly, never
+    /// panic and never cross tables.
+    fn check_page_owned(&self, page: u32) -> Result<()> {
+        if self.pages.contains(&page) {
+            Ok(())
+        } else {
+            Err(HeapError::Page(page, "page not owned by this heap"))
+        }
+    }
+
     /// Read every live document in insertion order.
     pub fn scan(&self, reader: &PageReader) -> Result<Vec<Object>> {
         let mut out = Vec::new();
@@ -502,6 +516,7 @@ impl Heap {
     /// pages of an open transaction are preferred, so consecutive
     /// mutations within one statement see each other.
     pub fn page_docs(&self, reader: &PageReader, tx: &Tx, page: u32) -> Result<Vec<(u64, Object)>> {
+        self.check_page_owned(page)?;
         let buf = load_page_owned(reader, Some(tx), page)?;
         validate_page(&buf, page)?;
         let mut out = Vec::new();
@@ -523,6 +538,7 @@ impl Heap {
     /// One document by locator; None for a tombstone/empty slot.
     pub fn doc_at(&self, reader: &PageReader, loc: u64) -> Result<Option<Object>> {
         let (page, slot_i) = unpack_loc(loc);
+        self.check_page_owned(page)?;
         let buf = reader.page(None, page)?;
         validate_page(&buf, page)?;
         if slot_i >= count_of(&buf) {
@@ -671,6 +687,7 @@ impl Heap {
             return Err(HeapError::DocTooLarge(bytes.len(), MAX_DOC_SIZE));
         }
         let (page_id, slot_i) = unpack_loc(loc);
+        self.check_page_owned(page_id)?;
         let mut page = load_page_owned(&PageReader::current(pager), Some(tx), page_id)?;
         validate_page(&page, page_id)?;
         let n = count_of(&page);
@@ -768,6 +785,11 @@ impl Heap {
         for &loc in locs {
             let (p, s) = unpack_loc(loc);
             by_page.entry(p).or_default().push(s);
+        }
+        // Validate every page BEFORE mutating any: a corrupted locator
+        // must abort the whole call, not leave earlier pages repacked.
+        for &page_id in by_page.keys() {
+            self.check_page_owned(page_id)?;
         }
         let mut all_moves = Vec::new();
         for (page_id, mut slots) in by_page {
@@ -1303,5 +1325,34 @@ mod tests {
             .expect_err("out-of-range slot must fail");
         assert!(format!("{err}").contains("out of range"), "{err}");
         let _ = loc;
+    }
+    #[test]
+    fn foreign_page_locator_is_rejected_loudly() {
+        // A corrupted index locator pointing at ANOTHER heap's page must
+        // error instead of silently reading/tombstoning/repacking that
+        // page (cross-table data destruction).
+        let (_d1, pager1) = db("heap_own_a.db");
+        let (_d2, pager2) = db("heap_own_b.db");
+        // `a` owns NO pages: every locator of heap `b` is foreign to it
+        // (two fresh pagers hand out the same first page id, so an empty
+        // side is the reliable way to build a genuinely foreign locator).
+        let mut a = Heap::default();
+        let mut b = Heap::default();
+        let mut tx = pager2.begin_tx();
+        let lb = b.insert(&pager2, &mut tx, &doc(9, "zzz")).unwrap();
+        pager2.commit_tx(tx).unwrap();
+        assert!(a.doc_at(&PageReader::current(&pager1), lb).is_err());
+        assert!(a
+            .page_docs(&PageReader::current(&pager1), &pager2.begin_tx(), 1)
+            .is_err());
+        let mut tx = pager1.begin_tx();
+        assert!(a.replace(&pager1, &mut tx, lb, &doc(2, "bbb")).is_err());
+        assert!(a.remove_many(&pager1, &mut tx, &[lb]).is_err());
+        pager1.abort_tx(tx).unwrap();
+        // Sanity: b's own locator still resolves.
+        assert!(b
+            .doc_at(&PageReader::current(&pager2), lb)
+            .unwrap()
+            .is_some());
     }
 }

@@ -10,9 +10,12 @@
 //! pushes dropped while `skip_through` is `i64::MAX`), then replays the
 //! backlog WITHOUT the registry lock — a large `from earliest` replay must
 //! not stall publishes (and the writes behind `write_order`). Each round
-//! re-arms the dedup filter and samples the watermark atomically under the
-//! lock: messages at or below the sample were dropped from the live stream
-//! and are replayed by that round's delta; later ids pass the filter.
+//! keeps the dedup filter suppressed for the WHOLE catch-up and samples
+//! the watermark once, in the registry lock, on the EXIT round only
+//! (messages at or below that sample are replayed by the catch-up; later
+//! ids pass the filter). The per-round re-arm scheme this replaced
+//! delivered every mid-backlog message twice — see the catch-up comments
+//! in server/lib.rs before touching the ordering here.
 //! Publishes serialize on the server's `write_order`, so per-connection
 //! push frames arrive in id order.
 //!

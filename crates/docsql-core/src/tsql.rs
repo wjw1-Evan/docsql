@@ -232,9 +232,7 @@ pub fn preprocess(sql: &str) -> String {
                     }
                 }
                 if closed {
-                    out.push('"');
-                    out.push_str(&ident.replace('"', "\"\""));
-                    out.push('"');
+                    out.push_str(&stmt::sql_quote_ident(&ident));
                 } else {
                     // Unterminated: copy verbatim, let the parser complain.
                     out.push_str(&sql[i..j]);
@@ -406,6 +404,15 @@ fn shim_statement(sql: &str, after_word: usize, word: &[u8], out: &mut String) -
             if expr.is_empty() {
                 return None;
             }
+            // T-SQL scripts put an N prefix on message literals
+            // (PRINT N'hello') more often than not; the engine's
+            // NationalStringLiteral arm handles it, so peel it here and
+            // re-emit the bare literal (PRAGMA value grammar has no N''.
+            let (expr, _n_prefixed) =
+                match expr.strip_prefix('N').or_else(|| expr.strip_prefix('n')) {
+                    Some(rest) if rest.starts_with('\'') => (rest, true),
+                    _ => (expr, false),
+                };
             let single_literal = if expr.starts_with('\'') {
                 match sql[start..].find('\'') {
                     Some(off) => {
@@ -568,13 +575,19 @@ fn rewrite_call(
     if !is_parse && !is_tsql_type_name(type_text) {
         return None;
     }
+    // Recurse into the value/style fragments: the value span was sliced out
+    // of the ORIGINAL text, so bracket identifiers (`[d]`), N'…' prefixes
+    // and nested CONVERT/PARSE calls inside it have not been through the
+    // main scan yet — emitting them verbatim produced marker calls the
+    // GenericDialect cannot parse (`CONVERT(VARCHAR(20), [d], 101)` was a
+    // hard parse error instead of a rewrite).
     out.push_str(&format!(
         "{marker}({}, {}",
         stmt::sql_string_literal(trim_h(type_text)),
-        trim_h(value_text)
+        preprocess(trim_h(value_text))
     ));
     if let Some(tail) = tail {
-        out.push_str(&format!(", {}", trim_h(tail)));
+        out.push_str(&format!(", {}", preprocess(trim_h(tail))));
     }
     out.push(')');
     Some(close + 1)
@@ -4478,5 +4491,25 @@ mod tests {
             f("STR", &[Value::Float(0.125), Value::Int(5), Value::Int(2)]),
             v_str(" 0.13")
         );
+    }
+    #[test]
+    fn convert_rewrites_value_side_brackets_and_nesting() {
+        // The value span must go through the same preprocessing: a bracket
+        // identifier or a nested CONVERT inside it used to be emitted
+        // verbatim into the marker call, producing text GenericDialect
+        // cannot parse.
+        assert_eq!(
+            preprocess("SELECT CONVERT(VARCHAR(20), [d], 101) FROM t"),
+            "SELECT __TSQL_CONVERT__('VARCHAR(20)', \"d\", 101) FROM t"
+        );
+        assert_eq!(
+            preprocess("SELECT CONVERT(INT, CONVERT(VARCHAR, x))"),
+            "SELECT __TSQL_CONVERT__('INT', __TSQL_CONVERT__('VARCHAR', x))"
+        );
+    }
+
+    #[test]
+    fn print_shim_accepts_n_prefixed_literal() {
+        assert_eq!(preprocess("PRINT N'hello'"), "PRAGMA tsql_print = 'hello'");
     }
 }

@@ -215,6 +215,12 @@ class _Transport:
         """Shared tail of both read paths: unseal keyed frames."""
         if self._sealer is not None:
             if not flags & _proto.FLAG_ENCRYPTED:
+                # An unsealed frame on a keyed connection means the stream
+                # can no longer be trusted (tampered flags / version skew):
+                # poison first, or a retry keeps using a wire whose framing
+                # integrity is gone — same discipline as the open() failure
+                # just below.
+                self._poison()
                 raise InterfaceError(
                     f"server sent an unencrypted frame {frame_type:#06x} on a keyed connection"
                 )

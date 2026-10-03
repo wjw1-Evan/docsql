@@ -304,3 +304,75 @@ public sealed class PoolCapacityTests : IClassFixture<ServerFixture>
         conn.Close();
     }
 }
+
+/// <summary>第三轮回归:CommitAsync/RollbackAsync 与保存点族缺「物理连接
+/// 代际守卫」——Close/Open 换线后迟到的异步 COMMIT/SAVEPOINT 会作用到新
+/// 物理连接上"别人的事务"(EF Core 只走异步事务路径,主力防线缺失)。
+/// </summary>
+public sealed class TransactionGenerationGuardTests : IClassFixture<ServerFixture>
+{
+    private readonly ServerFixture _fx;
+    public TransactionGenerationGuardTests(ServerFixture fx) => _fx = fx;
+
+    private static async Task<int> CountAsync(DocsqlConnection conn, string table)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*) FROM {table}";
+        using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return (int)reader.GetDouble(0);
+    }
+
+    [Fact]
+    public async Task CommitAsync_after_connection_recycled_throws()
+    {
+        var cs = $"host=127.0.0.1;port={_fx.Port}";
+        var conn = new DocsqlConnection(cs);
+        await conn.OpenAsync();
+        using (var ddl = conn.CreateCommand())
+        {
+            ddl.CommandText = "CREATE TABLE IF NOT EXISTS gen_guard (id INT PRIMARY KEY)";
+            await ddl.ExecuteNonQueryAsync();
+            ddl.CommandText = "DELETE FROM gen_guard";
+            await ddl.ExecuteNonQueryAsync();
+        }
+        var tx = await conn.BeginTransactionAsync();
+        using (var ins = conn.CreateCommand())
+        {
+            ins.Transaction = tx;
+            ins.CommandText = "INSERT INTO gen_guard VALUES (1)";
+            await ins.ExecuteNonQueryAsync();
+        }
+        // Close while InTransaction: the physical wire is dropped (the
+        // server rolled the transaction back on disconnect).
+        conn.Close();
+        await conn.OpenAsync(); // a recycled (or fresh) physical wire
+        await Assert.ThrowsAsync<InvalidOperationException>(() => tx.CommitAsync());
+        Assert.Equal(0, await CountAsync(conn, "gen_guard"));
+        // The recycled connection's transaction state must be intact.
+        using (var probe = conn.CreateCommand())
+        {
+            probe.CommandText = "BEGIN";
+            await probe.ExecuteNonQueryAsync();
+            probe.CommandText = "ROLLBACK";
+            await probe.ExecuteNonQueryAsync();
+        }
+        conn.Dispose();
+    }
+
+    [Fact]
+    public async Task Savepoints_after_connection_recycled_throw()
+    {
+        var cs = $"host=127.0.0.1;port={_fx.Port}";
+        var conn = new DocsqlConnection(cs);
+        await conn.OpenAsync();
+        var tx = await conn.BeginTransactionAsync();
+        conn.Close();
+        await conn.OpenAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => tx.SaveAsync("sp1"));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await tx.RollbackAsync("sp1"));
+        Assert.Throws<InvalidOperationException>(() => tx.Save("sp2"));
+        conn.Dispose();
+    }
+}

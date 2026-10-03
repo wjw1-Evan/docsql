@@ -170,7 +170,18 @@ def param_json(value):
     if isinstance(value, (dict, list, tuple)):
         # JSON documents bind as their JSON text (JSON_EXTRACT can read
         # them back); there is no native object parameter type on the wire.
-        return _dump_json(value if isinstance(value, (dict, list)) else list(value))
+        # A non-finite float NESTED inside the document fails _dump_json
+        # with a bare ValueError — the top-level NaN already raises
+        # DataError, and the nested shape must not leak a non-DB-API
+        # exception out of execute() (it would bypass `except Error`
+        # recovery paths in user code).
+        seq = value if isinstance(value, (dict, list)) else list(value)
+        try:
+            return _dump_json(seq)
+        except ValueError as exc:
+            raise DataError(
+                f"cannot bind document with non-finite float: {exc}"
+            ) from exc
     raise TypeError(f"unsupported parameter type: {type(value).__name__}")
 
 

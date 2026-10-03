@@ -1,3 +1,4 @@
+using System.Linq;
 // schema 校验:确认模型声明的表/列/命名索引都在库中(子集判定,
 // 忽略库中多出的对象)。通过时可跳过整场 SyncModel —— 后者对每条
 // 新连接都要逐表「建表探测 + 列探测」与索引同步,119 实体规模下是
@@ -61,6 +62,26 @@ internal static partial class SchemaSync
                 if (index.GetDatabaseName() is not { } iname) continue;
                 expectedIndexes.Add(iname);
                 if (index.IsUnique) expectedUniqueIndexes.Add(iname);
+                // 引擎只有 ASC 索引,模型声明 IsDescending 由 SyncIndexes 显式
+                // 抛 NotSupportedException(红线:DESC 必须响亮报错)。校验阶段
+                // 看不见方向:存量库里同名 ASC 索引会让校验通过、整场同步被
+                // 跳过,降序声明被静默忽略 —— 声明了降序就回落全量同步。
+                // IsDescending 在只读优化模型上对"未存储方向"直接抛
+                // InvalidOperationException(EF 契约:该情况即升序),按
+                // SchemaSync 同一契约捕获。
+                bool hasDescending;
+                try
+                {
+                    hasDescending = index.IsDescending is { } d && d.Any(x => x);
+                }
+                catch (InvalidOperationException)
+                {
+                    hasDescending = false;
+                }
+                if (hasDescending)
+                {
+                    return false;
+                }
                 var idxCols = new List<string>();
                 foreach (var p2 in index.Properties)
                 {

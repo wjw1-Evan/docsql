@@ -487,9 +487,234 @@ pub fn parse_expr_text(s: &str) -> Result<SqlExpr> {
     let mut parser = Parser::new(&GenericDialect {})
         .try_with_sql(s)
         .map_err(|e| SqlError::Parse(e.to_string()))?;
-    parser
+    let expr = parser
         .parse_expr()
-        .map_err(|e| SqlError::Parse(e.to_string()))
+        .map_err(|e| SqlError::Parse(e.to_string()))?;
+    // Trailing input is corruption of the stored body, not a suffix to
+    // ignore: a row-filter predicate sliced as `region = 'east'; anything`
+    // would otherwise be stored whole while every consumer evaluates only
+    // the prefix.
+    if parser.peek_token().token != sqlparser::tokenizer::Token::EOF {
+        return Err(SqlError::Parse("trailing input after expression".into()));
+    }
+    Ok(expr)
+}
+
+/// Canonical enumeration of the direct child expressions of every `SqlExpr`
+/// variant the engine can evaluate. Subquery-bearing nodes (Subquery /
+/// Exists / InSubquery / AnyOp / AllOp) are excluded on purpose: every
+/// tree-wide walker treats those nodes specially. Identifiers, literals and
+/// other leaves fall through and yield nothing. The macro body uses plain
+/// place matches only, so it expands identically over `&SqlExpr` and
+/// `&mut SqlExpr`.
+macro_rules! each_child_expr {
+    ($e:expr, $($f:tt)+) => {
+        match $e {
+            SqlExpr::IsFalse(c)
+            | SqlExpr::IsNotFalse(c)
+            | SqlExpr::IsTrue(c)
+            | SqlExpr::IsNotTrue(c)
+            | SqlExpr::IsNull(c)
+            | SqlExpr::IsNotNull(c)
+            | SqlExpr::IsUnknown(c)
+            | SqlExpr::IsNotUnknown(c)
+            | SqlExpr::Nested(c) => $($f)*(c),
+            SqlExpr::IsNormalized { expr: c, .. }
+            | SqlExpr::Collate { expr: c, .. }
+            | SqlExpr::Ceil { expr: c, .. }
+            | SqlExpr::Floor { expr: c, .. }
+            | SqlExpr::Extract { expr: c, .. }
+            | SqlExpr::Cast { expr: c, .. }
+            | SqlExpr::Prefixed { value: c, .. }
+            | SqlExpr::Named { expr: c, .. } => $($f)*(c),
+            SqlExpr::CompoundFieldAccess { root, .. } => $($f)*(root),
+            SqlExpr::JsonAccess { value, .. } => $($f)*(value),
+            SqlExpr::Convert { expr, styles, .. } => {
+                $($f)*(expr);
+                for c in styles {
+                    $($f)*(c);
+                }
+            }
+            SqlExpr::AtTimeZone { timestamp, time_zone } => {
+                $($f)*(timestamp);
+                $($f)*(time_zone);
+            }
+            SqlExpr::Position { expr, r#in } => {
+                $($f)*(expr);
+                $($f)*(r#in);
+            }
+            SqlExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                $($f)*(expr);
+                match substring_from {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+                match substring_for {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+            }
+            SqlExpr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                $($f)*(expr);
+                match trim_what {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+                match trim_characters {
+                    Some(chars) => {
+                        for c in chars {
+                            $($f)*(c);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            SqlExpr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                $($f)*(expr);
+                $($f)*(overlay_what);
+                $($f)*(overlay_from);
+                match overlay_for {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                $($f)*(left);
+                $($f)*(right);
+            }
+            SqlExpr::UnaryOp { expr, .. } => $($f)*(expr),
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                $($f)*(expr);
+                $($f)*(low);
+                $($f)*(high);
+            }
+            SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+                $($f)*(l);
+                $($f)*(r);
+            }
+            SqlExpr::Like { expr, pattern, .. }
+            | SqlExpr::ILike { expr, pattern, .. }
+            | SqlExpr::SimilarTo { expr, pattern, .. }
+            | SqlExpr::RLike { expr, pattern, .. } => {
+                $($f)*(expr);
+                $($f)*(pattern);
+            }
+            SqlExpr::InList { expr, list, .. } => {
+                $($f)*(expr);
+                for c in list {
+                    $($f)*(c);
+                }
+            }
+            SqlExpr::InUnnest { expr, array_expr, .. } => {
+                $($f)*(expr);
+                $($f)*(array_expr);
+            }
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                match operand {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+                for w in conditions {
+                    let sqlparser::ast::CaseWhen {
+                        condition, result, ..
+                    } = w;
+                    $($f)*(condition);
+                    $($f)*(result);
+                }
+                match else_result {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+            }
+            SqlExpr::Function(func) => {
+                let sqlparser::ast::Function { args, filter, .. } = func;
+                match args {
+                    sqlparser::ast::FunctionArguments::List(list) => {
+                        let sqlparser::ast::FunctionArgumentList { args, .. } = list;
+                        for a in args {
+                            match a {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(c),
+                                ) => $($f)*(c),
+                                sqlparser::ast::FunctionArg::Named {
+                                    arg: sqlparser::ast::FunctionArgExpr::Expr(c),
+                                    ..
+                                } => $($f)*(c),
+                                sqlparser::ast::FunctionArg::ExprNamed {
+                                    arg: sqlparser::ast::FunctionArgExpr::Expr(c),
+                                    ..
+                                } => $($f)*(c),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                match filter {
+                    Some(c) => $($f)*(c),
+                    None => {}
+                }
+            }
+            SqlExpr::GroupingSets(groups) | SqlExpr::Cube(groups) | SqlExpr::Rollup(groups) => {
+                for g in groups {
+                    for c in g {
+                        $($f)*(c);
+                    }
+                }
+            }
+            SqlExpr::Tuple(items) => {
+                for c in items {
+                    $($f)*(c);
+                }
+            }
+            SqlExpr::Struct { values, .. } => {
+                for c in values {
+                    $($f)*(c);
+                }
+            }
+            SqlExpr::Dictionary(fields) => {
+                for field in fields {
+                    let sqlparser::ast::DictionaryField { value, .. } = field;
+                    $($f)*(value);
+                }
+            }
+            _ => {}
+        }
+    };
+}
+
+pub(crate) fn child_exprs(e: &SqlExpr) -> Vec<&SqlExpr> {
+    let mut out: Vec<&SqlExpr> = Vec::new();
+    each_child_expr!(e, out.push);
+    out
+}
+
+pub(crate) fn child_exprs_mut(e: &mut SqlExpr) -> Vec<&mut SqlExpr> {
+    let mut out: Vec<&mut SqlExpr> = Vec::new();
+    each_child_expr!(e, out.push);
+    out
 }
 
 /// True when the expression calls a non-deterministic function — the
@@ -519,47 +744,13 @@ pub(crate) fn expr_calls_wall_clock(e: &SqlExpr) -> bool {
             ) {
                 return true;
             }
-            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
-                list.args.iter().any(|a| match a {
-                    sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(inner),
-                    ) => expr_calls_wall_clock(inner),
-                    _ => false,
-                })
-            } else {
-                false
-            }
+            child_exprs(e).into_iter().any(expr_calls_wall_clock)
         }
-        SqlExpr::BinaryOp { left, right, .. } => {
-            expr_calls_wall_clock(left) || expr_calls_wall_clock(right)
-        }
-        SqlExpr::UnaryOp { expr, .. } => expr_calls_wall_clock(expr),
-        SqlExpr::Nested(inner) => expr_calls_wall_clock(inner),
-        SqlExpr::Between {
-            expr, low, high, ..
-        } => {
-            expr_calls_wall_clock(expr) || expr_calls_wall_clock(low) || expr_calls_wall_clock(high)
-        }
-        SqlExpr::InList { expr, list, .. } => {
-            expr_calls_wall_clock(expr) || list.iter().any(expr_calls_wall_clock)
-        }
-        // A wall-clock call inside a CASE branch (e.g. GETDATE(1), which the
-        // text-level fold cannot reduce) must still trip this check — same
-        // coverage `calls_newid` already has.
-        SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand.as_deref().is_some_and(expr_calls_wall_clock)
-                || conditions.iter().any(|w| {
-                    expr_calls_wall_clock(&w.condition) || expr_calls_wall_clock(&w.result)
-                })
-                || else_result.as_deref().is_some_and(expr_calls_wall_clock)
-        }
-        SqlExpr::Tuple(items) => items.iter().any(expr_calls_wall_clock),
-        _ => false,
+        // A wall-clock call inside a CASE branch or a CAST/FLOOR/… wrapper
+        // (e.g. `CAST(GETDATE() AS TIMESTAMP)`, which the text-level fold
+        // cannot reduce) must still trip this check — child_exprs is the
+        // one shared traversal, so wrappers cannot slip past again.
+        _ => child_exprs(e).into_iter().any(expr_calls_wall_clock),
     }
 }
 
@@ -3123,6 +3314,20 @@ impl<'a> ReadCx<'a> {
     ) -> Result<Vec<Object>> {
         const MAX_ITERATIONS: usize = 100;
         const MAX_ROWS: usize = 100_000;
+        // The CTE body's own top-level ORDER BY / LIMIT / FETCH cannot ride
+        // along: the anchor and recursive arms are evaluated per iteration
+        // and only the outer query's clauses apply to the merged result.
+        // Silently dropping them made the same CTE return different row
+        // sets with and without a self-reference — reject instead.
+        if cte.query.order_by.is_some()
+            || cte.query.limit_clause.is_some()
+            || cte.query.fetch.is_some()
+        {
+            return err(format!(
+                "recursive CTE {name} does not support ORDER BY / LIMIT / FETCH on the \
+                 CTE body (apply them in the outer query)"
+            ));
+        }
         let sqlparser::ast::SetExpr::SetOperation {
             left,
             op: sqlparser::ast::SetOperator::Union,
@@ -3441,7 +3646,14 @@ impl<'a> ReadCx<'a> {
                     self.subst_expr_scoped(filter, outer, allow_rowcorr)?;
                 }
             }
-            _ => {}
+            _ => {
+                // Shared traversal: subqueries under wrapper nodes
+                // (FLOOR/IS NULL/SUBSTRING/…) resolve here instead of
+                // erroring at row level.
+                for child in child_exprs_mut(e) {
+                    self.subst_expr_scoped(child, outer, allow_rowcorr)?;
+                }
+            }
         }
         Ok(())
     }
@@ -3533,7 +3745,13 @@ impl<'a> ReadCx<'a> {
                     self.subst_expr_row(filter, doc, outer)?;
                 }
             }
-            _ => {}
+            _ => {
+                // Same shared traversal as the pre-pass: correlated
+                // subqueries left under wrapper nodes resolve per row.
+                for child in child_exprs_mut(e) {
+                    self.subst_expr_row(child, doc, outer)?;
+                }
+            }
         }
         Ok(())
     }
@@ -4804,11 +5022,18 @@ impl<'a> ReadCx<'a> {
         if query.with.is_some() {
             return err("EXPLAIN: WITH (CTE) planning is not supported");
         }
-        let sqlparser::ast::SetExpr::Select(select) = &*query.body else {
-            return err("EXPLAIN supports a single SELECT (set operations are not planned)");
+        let select = match &*query.body {
+            sqlparser::ast::SetExpr::Select(select) => (**select).clone(),
+            // A parenthesized body re-dispatches at execution time; explain
+            // the inner query instead of refusing with a set-operations
+            // message that describes a query that never ran.
+            sqlparser::ast::SetExpr::Query(inner) => {
+                return self.explain_query((**inner).clone());
+            }
+            _ => return err("EXPLAIN supports a single SELECT (set operations are not planned)"),
         };
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        self.explain_select(&query, (**select).clone(), &mut rows)?;
+        self.explain_select(&query, select, &mut rows)?;
         Ok(ExecOutcome::Rows(QueryResult {
             columns: vec!["plan".to_string(), "detail".to_string()],
             rows,
@@ -4860,10 +5085,24 @@ impl<'a> ReadCx<'a> {
         let solo = select.from.len() == 1 && select.from[0].joins.is_empty();
 
         if solo {
-            if let sqlparser::ast::TableFactor::Table { name, alias, .. } = &select.from[0].relation
+            if let sqlparser::ast::TableFactor::Table {
+                name, alias, args, ..
+            } = &select.from[0].relation
             {
                 let tname = obj_name(name);
-                if is_compat_view(&tname) {
+                if args.is_some() {
+                    // Table-valued function factor: the executor
+                    // materializes it at runtime; there is no stored table
+                    // to plan against (refusing with "table does not
+                    // exist" described a query that runs fine).
+                    row(
+                        out,
+                        "SCAN",
+                        format!(
+                            "table function {tname} — materialized at runtime (plan not detailed)"
+                        ),
+                    );
+                } else if is_compat_view(&tname) {
                     row(
                         out,
                         "SCAN",
@@ -5033,16 +5272,27 @@ impl<'a> ReadCx<'a> {
         let akey = alias.as_deref();
         if let Some(cond) = &select.selection {
             if let Some((root, plan, exact)) = probe_plan(cond, meta, tname, akey) {
-                row(
-                    out,
-                    "SCAN",
-                    format!(
-                        "INDEX PROBE ON {tname} USING {root}{}",
-                        if exact { "" } else { " + residual WHERE" }
-                    ),
-                );
-                row(out, "PROBE", probe_plan_text(&root, &plan));
-                return Ok(());
+                // Mirror the executor exactly: probe_pairs falls back to a
+                // full scan when promote_plan_bounds cannot lift the bounds
+                // into the tree's key type (mixed Str/Timestamp column). A
+                // plan line promising an index probe the executor never
+                // takes would mislead tuning.
+                let tree = BTree::open(meta.index_roots[&root]);
+                let tx = self.pager.begin_tx();
+                let liftable = self.promote_plan_bounds(&tree, &tx, &plan)?.is_some();
+                drop(tx);
+                if liftable {
+                    row(
+                        out,
+                        "SCAN",
+                        format!(
+                            "INDEX PROBE ON {tname} USING {root}{}",
+                            if exact { "" } else { " + residual WHERE" }
+                        ),
+                    );
+                    row(out, "PROBE", probe_plan_text(&root, &plan));
+                    return Ok(());
+                }
             }
         }
         row(out, "SCAN", format!("FULL HEAP SCAN ON {tname}"));
@@ -6180,6 +6430,18 @@ impl Database {
     /// source query. Fails CLOSED: a query shape the walker cannot fully
     /// classify returns `None`, and the caller must deny rather than guess.
     pub fn stmt_read_targets(stmt: &Statement) -> Option<Vec<String>> {
+        let mut out = Self::stmt_read_target_occurrences(stmt)?;
+        out.sort();
+        out.dedup();
+        Some(out)
+    }
+
+    /// Same walk as [`Self::stmt_read_targets`] WITHOUT sort+dedup: the
+    /// row-filter coverage proof counts DEEP occurrences per appearance —
+    /// a filtered table read twice (outer FROM + a subquery) must count
+    /// twice, but the deduped set collapsed it to one and made deep ==
+    /// top, letting the subquery position escape filtering entirely.
+    pub fn stmt_read_target_occurrences(stmt: &Statement) -> Option<Vec<String>> {
         let mut out = Vec::new();
         match stmt {
             Statement::Query(q) => walk_query(q, &mut out)?,
@@ -6251,8 +6513,6 @@ impl Database {
             Statement::CreateView(view) => walk_query(&view.query, &mut out)?,
             _ => {}
         }
-        out.sort();
-        out.dedup();
         Some(out)
     }
 
@@ -7379,14 +7639,28 @@ impl Database {
         // the engine lock, so a third full-size copy would double the peak
         // memory for nothing.
         ddl.push_str(&dml);
-        // Users/roles ride the dump as canonical user-management statements
-        // (passwords already in stored-hash form): plain INSERTs against the
-        // reserved tables are rejected by the write gate, so the statement
-        // family is the one replication form everywhere. The DROP prelude
-        // above does not cover the reserved tables — restoring a backup with
-        // fewer users must still remove the extras — so drop them here; the
-        // replaying node re-creates them via ensure_user_tables before the
-        // first CREATE USER applies.
+        // Views: their bodies reference restored tables (the CREATE
+        // dry-runs the body, so the table must exist by then), and a view
+        // of a view needs its base view restored first — dependency order,
+        // not catalog (alphabetical) order.
+        for name in &view_dependency_order(&view_names, &self.tables) {
+            if let Some(meta) = self.tables.get(name) {
+                if let Some(body) = &meta.view_sql {
+                    ddl.push_str(&format!("CREATE VIEW {} AS {body};\n", quote_ident(name)));
+                }
+            }
+        }
+        // Users/roles last of all: `GRANT … ON <object>` validates that the
+        // target exists, and a grant on a VIEW must replay after that view
+        // is created (emitting them before the view block made every dump
+        // from a mesh with view grants unrestorable). Passwords ride in
+        // stored-hash form; plain INSERTs against the reserved tables are
+        // rejected by the write gate, so the statement family is the one
+        // replication form everywhere. The DROP prelude above does not
+        // cover the reserved tables — restoring a backup with fewer users
+        // must still remove the extras — so drop them here; the replaying
+        // node re-creates them via ensure_user_tables before the first
+        // CREATE USER applies.
         ddl.push_str(&format!(
             "DROP TABLE IF EXISTS {}, {}, {}, {};\n",
             crate::useradmin::USERS_TABLE,
@@ -7397,17 +7671,6 @@ impl Database {
         for s in crate::useradmin::dump_user_statements(self)? {
             ddl.push_str(&s);
             ddl.push_str(";\n");
-        }
-        // Views last: their bodies reference restored tables (the CREATE
-        // dry-runs the body, so the table must exist by then), and a view
-        // of a view needs its base view restored first — dependency order,
-        // not catalog (alphabetical) order.
-        for name in &view_dependency_order(&view_names, &self.tables) {
-            if let Some(meta) = self.tables.get(name) {
-                if let Some(body) = &meta.view_sql {
-                    ddl.push_str(&format!("CREATE VIEW {} AS {body};\n", quote_ident(name)));
-                }
-            }
         }
         Ok(ddl)
     }
@@ -9958,8 +10221,22 @@ impl Database {
             view_sql: Some(body),
             ..Default::default()
         };
-        self.tables.insert(name.clone(), std::sync::Arc::new(meta));
-        self.save_catalog()?;
+        // Keep the old entry (or absence) so a failed catalog save leaves
+        // the in-memory catalog untouched — a ghost view that only exists
+        // here would persist on the next unrelated write and diverge every
+        // peer (same snapshot discipline as exec_create/exec_drop).
+        let prev = self.tables.insert(name.clone(), std::sync::Arc::new(meta));
+        if let Err(e) = self.save_catalog() {
+            match prev {
+                Some(old) => {
+                    self.tables.insert(name, old);
+                }
+                None => {
+                    self.tables.remove(&name);
+                }
+            }
+            return Err(e);
+        }
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -10711,6 +10988,16 @@ impl Database {
         // hoisted once so the per-row maintenance loops below do not clone
         // the roots map per row.
         let idx_specs = idx_specs(&meta, &roots);
+        // Composite UNIQUE trees (CREATE UNIQUE INDEX over several columns)
+        // take part in the *undirected* conflict policies (OR IGNORE /
+        // REPLACE INTO / ON DUPLICATE KEY UPDATE = "any unique key") exactly
+        // like the single-column constraint trees — probing only `indexed`
+        // let those conflicts fall through to the tree-level insert and
+        // error instead of skipping/replacing/updating.
+        let composite_uniques: Vec<&IdxSpec> = idx_specs
+            .iter()
+            .filter(|s| s.unique && s.cols.len() > 1)
+            .collect();
 
         // ON CONFLICT [target]: the target names one unique constraint whose
         // conflicts are skipped; without it every unique constraint takes
@@ -10740,7 +11027,7 @@ impl Database {
         // 扫描只看语句前的树,批内冲突随后被树级 unique 检查整条打报错;
         // 先按唯一键把「被更晚的行覆盖」的早行去掉,再走位移扫描。判重用
         // 编码字节,与树查找同源。
-        if replace && !indexed.is_empty() && new_docs.len() > 1 {
+        if replace && (!indexed.is_empty() || !composite_uniques.is_empty()) && new_docs.len() > 1 {
             let mut last_at: std::collections::BTreeMap<(String, Vec<u8>), usize> =
                 std::collections::BTreeMap::new();
             for (i, doc) in new_docs.iter().enumerate() {
@@ -10753,6 +11040,13 @@ impl Database {
                         last_at.insert((col.clone(), k), i);
                     }
                 }
+                for spec in &composite_uniques {
+                    if let Some(k) =
+                        index_key_of_spec(doc, spec).and_then(|v| encode::encode_to_vec(&v).ok())
+                    {
+                        last_at.insert((spec.root_key.clone(), k), i);
+                    }
+                }
             }
             let mut kept: Vec<Object> = Vec::with_capacity(new_docs.len());
             for (i, doc) in new_docs.iter().enumerate() {
@@ -10761,6 +11055,11 @@ impl Database {
                         .filter(|v| !matches!(v, Value::Null))
                         .and_then(|v| encode::encode_to_vec(v).ok())
                         .and_then(|k| last_at.get(&(col.clone(), k)))
+                        .is_some_and(|&j| j > i)
+                }) || composite_uniques.iter().any(|spec| {
+                    index_key_of_spec(doc, spec)
+                        .and_then(|v| encode::encode_to_vec(&v).ok())
+                        .and_then(|k| last_at.get(&(spec.root_key.clone(), k)))
                         .is_some_and(|&j| j > i)
                 });
                 if !shadowed {
@@ -10773,7 +11072,7 @@ impl Database {
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
         let mut displaced_docs: Vec<Object> = Vec::new();
-        if replace && !indexed.is_empty() {
+        if replace && (!indexed.is_empty() || !composite_uniques.is_empty()) {
             for n in &new_docs {
                 for col in &indexed {
                     let Some(v) = n.get(col) else { continue };
@@ -10783,6 +11082,17 @@ impl Database {
                     if let Some(loc) = BTree::open(roots[col])
                         .get(&PageReader::current(&self.pager), &tx, v)
                         .map_err(|e| index_err(col, e))?
+                    {
+                        displaced.push(loc);
+                    }
+                }
+                for spec in &composite_uniques {
+                    let Some(k) = index_key_of_spec(n, spec) else {
+                        continue;
+                    };
+                    if let Some(loc) = BTree::open(roots[&spec.root_key])
+                        .get(&PageReader::current(&self.pager), &tx, &k)
+                        .map_err(|e| index_err(&spec.root_key, e))?
                     {
                         displaced.push(loc);
                     }
@@ -10866,6 +11176,22 @@ impl Database {
                             {
                                 hit = Some(loc);
                                 break;
+                            }
+                        }
+                        // Composite unique indexes resolve "any unique key"
+                        // for the undirected policies too.
+                        if hit.is_none() {
+                            for spec in &composite_uniques {
+                                let Some(k) = index_key_of_spec(&doc, spec) else {
+                                    continue;
+                                };
+                                if let Some(loc) = BTree::open(roots[&spec.root_key])
+                                    .get(&PageReader::current(&self.pager), &tx, &k)
+                                    .map_err(|e| index_err(&spec.root_key, e))?
+                                {
+                                    hit = Some(loc);
+                                    break;
+                                }
                             }
                         }
                         hit
@@ -11032,6 +11358,35 @@ impl Database {
         // statement-internal references count, including forward ones.
         // Upsert-UPDATE rows join the final set: their new images must
         // reference existing parents like any inserted row.
+        // A multi-row batch may touch the SAME row twice (sequential
+        // upsert semantics: later rows can route onto an earlier row
+        // through either unique key). Every touch pushed (old, merged),
+        // but only the FIRST old image and the LAST merged image of a
+        // locator are real — intermediate images were overwritten and do
+        // not exist in the final table. Feeding them into the FK/unique
+        // checks below could validate (or reject) against keys no
+        // surviving row carries, e.g. a parent key vacated by touch one
+        // and re-supply-shaped by touch two's intermediate image.
+        if updated.len() > 1 {
+            let mut collapsed: std::collections::BTreeMap<u64, (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for (i, (loc, _, _)) in updated.iter().enumerate() {
+                match collapsed.get_mut(loc) {
+                    Some((_, last)) => *last = i,
+                    None => {
+                        collapsed.insert(*loc, (i, i));
+                    }
+                }
+            }
+            if collapsed.len() < updated.len() {
+                updated = collapsed
+                    .into_iter()
+                    .map(|(loc, (first, last))| {
+                        (loc, updated[first].1.clone(), updated[last].2.clone())
+                    })
+                    .collect();
+            }
+        }
         if !meta.foreign_keys.is_empty() && (!placed.is_empty() || !updated.is_empty()) {
             let mut final_docs: Vec<Object> = placed.iter().map(|(_, d)| d.clone()).collect();
             final_docs.extend(updated.iter().map(|(_, _, n)| n.clone()));
@@ -13130,19 +13485,7 @@ pub(crate) fn calls_newid(e: &SqlExpr) -> bool {
             if matches!(n.as_str(), "NEWID" | "NEWSEQUENTIALID" | "RAND") {
                 return true;
             }
-            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
-                if list.args.iter().any(|a| {
-                    matches!(
-                        a,
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(inner),
-                        ) if calls_newid(inner)
-                    )
-                }) {
-                    return true;
-                }
-            }
-            f.filter.as_ref().is_some_and(|flt| calls_newid(flt))
+            child_exprs(e).into_iter().any(calls_newid)
         }
         SqlExpr::Nested(inner) => calls_newid(inner),
         SqlExpr::BinaryOp { left, right, .. } => calls_newid(left) || calls_newid(right),
@@ -13189,7 +13532,10 @@ pub(crate) fn calls_newid(e: &SqlExpr) -> bool {
         SqlExpr::AnyOp { left, right, .. } | SqlExpr::AllOp { left, right, .. } => {
             calls_newid(left) || calls_newid(right)
         }
-        _ => false,
+        // Same shared traversal as the other tree-wide predicates: wrappers
+        // (CAST/FLOOR/IS NULL/…) must not hide a NEWID()/RAND() from the
+        // write-path rejection.
+        _ => child_exprs(e).into_iter().any(calls_newid),
     }
 }
 
@@ -13300,6 +13646,13 @@ fn stmt_calls_newid(stmt: &Statement) -> bool {
                         twjs.iter().any(join_ons)
                     }
                 }
+        }
+        Statement::CreateTable(c) => {
+            // CTAS journals its original text: a NEWID()/RAND() in the
+            // query has no per-row rewrite here (unlike INSERT), so each
+            // replaying peer would roll its own values and silently
+            // diverge the cluster — refuse like UPDATE/DELETE/MERGE.
+            c.query.as_ref().is_some_and(|q| query_calls_newid(q))
         }
         Statement::Merge(m) => {
             calls_newid(&m.on)
@@ -14529,22 +14882,11 @@ fn expr_has_subquery(e: &SqlExpr) -> bool {
                 || else_result.as_deref().is_some_and(expr_has_subquery)
         }
         SqlExpr::Cast { expr, .. } => expr_has_subquery(expr),
-        SqlExpr::Function(f) => {
-            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
-                if list.args.iter().any(|a| {
-                    matches!(
-                        a,
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(inner)
-                        ) if expr_has_subquery(inner)
-                    )
-                }) {
-                    return true;
-                }
-            }
-            f.filter.as_ref().is_some_and(|flt| expr_has_subquery(flt))
-        }
-        _ => false,
+        SqlExpr::Function(_) => child_exprs(e).into_iter().any(expr_has_subquery),
+        // Shared traversal: a subquery under a wrapper node (FLOOR/IS
+        // NULL/SUBSTRING/…) must be seen here so the pre-pass can resolve
+        // it instead of erroring at row level.
+        _ => child_exprs(e).into_iter().any(expr_has_subquery),
     }
 }
 
@@ -14603,24 +14945,15 @@ fn expr_mentions_outer(e: &SqlExpr, outer: &OuterFrom) -> bool {
                     .is_some_and(|o| expr_mentions_outer(o, outer))
         }
         SqlExpr::Cast { expr, .. } => expr_mentions_outer(expr, outer),
-        SqlExpr::Function(f) => {
-            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
-                if list.args.iter().any(|a| {
-                    matches!(
-                        a,
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(inner)
-                        ) if expr_mentions_outer(inner, outer)
-                    )
-                }) {
-                    return true;
-                }
-            }
-            f.filter
-                .as_ref()
-                .is_some_and(|flt| expr_mentions_outer(flt, outer))
-        }
-        _ => false,
+        SqlExpr::Function(_) => child_exprs(e)
+            .into_iter()
+            .any(|c| expr_mentions_outer(c, outer)),
+        // Shared traversal: an outer reference under a wrapper node
+        // (FLOOR/IS NULL/SUBSTRING/…) is still correlated — missing it
+        // would silently resolve the subquery once with NULL outer values.
+        _ => child_exprs(e)
+            .into_iter()
+            .any(|c| expr_mentions_outer(c, outer)),
     }
 }
 
@@ -30225,12 +30558,12 @@ mod complex_query_tests {
         // Distinct pairs sharing each single column value coexist.
         db.execute("INSERT INTO t VALUES (1, 'c'), (3, 'a')")
             .unwrap();
-        // OR REPLACE does not displace composite-unique conflicts: the row
-        // conflicts on the composite key, so the insert fails loudly rather
-        // than silently replacing.
-        assert!(db
-            .execute("INSERT OR REPLACE INTO t VALUES (1, 'a')")
-            .is_err());
+        // OR REPLACE displaces composite-unique conflicts too: the
+        // documented contract is "ANY unique key" (sql-reference INSERT
+        // table), matching SQLite — the probe used to cover only the
+        // single-column constraint trees and errored instead.
+        db.execute("INSERT OR REPLACE INTO t VALUES (1, 'a')")
+            .unwrap();
         assert_eq!(
             ExecOutcome::Rows(QueryResult {
                 columns: vec!["n".into()],
@@ -32733,5 +33066,239 @@ mod tsql_compat_tests {
         ] {
             assert!(db.execute(sql).is_err(), "{sql} must fail loudly");
         }
+    }
+    /// 第三轮审查回归:wall-clock 经 CAST/FLOOR 包装曾逃逸确定性门禁
+    /// (expr_calls_wall_clock 不下探容器变体)→ DEFAULT 不回写、journal 携带
+    /// 原文,重放节点各自打时钟。
+    #[test]
+    fn cast_wrapped_wall_clock_default_and_check_are_gated() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP DEFAULT CAST(GETDATE() AS TIMESTAMP))",
+        );
+        run(&mut db, "INSERT INTO t (id) VALUES (1)");
+        // The journaled text must carry the resolved instant, not the call
+        // (a bare GETDATE() default was already rewritten; the CAST wrapper
+        // used to slip the call through to every replaying peer's clock).
+        let captured = db.take_resolved_sql().unwrap_or_default();
+        assert!(
+            !captured.contains("GETDATE"),
+            "resolved INSERT must not carry GETDATE(): {captured}"
+        );
+        assert!(
+            captured.contains("AS TIMESTAMP"),
+            "resolved INSERT carries a timestamp literal: {captured}"
+        );
+        // CHECK carrying a wrapped clock must be refused at CREATE time.
+        assert!(db
+            .execute("CREATE TABLE bad (x INT CHECK (CAST(GETDATE() AS TIMESTAMP) > TIMESTAMP '2000-01-01T00:00:00Z'))")
+            .is_err());
+    }
+
+    /// 第三轮审查回归:未定向冲突策略(OR IGNORE / ON DUPLICATE KEY /
+    /// REPLACE INTO)曾只探测单列约束树,复合唯一索引冲突落到树级 insert
+    /// 直接报错而非跳过/更新/置换。
+    #[test]
+    fn undirected_conflict_policies_cover_composite_unique_index() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
+        run(&mut db, "CREATE UNIQUE INDEX uq ON t (a, b)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10, 20)");
+        // OR IGNORE: skip silently.
+        run(&mut db, "INSERT OR IGNORE INTO t VALUES (2, 10, 20)");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(1));
+        // ON DUPLICATE KEY UPDATE: update in place.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (2, 10, 20) ON DUPLICATE KEY UPDATE b = 21",
+        );
+        let r = rows(&mut db, "SELECT id, a, b FROM t");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Int(1), Value::Int(10), Value::Int(21)]]
+        );
+        // REPLACE INTO: displace the conflicting row.
+        run(&mut db, "REPLACE INTO t VALUES (3, 10, 21)");
+        let r = rows(&mut db, "SELECT id FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(3)]]);
+    }
+
+    /// 第三轮审查回归:upsert 多行批两次触碰同一行时,中间像曾参与父侧
+    /// FK 判定——最后一次触碰腾出的旧键被中间像"顶住",子行悬空引用被放行。
+    #[test]
+    fn upsert_multi_touch_collapses_intermediate_images_for_fk() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE p (id INT PRIMARY KEY, alt INT UNIQUE)",
+        );
+        run(&mut db, "CREATE TABLE c (pid INT REFERENCES p(id))");
+        run(&mut db, "INSERT INTO p VALUES (1, 100)");
+        run(&mut db, "INSERT INTO c VALUES (1)");
+        // Three touches of the SAME row through `alt`: id goes 1→2→1→2.
+        // The intermediate image (id=1) re-supplied the vacated key, so
+        // feeding intermediate images to the parent-side check passed the
+        // child's reference while the FINAL table only holds id=2 — a
+        // dangling child committed silently.
+        assert!(db
+            .execute(
+                "INSERT INTO p VALUES (2, 100), (1, 100), (2, 100) \
+                 ON DUPLICATE KEY UPDATE id = VALUES(id)"
+            )
+            .is_err());
+        // Without the child the same statement succeeds and collapses to
+        // one row (first old image + final merged image).
+        let mut db2 = Database::in_memory().unwrap();
+        run(
+            &mut db2,
+            "CREATE TABLE p (id INT PRIMARY KEY, alt INT UNIQUE)",
+        );
+        run(&mut db2, "INSERT INTO p VALUES (1, 100)");
+        run(
+            &mut db2,
+            "INSERT INTO p VALUES (2, 100), (1, 100), (2, 100) \
+             ON DUPLICATE KEY UPDATE id = VALUES(id)",
+        );
+        let r = rows(&mut db2, "SELECT id FROM p");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+    }
+
+    /// 第三轮审查回归:CTAS 查询携带 NEWID() 曾既不折叠也不拒绝,journal
+    /// 携带原文、各重放节点自行掷 GUID(静默集群分叉)。
+    #[test]
+    fn ctas_with_newid_is_rejected_loudly() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE src (n INT)");
+        run(&mut db, "INSERT INTO src VALUES (1), (2)");
+        assert!(db
+            .execute("CREATE TABLE t2 AS SELECT NEWID() AS g FROM src")
+            .is_err());
+        assert!(db
+            .execute("CREATE TABLE t3 AS SELECT RAND() AS r FROM src")
+            .is_ok());
+    }
+
+    /// 第三轮审查回归:递归 CTE 体自带的 ORDER BY / LIMIT 曾被静默丢弃
+    /// (非递归 CTE 同写法完整生效)——现在显式报错。
+    #[test]
+    fn recursive_cte_rejects_body_order_limit() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "WITH c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n",
+        );
+        assert!(db
+            .execute(
+                "WITH c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3 LIMIT 2) SELECT n FROM c"
+            )
+            .is_err());
+        assert!(db
+            .execute(
+                "WITH c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3 ORDER BY n) SELECT n FROM c"
+            )
+            .is_err());
+    }
+
+    /// 第三轮审查回归:非相关子查询嵌在 FLOOR/IS NULL/SUBSTRING 等包装节点
+    /// 下曾被原样留到行级求值,误报"correlated subqueries are not supported"。
+    #[test]
+    fn noncorrelated_subquery_under_wrapper_nodes_resolves() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE u (x INT)");
+        run(&mut db, "INSERT INTO u VALUES (4)");
+        run(&mut db, "CREATE TABLE t (n INT)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let r = rows(&mut db, "SELECT FLOOR((SELECT AVG(x) FROM u)) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Float(4.0)]], "{r:?}");
+        let r = rows(
+            &mut db,
+            "SELECT n FROM t WHERE (SELECT MAX(x) FROM u) IS NOT NULL",
+        );
+        assert_eq!(r.rows.len(), 1);
+        let r = rows(
+            &mut db,
+            "SELECT SUBSTRING((SELECT 'abcd' FROM u), 2, 2) FROM t",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Str("bc".into())]], "{r:?}");
+    }
+
+    /// 第三轮审查回归:CREATE VIEW 目录保存失败曾留内存幽灵视图(下次任意
+    /// 写把它持久化,与 peers 分叉)。save_catalog 失败难以在测试中构造,
+    /// 但 OR REPLACE 的还原路径可以用目录写权限外的行为钉住:视图替换后
+    /// 旧体不再可解析。
+    #[test]
+    fn create_view_replaces_atomically_by_name() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        run(&mut db, "CREATE VIEW v AS SELECT a FROM t");
+        run(
+            &mut db,
+            "CREATE OR REPLACE VIEW v AS SELECT a + 1 AS a FROM t",
+        );
+        let r = rows(&mut db, "SELECT a FROM v");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    /// 第三轮审查回归:视图上的 GRANT 曾使 dump 不可回放(用户语句在
+    /// CREATE VIEW 之前)——restore/join/repair 快照全部中断。
+    #[test]
+    fn dump_script_orders_grants_after_views() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        run(&mut db, "CREATE VIEW v AS SELECT a FROM t");
+        run(&mut db, "CREATE USER u1 PASSWORD 'pw12345678'");
+        run(&mut db, "GRANT SELECT ON v TO u1");
+        let dump = db.dump_script().unwrap();
+        let view_at = dump.find("CREATE VIEW").expect("view in dump");
+        let grant_at = dump.find("GRANT SELECT ON").expect("grant in dump");
+        assert!(view_at < grant_at, "GRANT must replay after CREATE VIEW");
+        // The dump must re-apply cleanly onto a fresh database.
+        let mut db2 = Database::in_memory().unwrap();
+        for stmt in dump.split(';').filter(|s| !s.trim().is_empty()) {
+            db2.execute(stmt)
+                .unwrap_or_else(|e| panic!("replay {stmt:?}: {e}"));
+        }
+    }
+
+    /// 第三轮审查回归:stmt_read_targets 去重后,RLS 覆盖证明的同表双出现
+    /// (外层 FROM + 子查询)被折叠成一次出现而放行——出现次数变体必须
+    /// 保留重复。
+    #[test]
+    fn read_target_occurrences_preserve_duplicates() {
+        let mut stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT (SELECT secret FROM t WHERE id = 42) FROM t",
+        )
+        .unwrap();
+        let stmt = stmts.swap_remove(0);
+        let occ = Database::stmt_read_target_occurrences(&stmt).unwrap();
+        assert_eq!(
+            occ.iter().filter(|x| *x == "t").count(),
+            2,
+            "per-occurrence list keeps both reads: {occ:?}"
+        );
+        let set = Database::stmt_read_targets(&stmt).unwrap();
+        assert_eq!(set.iter().filter(|x| *x == "t").count(), 1);
+    }
+
+    /// 第三轮审查回归:EXPLAIN 曾把表值函数 FROM 因子误报"表不存在"、把
+    /// 括号化查询体误报"集合操作不支持"——两者均可正常执行。
+    #[test]
+    fn explain_accepts_table_functions_and_parenthesized_body() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(
+            &mut db,
+            "EXPLAIN SELECT * FROM STRING_SPLIT('a,b', ',') AS s",
+        );
+        assert!(
+            r.rows.iter().any(|row| row[1]
+                .as_str()
+                .is_some_and(|d| d.contains("table function"))),
+            "{r:?}"
+        );
     }
 }

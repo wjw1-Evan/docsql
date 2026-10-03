@@ -114,6 +114,16 @@ class Subscriber:
         reader = self._reader
         if reader is not None:
             reader.join(timeout=5)
+            # The reader may have been mid-reconnect while we closed the OLD
+            # connection: after the join it can have installed a NEW one it
+            # never got to use. Close that too (idempotent) — otherwise the
+            # socket lingers against the server's connection budget.
+            leaked = self._conn
+            if leaked is not None and leaked is not conn:
+                try:
+                    leaked.close()
+                except Exception:
+                    pass
 
     def __enter__(self):
         return self
@@ -177,7 +187,15 @@ class Subscriber:
             return
         channel = msg.get("channel")
         mid = msg.get("id")
-        if isinstance(mid, int) and not isinstance(mid, bool):
+        if (
+            isinstance(mid, int)
+            and not isinstance(mid, bool)
+            # Pattern deliveries (pmessage) share this path but are never
+            # resumed by channel anchor — tracking them grew `_last_id`
+            # without bound on high-cardinality patterns while the entries
+            # stayed dead weight.
+            and channel in self._channels
+        ):
             prev = self._last_id.get(channel)
             if prev is None or mid > prev:
                 self._last_id[channel] = mid
@@ -287,14 +305,19 @@ class Subscriber:
                                 # A channel failed to re-register (authz
                                 # change, bad payload): swallowing this
                                 # left the subscriber silently deaf on a
-                                # channel it still believes in. Fail the
-                                # attempt loudly and retry.
+                                # channel it still believes in. Report and
+                                # keep the re-subscribe loop going: a
+                                # terminal `return False` killed the read
+                                # thread for ALL channels on one transient
+                                # rejection and left later subscribe() calls
+                                # waiting out their full 10s control budget
+                                # on a connection nobody reads.
                                 text = payload.decode("utf-8", "replace")
                                 print(
                                     f"docsql.Subscriber: resubscribe rejected: {text}",
                                     file=sys.stderr,
                                 )
-                                return False
+                                continue
                             # RESP_AFFECTED subscribe confirmations pass silently.
                     finally:
                         self._control_busy = False

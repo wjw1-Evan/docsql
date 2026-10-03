@@ -444,6 +444,12 @@ async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
     let Ok(entries) = std::fs::read_dir(&state.backup_dir) else {
         return;
     };
+    // Checksum-FIRST, the same contract as the live backup path: a .sql
+    // object landing without its sidecar is indistinguishable from a
+    // pre-checksum-era legacy object on the restore side (which then
+    // replays it unverified). One interleaved pass could upload the .sql
+    // and die before its sidecar; two passes close that window.
+    let mut sql_jobs: Vec<(String, std::path::PathBuf)> = Vec::new();
     for e in entries.flatten() {
         let Ok(name) = e.file_name().into_string() else {
             continue;
@@ -459,6 +465,9 @@ async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
             }
             continue;
         }
+        sql_jobs.push((name, e.path()));
+    }
+    for (name, path) in sql_jobs {
         let Ok(sidecar) = std::fs::read_to_string(state.backup_dir.join(format!("{name}.sha256")))
         else {
             continue; // pruned pair or legacy file: nothing to reconcile
@@ -466,7 +475,7 @@ async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
         let Some(hex) = sidecar.split_whitespace().next() else {
             continue;
         };
-        let _ = upload_backup_file(state, s3, &name, &e.path(), hex).await;
+        let _ = upload_backup_file(state, s3, &name, &path, hex).await;
     }
 }
 
@@ -566,6 +575,13 @@ fn verify_backup_checksum(dir: &Path, name: &str) -> Result<(), String> {
 /// snapshots the settled data. A tick while a manual backup runs is
 /// skipped silently.
 pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
+    // 0 disables automatic backups (documented in main.rs help and
+    // docs/operations.md): clamping it to 1 turned "disabled" into a
+    // full dump every second — write-path pressure, IO storm, and the
+    // retention window spinning through real backups.
+    if interval_secs == 0 {
+        return;
+    }
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut first = true;

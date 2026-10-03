@@ -430,12 +430,16 @@ impl Wal {
     }
 
     /// The ROLLBACK marker: append one ABORT frame per outstanding (unfenced)
-    /// deferred commit and clear the pending set. Without this, the restore
-    /// transaction's synchronous commit (`Wal::commit`) fences FIRST — a torn
-    /// crash landing between "FENCE durable" and "restore COMMIT durable"
-    /// would count every deferred statement of the rolled-back transaction as
-    /// committed and resurrect it. With the ABORT frames, recovery voids those
-    /// deferred commits no matter what fence follows.
+    /// deferred commit and clear the pending set. The restore transaction
+    /// itself commits via the DEFERRED path (the engine's `tx_snapshot` is
+    /// still Some while `restore_transaction` runs), so no synchronous
+    /// `Wal::commit` fences on its behalf — without the ABORT frames, any
+    /// later fence would count every deferred statement of the rolled-back
+    /// transaction as committed and resurrect it. With the ABORT frames,
+    /// recovery voids those deferred commits no matter what fence follows;
+    /// any fence that ever covers the original transaction's images also
+    /// covers the restore's, so the pair stays consistent on disk either
+    /// way.
     pub fn abort_deferred(&mut self) -> Result<()> {
         // Consume in place: on a mid-loop append failure the remaining txids
         // must survive. `fence()` keys off the counter alone, so an emptied

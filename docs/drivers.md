@@ -222,7 +222,7 @@ builder.AddDocsqlConnection("docsql");       // 注册 transient DocsqlConnectio
 ## CLI(docsql-cli)
 
 ```
-docsql connect 127.0.0.1:7600 --user analyst   # 密码走 DOCSQL_PASSWORD 或交互提示
+docsql connect 127.0.0.1:7600 --user analyst   # 密码走 DOCSQL_PASSWORD 或交互提示;--user 缺值是用法错误(不静默降级匿名)
   --csv / --json        行导出(RFC 4180 CSV / JSON 对象数组)
   -f script.sql         脚本批执行(错误即退出 1)
   help;                 内联命令帮助(含 pub/sub 命令面)

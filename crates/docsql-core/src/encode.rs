@@ -30,6 +30,8 @@ pub enum EncodeError {
     BadBool(u8),
     #[error("nesting exceeds {MAX_DEPTH} levels")]
     TooDeep,
+    #[error("duplicate object key {0:?}")]
+    DuplicateKey(String),
 }
 
 /// Matches json.rs — the decoder runs on network payloads, so recursion
@@ -175,7 +177,15 @@ impl<'a> Decoder<'a> {
                 for _ in 0..len {
                     let k = self.string()?;
                     let v = self.value_at(depth + 1)?;
-                    obj.insert(k, v);
+                    // Writers emit BTreeMap keys (unique by construction):
+                    // a repeated key is corruption, and silently keeping
+                    // the last one would decode a document that no longer
+                    // matches the bytes on disk — then dump/backup would
+                    // write the shrunken form and launder the corruption
+                    // into a legal value. Loud, like every other bad tag.
+                    if obj.insert(k.clone(), v).is_some() {
+                        return Err(EncodeError::DuplicateKey(k));
+                    }
                 }
                 Value::Object(obj)
             }
@@ -500,5 +510,21 @@ mod tests {
         for cut in 0..enc.len() {
             let _ = decode(&enc[..cut]);
         }
+    }
+    #[test]
+    fn duplicate_object_keys_fail_decoding_loudly() {
+        // {"a":1,"a":2} — legal encodings have BTreeMap-unique keys; a
+        // repeated key on disk is corruption and silently keeping the last
+        // value would let dump/backup launder the shrunken document.
+        let mut bytes = Vec::new();
+        bytes.push(7u8); // Object
+        put_u32(&mut bytes, 2).unwrap();
+        // key "a" (tag 4 + u32 len + bytes), value 1; then the SAME key
+        // again with value 2 — impossible from the writer (BTreeMap keys).
+        encode(&Value::Str("a".into()), &mut bytes).unwrap();
+        encode(&Value::Int(1), &mut bytes).unwrap();
+        encode(&Value::Str("a".into()), &mut bytes).unwrap();
+        encode(&Value::Int(2), &mut bytes).unwrap();
+        assert!(decode_prefix(&bytes).is_err());
     }
 }

@@ -13,6 +13,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -140,7 +141,23 @@ impl TlsLink {
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| format!("TLS peer name {host:?} from {target:?} invalid: {e}"))?;
         let config = client_config(ca)?;
-        let mut sock = TcpStream::connect(target).map_err(|e| e.to_string())?;
+        // Bounded connect (same 10s budget as the plain path): a
+        // firewalled target wedged the whole CLI in OS SYN retries.
+        let mut last = String::from("invalid address");
+        let mut sock = None;
+        for sa in target
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve {target:?}: {e}"))?
+        {
+            match TcpStream::connect_timeout(&sa, Duration::from_secs(10)) {
+                Ok(s) => {
+                    sock = Some(s);
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
+        }
+        let mut sock = sock.ok_or_else(|| format!("connect {target}: {last}"))?;
         let _ = sock.set_nodelay(true);
         sock.set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| e.to_string())?;

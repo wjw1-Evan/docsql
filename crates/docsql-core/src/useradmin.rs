@@ -787,6 +787,79 @@ pub fn redact_sql(sql: &str) -> String {
                             mask_end = Some(end);
                         }
                         break;
+                    } else if c == '"' {
+                        // Double-quoted mistyped literal (`PASSWORD "pw"`):
+                        // the parser rejects it, so this can only be
+                        // intended credential material — mask it. Over-
+                        // masking a legal `SELECT password "alias"` costs
+                        // audit-log fidelity; under-masking costs the
+                        // secret. "" escapes are part of the identifier.
+                        let b = sql.as_bytes();
+                        let mut e = k + 1;
+                        loop {
+                            match b[e..].iter().position(|&x| x == b'"') {
+                                Some(p) => {
+                                    e += p;
+                                    if b.get(e + 1) == Some(&b'"') {
+                                        e += 2;
+                                    } else {
+                                        e += 1;
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    e = b.len();
+                                    break;
+                                }
+                            }
+                        }
+                        mask_end = Some(e);
+                        break;
+                    } else if c.is_ascii_alphanumeric() && {
+                        // Bare unquoted password (`PASSWORD pw123`): always
+                        // rejected by the parser, still plaintext in the
+                        // audit log — mask the single word run and stop.
+                        // A SQL KEYWORD is not a password (`SELECT password
+                        // FROM t` must stay verbatim): read the whole run
+                        // and only treat it as credential material when it
+                        // is not one of the common continuations of a
+                        // column reference.
+                        let end = sql[k..]
+                            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                            .map(|p| k + p)
+                            .unwrap_or(sql.len());
+                        let word = sql[k..end].to_ascii_lowercase();
+                        !matches!(
+                            word.as_str(),
+                            "from"
+                                | "where"
+                                | "like"
+                                | "in"
+                                | "not"
+                                | "is"
+                                | "between"
+                                | "and"
+                                | "or"
+                                | "as"
+                                | "desc"
+                                | "asc"
+                                | "order"
+                                | "group"
+                                | "select"
+                                | "when"
+                                | "then"
+                                | "else"
+                                | "end"
+                                | "null"
+                                | "escape"
+                        )
+                    } {
+                        let end = sql[k..]
+                            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                            .map(|p| k + p)
+                            .unwrap_or(sql.len());
+                        mask_end = Some(end);
+                        break;
                     } else {
                         break;
                     }
@@ -1043,88 +1116,36 @@ impl Database {
                     "volatile functions (NEWID/RAND/NOW family) are not supported in row filters"
                         .into(),
                 ),
-                E::BinaryOp { left, right, .. } => {
-                    scan(left, volatile).or_else(|| scan(right, volatile))
-                }
-                E::UnaryOp { expr, .. } => scan(expr, volatile),
-                E::Nested(inner) => scan(inner, volatile),
-                E::Between {
-                    expr, low, high, ..
-                } => scan(expr, volatile)
-                    .or_else(|| scan(low, volatile))
-                    .or_else(|| scan(high, volatile)),
-                E::IsDistinctFrom(l, r) | E::IsNotDistinctFrom(l, r) => {
-                    scan(l, volatile).or_else(|| scan(r, volatile))
-                }
-                E::Like { expr, pattern, .. } | E::ILike { expr, pattern, .. } => {
-                    scan(expr, volatile).or_else(|| scan(pattern, volatile))
-                }
-                E::InList { expr, list, .. } => {
-                    scan(expr, volatile).or_else(|| list.iter().find_map(|i| scan(i, volatile)))
-                }
-                E::Case {
-                    operand,
-                    conditions,
-                    else_result,
-                    ..
-                } => {
-                    // CASE is a first-class container: a subquery (or a
-                    // volatile call) hidden in a WHEN/THEN/ELSE branch used
-                    // to slip past this scan, pass GRANT-time validation,
-                    // and then execute per-row inside the user's filtered
-                    // scans — reading tables the grantee has no access to.
-                    if let Some(op) = operand {
-                        if let Some(m) = scan(op, volatile) {
-                            return Some(m);
-                        }
-                    }
-                    for w in conditions {
-                        if let Some(m) = scan(&w.condition, volatile) {
-                            return Some(m);
-                        }
-                        if let Some(m) = scan(&w.result, volatile) {
-                            return Some(m);
-                        }
-                    }
-                    if let Some(el) = else_result {
-                        if let Some(m) = scan(el, volatile) {
-                            return Some(m);
-                        }
-                    }
-                    None
-                }
-                E::Tuple(items) => items.iter().find_map(|i| scan(i, volatile)),
-                E::Cast { expr, .. } => scan(expr, volatile),
-                sqlparser::ast::Expr::Function(f) => {
+                E::Function(f) => {
                     if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
                         for a in &list.args {
-                            match a {
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Expr(inner),
-                                ) => {
-                                    if let Some(m) = scan(inner, volatile) {
-                                        return Some(m);
-                                    }
-                                }
-                                sqlparser::ast::FunctionArg::Named { .. } => {
-                                    return Some(
-                                        "named function arguments are not supported in row filters"
-                                            .into(),
-                                    )
-                                }
-                                _ => {}
+                            if matches!(
+                                a,
+                                sqlparser::ast::FunctionArg::Named { .. }
+                                    | sqlparser::ast::FunctionArg::ExprNamed { .. }
+                            ) {
+                                return Some(
+                                    "named function arguments are not supported in row filters"
+                                        .into(),
+                                );
                             }
                         }
                     }
-                    // Aggregate FILTER (WHERE …) is another expression slot.
-                    if let Some(filter) = &f.filter {
-                        if let Some(m) = scan(filter, volatile) {
-                            return Some(m);
-                        }
-                    }
-                    None
+                    // Function args + aggregate FILTER, via the shared
+                    // traversal below.
+                    crate::engine::child_exprs(e)
+                        .into_iter()
+                        .find_map(|c| scan(c, volatile))
                 }
-                _ => None,
+                // Shared traversal (engine::child_exprs): every container
+                // the evaluator can descend into — FLOOR/IS NULL/
+                // SUBSTRING/POSITION/… — must be scanned. A narrower
+                // hand-rolled list let `FLOOR(RAND())` pass validation and
+                // land as a per-row random visibility filter, and let
+                // subqueries under those wrappers fail only at SELECT time.
+                _ => crate::engine::child_exprs(e)
+                    .into_iter()
+                    .find_map(|c| scan(c, volatile)),
             }
         }
         if let Some(m) = scan(&expr, &volatile) {
@@ -2463,6 +2484,63 @@ mod tests {
         assert_eq!(
             redact_sql("CREATE USER u PASSWORD 'pw'"),
             "CREATE USER u PASSWORD '***'"
+        );
+    }
+    #[test]
+    fn row_filter_rejects_wrapper_hidden_volatile_and_subquery() {
+        // 第三轮:FLOOR/IS NULL/SUBSTRING 等包装节点曾不在校验扫描的
+        // 遍历集里——RAND() 经 FLOOR 包装后落库成逐行随机可见性过滤器,
+        // 子查询则推迟到受限用户的 SELECT 才报错。
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE sales (id INT)").unwrap();
+        db.execute("CREATE TABLE secret (x INT)").unwrap();
+        db.execute("CREATE USER eve PASSWORD 'pw12345678'").unwrap();
+        assert!(db
+            .execute("GRANT SELECT ON sales TO eve WHERE FLOOR(RAND()) = 0")
+            .is_err());
+        assert!(db
+            .execute("GRANT SELECT ON sales TO eve WHERE CAST(RAND() AS INT) = 0")
+            .is_err());
+        assert!(db
+            .execute("GRANT SELECT ON sales TO eve WHERE (SELECT COUNT(*) FROM secret) IS NOT NULL")
+            .is_err());
+        // 合法包装谓词照常通过。
+        db.execute("GRANT SELECT ON sales WHERE FLOOR(id / 2.0) >= 0 TO eve")
+            .unwrap();
+    }
+
+    #[test]
+    fn row_filter_rejects_trailing_input_after_predicate() {
+        // `region = 'east'; anything` used to parse as a prefix and store
+        // the whole tail verbatim — silently different filter semantics at
+        // execution, and a broken dump replay at the bare `;`.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE sales (region TEXT)").unwrap();
+        db.execute("CREATE USER eve PASSWORD 'pw12345678'").unwrap();
+        assert!(db
+            .execute("GRANT SELECT ON sales WHERE region = 'east'; DROP TABLE sales TO eve")
+            .is_err());
+        db.execute("GRANT SELECT ON sales WHERE region = 'east' TO eve")
+            .unwrap();
+    }
+
+    #[test]
+    fn redact_masks_bare_and_double_quoted_passwords() {
+        // These forms are always REJECTED by the parser, but the audit log
+        // still carried the intended secret verbatim (fail-open for
+        // mistyped quoting).
+        assert_eq!(
+            redact_sql("CREATE USER eve PASSWORD 12345678"),
+            "CREATE USER eve PASSWORD '***'"
+        );
+        assert_eq!(
+            redact_sql("CREATE USER eve PASSWORD \"secret-pw\""),
+            "CREATE USER eve PASSWORD '***'"
+        );
+        // A keyword continuation of a column reference stays verbatim.
+        assert_eq!(
+            redact_sql("SELECT password FROM t"),
+            "SELECT password FROM t"
         );
     }
 }

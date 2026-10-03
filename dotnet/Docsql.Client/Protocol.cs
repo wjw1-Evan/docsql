@@ -297,9 +297,17 @@ public sealed class ProtocolConnection : IDisposable
         {
             throw new DocsqlException($"tls_ca '{caPath}' contains no certificates");
         }
-        return (_, cert, chain, _) =>
+        return (_, cert, chain, errors) =>
         {
             if (cert is null || chain is null)
+            {
+                return false;
+            }
+            // Supplying a custom callback switches OFF SslStream's own name
+            // matching — redo it here: without this, ANY certificate issued
+            // by the configured CA passed for ANY host name (tls_host was
+            // dead letter, weaker than the Rust dialer's verifier).
+            if (errors.HasFlag(System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch))
             {
                 return false;
             }
@@ -526,6 +534,13 @@ public sealed class ProtocolConnection : IDisposable
                 // 并送出应答帧 —— 该连接的帧流从此错位,必须弃用;否则同一
                 // 连接上的下一条命令会读到这条已取消语句的结果(静默错数据;
                 // 池路径靠 Rent 前 PING 验活兜底,直接复用连接对象时无兜底)。
+                BreakConnection();
+                throw;
+            }
+            catch (DocsqlException)
+            {
+                // 解密/重放闸失败:与有预算分支同一毒化纪律,防止 Close()
+                // 把帧流已不可信的连接归还池。
                 BreakConnection();
                 throw;
             }

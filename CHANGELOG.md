@@ -5,6 +5,81 @@
 
 ## [Unreleased]
 
+### 第三轮全模块缺陷审查修复(2026-10-03)
+
+对全部模块再做一轮系统审查(14 路并行→逐条源码核实→修复+回归落各模块内;Rust 全量
+1000+ 用例、.NET 186、Python 38 绿):
+
+- **表达式遍历(本轮主病灶)**:四套手写 AST walker(时钟/NEWID 拒绝、子查询预替换、
+  相关性探测、行过滤器校验)互不同步——`CAST(GETDATE() AS TIMESTAMP)` 作 DEFAULT 既
+  不折叠也不回写、journal 携带原文,各重放节点自行打时钟(集群静默分叉);`FLOOR(RAND())`
+  可落库成逐行随机可见性行过滤器;非相关子查询嵌在 FLOOR/IS NULL/SUBSTRING 等包装节点
+  下被误报"correlated subqueries not supported"。现统一为单一 `child_exprs` 枚举表,
+  全部谓词/改写器共享。
+- **SQL 内核**:未定向冲突策略(OR IGNORE / ON DUPLICATE KEY UPDATE / REPLACE INTO)
+  只探测单列约束树,复合唯一索引(`CREATE UNIQUE INDEX (a,b)`)冲突落到树级 insert 直接
+  报错而非跳过/更新/置换(与文档「任一唯一键」承诺相悖);upsert 多行批多次触碰同一行
+  时中间像参与父侧 FK/legacy 唯一检查,被覆盖的瞬时键"顶住"悬空引用放行;CTAS 查询携带
+  NEWID() 既不折叠也不拒绝,各重放节点自行掷 GUID(集群分叉)——现与 UPDATE/DELETE/MERGE
+  同规则响亮拒绝;递归 CTE 体自带的 ORDER BY/LIMIT 曾被静默丢弃(非递归 CTE 同写法完整
+  生效)——现显式报错;CREATE VIEW 目录保存失败留内存幽灵视图(下次任意写持久化,与
+  peers 分叉);EXPLAIN 误报两处可执行形态(表值函数 FROM 因子报「表不存在」、括号化
+  查询体报「集合操作不支持」),索引探针行不镜像混合带回退(计划说走索引、执行器实际
+  全堆扫描)。
+- **存储层**:损坏 locator 指向他表堆页时无页归属校验——UPDATE/DELETE 会 tombstone/
+  repack 并写回他表页(跨表静默写毁);解码端对象重复键静默后者覆盖(损坏被 dump/备份
+  "洗白"成合法文档)——两处均改为响亮报错。
+- **用户/安全**:视图上的 GRANT 使 dump 不可回放(用户语句排在 CREATE VIEW 之前,
+  restore/join/repair 快照全部中断)——dump 顺序改为 建表→DML→视图→用户语句;行过滤器
+  谓词带尾随输入(`region='east'; anything`)只按前缀解析、整段落库(过滤语义静默截断、
+  dump 回放在裸 `;` 断链)——现要求表达式消费到 EOF;`redact_sql` 对裸口令
+  (`PASSWORD 12345678`)与双引号误拼(`PASSWORD "pw"`)形态 fail-open(被拒语句明文仍进
+  审计日志)——现掩码(带 SQL 关键词守卫,`SELECT password FROM t` 不受影响)。
+- **服务器**:COMMIT 的 WAL fsync 失败后 server 无条件清 tx_owner——引擎侧事务保持打开
+  却无人可关,单次 I/O 瞬断即全节点写路径楔死至重启(客户端写/复制 apply/PUBLISH 全部
+  排队超时);RLS 覆盖证明用去重后的读目标集合计数,同表第二次出现(外层 FROM + 子查询)
+  把 deep 计数压回 top——子查询位完全逃过行过滤,受限行的值逐字出线(高危及,已补
+  出现次数变体);grants_epoch 刷新的纪元采样在解析临界区外,REVOKE 与采样交错可组装
+  "旧权限+新纪元"永久跳过刷新(与登录路径同类竞态,已并入同锁);REQ_SESSIONS 的活动
+  语句文本不脱敏(`CREATE USER ... PASSWORD '…'` 执行期间经会话监控出线)——先过
+  redact 再截断;repair 增量追赶后的摘要复验沿用"任一赞同即收敛"捷径(第二轮删掉的
+  同款缺陷从追赶分支漏回,均分分歧可永久固化)——改回多数派选举裁决;扇出对任意
+  RESP_ERROR 都回退普通 REQ_SQL(对端的 origin 上限/事务忙等拒绝被重放:防护绕过 + 每
+  条写 60s 双倍停等)——仅对「unsupported frame」(旧版本对端)回退。
+- **备份**:`DOCSQL_BACKUP_INTERVAL_SECS=0` 文档语义「关闭」,实现钳成每 1 秒一次全量
+  备份(写路径持续占用 + 保留窗口高速轮转)——现按文档禁用;远端对账补传不保证
+  checksum-first(`.sql` 先落远端、sidecar 半失败留下无校验和对象,恢复侧静默降级为
+  未校验重放)——拆两遍:先全部 sidecar 后对象。
+- **CLI**:语句中间的空行被子无条件丢弃(多行字符串字面量的空行被静默删除,存库值与
+  输入不一致,备份回放同样损坏);`help`/`exit;` 哨兵不查语句缓冲(字面量内整行
+  `help`/`exit;` 被吞或提前断流);`connect --user` 缺值静默降级为匿名连接;RESP_ROWS
+  载荷不可解码时退出码仍 0(假成功);TCP 建连无超时(防火墙 DROP 挂 ~75s)。
+- **.NET**:CommitAsync/RollbackAsync 与保存点族缺物理连接代际守卫(Close/Open 换线后
+  迟到的 COMMIT/SAVEPOINT 作用到新线上的事务——EF Core 只走异步路径,主力防线缺失);
+  连接池键漏 TLS 形态(同 host/凭据下 `tls=true` 与 `tls=false` 共用物理连接,「加密」
+  会话静默跑明文);`tls_ca` 校验不查主机名(自定义回调关掉 SslStream 名称匹配后任何
+  CA 签发证书过任何主机);EF SchemaVerify 看不见索引方向(存量 ASC 索引让降序声明被
+  静默忽略)。
+- **Python**:keyed 连接收到未加密帧只报错不毒化(重试继续用帧流不可信的连接);重订阅
+  遭拒直接杀死读线程(注释承诺重试;后续控制调用每次空等 10s 超时再毒化健康连接);
+  文档参数内嵌非有限浮点以裸 ValueError 泄漏出 execute()(非 DB-API 异常);模式投递
+  使 `_last_id` 无界增长(死重条目);close() 与重连竞态泄漏新建连接。
+- **T-SQL**:CONVERT/PARSE 改写把值侧的方括号标识符与嵌套调用原样拼进 marker 调用
+  (`CONVERT(VARCHAR(20), [d], 101)` 变成不可解析文本)——值侧递归预处理;条件/赋值
+  扫描的关键词截断缺词首守卫(`cause`/`house`/`border` 结尾标识符在 IF/SET 中被拦腰
+  切断);`;`/GO 分隔的纯语句批不路由解释器(单帧多语句曾被"每帧一句"挡死);
+  SUSER_SNAME()/ERROR_MESSAGE() 单语句不路由(批内可用、单句报错,行为不一致);
+  `PRINT N'…'` 不进垫片。
+- **部署/CI**:CI python 驱动测试 job 此前两轮 CHANGELOG 均声称已补、实际从未落盘
+  (workflow 无该 job)——本次真实新增(python job + 接入 build needs);prod compose 头
+  注释宣称四个 `DOCSQL_TLS_*` 经 .env 配置、实际从未接线(照做的用户数据面静默明文)
+  ——五个数据节点补透传 + `.env.example` 补条目;NuGet 发布补版本一致性门禁(tag 与
+  四个 csproj `<Version>` 及 AspireSample 钉版全等才 pack);CI restore 重试循环补显式
+  失败哨兵(耗尽后不再靠 NETSDK1004 间接报错);run-tests.sh 构建分支补脏树检查
+  (Docker COPY 会把未提交改动打进镜像,`DOCSQL_ALLOW_DIRTY=1` 逃生)+ 归一 dev compose
+  从 .env 读取的其余五个透传变量(本地 .env 不再破坏测试确定性)。
+- **Web 控制台**:备份页 `esc()` 套在 HTML 占位常量上,fallback 分支显示字面 HTML 文本。
+
 ## [0.8.0] - 2026-10-02
 
 ### 第二轮全模块缺陷审查修复(2026-10-01)

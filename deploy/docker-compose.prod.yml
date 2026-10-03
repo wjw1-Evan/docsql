@@ -75,6 +75,14 @@ services:
       # disables. See .env.example.
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS (wire for the four .env values named in the
+      # header comment — a documented-but-unwired variable left the data
+      # plane silently plaintext). Empty = unset (server ignores empties);
+      # enabling TLS also needs the PEM pair mounted into the container.
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:18601:7600"
     volumes:
@@ -116,6 +124,14 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS (wire for the four .env values named in the
+      # header comment — a documented-but-unwired variable left the data
+      # plane silently plaintext). Empty = unset (server ignores empties);
+      # enabling TLS also needs the PEM pair mounted into the container.
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:18602:7600"
     volumes:
@@ -152,6 +168,14 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS (wire for the four .env values named in the
+      # header comment — a documented-but-unwired variable left the data
+      # plane silently plaintext). Empty = unset (server ignores empties);
+      # enabling TLS also needs the PEM pair mounted into the container.
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:18603:7600"
     volumes:
@@ -199,6 +223,14 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS (wire for the four .env values named in the
+      # header comment — a documented-but-unwired variable left the data
+      # plane silently plaintext). Empty = unset (server ignores empties);
+      # enabling TLS also needs the PEM pair mounted into the container.
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:18604:7600"
     volumes:
@@ -268,6 +300,14 @@ services:
       # Automatic backups: same semantics as the cluster nodes above.
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS (wire for the four .env values named in the
+      # header comment — a documented-but-unwired variable left the data
+      # plane silently plaintext). Empty = unset (server ignores empties);
+      # enabling TLS also needs the PEM pair mounted into the container.
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:18600:7600"
     volumes:

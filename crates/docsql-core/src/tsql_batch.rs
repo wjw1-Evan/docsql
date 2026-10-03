@@ -1484,7 +1484,13 @@ impl<'a> Parser<'a> {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 b',' | b';' if depth == 0 => break,
-                _ if depth == 0 && c_is_alpha && self.word_at_is(SELECT_CLAUSE_STARTERS) => break,
+                _ if depth == 0
+                    && c_is_alpha
+                    && self.at_word_start()
+                    && self.word_at_is(SELECT_CLAUSE_STARTERS) =>
+                {
+                    break
+                }
                 b'\n' if depth == 0 && self.at_statement_boundary(start) => break,
                 _ => {}
             }
@@ -1839,6 +1845,7 @@ impl<'a> Parser<'a> {
                 }
                 _ if depth == 0
                     && c.is_ascii_alphabetic()
+                    && self.at_word_start()
                     && self.word_at_is_statement_starter() =>
                 {
                     break
@@ -1874,7 +1881,9 @@ impl<'a> Parser<'a> {
     /// keyword inside an identifier like `eelse`.
     fn at_word_start(&self) -> bool {
         match self.i.checked_sub(1).and_then(|p| self.b.get(p)) {
-            Some(prev) => !prev.is_ascii_alphanumeric() && *prev != b'_',
+            // `.` means qualified column access (`t.use`, `t.case`): the
+            // word after it is an identifier, never a keyword.
+            Some(prev) => !prev.is_ascii_alphanumeric() && *prev != b'_' && *prev != b'.',
             None => true,
         }
     }
@@ -2220,6 +2229,12 @@ fn unquote_literal(s: &str) -> String {
 /// multi-statement batch). The server keeps its single-statement fast
 /// path untouched otherwise.
 pub fn needs_interpretation(sql: &str) -> bool {
+    // `;`/GO separators split into several chunks of one Plain statement
+    // each: the per-chunk test below would never fire, yet the engine
+    // accepts exactly one statement per execute — count the batch as a
+    // whole so the interpreter runs the chunks sequentially (matching the
+    // docstring's "more than one statement").
+    let mut plain_chunks = 0usize;
     for chunk in stmt::text_chunks(sql) {
         let chunk = chunk.trim();
         if chunk.is_empty() {
@@ -2230,6 +2245,7 @@ pub fn needs_interpretation(sql: &str) -> bool {
                 if stmts.len() != 1 || !matches!(stmts[0], Stmt::Plain(_)) {
                     return true;
                 }
+                plain_chunks += 1;
             }
             Err(_) => return true,
         }
@@ -2243,7 +2259,7 @@ pub fn needs_interpretation(sql: &str) -> bool {
             return true;
         }
     }
-    false
+    plain_chunks > 1
 }
 
 /// `SCOPE_IDENTITY()`/`IDENT_CURRENT()` appears outside string
@@ -2294,10 +2310,26 @@ fn mentions_identity_fn(sql: &str) -> bool {
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
+                // Keep this list in lockstep with `substitute`'s
+                // empty-arg family below: a call the interpreter WOULD
+                // resolve must route there — a bare `SELECT SUSER_SNAME()`
+                // used to die on the engine's unknown-function path while
+                // the identical call inside a DECLARE batch worked.
                 let name = &sql.as_bytes()[start..i];
-                if !(name.eq_ignore_ascii_case(b"scope_identity")
-                    || name.eq_ignore_ascii_case(b"ident_current"))
-                {
+                const IDENTITY_FNS: &[&[u8]] = &[
+                    b"scope_identity",
+                    b"ident_current",
+                    b"error_message",
+                    b"error_number",
+                    b"suser_sname",
+                    b"original_login",
+                    b"system_user",
+                    b"session_user",
+                    b"user_name",
+                    b"app_name",
+                    b"host_name",
+                ];
+                if !IDENTITY_FNS.iter().any(|f| name.eq_ignore_ascii_case(f)) {
                     continue;
                 }
                 let mut j = i;
@@ -3214,5 +3246,40 @@ mod tests {
         // Semicolons separate statements.
         let stmts = parse_batch("SELECT 1; SELECT 2").unwrap();
         assert_eq!(stmts.len(), 2);
+    }
+    #[test]
+    fn condition_and_assignment_keyword_cuts_need_word_start() {
+        // `cause`/`border` end in a clause starter; without the word-start
+        // guard the condition was cut mid-identifier and the parse failed.
+        let mut s = TsqlSession::new();
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE t (v INT)").unwrap();
+        // `@cause` ends in the starter "use": the condition used to be cut
+        // at the `u` ("@ca"), failing the batch before the guard existed.
+        run_script(
+            &mut s,
+            &mut db,
+            "DECLARE @cause INT = 1\nIF @cause = 1 INSERT INTO t VALUES (2)",
+        )
+        .unwrap();
+        let out = run_script(&mut s, &mut db, "SELECT COUNT(*) AS c FROM t").unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(1));
+    }
+
+    #[test]
+    fn multi_chunk_plain_batches_route_to_the_interpreter() {
+        // `;`-separated plain statements used to bypass the interpreter and
+        // die on the engine's one-statement-per-execute rule, while the
+        // same text newline-separated ran fine.
+        assert!(needs_interpretation("SELECT 1; SELECT 2"));
+        assert!(needs_interpretation("SELECT 1\nGO\nSELECT 2"));
+        assert!(!needs_interpretation("SELECT 1"));
+    }
+
+    #[test]
+    fn identity_functions_route_single_statements() {
+        assert!(needs_interpretation("SELECT SUSER_SNAME()"));
+        assert!(needs_interpretation("SELECT ERROR_MESSAGE()"));
+        assert!(!needs_interpretation("SELECT 1"));
     }
 }
