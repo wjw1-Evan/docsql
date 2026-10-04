@@ -430,6 +430,24 @@ impl PubSub {
         inner.notify(channel, id, ts, payload)
     }
 
+    /// Distinct connections a notify on `channel` would currently reach
+    /// (exact + pattern subscribers). Used for the queued-PUBLISH ack: the
+    /// fan-out origin adds this count to its receivers exactly like a live
+    /// leg would, while the actual push happens after the drain.
+    pub async fn count_receivers(&self, channel: &str) -> u64 {
+        let inner = self.inner.lock().await;
+        let mut reached: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+        if let Some(subs) = inner.channels.get(channel) {
+            reached.extend(subs.keys().copied());
+        }
+        for (pattern, subs) in &inner.patterns {
+            if pattern_matches(pattern, channel) {
+                reached.extend(subs.keys().copied());
+            }
+        }
+        reached.len() as u64
+    }
+
     pub async fn remove_conn(&self, conn: ConnId) {
         self.inner.lock().await.remove_conn(conn);
     }

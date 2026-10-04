@@ -505,7 +505,7 @@ CREATE TABLE [ IF NOT EXISTS ] table_name AS SELECT ...
 | `NOT NULL` | 写入 NULL 或缺字段时报错 |
 | `DEFAULT expr` | INSERT 省略该列时求值填充；`ALTER TABLE ADD COLUMN` 带 DEFAULT 会回填存量行（回填值须满足 CHECK） |
 | `CHECK` | 写入时校验；仅求值为 FALSE 时失败（含 NULL 引用的表达式视为未知通过）；引用的列必须存在（DDL 拒绝幽灵列），不能含子查询 |
-| `REFERENCES` | 外键（RESTRICT 式）；不支持 `ON DELETE`/`ON UPDATE` 动作；表级复合形式与列级多被引列显式报错 |
+| `REFERENCES` | 外键（RESTRICT 式，语句终态判定）；不支持 `ON DELETE`/`ON UPDATE` 动作；表级复合形式与列级多被引列显式报错。自引用外键按**语句终态**校验：同语句腾空父键同时让新像引用它（`UPDATE t SET id=3, p=1 WHERE id=1`）被拒；同语句一并删除父子行（`DELETE FROM 自引用表`）合法 |
 | `AUTOINCREMENT` | 整数列：插入省略/NULL 时取 max+1；GUID 列：生成 UUIDv7 并回写语句 |
 | `GUID` 类型 | `GUID`/`UUID`/`UNIQUEIDENTIFIER`/`UUIDV7` |
 
@@ -913,7 +913,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 |---|---|
 | 查询 | `COUNT_BIG`、`SELECT TOP n` / `TOP (n)` / `TOP n WITH TIES`（改写为 LIMIT/FETCH；`PERCENT` 报错）、`dbo.` 前缀容忍（取末段）、`ORDER BY (SELECT 1)`（EF Skip/Take）、`x != TRUE` 软删语义 |
 | 记号 | `N'...'` 字面量、`[方括号]` 标识符（`]]` 转义）、字符串 `+` 拼接（与数字混合按隐式数值转换，失败报错）、位运算 `& \| ^ ~`（64 位整数） |
-| 模式匹配 | `LIKE '[a-z]'` / `[^…]` 字符类（`]` 前置为字面成员、未闭合 `[` 为字面括号；`%`/`_`/`ESCAPE` 语义不变） |
+| 模式匹配 | `LIKE '[a-z]'` / `[^…]` 字符类（`]` 前置为字面成员、未闭合 `[` 为字面括号；倒序区间 `[z-a]` 视为手误,整个类**不匹配任何字符**(取反同);`%`/`_`/`ESCAPE` 语义不变） |
 | 日期时间 | `GETDATE/GETUTCDATE/SYSDATETIME/SYSUTCDATETIME`（引擎仅 UTC）、`DATEADD/DATEDIFF/DATEDIFF_BIG`（边界跨越语义、月末钳制）、`DATEPART/DATENAME`（全部 datepart 缩写）、`YEAR/MONTH/DAY/DAYOFYEAR`、`EOMONTH`、`DATEFROMPARTS` 与 `*FROMPARTS` 族、`ISDATE/ISNUMERIC` |
 | 字符串 | `LEFT/RIGHT`、`CHARINDEX`、`REPLACE`、`REPLICATE`、`REVERSE`、`SPACE`、`STR`、`QUOTENAME`、`ASCII/CHAR/NCHAR/UNICODE`、`CONCAT_WS`、`TRANSLATE`、`STUFF`、`STRING_ESCAPE`（json）、`FORMAT`（常用数字/日期 token，未知 token 报错） |
 | 数学 | `FLOOR/CEILING/POWER/SQRT/SQUARE/EXP/LOG/LOG10/SIGN/PI` 与三角函数族 |
@@ -921,14 +921,14 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 逻辑 | `IIF`、`CHOOSE`、`ISNULL` |
 | 标识/元数据 | `NEWID/NEWSEQUENTIALID`（UUIDv7；**仅 SELECT/INSERT** —— INSERT 走回写把生成值作为字面量扇出，UPDATE/DELETE/MERGE 显式报错）、`DB_NAME/DB_ID/SERVERPROPERTY`、`CHECKSUM/BINARY_CHECKSUM`、`HASHBYTES`（MD5/SHA1/SHA2_256） |
 | 表值函数 | `FROM STRING_SPLIT(s, sep[, 1]) AS t`、`FROM GENERATE_SERIES(a, b[, step]) AS t`、`FROM OPENJSON(json) AS t`（默认 key/value/type 形状；`WITH` 子句报错；NULL 输入得空行集） |
-| 批/变量 | `DECLARE @x [类型] [= 初值]`、`SET @x = 表达式`、`SELECT @a = e1, @b = e2 [FROM …]`（取扫描末行，空扫描保持原值）、`IF … ELSE`、`BEGIN…END` 嵌套块、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@ERROR`/`@@VERSION`、`PRINT 表达式`（CLI 打印消息）；变量是**逐连接会话状态**（GO 结束批次即清空），替换经 `value_literal` 渲染，写语句只以字面量形式进入日志/复制 |
+| 批/变量 | `DECLARE @x [类型] [= 初值]`、`SET @x = 表达式`、`SELECT @a = e1, @b = e2 [FROM …]`（取扫描末行，空扫描保持原值;`@@ROWCOUNT` 随之刷新为扫描行数）、`IF … ELSE`（可直接管辖 `BEGIN TRY…CATCH`）、`BEGIN…END` 嵌套块、`WHILE` + `BREAK`/`CONTINUE`、`@@ROWCOUNT`/`@@ERROR`/`@@VERSION`、`PRINT 表达式`（CLI 打印消息）；变量是**逐连接会话状态**（GO 结束批次即清空），替换经 `value_literal` 渲染，写语句只以字面量形式进入日志/复制 |
 | 错误处理 | `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`（捕获后批继续；CATCH 内 `ERROR_MESSAGE()`/`ERROR_NUMBER()` 读被捕获错误，CATCH 外为 NULL；嵌套 TRY…CATCH 结束后外层 CATCH 的错误上下文恢复）；`THROW [code, 'msg', state]`（实参可为 @变量；CATCH 内裸 `THROW` 重抛原错误，可多次）、`RAISERROR('msg', sev, state)` 或 `RAISERROR 'msg', sev, state`（消息取第一实参，severity/state 不分级）；CATCH 内的错误继续上抛，TRY 内的 BREAK/CONTINUE 穿透到外层 WHILE |
 | 递归 CTE | `WITH [RECURSIVE] c(n) AS (锚点 UNION [ALL] 递归臂)`：半朴素迭代（每轮只见上一轮行，SQL Server 工作表语义）；`UNION` 按编码字节去重可收敛循环图、`UNION ALL` 循环在 100 轮/10 万行预算处响亮报错；T-SQL 无关键字拼写（自引用 UNION 体即递归）同样识别；CTE 体自带的顶层 `ORDER BY`/`LIMIT`/`FETCH` 显式报错（施加于合并结果请写在外层查询） |
 | APPLY | `CROSS APPLY 表函数 AS t` / `OUTER APPLY …`（STRING_SPLIT/GENERATE_SERIES/OPENJSON）：**逐左行求值**的相关化表函数——实参引用左表列，OUTER 空行集保留左行（右列读 NULL）；支持别名列改名与连续 APPLY；APPLY 子查询仍显式报错 |
 | PIVOT/UNPIVOT | `FROM src PIVOT (SUM(x) FOR col IN (v1 [AS c1], v2)) AS p`：隐式分组（除透视列与聚合实参列外的全部字段，按编码字节精确分桶），单聚合（SUM/AVG/MIN/MAX/COUNT），空单元格 COUNT 为 0、其余为 NULL（组内全 NULL 同此），IN 子查询与 `DEFAULT ON NULL` 报错；`FROM src UNPIVOT (val FOR col IN (a [AS α], b)) AS u`：每行×每列出一行，NULL 单元格剔除（`INCLUDE|EXCLUDE NULLS` 报错） |
 | 标识与随机 | `SCOPE_IDENTITY()`/`@@IDENTITY`（逐连接会话状态：连接内最后一条 INSERT 的自增 id,非 INSERT 语句不清除;服务端在写锁内随语句结果快照,跨连接不串值）;`RAND()`（[0,1) 浮点;每语句一值,同语句内各处同值,与 T-SQL 一致）——**复制安全**:SELECT 读路径可用,INSERT 路径字面量化回写(同 NEWID),UPDATE/DELETE/MERGE 拒绝 |
 | 会话身份 | `SUSER_SNAME()`/`ORIGINAL_LOGIN()`/`SYSTEM_USER`/`SESSION_USER`/`USER_NAME()`/`APP_NAME()`/`HOST_NAME()` —— 经连接身份上下文替换（服务端为登录用户，无上下文时报错） |
-| 会话垫片 | `SET <已知选项> ON/OFF`、`USE <db>`、`PRINT <字面量>`、`GO` 批分隔（CLI/控制台多语句）—— 与 PRAGMA 同通道**接受并忽略** |
+| 会话垫片 | `SET <已知选项> ON/OFF`、`USE <db>`（裸名/`"引号"`/`[方括号]` 均可）、`PRINT <字面量>`、`GO` 批分隔（CLI/控制台多语句）—— 与 PRAGMA 同通道**接受并忽略** |
 | 语义对齐 | `CONCAT` 把 NULL 当空串（`\|\|` 仍 NULL 传染）、`LEN` 不计尾随空格（`LENGTH` 计）、`TRIM('ab' FROM x)` 字符集裁剪、`ROUND(x, -n)` 负位数（十位/百位） |
 | 复制确定性 | 写语句中的 `GETDATE()` 族在写入节点折叠成时间戳字面量（与 `DEFAULT NOW()` 同红线）；`DEFAULT NEWID()` 按行定值回写 |
 | 其他 | `CAST(... AS BIT)`、`INFORMATION_SCHEMA.*`/`sqlite_master`（大小写不敏感）、`UPDATE ... FROM`、`DELETE ... USING`、`MERGE`（受限）、`JSON_ARRAY_CONTAINS`；`BIT`/`DATETIME2`/`NVARCHAR(MAX)` 等类型名按声明类型接受（值模型不变） |

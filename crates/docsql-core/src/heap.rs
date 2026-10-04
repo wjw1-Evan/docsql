@@ -278,6 +278,7 @@ fn recycle_chain(
     head: u32,
     total: usize,
     prefix: usize,
+    own_pages: &[u32],
     free: &mut Vec<u32>,
 ) -> Result<()> {
     if total > MAX_DOC_SIZE {
@@ -294,6 +295,15 @@ fn recycle_chain(
     while next != 0 {
         if !seen.insert(next) || chain.len() > total / min_chunk + 2 {
             return Err(HeapError::Page(next, "overflow chain corrupt (cycle)"));
+        }
+        if own_pages.contains(&next) {
+            // A chain page is never one of the table's heap data pages: a
+            // heap page whose slot count happens to equal the 0xFE marker
+            // must not be walked and zeroed as a chain hop.
+            return Err(HeapError::Page(
+                next,
+                "overflow chain corrupt (chain into heap page)",
+            ));
         }
         let page = load_page_owned(&PageReader::current(pager), Some(tx), next)?;
         let (nxt, l) = chain_header(&page, next)?;
@@ -330,6 +340,7 @@ fn recycle_chain(
 /// under another table. The heap pages themselves stay untouched; the caller
 /// frees them separately.
 pub fn free_overflow_chains(pager: &Pager, tx: &mut Tx, pages: &[u32]) -> Result<()> {
+    let own: HashSet<u32> = pages.iter().copied().collect();
     for &pid in pages {
         let page = load_page_owned(&PageReader::current(pager), Some(tx), pid)?;
         validate_page(&page, pid)?;
@@ -360,6 +371,12 @@ pub fn free_overflow_chains(pager: &Pager, tx: &mut Tx, pages: &[u32]) -> Result
             while next != 0 {
                 if !seen.insert(next) || chain.len() > total / min_chunk + 2 {
                     return Err(HeapError::Page(next, "overflow chain corrupt (cycle)"));
+                }
+                if own.contains(&next) {
+                    return Err(HeapError::Page(
+                        next,
+                        "overflow chain corrupt (chain into heap page)",
+                    ));
                 }
                 let chain_page = load_page_owned(&PageReader::current(pager), Some(tx), next)?;
                 let (nxt, l) = chain_header(&chain_page, next)?;
@@ -711,6 +728,7 @@ impl Heap {
                 head,
                 total,
                 content.len() - OVERFLOW_SLOT_HEADER,
+                &self.pages,
                 &mut self.overflow_free,
             )?;
         }
@@ -817,6 +835,7 @@ impl Heap {
                         head,
                         total,
                         content.len() - OVERFLOW_SLOT_HEADER,
+                        &self.pages,
                         &mut self.overflow_free,
                     )?;
                 }

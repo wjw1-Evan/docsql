@@ -223,10 +223,14 @@ builder.AddDocsqlConnection("docsql");       // 注册 transient DocsqlConnectio
 
 ```
 docsql connect 127.0.0.1:7600 --user analyst   # 密码走 DOCSQL_PASSWORD 或交互提示;--user 缺值是用法错误(不静默降级匿名)
-  --csv / --json        行导出(RFC 4180 CSV / JSON 对象数组)
+  --csv / --json        行导出(RFC 4180 CSV / JSON 对象数组;启动横幅走 stderr,批处理 stdout 恒为纯格式文档)
   -f script.sql         脚本批执行(错误即退出 1)
   help;                 内联命令帮助(含 pub/sub 命令面)
 ```
+
+退出码约定:SQL 语句错误、`publish`/`subscribe`/`trim` 被拒、传输失败、坏帧均使脚本
+(fail_fast 路径)以非零退出;CSV 公式注入防护只拦 `=`/`+`/`@` 与非常规 `-` 形态,负数
+保持数值单元格。注:CLI 暂不支持 `DOCSQL_KEY` 帧加密节点(用 .NET/Python 驱动或 TLS)。
 
 订阅是专用连接 + 专职读线程(CLI 已内置):普通一问一答连接会把推送帧错当成命令响应。
 

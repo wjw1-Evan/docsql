@@ -2705,8 +2705,10 @@ function openSessionsTab() {
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
     $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     const killSession = (row) => {
+      // row[1]/row[2](来源/身份)是节点侧自由文本,直接传原值:dialog()
+      // 对 label 统一 esc,调用方预转义会把 & < > 显示成实体(双重转义)。
       dialog(T('终止会话 {0}', row[0]), [
-        {name: 'confirm', label: T('终止该连接?正在执行的语句会先完成,随后连接关闭。') + ` (${esc(row[1])} · ${esc(row[2])})`, ph: 'KILL', value: ''},
+        {name: 'confirm', label: T('终止该连接?正在执行的语句会先完成,随后连接关闭。') + ` (${row[1]} · ${row[2]})`, ph: 'KILL', value: ''},
       ], T('终止'), async (vals, err) => {
         if (vals.confirm !== 'KILL') { err(T('输入 KILL 确认')); throw new Error('cancel'); }
         try {
@@ -3578,7 +3580,11 @@ const explorer = {
     // 表名进注释前剥掉换行:否则一个含换行的表名能把注释提前收线,
     // 后半截名字作为 SQL 执行。
     const safeName = String(m.name).replace(/[\r\n]+/g, ' ');
-    let s = T('-- 表 {0}({1} 行,{2} 页)', safeName, m.row_count, m.pages) + `\nCREATE TABLE "${qident(m.name)}" (\n${cols}\n);`;
+    // 行数/页数同理来自 /api/meta 的自由 JSON(失陷节点可回字符串):
+    // 强制数字归一,换行/语句边界符不可能穿过数字 coercion —— 与
+    // safeName 同一威胁模型,别把未消毒的值直接拼进注释。
+    const safeNum = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    let s = T('-- 表 {0}({1} 行,{2} 页)', safeName, safeNum(m.row_count), safeNum(m.pages)) + `\nCREATE TABLE "${qident(m.name)}" (\n${cols}\n);`;
     // 索引 DDL 用 index_defs 还原列与唯一性(仅名字不足以重建)。
     const defs = m.index_defs || [];
     for (const i of m.indexes) {
@@ -3671,7 +3677,9 @@ $$('.menu-drop [data-act]').forEach(item => {
     else if (act === 'logs') openLogsTab();
     else if (act === 'backup') openBackupTab();
     else if (act === 'account') accountDialog();
-    else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST'}).finally(() => location.reload());
+    // logout 端点要求 JSON 体(与 /api/backup 同一 CSRF 门):跨站表单
+    // 发不出 application/json,空 {} 即可,成败都刷新回登录页。
+    else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}).finally(() => location.reload());
     else if (act === 'about') aboutDialog();
   };
 });

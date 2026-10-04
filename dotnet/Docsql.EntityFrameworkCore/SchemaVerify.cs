@@ -1,14 +1,16 @@
 using System.Linq;
 // schema 校验:确认模型声明的表/列/命名索引都在库中(子集判定,
-// 忽略库中多出的对象)。通过时可跳过整场 SyncModel —— 后者对每条
-// 新连接都要逐表「建表探测 + 列探测」与索引同步,119 实体规模下是
-// 数百次往返;EF 每个 DbContext 都是一条新连接,不能按此计价。
+// 忽略库中多出的对象),且模型主键列按提供程序形状强制(NOT NULL,
+// 弱判定 —— 引擎 SQL 面不暴露 PK 本身,见 VerifyModel 注释)。
+// 通过时可跳过整场 SyncModel —— 后者对每条新连接都要逐表「建表探测 +
+// 列探测」与索引同步,119 实体规模下是数百次往返;EF 每个 DbContext 都
+// 是一条新连接,不能按此计价。
 //
 // 校验用两条一次性查询:
-//   information_schema.columns  → 全部 表 × 声明列(catalog 直出)
+//   information_schema.columns  → 全部 表 × 声明列 × is_nullable(catalog 直出)
 //   sqlite_master(type=index)   → 全部命名索引(自动索引不列出)
 //
-// 校验失败(缺表/缺列/缺索引,或外部删表)才回落全量同步,
+// 校验失败(缺表/缺列/缺索引/主键未强制,或外部删表)才回落全量同步,
 // 语义与逐连接同步一致:外部 DDL 在下一个上下文即被恢复。
 
 using System.Data.Common;
@@ -22,12 +24,22 @@ internal static partial class SchemaSync
     /// <summary>
     /// 模型要求的表/列/索引是否都已存在。子集判定:库中多出的表/列/索引不影响
     /// 结果(同步本身只增不减,索引回收另走 SyncIndexes)。
+    /// 另核主键列的强制形状:引擎的 SQL 面不暴露 PK 存在性(sqlite_master 表行
+    /// 的 sql 是空文本、自动索引不出列),提供程序建表形状是「非空主键列
+    /// NOT NULL PRIMARY KEY」—— 以 is_nullable=NO 为弱判定。此前只比列名子集,
+    /// 外部建的无 PK 同名表(列名恰好齐)被判齐备,EF 的身份/唯一性保证静默
+    /// 失效。判据与 SyncTable 完全同一(门禁一致):校验失败 ⇒ 全量同步能收敛
+    /// (SyncTable 走保数据重建)。
     /// </summary>
     public static bool VerifyModel(DbConnection conn, IModel model)
     {
         var expectedTables = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         var expectedIndexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var expectedUniqueIndexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // 期望的非空主键列(table → pk column):取该表首个声明单列非空主键的
+        // 实体(TPH 层次共享同一主键);可空主键(PK ≠ NOT NULL)与无键实体
+        // 无法在 SQL 面区分,两侧(verify/sync)同样跳过。
+        var expectedPkColumns = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         // Index column lists (and owning table), in model order: with an
         // explicit HasDatabaseName EF keeps the same index name when its
         // definition changes, so a name-only check left the stale index
@@ -56,6 +68,17 @@ internal static partial class SchemaSync
             else
             {
                 expectedTables[table] = columns;
+            }
+            if (!expectedPkColumns.ContainsKey(table)
+                && entity.FindPrimaryKey() is { Properties.Count: 1 } pk
+                && !pk.Properties[0].IsNullable)
+            {
+                var pkColumn = pk.Properties[0].GetColumnName(
+                    StoreObjectIdentifier.Table(table, entity.GetSchema()));
+                if (pkColumn is not null)
+                {
+                    expectedPkColumns[table] = pkColumn;
+                }
             }
             foreach (var index in entity.GetIndexes())
             {
@@ -96,14 +119,22 @@ internal static partial class SchemaSync
         if (expectedTables.Count == 0) return true;
 
         var actualColumns = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var actualNotNullColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = "SELECT table_name, column_name FROM information_schema.columns";
+            cmd.CommandText =
+                "SELECT table_name, column_name, is_nullable FROM information_schema.columns";
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
                 var table = reader.GetString(0);
                 var column = reader.GetString(1);
+                var nullable = reader.GetString(2);
+                if (nullable.Equals("NO", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 同库内表名+列名组合不区分大小写(引擎标识符语义)。
+                    actualNotNullColumns.Add(table + "\u0001" + column);
+                }
                 if (!actualColumns.TryGetValue(table, out var set))
                     actualColumns[table] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 set.Add(column);
@@ -116,6 +147,12 @@ internal static partial class SchemaSync
             {
                 if (!actual.Contains(column)) return false;
             }
+        }
+        foreach (var (table, pkColumn) in expectedPkColumns)
+        {
+            // 主键列缺失或可空 = 未按提供程序形状强制(外部无 PK 裸表),
+            // 与 SyncTable 的 PkColumnEnforced 同判据。
+            if (!actualNotNullColumns.Contains(table + "\u0001" + pkColumn)) return false;
         }
 
         // 即便模型没有索引,也要取实际索引:模型表上残留的 IX_ 索引属于回收面。

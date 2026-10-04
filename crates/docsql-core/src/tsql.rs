@@ -51,11 +51,14 @@ fn is_tsql_type_name(word: &str) -> bool {
     if let Some(s) = suffix {
         let s = s.trim();
         let parts: Vec<&str> = s.split(',').collect();
+        // Trim each part: `DECIMAL(10, 2)` is legal T-SQL and the digits
+        // check must not reject the space.
         let ok = s.eq_ignore_ascii_case("max")
             || (parts.len() <= 2
-                && parts
-                    .iter()
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())));
+                && parts.iter().all(|p| {
+                    let p = p.trim();
+                    !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
+                }));
         if !ok {
             return false;
         }
@@ -437,8 +440,8 @@ fn shim_statement(sql: &str, after_word: usize, word: &[u8], out: &mut String) -
     }
 }
 
-/// Read one identifier (bare word or "quoted") starting at `*i`, advancing
-/// past it.
+/// Read one identifier (bare word, "quoted" or [bracketed]) starting at
+/// `*i`, advancing past it.
 fn read_shim_ident(sql: &str, i: &mut usize) -> Option<String> {
     let b = sql.as_bytes();
     if *i >= b.len() {
@@ -455,6 +458,19 @@ fn read_shim_ident(sql: &str, i: &mut usize) -> Option<String> {
         }
         *i += 1;
         return Some(sql[start + 1..*i - 1].replace("\"\"", "\""));
+    }
+    if b[*i] == b'[' {
+        // T-SQL scripts routinely bracket the name (`USE [master]`).
+        let start = *i;
+        *i += 1;
+        while *i < b.len() && b[*i] != b']' {
+            *i += 1;
+        }
+        if *i >= b.len() {
+            return None; // unterminated bracket
+        }
+        *i += 1;
+        return Some(sql[start + 1..*i - 1].replace("]]", "]"));
     }
     if b[*i].is_ascii_alphabetic() || b[*i] == b'_' {
         let start = *i;
@@ -727,6 +743,33 @@ fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
                 i = end;
                 continue;
             }
+            // Quoted/bracketed identifiers are opaque: a comma or paren
+            // inside one (`CONVERT(INT, [a,b])`) must not split the
+            // argument list.
+            b'"' | b'`' => {
+                let quote = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == quote {
+                        if b.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
             // Comments are opaque: a comma inside one must not split the
             // argument list (a mis-split leaves the call verbatim, which
             // then fails loudly downstream).
@@ -780,6 +823,10 @@ enum LikeTok {
         neg: bool,
         ranges: Vec<(char, char)>,
     },
+    /// A malformed class (reversed range `[z-a]`): matches NOTHING,
+    /// negation included — T-SQL rejects the pattern outright and this
+    /// tokenizer has no loud channel.
+    Never,
 }
 
 /// SQL LIKE with `%`, `_`, `ESCAPE` — and the T-SQL `[abc]` / `[^a-z]`
@@ -804,6 +851,7 @@ pub fn like_match(s: &str, pat: &str, esc: Option<char>) -> bool {
                     let in_class = ranges.iter().any(|(lo, hi)| s[si] >= *lo && s[si] <= *hi);
                     in_class != *neg
                 }
+                LikeTok::Never => false,
                 LikeTok::AnyRun => false,
             };
             if hit {
@@ -866,6 +914,7 @@ fn tokenize_like(pat: &str, esc: Option<char>) -> Vec<LikeTok> {
             let mut ranges: Vec<(char, char)> = Vec::new();
             let mut first = true;
             let mut closed = false;
+            let mut malformed = false;
             while j < chars.len() {
                 if chars[j] == ']' && !first {
                     closed = true;
@@ -874,6 +923,14 @@ fn tokenize_like(pat: &str, esc: Option<char>) -> Vec<LikeTok> {
                 }
                 first = false;
                 if j + 2 < chars.len() && chars[j + 1] == '-' && chars[j + 2] != ']' {
+                    // A reversed range (`[z-a]`) is a typo T-SQL rejects with
+                    // "invalid range"; the tokenizer has no loud channel
+                    // (like_match is a bool filter), so the whole class
+                    // matches NOTHING — negated included — which is strictly
+                    // safer than a negated class matching everything.
+                    if chars[j] > chars[j + 2] {
+                        malformed = true;
+                    }
                     ranges.push((chars[j], chars[j + 2]));
                     j += 3;
                 } else {
@@ -881,7 +938,10 @@ fn tokenize_like(pat: &str, esc: Option<char>) -> Vec<LikeTok> {
                     j += 1;
                 }
             }
-            if closed && !ranges.is_empty() {
+            if malformed {
+                toks.push(LikeTok::Never);
+                i = j;
+            } else if closed && !ranges.is_empty() {
                 toks.push(LikeTok::Class { neg, ranges });
                 i = j;
             } else {

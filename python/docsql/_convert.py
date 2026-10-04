@@ -63,6 +63,17 @@ def _exact_decimal_text(value):
     _sign, digits, exp = value.as_tuple()
     digit_text = "".join(map(str, digits)) or "0"
     if exp >= 0:
+        # Reject BEFORE materializing the mantissa: int(digit_text) * 10**exp
+        # on something like Decimal("1E+999999999") first builds the whole
+        # billion-digit power (client hang / OOM) and only THEN fails the
+        # _DEC_MAX check below. The digit-count bound is exact, not a
+        # heuristic: _DEC_MAX has 29 digits, so 30+ whole digits always
+        # exceed it (and <=29-digit powers are cheap to build).
+        if len(digit_text) + exp > 29:
+            raise DataError(
+                f"{value} exceeds DECIMAL precision (28 significant digits, "
+                f"max {_DEC_MAX}); bind it as a string or scale it down"
+            )
         mantissa, scale = int(digit_text) * 10**exp, 0
     else:
         mantissa, scale = int(digit_text), -exp
@@ -193,4 +204,14 @@ def _dump_json(value):
 
 def execute_payload(handle, params):
     head = '{"handle":' + str(handle) + ',"params":['
-    return (head + ",".join(param_json(p) for p in params) + "]}").encode("utf-8")
+    text = head + ",".join(param_json(p) for p in params) + "]}"
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # Lone surrogates ride str binds through json.dumps(ensure_ascii=
+        # False) untouched and only detonate at this final encode — as a
+        # bare UnicodeEncodeError it used to escape execute() past every
+        # ``except Error`` recovery path in user code.
+        raise DataError(
+            f"cannot bind parameter text (unpaired surrogate is not UTF-8): {exc}"
+        ) from exc

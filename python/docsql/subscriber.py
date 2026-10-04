@@ -65,6 +65,12 @@ class Subscriber:
         self._patterns = {}   # pattern -> default from (str)
         self._last_id = {}    # channel -> newest delivered id
         self._replies = queue.Queue()
+        # True once a control round trip timed out and poisoned the wire:
+        # frames the reader pulls off it afterwards are late replies for a
+        # dead request and must never reach the queue (the next control
+        # call would mistake one for its own ACK). Cleared — after a
+        # race-free drain — when the reader installs the next connection.
+        self._replies_stale = False
         self._write_lock = threading.Lock()
         # True while a control round trip (subscribe/unsubscribe) is between
         # its request and its reply: the reader must not inject a keepalive
@@ -92,15 +98,27 @@ class Subscriber:
 
     def unsubscribe(self, *channels):
         self._control(_proto.REQ_UNSUBSCRIBE, list(channels))
-        for c in channels:
-            self._channels.pop(c, None)
-            self._last_id.pop(c, None)
+        if not channels:
+            # Server semantics: an empty name list unregisters EVERY channel
+            # of this connection (pubsub.rs `unregister`). The local sets
+            # used to keep everything, so the next reconnect resurrected
+            # every channel the caller had asked to drop.
+            self._channels.clear()
+            self._last_id.clear()
+        else:
+            for c in channels:
+                self._channels.pop(c, None)
+                self._last_id.pop(c, None)
         return self
 
     def punsubscribe(self, *patterns):
         self._control(_proto.REQ_PUNSUBSCRIBE, list(patterns))
-        for p in patterns:
-            self._patterns.pop(p, None)
+        if not patterns:
+            # Same all-or-named semantics as unsubscribe().
+            self._patterns.clear()
+        else:
+            for p in patterns:
+                self._patterns.pop(p, None)
         return self
 
     def close(self):
@@ -135,55 +153,82 @@ class Subscriber:
     # -- internals ------------------------------------------------------------
     def _control(self, frame_type, body):
         payload = json.dumps(body).encode("utf-8")
-        with self._write_lock:
-            self._control_busy = True
-            try:
-                self._conn._transport.write_frame(frame_type, payload)
-                while True:
-                    try:
-                        _flags, ftype, rpayload = self._replies.get(timeout=10)
-                    except queue.Empty as e:
-                        # The reply may still land later — and from that
-                        # moment the queue can no longer be matched to
-                        # requests (a late ACK would be consumed as the
-                        # NEXT operation's reply: a one-off control
-                        # desync). Drain anything pending and POISON the
-                        # transport: the reader loop then reconnects and
-                        # resubscribes every recorded channel from its last
-                        # seen id. This channel is NOT recorded (the
-                        # subscribe did not complete) — retry it explicitly.
-                        while True:
-                            try:
-                                self._replies.get_nowait()
-                            except queue.Empty:
-                                break
+        pushes = []
+        try:
+            with self._write_lock:
+                self._control_busy = True
+                try:
+                    self._conn._transport.write_frame(frame_type, payload)
+                    while True:
                         try:
-                            self._conn._transport._poison()
-                        except Exception:
-                            pass
-                        raise OperationalError(
-                            "subscriber control reply timed out (no frame within 10s); "
-                            "connection poisoned — the reader loop reconnects and "
-                            "resubscribes recorded channels, retry this call"
-                        ) from e
-                    if ftype == _proto.RESP_PUSH:
-                        self._dispatch(rpayload)
-                        continue
-                    if ftype == _proto.RESP_PONG:
-                        continue  # keepalive echo racing our request
-                    if ftype == _proto.RESP_ERROR:
-                        # A server-side rejection is a statement error, not a
-                        # transport failure — InterfaceError would wrongly
-                        # declare the whole connection dead.
-                        raise map_server_error(rpayload.decode("utf-8", "replace"))
-                    break
-            finally:
-                self._control_busy = False
+                            _flags, ftype, rpayload = self._replies.get(timeout=10)
+                        except queue.Empty as e:
+                            # The reply may still land later — and from that
+                            # moment the queue can no longer be matched to
+                            # requests (a late ACK would be consumed as the
+                            # NEXT operation's reply: a one-off control
+                            # desync). Drain anything pending and POISON the
+                            # transport: the reader loop then reconnects and
+                            # resubscribes every recorded channel from its last
+                            # seen id. This channel is NOT recorded (the
+                            # subscribe did not complete) — retry it explicitly.
+                            # Mark the queue stale BEFORE draining: frames the
+                            # reader is about to put were read off this dying
+                            # wire and belong to a dead request (the reader
+                            # drops them while stale; the reconnect-side drain
+                            # closes the check-vs-put race).
+                            self._replies_stale = True
+                            while True:
+                                try:
+                                    self._replies.get_nowait()
+                                except queue.Empty:
+                                    break
+                            try:
+                                self._conn._transport._poison()
+                            except Exception:
+                                pass
+                            raise OperationalError(
+                                "subscriber control reply timed out (no frame within 10s); "
+                                "connection poisoned — the reader loop reconnects and "
+                                "resubscribes recorded channels, retry this call"
+                            ) from e
+                        if ftype == _proto.RESP_PUSH:
+                            # Buffer, never dispatch here: _dispatch runs the
+                            # USER callback, and a callback calling
+                            # subscribe()/unsubscribe() re-enters _control on
+                            # this same thread — under the held write lock
+                            # that is a permanent deadlock (non-reentrant).
+                            pushes.append(rpayload)
+                            continue
+                        if ftype == _proto.RESP_PONG:
+                            continue  # keepalive echo racing our request
+                        if ftype == _proto.RESP_ERROR:
+                            # A server-side rejection is a statement error, not a
+                            # transport failure — InterfaceError would wrongly
+                            # declare the whole connection dead.
+                            raise map_server_error(rpayload.decode("utf-8", "replace"))
+                        break
+                finally:
+                    self._control_busy = False
+        finally:
+            # Deliver buffered pushes with the lock released (see above); they
+            # were received before the control reply either way.
+            for p in pushes:
+                self._dispatch(p)
 
     def _dispatch(self, payload):
         try:
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
+            return
+        try:
+            self._on_message(msg)
+        except Exception:
+            # Delivery FAILED: keep the old watermark so the next resubscribe
+            # replays this message instead of resuming past it — the cursor
+            # used to advance before the callback ran, so a message whose
+            # consumer threw was never redelivered after a reconnect.
+            print("docsql.Subscriber: on_message callback raised", file=sys.stderr)
             return
         channel = msg.get("channel")
         mid = msg.get("id")
@@ -199,12 +244,6 @@ class Subscriber:
             prev = self._last_id.get(channel)
             if prev is None or mid > prev:
                 self._last_id[channel] = mid
-        try:
-            self._on_message(msg)
-        except Exception:
-            import sys
-
-            print("docsql.Subscriber: on_message callback raised", file=sys.stderr)
 
     def _run(self):
         """Reader-thread main loop: read until the connection breaks, then
@@ -237,9 +276,18 @@ class Subscriber:
                     # Idle keepalive: proves the connection (and beats
                     # DOCSQL_IDLE_TIMEOUT). The PONG echo is dropped below;
                     # never sent while a control round trip may claim it.
-                    with self._write_lock:
-                        if not self._conn._transport._closed:
-                            self._conn._transport.write_frame(_proto.REQ_PING, b"")
+                    # The lock is taken NON-BLOCKING: a plain acquire could
+                    # park this reader for a control call's full 10s reply
+                    # budget — and this reader is the very thread that must
+                    # queue that reply (check-then-block was a TOCTOU:
+                    # _control_busy can flip between the check and the
+                    # lock). Skip the round when the wire is owned.
+                    if self._write_lock.acquire(blocking=False):
+                        try:
+                            if not self._conn._transport._closed:
+                                self._conn._transport.write_frame(_proto.REQ_PING, b"")
+                        finally:
+                            self._write_lock.release()
                 continue
             idle_polls = 0
             _flags, ftype, payload = got
@@ -247,6 +295,14 @@ class Subscriber:
                 self._dispatch(payload)
             elif ftype == _proto.RESP_PONG:
                 pass  # keepalive echo (the resubscribe drain has its own PONG)
+            elif self._replies_stale:
+                # A control call timed out and poisoned this wire: any other
+                # frame read off it is a late arrival for a dead request.
+                # Queueing it would let the NEXT control call (already on
+                # the reconnected transport) mistake it for its own ACK —
+                # a one-off control desync. Drop it; the resume cursors
+                # make lost replays recoverable, desynced ACKs are not.
+                continue
             else:
                 self._replies.put(got)
 
@@ -258,6 +314,12 @@ class Subscriber:
             if self._closed.is_set():
                 return False
             time.sleep(delay)
+            # close() may have fired DURING the sleep: its join(5s) can have
+            # already timed out (backoff sleeps grow to 8s), so close()'s
+            # post-join sweep has run — a connection installed now would
+            # never be swept and leak against the server's conn budget.
+            if self._closed.is_set():
+                return False
             delay = min(delay * 2, 8.0)
             try:
                 self._conn = connect(**self._conn_kwargs)
@@ -266,6 +328,26 @@ class Subscriber:
                 # garbage): catching only Error used to let them escape the
                 # reader thread entirely, killing the subscriber silently.
                 continue
+            if self._closed.is_set():
+                # close() raced the install: nobody will ever read or close
+                # this socket (close()'s own sweep has already passed).
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                return False
+            # New wire: drop anything still queued — it was read off the
+            # poisoned transport after the timeout drain (that drain raced
+            # this thread's puts; the reader is the only producer, so THIS
+            # drain is race-free) — then stop dropping.
+            while True:
+                try:
+                    self._replies.get_nowait()
+                except queue.Empty:
+                    break
+            self._replies_stale = False
+            pushes = []
+            confirmed = False
             try:
                 # The write+drain holds the write lock: a concurrent
                 # subscribe() interleaving its own frames on the raw socket
@@ -298,9 +380,13 @@ class Subscriber:
                         while True:
                             _flags, ftype, payload = self._conn._transport.read_frame()
                             if ftype == _proto.RESP_PUSH:
-                                self._dispatch(payload)
+                                # Buffered, dispatched below with the lock
+                                # released — user callbacks must never run
+                                # under _write_lock (see _control).
+                                pushes.append(payload)
                             elif ftype == _proto.RESP_PONG:
-                                return True
+                                confirmed = True
+                                break
                             elif ftype == _proto.RESP_ERROR:
                                 # A channel failed to re-register (authz
                                 # change, bad payload): swallowing this
@@ -323,6 +409,20 @@ class Subscriber:
                         self._control_busy = False
             except Exception:
                 continue
+            finally:
+                # Replay pushes with the lock released (see _control).
+                for p in pushes:
+                    self._dispatch(p)
+            if confirmed:
+                if self._closed.is_set():
+                    # close() raced the drain: same leak as above — the
+                    # reader is about to exit and nobody else will close it.
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    return False
+                return True
         print(
             "docsql.Subscriber: reconnect budget exhausted; reader thread exiting "
             "(call close() and construct a new Subscriber to retry)",

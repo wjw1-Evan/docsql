@@ -196,7 +196,6 @@ async fn http_headers(
     body: Option<&str>,
     extra_headers: &[String],
 ) -> HttpResponse {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     if let Some(t) = token {
         req.push_str(&format!("X-Docsql-Token: {t}\r\n"));
@@ -213,6 +212,36 @@ async fn http_headers(
         req.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
     req.push_str("\r\n");
+    http_send(addr, req, body).await
+}
+
+/// POST with an explicit Content-Type instead of the helpers' JSON default —
+/// a cross-site HTML form posts `application/x-www-form-urlencoded` without
+/// a CORS preflight, exactly the shape the JSON-body CSRF gates (backup
+/// trigger, logout) must refuse.
+async fn http_post_ct(
+    addr: &str,
+    path: &str,
+    cookie: Option<&str>,
+    ct: &str,
+    body: &str,
+) -> HttpResponse {
+    let mut req = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(c) = cookie {
+        req.push_str(&format!("Cookie: {c}\r\n"));
+    }
+    req.push_str(&format!(
+        "Content-Type: {ct}\r\nContent-Length: {}\r\n",
+        body.len()
+    ));
+    req.push_str("\r\n");
+    http_send(addr, req, Some(body)).await
+}
+
+/// Write a prebuilt request head (+ optional body) on a fresh connection
+/// and parse the response (shared by the helpers above).
+async fn http_send(addr: &str, req: String, body: Option<&str>) -> HttpResponse {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(req.as_bytes()).await.unwrap();
     if let Some(b) = body {
         stream.write_all(b.as_bytes()).await.unwrap();
@@ -322,6 +351,12 @@ async fn console_page_served_over_http() {
     assert!(html.contains("docsql.ui.editorRatio")); // draggable editor/results split
     assert!(html.contains("aboutDialog")); // redesigned About dialog
     assert!(html.contains("复制诊断信息"));
+    // Table-script generator sanitizes the comment's row/page counts (a
+    // compromised node could otherwise smuggle newlines through /api/meta
+    // and close the comment early), and logout posts a JSON body so the
+    // endpoint's CSRF gate accepts the console's own call.
+    assert!(html.contains("safeNum"));
+    assert!(html.contains("body: '{}'"));
 
     // The API surface is JSON-only: a bare GET on it is rejected.
     let res = http(&addr, "GET", "/api/sql", None, None).await;
@@ -1209,7 +1244,7 @@ async fn console_account_setup_login_and_gate() {
             .status,
         200
     );
-    let r = http_cookie(&addr, "POST", "/api/auth/logout", &cookie, None).await;
+    let r = http_cookie(&addr, "POST", "/api/auth/logout", &cookie, Some("{}")).await;
     assert_eq!(r.status, 200);
     assert_eq!(
         http_cookie(&addr, "GET", "/api/meta", &cookie, None)
@@ -1222,6 +1257,82 @@ async fn console_account_setup_login_and_gate() {
             .await
             .status,
         200
+    );
+}
+
+/// Logout is a state-changing endpoint, so it carries the same JSON-body
+/// CSRF gate as the backup trigger: a plain HTML form can post
+/// `application/x-www-form-urlencoded` (or nothing at all) cross-site
+/// without a CORS preflight and used to force-close the operator's
+/// session. Only a real JSON body logs out — and it must actually drop
+/// the session server-side and clear the cookie.
+#[tokio::test]
+async fn logout_requires_json_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("console-auth.json");
+    let addr = start_web_auth(
+        None,
+        Vec::new(),
+        None,
+        Some(auth_file.to_string_lossy().into_owned()),
+    )
+    .await;
+
+    // Setup mints the account plus the operator's session.
+    let body = creds_body("admin", &users_test_pw());
+    let r = http(&addr, "POST", "/api/auth/setup", None, Some(&body)).await;
+    assert_eq!(r.status, 200);
+    let cookie = r.header("set-cookie").expect("session cookie").to_string();
+    assert!(cookie.starts_with("docsql_session="), "{cookie}");
+
+    // Bodyless POST — what a cross-site form auto-submits — is refused.
+    assert_eq!(
+        http_cookie(&addr, "POST", "/api/auth/logout", &cookie, None)
+            .await
+            .status,
+        415,
+        "bodyless logout must be rejected"
+    );
+    // A form-encoded body is refused the same way: no JSON content type,
+    // no logout.
+    assert_eq!(
+        http_post_ct(
+            &addr,
+            "/api/auth/logout",
+            Some(&cookie),
+            "application/x-www-form-urlencoded",
+            "x=1"
+        )
+        .await
+        .status,
+        415,
+        "form-encoded logout must be rejected"
+    );
+
+    // Both refusals left the session alive (the probes must not log out).
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie, None)
+            .await
+            .status,
+        200,
+        "rejected CSRF probes must not close the operator's session"
+    );
+
+    // A real JSON body logs out: 200, cookie cleared, session gone.
+    let r = http_cookie(&addr, "POST", "/api/auth/logout", &cookie, Some("{}")).await;
+    assert_eq!(r.status, 200);
+    let clear = r.header("set-cookie").unwrap().to_string();
+    assert_eq!(r.json()["ok"], true);
+    assert!(
+        clear.contains("Max-Age=0"),
+        "logout must clear the cookie: {clear}"
+    );
+    assert_eq!(
+        http_cookie(&addr, "GET", "/api/meta", &cookie, None)
+            .await
+            .status,
+        401,
+        "the dropped session must not open data endpoints anymore"
     );
 }
 
@@ -2163,7 +2274,7 @@ async fn auth_disabled_surface_and_no_upstream_backup() {
             .status,
         404
     );
-    let r = http(&addr, "POST", "/api/auth/logout", None, None).await;
+    let r = http(&addr, "POST", "/api/auth/logout", None, Some("{}")).await;
     assert_eq!(r.status, 200);
     let clear = r.header("set-cookie").unwrap().to_string();
     assert_eq!(r.json()["ok"], true);

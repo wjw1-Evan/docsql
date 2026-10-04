@@ -263,10 +263,29 @@ impl TsqlSession {
                 // SELECT @a = e1, @b = e2 <tail>: one scan assigns every
                 // variable from the LAST row (T-SQL rowset-assignment
                 // rules; an empty scan leaves the variables unchanged).
+                // The scan is a statement for @@ROWCOUNT: the classic
+                // `IF @@ROWCOUNT = 0` guard after a SELECT-assignment
+                // must read the scan's row count, not the previous
+                // Plain's stale value.
                 let exprs: Vec<&str> = assigns.iter().map(|(_, e)| e.as_str()).collect();
                 let query = format!("SELECT {} {}", exprs.join(", "), tail);
                 let rendered = self.substitute(&query)?;
-                if let Some(row) = self.eval_tracked(exec, &rendered).await? {
+                let mut last: Option<Vec<Value>> = None;
+                match exec.execute(&rendered).await {
+                    Ok(ExecResult::Rows(r)) => {
+                        self.rowcount = r.rows.len() as u64;
+                        last = r.rows.into_iter().last();
+                    }
+                    Ok(ExecResult::Affected(n)) => {
+                        self.rowcount = n;
+                    }
+                    Err(e) => {
+                        self.last_error = error_number(&e);
+                        return Err(e);
+                    }
+                }
+                self.last_error = 0;
+                if let Some(row) = last {
                     for (i, (name, _)) in assigns.iter().enumerate() {
                         let v = row.get(i).cloned().unwrap_or(Value::Null);
                         self.vars.insert(name.clone(), v);
@@ -1251,6 +1270,45 @@ impl<'a> Parser<'a> {
         self.word_after_is_transaction(self.i + 5)
     }
 
+    /// At `j` (just past a `begin` word): does TRY or CATCH follow
+    /// (word-level, trivia-tolerant)? Those spell the compound
+    /// TRY…CATCH statement, never a plain BEGIN…END block.
+    fn word_after_is_try_or_catch(&self, mut j: usize) -> bool {
+        loop {
+            while j < self.b.len() && self.b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if self.b.get(j) == Some(&b'-') && self.b.get(j + 1) == Some(&b'-') {
+                while j < self.b.len() && self.b[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            if self.b.get(j) == Some(&b'/') && self.b.get(j + 1) == Some(&b'*') {
+                j += 2;
+                while j + 1 < self.b.len() && !(self.b[j] == b'*' && self.b[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(self.b.len());
+                continue;
+            }
+            break;
+        }
+        let lb = self.lb();
+        for kw in ["try", "catch"] {
+            let kb = kw.as_bytes();
+            if self.b.len() >= j + kb.len()
+                && &lb[j..j + kb.len()] == kb
+                && (self.b.len() == j + kb.len()
+                    || !(self.b[j + kb.len()].is_ascii_alphanumeric()
+                        || self.b[j + kb.len()] == b'_'))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// At `j` (just past a `begin` word): does a transaction keyword follow,
     /// skipping trivia? Used both at the cursor (`begin_starts_transaction`)
     /// and inside block-shape scans that look ahead.
@@ -1944,8 +2002,15 @@ impl<'a> Parser<'a> {
     /// plain statement.
     fn parse_governed(&mut self, depth: usize) -> Result<Vec<Stmt>> {
         if self.peek_word() == Some(b"begin") && self.begin_opens_block() {
-            self.i += 5;
-            return self.parse_block(depth);
+            // `BEGIN TRY`/`BEGIN CATCH` directly under IF/WHILE/ELSE is the
+            // compound TRY…CATCH statement, not a plain block: parse_block
+            // would stop at the first `END` and leak END TRY's trailing
+            // word into the next statement (the whole batch then failed to
+            // parse). parse_one_stmt has the dedicated compound arm.
+            if !self.word_after_is_try_or_catch(self.i + 5) {
+                self.i += 5;
+                return self.parse_block(depth);
+            }
         }
         // `IF … BREAK` / `WHILE … CONTINUE` govern the flow statements
         // themselves, not a plain run spelling the keyword; the same goes
@@ -2217,11 +2282,19 @@ fn leading_trivia_end(text: &str) -> usize {
 /// Strip one layer of single quotes; anything else returns as-is.
 fn unquote_literal(s: &str) -> String {
     let t = s.trim();
-    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
-        t[1..t.len() - 1].replace("''", "'")
-    } else {
-        t.to_string()
+    // Only unquote a SINGLE well-formed literal: `'x' + 'y'` (a
+    // concatenation) starts and ends with a quote too, and peeling one
+    // layer mangled the message into `x' + 'y` with the inner quotes
+    // exposed. Anything that is not exactly one closed literal stays raw.
+    if t.starts_with('\'') {
+        if let (_, true) = stmt::sql_literal_end(t, 0) {
+            let end = stmt::sql_literal_end(t, 0).0;
+            if t[end..].trim().is_empty() {
+                return t[1..end - 1].replace("''", "'");
+            }
+        }
     }
+    t.to_string()
 }
 
 /// True when the script needs the interpreter: any control-flow or
@@ -2439,6 +2512,83 @@ mod tests {
             Some(ExecResult::Rows(r)) => r.rows.clone(),
             other => panic!("expected rows, got {other:?}"),
         }
+    }
+
+    /// IF/WHILE 直接管辖的 BEGIN TRY…CATCH 曾被当普通块解析,END TRY 的
+    /// 尾词漏进下一条语句,整批必挂。
+    #[test]
+    fn if_and_while_govern_begin_try_catch() {
+        let mut db = DbExec::new();
+        let mut ses = TsqlSession::new();
+        run_script(
+            &mut ses,
+            &mut db,
+            "CREATE TABLE t (a INT)\nINSERT INTO t VALUES (0)",
+        )
+        .unwrap();
+        let out = run_script(
+            &mut ses,
+            &mut db,
+            "IF 1 = 1\nBEGIN TRY\n INSERT INTO missing VALUES (1)\nEND TRY\nBEGIN CATCH\n UPDATE t SET a = 99\nEND CATCH\nSELECT a FROM t",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(99)]]);
+
+        let out = run_script(
+            &mut ses,
+            &mut db,
+            "DECLARE @i INT = 0\nWHILE @i < 1\nBEGIN TRY\n SET @i = @i + 1\nEND TRY\nBEGIN CATCH\n SET @i = 99\nEND CATCH\nSELECT @i",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(1)]]);
+
+        // 条件为假的分支同样不再解析失败。
+        let out = run_script(
+            &mut ses,
+            &mut db,
+            "IF 1 = 2\nBEGIN TRY\n INSERT INTO missing VALUES (1)\nEND TRY\nBEGIN CATCH\n UPDATE t SET a = -1\nEND CATCH\nSELECT a FROM t",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(99)]]);
+    }
+
+    /// SELECT 赋值语句必须刷新 @@ROWCOUNT(经典 `IF @@ROWCOUNT = 0` 守卫)。
+    #[test]
+    fn select_assignment_refreshes_rowcount() {
+        let mut db = DbExec::new();
+        let mut ses = TsqlSession::new();
+        run_script(
+            &mut ses,
+            &mut db,
+            "CREATE TABLE e (a INT)\nINSERT INTO e VALUES (9)",
+        )
+        .unwrap();
+        let out = run_script(
+            &mut ses,
+            &mut db,
+            "DECLARE @a INT\nSELECT @a = a FROM e WHERE a = 99\nSELECT @@ROWCOUNT",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(0)]]);
+        let out = run_script(
+            &mut ses,
+            &mut db,
+            "SELECT @a = a FROM e WHERE a = 9\nSELECT @@ROWCOUNT",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(1)]]);
+    }
+
+    /// RAISERROR 拼接型消息参数不再被剥成残句。
+    #[test]
+    fn raiserror_concat_message_stays_raw() {
+        let mut db = DbExec::new();
+        let mut ses = TsqlSession::new();
+        let err = run_script(&mut ses, &mut db, "RAISERROR('x' + 'y', 16, 1)").unwrap_err();
+        assert!(err.to_string().contains("error 50000"), "{err}");
+        // The raw expression keeps its outer quotes; the old bug peeled one
+        // layer and exposed `x' + 'y`.
+        assert!(err.to_string().contains("'x' + 'y'"), "{err}");
     }
 
     /// 无括号包裹的 CASE 表达式:read_plain 曾在其 ELSE 处切断语句,残留的

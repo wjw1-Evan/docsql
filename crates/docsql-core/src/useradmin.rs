@@ -343,7 +343,43 @@ fn is_word_byte(b: u8) -> bool {
 fn parse_grant_with_filter(sql: &str) -> Result<UserAdminStmt, String> {
     let where_at = find_top_level_word(sql, "WHERE", 0, false)
         .ok_or_else(|| "WHERE without a position".to_string())?;
-    let to_at = find_top_level_word(sql, "TO", where_at, true)
+    // The clause marker is the first top-level TO that still has a grantee
+    // after it. A user/role literally named `to` makes the LAST TO the
+    // grantee itself (`… WHERE x > 0 TO to`): picking the last TO mistook
+    // the grantee for the marker and the parse failed on a legal grant.
+    let b = sql.as_bytes();
+    let mut to_at: Option<usize> = None;
+    let mut scan = where_at;
+    while let Some(p) = find_top_level_word(sql, "TO", scan, false) {
+        let mut k = p + 2;
+        loop {
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if b.get(k) == Some(&b'-') && b.get(k + 1) == Some(&b'-') {
+                k = (k..b.len())
+                    .find(|&i| b[i] == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(b.len());
+                continue;
+            }
+            if b.get(k) == Some(&b'/') && b.get(k + 1) == Some(&b'*') {
+                k += 2;
+                while k + 1 < b.len() && !(b[k] == b'*' && b[k + 1] == b'/') {
+                    k += 1;
+                }
+                k = (k + 2).min(b.len());
+                continue;
+            }
+            break;
+        }
+        if k < b.len() && (is_word_start(b, k) || b[k] == b'"') {
+            to_at = Some(p);
+            break;
+        }
+        scan = p + 2;
+    }
+    let to_at = to_at
         .ok_or_else(|| "GRANT ... WHERE requires TO <grantee> after the predicate".to_string())?;
     let predicate = sql[where_at + "WHERE".len()..to_at].trim();
     if predicate.is_empty() {
@@ -765,10 +801,17 @@ pub fn redact_sql(sql: &str) -> String {
                 // their literals verbatim.
                 let mut k = j;
                 let mut mask_end: Option<usize> = None;
+                // `(` opens a mistyped group (`PASSWORD ('pw')`): skip it so
+                // the literal inside is found, and remember to swallow its
+                // closing paren into the mask.
+                let mut paren = false;
                 loop {
                     let rest = &sql[k..];
                     let Some(c) = rest.chars().next() else { break };
-                    if c.is_whitespace() || c == '=' || c == 'N' || c == 'n' {
+                    if c.is_whitespace() || c == '=' || c == 'N' || c == 'n' || c == '(' {
+                        if c == '(' {
+                            paren = true;
+                        }
                         k += c.len_utf8();
                     } else if rest.starts_with("/*") {
                         match rest.find("*/") {
@@ -784,6 +827,10 @@ pub fn redact_sql(sql: &str) -> String {
                         let (end, closed) = crate::stmt::sql_literal_end(sql, k);
                         let value = &sql[k + 1..if closed { end - 1 } else { bytes.len() }];
                         if !kdf::is_stored_form(value) {
+                            let mut end = end;
+                            if paren && sql.as_bytes().get(end) == Some(&b')') {
+                                end += 1;
+                            }
                             mask_end = Some(end);
                         }
                         break;
@@ -859,7 +906,12 @@ pub fn redact_sql(sql: &str) -> String {
                             .map(|p| k + p)
                             .unwrap_or(sql.len());
                         mask_end = Some(end);
-                        break;
+                        // Keep scanning: a hex-bitmap mistype (`PASSWORD
+                        // x'..'`) has its literal right after the bare word,
+                        // and stopping here used to leave that literal for
+                        // the main loop to copy verbatim.
+                        k = end;
+                        continue;
                     } else {
                         break;
                     }
@@ -1910,6 +1962,34 @@ mod tests {
         // 不是赋值形态:password 列后的普通字面量原样保留。
         let sel = "SELECT password FROM t WHERE note = 'my PASSWORD is fine'";
         assert_eq!(redact_sql(sel), sel);
+
+        // 十六进制位图误打(`x'..'`)与括号组形态(`('..')`):裸词/括号之后
+        // 紧跟的字面量曾 fail-open 地整段进审计日志。
+        for sql in [
+            "CREATE USER eve PASSWORD x's3cret-pw12'",
+            "CREATE USER eve PASSWORD ('s3cret-pw12')",
+        ] {
+            let redacted = redact_sql(sql);
+            assert!(!redacted.contains("s3cret-pw12"), "{sql} -> {redacted}");
+            assert!(redacted.contains("PASSWORD '***'"), "{sql} -> {redacted}");
+        }
+        // 关键词续接(合法列引用)不受新扫描影响。
+        let sel2 = "SELECT password FROM t";
+        assert_eq!(redact_sql(sel2), sel2);
+    }
+
+    /// 受让人恰名为 `to` 时,最后一个顶层 TO 是受让人自己:子句标记必须是
+    /// 「其后还有名字」的那个 TO。
+    #[test]
+    fn grant_with_filter_to_grantee_named_to() {
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE t (x INT)").unwrap();
+        db.execute("CREATE USER to PASSWORD 'pw12345678'").unwrap();
+        db.execute("GRANT SELECT ON t WHERE x > 0 TO to")
+            .unwrap_or_else(|e| panic!("grant to user named 'to': {e}"));
+        // 渲染回放(带双引号受让人)同样成立。
+        db.execute("GRANT SELECT ON t WHERE x > 1 TO \"to\"")
+            .unwrap();
     }
 
     /// 过滤式 GRANT 的路由预筛曾是字面 " ON " 子串:换行/制表符分隔的合法

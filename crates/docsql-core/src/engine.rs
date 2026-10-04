@@ -3776,6 +3776,12 @@ impl<'a> ReadCx<'a> {
                 op: compare_op.clone(),
                 right: Box::new(v),
             };
+            // Comparisons are NOT two-valued everywhere: a Timestamp against
+            // an unparseable string evaluates to Null, and OR/AND of Null
+            // errors out. An unknown comparison never satisfies the element
+            // for ANY, and makes the whole ALL chain fail to prove — both
+            // fold to FALSE under COALESCE, matching WHERE-visible semantics.
+            let cmp = coalesce_false(cmp);
             acc = Some(match acc {
                 None => cmp,
                 Some(prev) => SqlExpr::BinaryOp {
@@ -6320,6 +6326,10 @@ impl Database {
 
     /// ROLLBACK TO SAVEPOINT name: restore that savepoint's state; the
     /// outer transaction continues and later savepoints are discarded.
+    /// The named savepoint itself is discarded too (a documented divergence
+    /// from SQLite/PG, pinned by duplicate_savepoint_names_resolve_to_newest:
+    /// a second ROLLBACK TO the same name resolves to the OLDER same-named
+    /// savepoint, not an error).
     fn rollback_to_savepoint(&mut self, name: &str) -> Result<ExecOutcome> {
         let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) else {
             return err(format!("savepoint {name} does not exist"));
@@ -7785,17 +7795,69 @@ impl Database {
     /// Table/view grants for a dropped object are garbage: delete them
     /// before the catalog change (recreating the same name must not
     /// resurrect the old privileges). Autocommit statements; replay order
-    /// on peers is identical.
-    fn delete_grants_for(&mut self, names: &[String]) {
+    /// on peers is identical. The deleted ROWS come back to the caller:
+    /// a failure of the main DDL after this point must restore them, or
+    /// the node keeps a grants divergence no journal entry explains.
+    /// Errors propagate — the old `.ok()` swallowed disk failures into a
+    /// silent half-drop.
+    fn delete_grants_for(&mut self, names: &[String]) -> Result<Vec<Object>> {
+        // The grants table is created lazily on the first user-admin write;
+        // a node with no users has no grants to clean.
+        if !self.tables.contains_key(crate::useradmin::GRANTS_TABLE) {
+            return Ok(Vec::new());
+        }
+        let mut deleted = Vec::new();
         for name in names {
             if !is_internal_table(name) {
                 let lit_name = crate::stmt::sql_string_literal(name);
+                if let Ok(ExecOutcome::Rows(r)) = self.execute(&format!(
+                    "SELECT * FROM {} WHERE tbl = {}",
+                    crate::useradmin::GRANTS_TABLE,
+                    lit_name
+                )) {
+                    for row in &r.rows {
+                        let mut obj = Object::new();
+                        for (c, v) in r.columns.iter().zip(row.iter()) {
+                            obj.insert(c.clone(), v.clone());
+                        }
+                        deleted.push(obj);
+                    }
+                }
                 self.execute(&format!(
                     "DELETE FROM {} WHERE tbl = {}",
                     crate::useradmin::GRANTS_TABLE,
                     lit_name
-                ))
-                .ok();
+                ))?;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Best-effort restore of grant rows a failed DDL must put back. Only
+    /// reachable on a main-DDL failure after the grants autocommit landed;
+    /// a restore failure is shouted to stderr (the alternative — silence —
+    /// is the divergence this helper exists to close).
+    fn restore_grant_rows(&mut self, rows: &[Object]) {
+        for row in rows {
+            let cols: Vec<String> = row.keys().cloned().collect();
+            let vals: Vec<String> = row
+                .values()
+                .map(|v| value_literal(v).unwrap_or_else(|_| "NULL".to_string()))
+                .collect();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                crate::useradmin::GRANTS_TABLE,
+                cols.iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                vals.join(", ")
+            );
+            if let Err(e) = self.execute(&sql) {
+                eprintln!(
+                    "warning: failed to restore grant rows after a failed DDL ({e}); \
+                     run the DDL again or REVOKE manually"
+                );
             }
         }
     }
@@ -7961,7 +8023,7 @@ impl Database {
                     // the in-memory catalog (the next successful write would
                     // persist a half-drop that never freed anything).
                     let catalog_prev = self.tables.clone();
-                    self.delete_grants_for(&dropping);
+                    let grants_deleted = self.delete_grants_for(&dropping)?;
                     let mut tx = self.pager.begin_tx();
                     for name in &dropping {
                         self.tables.remove(name);
@@ -7974,6 +8036,7 @@ impl Database {
                         Err(e) => {
                             self.pager.abort_tx(tx)?;
                             self.tables = catalog_prev;
+                            self.restore_grant_rows(&grants_deleted);
                             return Err(e);
                         }
                     }
@@ -8059,7 +8122,7 @@ impl Database {
                 // next successful write would persist a half-drop whose
                 // pages were never freed).
                 let catalog_prev = self.tables.clone();
-                self.delete_grants_for(&dropping);
+                let grants_deleted = self.delete_grants_for(&dropping)?;
                 let mut tx = self.pager.begin_tx();
                 // CASCADE drops the referencing FK declarations along with
                 // the table (PostgreSQL semantics): the child table stays,
@@ -8096,6 +8159,7 @@ impl Database {
                     Err(e) => {
                         self.pager.abort_tx(tx)?;
                         self.tables = catalog_prev;
+                        self.restore_grant_rows(&grants_deleted);
                         Err(e)
                     }
                 }
@@ -8679,11 +8743,13 @@ impl Database {
             // per FK inside check_fks_in) — keep the timeout armed.
             self.stmt_deadline.check()?;
             meta.check(doc)?;
-            self.check_fks_in(&tname, &meta, doc, &out)?;
+            self.check_fks_in(&tname, &meta, doc, &out, Some(&out))?;
         }
         meta.check_unique(&out)?;
         // Parent-side FK: key values that disappear must not be referenced.
-        self.check_fk_parent_delete(&tname, &old_changed, &out)?;
+        // The self-reference child scan runs over the final images (`out`
+        // IS the whole final table here — untouched rows included).
+        self.check_fk_parent_delete_skipping(&tname, &old_changed, &out, &[], Some(&out))?;
         let changed = changed_docs.clone();
         self.rewrite_table(&tname, &mut meta, out)?;
         if let Some(ret) = &update_returning {
@@ -8721,28 +8787,50 @@ impl Database {
             updates.push((loc, old_doc, doc));
         }
         // 子侧 FK 在收集完本语句全部最终像之后统一校验:自引用/行间引用
-        // 的父候选包含批次自身。
-        {
-            let batch: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
-            for doc in &batch {
-                // Big UPDATEs (with a FK, check_fks_in also scans the parent
-                // table per row) must stay interruptible.
-                self.stmt_deadline.check()?;
-                self.check_fks_in(&tname, &meta, doc, &batch)?;
-            }
-        }
+        // 的父候选包含批次自身。零命中在下方早退(空批次检查是 no-op)。
         if updates.is_empty() {
             if let Some(ret) = update_returning {
                 return project_returning(ret, &[]);
             }
             return Ok(ExecOutcome::Affected(0));
         }
+        // Self-referential FKs resolve parents against the statement's
+        // COMPLETE final state (pre-state minus replaced old images plus the
+        // new images); the pre-state heap alone would satisfy keys this
+        // statement vacates (`SET id = 3, p = 1 WHERE id = 1`). Only
+        // self-FK tables pay the extra table load.
+        let self_final: Option<Vec<Object>> =
+            if meta.foreign_keys.iter().any(|(_, rt, _)| rt == &tname) {
+                let old_keys: std::collections::BTreeSet<Vec<u8>> =
+                    updates.iter().map(|(_, o, _)| object_key(o)).collect();
+                let mut final_state = self.table_docs_cx(&tname)?;
+                final_state.retain(|d| !old_keys.contains(&object_key(d)));
+                final_state.extend(updates.iter().map(|(_, _, n)| n.clone()));
+                Some(final_state)
+            } else {
+                None
+            };
+        {
+            let batch: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
+            for doc in &batch {
+                // Big UPDATEs (with a FK, check_fks_in also scans the parent
+                // table per row) must stay interruptible.
+                self.stmt_deadline.check()?;
+                self.check_fks_in(&tname, &meta, doc, &batch, self_final.as_deref())?;
+            }
+        }
         // Parent-side FK check before any page is touched. `updates` rows
         // are the only ones whose key values can disappear; their new docs
         // are the survivors (referenced columns are unique in practice).
         let old_docs: Vec<Object> = updates.iter().map(|(_, o, _)| o.clone()).collect();
         let new_docs: Vec<Object> = updates.iter().map(|(_, _, n)| n.clone()).collect();
-        self.check_fk_parent_delete(&tname, &old_docs, &new_docs)?;
+        self.check_fk_parent_delete_skipping(
+            &tname,
+            &old_docs,
+            &new_docs,
+            &[],
+            self_final.as_deref(),
+        )?;
         // Pre-statement docs for the legacy whole-set unique check below —
         // loaded only when that check can actually run (a constraint column
         // without a tree). Tables with full trees enforce uniqueness in the
@@ -8991,7 +9079,11 @@ impl Database {
             (kept, removed)
         };
         let count = removed.len() as u64;
-        self.check_fk_parent_delete(&tname, &removed, &[])?;
+        // The self-reference child scan runs over the FINAL state (`kept`):
+        // rows deleted by this same statement cannot end up orphaned, so
+        // `DELETE FROM self_ref_table` may clear parent and child rows
+        // together (SQLite/PG statement-final semantics).
+        self.check_fk_parent_delete_skipping(&tname, &removed, &[], &[], Some(&kept))?;
         self.rewrite_table(&tname, &mut meta, kept)?;
         if let Some(ret) = &returning {
             return project_returning(ret, &removed);
@@ -9020,9 +9112,31 @@ impl Database {
             }
             return Ok(ExecOutcome::Affected(0));
         }
-        // Parent-side FK check before any page is touched.
+        // Parent-side FK check before any page is touched. The self-reference
+        // child scan runs over the final state (pre-state minus the removed
+        // rows), so deleting parent and child rows of a self-FK table in one
+        // statement is legal; only self-FK tables pay the extra table load.
         let removed_docs: Vec<Object> = targets.iter().map(|(_, d)| d.clone()).collect();
-        self.check_fk_parent_delete(&tname, &removed_docs, &[])?;
+        let self_final: Option<Vec<Object>> =
+            if meta.foreign_keys.iter().any(|(_, rt, _)| rt == &tname) {
+                let rm: std::collections::BTreeSet<Vec<u8>> =
+                    targets.iter().map(|(_, d)| object_key(d)).collect();
+                Some(
+                    self.table_docs_cx(&tname)?
+                        .into_iter()
+                        .filter(|d| !rm.contains(&object_key(d)))
+                        .collect(),
+                )
+            } else {
+                None
+            };
+        self.check_fk_parent_delete_skipping(
+            &tname,
+            &removed_docs,
+            &[],
+            &[],
+            self_final.as_deref(),
+        )?;
         let mut heap = Heap {
             pages: meta.pages.clone(),
             overflow_free: meta.overflow_free.clone(),
@@ -9123,6 +9237,14 @@ impl Database {
                 "index names beginning with sqlite_autoindex_ are reserved for \
                  PRIMARY KEY/UNIQUE constraint indexes",
             );
+        }
+        // System/internal table names are unusable as index names: the
+        // server's write gate classifies DROP INDEX by name and would
+        // refuse to ever drop it (no other DROP INDEX entry point exists).
+        if is_system_table(&iname) || is_internal_table(&iname) {
+            return err(format!(
+                "index name {iname} is reserved for a system/internal table"
+            ));
         }
         // Index names share a database-wide namespace (SQLite semantics):
         // a name taken by any table blocks reuse elsewhere.
@@ -9424,15 +9546,27 @@ impl Database {
                         // column reads NULL — for a WHERE that is silently
                         // wrong rows) while the dump replays "fine". Refuse
                         // like RENAME does, scoped to views that actually
-                        // name the column.
-                        let view_refs: Vec<String> = self
-                            .direct_view_dependents(&[tname.to_string()])
+                        // name the column. The chain is TRANSITIVE: a
+                        // `SELECT *` middle layer carries the column upward
+                        // without naming it, so direct dependents alone
+                        // would let v2 = SELECT v FROM v1 degrade to NULL.
+                        let mut dep_chain = vec![tname.to_string()];
+                        loop {
+                            let deps = self.direct_view_dependents(&dep_chain);
+                            if deps.is_empty() {
+                                break;
+                            }
+                            dep_chain.extend(deps);
+                        }
+                        let view_refs: Vec<String> = dep_chain
                             .into_iter()
                             .filter(|v| {
-                                self.tables
-                                    .get(v)
-                                    .and_then(|m| m.view_sql.clone())
-                                    .is_some_and(|sql| text_references_ident(&sql, name))
+                                v != tname
+                                    && self
+                                        .tables
+                                        .get(v)
+                                        .and_then(|m| m.view_sql.clone())
+                                        .is_some_and(|sql| text_references_ident(&sql, name))
                             })
                             .collect();
                         if !view_refs.is_empty() {
@@ -9828,8 +9962,22 @@ impl Database {
                     if meta.autoguid.as_deref() == Some(old.as_str()) {
                         meta.autoguid = Some(new.clone());
                     }
-                    if let Some(root) = meta.index_roots.remove(old) {
-                        meta.index_roots.insert(new.clone(), root);
+                    // Only the column's OWN single-column tree rekeys with
+                    // the rename. A composite or JSON-path index NAMED like
+                    // the column keeps its def-name root — the def name does
+                    // not follow the column, and rekeying would graft an
+                    // Array/path-keyed tree onto the new column key where
+                    // DML would mix scalar keys into it.
+                    let own_tree = meta
+                        .index_defs
+                        .iter()
+                        .find(|d| d.name == *old)
+                        .map(|d| d.path.is_none() && d.columns.len() == 1 && d.columns[0] == *old)
+                        .unwrap_or(true);
+                    if own_tree {
+                        if let Some(root) = meta.index_roots.remove(old) {
+                            meta.index_roots.insert(new.clone(), root);
+                        }
                     }
                     meta.defaults = meta
                         .defaults
@@ -9964,16 +10112,30 @@ impl Database {
                     // would (a) resurrect onto a future same-named table —
                     // silent privilege escalation across unrelated data —
                     // and (b) break dump replay (GRANT on a table that no
-                    // longer exists aborts the whole restore).
+                    // longer exists aborts the whole restore). A failure of
+                    // the UPDATE fails the whole rename BEFORE the rewrite
+                    // (the catalog entry is restored below like every other
+                    // failure path); a rewrite failure reverts the grants
+                    // rows the same way.
                     let lit_old = crate::stmt::sql_string_literal(&tname);
                     let lit_new = crate::stmt::sql_string_literal(&new_name);
-                    self.execute(&format!(
-                        "UPDATE {} SET tbl = {} WHERE tbl = {}",
-                        crate::useradmin::GRANTS_TABLE,
-                        lit_new,
-                        lit_old
-                    ))
-                    .ok();
+                    let grants_update = if self.tables.contains_key(crate::useradmin::GRANTS_TABLE)
+                    {
+                        self.execute(&format!(
+                            "UPDATE {} SET tbl = {} WHERE tbl = {}",
+                            crate::useradmin::GRANTS_TABLE,
+                            lit_new,
+                            lit_old
+                        ))
+                    } else {
+                        Ok(ExecOutcome::Affected(0))
+                    };
+                    if let Err(e) = grants_update {
+                        if let Some(old) = old_entry {
+                            self.tables.insert(tname.clone(), old);
+                        }
+                        return Err(e);
+                    }
                     if let Err(e) = self.rewrite_table(&new_name, &mut meta, docs) {
                         // rewrite_table's own failure restore only covers the
                         // NEW name's entry (absent here) — without this the
@@ -9981,6 +10143,20 @@ impl Database {
                         // data pages) would vanish from the catalog.
                         if let Some(old) = old_entry {
                             self.tables.insert(tname.clone(), old);
+                        }
+                        // The grants UPDATE above already landed (autocommit):
+                        // point the rows back at the old name or the next
+                        // same-named table would inherit them.
+                        if let Err(e2) = self.execute(&format!(
+                            "UPDATE {} SET tbl = {} WHERE tbl = {}",
+                            crate::useradmin::GRANTS_TABLE,
+                            lit_old,
+                            lit_new
+                        )) {
+                            eprintln!(
+                                "warning: failed to revert grant rows after a failed \
+                                 RENAME ({e2}); re-run the RENAME or fix grants manually"
+                            );
                         }
                         return Err(e);
                     }
@@ -10027,12 +10203,20 @@ impl Database {
     /// images are legitimate parent candidates. Without them such rows were
     /// rejected (or, via UPDATE, created rows that dump/restore could never
     /// replay) even though SQLite/PG immediate FKs accept them.
+    ///
+    /// `self_final` is the statement's COMPLETE final state of `table` (the
+    /// pre-statement rows minus replaced old images plus the new images).
+    /// When provided, self-referential lookups use it ALONE: `same_batch`
+    /// plus the pre-statement heap would still satisfy values this very
+    /// statement removes (`UPDATE t SET id = 3, p = 1 WHERE id = 1`).
+    #[allow(clippy::too_many_arguments)]
     fn check_fks_in(
         &mut self,
         table: &str,
         meta: &TableMeta,
         doc: &Object,
         same_batch: &[Object],
+        self_final: Option<&[Object]>,
     ) -> Result<()> {
         for (col, rtable, rcol) in &meta.foreign_keys {
             let Some(v) = doc.get(col) else {
@@ -10050,8 +10234,18 @@ impl Database {
                     .map(|rv| Value::cmp_values(rv, v) == Ordering::Equal)
                     .unwrap_or(false)
             };
-            if rtable == table && same_batch.iter().any(matches_parent) {
-                continue;
+            if rtable == table {
+                if let Some(final_state) = self_final {
+                    if !final_state.iter().any(matches_parent) {
+                        return err(format!(
+                            "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
+                        ));
+                    }
+                    continue;
+                }
+                if same_batch.iter().any(matches_parent) {
+                    continue;
+                }
             }
             let ref_docs = self.table_docs_cx(rtable)?;
             if !ref_docs.iter().any(matches_parent) {
@@ -10758,6 +10952,11 @@ impl Database {
             if let Some(dup) = cols.iter().find(|c| !seen.insert((*c).clone())) {
                 return err(format!("duplicate column name: {dup}"));
             }
+            // Deliberately NOT validated against meta.columns: this is a
+            // document store — an explicit list may name schemaless fields
+            // the declared columns have not seen yet (observed-columns
+            // tracking and the schemaless SELECT * union depend on it;
+            // useradmin's own grants rows ride the same behavior).
             cols
         };
         let Some(source) = &insert.source else {
@@ -11481,11 +11680,30 @@ impl Database {
         if !meta.foreign_keys.is_empty() && (!placed.is_empty() || !updated.is_empty()) {
             let mut final_docs: Vec<Object> = placed.iter().map(|(_, d)| d.clone()).collect();
             final_docs.extend(updated.iter().map(|(_, _, n)| n.clone()));
+            // Self-referential FKs need the statement's COMPLETE final state
+            // (pre-state minus the replaced old images plus these images):
+            // the pre-state heap still carries keys an upsert-UPDATE vacates
+            // (`VALUES (1,1) ON CONFLICT (id) DO UPDATE SET id = 3, p = 1`).
+            // Plain INSERT keeps `None`: nothing is replaced, so same_batch
+            // plus the pre-state heap is already the final state.
+            let self_final: Option<Vec<Object>> =
+                if !updated.is_empty() && meta.foreign_keys.iter().any(|(_, rt, _)| rt == &table) {
+                    let old_keys: std::collections::BTreeSet<Vec<u8>> =
+                        updated.iter().map(|(_, o, _)| object_key(o)).collect();
+                    let mut final_state = self.table_docs_cx(&table)?;
+                    final_state.retain(|d| !old_keys.contains(&object_key(d)));
+                    final_state.extend(final_docs.iter().cloned());
+                    Some(final_state)
+                } else {
+                    None
+                };
             for doc in &final_docs {
                 // A big INSERT ... SELECT walks this per placed row: keep the
                 // statement timeout armed like every other row loop.
                 self.stmt_deadline.check()?;
-                if let Err(e) = self.check_fks_in(&table, &meta, doc, &final_docs) {
+                if let Err(e) =
+                    self.check_fks_in(&table, &meta, doc, &final_docs, self_final.as_deref())
+                {
                     self.pager.abort_tx(tx)?;
                     return Err(e);
                 }
@@ -11493,8 +11711,23 @@ impl Database {
         }
         // Parent-side FK for upsert-updated rows: the old image's key
         // values disappear exactly like a DELETE's and must not be
-        // referenced by children (new images already checked above).
+        // referenced by children (new images already checked above). This
+        // runs OUTSIDE the target's own-FK gate — the referencing children
+        // belong to OTHER tables, which do not care whether the target
+        // declares FKs of its own.
         if !updated.is_empty() {
+            let has_self_fk = meta.foreign_keys.iter().any(|(_, rt, _)| rt == &table);
+            let self_final: Option<Vec<Object>> = if has_self_fk {
+                let old_keys: std::collections::BTreeSet<Vec<u8>> =
+                    updated.iter().map(|(_, o, _)| object_key(o)).collect();
+                let mut final_state = self.table_docs_cx(&table)?;
+                final_state.retain(|d| !old_keys.contains(&object_key(d)));
+                final_state.extend(updated.iter().map(|(_, _, n)| n.clone()));
+                final_state.extend(placed.iter().map(|(_, d)| d.clone()));
+                Some(final_state)
+            } else {
+                None
+            };
             let olds: Vec<Object> = updated.iter().map(|(_, o, _)| o.clone()).collect();
             // `news` is the "keys that still exist after this statement"
             // set: rows PLACED by the same batch can re-supply a key the
@@ -11505,7 +11738,13 @@ impl Database {
             // through the placed row.
             let mut news: Vec<Object> = updated.iter().map(|(_, _, n)| n.clone()).collect();
             news.extend(placed.iter().map(|(_, d)| d.clone()));
-            if let Err(e) = self.check_fk_parent_delete(&table, &olds, &news) {
+            if let Err(e) = self.check_fk_parent_delete_skipping(
+                &table,
+                &olds,
+                &news,
+                &[],
+                self_final.as_deref(),
+            ) {
                 self.pager.abort_tx(tx)?;
                 return Err(e);
             }
@@ -12025,11 +12264,15 @@ impl Database {
         // key. Everything so far is staged in `tx` — the abort paths below
         // discard it (all-or-nothing).
         let has_constraints = meta.primary_key.is_some() || !meta.unique.is_empty();
+        // ALL constraint columns must be treed to skip the whole-set check —
+        // `any` here would let a mixed state (one treed, one treeless
+        // constraint) skip the check and silently admit duplicates on the
+        // treeless one (same all-or-nothing gate as the INSERT path).
         let constraint_treed = meta
             .primary_key
             .iter()
             .chain(meta.unique.iter())
-            .any(|c| roots.contains_key(c));
+            .all(|c| roots.contains_key(c));
         if has_constraints && !constraint_treed && (updates.len() + inserted) > 0 {
             let mut combined: Vec<Object> = match (Heap {
                 pages: meta.pages.clone(),
@@ -14017,7 +14260,16 @@ impl RunningAgg {
             }
             AggOp::Min => self.min.clone().unwrap_or(Value::Null),
             AggOp::Max => self.max.clone().unwrap_or(Value::Null),
-            AggOp::GroupConcat => Value::Str(self.concat.clone()),
+            // Zero contributing rows (or an all-NULL frame) is NULL, not the
+            // empty string — the batch reduce keeps the same contract and
+            // IS NULL checks depend on it.
+            AggOp::GroupConcat => {
+                if self.concat_any {
+                    Value::Str(self.concat.clone())
+                } else {
+                    Value::Null
+                }
+            }
         }
     }
 }
@@ -17744,6 +17996,31 @@ fn rewrite_tsql_top(mut query: Query) -> Result<Query> {
 
 /// Inline a computed Value as a literal expression node (subquery
 /// substitution rewrites results into the row-local expression tree).
+/// `COALESCE(<expr>, FALSE)`: a Null-comparing element in a quantified
+/// ANY/ALL chain must fold to FALSE, not poison the OR/AND above it.
+fn coalesce_false(e: SqlExpr) -> SqlExpr {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList};
+    SqlExpr::Function(sqlparser::ast::Function {
+        name: sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::new("COALESCE")]),
+        uses_odbc_syntax: false,
+        parameters: sqlparser::ast::FunctionArguments::None,
+        args: sqlparser::ast::FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(
+                    sqlparser::ast::Value::Boolean(false).into(),
+                ))),
+            ],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
 fn value_to_literal(v: Value) -> Result<SqlExpr> {
     use sqlparser::ast::Value as V;
     Ok(match v {
@@ -18710,6 +18987,13 @@ fn probe_plan(
                 return Some((def.name.clone(), plan, exact));
             }
         }
+    }
+    // Path conjuncts the dedicated plan did not consume (no matching path
+    // index, or named-column conjuncts sharing the WHERE) ride the residual
+    // filter; every column-plan branch below must stay inexact for them or
+    // the exact window would silently drop the JSON predicate.
+    if path_target.is_some() {
+        opaque = true;
     }
     // Composite-index probe: longest equality prefix over the index columns
     // wins. Full-column equality is an exact key (Eq of the Array); a
@@ -29266,6 +29550,156 @@ mod tx_rollback_tests {
         assert!(validate_json_index_path("$.a.").is_err());
         assert!(validate_json_index_path("$.a[x]").is_err());
         assert!(validate_json_index_path("$.a['b']").is_err());
+    }
+
+    #[test]
+    fn json_path_residual_predicate_keeps_exact_window_inexact() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY NOT NULL, doc TEXT)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, '{\"p\":9}')");
+        run(&mut db, "INSERT INTO t VALUES (2, '{\"p\":5}')");
+        // The exact ORDER BY-id window must NOT swallow the JSON predicate
+        // just because `id` carries an exact probe of its own.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id > 0 AND JSON_EXTRACT(doc, '$.p') = 5 ORDER BY id LIMIT 10",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        // Eq-probe shape and DESC variant share the same guard.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE id = 1 AND JSON_EXTRACT(doc, '$.p') = 5 ORDER BY id DESC LIMIT 10",
+        );
+        assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    }
+
+    #[test]
+    fn window_group_concat_zero_contribution_frame_is_null() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE g (k INT, v TEXT)");
+        run(&mut db, "INSERT INTO g VALUES (1, NULL), (2, 'b')");
+        let r = rows(&mut db, "SELECT GROUP_CONCAT(v) OVER (ORDER BY k) FROM g");
+        // Batch semantics: zero contributing rows (all-NULL frame) is NULL,
+        // not the empty string — IS NULL checks depend on the agreement.
+        assert_eq!(r.rows[0][0], Value::Null);
+        assert_eq!(r.rows[1][0], Value::Str("b".into()));
+    }
+
+    #[test]
+    fn quantified_comparison_tolerates_unknown_elements() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE x (ts TIMESTAMP)");
+        run(&mut db, "CREATE TABLE s (txt TEXT)");
+        run(
+            &mut db,
+            "INSERT INTO x VALUES (TIMESTAMP '2026-01-01T00:00:00Z')",
+        );
+        run(&mut db, "INSERT INTO s VALUES ('not-a-timestamp')");
+        // A Timestamp vs unparseable-string comparison evaluates to Null;
+        // the ANY chain must fold it to "not satisfied", not error out.
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM x WHERE ts > ANY (SELECT txt FROM s)",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(0));
+    }
+
+    #[test]
+    fn self_fk_terminal_state_checks() {
+        // UPDATE vacating a parent key while a new image references it.
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, p INT REFERENCES t(id))",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, NULL), (2, NULL)");
+        let e = db
+            .execute("UPDATE t SET id = 3, p = 1 WHERE id = 1")
+            .unwrap_err();
+        assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+
+        // Upsert-UPDATE shape of the same hole.
+        let e = db
+            .execute("INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET id = 3, p = 1")
+            .unwrap_err();
+        assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+
+        // Deleting parent and child rows of a self-FK table in one
+        // statement is legal (statement-final semantics).
+        run(&mut db, "DELETE FROM t");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0],
+            Value::Int(0)
+        );
+
+        // The probe (fast) DELETE path keeps the same semantics.
+        run(&mut db, "INSERT INTO t VALUES (1, NULL), (2, 1)");
+        run(&mut db, "DELETE FROM t WHERE id IS NOT NULL");
+        assert_eq!(
+            rows(&mut db, "SELECT COUNT(*) FROM t").rows[0][0],
+            Value::Int(0)
+        );
+
+        // A key-chain shift whose final state is consistent still passes.
+        run(&mut db, "INSERT INTO t VALUES (1, NULL), (2, 1)");
+        run(
+            &mut db,
+            "UPDATE t SET id = id + 1, p = CASE WHEN p IS NULL THEN NULL ELSE p + 1 END",
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT id, p FROM t ORDER BY id").rows,
+            vec![
+                vec![Value::Int(2), Value::Null],
+                vec![Value::Int(3), Value::Int(2)]
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_column_does_not_adopt_composite_tree_named_like_column() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, x INT, y INT)");
+        // A composite index NAMED like the column keeps its def-name root.
+        run(&mut db, "CREATE INDEX a ON t (x, y)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10, 20)");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN a TO b");
+        // The composite tree still answers probes after the rename.
+        let r = rows(&mut db, "SELECT b FROM t WHERE x = 10 AND y = 20");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // ...and the renamed column did NOT gain a bogus scalar tree.
+        let e = db.execute("CREATE TABLE u (c INT)").unwrap();
+        drop(e);
+        let r = rows(&mut db, "SELECT b FROM t WHERE b = 1");
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn drop_column_refuses_through_select_star_middle_view() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT, v INT)");
+        run(&mut db, "CREATE VIEW v1 AS SELECT * FROM t");
+        run(&mut db, "CREATE VIEW v2 AS SELECT v FROM v1");
+        // v1 never names the column (SELECT *), but v2 does; the refusal
+        // must walk the transitive chain instead of degrading v2 to NULL.
+        let e = db.execute("ALTER TABLE t DROP COLUMN v").unwrap_err();
+        assert!(e.to_string().contains("referenced by VIEW v2"), "{e}");
+    }
+
+    #[test]
+    fn create_index_rejects_system_table_names() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        let e = db
+            .execute("CREATE INDEX _cluster_log ON t (a)")
+            .unwrap_err();
+        assert!(e.to_string().contains("reserved"), "{e}");
+        let e = db
+            .execute("CREATE INDEX docsql_users ON t (a)")
+            .unwrap_err();
+        assert!(e.to_string().contains("reserved"), "{e}");
     }
 
     #[test]

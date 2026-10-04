@@ -5,6 +5,91 @@
 
 ## [Unreleased]
 
+### 第四轮全模块缺陷审查修复(2026-10-04)
+
+对全部模块再做一轮系统审查(15 路并行→逐条源码核实→修复+回归落各模块内;Rust 1046/.NET 197/Python 59 绿):
+
+- **查询内核**:`probe_plan` 的标量 Eq/复合前缀/Range 分支 exact 判定不检查未被消费的
+  JSON 路径谓词——`WHERE 索引列 OP ? AND JSON_EXTRACT(doc,'$.p') = ?` 命中 exact 索引
+  窗口时整个 JSON 谓词被静默丢弃(多行;EF 建表形状即触发);窗口 `GROUP_CONCAT` 零贡献
+  帧返回 `''` 而批量形态返回 NULL(`IS NULL` 两形态结果相反);量化比较
+  `> ANY (SELECT …)` 遇 Timestamp↔不可解析字符串的 Null 比较直接报
+  "OR requires booleans"(合法查询的成败取决于数据内容,现 Null 元素折叠为不满足)。
+- **外键语句终态(本轮主病灶)**:UPDATE 慢/快路径与 upsert-UPDATE 对自引用外键仍看
+  语句前数据——`UPDATE 自引用表 SET id=3, p=1 WHERE id=1`(同语句腾空父键+新像引用它)
+  静默落库悬挂引用(MERGE 早有终态修复,这三处没有);DELETE 删除自引用表的父子行
+  (含整表清空)被误拒(offender 扫描不排除同语句正在删除的子行);MERGE 的 legacy 全集
+  唯一检查门方向倒置(`any`→应 `all`,混合态下唯一性完全无 enforcement)。现全部按
+  语句终态校验:腾空+引用被拒、父子同删合法、链式平移(`SET id=id+1, p=p+1`)保持放行。
+- **DDL/目录**:RENAME COLUMN 把「以旧列名命名的复合/JSON 路径索引树」误搬到新列名键
+  (def 与 root 错位,标量键混入 Array/路径键树→静默错结果);DROP COLUMN 的视图依赖
+  检查只扫直接依赖视图,`SELECT *` 中间层让上层视图静默降级 NULL 列(现走传递闭包);
+  grants 副写(随 DROP/RENAME 清理)先于主 DDL 且错误被 `.ok()` 吞——主 DDL 失败产生
+  无 journal 解释的用户表分叉、同名重建复活旧授权(现传播失败+快照恢复被删行);
+  CREATE INDEX 允许占用系统/内部表名,该索引经服务端写门禁永远不可 DROP。
+- **存储层**:WAL 帧长度字段损坏成超上限值时被无条件当撕裂尾静默截断(其后全部已提交
+  事务被丢弃,与 CRC 路径「中段损坏响亮报错」契约相悖);溢出链页校验补自表页归属
+  (堆页槽数恰为 0xFE 标记值时不再被当链页走零)。
+- **T-SQL**:`IF`/`WHILE` 直接管辖的 `BEGIN TRY…CATCH` 被当普通块解析,END TRY 尾词
+  漏进下一条语句、整批必挂(无 BEGIN…END 包裹的标准写法全灭);`SELECT @a = … FROM …`
+  不刷新 `@@ROWCOUNT`(经典 `IF @@ROWCOUNT = 0` 守卫读到上一条 Plain 的陈旧值);
+  `CONVERT(DECIMAL(10, 2), …)`(逗号后带空格)不重写并报误导性错误;`USE [master]`
+  方括号形态失效;LIKE 倒序字符类 `[z-a]` 取反后匹配一切(现整个类不匹配任何字符);
+  RAISERROR 拼接型消息被剥成残句。
+- **用户/安全**:`redact_sql` 对 `PASSWORD x'…'`(十六进制误打)与 `PASSWORD ('…')`
+  形态 fail-open——被拒语句的明文口令完整进审计/查询日志;名为 `to` 的用户/角色使
+  过滤式 GRANT 的子句切分误判(合法授权被拒)。
+- **服务器**:bootstrap/repair 快照重放持锁期间,对端扇出的复制 PUBLISH/TRIM 直接
+  等锁、30s 超时被丢——`_pubsub_messages` 是系统表,无摘要/快照/期刊兜底,一次窗口
+  即永久分叉(现随 sync 队列入队、drain 后重放;restore 窗口改 10 分钟有界重试);
+  sync 队列字节预算不计 origin(node_id 在入队路径无上限,兼容模式可钉住无界内存);
+  `parse_seq_frame` 接受超长 origin;apply_sync/apply_repair_sync 重放无 panic 防护
+  (任务 panic 留无主开事务,全节点写楔死至重启);`docsql_log` 视图静默丢弃
+  WHERE/投影/聚合/ORDER BY(合规检索拿到错误结果集——现支持裸列投影+ORDER BY+LIMIT,
+  其余形状响亮拒绝);S3 远端对账/保留/PITR 预取按裸前缀匹配,前缀互为字符串前缀的
+  两节点互相删除对方远程备份并混入对方增量链;增量段文件名无路径校验(受控桶可路径
+  穿越写任意 `.sql`);list 分页无进展保护(恶意网关恒真 truncated 卡死备份任务);
+  `DOCSQL_ARBITER` 缺 cluster token 只告警不拒启(故障时刻演变为集群级误栅栏)、
+  `DOCSQL_AUTO_PROMOTE` 缺 `DOCSQL_REPLICATE_TO` 静默空转(两处改 exit 2);quorum
+  探测任务 panic 不记 miss(成员恒"可见",栅栏永不触发);`CATCHUP_WINDOW=0` 的提升
+  滞后守卫反而比任何有限窗口更严(与自身"不限"文档语义相反)。
+- **CLI**:启动横幅打 stdout 污染 `--json`/`--csv` 批处理流(改 stderr);TLS 握手
+  `Ok` 分支不查预算(滴漏字节的对端可无限拖住握手);`publish`/`subscribe`/`trim`
+  被拒后脚本仍退出 0;`_end`/`1end` 等标识符后缀被当裸 END 提前扣减块深度(块体中途
+  被冲刷);批 Err 分支丢弃已收集的 PRINT 输出;嵌入式快路径不喂会话
+  `@@IDENTITY`/`@@ERROR` 钩子;CSV 公式注入防护把负数变文本。
+- **.NET**:事务代际守卫经 `Proto` getter——连接 Close 后 Dispose/Commit 抛
+  InvalidOperationException 而非走设计分支;`GetInt64/GetInt32/GetDouble/GetBoolean`
+  未传 InvariantCulture(de-DE 下 `"3.14"` 解析为 314);命令的 `CommandTimeout`
+  写进物理连接读预算不恢复,泄漏给后续 COMMIT/ROLLBACK(1s 预算可掐死提交);
+  `SendAsync` 的 IOException 不毒化连接;池归还与 `ClearAllPools` 的 TOCTOU;
+  `GetString` 对 BLOB 静默返回 "System.Byte[]";EF `SyncIndexes` 按单实体划定 IX_
+  回收面(TPH/table-splitting 兄弟实体索引被逐轮互 DROP,含 UNIQUE);
+  `Math.Round(x, MidpointRounding)` 枚举常量被当小数位数误译;SchemaVerify 不核
+  主键存在性(手工建的无 PK 同名表被判齐备,现补 NOT NULL 弱校验+保数据重建);
+  Aspire `WithWebConsole` 快照 token,之后再 `WithToken` 控制台持旧 token 全 401
+  (改延迟绑定)。
+- **Python**:订阅回调在持 `_write_lock` 时执行,回调内调控制 API 同线程重入死锁;
+  无参 `unsubscribe()` 服务端全退但本地不清(重连后已退频道复活);`close()` 撞上
+  重连退避泄漏一条活连接;`Decimal("1E+999999999")` 先物化巨整數再检查(客户端
+  挂起/OOM);裸字符串参数被炸成单字符序列静默插错数据;坏帧头不毒化传输;水位先于
+  回调推进(回调失败的消息永不补投);保活与控制往返的 TOCTOU;孤立代理项以裸
+  UnicodeEncodeError 逃逸。
+- **部署**:run-tests.sh 恢复原栈时把「未设置」的变量导出为空串压掉 deploy/.env 真实
+  配置(token 被清=控制台自锁);dev 栈 node-b/c/d/single 未接线 `DOCSQL_TLS_*`
+  (.env.example 宣称可配,实为静默明文);两份 compose 的四个 web 服务未透传出站
+  `DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA`(数据面开 TLS 控制台即瘫);multinode 卷残留
+  守卫的 exit 1 发在子 shell 里形同虚设;dev compose 硬编码上游仓库地址(fork CI 必
+  拉取失败,改 `DOCSQL_DEV_IMAGE` 可覆写);single-test 订阅者存活窗口 3s 与 exec
+  冷启动抖动赛跑。
+- **评估后不改**:无树旧卷的 OR IGNORE 等冲突策略退化(混合态仅升级卷可达且不可构造,
+  INSERT 门已正确);TRUNCATE 多目标逐表独立提交的 IO 故障半提交窗口(架构性,仅 IO
+  故障);heap 链页跨表归属(需复合腐蚀,自表归属已堵);双副本同配 AUTO_PROMOTE 的
+  等值 epoch 双主(文档钉主从对部署);CLI 不支持 `DOCSQL_KEY`(功能缺口记入
+  drivers.md,非缺陷);rollback-to-savepoint 丢弃同名保存点(测试钉住的既定语义,
+  与 SQLite/PG 的分歧已注释);SYNC_ATTEMPT_TIMEOUT 90s 全程预算(大库 join 收敛
+  问题,待后续按分块进度制重做)。
+
 ## [0.9.0] - 2026-10-03
 
 ### 查询性能:IN / BETWEEN / LIKE 前缀走索引探针(2026-10-03)

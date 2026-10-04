@@ -29,7 +29,7 @@ import threading
 import time
 
 from . import _proto
-from ._proto import sql_payload
+from ._proto import ProtocolError, sql_payload
 from ._convert import execute_payload, rows_from_payload, ts_ms
 from ._crypto import Sealer
 from .errors import (
@@ -184,6 +184,19 @@ class _Transport:
         self._closed = True
         self._shutdown_sock()
 
+    def _decode_header(self, buf):
+        """decode_header under the transport's poisoning contract: a bad
+        magic or an oversized advertised length means the byte stream can no
+        longer be framed, so every LATER use must raise too (write_frame on
+        the live-looking socket would push the next request into a desynced
+        wire). Read failures all poison — the header decode used to be the
+        lone exception."""
+        try:
+            return _proto.decode_header(buf)
+        except ProtocolError:
+            self._poison()
+            raise
+
     # -- socket plumbing ---------------------------------------------------
     def _read_exact(self, n):
         buf = bytearray()
@@ -203,7 +216,7 @@ class _Transport:
         return bytes(buf)
 
     def _read_hello(self):
-        flags, frame_type, length = _proto.decode_header(self._read_exact(_proto.HEADER_LEN))
+        flags, frame_type, length = self._decode_header(self._read_exact(_proto.HEADER_LEN))
         payload = self._read_exact(length)
         if frame_type != _proto.RESP_HELLO or length != 16:
             raise InterfaceError(
@@ -237,7 +250,7 @@ class _Transport:
     def read_frame(self):
         """Read one frame; returns (flags, frame_type, payload). Not sealed
         responses are rejected on keyed connections, mirroring the server."""
-        flags, frame_type, length = _proto.decode_header(self._read_exact(_proto.HEADER_LEN))
+        flags, frame_type, length = self._decode_header(self._read_exact(_proto.HEADER_LEN))
         payload = self._read_exact(length)
         return self._finalize_frame(flags, frame_type, payload)
 
@@ -250,7 +263,7 @@ class _Transport:
         while True:
             if len(self._poll_buf) >= _proto.HEADER_LEN:
                 header = bytes(self._poll_buf[: _proto.HEADER_LEN])
-                flags, frame_type, length = _proto.decode_header(header)
+                flags, frame_type, length = self._decode_header(header)
                 if len(self._poll_buf) >= _proto.HEADER_LEN + length:
                     payload = bytes(
                         self._poll_buf[_proto.HEADER_LEN : _proto.HEADER_LEN + length]
@@ -557,6 +570,16 @@ class Cursor:
         if parameters is None:
             ftype, payload = self._transport_round_trip_sql(operation)
         else:
+            if isinstance(parameters, (str, bytes, bytearray)):
+                # sqlite3 parity: a bare string/bytes is nearly always a
+                # missing-comma mistake; iterating it fans out into single
+                # CHARACTERS and, when the placeholder count happens to
+                # match, silently binds the wrong data ("SELECT ?,?,?" with
+                # "abc" used to insert 97/98/99).
+                raise ProgrammingError(
+                    "parameters must be a sequence of values, not a str/bytes "
+                    "literal — wrap single values as (value,)"
+                )
             params = list(parameters)
             handle = self._prepare(operation)
             ftype, payload = self._conn._transport.round_trip(

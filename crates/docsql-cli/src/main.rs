@@ -219,7 +219,9 @@ fn main() {
                 eprintln!("DocSQL: cannot open {path}: {e}");
                 std::process::exit(1);
             });
-            println!("DocSQL — type SQL statements ending with ';', quit with exit;");
+            // stderr, not stdout: --json/--csv batch consumers parse the
+            // stream and a banner line breaks them at the first byte.
+            eprintln!("DocSQL — type SQL statements ending with ';', quit with exit;");
             let stdin = std::io::BufReader::new(std::io::stdin().lock());
             // Two orthogonal flags (see run_embedded): stdin REPL
             // semantics vs batch fail-fast error codes.
@@ -342,7 +344,22 @@ fn statements_ready(sql: &str) -> bool {
                     i = k;
                     continue;
                 }
-                c if !c.is_ascii_whitespace() => last_semi = false,
+                c if !c.is_ascii_whitespace() => {
+                    last_semi = false;
+                    // Swallow the whole identifier-ish run: `_end`, `1end`,
+                    // `#end`, `t.end` are identifiers, and leaving their
+                    // tail to be re-read as a bare keyword decremented
+                    // begin_depth early (a block got flushed mid-body).
+                    let mut k = i;
+                    while k < b.len()
+                        && (b[k].is_ascii_alphanumeric()
+                            || matches!(b[k], b'_' | b'#' | b'$' | b'.'))
+                    {
+                        k += 1;
+                    }
+                    i = if k > i { k } else { i + 1 };
+                    continue;
+                }
                 _ => {}
             },
             S::Single => {
@@ -508,6 +525,11 @@ fn run_embedded_chunk(
                 }
             }
             Err(e) => {
+                // PRINTs collected before the failure are real output —
+                // dropping them hid progress from batch scripts.
+                for msg in tsql.take_prints() {
+                    println!("PRINT: {msg}");
+                }
                 eprintln!("error: {e}");
                 if !interactive {
                     std::process::exit(1);
@@ -518,9 +540,24 @@ fn run_embedded_chunk(
     }
     for part in split_ready(text) {
         match db.execute(&part) {
-            Ok(ExecOutcome::Rows(r)) => print_rows(&r, format),
-            Ok(ExecOutcome::Affected(n)) => println!("({n} rows affected)"),
+            Ok(out) => {
+                // Feed the per-run T-SQL session the same hooks the server
+                // fast path does: a later `SELECT @@IDENTITY` / `@@ERROR`
+                // routes through the interpreter and must see THIS
+                // statement, not the previous one.
+                if docsql_core::tsql_batch::is_insert_statement(&part) {
+                    tsql.note_identity(db.last_insert_id().map(Value::Int));
+                }
+                tsql.note_error(0);
+                match out {
+                    ExecOutcome::Rows(r) => print_rows(&r, format),
+                    ExecOutcome::Affected(n) => println!("({n} rows affected)"),
+                }
+            }
             Err(e) => {
+                tsql.note_error(docsql_core::tsql_batch::error_code_from_text(
+                    &e.to_string(),
+                ));
                 eprintln!("error: {e}");
                 if !interactive {
                     std::process::exit(1);
@@ -1060,6 +1097,10 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> bo
                 "error: {}",
                 sanitize_terminal(&String::from_utf8_lossy(&f.payload))
             );
+            // A refused PUBLISH/TRIM is a failed operation: fail_fast
+            // scripts must see it in the exit status, exactly like a
+            // failed SQL statement or a transport loss.
+            return false;
         }
         Ok(f) => {
             if f.frame_type == proto::RESP_AFFECTED {
@@ -1105,7 +1146,7 @@ fn remote_shell(
             std::process::exit(2);
         }
     }
-    println!(
+    eprintln!(
         "DocSQL → {addr} — SQL over the wire, quit with exit; \
          (`auth <token>;`, `subscribe <ch>;`, `publish <ch> <msg>;`)"
     );
@@ -1216,7 +1257,10 @@ fn remote_shell(
         }
         stmt.clear();
     }
-    // Scripts tolerate a missing final `;`.
+    // Scripts tolerate a missing final `;`. split_ready delegates to the
+    // engine's BEGIN/END-aware splitter, so a semicolon-less T-SQL block
+    // still goes out as ONE frame (the server-side interpreter picks it
+    // up) — pinned by semicolonless_tsql_batch_needs_whole_frame_routing.
     if !stmt.trim().is_empty() {
         for part in split_ready(&stmt) {
             let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&part).unwrap());
@@ -1348,10 +1392,30 @@ fn csv_cell(s: &str) -> String {
     // in Excel/LibreOffice/Sheets when the exported file is opened. A stored
     // `=WEBSERVICE(...)` from any writer must not run on the analyst's
     // machine — prefix a quote, the standard neutralizer.
-    let needs_guard = s
-        .as_bytes()
-        .first()
-        .is_some_and(|c| matches!(c, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'));
+    // Excel/Sheets formula injection guard. `-` is special-cased: plain
+    // negative numbers (`-5`, `-1.5`) are data, not formulas — guarding
+    // them turned every numeric column into text. Only a `-` followed by
+    // something non-numeric keeps the guard (`-=cmd…` style payloads).
+    let first = s.as_bytes().first().copied();
+    let numeric_negative = |t: &str| {
+        let rest = &t[1..];
+        let mut seen_digit = false;
+        for c in rest.bytes() {
+            if c.is_ascii_digit() {
+                seen_digit = true;
+            } else if c == b'.' {
+                // keep scanning
+            } else {
+                return false;
+            }
+        }
+        seen_digit
+    };
+    let needs_guard = match first {
+        Some(b'-') => !numeric_negative(s),
+        Some(c) => matches!(c, b'=' | b'+' | b'@' | b'\t' | b'\r'),
+        None => false,
+    };
     let guarded: std::borrow::Cow<str> = if needs_guard {
         std::borrow::Cow::Owned(format!("'{s}"))
     } else {
@@ -1458,6 +1522,46 @@ pub fn render_rows(r: &QueryResult) -> String {
 mod tests {
     use super::*;
     use docsql_core::engine::Database;
+
+    /// `_end`/`1end` 等标识符后缀曾被当裸 END 提前扣减 BEGIN 深度,块体中
+    /// 途被当成完整语句冲刷。
+    #[test]
+    fn statements_ready_identifier_suffix_is_not_a_keyword() {
+        assert!(!statements_ready("BEGIN\nSET @x = _end;\n"));
+        assert!(!statements_ready("BEGIN\nSELECT 1end;\n"));
+        // 真正的 END 仍然闭合块。
+        assert!(statements_ready("BEGIN\nSELECT 1;\nEND;\n"));
+    }
+
+    /// CSV 公式注入防护不再把负数变文本。
+    #[test]
+    fn csv_cell_guards_formulas_but_not_negative_numbers() {
+        assert_eq!(csv_cell("-5"), "-5");
+        assert_eq!(csv_cell("-1.5"), "-1.5");
+        assert_eq!(csv_cell("plain text"), "plain text");
+        assert_eq!(csv_cell("=1+1"), "'=1+1");
+        assert_eq!(csv_cell("@cmd"), "'@cmd");
+        assert_eq!(csv_cell("-=2+3"), "'-=2+3");
+        // A bare "-" is not a number and stays guarded.
+        assert_eq!(csv_cell("-"), "'-");
+    }
+
+    /// 无尾分号的 T-SQL 批必须整体路由(needs_interpretation),split_ready
+    /// 会把块内 `;` 当语句边界截断它。
+    #[test]
+    fn semicolonless_tsql_batch_needs_whole_frame_routing() {
+        let text = "WHILE @i < 2\nBEGIN\n SET @i = @i + 1;\nEND";
+        assert!(
+            docsql_core::tsql_batch::needs_interpretation(text),
+            "must route whole"
+        );
+        // The engine's splitter is BEGIN/END-aware: the block stays whole
+        // even with an internal `;` and no trailing terminator. If this
+        // ever regresses, the EOF flush starts shipping truncated batches.
+        let parts = split_ready(text);
+        assert_eq!(parts.len(), 1, "parts: {parts:?}");
+        assert_eq!(parts[0], text);
+    }
 
     /// The session-aware chunk executor: T-SQL batches route through the
     /// interpreter (PRINT collected, last outcome printed), plain chunks

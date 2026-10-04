@@ -15,6 +15,9 @@
 # Set DOCSQL_DEV_IMAGE_TAG to run against an existing image instead of
 # building — deliberately NOT DOCSQL_IMAGE_TAG, which belongs to the prod
 # compose and its .env and must never silently retag the dev stack.
+# DOCSQL_DEV_IMAGE overrides the registry/repository part (default
+# ghcr.io/wjw1-evan/docsql) — fork CI builds under its own GHCR address and
+# run-tests.sh routes the workflow's IMAGE export through this variable.
 #
 # DOCSQL_DEV_TOKEN (deliberately NOT DOCSQL_TOKEN, same separation rule as
 # the image tag): the client token handed to every node AND both web
@@ -38,7 +41,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-a
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -69,11 +72,14 @@ services:
       # PEM pair, set DOCSQL_TLS_CERT/KEY on every node and
       # DOCSQL_TLS_CONNECT=1 so inter-node dials also ride TLS. The CLI
       # healthcheck picks TLS up from DOCSQL_TLS_CONNECT automatically;
-      # .NET clients connect with "...;tls=true".
-      # DOCSQL_TLS_CERT: "/certs/cert.pem"
-      # DOCSQL_TLS_KEY: "/certs/key.pem"
-      # DOCSQL_TLS_CONNECT: "1"
-      # DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
+      # .NET clients connect with "...;tls=true". Wired like the prod
+      # compose (four-value passthrough; empty = unset, the server ignores
+      # empties) — these used to be comments only, leaving the dev data
+      # plane silently plaintext while .env.example documented the quartet.
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:17601:7600"
     volumes:
@@ -96,7 +102,7 @@ services:
 
   node-b:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-b
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -109,6 +115,12 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS: four-value passthrough as node-a (empty =
+      # unset; enabling needs the PEM pair mounted into the container).
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:17602:7600"
     volumes:
@@ -126,7 +138,7 @@ services:
 
   node-c:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-c
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -139,6 +151,12 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS: four-value passthrough as node-a (empty =
+      # unset; enabling needs the PEM pair mounted into the container).
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:17603:7600"
     volumes:
@@ -165,7 +183,7 @@ services:
   # and recreate them (no data is lost, no re-sync happens).
   node-d:
     profiles: ["join"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-d
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -179,6 +197,12 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS: four-value passthrough as node-a (empty =
+      # unset; enabling needs the PEM pair mounted into the container).
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:17604:7600"
     volumes:
@@ -202,7 +226,7 @@ services:
   # probes and the node switcher.
   node-web:
     profiles: ["cluster"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-web
     command: ["node-a:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
@@ -214,6 +238,13 @@ services:
       # Console account (first-use username/password). Empty env disables
       # the gate (run-tests.sh sets it so its raw curls stay unauthenticated).
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+      # Outbound TLS for the console's wire-protocol dials to the managed
+      # nodes: the console has no listener cert of its own, so only the
+      # dial-side pair applies. Without this passthrough a TLS-enabled data
+      # plane leaves the console dialing plaintext — every data endpoint
+      # then fails.
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     volumes:
       - web-auth:/auth
     ports:
@@ -232,7 +263,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]
     environment:
@@ -244,6 +275,12 @@ services:
       DOCSQL_IDLE_TIMEOUT: "${DOCSQL_IDLE_TIMEOUT:-}"
       DOCSQL_BACKUP_INTERVAL_SECS: "${DOCSQL_BACKUP_INTERVAL_SECS:-}"
       DOCSQL_BACKUP_KEEP: "${DOCSQL_BACKUP_KEEP:-}"
+      # Native data-plane TLS: four-value passthrough as node-a (empty =
+      # unset; enabling needs the PEM pair mounted into the container).
+      DOCSQL_TLS_CERT: "${DOCSQL_TLS_CERT:-}"
+      DOCSQL_TLS_KEY: "${DOCSQL_TLS_KEY:-}"
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     ports:
       - "127.0.0.1:17600:7600"
     volumes:
@@ -261,7 +298,7 @@ services:
   # data. DOCSQL_PEERS powers the cluster-status page (one node).
   node-web-single:
     profiles: ["single"]
-    image: "ghcr.io/wjw1-evan/docsql:${DOCSQL_DEV_IMAGE_TAG:-local}"
+    image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-web-single
     command: ["node-single:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
@@ -269,6 +306,10 @@ services:
       DOCSQL_PEERS: "node-single:7600"
       DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+      # Outbound TLS for the console's wire-protocol dials to the managed
+      # node (dial-side pair only — see node-web).
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     volumes:
       - web-auth-single:/auth
     ports:

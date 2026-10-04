@@ -1195,7 +1195,19 @@ async fn auth_login(
     )
 }
 
-async fn auth_logout(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+#[derive(serde::Deserialize)]
+struct LogoutBody {}
+
+/// Logout: drop the presented session (if any) and clear the cookie. The
+/// body is REQUIRED (JSON content type), same CSRF gate as the backup
+/// trigger: a plain HTML form can post `application/x-www-form-urlencoded`
+/// (or nothing at all) cross-site without a CORS preflight, which used to
+/// let any attacker page force-close the operator's console session.
+async fn auth_logout(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(_body): Json<LogoutBody>,
+) -> Response {
     if let Some(a) = &state.auth {
         if let Some(token) = session_from(&headers) {
             a.sessions.drop_session(&token);

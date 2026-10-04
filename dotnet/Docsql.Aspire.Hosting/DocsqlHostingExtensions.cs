@@ -137,10 +137,17 @@ public static class DocsqlHostingExtensions
         }
         consoleBuilder.WithVolume(VolumeNameGenerator.Generate(consoleBuilder, "auth"), "/auth");
 
-        if (builder.Resource.TokenParameter is { } token)
+        // 延迟绑定:读取 TokenParameter 的时机是环境变量求值时,而非本方法
+        // 调用时刻 —— 调用之后再 WithToken 换 token 时,快照形态会让控制台
+        // 持旧 token 对节点全部 401(server 已换新值)。回调与
+        // WithEnvironment(name, parameter) 内部行为一致(向字典放 ParameterResource)。
+        consoleBuilder.WithEnvironment(context =>
         {
-            consoleBuilder.WithEnvironment("DOCSQL_TOKEN", token);
-        }
+            if (builder.Resource.TokenParameter is { } token)
+            {
+                context.EnvironmentVariables["DOCSQL_TOKEN"] = token;
+            }
+        });
         return builder;
     }
 

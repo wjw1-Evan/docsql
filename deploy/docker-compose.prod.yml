@@ -269,6 +269,13 @@ services:
       # Console account (first-use username/password). Empty env disables
       # the gate (run-tests.sh sets it so its raw curls stay unauthenticated).
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+      # Outbound TLS for the console's wire-protocol dials to the managed
+      # nodes: the console has no listener cert of its own, so only the
+      # dial-side pair applies. Without this passthrough a TLS-enabled data
+      # plane leaves the console dialing plaintext — every data endpoint
+      # then fails.
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     volumes:
       - web-auth:/auth
     ports:
@@ -337,6 +344,10 @@ services:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
       DOCSQL_PEERS: "node-single:7600"
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"
+      # Outbound TLS for the console's wire-protocol dials to the managed
+      # node (dial-side pair only — see node-web).
+      DOCSQL_TLS_CONNECT: "${DOCSQL_TLS_CONNECT:-}"
+      DOCSQL_TLS_CA: "${DOCSQL_TLS_CA:-}"
     volumes:
       - web-auth-single:/auth
     ports:

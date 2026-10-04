@@ -296,8 +296,84 @@ pub(crate) fn try_serve_log_view(
     {
         return None;
     }
-    // Best-effort LIMIT n support; default 100 most-recent rows.
-    let limit = parse_limit(&words).unwrap_or(100);
+    const COLS: [&str; 7] = [
+        "ts_ms",
+        "peer",
+        "sql",
+        "ms",
+        "affected",
+        "error",
+        "replicated",
+    ];
+    // Clause-level SILENT ignoring is the red line this view used to cross:
+    // WHERE/aggregates dropped on the floor answered compliance queries
+    // with wrong result sets. Supported surface: bare-column projection
+    // (empty list == `*`), ORDER BY <col> [ASC|DESC] and LIMIT; anything
+    // else is rejected loudly.
+    let from_idx = words
+        .windows(2)
+        .position(|w| w[0] == "from" && w[1] == "docsql_log")?;
+    let proj_words: Vec<&str> = words[..from_idx]
+        .iter()
+        .skip_while(|w| **w == "select")
+        .copied()
+        .collect();
+    for w in &proj_words {
+        if matches!(
+            *w,
+            "count" | "sum" | "avg" | "min" | "max" | "distinct" | "case"
+        ) {
+            return Some(err_frame(
+                "docsql_log view: aggregates/expressions are not supported \
+                 (bare columns, ORDER BY and LIMIT only)",
+            ));
+        }
+    }
+    let proj: Vec<&str> = proj_words
+        .iter()
+        .map(|w| if COLS.contains(w) { *w } else { "" })
+        .collect();
+    if proj_words.iter().any(|w| !COLS.contains(w)) {
+        return Some(err_frame(
+            "docsql_log view: unknown or unsupported projection column",
+        ));
+    }
+    // Tail after `FROM docsql_log`: [] | LIMIT n | ORDER BY c [ASC|DESC] |
+    // ORDER BY c [ASC|DESC] LIMIT n — anything else errors.
+    let mut tail = &words[from_idx + 2..];
+    let mut order: Option<(&str, bool)> = None; // (col, asc)
+    if tail.first() == Some(&"order") {
+        if tail.get(1) != Some(&"by") {
+            return Some(err_frame("docsql_log view: bad ORDER BY"));
+        }
+        let Some(col) = tail.get(2) else {
+            return Some(err_frame("docsql_log view: ORDER BY needs a column"));
+        };
+        if !COLS.contains(col) {
+            return Some(err_frame("docsql_log view: unknown ORDER BY column"));
+        }
+        let mut next = 3;
+        let mut asc = true;
+        if matches!(tail.get(3), Some(&"asc") | Some(&"desc")) {
+            asc = tail[3] == "asc";
+            next = 4;
+        }
+        order = Some((COLS[COLS.iter().position(|c| c == col).unwrap()], asc));
+        tail = &tail[next..];
+    }
+    let limit = match tail.first() {
+        None => 100,
+        Some(&"limit") => match tail.get(1).and_then(|w| w.parse::<usize>().ok()) {
+            Some(n) if tail.len() == 2 => n,
+            _ => return Some(err_frame("docsql_log view: bad LIMIT")),
+        },
+        Some(_) => {
+            return Some(err_frame(
+                "docsql_log view: WHERE/GROUP BY/JOIN are not supported \
+                 (bare columns, ORDER BY and LIMIT only)",
+            ))
+        }
+    };
 
     let mut docs: Vec<Object> = Vec::new();
     for e in state.query_log.snapshot().iter().rev().take(limit) {
@@ -317,25 +393,30 @@ pub(crate) fn try_serve_log_view(
         o.insert("replicated".into(), Value::Bool(e.replicated));
         docs.push(o);
     }
-    const COLS: [&str; 7] = [
-        "ts_ms",
-        "peer",
-        "sql",
-        "ms",
-        "affected",
-        "error",
-        "replicated",
-    ];
+    if let Some((col, asc)) = order {
+        docs.sort_by(|a, b| {
+            let av = a.get(col).cloned().unwrap_or(Value::Null);
+            let bv = b.get(col).cloned().unwrap_or(Value::Null);
+            let ord = Value::cmp_values(&av, &bv);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+    }
+    let out_cols: Vec<&str> = if proj.is_empty() { COLS.to_vec() } else { proj };
     let mut obj = Object::new();
     obj.insert(
         "columns".into(),
-        Value::Array(COLS.iter().map(|c| Value::Str((*c).into())).collect()),
+        Value::Array(out_cols.iter().map(|c| Value::Str((*c).into())).collect()),
     );
     let rows: Vec<Value> = docs
         .iter()
         .map(|d| {
             Value::Array(
-                COLS.iter()
+                out_cols
+                    .iter()
                     .map(|c| d.get(*c).cloned().unwrap_or(Value::Null))
                     .collect(),
             )
@@ -348,10 +429,8 @@ pub(crate) fn try_serve_log_view(
     ))
 }
 
-fn parse_limit(words: &[&str]) -> Option<usize> {
-    // Token-based: a literal containing "limit" must not supply the value.
-    let idx = words.iter().rposition(|w| *w == "limit")?;
-    words.get(idx + 1)?.parse().ok()
+fn err_frame(msg: &str) -> crate::Frame {
+    crate::Frame::new(proto::RESP_ERROR, msg.as_bytes().to_vec())
 }
 
 // ---------------------------------------------------------------------------

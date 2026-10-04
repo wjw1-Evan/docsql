@@ -163,6 +163,42 @@ public sealed class TsqlFunctionTranslationTests : IClassFixture<EfServerFixture
         Assert.Single(hit);
     }
 
+    /// 第四轮回归:Math.Round(x, MidpointRounding.X) 的第二参是枚举常量,
+    /// 曾被当小数位数翻译(AwayFromZero=1 → ROUND(x,1),静默错值)。
+    /// 修复:(x, int digits) → ROUND(x, digits);AwayFromZero → ROUND(x,0)
+    /// (引擎 ROUND 即半离零);其余枚举值显式报 NotSupportedException。
+    [Fact]
+    public void Math_Round_two_arg_forms_translate_by_second_arg_type()
+    {
+        Seed();
+        using var db = NewDb();
+        db.Items.Add(new FuncItem { Id = 1, Name = "r1", Amount = 2.5 });
+        db.Items.Add(new FuncItem { Id = 2, Name = "r2", Amount = 3.14159 });
+        db.SaveChanges();
+
+        using var q = NewDb();
+        // (x, int digits):常规两参 ROUND。
+        var row = q.Items.Where(i => i.Id == 2)
+            .Select(i => new { R2 = Math.Round(i.Amount, 2), R0 = Math.Round(i.Amount, 0) })
+            .Single();
+        Assert.Equal(3.14, row.R2);
+        Assert.Equal(3.0, row.R0);
+
+        // (x, MidpointRounding.AwayFromZero):舍入到整数(修复前被译成
+        // ROUND(x,1),2.5 原样返回 2.5)。
+        var away = q.Items.Where(i => i.Id == 1)
+            .Select(i => Math.Round(i.Amount, MidpointRounding.AwayFromZero))
+            .Single();
+        Assert.Equal(3.0, away);
+
+        // 其余舍入模式引擎不实现:必须显式报错,不得静默当 digits 翻译。
+        var ex = Assert.Throws<NotSupportedException>(() => q.Items
+            .Where(i => i.Id == 1)
+            .Select(i => Math.Round(i.Amount, MidpointRounding.ToEven))
+            .ToList());
+        Assert.Contains("MidpointRounding", ex.Message);
+    }
+
     [Fact]
     public void Math_functions_translate()
     {

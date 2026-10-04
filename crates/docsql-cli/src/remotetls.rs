@@ -177,6 +177,13 @@ impl TlsLink {
             match conn.read_tls(&mut sock) {
                 Ok(0) => return Err("connection closed during TLS handshake".into()),
                 Ok(_) => {
+                    // Progress is NOT completion: a peer that dribbles one
+                    // byte every few seconds never trips the 5s socket
+                    // timeout, so the budget must be checked on EVERY read
+                    // (that is what HANDSHAKE_BUDGET exists for).
+                    if Instant::now() > deadline {
+                        return Err("TLS handshake timed out".into());
+                    }
                     conn.process_new_packets()
                         .map_err(|e| format!("tls handshake: {e}"))?;
                 }

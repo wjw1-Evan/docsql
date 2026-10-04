@@ -88,7 +88,9 @@ echo "== 6. pub/sub (persistent, single node) =="
 ch="solo-$(date +%s)"
 tmp=$(mktemp)
 # 后台订阅(输出落宿主临时文件),另一连接发布,断言实时推送。
-( printf "subscribe %s latest;\n" "$ch"; sleep 3; printf "exit;\n" ) \
+# 存活窗口 5s:发布前的 docker exec 冷启动可能 >1s(自注释),窗口太窄
+# 订阅者会在发布前掉线(publish 报 0 receivers)。
+( printf "subscribe %s latest;\n" "$ch"; sleep 5; printf "exit;\n" ) \
   | docker exec -i "$CTR" docsql-cli connect "$A" >"$tmp" 2>&1 &
 sub=$!
 # 轮询等订阅确认(docker exec 冷启动可能 >1s,固定 sleep 会抢跑)。

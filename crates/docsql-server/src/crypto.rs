@@ -2,7 +2,8 @@
 //!
 //! Pre-shared-key mode (`DOCSQL_KEY`, 32 bytes hex): every frame payload is
 //! sealed with AES-256-GCM using a structured nonce — a per-process random
-//! 4-byte prefix plus a process-wide monotonic 64-bit counter —
+//! 8-byte prefix plus a process-wide monotonic 32-bit counter (the counter
+//! refuses to wrap past u32::MAX instead of recycling nonces) —
 //! `payload' = nonce[12] || ciphertext+tag[16]`. The frame header (type,
 //! length, flags) stays plaintext so routing stays cheap; everything
 //! application-visible (SQL text, KV args, AUTH token, rows) is encrypted.

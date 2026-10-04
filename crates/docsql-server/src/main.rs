@@ -318,6 +318,27 @@ fn config_from_env(
                 .to_string(),
         );
     }
+    // An arbiter without the cluster token silently counts every data node
+    // as unreachable (their probes authenticate with the token): quiescent
+    // misconfiguration that turns into a cluster-wide false fence exactly
+    // when a node dies. Fail fast like every other env contract here.
+    if arbiter && cluster_token.as_ref().is_none_or(|t| t.is_empty()) {
+        return Err(
+            "DOCSQL_ARBITER requires DOCSQL_CLUSTER_TOKEN (data nodes probe with it; \
+             without it every member looks unreachable and the quorum math is wrong)"
+                .to_string(),
+        );
+    }
+    // AUTO_PROMOTE without a primary to lose is a silent no-op: the trigger
+    // would wait on a primary address that does not exist, and the operator
+    // learns nothing at failure time.
+    if auto_promote && replicate_to.as_ref().is_none_or(|t| t.trim().is_empty()) {
+        return Err(
+            "DOCSQL_AUTO_PROMOTE requires DOCSQL_REPLICATE_TO (it promotes a \
+             lost primary's replica; symmetric-cluster members never promote)"
+                .to_string(),
+        );
+    }
     let transport_key = match getenv("DOCSQL_KEY") {
         Some(k) if !k.trim().is_empty() => {
             let key =

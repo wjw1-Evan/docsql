@@ -370,7 +370,7 @@ async fn prune_remote_inner(
     state: &Arc<ServerState>,
 ) -> Result<(), String> {
     let cfg = s3.config();
-    let keys = s3.list(&cfg.prefix).await?;
+    let keys = owned_keys(&s3.list(&cfg.prefix).await?, &cfg.prefix);
     let keep = cfg.effective_keep(state.backup_keep);
     prune_remote_class(s3, &keys, "backup-", keep).await?;
     prune_remote_class(s3, &keys, "incr-", keep.max(4)).await?;
@@ -411,6 +411,37 @@ fn key_file_name(key: &str) -> Option<&str> {
     (!n.is_empty()).then_some(n)
 }
 
+/// Keys that belong to THIS node's prefix. S3 prefixes are plain string
+/// prefixes, so a node with prefix `db` also sees a sibling node's
+/// `db2/…` keys; treating them as own would prune the sibling's remote
+/// copies and mix its incremental chain into local PITR. Own objects are
+/// exactly `{prefix}/{name}` — remainder starts with `/` and carries no
+/// further `/`.
+fn owned_keys(keys: &[String], prefix: &str) -> Vec<String> {
+    keys.iter()
+        .filter(|k| {
+            k.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+        })
+        .cloned()
+        .collect()
+}
+
+/// A file name safe to join onto the backup directory: no separators, no
+/// `..`, ASCII identifier-ish bytes only (backup-*/incr-* names and their
+/// .sha256 sidecars all fit). S3 listing content is environment-controlled,
+/// never trusted for path building.
+fn safe_backup_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        && !name.contains("..")
+}
+
 /// `fs::rename` plus a parent-directory fsync: on journaling filesystems a
 /// rename can be visible without being durable, and a crash landing there
 /// drops the NEW name entirely (the file data itself was synced before the
@@ -440,7 +471,11 @@ async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
     let Ok(keys) = s3.list(&cfg.prefix).await else {
         return;
     };
-    let remote: std::collections::HashSet<String> = keys.into_iter().collect();
+    // Only THIS prefix's objects count as "already remote": a sibling
+    // node whose prefix is a plain string prefix of ours (db vs db2)
+    // must not suppress our upload of the same FILE name.
+    let remote: std::collections::HashSet<String> =
+        owned_keys(&keys, &cfg.prefix).into_iter().collect();
     let Ok(entries) = std::fs::read_dir(&state.backup_dir) else {
         return;
     };
@@ -1490,7 +1525,9 @@ async fn ensure_local_backup_assets(
     };
     let cfg = s3.config();
     let remote: std::collections::HashSet<String> =
-        s3.list(&cfg.prefix).await?.into_iter().collect();
+        owned_keys(&s3.list(&cfg.prefix).await?, &cfg.prefix)
+            .into_iter()
+            .collect();
     let remote_has = |name: &str| remote.contains(&cfg.object_key(name));
     if !state.backup_dir.join(file).is_file() {
         if !remote_has(file) {
@@ -1512,6 +1549,13 @@ async fn ensure_local_backup_assets(
                 continue;
             };
             if !(fname.starts_with("incr-") && fname.ends_with(".sql")) {
+                continue;
+            }
+            // Defense in depth on top of the owned-keys filter: listing
+            // content is environment-controlled and must never drive a
+            // path join outside the backup directory.
+            if !safe_backup_file_name(fname) {
+                eprintln!("remote backup listing: skipping non-file name {fname:?}");
                 continue;
             }
             if !state.backup_dir.join(fname).is_file() {

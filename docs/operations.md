@@ -27,6 +27,10 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
 - compose 必须带 profile(不带 = 空操作);
 - 控制台是纯管理工具、自身零存储:启动参数即默认管理节点(`DOCSQL_UPSTREAM` 或首个 peer),
   数据操作全部转发到节点执行;
+- dev 栈数据节点与 web 控制台完整透传 `DOCSQL_TLS_*`(与 prod 同形);web 控制台服务另透传
+  出站 `DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA`(数据面开 TLS 后控制台才能拨号)。
+- dev compose 镜像可整体覆写:`DOCSQL_DEV_IMAGE`(默认 `ghcr.io/wjw1-evan/docsql`,fork 仓库
+  CI 与本地复用 alike);tag 仍走 `DOCSQL_DEV_IMAGE_TAG`。
 - 节点与控制台镜像 tag 分别由 `DOCSQL_DEV_IMAGE_TAG`(默认 `local`)与 `DOCSQL_IMAGE_TAG`
   (生产 `.env`,默认 `latest`)控制,两栈互不影响。
 
@@ -151,8 +155,8 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_QUORUM` | 0 | 1 = 多数派可见性写栅栏(设计 004 §2):失多数派的节点自动拒绝客户端写(读/订阅/复制 apply 不受影响),分区不再产生会被修复覆盖的少数派写;愈合自动解除;进入/解除写审计日志 |
 | `DOCSQL_QUORUM_PROBE_MS` / `_K` | 1000 / 3 | 探测周期 / 成员失联防抖周期数(栅栏约 K×周期后触发,滚动重启不误伤);非法值拒绝启动 |
 | `DOCSQL_QUORUM_MEMBERS` / `_ARBITERS` | 无(跟随 PEERS)/ 无 | 仲裁成员表覆盖 / 追加零数据投票成员 |
-| `DOCSQL_ARBITER` | 0 | 1 = 仲裁者模式:零存储投票成员,只应答状态探测(需 `DOCSQL_CLUSTER_TOKEN`),给 2 节点集群第三个故障域;与 `DOCSQL_QUORUM` 互斥 |
-| `DOCSQL_AUTO_PROMOTE` | 0 | 1 = 主从副本自动提升(设计 004 §4,需 `DOCSQL_QUORUM=1`):主失联 K 周期 + 多数派可见 + 日志滞后 ≤ `DOCSQL_CATCHUP_WINDOW` 三条件同时满足才执行(滞后超窗保持只读并告警);提升后 epoch+1,回归的旧主探测到更高 epoch 自动降级为只读并重指向新主;部署要求:主从对互相列入成员表 |
+| `DOCSQL_ARBITER` | 0 | 1 = 仲裁者模式:零存储投票成员,只应答状态探测(**必须**配 `DOCSQL_CLUSTER_TOKEN`,缺失拒绝启动——数据节点用 cluster token 探测,缺它会把全部成员误判失联),给 2 节点集群第三个故障域;与 `DOCSQL_QUORUM` 互斥 |
+| `DOCSQL_AUTO_PROMOTE` | 0 | 1 = 主从副本自动提升(设计 004 §4,需 `DOCSQL_QUORUM=1` 且配 `DOCSQL_REPLICATE_TO`,缺任一拒绝启动):主失联 K 周期 + 多数派可见 + 日志滞后 ≤ `DOCSQL_CATCHUP_WINDOW` 三条件同时满足才执行(滞后超窗保持只读并告警;`CATCHUP_WINDOW=0` 视为不限滞后);提升后 epoch+1,回归的旧主探测到更高 epoch 自动降级为只读并重指向新主;部署要求:主从对互相列入成员表 |
 
 ### Web 控制台
 

@@ -587,9 +587,15 @@ impl FrameReader {
         let lsn = u64::from_le_bytes(head[0..8].try_into().unwrap());
         let len = u32::from_le_bytes(head[17..21].try_into().unwrap()) as usize;
         if len > MAX_FRAME_PAYLOAD {
-            // Garbage length: cannot know where the frame would end, so it
-            // is indistinguishable from a torn tail. Stop (the opener
-            // truncates here); never allocate on the strength of it.
+            // Garbage length: never allocate on the strength of it. It is
+            // only tolerable as the torn TAIL — with valid bytes after the
+            // claimed extent the damage is mid-log, and truncating there
+            // would silently discard every later committed transaction
+            // (same loud-Corrupt rule as the CRC path below).
+            let frame_end = self.pos + (HEAD_LEN as u64) + (len as u64) + 4;
+            if frame_end < self.file_len {
+                return Err(WalError::Corrupt(lsn, "corrupt frame length mid-log"));
+            }
             return Ok(None);
         }
         let frame_end = self.pos + (HEAD_LEN as u64) + (len as u64) + 4;
@@ -807,6 +813,39 @@ mod tests {
         let err = match Wal::open(&path) {
             Err(e) => e,
             Ok(_) => panic!("corrupt mid-log frame must fail the open"),
+        };
+        assert!(matches!(err, WalError::Corrupt(_, _)), "{err:?}");
+    }
+
+    #[test]
+    fn oversize_length_corruption_mid_log_fails_open_loudly() {
+        // A length field corrupted past MAX_FRAME_PAYLOAD used to be
+        // treated as an unconditionally torn tail and silently truncated,
+        // discarding every later committed transaction even though valid
+        // bytes followed the claimed extent. Same rule as the CRC path:
+        // mid-log damage fails the open.
+        let (_dir, path) = wal_dir();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.begin(1).unwrap();
+            w.log_write(1, b"payload!").unwrap();
+            w.commit(1).unwrap();
+            w.begin(2).unwrap();
+            w.log_write(2, b"second").unwrap();
+            w.commit(2).unwrap();
+        }
+        let mut data = std::fs::read(&path).unwrap();
+        // Corrupt the FIRST WRITE frame's 4-byte length (head bytes 17..21)
+        // past any plausible payload.
+        let idx = data.iter().position(|&b| b == b'!').unwrap();
+        let head_start = idx - (8 + 1 + 8 + 4); // lsn|kind|txid|len precede payload
+        let big = 0x7fff_ffffu32.to_le_bytes();
+        data[head_start + 17..head_start + 21].copy_from_slice(&big);
+        std::fs::write(&path, data).unwrap();
+
+        let err = match Wal::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize-length mid-log frame must fail the open"),
         };
         assert!(matches!(err, WalError::Corrupt(_, _)), "{err:?}");
     }

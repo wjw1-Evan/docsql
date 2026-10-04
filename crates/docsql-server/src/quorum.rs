@@ -194,7 +194,8 @@ pub async fn quorum_task(state: Arc<ServerState>) {
     loop {
         tick.tick().await;
         let mut probes = Vec::new();
-        for member in quorum.members.clone() {
+        let member_list: Vec<String> = quorum.members.clone();
+        for member in member_list.clone() {
             let st = state.clone();
             probes.push(tokio::spawn(async move {
                 let probe = tokio::time::timeout(PROBE_IO_TIMEOUT, async {
@@ -205,7 +206,7 @@ pub async fn quorum_task(state: Arc<ServerState>) {
             }));
         }
         let mut any_failed = false;
-        for probe in probes {
+        for (idx, probe) in probes.into_iter().enumerate() {
             match probe.await {
                 Ok((member, outcome)) => {
                     let ok = matches!(outcome, Ok(Ok(_)));
@@ -220,8 +221,13 @@ pub async fn quorum_task(state: Arc<ServerState>) {
                     }
                 }
                 // A probe task dying (join error) never answered this
-                // cycle: count the cycle as failed.
-                Err(_) => any_failed = true,
+                // cycle: count the cycle as failed AND as a miss for the
+                // member — a member whose probe task keeps panicking must
+                // not stay "visible" forever, or the fence never triggers.
+                Err(_) => {
+                    any_failed = true;
+                    quorum.record(&member_list[idx], false);
+                }
             }
         }
         if any_failed {
@@ -326,9 +332,12 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                 let primary_origin = view.as_ref().and_then(|v| v.node_id.clone());
                 let lag_ok = match (primary_head, primary_origin, state.catchup_window) {
                     (None, _, _) | (_, None, _) => false, // never saw the primary/its identity: cannot judge
-                    (Some(ph), Some(origin), 0) => {
-                        ph >= applied_position(state, &origin).unwrap_or(0)
-                    }
+                    // Zero window = UNBOUNDED retention: every lag is
+                    // acceptable (the comment above says so; the old
+                    // `ph >= applied` comparison was stricter than any
+                    // finite window and locked a caught-up-but-older
+                    // replica out of promotion forever).
+                    (Some(_), Some(_), 0) => true,
                     (Some(ph), Some(origin), window) => {
                         ph.saturating_sub(applied_position(state, &origin).unwrap_or(0)) <= window
                     }

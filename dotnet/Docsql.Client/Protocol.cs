@@ -515,12 +515,23 @@ public sealed class ProtocolConnection : IDisposable
 
     /// <summary><see cref="Send"/> 的真异步形态。取消只到语句边界:一帧发到
     /// 一半作废会错位帧流(该连接只能弃用),语句级取消由服务端语句超时承担,
-    /// ct 在发送前检查。</summary>
+    /// ct 在发送前检查。IO/Socket 失败(写或读阶段)与同步 <see cref="Send"/>
+    /// 同一毒化纪律:连接置 Broken 后原样上抛,死连接绝不回池。</summary>
     public async Task<Frame> SendAsync(
         Frame request, CancellationToken cancellationToken = default, int readTimeoutMs = -1)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await WriteAsync(request).ConfigureAwait(false);
+        try
+        {
+            await WriteAsync(request).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or SocketException)
+        {
+            // 对端断开/RST 时的写失败:不置 Broken 的话 Close() 会把这条
+            // 死连接归还池,下一个借出者在 PING 上撞尸体(对齐同步 Send)。
+            BreakConnection();
+            throw;
+        }
         int budget = readTimeoutMs >= 0 ? readTimeoutMs : ReadTimeoutMs;
         if (budget <= 0)
         {
@@ -541,6 +552,11 @@ public sealed class ProtocolConnection : IDisposable
             {
                 // 解密/重放闸失败:与有预算分支同一毒化纪律,防止 Close()
                 // 把帧流已不可信的连接归还池。
+                BreakConnection();
+                throw;
+            }
+            catch (Exception e) when (e is IOException or SocketException)
+            {
                 BreakConnection();
                 throw;
             }
@@ -566,6 +582,13 @@ public sealed class ProtocolConnection : IDisposable
         {
             // 解密/重放闸失败(Assemble):同 Send 的毒化纪律,防止
             // Close() 把帧流不可信的连接归还池。
+            BreakConnection();
+            throw;
+        }
+        catch (Exception e) when (e is IOException or SocketException)
+        {
+            // 读阶段的对端断开/连接重置:同写阶段的毒化纪律(对齐同步 Send
+            // 的 IOException/SocketException 臂),死连接不得回池。
             BreakConnection();
             throw;
         }

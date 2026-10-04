@@ -162,6 +162,12 @@ internal static class ConnectionPool
         public readonly int MaxSize;
         public readonly SemaphoreSlim Permits;
 
+        /// <summary>Guards「Closed 检查 + 入队」与 ClearSlot/ClearAll 的
+        /// 「置 Closed + 排空」互斥:两者无锁交错时,Return 可能刚通过
+        /// Closed 检查就被 Clear 抢先注销并排空 —— 随后的 Enqueue 把连接
+        /// 塞进一条没人再消费的队列里(物理 socket 永久泄漏)。</summary>
+        public readonly object Sync = new();
+
         /// <summary>Set by ClearSlot/ClearAll: a borrowed connection returned
         /// after the slot left the registry must be closed, not enqueued
         /// into the now-unreachable queue (it would leak its socket).</summary>
@@ -305,18 +311,31 @@ internal static class ConnectionPool
 
     internal static void Return(Slot? slot, ProtocolConnection proto)
     {
-        if (slot is null || slot.Closed)
+        if (slot is null)
         {
             Interlocked.Increment(ref Discarded);
             proto.Dispose();
             return;
         }
-        // Reset the read budget before pooling: Execute() stamps its
-        // CommandTimeout onto the PHYSICAL connection, and the next
-        // borrower's liveness PING would otherwise wait on the previous
-        // user's budget (up to hours) against a black-holed peer.
-        proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
-        slot.Idle.Enqueue(proto);
+        // Closed 检查与入队必须原子:与 ClearSlot/ClearAll 的「置 Closed +
+        // 排空」无锁交错时,连接会被塞进已注销槽的队列里,没人再消费它
+        // (socket 泄漏)。借出侧只出队(ConcurrentQueue 自身线程安全),
+        // 无需同锁。
+        lock (slot.Sync)
+        {
+            if (slot.Closed)
+            {
+                Interlocked.Increment(ref Discarded);
+                proto.Dispose();
+                return;
+            }
+            // Reset the read budget before pooling: Execute() stamps its
+            // CommandTimeout onto the PHYSICAL connection, and the next
+            // borrower's liveness PING would otherwise wait on the previous
+            // user's budget (up to hours) against a black-holed peer.
+            proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
+            slot.Idle.Enqueue(proto);
+        }
         slot.Permits.Release();
         // 并发归还可能让空闲数越过 MaxSize:自愈裁剪,物理连接总数不超上限。
         while (slot.Idle.Count > slot.MaxSize && slot.Idle.TryDequeue(out var excess))
@@ -339,13 +358,16 @@ internal static class ConnectionPool
     {
         foreach (var slot in Pools.Values)
         {
-            // Mark closed BEFORE draining: a connection borrowed right now
-            // will be disposed on Return instead of enqueued into a queue
-            // nobody owns.
-            slot.Closed = true;
-            while (slot.Idle.TryDequeue(out var proto))
+            // Mark closed + drain atomically against Return (see Slot.Sync):
+            // a connection borrowed right now will be disposed on Return
+            // instead of enqueued into a queue nobody owns.
+            lock (slot.Sync)
             {
-                proto.Dispose();
+                slot.Closed = true;
+                while (slot.Idle.TryDequeue(out var proto))
+                {
+                    proto.Dispose();
+                }
             }
         }
         Pools.Clear();
@@ -355,10 +377,13 @@ internal static class ConnectionPool
     {
         if (Pools.TryRemove(key, out var slot))
         {
-            slot.Closed = true;
-            while (slot.Idle.TryDequeue(out var proto))
+            lock (slot.Sync)
             {
-                proto.Dispose();
+                slot.Closed = true;
+                while (slot.Idle.TryDequeue(out var proto))
+                {
+                    proto.Dispose();
+                }
             }
         }
     }
@@ -449,6 +474,13 @@ public sealed class DocsqlConnection : DbConnection
 
     internal ProtocolConnection Proto =>
         _proto ?? throw new InvalidOperationException("connection is closed");
+
+    /// <summary>Proto 的可为空形态:事务代际守卫(<see cref="DocsqlTransaction"/>
+    /// 的 StillOwnsConnection)在连接 Close 之后也要读取 —— Proto getter 在
+    /// _proto=null 时抛 InvalidOperationException,会让 Dispose/Commit/Rollback
+    /// 从守卫里逃出该异常而不是走设计的 closed 分支(返回 false)。Close 未
+    /// 重开 = null = 不再持有 BEGIN 时那条物理连接,语义与重开换线一致。</summary>
+    internal ProtocolConnection? ProtoOrNull => _proto;
 
     public override void ChangeDatabase(string databaseName) { }
 
@@ -1409,12 +1441,26 @@ public sealed class DocsqlDataReader : DbDataReader
             $"column {_columns[ordinal]} is NULL; check IsDBNull first")
         : convert(CurrentRow[ordinal]);
 
-    public override long GetInt64(int ordinal) => NonNull(ordinal, Convert.ToInt64);
-    public override int GetInt32(int ordinal) => NonNull(ordinal, Convert.ToInt32);
-    public override double GetDouble(int ordinal) => NonNull(ordinal, Convert.ToDouble);
-    public override string GetString(int ordinal) =>
-        NonNull(ordinal, v => Convert.ToString(v, CultureInfo.InvariantCulture)!);
-    public override bool GetBoolean(int ordinal) => NonNull(ordinal, Convert.ToBoolean);
+    // 字符串值按 InvariantCulture 解析(与 GetInt16/GetFloat 同形态):
+    // CurrentCulture 下 de-DE 会把 "3.14" 当千分位读成 314 —— 任何区域
+    // 设置都不许改变 wire 文本到数值的转换结果。
+    public override long GetInt64(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToInt64(v, CultureInfo.InvariantCulture));
+    public override int GetInt32(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToInt32(v, CultureInfo.InvariantCulture));
+    public override double GetDouble(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToDouble(v, CultureInfo.InvariantCulture));
+    public override string GetString(int ordinal) => NonNull(ordinal, v => v switch
+    {
+        // byte[] 的 Convert.ToString 只会给出 "System.Byte[]" —— 与其余
+        // typed getter 契约一致:类型不符抛 InvalidCastException,而不是
+        // 静默返回无意义文本当列值。
+        byte[] => throw new InvalidCastException(
+            $"column {_columns[ordinal]} is a BLOB value; use GetFieldValue<byte[]> or GetBytes"),
+        _ => Convert.ToString(v, CultureInfo.InvariantCulture)!,
+    });
+    public override bool GetBoolean(int ordinal) =>
+        NonNull(ordinal, v => Convert.ToBoolean(v, CultureInfo.InvariantCulture));
 
     /// <summary>EF 提供程序按类型映射读取;泛型读取覆盖 DECIMAL/BLOB/DATE/TIME 文本。</summary>
     public override T GetFieldValue<T>(int ordinal)
@@ -1641,9 +1687,12 @@ public sealed class DocsqlTransaction : DbTransaction
         await RunAsync($"RELEASE SAVEPOINT {QuoteIdent(savePointName)}", cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>事务归属的物理连接是否仍是被 BEGIN 的那条。</summary>
+    /// <summary>事务归属的物理连接是否仍是被 BEGIN 的那条。经可为空访问读取:
+    /// 连接已 Close(未重开)时 <see cref="DocsqlConnection.Proto"/> getter 会抛
+    /// InvalidOperationException,Dispose/Commit/Rollback 会从守卫里逃出该异常
+    /// 而非走设计的 closed 分支。</summary>
     private bool StillOwnsConnection =>
-        ReferenceEquals(_conn.Proto, _protoAtBegin);
+        _conn.ProtoOrNull is { } proto && ReferenceEquals(proto, _protoAtBegin);
 
     /// <summary>物理连接换代守卫:Close/Open 之后连接对象可能租到另一条物理线
     /// (原线断连时服务端已回滚本事务)。此后的任何事务帧 —— COMMIT、ROLLBACK、
@@ -1751,6 +1800,8 @@ public sealed class DocsqlTransaction : DbTransaction
             }
             try
             {
+                // 事务控制帧不继承上一条命令的预算(见 Run),回滚帧同理。
+                _protoAtBegin.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
                 _protoAtBegin.Send(new Frame(
                     FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql("ROLLBACK")));
             }
@@ -1768,15 +1819,21 @@ public sealed class DocsqlTransaction : DbTransaction
 
     private void Run(string sql)
     {
-        Check(_conn.Proto.Send(
+        // 事务控制帧不继承上一条命令的 CommandTimeout 预算:同步 Execute 把
+        // 预算 stamp 在物理连接上,COMMIT/ROLLBACK/保存点若带着上一条命令
+        // 的 1s 预算,慢盘下会被误判超时并毒化连接。发送前恢复默认读预算。
+        var proto = _conn.Proto;
+        proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
+        Check(proto.Send(
             new Frame(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(sql))));
     }
 
     private async Task RunAsync(string sql, CancellationToken cancellationToken)
     {
+        // 同 Run:显式传默认预算,不读可能被同步命令污染的 ReadTimeoutMs。
         Check(await _conn.Proto.SendAsync(
             new Frame(FrameType.ReqSql, 0, 0, ProtocolConnection.EncodeSql(sql)),
-            cancellationToken).ConfigureAwait(false));
+            cancellationToken, ProtocolConnection.DefaultReadTimeoutMs).ConfigureAwait(false));
     }
 
     private static void Check(Frame resp)

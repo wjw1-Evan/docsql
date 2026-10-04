@@ -333,7 +333,15 @@ impl S3Client {
         let (host, port, authority) = endpoint_parts(&self.cfg.endpoint)?;
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
+        // Progress guard: a broken (or hostile) gateway returning
+        // IsTruncated with the SAME token forever must not pin the backup
+        // task — and `BackupShared.running` — in an endless page loop.
+        let mut pages = 0usize;
         loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err("s3 list: too many pages (no progress?)".into());
+            }
             let mut params: Vec<(&str, String)> = vec![
                 ("list-type", "2".to_string()),
                 ("max-keys", "1000".to_string()),
@@ -367,6 +375,9 @@ impl S3Client {
             keys.extend(page);
             if !truncated {
                 return Ok(keys);
+            }
+            if token.as_ref() == next.as_ref() {
+                return Err("s3 list: continuation token made no progress".into());
             }
             token = next;
             if token.is_none() {

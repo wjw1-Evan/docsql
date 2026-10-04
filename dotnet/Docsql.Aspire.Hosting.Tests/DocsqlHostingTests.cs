@@ -169,4 +169,24 @@ public class DocsqlHostingTests
         Assert.Equal("{docsql-token.value}", env["DOCSQL_TOKEN"]);
         app.Dispose();
     }
+
+    /// <summary>第四轮回归:WithWebConsole 曾在调用时刻快照 TokenParameter,
+    /// 之后再 WithToken 换 token 时控制台持旧 token 对节点全部 401。
+    /// 修复:延迟绑定(环境变量求值时读取 builder.Resource.TokenParameter)。</summary>
+    [Fact]
+    public async Task WithWebConsole_binds_token_lazily_so_later_WithToken_wins()
+    {
+        var (app, resource) = Build<DocsqlWebConsoleResource>(builder =>
+        {
+            var db = builder.AddDocsql("docsql");
+            db.WithWebConsole();
+            // 控制台挂好之后再换 token:server 侧 WithToken 自己更新,控制台
+            // 必须跟着新值(延迟绑定),不得持有调用时刻的旧参数快照。
+            db.WithToken(builder.AddParameter("later-token", secret: true));
+        });
+
+        var env = await EnvAsync(resource);
+        Assert.Equal("{later-token.value}", env["DOCSQL_TOKEN"]);
+        app.Dispose();
+    }
 }

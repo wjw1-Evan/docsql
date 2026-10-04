@@ -378,6 +378,16 @@ wait_row_d() {
   fi
   docker volume create "$dvol" >/dev/null
   DOCSQL_DEV_IMAGE_TAG="${DOCSQL_DEV_IMAGE_TAG:-local}" docker compose --profile cluster --profile join up -d node-d >/dev/null )
+# The FATAL guard above exits the subshell with 1 — previously the parent
+# never looked at the status, so the guard was cosmetic: the suite went on
+# to boot node-d against last run's residue anyway (false green). Any
+# teardown failure (guard hit, volume create failed, compose up failed)
+# must abort the whole suite here.
+guard_rc=$?
+if [ "$guard_rc" -ne 0 ]; then
+  echo "FATAL: node-d teardown/recreate failed (rc=$guard_rc); aborting chapter 12" >&2
+  exit 1
+fi
 ok_d=""
 for _ in $(seq 1 60); do
   sqld "SELECT 1;" >/dev/null 2>&1 && { ok_d=1; break; }

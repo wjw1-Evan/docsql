@@ -10,6 +10,8 @@
 //   (T-SQL 月末语义);
 // - Math.Round 映射引擎 ROUND:半离零舍入,.NET 默认是银行家舍入,两者在有
 //   .5 尾数时可能有 1 位差(与 SQL Server 行为一致,属提供程序惯例);
+//   两参形态区分第二参 CLR 类型:(x, int digits) → ROUND(x, digits);
+//   (x, MidpointRounding.AwayFromZero) → ROUND(x, 0),其余枚举值显式报错;
 // - DATEDIFF 计"跨越边界"次数,与 T-SQL 相同(12-31→1-1 相差 1 年)。
 
 using System.Reflection;
@@ -117,11 +119,36 @@ public sealed class DocsqlTsqlMethodTranslator : IMethodCallTranslator
             case nameof(Math.Round) when arguments.Count == 1:
                 return Fn("ROUND", a0.Type, a0);
             case nameof(Math.Round)
-                when arguments.Count == 2 && arguments[1] is SqlConstantExpression digits:
-                return Fn("ROUND", a0.Type, a0, digits);
+                when arguments.Count == 2 && arguments[1] is SqlConstantExpression second:
+                return TranslateRoundTwoArg(a0, second);
             default:
                 return null;
         }
+    }
+
+    /// <summary>Math.Round 的两参重载只有 (x, int digits) 与 (x, MidpointRounding)
+    /// 两种。此前不区分 CLR 类型把第二参直接当 digits 翻译:枚举常量被按底层
+    /// 值渲染,AwayFromZero(=1)静默变成 ROUND(x, 1)(改小数位而不是舍入模式)。
+    /// digits 常量是 int 才走两参 ROUND;MidpointRounding.AwayFromZero 与引擎
+    /// ROUND 的半离零语义一致 → ROUND(x, 0);其余舍入模式引擎不实现,显式报错。</summary>
+    private SqlExpression? TranslateRoundTwoArg(SqlExpression value, SqlConstantExpression second)
+    {
+        if (second.Type == typeof(int))
+        {
+            return Fn("ROUND", value.Type, value, second);
+        }
+        if (second.Type == typeof(MidpointRounding))
+        {
+            return (MidpointRounding)second.Value! switch
+            {
+                MidpointRounding.AwayFromZero =>
+                    Fn("ROUND", value.Type, value, _sql.Constant(0)),
+                var mode => throw new NotSupportedException(
+                    $"Math.Round with MidpointRounding.{mode} is not supported; the engine's " +
+                    "ROUND is always half-away-from-zero (use MidpointRounding.AwayFromZero)"),
+            };
+        }
+        return null;
     }
 
     private SqlExpression? TranslateStringStatic(MethodInfo method, IReadOnlyList<SqlExpression> arguments)
