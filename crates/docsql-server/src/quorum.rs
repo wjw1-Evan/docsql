@@ -347,7 +347,7 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                     *state.replicate_to.lock().await = None;
                     let epoch = state.primary_epoch.fetch_add(1, Ordering::SeqCst) + 1;
                     let detail = format!(
-                        "auto: primary {primary} lost, majority visible, lag within                          window; epoch now {epoch}"
+                        "auto: primary {primary} lost, majority visible, lag within window; epoch now {epoch}"
                     );
                     eprintln!("docsql-quorum: promoted ({detail})");
                     crate::querylog::sync_event(
@@ -360,7 +360,7 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                     );
                 } else if !state.promote_lag_warned.swap(true, Ordering::SeqCst) {
                     eprintln!(
-                        "docsql-quorum: primary {primary} lost but local journal is                          behind beyond DOCSQL_CATCHUP_WINDOW — staying read-only                          (promoting would orphan the writes the primary confirmed)"
+                        "docsql-quorum: primary {primary} lost but local journal is behind beyond DOCSQL_CATCHUP_WINDOW — staying read-only (promoting would orphan the writes the primary confirmed)"
                     );
                     crate::querylog::sync_event(
                         &state.sync_log,
@@ -383,17 +383,30 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
     if !read_only {
         let forwarding = state.replicate_to.lock().await.is_some();
         if !forwarding {
+            // Pick the HIGHEST-epoch active primary (address breaks ties):
+            // member_views iterates a HashMap in arbitrary order, so taking
+            // the first hit let simultaneous higher primaries re-point
+            // different nodes at different (even lower-ranked) winners —
+            // and demotion never self-corrects.
+            let mut best: Option<(String, u64)> = None;
             for (addr, view) in quorum.member_views() {
-                if view.is_active_primary() && view.epoch > self_epoch {
+                if view.is_active_primary()
+                    && view.epoch > self_epoch
+                    && best.as_ref().is_none_or(|(_, e)| view.epoch > *e)
+                {
+                    best = Some((addr.clone(), view.epoch));
+                }
+            }
+            if let Some((addr, view_epoch)) = best {
+                {
                     state.read_only.store(true, Ordering::SeqCst);
                     *state.replicate_to.lock().await = Some(addr.clone());
                     // The mesh outranks us: freeze self-promotion for this
                     // process (see the (a) gate comment).
                     state.auto_promote_frozen.store(true, Ordering::SeqCst);
                     let detail = format!(
-                        "higher-ranked primary visible: {addr} (epoch {} > {self_epoch}); \
-                         demoted to read-only replica and re-pointed",
-                        view.epoch
+                        "higher-ranked primary visible: {addr} (epoch {view_epoch} > {self_epoch}); \
+                         demoted to read-only replica and re-pointed"
                     );
                     eprintln!("docsql-quorum: {detail}");
                     crate::querylog::sync_event(
@@ -404,7 +417,6 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                         true,
                         Some(detail),
                     );
-                    break;
                 }
             }
         }

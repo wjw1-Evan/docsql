@@ -1012,7 +1012,16 @@ const authGate = {
   lastUser: '',
   async boot() {
     let st = {mode: 'off'};
-    try { st = await fetch('/api/auth/status').then(r => r.json()); } catch { return true; }
+    // 探测失败不能当成「无账号门」:active 保持 false 会让此后所有 401
+    // 只弹 toast、永远不出现登录遮罩,页面卡死到手动刷新。降级为
+    // login 遮罩,让用户在遮罩上重试一次即恢复。
+    try { st = await fetch('/api/auth/status').then(r => r.json()); }
+    catch {
+      this.active = true;
+      this.mode = 'login';
+      this.show('login');
+      return false;
+    }
     this.active = st.mode && st.mode !== 'off';
     if (!this.active) return true;
     $('[data-act="logout"]').style.display = '';
@@ -2555,6 +2564,9 @@ function openDashboard() {
     $('[data-do="newq"]', t.el).onclick = () => openQueryTab();
     $('[data-do="refresh"]', t.el).onclick = t.load;
     t.load = async () => {
+      // 5s 轮询与在途慢响应交叠时,旧响应后到会覆盖新渲染:序号淘汰。
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq;
       // 统计对象随节点选择器切换:默认管理节点或其它集群节点。
       $('.sub', t.el).textContent = api.node
         ? T('统计对象为节点 {0}(写在该节点上执行并按其集群配置扇出)', api.node)
@@ -2563,6 +2575,7 @@ function openDashboard() {
           : T('统计对象为默认管理节点(集群状况见「视图 → 集群状态」) · 文档存储 + SQL · v{0}', CONSOLE_VERSION));
       try {
         const m = await api.get('/api/meta');
+        if (seq !== t.reqSeq) return;
         if (m && m.error) {
           $('[data-cards]', t.el).innerHTML =
             `<div class="card" style="max-width:520px"><div class="v" style="font-size:15px;color:var(--err)">${T('节点不可用')}</div><div class="k">${esc(m.error)}</div></div>`;
@@ -2670,6 +2683,7 @@ function openClusterTab() {
     t.load = async () => {
       try {
         const data = await api.get('/api/cluster');
+        if (seq !== t.reqSeq) return;
         nodes.sync(data.nodes || []); // 顺带刷新节点切换器的在线状态
         t.render(data);
         $('[data-at]', t.el).textContent = T('上次刷新 {0}', new Date().toTimeString().slice(0, 8));
@@ -2776,6 +2790,7 @@ function openSessionsTab() {
     t.load = async () => {
       try {
         const data = await api.get('/api/sessions');
+        if (seq !== t.reqSeq) return;
         t.render(data);
         $('[data-at]', t.el).textContent = T('上次刷新 {0}', new Date().toTimeString().slice(0, 8));
       } catch (e) { ui.toast(T('会话列表读取失败:{0}', e.message), true); }
@@ -2815,6 +2830,7 @@ function openUsersTab() {
       let data;
       try {
         data = await api.get('/api/users');
+        if (seq !== t.reqSeq) return;
         if (!data.error) {
           const meta = await api.get('/api/meta');
           data.tables = (meta.tables || []).map(x => x.name).filter(n => n);
@@ -3146,6 +3162,7 @@ function openBackupTab() {
     t.load = async () => {
       try {
         const v = await api.get('/api/backup');
+        if (seq !== t.reqSeq) return;
         t.render(v);
         $('[data-at]', t.el).textContent = T('上次刷新 {0}', new Date().toTimeString().slice(0, 8));
       } catch (e) { ui.toast(T('备份状态读取失败:{0}', e.message), true); }
@@ -3262,6 +3279,7 @@ function openLogsTab() {
     t.load = async () => {
       try {
         const data = await api.get('/api/logs?limit=' + t.limit);
+        if (seq !== t.reqSeq) return;
         const rows = [];
         const pushQuery = (list, src, srcKey) => (list || []).forEach(e => rows.push({
           ts: e.ts_ms, src, srcKey, cat: 'data', text: e.sql || '',

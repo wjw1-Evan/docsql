@@ -291,6 +291,19 @@ internal static class ConnectionPool
                         return proto;
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    // 调用方取消了 OPEN(应用关停/请求中止):一次取消不该
+                    // 排干整个池(下一波请求全部走新建)。只有取消发生在
+                    // 发送之前(连接未 Broken、帧流未错位)的连接可归还;
+                    // 已 Broken 的(读等待中被取消,应答帧仍会送达)照常
+                    // 丢弃 —— 归还它等于给下一个借出者留一具错位尸体。
+                    if (!proto.Broken)
+                    {
+                        slot.Idle.Append(proto);
+                    }
+                    throw;
+                }
                 catch
                 {
                     // 死连接(对端重启/网络断/超时)。
@@ -489,6 +502,10 @@ public sealed class DocsqlConnection : DbConnection
     /// </summary>
     public void Promote()
     {
+        // Connection-level APIs carry no command budget: reset whatever a
+        // previous command left on the physical connection (PROMOTE walks
+        // the write path, a stale 1s budget would poison it like COMMIT did).
+        Proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
         Proto.Send(new Frame(FrameType.ReqPromote, 0, 0, Array.Empty<byte>())).EnsureOk();
     }
 
@@ -499,6 +516,9 @@ public sealed class DocsqlConnection : DbConnection
     /// </summary>
     public (long Id, long Receivers) Publish(string channel, string payload)
     {
+        // PUBLISH fsyncs before pushing: a stale per-command budget must not
+        // misread that as a timeout and poison the connection.
+        Proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
         var body = JsonSerializer.Serialize(new { channel, payload });
         var resp = Proto.Send(new Frame(FrameType.ReqPublish, 0, 0, Encoding.UTF8.GetBytes(body)))
             .EnsureOk();
@@ -513,6 +533,7 @@ public sealed class DocsqlConnection : DbConnection
     /// </summary>
     public long PubsubTrim(string channel, long keep)
     {
+        Proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
         var body = JsonSerializer.Serialize(new { sub = "trim", channel, keep });
         var resp = Proto.Send(new Frame(FrameType.ReqPubsub, 0, 0, Encoding.UTF8.GetBytes(body)));
         return resp.Type switch
@@ -837,11 +858,22 @@ public sealed class DocsqlCommand : DbCommand
         var frame = Execute();
         return frame.Type switch
         {
-            FrameType.RespRows => new DocsqlDataReader(frame.Payload),
-            FrameType.RespAffected => new DocsqlDataReader(
-                Array.Empty<byte>(), DecodeAffected(frame.Payload)),
+            FrameType.RespRows => WireCloseBehavior(
+                new DocsqlDataReader(frame.Payload), behavior),
+            FrameType.RespAffected => WireCloseBehavior(
+                new DocsqlDataReader(Array.Empty<byte>(), DecodeAffected(frame.Payload)),
+                behavior),
             _ => throw new DocsqlException(ErrorText(frame)),
         };
+    }
+
+    private DocsqlDataReader WireCloseBehavior(DocsqlDataReader reader, CommandBehavior behavior)
+    {
+        if (behavior.HasFlag(CommandBehavior.CloseConnection))
+        {
+            reader._closeOnDispose = Connection;
+        }
+        return reader;
     }
 
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
@@ -1266,6 +1298,10 @@ public sealed class DocsqlDataReader : DbDataReader
     private bool _closed;
 
     private readonly int _recordsAffected;
+    // CommandBehavior.CloseConnection: disposing the reader also closes the
+    // connection — callers that hand the reader out without keeping a
+    // reference relied on this and leaked pool permits.
+    internal DocsqlConnection? _closeOnDispose;
 
     internal DocsqlDataReader(byte[] payload, int recordsAffected = 0)
     {
@@ -1394,6 +1430,9 @@ public sealed class DocsqlDataReader : DbDataReader
     protected override void Dispose(bool disposing)
     {
         _closed = true;
+        // CommandBehavior.CloseConnection: the reader owns the connection's
+        // lifetime for callers that never held a reference to it.
+        _closeOnDispose?.Close();
         base.Dispose(disposing);
     }
     public override int RecordsAffected => _recordsAffected;

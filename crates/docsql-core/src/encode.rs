@@ -32,6 +32,8 @@ pub enum EncodeError {
     TooDeep,
     #[error("duplicate object key {0:?}")]
     DuplicateKey(String),
+    #[error("corrupt decimal: scale {0} exceeds 28")]
+    BadDecimalScale(u32),
 }
 
 /// Matches json.rs — the decoder runs on network payloads, so recursion
@@ -193,7 +195,14 @@ impl<'a> Decoder<'a> {
                 let b = self.take(16)?;
                 let mut raw = [0u8; 16];
                 raw.copy_from_slice(b);
-                Value::Decimal(Decimal::deserialize(raw))
+                let d = Decimal::deserialize(raw);
+                // deserialize does not validate scale; 29..=31 decodes
+                // cleanly but later indexes FIVE_POW[scale] (cap 28) and
+                // panics. Corrupt input must fail loudly here.
+                if d.scale() > 28 {
+                    return Err(EncodeError::BadDecimalScale(d.scale()));
+                }
+                Value::Decimal(d)
             }
             9 => {
                 let b = self.take(8)?;

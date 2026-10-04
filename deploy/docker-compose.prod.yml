@@ -265,7 +265,9 @@ services:
     entrypoint: ["docsql-web"]
     environment:
       DOCSQL_TOKEN: "${DOCSQL_TOKEN:-}"
-      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      # node-d included: after `--profile join` it is a full peer the
+      # console must be able to manage (unreachable entries are harmless).
+      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600,node-d:7600"
       # Console account (first-use username/password). Empty env disables
       # the gate (run-tests.sh sets it so its raw curls stay unauthenticated).
       DOCSQL_WEB_AUTH_FILE: "${DOCSQL_WEB_AUTH_FILE-/auth/console-auth.json}"

@@ -49,6 +49,10 @@ pub const PUBSUB_TABLE: &str = "_pubsub_messages";
 /// origin's.
 pub const CLUSTER_LOG_TABLE: &str = "_cluster_log";
 
+/// Byte cap for one `journal_range` catch-up batch: large documents make a
+/// fixed row count an unbounded memory commitment on the serving node.
+const JOURNAL_RANGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// System table backing catch-up replication positions: per origin node
 /// id, the last applied journal seq. Updated right after each applied
 /// replicated write; a crash between apply and update leaves the position
@@ -1798,11 +1802,22 @@ impl<'a> ReadCx<'a> {
                         ("tbl_name".into(), Value::Str(tbl.clone())),
                         (
                             "sql".into(),
+                            // Identifiers quoted: the EF provider replays
+                            // this DDL verbatim during its keep-data rebuild,
+                            // and a reserved-word table/column name (Order,
+                            // Order) failed to parse there — taking the user's
+                            // hand-made indexes down with it.
                             Value::Str(format!(
                                 "CREATE {}INDEX {iname} ON {tbl} ({col})",
                                 if d.unique { "UNIQUE " } else { "" },
-                                iname = d.name,
-                                col = d.columns.join(", ")
+                                iname = crate::stmt::sql_quote_ident(&d.name),
+                                tbl = crate::stmt::sql_quote_ident(tbl),
+                                col = d
+                                    .columns
+                                    .iter()
+                                    .map(|c| crate::stmt::sql_quote_ident(c))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             )),
                         ),
                     ]));
@@ -3369,20 +3384,24 @@ impl<'a> ReadCx<'a> {
                 .collect()
         };
         let columns = anchor.columns.clone();
-        let mut all: Vec<Object> = to_docs(anchor.rows, &columns);
         // UNION (distinct) keeps a seen-set over encoded bytes; UNION ALL
-        // appends everything and relies on the caps.
+        // appends everything and relies on the caps. The anchor dedupes
+        // through the same set — UNION semantics cover the seed rows too,
+        // not just the recursive arm's output.
         let distinct = !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
         let doc_key = |d: &Object| -> Vec<u8> {
             let mut buf = Vec::new();
             crate::encode::encode_object(d, &mut buf).unwrap_or_default();
             buf
         };
-        let mut seen: std::collections::BTreeSet<Vec<u8>> = if distinct {
-            all.iter().map(&doc_key).collect()
-        } else {
-            std::collections::BTreeSet::new()
-        };
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        let mut all: Vec<Object> = Vec::new();
+        for d in to_docs(anchor.rows, &columns) {
+            if distinct && !seen.insert(doc_key(&d)) {
+                continue;
+            }
+            all.push(d);
+        }
         let arm_query = |binding: Vec<Object>| -> Result<QueryResult> {
             let mut scope = outer.clone();
             scope.insert(name.to_string(), binding);
@@ -3487,6 +3506,11 @@ impl<'a> ReadCx<'a> {
                     return reject();
                 }
                 let r = self.subquery_result(q)?;
+                if r.rows.len() > 1 {
+                    // Silently taking the first row makes the result depend
+                    // on scan order — a wrong answer that looks plausible.
+                    return err("scalar subquery returned more than one row");
+                }
                 let v = r
                     .rows
                     .first()
@@ -3767,38 +3791,91 @@ impl<'a> ReadCx<'a> {
         compare_op: &BinaryOperator,
         any: bool,
     ) -> Result<SqlExpr> {
+        fn lit_bool(b: bool) -> SqlExpr {
+            SqlExpr::Value(sqlparser::ast::Value::Boolean(b).into())
+        }
+        fn lit_null() -> SqlExpr {
+            SqlExpr::Value(sqlparser::ast::Value::Null.into())
+        }
         let r = self.subquery_result(q)?;
-        let mut acc: Option<SqlExpr> = None;
+        if r.rows.is_empty() {
+            // ANY over the empty set is FALSE, ALL is TRUE (standard).
+            return value_to_literal(Value::Bool(!any));
+        }
+        let mut cmps = Vec::with_capacity(r.rows.len());
         for row in &r.rows {
             let v = value_to_literal(row.first().cloned().unwrap_or(Value::Null))?;
-            let cmp = SqlExpr::BinaryOp {
+            cmps.push(SqlExpr::BinaryOp {
                 left: Box::new(left.clone()),
                 op: compare_op.clone(),
                 right: Box::new(v),
-            };
-            // Comparisons are NOT two-valued everywhere: a Timestamp against
-            // an unparseable string evaluates to Null, and OR/AND of Null
-            // errors out. An unknown comparison never satisfies the element
-            // for ANY, and makes the whole ALL chain fail to prove — both
-            // fold to FALSE under COALESCE, matching WHERE-visible semantics.
-            let cmp = coalesce_false(cmp);
-            acc = Some(match acc {
-                None => cmp,
-                Some(prev) => SqlExpr::BinaryOp {
-                    left: Box::new(prev),
-                    op: if any {
-                        BinaryOperator::Or
-                    } else {
-                        BinaryOperator::And
-                    },
-                    right: Box::new(cmp),
-                },
             });
         }
-        match acc {
-            Some(expr) => Ok(expr),
-            None => value_to_literal(Value::Bool(!any)),
+        // Three-valued quantification. The engine's boolean AND/OR reject
+        // Null, and the old COALESCE-to-FALSE fold was only WHERE-visible:
+        // under NOT it admitted rows three-valued logic filters
+        // (`NOT (x > ALL (…, NULL))` must stay UNKNOWN, not become TRUE).
+        // `c = TRUE` / `c = FALSE` are Null-safe (a Null comparison is
+        // FALSE under the engine's total order, never an error), so a CASE
+        // over the folded chains reproduces the exact ANY/ALL truth table
+        // under any nesting.
+        let eq_bool = |c: SqlExpr, b: bool| -> SqlExpr {
+            SqlExpr::BinaryOp {
+                left: Box::new(c),
+                op: BinaryOperator::Eq,
+                right: Box::new(lit_bool(b)),
+            }
+        };
+        let fold = |mut v: Vec<SqlExpr>, op: BinaryOperator| -> SqlExpr {
+            let mut acc = v.swap_remove(0);
+            for e in v {
+                acc = SqlExpr::BinaryOp {
+                    left: Box::new(acc),
+                    op: op.clone(),
+                    right: Box::new(e),
+                };
+            }
+            acc
+        };
+        let mut t_eqs = Vec::with_capacity(cmps.len());
+        let mut f_eqs = Vec::with_capacity(cmps.len());
+        for c in cmps {
+            t_eqs.push(eq_bool(c.clone(), true));
+            f_eqs.push(eq_bool(c, false));
         }
+        // ANY: TRUE if some comparison is TRUE, FALSE if all are FALSE,
+        // else UNKNOWN. ALL mirrors it.
+        let (c1, r1, c2, r2) = if any {
+            (
+                fold(t_eqs, BinaryOperator::Or),
+                lit_bool(true),
+                fold(f_eqs, BinaryOperator::And),
+                lit_bool(false),
+            )
+        } else {
+            (
+                fold(f_eqs, BinaryOperator::Or),
+                lit_bool(false),
+                fold(t_eqs, BinaryOperator::And),
+                lit_bool(true),
+            )
+        };
+        Ok(SqlExpr::Case {
+            case_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+            end_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+            operand: None,
+            conditions: vec![
+                sqlparser::ast::CaseWhen {
+                    condition: c1,
+                    result: r1,
+                },
+                sqlparser::ast::CaseWhen {
+                    condition: c2,
+                    result: r2,
+                },
+            ],
+            else_result: Some(Box::new(lit_null())),
+        })
     }
 
     /// Run a subquery and return its rows (first column only matters for
@@ -5199,6 +5276,13 @@ impl<'a> ReadCx<'a> {
                             "table function {tname} — materialized at runtime (plan not detailed)"
                         ),
                     );
+                } else if !plain_table_factor(&select.from[0].relation) {
+                    // TABLESAMPLE / index hints / alias column lists / VERSION
+                    // AS OF …: load_table_factor rejects these at runtime —
+                    // printing an INDEX PROBE plan for a statement that
+                    // cannot execute breaks the EXPLAIN/exec mirror.
+                    return err("table factor carries clauses the executor rejects \
+                         (TABLESAMPLE / index hints / alias columns / VERSION AS OF)");
                 } else if is_compat_view(&tname) {
                     row(
                         out,
@@ -5780,12 +5864,26 @@ impl Database {
                                                 // Legacy three-element entries
                                                 // are single-column.
                                                 let columns = match t.get(3) {
-                                                    Some(Value::Array(a)) => a
-                                                        .iter()
-                                                        .filter_map(|v| {
-                                                            v.as_str().map(String::from)
-                                                        })
-                                                        .collect::<Vec<_>>(),
+                                                    Some(Value::Array(a)) => {
+                                                        // An EMPTY array must
+                                                        // not survive: IndexDef
+                                                        // assumes columns
+                                                        // non-empty (`column()`
+                                                        // indexes [0]) and
+                                                        // panics on the next
+                                                        // catalog save.
+                                                        let cols: Vec<_> = a
+                                                            .iter()
+                                                            .filter_map(|v| {
+                                                                v.as_str().map(String::from)
+                                                            })
+                                                            .collect();
+                                                        if cols.is_empty() {
+                                                            vec![c.to_string()]
+                                                        } else {
+                                                            cols
+                                                        }
+                                                    }
                                                     _ => vec![c.to_string()],
                                                 };
                                                 // Optional 5th element (design
@@ -6288,6 +6386,15 @@ impl Database {
         }
         let _ = self.tx_snapshot.take();
         self.savepoints.clear();
+        // The restore transaction committed DEFERRED (the snapshot was still
+        // in place during it): fence + fsync now. ROLLBACK is a terminal
+        // statement — no later COMMIT exists to trigger the WAL cap — so
+        // without this a BEGIN/INSERT/ROLLBACK workload grew the log and
+        // pending_writes without bound. The fence is also the durability
+        // boundary for the undo-replayed page images. On failure the error
+        // is loud and a retried ROLLBACK is idempotent (the undo journal is
+        // empty by then; the catalog is already at the snapshot state).
+        self.pager.sync_wal()?;
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -6476,9 +6583,10 @@ impl Database {
         let sql = meta.view_sql.as_ref()?;
         let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
         let stmt = stmts.swap_remove(0);
+        let objects = |n: &str| self.tables.contains_key(n);
         let mut out = Vec::new();
         match stmt {
-            Statement::Query(q) => walk_query(&q, &mut out)?,
+            Statement::Query(q) => walk_query(&q, &mut out, &objects)?,
             _ => return None,
         }
         Some(out)
@@ -6530,8 +6638,11 @@ impl Database {
     /// predicates, aggregate FILTER conditions) and a CTAS/CREATE VIEW
     /// source query. Fails CLOSED: a query shape the walker cannot fully
     /// classify returns `None`, and the caller must deny rather than guess.
-    pub fn stmt_read_targets(stmt: &Statement) -> Option<Vec<String>> {
-        let mut out = Self::stmt_read_target_occurrences(stmt)?;
+    pub fn stmt_read_targets(
+        stmt: &Statement,
+        objects: &dyn Fn(&str) -> bool,
+    ) -> Option<Vec<String>> {
+        let mut out = Self::stmt_read_target_occurrences(stmt, objects)?;
         out.sort();
         out.dedup();
         Some(out)
@@ -6542,19 +6653,22 @@ impl Database {
     /// a filtered table read twice (outer FROM + a subquery) must count
     /// twice, but the deduped set collapsed it to one and made deep ==
     /// top, letting the subquery position escape filtering entirely.
-    pub fn stmt_read_target_occurrences(stmt: &Statement) -> Option<Vec<String>> {
+    pub fn stmt_read_target_occurrences(
+        stmt: &Statement,
+        objects: &dyn Fn(&str) -> bool,
+    ) -> Option<Vec<String>> {
         let mut out = Vec::new();
         match stmt {
-            Statement::Query(q) => walk_query(q, &mut out)?,
+            Statement::Query(q) => walk_query(q, &mut out, objects)?,
             // EXPLAIN reads exactly what its inner query reads (fail-closed
             // on any inner shape the walker cannot classify).
             Statement::Explain { statement, .. } => match statement.as_ref() {
-                Statement::Query(q) => walk_query(q, &mut out)?,
+                Statement::Query(q) => walk_query(q, &mut out, objects)?,
                 _ => return None,
             },
             Statement::Insert(insert) => {
                 if let Some(source) = &insert.source {
-                    walk_query(source, &mut out)?;
+                    walk_query(source, &mut out, objects)?;
                 }
             }
             Statement::Update(u) => {
@@ -6562,7 +6676,7 @@ impl Database {
                 // (SELECT pw FROM docsql_users …)`); exec_update
                 // substitutes and evaluates them, so they are reads.
                 for a in &u.assignments {
-                    walk_expr(&a.value, &mut out)?;
+                    walk_expr(&a.value, &mut out, objects)?;
                 }
                 // The update target itself is a WRITE target; extra FROM
                 // tables are reads.
@@ -6572,11 +6686,11 @@ impl Database {
                         | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => v,
                     };
                     for twj in list {
-                        walk_factor(&twj.relation, &mut out)?;
+                        walk_factor(&twj.relation, &mut out, objects)?;
                     }
                 }
                 if let Some(sel) = &u.selection {
-                    walk_expr(sel, &mut out)?;
+                    walk_expr(sel, &mut out, objects)?;
                 }
             }
             Statement::Delete(d) => {
@@ -6584,11 +6698,11 @@ impl Database {
                 // stmt_write_targets.
                 if let Some(using) = &d.using {
                     for twj in using {
-                        walk_factor(&twj.relation, &mut out)?;
+                        walk_factor(&twj.relation, &mut out, objects)?;
                     }
                 }
                 if let Some(sel) = &d.selection {
-                    walk_expr(sel, &mut out)?;
+                    walk_expr(sel, &mut out, objects)?;
                 }
             }
             Statement::Merge(m) => {
@@ -6596,10 +6710,10 @@ impl Database {
                 // stmt_write_targets. ON/assignments referencing the target
                 // are writes, not reads. WHEN predicates are evaluated per
                 // row and may carry subqueries — walk them too.
-                walk_factor(&m.source, &mut out)?;
+                walk_factor(&m.source, &mut out, objects)?;
                 for clause in &m.clauses {
                     if let Some(pred) = &clause.predicate {
-                        walk_expr(pred, &mut out)?;
+                        walk_expr(pred, &mut out, objects)?;
                     }
                 }
             }
@@ -6608,10 +6722,10 @@ impl Database {
                 // authorization input (the admin-only DDL gate shadows this
                 // today, but the classification must stay honest).
                 if let Some(q) = &create.query {
-                    walk_query(q, &mut out)?;
+                    walk_query(q, &mut out, objects)?;
                 }
             }
-            Statement::CreateView(view) => walk_query(&view.query, &mut out)?,
+            Statement::CreateView(view) => walk_query(&view.query, &mut out, objects)?,
             _ => {}
         }
         Some(out)
@@ -6915,6 +7029,18 @@ impl Database {
                     }
                     return Ok(outcome);
                 }
+            }
+        }
+        // T-SQL wall clocks are per-STATEMENT on the READ path too: the
+        // scalar arm re-samples now_ms() per call site, so every row (and
+        // two GETDATE()s in one projection) drifted across the scan. Fold
+        // reads exactly like RAND below — one instant per statement.
+        if !parsed.is_write && crate::stmt::mentions_wall_clock(&parsed.source) {
+            if let Some(folded) =
+                crate::stmt::fold_wall_clocks(&parsed.source, crate::now_ms() as i64)
+            {
+                let reparsed = Self::parse_classified(&folded)?;
+                return self.execute_parsed(reparsed);
             }
         }
         // T-SQL RAND(): evaluated ONCE per statement — every row of the
@@ -7409,12 +7535,20 @@ impl Database {
              ORDER BY seq ASC LIMIT {limit}"
         ))?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         if let ExecOutcome::Rows(rows) = r {
             for row in &rows.rows {
                 let (Some(Value::Int(seq)), Some(Value::Str(sql))) = (row.first(), row.get(1))
                 else {
                     return err("journal row has unexpected shape");
                 };
+                bytes = bytes.saturating_add(sql.len());
+                if !out.is_empty() && bytes > JOURNAL_RANGE_MAX_BYTES {
+                    // Byte budget for the catch-up batch: rows can carry
+                    // ~16MiB documents, so a 512-row page could otherwise
+                    // materialize gigabytes in one Vec on the serving node.
+                    break;
+                }
                 out.push((*seq as u64, sql.clone()));
             }
         }
@@ -7945,7 +8079,13 @@ impl Database {
                                     .position(|d| d.name == iname.as_str())
                                 {
                                     let def = meta.index_defs.remove(dpos);
-                                    if def.columns.len() > 1 {
+                                    // Trees keyed by the index NAME (composite
+                                    // or JSON-path indexes) are unaddressable
+                                    // once the definition is gone — and a
+                                    // path tree left behind gets mistaken for
+                                    // the column's own scalar tree, silently
+                                    // hijacking probes and ORDER BY walks.
+                                    if def.columns.len() > 1 || def.path.is_some() {
                                         if let Some(root) = meta.index_roots.remove(&iname) {
                                             dropped_roots.push((iname.clone(), root));
                                         }
@@ -9674,6 +9814,20 @@ impl Database {
                     if pk.as_deref() == Some(old.as_str()) {
                         pk = Some(new.clone());
                     }
+                    // The apply loop rekeys the single-column tree from the
+                    // old column name to the new one — evolve the simulated
+                    // roots the same way, or a later rename falsely reports
+                    // a collision with the vacated name.
+                    if roots.remove(old.as_str()) {
+                        roots.insert(new.clone());
+                    }
+                    for d in index_defs.iter_mut() {
+                        for c in d.columns.iter_mut() {
+                            if c == old {
+                                *c = new.clone();
+                            }
+                        }
+                    }
                     checks = checks
                         .iter()
                         .map(|c| rename_ident_in_text(c, old, new))
@@ -9725,7 +9879,6 @@ impl Database {
         self.validate_alter_ops(&meta, &tname, &alter.operations)?;
         // rewrite_table persists the catalog in its own transaction; only
         // metadata-only ALTERs (plain ADD COLUMN) need the tail save.
-        let mut rewrote = false;
         // Trees detached from `meta.index_roots` by DROP COLUMN below; freed
         // inside the rebuild's write unit (see rewrite_table_with_dead).
         let mut dead_trees: Vec<(String, u32)> = Vec::new();
@@ -9833,7 +9986,6 @@ impl Database {
                             meta.check(d)?;
                         }
                         self.rewrite_table(&tname, &mut meta, filled)?;
-                        rewrote = true;
                     }
                 }
                 Op::DropColumn { column_names, .. } => {
@@ -9928,7 +10080,6 @@ impl Database {
                         stripped,
                         std::mem::take(&mut dead_trees),
                     )?;
-                    rewrote = true;
                 }
                 Op::RenameColumn {
                     old_column_name,
@@ -10053,7 +10204,6 @@ impl Database {
                         })
                         .collect();
                     self.rewrite_table(&tname, &mut meta, renamed)?;
-                    rewrote = true;
                     // Referencing tables' remote columns follow too (the same
                     // rule RENAME TABLE applies to their rt, also after the
                     // commit so the failure path stays atomic): a dangling rc
@@ -10187,10 +10337,13 @@ impl Database {
                 other => return err(format!("unsupported ALTER TABLE operation: {other}")),
             }
         }
-        if !rewrote {
-            self.tables.insert(tname.clone(), std::sync::Arc::new(meta));
-            self.save_catalog()?;
-        }
+        // A rewrite persists the meta CLONE it saw; any metadata-only
+        // operations after it in the same statement (ADD COLUMN without a
+        // DEFAULT, a CHECK) only touched the local `meta` and were silently
+        // dropped. Save the final state unconditionally — the extra save
+        // after a bare rewrite is idempotent.
+        self.tables.insert(tname.clone(), std::sync::Arc::new(meta));
+        self.save_catalog()?;
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -10262,16 +10415,7 @@ impl Database {
     /// referenced by child tables. `replacement_docs` carries the statement's
     /// surviving/updated rows of `table`: a parent-key value kept by any of
     /// them stays referenceable.
-    fn check_fk_parent_delete(
-        &mut self,
-        table: &str,
-        removed_docs: &[Object],
-        replacement_docs: &[Object],
-    ) -> Result<()> {
-        self.check_fk_parent_delete_skipping(table, removed_docs, replacement_docs, &[], None)
-    }
-
-    /// [`check_fk_parent_delete`] with a child-table exclusion list: children
+    /// [`check_fk_parent_delete_skipping`] with a child-table exclusion list: children
     /// named in `skip` are also being emptied by the same statement (e.g.
     /// `TRUNCATE parent, child`), so their rows cannot end up orphaned.
     /// `self_children` overrides the scan of `table`'s own rows with the
@@ -10459,11 +10603,12 @@ impl Database {
         // new body must never return to `name` — otherwise every later
         // SELECT would recurse until the expansion budget trips.
         {
+            let objects = |n: &str| self.tables.contains_key(n);
             let mut refs = Vec::new();
             let mut stmts = Parser::parse_sql(&GenericDialect {}, &body)
                 .map_err(|e| SqlError::Parse(e.to_string()))?;
             if let Statement::Query(q) = stmts.swap_remove(0) {
-                if walk_query(&q, &mut refs).is_none() {
+                if walk_query(&q, &mut refs, &objects).is_none() {
                     return err("view body cannot be classified");
                 }
                 if refs.iter().any(|r| r == &name) {
@@ -10622,6 +10767,16 @@ impl Database {
             let ExecOutcome::Rows(r) = self.exec_query_cx(q.as_ref().clone())? else {
                 return err("CREATE TABLE AS requires a SELECT");
             };
+            // An explicit column list alongside AS SELECT would rename the
+            // outputs (and its constraints would apply) — silently dropping
+            // it shaped the table after the query instead. Refuse loudly
+            // rather than ignore half the statement.
+            if !create.columns.is_empty() {
+                return err(
+                    "CREATE TABLE (…) AS SELECT with an explicit column list is not supported \
+                     (omit the list, or alias the SELECT outputs)",
+                );
+            }
             let docs: Vec<Object> = r
                 .rows
                 .into_iter()
@@ -11142,6 +11297,12 @@ impl Database {
             }
             _ => (false, Vec::new(), None),
         };
+        if replace && do_nothing {
+            // Displacement deletes the conflicting old rows first, then DO
+            // NOTHING skips every incoming row — a silent net delete. Reject
+            // the mix like the DO UPDATE combination below.
+            return err("OR REPLACE / REPLACE INTO cannot combine with ON CONFLICT DO NOTHING");
+        }
         if do_update {
             if replace || do_nothing {
                 return err(
@@ -11252,6 +11413,19 @@ impl Database {
                 sql.push_str(&on.to_string());
             }
             self.resolved_sql = Some(sql);
+        } else if source_calls_nondet && new_docs.is_empty() {
+            // Zero rows from a NONDETERMINISTIC source: replaying the
+            // original text re-rolls RAND()/NEWID() on every peer — an
+            // empty draw here can be non-empty there, silently forking the
+            // cluster. Ship a deterministically-empty statement instead.
+            // (INSERT ... SELECT is safe to emit: an auto-GUID table never
+            // reaches this point — that shape is rejected above.)
+            let col = meta.columns.first().cloned().unwrap_or_else(|| "v".into());
+            let q = quote_ident(&col);
+            self.resolved_sql = Some(format!(
+                "INSERT INTO {} ({q}) SELECT {q} FROM (VALUES (NULL)) AS __empty__({q}) WHERE 1 = 0",
+                quote_ident(&table)
+            ));
         }
 
         // One pager transaction for heap pages and index trees alike: a
@@ -11410,7 +11584,26 @@ impl Database {
                         .map(|(_, d)| d.clone())
                 })
                 .collect();
-            self.check_fk_parent_delete(&table, &displaced_docs, &new_docs)?;
+            // Self-referential FKs must see the statement's FINAL state —
+            // pre-state minus the displaced rows plus the placed rows. The
+            // committed-state fallback would count references that vanish
+            // together with their parent and reject a legal replace.
+            let displaced_set: std::collections::BTreeSet<u64> =
+                displaced.iter().copied().collect();
+            let mut final_rows: Vec<Object> = self
+                .table_pairs_cx(&table)?
+                .into_iter()
+                .filter(|(l, _)| !displaced_set.contains(l))
+                .map(|(_, d)| d)
+                .collect();
+            final_rows.extend(new_docs.iter().cloned());
+            self.check_fk_parent_delete_skipping(
+                &table,
+                &displaced_docs,
+                &new_docs,
+                &[],
+                Some(&final_rows),
+            )?;
             let moves = heap.remove_many(&self.pager, &mut tx, &displaced)?;
             for loc in &displaced {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
@@ -11840,16 +12033,28 @@ impl Database {
         self.commit_pager_tx(tx)?;
         // AUTOINCREMENT counter: never regress, follow explicit max.
         if let Some(col) = &meta.autoinc {
-            let used = placed
-                .iter()
-                .filter_map(|(_, d)| match d.get(col) {
-                    Some(Value::Int(i)) => Some((*i).saturating_add(1)),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(next_autoinc)
-                .max(next_autoinc);
-            self.autoinc_cache.insert(table.clone(), used);
+            // The upsert-UPDATE arm can raise the live max past every placed
+            // id (SET id = <higher>) — invalidate like the UPDATE fast path,
+            // or the stale cache keeps issuing already-taken ids and every
+            // subsequent autoincrement INSERT fails on the unique tree.
+            let du_touched = do_update
+                && du_assignments.iter().any(|a| {
+                    matches!(&a.target, sqlparser::ast::AssignmentTarget::ColumnName(c) if obj_name(c) == *col)
+                });
+            if du_touched {
+                self.autoinc_cache.remove(&table);
+            } else {
+                let used = placed
+                    .iter()
+                    .filter_map(|(_, d)| match d.get(col) {
+                        Some(Value::Int(i)) => Some((*i).saturating_add(1)),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(next_autoinc)
+                    .max(next_autoinc);
+                self.autoinc_cache.insert(table.clone(), used);
+            }
             // Max id this statement actually placed (explicit values count;
             // an INSERT that placed no rows leaves the previous value).
             self.last_insert_id = placed
@@ -13297,7 +13502,18 @@ fn join_key_of(v: &Value) -> Option<JoinKey> {
         // terminates candidates exactly).
         Value::Decimal(d) => JoinKey::Num(num_key(d.to_f64()?)),
         Value::Timestamp(ms) => JoinKey::Num(num_key(*ms as f64)),
-        Value::Str(s) => JoinKey::Str(s.clone()),
+        Value::Str(s) => {
+            // A parseable timestamp string joins against TIMESTAMP values —
+            // binop coerces the pair before comparing — so both sides must
+            // land in the same bucket or the hash path would drop a match
+            // the nested loop finds. Keying parseable strings by their
+            // instant only ever over-merges (string≠string pairs become
+            // candidates the ON re-evaluation rejects); it never splits.
+            match crate::value::parse_timestamp_ms(s) {
+                Some(ms) => JoinKey::Num(num_key(ms as f64)),
+                None => JoinKey::Str(s.clone()),
+            }
+        }
         Value::Bytes(b) => JoinKey::Bytes(b.clone()),
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -15621,8 +15837,8 @@ fn subst_outer_refs_setexpr(
 // Every walker returns Option<()>: `None` means "shape not fully
 // classifiable" and the authorization caller must DENY (fail closed).
 
-fn walk_query(q: &Query, out: &mut Vec<String>) -> Option<()> {
-    walk_query_shadowed(q, out, &[])
+fn walk_query(q: &Query, out: &mut Vec<String>, objects: &dyn Fn(&str) -> bool) -> Option<()> {
+    walk_query_shadowed(q, out, &[], objects)
 }
 
 /// `shadow` carries the CTE names visible at this scope: a WITH alias shadows
@@ -15630,79 +15846,101 @@ fn walk_query(q: &Query, out: &mut Vec<String>) -> Option<()> {
 /// FROM refs under those names read the CTE, not a base object, and must not
 /// land in the base set — a view whose body opens `WITH v AS (…) SELECT *
 /// FROM v` used to be misjudged as self-referencing and refused.
-fn walk_query_shadowed(q: &Query, out: &mut Vec<String>, outer: &[String]) -> Option<()> {
+/// `objects` tells whether a name matches a real table/view: the engine binds
+/// a CTE's own body (and a recursive anchor) BEFORE the CTE enters scope, so
+/// a self-name that also names a real object reads the BASE object there —
+/// shadowing it would hide that read from authorization and row filters
+/// entirely (the name only shadows once its body is done).
+fn walk_query_shadowed(
+    q: &Query,
+    out: &mut Vec<String>,
+    outer: &[String],
+    objects: &dyn Fn(&str) -> bool,
+) -> Option<()> {
     let mut shadow: Vec<String> = outer.to_vec();
     if let Some(w) = &q.with {
         for cte in &w.cte_tables {
-            shadow.push(cte.alias.name.value.clone());
-            // CTE bodies see the WITH list built so far (and outer scopes):
-            // a recursive CTE's self-reference is a CTE read, not a table.
-            walk_query_shadowed(&cte.query, out, &shadow)?;
+            let name = cte.alias.name.value.clone();
+            if !objects(&name) {
+                shadow.push(name.clone());
+            }
+            walk_query_shadowed(&cte.query, out, &shadow, objects)?;
+            // From here on (later CTE bodies, the main query) the name is a
+            // materialized CTE read for everyone.
+            shadow.push(name);
         }
     }
-    if shadow.len() == outer.len() {
-        return walk_query_inner(q, out);
+    // Fast path only when NO names are shadowed at this level: a body walk
+    // arrives with the enclosing scope's shadow in `outer`, and short-
+    // circuiting there wrote the refs straight into `out`, skipping the
+    // filter entirely (the body's own CTE reads leaked into the base set).
+    if shadow.is_empty() {
+        return walk_query_inner(q, out, objects);
     }
     let mut refs = Vec::new();
-    walk_query_inner(q, &mut refs)?;
+    walk_query_inner(q, &mut refs, objects)?;
     out.extend(refs.into_iter().filter(|r| !shadow.iter().any(|s| s == r)));
     Some(())
 }
 
-fn walk_query_inner(q: &Query, out: &mut Vec<String>) -> Option<()> {
-    walk_setexpr(&q.body, out)?;
+fn walk_query_inner(
+    q: &Query,
+    out: &mut Vec<String>,
+    objects: &dyn Fn(&str) -> bool,
+) -> Option<()> {
+    walk_setexpr(&q.body, out, objects)?;
     if let Some(order_by) = &q.order_by {
         if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
             for obe in exprs {
-                walk_expr(&obe.expr, out)?;
+                walk_expr(&obe.expr, out, objects)?;
             }
         }
     }
     Some(())
 }
 
-fn walk_setexpr(se: &SetExpr, out: &mut Vec<String>) -> Option<()> {
+fn walk_setexpr(se: &SetExpr, out: &mut Vec<String>, objects: &dyn Fn(&str) -> bool) -> Option<()> {
     match se {
         SetExpr::Select(sel) => {
             for twj in &sel.from {
-                walk_factor(&twj.relation, out)?;
+                walk_factor(&twj.relation, out, objects)?;
                 for j in &twj.joins {
-                    walk_factor(&j.relation, out)?;
+                    walk_factor(&j.relation, out, objects)?;
                     if let Some(e) = join_on_expr(&j.join_operator) {
-                        walk_expr(e, out)?;
+                        walk_expr(e, out, objects)?;
                     }
                 }
             }
             for item in &sel.projection {
                 match item {
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                        walk_expr(e, out)?
+                        walk_expr(e, out, objects)?
                     }
                     _ => {}
                 }
             }
             if let Some(sel_expr) = &sel.selection {
-                walk_expr(sel_expr, out)?;
+                walk_expr(sel_expr, out, objects)?;
             }
             if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &sel.group_by {
                 for e in exprs {
-                    walk_expr(e, out)?;
+                    walk_expr(e, out, objects)?;
                 }
             }
             if let Some(having) = &sel.having {
-                walk_expr(having, out)?;
+                walk_expr(having, out, objects)?;
             }
             Some(())
         }
-        SetExpr::Query(inner) => walk_query(inner, out),
+        SetExpr::Query(inner) => walk_query(inner, out, objects),
         SetExpr::SetOperation { left, right, .. } => {
-            walk_setexpr(left, out)?;
-            walk_setexpr(right, out)
+            walk_setexpr(left, out, objects)?;
+            walk_setexpr(right, out, objects)
         }
         SetExpr::Values(values) => {
             for row in &values.rows {
                 for e in row.content.iter() {
-                    walk_expr(e, out)?;
+                    walk_expr(e, out, objects)?;
                 }
             }
             Some(())
@@ -15770,7 +16008,11 @@ fn join_on_expr_mut(op: &mut sqlparser::ast::JoinOperator) -> Option<&mut SqlExp
     }
 }
 
-fn walk_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) -> Option<()> {
+fn walk_factor(
+    tf: &sqlparser::ast::TableFactor,
+    out: &mut Vec<String>,
+    objects: &dyn Fn(&str) -> bool,
+) -> Option<()> {
     match tf {
         sqlparser::ast::TableFactor::Table { name, .. } => {
             // Multi-part names keep their QUALIFIED form for the
@@ -15796,13 +16038,13 @@ fn walk_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) -> Optio
             }
             Some(())
         }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => walk_query(subquery, out),
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => walk_query(subquery, out, objects),
         sqlparser::ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            walk_factor(&table_with_joins.relation, out)?;
+            walk_factor(&table_with_joins.relation, out, objects)?;
             for j in &table_with_joins.joins {
-                walk_factor(&j.relation, out)?;
+                walk_factor(&j.relation, out, objects)?;
             }
             Some(())
         }
@@ -15811,40 +16053,40 @@ fn walk_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) -> Optio
     }
 }
 
-fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
+fn walk_expr(e: &SqlExpr, out: &mut Vec<String>, objects: &dyn Fn(&str) -> bool) -> Option<()> {
     use SqlExpr::*;
     match e {
         Value(_) | Identifier(_) | CompoundIdentifier(_) | TypedString { .. } => Some(()),
-        IsNull(i) | IsNotNull(i) | Nested(i) | Cast { expr: i, .. } => walk_expr(i, out),
-        UnaryOp { expr, .. } => walk_expr(expr, out),
+        IsNull(i) | IsNotNull(i) | Nested(i) | Cast { expr: i, .. } => walk_expr(i, out, objects),
+        UnaryOp { expr, .. } => walk_expr(expr, out, objects),
         BinaryOp { left, right, .. } => {
-            walk_expr(left, out)?;
-            walk_expr(right, out)
+            walk_expr(left, out, objects)?;
+            walk_expr(right, out, objects)
         }
         Between {
             expr, low, high, ..
         } => {
-            walk_expr(expr, out)?;
-            walk_expr(low, out)?;
-            walk_expr(high, out)
+            walk_expr(expr, out, objects)?;
+            walk_expr(low, out, objects)?;
+            walk_expr(high, out, objects)
         }
         Like { expr, pattern, .. } | ILike { expr, pattern, .. } => {
-            walk_expr(expr, out)?;
-            walk_expr(pattern, out)
+            walk_expr(expr, out, objects)?;
+            walk_expr(pattern, out, objects)
         }
         InList { expr, list, .. } => {
-            walk_expr(expr, out)?;
+            walk_expr(expr, out, objects)?;
             for item in list {
-                walk_expr(item, out)?;
+                walk_expr(item, out, objects)?;
             }
             Some(())
         }
         InSubquery { expr, subquery, .. } => {
-            walk_expr(expr, out)?;
-            walk_query(subquery, out)
+            walk_expr(expr, out, objects)?;
+            walk_query(subquery, out, objects)
         }
-        Subquery(q) => walk_query(q, out),
-        Exists { subquery, .. } => walk_query(subquery, out),
+        Subquery(q) => walk_query(q, out, objects),
+        Exists { subquery, .. } => walk_query(subquery, out, objects),
         Case {
             operand,
             conditions,
@@ -15852,14 +16094,14 @@ fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
             ..
         } => {
             if let Some(o) = operand {
-                walk_expr(o, out)?;
+                walk_expr(o, out, objects)?;
             }
             for w in conditions {
-                walk_expr(&w.condition, out)?;
-                walk_expr(&w.result, out)?;
+                walk_expr(&w.condition, out, objects)?;
+                walk_expr(&w.result, out, objects)?;
             }
             if let Some(r) = else_result {
-                walk_expr(r, out)?;
+                walk_expr(r, out, objects)?;
             }
             Some(())
         }
@@ -15870,7 +16112,7 @@ fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
                         sqlparser::ast::FunctionArgExpr::Expr(inner),
                     ) = a
                     {
-                        walk_expr(inner, out)?;
+                        walk_expr(inner, out, objects)?;
                     }
                 }
             }
@@ -15878,10 +16120,10 @@ fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
             // subqueries — an unwalked filter would let a read-only user
             // run a hidden subquery the classifier never sees.
             if let Some(cond) = &f.filter {
-                walk_expr(cond, out)?;
+                walk_expr(cond, out, objects)?;
             }
             for og in &f.within_group {
-                walk_expr(&og.expr, out)?;
+                walk_expr(&og.expr, out, objects)?;
             }
             Some(())
         }
@@ -15891,21 +16133,21 @@ fn walk_expr(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
             substring_for,
             ..
         } => {
-            walk_expr(expr, out)?;
+            walk_expr(expr, out, objects)?;
             if let Some(f) = substring_from {
-                walk_expr(f, out)?;
+                walk_expr(f, out, objects)?;
             }
             if let Some(l) = substring_for {
-                walk_expr(l, out)?;
+                walk_expr(l, out, objects)?;
             }
             Some(())
         }
         Trim {
             expr, trim_what, ..
         } => {
-            walk_expr(expr, out)?;
+            walk_expr(expr, out, objects)?;
             if let Some(w) = trim_what {
-                walk_expr(w, out)?;
+                walk_expr(w, out, objects)?;
             }
             Some(())
         }
@@ -16164,6 +16406,7 @@ fn view_dependency_order(
     tables: &std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
 ) -> Vec<String> {
     let view_set: std::collections::BTreeSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    let objects = |n: &str| tables.contains_key(n);
     // Direct view→view edges (an unparseable body contributes none; the
     // CREATE would fail at replay time anyway).
     let edges: Vec<(String, Vec<String>)> = names
@@ -16174,7 +16417,7 @@ fn view_dependency_order(
                 if let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) {
                     if let Some(Statement::Query(q)) = stmts.pop() {
                         let mut refs = Vec::new();
-                        if walk_query(&q, &mut refs).is_some() {
+                        if walk_query(&q, &mut refs, &objects).is_some() {
                             deps = refs
                                 .into_iter()
                                 .filter(|r| view_set.contains(r.as_str()))
@@ -17994,33 +18237,6 @@ fn rewrite_tsql_top(mut query: Query) -> Result<Query> {
     Ok(query)
 }
 
-/// Inline a computed Value as a literal expression node (subquery
-/// substitution rewrites results into the row-local expression tree).
-/// `COALESCE(<expr>, FALSE)`: a Null-comparing element in a quantified
-/// ANY/ALL chain must fold to FALSE, not poison the OR/AND above it.
-fn coalesce_false(e: SqlExpr) -> SqlExpr {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList};
-    SqlExpr::Function(sqlparser::ast::Function {
-        name: sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::new("COALESCE")]),
-        uses_odbc_syntax: false,
-        parameters: sqlparser::ast::FunctionArguments::None,
-        args: sqlparser::ast::FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(
-                    sqlparser::ast::Value::Boolean(false).into(),
-                ))),
-            ],
-            clauses: Vec::new(),
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: Vec::new(),
-    })
-}
-
 fn value_to_literal(v: Value) -> Result<SqlExpr> {
     use sqlparser::ast::Value as V;
     Ok(match v {
@@ -18327,10 +18543,16 @@ fn refs_rownum_in(assignments: &[sqlparser::ast::Assignment], selection: &Option
 /// analysis, exotic clauses) — callers must treat None as fail-closed and
 /// refuse the statement for column-restricted grants.
 pub fn single_table_select_refs(stmt: &Statement) -> Option<(String, Vec<String>)> {
-    use sqlparser::ast::{GroupByExpr, OrderByKind, SelectItem, SetExpr, TableFactor};
     let Statement::Query(q) = stmt else {
         return None;
     };
+    single_table_query_refs(q)
+}
+
+/// [`single_table_select_refs`] over a bare query — the INSERT ... SELECT
+/// source (used by the write path's column-grant attribution).
+pub fn single_table_query_refs(q: &Query) -> Option<(String, Vec<String>)> {
+    use sqlparser::ast::{GroupByExpr, OrderByKind, SelectItem, SetExpr, TableFactor};
     if q.with.is_some() {
         return None;
     }
@@ -18978,10 +19200,18 @@ fn probe_plan(
                 let exact = !opaque;
                 let plan = match (path_eq, path_range) {
                     (Some(v), _) => ProbePlan::Eq(v),
-                    (None, Some(bounds)) => ProbePlan::Range {
-                        lo: path_bound(&bounds, true),
-                        hi: path_bound(&bounds, false),
-                    },
+                    (None, Some(bounds)) => {
+                        // An unbounded lower side must still reach rows whose
+                        // extraction is NULL (`NULL < k` is TRUE — NULL sorts
+                        // below everything), but those rows have no tree key.
+                        // Only a bounded range is a candidate superset.
+                        let lo = path_bound(&bounds, true);
+                        lo.as_ref()?;
+                        ProbePlan::Range {
+                            lo,
+                            hi: path_bound(&bounds, false),
+                        }
+                    }
                     (None, None) => return None,
                 };
                 return Some((def.name.clone(), plan, exact));
@@ -19024,6 +19254,18 @@ fn probe_plan(
                 }
             }
             if prefix.is_empty() {
+                continue;
+            }
+            // Partial prefix: a row matching the prefix whose remaining
+            // index columns are NULL has no tree key, yet the WHERE (which
+            // only constrains the prefix) keeps it — probing would silently
+            // drop it. Full-column equality is immune (a NULL anywhere makes
+            // the equality false for that row).
+            if prefix.len() < cols.len()
+                && cols[prefix.len()..]
+                    .iter()
+                    .any(|c| !meta.not_null.contains(c))
+            {
                 continue;
             }
             let longer = match &best {
@@ -19118,6 +19360,13 @@ fn probe_plan(
         }
     }
     if lo.is_none() && hi.is_none() {
+        return None;
+    }
+    // An unbounded lower side (`col < k`) is TRUE for NULL keys — NULL
+    // sorts below every value — but the tree holds no NULL keys, so the
+    // probe candidates would silently drop those rows. Only a NOT NULL
+    // column makes the unbounded scan a superset.
+    if lo.is_none() && !meta.not_null.contains(&col) {
         return None;
     }
     let exact = !opaque && eq_map.is_empty() && in_target.is_none();
@@ -20106,6 +20355,43 @@ mod tests {
                 "row {id} chain corrupted"
             );
         }
+    }
+
+    #[test]
+    fn rollback_only_workload_keeps_wal_bounded() {
+        // ROLLBACK is a terminal statement: without the fence+sync in its
+        // tail, nothing ever triggered the WAL cap and a BEGIN/INSERT/
+        // ROLLBACK loop grew the log without bound.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, b TEXT)");
+            for i in 0..600 {
+                run(&mut db, "BEGIN");
+                run(
+                    &mut db,
+                    &format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(3000)),
+                );
+                run(&mut db, "ROLLBACK");
+            }
+            let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+            assert_eq!(r.rows[0][0], Value::Int(0));
+        }
+        // Deterministic observable: every ROLLBACK now closes with a
+        // KIND_FENCE record (the sync in its tail). Before the fix a
+        // rollback-only workload never fenced, so recovery had no durable
+        // boundary and the WAL-cap paths never fired. The truncation itself
+        // is asynchronous (soft threshold) — size assertions would flap.
+        let fences = crate::wal::Wal::scan_file(&crate::pager::wal_path_for(&path))
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == crate::wal::KIND_FENCE)
+            .count();
+        assert!(
+            fences >= 600,
+            "expected one fence per ROLLBACK, got {fences}"
+        );
     }
 
     #[test]
@@ -21175,11 +21461,17 @@ mod tests {
         );
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0][0], Value::Str("iv".into()));
-        assert_eq!(r.rows[0][1], Value::Str("CREATE INDEX iv ON t (v)".into()));
+        // Identifiers are quoted now: the EF provider replays this DDL
+        // verbatim in its keep-data rebuild, and a reserved-word name used
+        // to fail the replay (taking user indexes with it).
+        assert_eq!(
+            r.rows[0][1],
+            Value::Str("CREATE INDEX \"iv\" ON \"t\" (\"v\")".into())
+        );
         assert_eq!(r.rows[1][0], Value::Str("uv".into()));
         assert_eq!(
             r.rows[1][1],
-            Value::Str("CREATE UNIQUE INDEX uv ON t (id)".into())
+            Value::Str("CREATE UNIQUE INDEX \"uv\" ON \"t\" (\"id\")".into())
         );
         // tables and indexes coexist in the view
         let r = rows(&mut db, "SELECT type FROM sqlite_master ORDER BY type");
@@ -21394,7 +21686,7 @@ mod tests {
             let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
             let stmt = stmts.swap_remove(0);
             assert!(
-                Database::stmt_read_targets(&stmt).is_some(),
+                Database::stmt_read_targets(&stmt, &|_| false).is_some(),
                 "read-target classifier rejected supported shape: {sql}"
             );
         };
@@ -21405,7 +21697,7 @@ mod tests {
         ok("UPDATE t SET v = 1 WHERE id IN (SELECT id FROM other)");
         // Rare shapes (tuples/ANY/...) are denied fail-closed.
         let mut out = Vec::new();
-        assert!(walk_expr(&parse_select_expr("(1, 2)"), &mut out).is_none());
+        assert!(walk_expr(&parse_select_expr("(1, 2)"), &mut out, &|_| false).is_none());
         // The parser never emits `Substring` under the generic dialect, so
         // walk its from/for arms directly.
         let sub = SqlExpr::Substring {
@@ -21416,7 +21708,7 @@ mod tests {
             shorthand: false,
         };
         let mut out = Vec::new();
-        assert!(walk_expr(&sub, &mut out).is_some());
+        assert!(walk_expr(&sub, &mut out, &|_| false).is_some());
     }
 
     #[test]
@@ -24537,7 +24829,7 @@ mod tests {
     /// 零行 INSERT ... SELECT NEWID():回写曾退化成 `INSERT INTO t () VALUES `
     /// (不可解析文本)并进 journal/扇出,重放节点永久失败。
     #[test]
-    fn zero_row_insert_select_with_nondet_keeps_original_sql() {
+    fn zero_row_insert_select_with_nondet_replays_deterministically() {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE t (id TEXT PRIMARY KEY)");
         run(&mut db, "CREATE TABLE src (x INT)");
@@ -24545,12 +24837,82 @@ mod tests {
             &mut db,
             "INSERT INTO t (id) SELECT NEWID() FROM src WHERE 1 = 0",
         );
+        // The original text re-rolls NEWID()/RAND() on every replaying peer
+        // (an empty draw here can be non-empty there). The rewrite must be a
+        // deterministically-empty statement instead — never the degenerate
+        // zero-column canonical form.
+        let Some(resolved) = db.take_resolved_sql() else {
+            panic!("zero-row nondet INSERT must ship a deterministic empty rewrite");
+        };
         assert!(
-            db.take_resolved_sql().is_none(),
-            "zero-row nondet INSERT must NOT be rewritten into a degenerate canonical form"
+            resolved.contains("WHERE 1 = 0") && resolved.contains("INSERT INTO"),
+            "rewrite must be a deterministically-empty INSERT: {resolved}"
         );
         let r = rows(&mut db, "SELECT COUNT(*) FROM t");
         assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+        // Replaying the rewrite on a fresh node stays empty.
+        let mut db2 = Database::in_memory().unwrap();
+        run(&mut db2, "CREATE TABLE t (id TEXT PRIMARY KEY)");
+        run(&mut db2, "CREATE TABLE src (x INT)");
+        run(&mut db2, &resolved);
+        let r = rows(&mut db2, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+    }
+
+    #[test]
+    fn or_replace_with_do_nothing_is_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10)");
+        let m = db
+            .execute("INSERT OR REPLACE INTO t (id, v) VALUES (1, 20) ON CONFLICT (id) DO NOTHING")
+            .expect_err("displacement + skip must be rejected");
+        assert!(m.to_string().contains("cannot combine"), "{m}");
+        // The original row is intact — the statement was rejected up front.
+        let r = rows(&mut db, "SELECT v FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(10)]]);
+    }
+
+    /// 位移删除的自引用父行不得把「随它一起消失的自引用」计为孤儿。
+    #[test]
+    fn or_replace_self_fk_sees_final_state() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, boss INT, FOREIGN KEY (boss) REFERENCES t(id))",
+        );
+        run(&mut db, "CREATE UNIQUE INDEX uq_ab ON t (a, b)");
+        run(&mut db, "INSERT INTO t VALUES (9, 1, 1, 9)");
+        // uq_ab 冲突位移旧行(其 boss=9 指向自身);终态只剩新行,合法。
+        run(
+            &mut db,
+            "INSERT OR REPLACE INTO t (id, a, b, boss) VALUES (5, 1, 1, NULL)",
+        );
+        let r = rows(&mut db, "SELECT id FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn upsert_update_raising_autoinc_refreshes_cache() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, v INT)",
+        );
+        run(&mut db, "INSERT INTO t (v) VALUES (1)");
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET id = 50",
+        );
+        // 2..=50 次自增插入全部成功;抬到 50 后不得再撞已占 id。
+        for _ in 0..60 {
+            match run(&mut db, "INSERT INTO t (v) VALUES (1)") {
+                ExecOutcome::Affected(_) => {}
+                other => panic!("autoincrement insert must not hit a taken id: {other:?}"),
+            }
+        }
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(61));
     }
 
     /// 同批 placed 行重新供给了被 upsert 更新腾出的父键:父侧 FK 检查
@@ -25320,6 +25682,102 @@ mod tests {
         assert!(db.catalog()[0].indexes.is_empty());
         assert!(db.execute("DROP INDEX ia").is_err());
         run(&mut db, "DROP INDEX IF EXISTS ia"); // no error
+    }
+
+    #[test]
+    fn drop_index_recycles_json_path_tree() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE ev (id INT PRIMARY KEY, data TEXT)");
+        run(
+            &mut db,
+            "INSERT INTO ev VALUES (1, '{\"k\":\"x\"}'), (2, '{\"k\":\"y\"}')",
+        );
+        run(
+            &mut db,
+            "CREATE INDEX data ON ev (JSON_EXTRACT(data, '$.k'))",
+        );
+        run(&mut db, "DROP INDEX data");
+        // 残留路径树曾被误当 data 列的标量树:同列查询静默丢行。
+        let r = rows(&mut db, "SELECT id FROM ev WHERE data = '{\"k\":\"x\"}'");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+        // 同名索引必须可重建(残留 root 会报 already in use)。
+        run(
+            &mut db,
+            "CREATE INDEX data ON ev (JSON_EXTRACT(data, '$.k'))",
+        );
+    }
+
+    #[test]
+    fn cte_named_like_a_table_still_reads_the_base_object() {
+        // 授权 walker 曾把 CTE 自名遮蔽进 body,同名基表读完全逃过
+        // stmt_read_targets。引擎语义:body(与非递归/anchor)先于 CTE
+        // 入作用域,读的是基表。
+        let sql =
+            "WITH secret AS (SELECT * FROM secret UNION SELECT * FROM secret) SELECT * FROM secret";
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = stmts.swap_remove(0);
+        let objects = |n: &str| n == "secret";
+        let targets = Database::stmt_read_targets(&stmt, &objects).unwrap();
+        assert!(
+            targets.iter().any(|t| t == "secret"),
+            "same-named base reads must stay visible: {targets:?}"
+        );
+        // 纯 CTE 名(不撞表)仍被遮蔽——正常递归 CTE 不产生伪读目标。
+        let sql =
+            "WITH nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums) SELECT * FROM nums";
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = stmts.swap_remove(0);
+        let targets = Database::stmt_read_targets(&stmt, &|_| false).unwrap();
+        assert!(
+            !targets.iter().any(|t| t == "nums"),
+            "a pure CTE self-reference is not a base read: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn alter_rewrite_keeps_followup_metadata_ops() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY)");
+        // ADD COLUMN b(带 DEFAULT 触发全表重写)之后的纯元数据 ADD COLUMN c
+        // 曾随「rewrote 已保存」被静默丢弃。
+        run(
+            &mut db,
+            "ALTER TABLE t ADD COLUMN b INT DEFAULT 7, ADD COLUMN c INT",
+        );
+        run(&mut db, "INSERT INTO t VALUES (2, 20, 30)");
+        let r = rows(&mut db, "SELECT c FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(30)]]);
+        // DROP COLUMN + ADD COLUMN 的混合形态同样收敛。
+        run(
+            &mut db,
+            "ALTER TABLE t DROP COLUMN b, ADD COLUMN d INT CHECK (d >= 0)",
+        );
+        let m = db.execute("INSERT INTO t VALUES (3, -1)");
+        assert!(m.is_err(), "CHECK on the trailing ADD COLUMN must persist");
+    }
+
+    #[test]
+    fn ctas_explicit_column_list_is_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE src (x INT)");
+        let m = db
+            .execute("CREATE TABLE ct (renamed INT) AS SELECT x FROM src")
+            .expect_err("column list on CTAS must be refused, not ignored");
+        assert!(m.to_string().contains("explicit column list"), "{m}");
+    }
+
+    #[test]
+    fn alter_rename_column_swap_via_vacated_name() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT PRIMARY KEY)");
+        // 校验器曾不随 rename 演化模拟 roots,换名组合被假拒绝。
+        run(
+            &mut db,
+            "ALTER TABLE t RENAME COLUMN a TO b, RENAME COLUMN b TO a",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let r = rows(&mut db, "SELECT a FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
     }
 
     #[test]
@@ -26674,6 +27132,11 @@ mod tests {
             "v IN (SELECT p FROM pt WHERE id <= 12)",
             "p IN (SELECT p FROM pt WHERE id <= 12)",
         );
+        // 无下界范围:NULL 排在一切值之下,`v < k` 对 NULL 键为真,而树
+        // 无 NULL 键——探针必须整体回退全扫(v 可空),不得静默丢行。
+        parity(&mut db, "v < 3", "p < 3");
+        parity(&mut db, "v <= 3", "p <= 3");
+        parity(&mut db, "v < -100", "p < -100");
         // UPDATE/DELETE 快路径(index_probe_cx)同探针,影响行数同答。
         let affected = |db: &mut Database, sql: &str| match run(db, sql) {
             ExecOutcome::Affected(n) => n,
@@ -26691,6 +27154,173 @@ mod tests {
         let n_scan = affected(&mut db, "DELETE FROM pt WHERE p IN (8, 9)");
         run(&mut db, "ROLLBACK");
         assert_eq!(n_idx, n_scan);
+    }
+
+    #[test]
+    fn unbounded_probe_never_drops_null_key_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, b INT, c INT, p INT)",
+        );
+        run(&mut db, "CREATE INDEX ix_bc ON t (b, c)");
+        run(&mut db, "CREATE INDEX ix_p ON t (p)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 5, NULL, NULL), (2, 5, 7, 2), (3, 6, NULL, NULL), (4, 7, 8, 8)",
+        );
+        // 复合部分前缀 + 未覆盖列 NULL:该行无树键,探针须回退全扫。
+        let a = rows(&mut db, "SELECT id FROM t WHERE b = 5 ORDER BY id").rows;
+        let expect = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
+        assert_eq!(a, expect, "复合前缀探针不得丢弃未覆盖列为 NULL 的行");
+        // JSON 路径索引无下界范围:提取为 NULL 的行(`NULL < k` 为真)不得丢。
+        run(&mut db, "CREATE TABLE j (id INT PRIMARY KEY, doc TEXT)");
+        run(
+            &mut db,
+            "CREATE INDEX ix_age ON j (JSON_EXTRACT(doc, '$.age'))",
+        );
+        run(
+            &mut db,
+            "INSERT INTO j VALUES (1, '{\"age\":10}'), (2, 'not json'), (3, '{}')",
+        );
+        let a = rows(
+            &mut db,
+            "SELECT id FROM j WHERE JSON_EXTRACT(doc, '$.age') < 30 ORDER BY id",
+        )
+        .rows;
+        let expect = vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+        ];
+        assert_eq!(a, expect, "路径范围探针不得丢弃提取为 NULL 的行");
+    }
+
+    #[test]
+    fn quantified_any_all_three_valued_logic() {
+        // NULL itself is a comparable value in this engine (total order);
+        // the only UNKNOWN source is Timestamp vs an unparseable string.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, TIMESTAMP '2026-06-01T00:00:00Z')",
+        );
+        run(&mut db, "CREATE TABLE s (x TEXT)");
+        run(
+            &mut db,
+            "INSERT INTO s VALUES ('2025-01-01T00:00:00Z'), ('garbage')",
+        );
+        // ts > '2025…' TRUE, ts > 'garbage' UNKNOWN → ALL = UNKNOWN → the
+        // row filters bare AND under NOT (the old FALSE fold let NOT admit
+        // it — NOT FALSE became TRUE).
+        let r = rows(&mut db, "SELECT id FROM t WHERE ts > ALL (SELECT x FROM s)").rows;
+        assert!(
+            r.is_empty(),
+            "ALL with an UNKNOWN element is UNKNOWN: {r:?}"
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE NOT (ts > ALL (SELECT x FROM s))",
+        )
+        .rows;
+        assert!(r.is_empty(), "NOT UNKNOWN must not admit rows: {r:?}");
+        // ANY with the same inputs: one TRUE → TRUE (standard).
+        let r = rows(&mut db, "SELECT id FROM t WHERE ts > ANY (SELECT x FROM s)").rows;
+        assert_eq!(r, vec![vec![Value::Int(1)]]);
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE NOT (ts > ANY (SELECT x FROM s))",
+        )
+        .rows;
+        assert!(r.is_empty(), "NOT TRUE is FALSE");
+        // All-UNKNOWN ANY = UNKNOWN (not FALSE): older row below proves it.
+        run(&mut db, "DELETE FROM s");
+        run(&mut db, "INSERT INTO s VALUES ('garbage'), ('junk')");
+        let r = rows(&mut db, "SELECT id FROM t WHERE ts > ANY (SELECT x FROM s)").rows;
+        assert!(r.is_empty(), "all-UNKNOWN ANY filters");
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE NOT (ts > ANY (SELECT x FROM s))",
+        )
+        .rows;
+        assert!(
+            r.is_empty(),
+            "NOT UNKNOWN must not admit rows either: {r:?}"
+        );
+        // Two-valued shape stays intact without UNKNOWN elements.
+        run(&mut db, "DELETE FROM s");
+        run(
+            &mut db,
+            "INSERT INTO s VALUES ('2025-01-01T00:00:00Z'), ('2027-01-01T00:00:00Z')",
+        );
+        let r = rows(&mut db, "SELECT id FROM t WHERE ts > ALL (SELECT x FROM s)").rows;
+        assert!(r.is_empty());
+        let r = rows(&mut db, "SELECT id FROM t WHERE ts > ANY (SELECT x FROM s)").rows;
+        assert_eq!(r, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn hash_join_timestamp_string_coercion() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT PRIMARY KEY, ts TIMESTAMP)");
+        run(&mut db, "CREATE TABLE b (id INT PRIMARY KEY, s TEXT)");
+        for i in 1..=200 {
+            let day = (i - 1) % 28 + 1;
+            let hour = (i - 1) / 28;
+            let text = format!("2026-01-{day:02}T{hour:02}:00:00Z");
+            run(
+                &mut db,
+                &format!("INSERT INTO a VALUES ({i}, TIMESTAMP '{text}')"),
+            );
+            if i % 2 == 0 {
+                run(&mut db, &format!("INSERT INTO b VALUES ({i}, '{text}')"));
+            }
+        }
+        run(&mut db, "INSERT INTO b VALUES (1, 'not a timestamp')");
+        let inner = rows(&mut db, "SELECT COUNT(*) AS n FROM a JOIN b ON a.ts = b.s").rows;
+        assert_eq!(
+            inner[0][0],
+            Value::Int(100),
+            "哈希 join 桶不得拆散 Timestamp↔可解析字符串命中对"
+        );
+        let left = rows(
+            &mut db,
+            "SELECT COUNT(*) AS n FROM a LEFT JOIN b ON a.ts = b.s",
+        )
+        .rows;
+        assert_eq!(
+            left[0][0],
+            Value::Int(200),
+            "LEFT JOIN 不得把真实命中当未命中"
+        );
+    }
+
+    #[test]
+    fn recursive_cte_union_dedupes_anchor_rows() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(
+            &mut db,
+            "WITH c AS (SELECT n FROM (VALUES (1), (1), (2)) v(n) UNION SELECT n + 1 FROM c WHERE n < 2) \
+             SELECT COUNT(*) AS n, SUM(n) AS s FROM c",
+        )
+        .rows;
+        assert_eq!(
+            r[0],
+            vec![Value::Int(2), Value::Int(3)],
+            "UNION 去重须覆盖 anchor 臂的重复行"
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_multiple_rows_is_an_error() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE e (v INT)");
+        run(&mut db, "INSERT INTO e VALUES (10), (30)");
+        let m = db
+            .execute("SELECT 1 WHERE 1 = (SELECT v FROM e)")
+            .expect_err("multi-row scalar subquery must be an error");
+        assert!(m.to_string().contains("more than one row"), "{m}");
     }
 
     #[test]
@@ -32157,7 +32787,8 @@ mod complex_query_tests {
             let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
             stmts.swap_remove(0)
         };
-        let read = |sql: &str| Database::stmt_read_targets(&parse(sql)).unwrap_or_default();
+        let read =
+            |sql: &str| Database::stmt_read_targets(&parse(sql), &|_| false).unwrap_or_default();
 
         assert_eq!(
             read("SELECT a.id FROM a JOIN b ON a.id = b.id"),
@@ -32196,7 +32827,8 @@ mod complex_query_tests {
             let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
             stmts.swap_remove(0)
         };
-        let read = |sql: &str| Database::stmt_read_targets(&parse(sql)).unwrap_or_default();
+        let read =
+            |sql: &str| Database::stmt_read_targets(&parse(sql), &|_| false).unwrap_or_default();
 
         // UPDATE: assignment-value subquery (exec_update substitutes and
         // evaluates these).
@@ -34089,7 +34721,7 @@ mod tsql_compat_tests {
             "WITH v AS (SELECT x FROM secret) SELECT * FROM v",
         )
         .unwrap();
-        let targets = Database::stmt_read_targets(&stmts.swap_remove(0)).unwrap();
+        let targets = Database::stmt_read_targets(&stmts.swap_remove(0), &|_| false).unwrap();
         assert_eq!(targets, vec!["secret"]);
         // 建视图撞名场景:WITH 体视图本身被响亮拒绝(既有边界),
         // 不再以误导性的「自引用」为由。
@@ -34384,13 +35016,13 @@ mod tsql_compat_tests {
         )
         .unwrap();
         let stmt = stmts.swap_remove(0);
-        let occ = Database::stmt_read_target_occurrences(&stmt).unwrap();
+        let occ = Database::stmt_read_target_occurrences(&stmt, &|_| false).unwrap();
         assert_eq!(
             occ.iter().filter(|x| *x == "t").count(),
             2,
             "per-occurrence list keeps both reads: {occ:?}"
         );
-        let set = Database::stmt_read_targets(&stmt).unwrap();
+        let set = Database::stmt_read_targets(&stmt, &|_| false).unwrap();
         assert_eq!(set.iter().filter(|x| *x == "t").count(), 1);
     }
 

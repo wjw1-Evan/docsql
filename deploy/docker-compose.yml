@@ -231,7 +231,9 @@ services:
     command: ["node-a:7600", "0.0.0.0:7700"]
     entrypoint: ["docsql-web"]
     environment:
-      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600"
+      # node-d included: after `--profile join` it is a full peer the
+      # console must be able to manage (unreachable entries are harmless).
+      DOCSQL_PEERS: "node-a:7600,node-b:7600,node-c:7600,node-d:7600"
       # Same client token as the nodes: the console authenticates to them
       # with it (required once database users exist — see header comment).
       DOCSQL_TOKEN: "${DOCSQL_DEV_TOKEN:-}"

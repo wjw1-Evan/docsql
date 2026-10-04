@@ -493,6 +493,26 @@ fn statement_end(sql: &str, from: usize) -> usize {
                 let (end, _) = stmt::sql_literal_end(sql, i);
                 i = end;
             }
+            // Quoted/bracket identifiers are opaque: a `;` inside one is
+            // part of the identifier, not a statement boundary.
+            b'"' | b'`' | b'[' => {
+                let close = match b[i] {
+                    b'[' => b']',
+                    other => other,
+                };
+                i += 1;
+                while i < b.len() {
+                    if b[i] == close {
+                        if b.get(i + 1) == Some(&close) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
             b'-' if b.get(i + 1) == Some(&b'-') => {
                 while i < b.len() && b[i] != b'\n' {
                     i += 1;
@@ -699,6 +719,27 @@ fn balanced_close(sql: &str, open: usize) -> Option<usize> {
             b'\'' => {
                 let (end, _) = stmt::sql_literal_end(sql, i);
                 i = end;
+                continue;
+            }
+            // Quoted/bracket identifiers are opaque: a `)` or `;` inside
+            // one must not close the span (same rule as split_top_level).
+            b'"' | b'`' | b'[' => {
+                let close = match b[i] {
+                    b'[' => b']',
+                    other => other,
+                };
+                i += 1;
+                while i < b.len() {
+                    if b[i] == close {
+                        if b.get(i + 1) == Some(&close) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
                 continue;
             }
             b'-' if b.get(i + 1) == Some(&b'-') => {
@@ -1259,11 +1300,14 @@ fn datediff(part: DatePart, a: i64, b: i64) -> Res<i64> {
         Quarter => (pb.year * 4 + (pb.month - 1) / 3) - (pa.year * 4 + (pa.month - 1) / 3),
         Month => (pb.year * 12 + pb.month) - (pa.year * 12 + pa.month),
         Day | DayOfYear => pb.days - pa.days,
-        // Week boundaries are Sundays; weekday diffs count the same.
-        Week | Weekday => {
+        // Week boundaries are Sundays. T-SQL's weekday/dw unit counts DAY
+        // boundaries (documented quirk: DATEDIFF(weekday) ==
+        // DATEDIFF(day)); only week/wk counts Sunday crossings.
+        Week => {
             let sun = |p: &TsParts| p.days - (p.weekday - 1);
             (sun(&pb) - sun(&pa)) / 7
         }
+        Weekday => pb.days - pa.days,
         Hour => b.div_euclid(3_600_000) - a.div_euclid(3_600_000),
         Minute => b.div_euclid(60_000) - a.div_euclid(60_000),
         Second => b.div_euclid(1_000) - a.div_euclid(1_000),
@@ -1534,6 +1578,9 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
         },
         "CHARINDEX" => match args {
             [needle, hay] => charindex(needle, hay, None),
+            // NULL start propagates NULL; a nonpositive start searches from
+            // the beginning (T-SQL documented behavior, not "not found").
+            [_, _, Value::Null] => Ok(Value::Null),
             [needle, hay, start] => charindex(needle, hay, int_arg(start, name, 2)?),
             _ => err("CHARINDEX takes 2 or 3 arguments"),
         },
@@ -2068,10 +2115,7 @@ fn charindex(needle: &Value, hay: &Value, start: Option<i64>) -> Res<Value> {
     let (Some(needle), Some(hay)) = (text_arg(needle), text_arg(hay)) else {
         return Ok(Value::Null);
     };
-    let start = start.unwrap_or(1);
-    if start < 1 {
-        return Ok(Value::Int(0));
-    }
+    let start = start.filter(|s| *s >= 1).unwrap_or(1);
     let hay_chars: Vec<char> = hay.chars().collect();
     if (start as usize) > hay_chars.len() {
         return Ok(Value::Int(0));
@@ -2174,9 +2218,9 @@ fn eomonth(v: &Value, months: i64) -> Res<Value> {
 /// present slots; any NULL part yields NULL (T-SQL).
 fn from_parts_call(name: &str, args: &[Value], slots: [Option<usize>; 4]) -> Res<Value> {
     let want = 3 + slots.iter().flatten().count();
-    if args.len() < want {
+    if args.len() != want {
         return err(format!(
-            "function {name} takes {want} arguments, got {}",
+            "function {name} takes exactly {want} arguments, got {}",
             args.len()
         ));
     }
@@ -2225,6 +2269,11 @@ fn frac_to_ms(name: &str, args: &[Value], prec_idx: usize) -> Res<(i64, bool)> {
         Some(Value::Int(p)) if (0..=7).contains(p) => *p,
         _ => 7,
     };
+    if frac < 0 {
+        // A negative fraction would silently wind the clock BACK — T-SQL
+        // rejects it ("some of the arguments have invalid values").
+        return err(format!("function {name}: fractions cannot be negative"));
+    }
     let scale = 10i64.checked_pow(prec as u32).unwrap_or(10_000_000);
     Ok((frac.saturating_mul(1000) / scale, true))
 }
@@ -2469,8 +2518,19 @@ fn format_style(ms: i64, style: i64) -> Res<Value> {
 /// Rearrange a date string written in a supported input style into the
 /// ISO layout the engine's timestamp parser accepts.
 fn restyle_to_iso(s: &str, style: i64) -> Res<String> {
-    let t = s.trim();
-    let bad = || SqlError::Message(format!("cannot convert {t:?} with CONVERT style {style}"));
+    let orig = s.trim();
+    // Numeric-input styles accept an optional trailing time component
+    // (`'09/21/2026 13:45:06'` with style 101): split it off, convert the
+    // date, then re-attach so the cast sees a full timestamp.
+    let (t, time_part) = match orig.find(' ') {
+        Some(sp) => (&orig[..sp], Some(orig[sp..].trim_start())),
+        None => (orig, None),
+    };
+    let bad = || {
+        SqlError::Message(format!(
+            "cannot convert {orig:?} with CONVERT style {style}"
+        ))
+    };
     let split3 = |sep: char| -> Option<Vec<String>> {
         let parts: Vec<&str> = t.split(sep).collect();
         (parts.len() == 3).then(|| parts.into_iter().map(str::to_string).collect())
@@ -2539,7 +2599,10 @@ fn restyle_to_iso(s: &str, style: i64) -> Res<String> {
         _ => return Err(bad()),
     };
     let y = if (0..=99).contains(&y) { century(y) } else { y };
-    Ok(format!("{y:04}-{m:02}-{d:02}"))
+    Ok(match time_part {
+        Some(tp) => format!("{y:04}-{m:02}-{d:02} {tp}"),
+        None => format!("{y:04}-{m:02}-{d:02}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3180,6 +3243,65 @@ mod tests {
     }
 
     // ---- preprocess ----
+
+    #[test]
+    fn charindex_null_and_nonpositive_start_semantics() {
+        // NULL start propagates NULL (not "search from 1").
+        let q = |sql: &str| {
+            let mut db = crate::engine::Database::in_memory().unwrap();
+            match db.execute(sql) {
+                Ok(crate::engine::ExecOutcome::Rows(r)) => r.rows,
+                other => panic!("{sql} -> {other:?}"),
+            }
+        };
+        assert_eq!(
+            q("SELECT CHARINDEX('l', 'hello', NULL)"),
+            vec![vec![crate::value::Value::Null]]
+        );
+        // Nonpositive start searches from the beginning (T-SQL doc).
+        assert_eq!(
+            q("SELECT CHARINDEX('l', 'hello', 0)"),
+            vec![vec![crate::value::Value::Int(3)]]
+        );
+    }
+
+    #[test]
+    fn datediff_weekday_counts_day_boundaries() {
+        // Call the datediff core directly: DATEDIFF(weekday) equals
+        // DATEDIFF(day) in T-SQL (day-boundary counting), while week/wk
+        // counts Sunday crossings.
+        let a = crate::value::parse_timestamp_ms("2026-09-21T00:00:00Z").unwrap();
+        let b = crate::value::parse_timestamp_ms("2026-09-22T00:00:00Z").unwrap();
+        assert_eq!(
+            datediff(DatePart::Weekday, a, b).unwrap(),
+            datediff(DatePart::Day, a, b).unwrap()
+        );
+        // Mon → Tue crosses no Sunday but IS one day boundary.
+        assert_eq!(datediff(DatePart::Weekday, a, b).unwrap(), 1);
+        assert_eq!(datediff(DatePart::Week, a, b).unwrap(), 0);
+        // Mon → next Sun crosses exactly one Sunday boundary.
+        let c = crate::value::parse_timestamp_ms("2026-09-27T00:00:00Z").unwrap();
+        assert_eq!(datediff(DatePart::Week, a, c).unwrap(), 1);
+    }
+
+    #[test]
+    fn convert_numeric_style_accepts_trailing_time() {
+        let mut db = crate::engine::Database::in_memory().unwrap();
+        let r = match db.execute("SELECT CONVERT(TIMESTAMP, '09/21/2026 13:45:06', 101)") {
+            Ok(crate::engine::ExecOutcome::Rows(r)) => r.rows,
+            other => panic!("{other:?}"),
+        };
+        assert!(r[0][0].type_name().eq_ignore_ascii_case("timestamp"));
+    }
+
+    #[test]
+    fn fromparts_rejects_extra_args_and_negative_fractions() {
+        let mut db = crate::engine::Database::in_memory().unwrap();
+        assert!(db.execute("SELECT DATEFROMPARTS(2026, 9, 21, 9)").is_err());
+        assert!(db
+            .execute("SELECT DATETIME2FROMPARTS(2026, 1, 2, 3, 4, 5, -250, 3)")
+            .is_err());
+    }
 
     #[test]
     fn preprocess_brackets() {

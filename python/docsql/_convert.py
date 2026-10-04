@@ -90,10 +90,17 @@ def _exact_decimal_text(value):
 
 def rows_from_payload(payload):
     """Decode a RESP_ROWS payload: {"columns": [str], "rows": [[v]]}.
-    Rows come back as tuples (DB-API convention)."""
-    body = json.loads(payload.decode("utf-8"), object_hook=_marker_hook)
-    columns = body.get("columns") or []
-    rows = [tuple(r) for r in (body.get("rows") or [])]
+    Rows come back as tuples (DB-API convention). Malformed payloads raise
+    DB-API errors — a bare ValueError/AttributeError used to escape the
+    driver and bypass the caller's `except Error` recovery."""
+    try:
+        body = json.loads(payload.decode("utf-8"), object_hook=_marker_hook)
+        columns = body.get("columns") or []
+        rows = [tuple(r) for r in (body.get("rows") or [])]
+    except (ValueError, AttributeError, TypeError, UnicodeDecodeError) as e:
+        from .errors import InterfaceError
+
+        raise InterfaceError(f"malformed rows payload: {e}") from e
     return columns, rows
 
 

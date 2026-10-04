@@ -75,6 +75,23 @@ public sealed class DocsqlDatabaseCreator(
         }
     }
 
-    public Task<bool> CanConnectAsync(CancellationToken ct = default)
-        => Task.FromResult(CanConnect());
+    public async Task<bool> CanConnectAsync(CancellationToken ct = default)
+    {
+        // 真异步:健康检查每轮探测都走这里,同步 Open()(TCP 建连+认证,
+        // 上限 15s)会在线程池上阻塞一个线程;节点宕机时的高频探测把
+        // 线程饥饿放大给整个服务。
+        try
+        {
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            connection.Close();
+        }
+    }
 }

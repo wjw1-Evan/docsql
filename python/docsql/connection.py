@@ -519,7 +519,10 @@ class Connection:
         _check(ftype, payload)
         import json
 
-        return json.loads(payload.decode("utf-8"))
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise InterfaceError(f"malformed status payload: {e}") from e
 
     def publish(self, channel, payload):
         """Persistent pub/sub publish; returns (id, receivers)."""
@@ -556,6 +559,25 @@ class Cursor:
         self._rows = []
         self._pos = 0
         self.rowcount = -1
+        # Validate the INPUT and prepare the template BEFORE opening the
+        # implicit transaction: a doomed call used to leave an empty BEGIN
+        # owning the single-writer engine (other connections' BEGINs queued
+        # behind it) until rollback or disconnect.
+        _params = None
+        _handle = None
+        if parameters is not None:
+            if isinstance(parameters, (str, bytes, bytearray)):
+                # sqlite3 parity: a bare string/bytes is nearly always a
+                # missing-comma mistake; iterating it fans out into single
+                # CHARACTERS and, when the placeholder count happens to
+                # match, silently binds the wrong data ("SELECT ?,?,?" with
+                # "abc" used to insert 97/98/99).
+                raise ProgrammingError(
+                    "parameters must be a sequence of values, not a str/bytes "
+                    "literal — wrap single values as (value,)"
+                )
+            _params = list(parameters)
+            _handle = self._prepare(operation)
         if not self._conn.autocommit and not self._conn._tx_open:
             # Implicit transaction block (see the module docstring for why
             # this is opt-in rather than the default).
@@ -567,30 +589,25 @@ class Cursor:
             # A new transaction supersedes any lost one: its commit will be
             # real, so the loss must not fail it retroactively.
             self._conn._tx_lost = False
-        if parameters is None:
+        if _params is None:
             ftype, payload = self._transport_round_trip_sql(operation)
         else:
-            if isinstance(parameters, (str, bytes, bytearray)):
-                # sqlite3 parity: a bare string/bytes is nearly always a
-                # missing-comma mistake; iterating it fans out into single
-                # CHARACTERS and, when the placeholder count happens to
-                # match, silently binds the wrong data ("SELECT ?,?,?" with
-                # "abc" used to insert 97/98/99).
-                raise ProgrammingError(
-                    "parameters must be a sequence of values, not a str/bytes "
-                    "literal — wrap single values as (value,)"
-                )
-            params = list(parameters)
-            handle = self._prepare(operation)
             ftype, payload = self._conn._transport.round_trip(
-                _proto.REQ_EXECUTE, execute_payload(handle, params)
+                _proto.REQ_EXECUTE, execute_payload(_handle, _params)
             )
         if ftype == _proto.RESP_ROWS:
             self._columns, self._rows = rows_from_payload(payload)
         elif ftype == _proto.RESP_AFFECTED:
             self.rowcount = int.from_bytes(payload[:8], "little", signed=True)
         else:
-            _check(ftype, payload)  # raises
+            _check(ftype, payload)  # raises on RESP_ERROR
+            # Anything else (a version-skewed server, a desynchronized
+            # stream) must kill the connection loudly: returning "no result
+            # set, rowcount -1" kept callers running on a misaligned stream.
+            raise InterfaceError(
+                f"unexpected reply frame {ftype:#06x} for statement — "
+                "connection is desynchronized"
+            )
 
     def _transport_round_trip_sql(self, sql):
         return self._conn._transport.round_trip(_proto.REQ_SQL, sql_payload(sql))
@@ -623,7 +640,10 @@ class Cursor:
         _check(ftype, payload)
         import json
 
-        handle = json.loads(payload.decode("utf-8"))["handle"]
+        try:
+            handle = json.loads(payload.decode("utf-8"))["handle"]
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError) as e:
+            raise InterfaceError(f"malformed prepare reply: {e}") from e
         self._conn._prepared[template] = handle
         return handle
 

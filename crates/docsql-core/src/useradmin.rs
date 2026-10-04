@@ -439,24 +439,41 @@ impl Cursor {
         }
         t
     }
+    /// Error text for an unexpected token: NEVER the token's contents — a
+    /// misplaced password literal rides the error into the query log, so
+    /// only the token KIND is named.
+    fn tok_kind(t: &Option<Tok>) -> &'static str {
+        match t {
+            None => "end of statement",
+            Some(Tok::Word(_)) => "a word",
+            Some(Tok::Str(_)) => "a string literal",
+            Some(Tok::Comma) => "a comma",
+            Some(Tok::LParen) => "an opening paren",
+            Some(Tok::RParen) => "a closing paren",
+        }
+    }
+
     fn expect_end(&self) -> Result<(), String> {
         match self.peek() {
             None => Ok(()),
-            Some(t) => Err(format!("unexpected trailing token {t:?}")),
+            Some(t) => Err(format!(
+                "unexpected trailing token ({})",
+                Self::tok_kind(&Some(t.clone()))
+            )),
         }
     }
     /// Next token must be the given keyword (case-insensitive).
     fn kw(&mut self, word: &str) -> Result<(), String> {
         match self.next() {
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case(word) => Ok(()),
-            other => Err(format!("expected {word}, found {other:?}")),
+            other => Err(format!("expected {word}, found {}", Self::tok_kind(&other))),
         }
     }
     /// A name (identifier); folded to lowercase.
     fn name(&mut self) -> Result<String, String> {
         match self.next() {
             Some(Tok::Word(w)) => Ok(w.to_lowercase()),
-            other => Err(format!("expected a name, found {other:?}")),
+            other => Err(format!("expected a name, found {}", Self::tok_kind(&other))),
         }
     }
     /// A table name for GRANT/REVOKE targets: case PRESERVED. The engine
@@ -728,16 +745,58 @@ pub fn redact_sql(sql: &str) -> String {
                 .all(|(x, y)| x.eq_ignore_ascii_case(y))
     }
 
+    // Fail-closed backstop for malformed user statements: when the
+    // plaintext never sits after a PASSWORD keyword (a mistyped position
+    // the tokenizer rejects), the branches below fire none — but the
+    // rejected statement still reaches the audit log. On CREATE/ALTER USER
+    // shapes, mask EVERY string literal the main loop walks through.
+    let user_stmt = {
+        let mut words = sql.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let second = words.next().unwrap_or("");
+        (first.eq_ignore_ascii_case("CREATE") || first.eq_ignore_ascii_case("ALTER"))
+            && second.eq_ignore_ascii_case("USER")
+    };
+
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // Quoted identifiers are opaque: an apostrophe inside one must not
+        // pair with a later quote and swallow the PASSWORD keyword (that
+        // desync copied the plaintext out verbatim).
+        if bytes[i] == b'"' || bytes[i] == b'`' {
+            let q = bytes[i];
+            let mut e = i + 1;
+            while e < bytes.len() {
+                if bytes[e] == q {
+                    if bytes.get(e + 1) == Some(&q) {
+                        e += 2; // doubled escape inside the identifier
+                        continue;
+                    }
+                    e += 1;
+                    break;
+                }
+                e += 1;
+            }
+            out.push_str(&sql[i..e]);
+            i = e;
+            continue;
+        }
         // String literals are opaque: a PASSWORD inside quoted data is user
         // text, not the keyword — redacting there rewrote the audit entry
         // into a statement that never executed. Skip whole literals with
         // the same scanner the rest of the pipeline uses.
         if bytes[i] == b'\'' {
-            let (end, _closed) = crate::stmt::sql_literal_end(sql, i);
+            let (end, closed) = crate::stmt::sql_literal_end(sql, i);
+            if user_stmt {
+                let value = &sql[i + 1..if closed { end - 1 } else { bytes.len() }];
+                if !kdf::is_stored_form(value) {
+                    out.push_str("'***'");
+                    i = end;
+                    continue;
+                }
+            }
             out.push_str(&sql[i..end]);
             i = end;
             continue;
@@ -1469,14 +1528,46 @@ impl Database {
                     for t in tables {
                         for p in privileges {
                             // Stored rows carry the canonical uppercase
-                            // name() form (written by the grant path).
-                            let cond = [
-                                ("grantee", g.as_str()),
-                                ("priv", p.name()),
-                                ("tbl", t.as_str()),
-                            ];
-                            if rows_have(&rows, &cond) {
-                                delete_rows(self, GRANTS_TABLE, &cond)?;
+                            // name() form (written by the grant path). The
+                            // TABLE name matches case-insensitively — the
+                            // resolve side does too, so a REVOKE spelled
+                            // with different casing must not silently keep
+                            // the grant alive. Deletion runs on the stored
+                            // spelling (the catalog is case-sensitive).
+                            let matches = rows.iter().any(|d| {
+                                d.get("grantee").and_then(|x| x.as_str()) == Some(g.as_str())
+                                    && d.get("priv").and_then(|x| x.as_str()) == Some(p.name())
+                                    && d.get("tbl")
+                                        .and_then(|x| x.as_str())
+                                        .is_some_and(|st| st.eq_ignore_ascii_case(t))
+                            });
+                            if matches {
+                                let stored_tbl: Vec<String> = rows
+                                    .iter()
+                                    .filter(|d| {
+                                        d.get("grantee").and_then(|x| x.as_str())
+                                            == Some(g.as_str())
+                                            && d.get("priv").and_then(|x| x.as_str())
+                                                == Some(p.name())
+                                    })
+                                    .filter_map(|d| {
+                                        d.get("tbl")
+                                            .and_then(|x| x.as_str())
+                                            .filter(|st| st.eq_ignore_ascii_case(t))
+                                            .map(String::from)
+                                    })
+                                    .collect();
+                                for st in stored_tbl {
+                                    delete_rows(
+                                        self,
+                                        GRANTS_TABLE,
+                                        &[
+                                            ("grantee", g.as_str()),
+                                            ("priv", p.name()),
+                                            ("tbl", st.as_str()),
+                                        ],
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -2265,6 +2356,64 @@ mod tests {
         assert!(!redacted.contains("s3cret-pw12"), "{redacted}");
         // The statement itself still refuses to parse.
         assert!(parse(sql).is_some_and(|r| r.is_err()));
+    }
+
+    #[test]
+    fn redact_skips_quoted_identifiers_so_apostrophes_cannot_desync() {
+        // An apostrophe inside a double-quoted identifier used to swallow
+        // the PASSWORD keyword as pseudo-literal text, and the real secret
+        // then copied out character by character.
+        let sql = "CREATE USER \"o'brien\" PASSWORD 'hunter2secret'";
+        let redacted = redact_sql(sql);
+        assert!(!redacted.contains("hunter2secret"), "{redacted}");
+        assert!(redacted.contains("'***'"), "{redacted}");
+        // Backtick identifiers behave the same.
+        let sql = "CREATE USER `o'brien` PASSWORD 'hunter2secret'";
+        assert!(!redact_sql(sql).contains("hunter2secret"));
+    }
+
+    #[test]
+    fn redact_backstops_user_statements_without_password_keyword() {
+        // A mistyped position (no PASSWORD keyword at all) still carries the
+        // plaintext in a literal — the statement is rejected but the audit
+        // log must never see it verbatim.
+        let sql = "CREATE USER dave 'pw12345678'";
+        let redacted = redact_sql(sql);
+        assert!(!redacted.contains("pw12345678"), "{redacted}");
+        assert!(redacted.contains("'***'"), "{redacted}");
+        // Non-user statements are untouched by the backstop.
+        assert_eq!(redact_sql("SELECT 'pw12345678'"), "SELECT 'pw12345678'");
+    }
+
+    #[test]
+    fn parse_errors_never_quote_token_contents() {
+        // The error message used to Debug-print the token, carrying the
+        // password literal into the query log's error field.
+        let r = parse("ALTER USER alice 'newsecret99'");
+        let msg = r
+            .expect("parses into an error result")
+            .expect_err("malformed");
+        assert!(!msg.contains("newsecret99"), "{msg}");
+        assert!(msg.contains("a string literal"), "{msg}");
+    }
+
+    #[test]
+    fn revoke_matches_table_name_case_insensitively() {
+        let mut db = crate::engine::Database::in_memory().unwrap();
+        db.execute("CREATE TABLE MyTable (a INT)").unwrap();
+        db.execute("CREATE USER u PASSWORD 'a-good-password'")
+            .unwrap();
+        db.execute("GRANT SELECT ON MyTable TO u").unwrap();
+        // Different casing used to delete zero rows while still reporting
+        // success — the grant stayed alive.
+        db.execute("REVOKE SELECT ON mytable FROM u").unwrap();
+        let grants = db.table_docs_cx("docsql_grants").unwrap();
+        assert!(
+            !grants
+                .iter()
+                .any(|g| g.get("tbl").and_then(|v| v.as_str()) == Some("MyTable")),
+            "grant must be gone: {grants:?}"
+        );
     }
 
     #[test]

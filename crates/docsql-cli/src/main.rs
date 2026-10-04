@@ -188,6 +188,12 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE by default, so `docsql --csv … | head` died with
+    // a broken-pipe panic (exit 101) instead of ending quietly. Default
+    // disposition: the process terminates on EPIPE like every other CLI.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", usage());
@@ -514,12 +520,12 @@ fn run_embedded_chunk(
         match docsql_core::tsql_batch::block_on(tsql.run_batch(text, &mut exec)) {
             Ok(out) => {
                 for msg in tsql.take_prints() {
-                    println!("PRINT: {msg}");
+                    note_line(format, &format!("PRINT: {msg}"));
                 }
                 match out {
                     Some(docsql_core::tsql_batch::ExecResult::Rows(r)) => print_rows(&r, format),
                     Some(docsql_core::tsql_batch::ExecResult::Affected(n)) => {
-                        println!("({n} rows affected)")
+                        note_line(format, &format!("({n} rows affected)"))
                     }
                     None => {}
                 }
@@ -528,7 +534,7 @@ fn run_embedded_chunk(
                 // PRINTs collected before the failure are real output —
                 // dropping them hid progress from batch scripts.
                 for msg in tsql.take_prints() {
-                    println!("PRINT: {msg}");
+                    note_line(format, &format!("PRINT: {msg}"));
                 }
                 eprintln!("error: {e}");
                 if !interactive {
@@ -551,7 +557,7 @@ fn run_embedded_chunk(
                 tsql.note_error(0);
                 match out {
                     ExecOutcome::Rows(r) => print_rows(&r, format),
-                    ExecOutcome::Affected(n) => println!("({n} rows affected)"),
+                    ExecOutcome::Affected(n) => note_line(format, &format!("({n} rows affected)")),
                 }
             }
             Err(e) => {
@@ -603,6 +609,11 @@ fn print_embedded_help() {
 struct Remote {
     writer: Outbound,
     queue: std::sync::mpsc::Receiver<Frame>,
+    /// Requests sent but not yet answered. The reader thread drops
+    /// server-originated error frames that arrive with no request in
+    /// flight (idle-timeout kicks, KILL notifications) instead of queueing
+    /// them for the NEXT command to misread as its own response.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Transport half owned by the main thread: the plain TCP stream, or the
@@ -665,26 +676,70 @@ fn tcp_connect_bounded(addr: &str) -> Result<std::net::TcpStream, String> {
 impl Remote {
     fn connect(addr: &str) -> Result<Remote, String> {
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        let in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize> =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writer = if tls_env_enabled()? {
             let ca = std::env::var("DOCSQL_TLS_CA")
                 .ok()
                 .filter(|v| !v.trim().is_empty());
             let link = remotetls::TlsLink::connect(addr, ca.as_deref().map(std::path::Path::new))?;
-            link.spawn_reader(tx, print_push);
+            let ifl = in_flight.clone();
+            link.spawn_reader(tx, print_push, ifl);
             Outbound::Tls(link)
         } else {
             let stream = tcp_connect_bounded(addr)?;
             let reader = stream.try_clone().map_err(|e| e.to_string())?;
-            std::thread::spawn(move || reader_loop(reader, tx));
+            let in_flight2 = in_flight.clone();
+            std::thread::spawn(move || reader_loop(reader, tx, in_flight2));
             Outbound::Plain(stream)
         };
-        Ok(Remote { writer, queue: rx })
+        Ok(Remote {
+            writer,
+            queue: rx,
+            in_flight,
+        })
+    }
+
+    /// Background keepalive for an IDLE interactive session: servers with
+    /// DOCSQL_IDLE_TIMEOUT disconnect silent subscribers (and readers)
+    /// otherwise. A PING goes out only when no request is in flight; the
+    /// reader thread swallows the PONG so it can never shift the
+    /// request/response pairing.
+    fn spawn_keepalive(&self) {
+        let writer = match &self.writer {
+            Outbound::Plain(s) => s.try_clone(),
+            Outbound::Tls(_) => return, // TLS link shares the session; the
+                                        // reader thread already keeps the socket warm with reads.
+        };
+        let Ok(writer) = writer else { return };
+        let in_flight = self.in_flight.clone();
+        std::thread::spawn(move || {
+            let interval = std::time::Duration::from_secs(25);
+            let mut writer = writer;
+            loop {
+                std::thread::sleep(interval);
+                if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    if let Ok(bytes) = Frame::new(proto::REQ_PING, vec![]).encode() {
+                        if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Send one frame and wait for its response frame.
     fn round_trip(&mut self, frame: &Frame) -> Result<Frame, String> {
         let bytes = frame.encode().map_err(|e| e.to_string())?;
-        self.writer.send_frame(&bytes)?;
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sent = self.writer.send_frame(&bytes);
+        if sent.is_err() {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        sent?;
         // A server that accepts but never answers (wedged node, dead
         // middlebox) must fail the script with a nonzero exit instead of
         // hanging it forever. `DOCSQL_CLI_TIMEOUT_MS` overrides (0 =
@@ -723,7 +778,11 @@ impl Remote {
             match got {
                 // Defensive: pushes normally print in the reader thread.
                 Some(Ok(f)) if f.frame_type == proto::RESP_PUSH => continue,
-                Some(Ok(f)) => return Ok(f),
+                Some(Ok(f)) => {
+                    self.in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(f);
+                }
                 Some(Err(())) => return Err("connection closed".to_string()),
                 None => {
                     return Err("no response within the response budget \
@@ -735,7 +794,11 @@ impl Remote {
     }
 }
 
-fn reader_loop(mut stream: std::net::TcpStream, tx: std::sync::mpsc::Sender<Frame>) {
+fn reader_loop(
+    mut stream: std::net::TcpStream,
+    tx: std::sync::mpsc::Sender<Frame>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     loop {
         let mut header = [0u8; proto::HEADER_LEN];
         if stream.read_exact(&mut header).is_err() {
@@ -762,6 +825,23 @@ fn reader_loop(mut stream: std::net::TcpStream, tx: std::sync::mpsc::Sender<Fram
         if f.frame_type == proto::RESP_PUSH {
             print_push(&f);
             let _ = std::io::stdout().flush();
+            continue;
+        }
+        // Keepalive answers belong to nobody: swallow them so the pairing
+        // with real requests never shifts.
+        if f.frame_type == proto::RESP_PONG {
+            continue;
+        }
+        // Server-originated errors (idle-timeout kick, KILL) arriving with
+        // no request in flight must not sit in the queue for the NEXT
+        // command to misread as its own response.
+        if f.frame_type == proto::RESP_ERROR
+            && in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0
+        {
+            eprintln!(
+                "{}",
+                sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+            );
             continue;
         }
         if tx.send(f).is_err() {
@@ -883,11 +963,33 @@ fn read_password_hidden() -> std::io::Result<String> {
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // Ctrl-C during the prompt kills the process with the default SIGINT
+    // handler — no unwinding, no restore, and the terminal stays echo-less
+    // until `stty sane`. The handler re-enables just the ECHO bit (the only
+    // one this window cleared) before exiting — no shared mutable state.
+    unsafe extern "C" fn restore_and_exit(sig: libc::c_int) {
+        let fd = libc::STDIN_FILENO;
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            t.c_lflag |= libc::ECHO;
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
+        libc::_exit(128 + sig);
+    }
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            restore_and_exit as *const () as libc::sighandler_t,
+        );
+    }
     let mut line = String::new();
     let read = std::io::stdin().read_line(&mut line);
     // Restore before reporting the read result: the terminal must never
     // stay echo-less, even when stdin failed.
-    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::tcsetattr(fd, libc::TCSANOW, &original);
+    }
     read?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
@@ -1019,7 +1121,16 @@ fn parse_pubsub_command(line: &str) -> Option<PubsubCmd> {
     }
 }
 
-fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> bool {
+/// Outcome of an inline pub/sub control command: a REFUSED operation keeps
+/// the connection usable (the shell continues, scripts fail at the end like
+/// a failed SQL statement); a TRANSPORT loss leaves no session to continue.
+enum PubsubOutcome {
+    Ok,
+    Refused,
+    Transport,
+}
+
+fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> PubsubOutcome {
     let (frame_type, payload, confirm) = match &cmd {
         PubsubCmd::Subscribe {
             name,
@@ -1098,18 +1209,20 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> bo
                 sanitize_terminal(&String::from_utf8_lossy(&f.payload))
             );
             // A refused PUBLISH/TRIM is a failed operation: fail_fast
-            // scripts must see it in the exit status, exactly like a
-            // failed SQL statement or a transport loss.
-            return false;
+            // scripts must see it in the exit status, exactly like a failed
+            // SQL statement — but the connection itself is still healthy.
+            return PubsubOutcome::Refused;
         }
         Ok(f) => {
             if f.frame_type == proto::RESP_AFFECTED {
                 let n = proto::decode_affected(&f.payload);
                 match confirm {
-                    "subscribed" => println!("(subscribed; {n} active subscription(s))"),
-                    "unsubscribed" => println!("(unsubscribed; {n} remain)"),
-                    "trimmed" => println!("({n} message(s) trimmed)"),
-                    _ => println!("({n} rows affected)"),
+                    "subscribed" => {
+                        note_line(format, &format!("(subscribed; {n} active subscription(s))"))
+                    }
+                    "unsubscribed" => note_line(format, &format!("(unsubscribed; {n} remain)")),
+                    "trimmed" => note_line(format, &format!("({n} message(s) trimmed)")),
+                    _ => note_line(format, &format!("({n} rows affected)")),
                 }
             } else {
                 print_frame(&f, format);
@@ -1117,10 +1230,10 @@ fn run_pubsub_command(remote: &mut Remote, cmd: PubsubCmd, format: Format) -> bo
         }
         Err(e) => {
             eprintln!("{e}");
-            return false;
+            return PubsubOutcome::Transport;
         }
     }
-    true
+    PubsubOutcome::Ok
 }
 
 fn remote_shell(
@@ -1150,6 +1263,13 @@ fn remote_shell(
         "DocSQL → {addr} — SQL over the wire, quit with exit; \
          (`auth <token>;`, `subscribe <ch>;`, `publish <ch> <msg>;`)"
     );
+    // Interactive sessions idle while the operator types: a server with
+    // DOCSQL_IDLE_TIMEOUT would drop the connection mid-thought (and any
+    // active subscription with it). Scripts stream continuously and skip
+    // this.
+    if script.is_none() {
+        remote.spawn_keepalive();
+    }
     let source: Box<dyn std::io::Read> = match script {
         Some(p) => match std::fs::File::open(p) {
             Ok(f) => Box::new(f),
@@ -1202,16 +1322,24 @@ fn remote_shell(
                 .filter(|t| !t.is_empty())
             {
                 if auth(&mut remote, tok) {
-                    println!("ok");
+                    note_line(format, "ok");
+                } else {
+                    // A failed re-auth is a failed statement: without this
+                    // the script (still on its OLD identity) exited 0 and
+                    // an orchestrator believed the rotation succeeded.
+                    stmt_failed = true;
                 }
                 continue;
             }
             // Inline pub/sub commands (single line, `;`-terminated like SQL).
             if let Some(cmd) = parse_pubsub_command(trimmed) {
-                if !run_pubsub_command(&mut remote, cmd, format) {
-                    // A failed control round trip leaves the session unusable —
-                    // exit nonzero so scripts see the transport loss.
-                    std::process::exit(1);
+                match run_pubsub_command(&mut remote, cmd, format) {
+                    PubsubOutcome::Ok => {}
+                    // A refused operation kills scripts but not the shell —
+                    // the connection is healthy and the next line may run.
+                    PubsubOutcome::Refused => stmt_failed = true,
+                    // Only a transport loss leaves the session unusable.
+                    PubsubOutcome::Transport => std::process::exit(1),
                 }
                 continue;
             }
@@ -1339,7 +1467,7 @@ fn print_frame(f: &Frame, format: Format) -> bool {
         }
         proto::RESP_AFFECTED => {
             let n = proto::decode_affected(&f.payload);
-            println!("({n} rows affected)");
+            note_line(format, &format!("({n} rows affected)"));
             true
         }
         _ => {
@@ -1386,6 +1514,16 @@ pub fn render_csv(r: &QueryResult) -> String {
     out
 }
 
+/// Human-readable progress/confirmation lines. Machine-readable formats
+/// (--json/--csv) must stay parseable on stdout: anything that is not a
+/// result document goes to stderr there.
+fn note_line(format: Format, msg: &str) {
+    match format {
+        Format::Table => println!("{msg}"),
+        _ => eprintln!("{msg}"),
+    }
+}
+
 fn csv_cell(s: &str) -> String {
     // CSV formula injection guard: a cell starting with =, +, -, @ (or a
     // tab/CR, which Excel also treats as formula introducers) would execute
@@ -1398,15 +1536,31 @@ fn csv_cell(s: &str) -> String {
     // something non-numeric keeps the guard (`-=cmd…` style payloads).
     let first = s.as_bytes().first().copied();
     let numeric_negative = |t: &str| {
+        // Digits, one dot, and an optional exponent (`-1e5`, `-1.5E-3` —
+        // numeric literals Excel keeps as numbers): anything else keeps
+        // the guard.
         let rest = &t[1..];
         let mut seen_digit = false;
-        for c in rest.bytes() {
+        let mut seen_dot = false;
+        for (i, c) in rest.bytes().enumerate() {
             if c.is_ascii_digit() {
                 seen_digit = true;
-            } else if c == b'.' {
-                // keep scanning
-            } else {
+            } else if c == b'.' && seen_dot {
                 return false;
+            } else if c == b'.' {
+                seen_dot = true;
+            } else {
+                return (c == b'e' || c == b'E')
+                    && seen_digit
+                    && match rest.as_bytes().get(i + 1) {
+                        Some(b'+') | Some(b'-') => {
+                            rest[i + 2..].bytes().all(|d| d.is_ascii_digit()) && rest.len() > i + 2
+                        }
+                        Some(d) if d.is_ascii_digit() => {
+                            rest[i + 1..].bytes().all(|d| d.is_ascii_digit())
+                        }
+                        _ => false,
+                    };
             }
         }
         seen_digit
@@ -2193,7 +2347,13 @@ mod tests {
         let client = std::net::TcpStream::connect(addr).unwrap();
         let server = listener.accept().unwrap().0;
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        std::thread::spawn(move || reader_loop(server, tx));
+        std::thread::spawn(move || {
+            reader_loop(
+                server,
+                tx,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+        });
         let mut client = client;
         let send = |s: &mut std::net::TcpStream, f: &Frame| {
             s.write_all(&f.encode().unwrap()).unwrap();
@@ -2239,7 +2399,13 @@ mod tests {
         let client = std::net::TcpStream::connect(addr).unwrap();
         let server = listener.accept().unwrap().0;
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        std::thread::spawn(move || reader_loop(server, tx));
+        std::thread::spawn(move || {
+            reader_loop(
+                server,
+                tx,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+        });
         drop(rx);
         let mut client = client;
         let f = Frame::new(proto::RESP_AFFECTED, 1u64.to_le_bytes().to_vec());
@@ -2254,7 +2420,13 @@ mod tests {
         let client2 = std::net::TcpStream::connect(addr2).unwrap();
         let server2 = listener.accept().unwrap().0;
         let (tx2, rx2) = std::sync::mpsc::channel::<Frame>();
-        std::thread::spawn(move || reader_loop(server2, tx2));
+        std::thread::spawn(move || {
+            reader_loop(
+                server2,
+                tx2,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+        });
         let mut client2 = client2;
         client2.write_all(&[0u8; 5]).unwrap(); // 半个帧头
         client2.flush().unwrap();
@@ -2272,7 +2444,13 @@ mod tests {
         let client = std::net::TcpStream::connect(addr).unwrap();
         let server = listener.accept().unwrap().0;
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        std::thread::spawn(move || reader_loop(server, tx));
+        std::thread::spawn(move || {
+            reader_loop(
+                server,
+                tx,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+        });
         let mut client = client;
         // 合法帧头 + 破损载荷:decode 失败必须收线而不是死循环。
         let mut buf = vec![0u8; proto::HEADER_LEN];

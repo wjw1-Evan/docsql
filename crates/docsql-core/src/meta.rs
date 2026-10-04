@@ -23,14 +23,17 @@ fn int(n: u64) -> Value {
 /// backing store, catch-up journal/positions/identity) under
 /// `system_tables` — excluded from `tables`/`totals`, reported separately
 /// so the console's object tree can show them as a read-only branch.
-pub fn build_meta(db: &mut Database, db_path: &Path, started: Instant, version: &str) -> Value {
+pub fn build_meta(db: &Database, db_path: &Path, started: Instant, version: &str) -> Value {
     let catalog: Vec<_> = db.catalog().into_iter().collect();
     let mut tables = Vec::new();
     let mut system_tables = Vec::new();
     let mut total_rows = 0u64;
     let mut total_indexes = 0u64;
     for t in &catalog {
-        let row_count = match db.execute(&format!(
+        // Read tier: the census is plain SELECTs — the REQ_META caller
+        // holds only a read lock, so concurrent readers share the engine
+        // instead of the whole catalog pausing every writer.
+        let row_count = match db.execute_read(&format!(
             "SELECT COUNT(*) FROM {}",
             crate::stmt::sql_quote_ident(&t.name)
         )) {
@@ -191,7 +194,7 @@ mod tests {
         d.execute("INSERT INTO m VALUES (1, 'a'), (2, 'b')")
             .unwrap();
         d.execute("CREATE INDEX mi ON m (name)").unwrap();
-        let v = build_meta(&mut d, &path, Instant::now(), "1.0");
+        let v = build_meta(&d, &path, Instant::now(), "1.0");
         let tables = match &v {
             Value::Object(o) => match o.get("tables") {
                 Some(Value::Array(a)) => a.clone(),
@@ -259,7 +262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut d = Database::open(&dir.path().join("m.db")).unwrap();
         d.ensure_pubsub_table().unwrap();
-        let v = build_meta(&mut d, &dir.path().join("m.db"), Instant::now(), "1.0");
+        let v = build_meta(&d, &dir.path().join("m.db"), Instant::now(), "1.0");
         match &v {
             Value::Object(o) => match o.get("tables") {
                 Some(Value::Array(a)) => assert!(a.is_empty()),
@@ -278,7 +281,7 @@ mod tests {
         d.execute("INSERT INTO user_t VALUES (1)").unwrap();
         d.ensure_cluster_tables().unwrap();
         d.journal_append("INSERT INTO user_t VALUES (1)").unwrap();
-        let v = build_meta(&mut d, &path, Instant::now(), "1.0");
+        let v = build_meta(&d, &path, Instant::now(), "1.0");
         // User surfaces stay user-only...
         assert_eq!(
             meta_table_field(&v, "tables", "user_t", "row_count"),

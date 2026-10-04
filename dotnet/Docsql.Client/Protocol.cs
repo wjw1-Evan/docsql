@@ -411,9 +411,24 @@ public sealed class ProtocolConnection : IDisposable
         {
             ClearPrepared();
         }
-        var resp = Send(new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)))
-            .EnsureOk("prepare failed: ");
-        return FinishPrepare(resp, template);
+        // Prepare belongs to the command it serves, not to whatever budget a
+        // previous command left on this connection: read the property only
+        // after restoring the default.
+        int prev = ReadTimeoutMs;
+        ReadTimeoutMs = DefaultReadTimeoutMs;
+        try
+        {
+            var resp = Send(new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)))
+                .EnsureOk("prepare failed: ");
+            return FinishPrepare(resp, template);
+        }
+        finally
+        {
+            if (!Broken)
+            {
+                ReadTimeoutMs = prev;
+            }
+        }
     }
 
     /// <summary><see cref="GetOrPrepare"/> 的真异步形态。</summary>
@@ -429,7 +444,8 @@ public sealed class ProtocolConnection : IDisposable
             ClearPrepared();
         }
         var resp = await SendAsync(
-                new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)), cancellationToken)
+                new Frame(FrameType.ReqPrepare, 0, 0, EncodeSql(template)), cancellationToken,
+                DefaultReadTimeoutMs)
             .ConfigureAwait(false);
         resp.EnsureOk("prepare failed: ");
         return FinishPrepare(resp, template);
@@ -457,7 +473,8 @@ public sealed class ProtocolConnection : IDisposable
             {
                 Send(new Frame(
                     FrameType.ReqCloseStmt, 0, 0,
-                    System.Text.Encoding.UTF8.GetBytes($"{{\"handle\":{h}}}")));
+                    System.Text.Encoding.UTF8.GetBytes($"{{\"handle\":{h}}}")),
+                    DefaultReadTimeoutMs);
             }
             catch
             {
@@ -479,8 +496,17 @@ public sealed class ProtocolConnection : IDisposable
         return buf;
     }
 
-    public Frame Send(Frame request)
+    public Frame Send(Frame request) => Send(request, -1);
+
+    /// <summary>同步往返,可显式指定读预算:连接级控制帧(PREPARE/CLOSE)
+    /// 不属于任何命令,不该继承上一条命令遗留的 ReadTimeoutMs。</summary>
+    public Frame Send(Frame request, int readTimeoutMs)
     {
+        int prev = ReadTimeoutMs;
+        if (readTimeoutMs >= 0)
+        {
+            ReadTimeoutMs = readTimeoutMs;
+        }
         try
         {
             Write(request);
@@ -511,6 +537,13 @@ public sealed class ProtocolConnection : IDisposable
             BreakConnection();
             throw;
         }
+        finally
+        {
+            if (readTimeoutMs >= 0 && !Broken)
+            {
+                ReadTimeoutMs = prev;
+            }
+        }
     }
 
     /// <summary><see cref="Send"/> 的真异步形态。取消只到语句边界:一帧发到
@@ -523,7 +556,7 @@ public sealed class ProtocolConnection : IDisposable
         cancellationToken.ThrowIfCancellationRequested();
         try
         {
-            await WriteAsync(request).ConfigureAwait(false);
+            await WriteAsync(request, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception e) when (e is IOException or SocketException)
         {
@@ -637,11 +670,30 @@ public sealed class ProtocolConnection : IDisposable
     }
 
     /// <summary><see cref="Write"/> 的真异步形态。</summary>
-    public async Task WriteAsync(Frame request)
+    public async Task WriteAsync(Frame request, CancellationToken cancellationToken = default)
     {
         var sealedFrame = SealFrame(request);
-        await _stream.WriteAsync(sealedFrame.Encode()).ConfigureAwait(false);
-        await _stream.FlushAsync().ConfigureAwait(false);
+        // ct on the wire write: a stalled peer that stops reading must not
+        // park an unbounded payload write outside every budget and token.
+        // A partially-written frame misaligns the stream — the caller's
+        // poison discipline applies (SendAsync marks Broken on IO faults;
+        // cancellation mid-write must discard the connection too).
+        var bytes = sealedFrame.Encode();
+        try
+        {
+            await _stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+            await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            BreakConnection();
+            throw;
+        }
+        catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException)
+        {
+            BreakConnection();
+            throw;
+        }
     }
 
     /// <summary>仅接收一帧(已解密);阻塞直至一帧完整到达。</summary>

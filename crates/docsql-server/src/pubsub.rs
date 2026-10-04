@@ -316,6 +316,25 @@ pub fn try_rewrite_pubsub_view(sql: &str) -> Option<String> {
             i = end;
             continue;
         }
+        // Comments are opaque too: an apostrophe inside one (`-- it's the
+        // id`) swallowed everything after it as a pseudo-literal, the
+        // reference escaped the rewrite, and the engine then failed with
+        // "no such table".
+        if lb[i] == b'-' && lb.get(i + 1) == Some(&b'-') {
+            let end = sql[i..].find('\n').map(|p| i + p + 1).unwrap_or(sql.len());
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if lb[i] == b'/' && lb.get(i + 1) == Some(&b'*') {
+            let end = sql[i + 2..]
+                .find("*/")
+                .map(|p| i + 2 + p + 2)
+                .unwrap_or(sql.len());
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
         if i + needle.len() <= lb.len()
             && &lb[i..i + needle.len()] == needle
             // Identifier boundaries on both sides: a longer user table name

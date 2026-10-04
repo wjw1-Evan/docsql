@@ -57,6 +57,17 @@ USER_BACKUP_KEEP="${DOCSQL_BACKUP_KEEP:-}"
 HAD_BACKUP_KEEP="${DOCSQL_BACKUP_KEEP+set}"
 USER_ADVERTISE="${DOCSQL_ADVERTISE:-}"
 HAD_ADVERTISE="${DOCSQL_ADVERTISE+set}"
+# TLS 四件同纪律:dev compose 与 prod 同目录共享 deploy/.env —— 为 prod
+# 启用的 TLS 值会透传进测试栈,节点拿到容器内不存在的证书路径启动即退,
+# 测试死在 "port never came up" 且报错晦涩(与被测代码无关)。
+USER_TLS_CERT="${DOCSQL_TLS_CERT:-}"
+HAD_TLS_CERT="${DOCSQL_TLS_CERT+set}"
+USER_TLS_KEY="${DOCSQL_TLS_KEY:-}"
+HAD_TLS_KEY="${DOCSQL_TLS_KEY+set}"
+USER_TLS_CONNECT="${DOCSQL_TLS_CONNECT:-}"
+HAD_TLS_CONNECT="${DOCSQL_TLS_CONNECT+set}"
+USER_TLS_CA="${DOCSQL_TLS_CA:-}"
+HAD_TLS_CA="${DOCSQL_TLS_CA+set}"
 # Image repository override (fork CI): the workflow exports IMAGE pointing
 # at the fork's own GHCR address (ghcr.io/<owner>/<repo>); route it into the
 # dev compose's image name so the deploy test pulls what was just built
@@ -83,6 +94,10 @@ export DOCSQL_MAX_CONN=""
 export DOCSQL_IDLE_TIMEOUT=""
 export DOCSQL_BACKUP_KEEP=""
 export DOCSQL_ADVERTISE=""
+export DOCSQL_TLS_CERT=""
+export DOCSQL_TLS_KEY=""
+export DOCSQL_TLS_CONNECT=""
+export DOCSQL_TLS_CA=""
 
 TAG="${DOCSQL_DEV_IMAGE_TAG:-local}"
 PROFILES="--profile single --profile cluster"
@@ -150,6 +165,10 @@ restore_user_stack() {
     restore_env DOCSQL_IDLE_TIMEOUT "$HAD_IDLE_TIMEOUT" "$USER_IDLE_TIMEOUT"
     restore_env DOCSQL_BACKUP_KEEP "$HAD_BACKUP_KEEP" "$USER_BACKUP_KEEP"
     restore_env DOCSQL_ADVERTISE "$HAD_ADVERTISE" "$USER_ADVERTISE"
+    restore_env DOCSQL_TLS_CERT "$HAD_TLS_CERT" "$USER_TLS_CERT"
+    restore_env DOCSQL_TLS_KEY "$HAD_TLS_KEY" "$USER_TLS_KEY"
+    restore_env DOCSQL_TLS_CONNECT "$HAD_TLS_CONNECT" "$USER_TLS_CONNECT"
+    restore_env DOCSQL_TLS_CA "$HAD_TLS_CA" "$USER_TLS_CA"
     restore_env DOCSQL_WEB_AUTH_FILE "$HAD_WEB_AUTH_FILE" "$USER_WEB_AUTH_FILE"
     restore_env DOCSQL_DEV_IMAGE "$HAD_DEV_IMAGE" "$USER_DEV_IMAGE"
     docker compose $UP_PROFILES up -d >/dev/null 2>&1 \

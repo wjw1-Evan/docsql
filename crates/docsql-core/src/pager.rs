@@ -1025,6 +1025,12 @@ impl Pager {
         if offset + data.len() > PAGE_SIZE {
             return Err(PagerError::OutOfRange(id, u32::MAX));
         }
+        // Page 0 is the file header (magic + page count): readers and the
+        // recovery loop both refuse it, so a write staged against it would
+        // silently destroy the directory and make the WAL unreplayable.
+        if id == 0 {
+            return Err(PagerError::OutOfRange(id, self.num_pages()));
+        }
         if id >= self.num_pages() && !tx.staged.contains_key(&id) {
             return Err(PagerError::OutOfRange(id, self.num_pages()));
         }
@@ -1773,6 +1779,18 @@ mod tests {
         assert_eq!(&one[..14], b"hello page one");
         let two = pager.read_page(p2).unwrap().to_vec();
         assert_eq!(&two[100..113], b"page two @100");
+    }
+
+    #[test]
+    fn write_page_refuses_page_zero() {
+        let (_dir, path) = tmp_db("z.db");
+        let pager = Pager::open(&path).unwrap();
+        let mut tx = pager.begin_tx();
+        // Page 0 is the file header; every reader and the recovery loop
+        // refuse it, so staging a write there must fail loudly.
+        let r = pager.write_page(&mut tx, 0, 0, &[1u8; 16]);
+        assert!(r.is_err(), "write_page(0) must be refused");
+        drop(tx);
     }
 
     #[test]

@@ -641,12 +641,24 @@ impl Heap {
         let inline_len = max_inline.min(bytes.len());
 
         // Chain pages: free list first, fresh allocation for the remainder.
+        // A popped free-list entry must never be one of THIS heap's pages:
+        // writing a chain image over a live data page both corrupts it and
+        // (below) makes the second main-page load read a 0xFE image.
+        let own_pages: std::collections::BTreeSet<u32> = self.pages.iter().copied().collect();
         let rest = &bytes[inline_len..];
         let chunk_count = rest.chunks(PAGE_SIZE - CHAIN_HEADER).count();
         let mut chain = Vec::with_capacity(chunk_count);
         while chain.len() < chunk_count {
             match self.overflow_free.pop() {
-                Some(pid) => chain.push(pid),
+                Some(pid) => {
+                    if own_pages.contains(&pid) {
+                        return Err(HeapError::Page(
+                            pid,
+                            "overflow free list names a live page of this heap",
+                        ));
+                    }
+                    chain.push(pid);
+                }
                 None => chain.push(pager.allocate_page(tx)?),
             }
         }
@@ -680,6 +692,10 @@ impl Heap {
         }
         let last = *self.pages.last().unwrap();
         let mut page = load_page_owned(&PageReader::current(pager), Some(tx), last)?;
+        // Re-validate: the chain writes above ran while the main page was
+        // only staged, and the first load predates them. Corrupt content
+        // must fail loudly here, not slice-panic in content_start below.
+        validate_page(&page, last)?;
         let off = content_start(&page) - content.len();
         page[off..off + content.len()].copy_from_slice(&content);
         push_slot(&mut page, off, content.len());

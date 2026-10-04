@@ -468,13 +468,16 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/change", post(auth_change))
         .route("/api/auth/logout", post(auth_logout))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            count_requests,
-        ))
+        // count_requests OUTERMOST: the token-bypass 429 fires inside
+        // security_headers, and an inner counter left that security event
+        // invisible to /metrics.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security_headers,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            count_requests,
         ))
         .with_state(state)
 }
@@ -506,7 +509,7 @@ async fn count_requests(
         _ => "other",
     };
     let raw_path = req.uri().path().to_string();
-    const KNOWN: [&str; 17] = [
+    const KNOWN: [&str; 18] = [
         "/",
         "/healthz",
         "/metrics",
@@ -515,6 +518,7 @@ async fn count_requests(
         "/api/meta",
         "/api/stats",
         "/api/cluster",
+        "/api/sessions",
         "/api/logs",
         "/api/users",
         "/api/backup",

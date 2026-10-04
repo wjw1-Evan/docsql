@@ -152,13 +152,40 @@ class Subscriber:
 
     # -- internals ------------------------------------------------------------
     def _control(self, frame_type, body):
+        # A dead reader leaves a poisoned transport behind: after a
+        # disconnect with NO recorded subscriptions the loop exits (nothing
+        # to resubscribe), and every later subscribe() failed forever on the
+        # closed wire. Rebuild the connection and restart the reader first
+        # — auto-resubscribe semantics recover the object.
+        if (
+            not self._closed.is_set()
+            and self._conn is not None
+            and self._conn._transport._closed
+        ):
+            with self._write_lock:
+                if self._conn._transport._closed and not self._closed.is_set():
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = connect(**self._conn_kwargs)
+                    self._reader = threading.Thread(
+                        target=self._run, name="docsql-subscriber", daemon=True
+                    )
+                    self._reader.start()
         payload = json.dumps(body).encode("utf-8")
         pushes = []
+        # Snapshot the connection this REQUEST went out on: the reader loop
+        # may replace `self._conn` mid-wait (reconnect finished inside the
+        # 10s window) — poisoning the NEW connection below both killed a
+        # healthy link and marked its replies stale for a full extra
+        # backoff round.
+        conn_at_send = self._conn
         try:
             with self._write_lock:
                 self._control_busy = True
                 try:
-                    self._conn._transport.write_frame(frame_type, payload)
+                    conn_at_send._transport.write_frame(frame_type, payload)
                     while True:
                         try:
                             _flags, ftype, rpayload = self._replies.get(timeout=10)
@@ -184,7 +211,7 @@ class Subscriber:
                                 except queue.Empty:
                                     break
                             try:
-                                self._conn._transport._poison()
+                                conn_at_send._transport._poison()
                             except Exception:
                                 pass
                             raise OperationalError(

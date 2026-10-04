@@ -1481,7 +1481,16 @@ pub async fn handle_connection(
             };
             let bytes = match f.encode() {
                 Ok(b) => b,
-                Err(_) => continue,
+                // A frame over the 64MiB wire cap (giant RESP_META/SESSIONS)
+                // must answer the request, not vanish — silently dropping
+                // it left the peer waiting until its idle timeout.
+                Err(_) => {
+                    let err =
+                        Frame::new(proto::RESP_ERROR, b"response too large to encode".to_vec());
+                    let _ = wr.write_all(&err.encode().unwrap_or_default()).await;
+                    let _ = wr.flush().await;
+                    break;
+                }
             };
             wmetrics
                 .bytes_out_total
@@ -2075,6 +2084,13 @@ pub async fn handle_connection(
                         state
                             .primary_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // A manual PROMOTE re-arms auto-promotion: without
+                        // this, a node demoted (and frozen) by the probe
+                        // loop could never auto-promote again until restart
+                        // — the quorum comment promises the unfreeze.
+                        state
+                            .auto_promote_frozen
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                         querylog::sync_event(&state.sync_log, "promote", "", None, true, None);
                         // Failover changes who owns writes cluster-wide: the
                         // trail must say who pulled the trigger.
@@ -2233,9 +2249,9 @@ pub async fn handle_connection(
                         // on its embedded engine, so remote nodes report
                         // shape-identical /api/meta payloads. Not an SQL
                         // statement, so it bypasses the query log.
-                        let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                        let db = state.db.read().unwrap_or_else(|p| p.into_inner());
                         let meta = docsql_core::meta::build_meta(
-                            &mut db,
+                            &db,
                             &state.db_path,
                             state.started,
                             env!("CARGO_PKG_VERSION"),
@@ -2559,11 +2575,28 @@ pub async fn handle_connection(
                         None => (Err("execute: unknown statement handle".to_string()), String::new()),
                     };
                         match rendered {
-                            Ok(sql) => {
+                            Ok(mut sql) => {
                                 let started = std::time::Instant::now();
                                 let deadline = state
                                     .statement_timeout
                                     .map(|t| std::time::Instant::now() + t);
+                                // Same docsql_pubsub decision as the REQ_SQL
+                                // arm: a user table by that name must not be
+                                // shadowed by the compat view here either —
+                                // the prepared path used to skip the rewrite
+                                // and fail with "no such table".
+                                if !state
+                                    .db
+                                    .read()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .table_exists("docsql_pubsub")
+                                {
+                                    if let Some(rewritten) =
+                                        pubsub::try_rewrite_pubsub_view(&sql)
+                                    {
+                                        sql = rewritten;
+                                    }
+                                }
                                 let mut exec_logged_sql: Option<String> = None;
                                 let (resp, logged) =
                                     match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly)
@@ -2996,6 +3029,25 @@ fn bind_params(sql: &str, params: &[Value]) -> Result<String, String> {
                 }
                 out.push_str(&sql[start..i]);
             }
+            // T-SQL [bracket] identifiers are data to the preprocessor
+            // (`[x]` becomes `"x"` before parsing): a `?` inside one is
+            // part of the identifier, not a placeholder.
+            b'[' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b']' {
+                        if bytes.get(i + 1) == Some(&b']') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
+            }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 let start = i;
                 while i < bytes.len() && bytes[i] != b'\n' {
@@ -3413,6 +3465,13 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
             db.any_user_exists().unwrap_or(false),
         )
     };
+    // File sizes sampled BEFORE the read guard: holding the engine lock
+    // across stat calls let a slow mount stall every writer for the same
+    // duration on every status poll.
+    let (db_bytes, wal_bytes) = (
+        file_bytes(&state.db_path),
+        file_bytes(&wal_path(&state.db_path)),
+    );
     // Read tier: the census is a set of plain SELECTs — concurrent readers
     // share the engine (MVCC stage A) instead of blocking each other.
     let db = state.db.read().unwrap_or_else(|p| p.into_inner());
@@ -3456,8 +3515,8 @@ pub async fn status_payload(state: &ServerState) -> serde_json::Value {
         "storage": {
             "page_size": db.page_size(),
             "num_pages": db.num_pages(),
-            "db_bytes": file_bytes(&state.db_path),
-            "wal_bytes": file_bytes(&wal_path(&state.db_path)),
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
         },
         "durable_lsn": db.durable_lsn(),
         "totals": {"tables": user_tables, "rows": total_rows},
@@ -3575,7 +3634,8 @@ fn apply_row_filters(
     // they are WRITE targets, but their rows are exactly what a filter on
     // them must protect (without this the early-exit below silently
     // skipped `UPDATE sales SET … WHERE …`).
-    let mut targets = match Database::stmt_read_target_occurrences(stmt) {
+    let objects = |n: &str| db.table_exists(n);
+    let mut targets = match Database::stmt_read_target_occurrences(stmt, &objects) {
         Some(t) => t,
         None => {
             return if mentions_filtered() {
@@ -3823,7 +3883,8 @@ fn authorize_statement(
             }
             use sqlparser::ast::Statement as S;
             if !is_write {
-                let Some(targets) = Database::stmt_read_targets(s) else {
+                let objects = |n: &str| db.is_some_and(|d| d.table_exists(n));
+                let Some(targets) = Database::stmt_read_targets(s, &objects) else {
                     return Err(
                         "this statement shape cannot be authorized for user connections".into(),
                     );
@@ -3928,6 +3989,38 @@ fn authorize_statement(
                 S::Update(_) => (PRIV_UPDATE, "UPDATE"),
                 S::Delete(_) => (PRIV_DELETE, "DELETE"),
                 S::Truncate(_) => (PRIV_DELETE, "TRUNCATE"),
+                // MERGE is ordinary DML (write-targets, read-targets and the
+                // system-table gate all classify it); it used to fall into
+                // the DDL refusal. Require the privileges of the arms the
+                // statement actually carries, each held on the target.
+                S::Merge(m) => {
+                    let mut bits: u8 = 0;
+                    for c in &m.clauses {
+                        bits |= match &c.action {
+                            sqlparser::ast::MergeAction::Insert(_) => PRIV_INSERT,
+                            sqlparser::ast::MergeAction::Update(_) => PRIV_UPDATE,
+                            sqlparser::ast::MergeAction::Delete { .. } => PRIV_DELETE,
+                        };
+                    }
+                    let targets = Database::stmt_write_targets(s);
+                    for t in &targets {
+                        for (b, l) in [
+                            (PRIV_INSERT, "INSERT"),
+                            (PRIV_UPDATE, "UPDATE"),
+                            (PRIV_DELETE, "DELETE"),
+                        ] {
+                            if bits & b != 0 && !g.may_dml(t, b) {
+                                return Err(format!(
+                                    "MERGE arm {l} on table {t} requires the readwrite role \
+                                     or a table grant"
+                                ));
+                            }
+                        }
+                    }
+                    // Arm bits are already verified above; fall through to
+                    // the read-source checks with a no-op bit.
+                    (0, "MERGE")
+                }
                 _ => return Err("DDL and administrative statements require the admin role".into()),
             };
             let mut write_targets = Database::stmt_write_targets(s);
@@ -3961,7 +4054,8 @@ fn authorize_statement(
                 }
             }
             for t in write_targets {
-                if !g.may_dml(&t, bit) {
+                // bit == 0: the MERGE arm verified each arm-bit above.
+                if bit != 0 && !g.may_dml(&t, bit) {
                     return Err(format!(
                         "{label} on table {t} requires the readwrite role or a table grant"
                     ));
@@ -3972,9 +4066,57 @@ fn authorize_statement(
             // authorization input — without this check a user holding only a
             // write grant could copy docsql_users password hashes (or any
             // ungranted table) into a table of their own and read them back.
-            let sources = Database::stmt_read_targets(s).ok_or_else(|| {
+            let objects = |n: &str| db.is_some_and(|d| d.table_exists(n));
+            let sources = Database::stmt_read_targets(s, &objects).ok_or_else(|| {
                 "this statement shape cannot be authorized for user connections".to_string()
             })?;
+            // Column-restricted grants bind on WRITE sources too: an
+            // INSERT .. SELECT copying an ungranted column into one's own
+            // table used to pass the table-level may_select alone and leak
+            // the value on read-back.
+            let restricted: Vec<&String> = sources
+                .iter()
+                .filter(|t| g.is_restricted_select(t))
+                .collect();
+            if !restricted.is_empty() {
+                let attributed = match s.as_ref() {
+                    S::Insert(ins) => ins
+                        .source
+                        .as_ref()
+                        .and_then(|q| docsql_core::engine::single_table_query_refs(q.as_ref())),
+                    _ => None,
+                };
+                match attributed {
+                    Some((table, cols)) => {
+                        for rt in &restricted {
+                            if !rt.eq_ignore_ascii_case(&table) {
+                                return Err(format!(
+                                    "reading {rt} with column-restricted grants requires \
+                                     a single-table SELECT of exactly that table"
+                                ));
+                            }
+                            let granted = g.granted_cols(rt);
+                            for c in &cols {
+                                if !granted.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                                    return Err(format!(
+                                        "SELECT on column {c} of {table} is not granted \
+                                         (the grant lists its columns)"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(
+                            "write sources cannot be authorized against column-restricted \
+                             grants (only a plain single-table INSERT ... SELECT is \
+                             attributable; wildcards, joins, subqueries, UPDATE and MERGE \
+                             sources are not)"
+                                .into(),
+                        );
+                    }
+                }
+            }
             // View expansion: a view is a SELECT permission boundary, not a
             // license to write through it. A write reading a view needs the
             // grants on the view's BASE tables (fail-closed, chain capped).
@@ -5321,9 +5463,11 @@ async fn handle_publish(state: &Arc<ServerState>, frame: &Frame, is_replication:
         // Gate window (bootstrap/repair snapshot replay): queue the
         // equivalent INSERT like any replicated SQL write instead of
         // racing the replay for the write order. The drain replays it
-        // after adoption (autoincrement stays in lockstep with the
-        // origin, so the assigned id matches); retention self-heals on
-        // the next publish/trim. The replay path lifts the system-table
+        // after adoption. NOTE: the autoincrement id only matches the
+        // origin on nodes that were in sync when it was assigned — a
+        // joiner (empty system tables) or a repaired node assigns its own
+        // local id, so message ids are node-local, not cluster-global;
+        // retention self-heals on the next publish/trim. The replay path lifts the system-table
         // gate via the queued write's flag.
         let ts = now_ms() as i64;
         let sql = format!(
@@ -7171,6 +7315,13 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
             tokio::time::sleep(SYNC_RETRY_DELAY).await;
             continue;
         }
+        // Post-catch-up digest views, when the incremental path produced
+        // them this round (used by the phase-2 election below).
+        type DigestViews = (
+            Vec<docsql_core::engine::TableDigest>,
+            Vec<(String, Vec<docsql_core::engine::TableDigest>)>,
+        );
+        let mut stale_views: Option<DigestViews> = None;
         let local = {
             let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
             db.digests()
@@ -7228,6 +7379,10 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                             db.digests()
                         };
                         if let Ok(fresh_local) = fresh_local {
+                            // Keep the post-catch-up views for the phase-2
+                            // election below: the round-start local/reports
+                            // are stale by everything the replay applied.
+                            stale_views = Some((fresh_local.clone(), fresh.clone()));
                             // Convergence must be the ELECTION's verdict
                             // (local group wins decide_repair), not "any
                             // single peer agrees": in an even split
@@ -7282,6 +7437,13 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
             .iter()
             .filter_map(|(_, info)| Some((info.node_id.clone()?, info.journal_head?)))
             .collect();
+        // Prefer the post-catch-up digests when the replay path produced
+        // them: electing on round-start views could pick a reference group
+        // the mesh has already moved past.
+        let (local, reports) = match stale_views.take() {
+            Some((fl, f)) => (fl, f),
+            None => (local, reports),
+        };
         match decide_repair(&local, &reports) {
             RepairDecision::Converged => {
                 drain_sync_queue(&state, false).await;
@@ -8412,6 +8574,82 @@ mod security_tests {
     use super::*;
 
     #[test]
+    fn authorize_statement_routes_merge_by_its_arms() {
+        use docsql_core::useradmin::{PRIV_DELETE, PRIV_INSERT, PRIV_UPDATE};
+        let mut db = docsql_core::engine::Database::in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE tgt (id INT PRIMARY KEY, v INT)",
+            "CREATE TABLE src (id INT PRIMARY KEY, v INT)",
+            "INSERT INTO tgt VALUES (1, 1)",
+            "INSERT INTO src VALUES (1, 2)",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let parse = |sql: &str| docsql_core::engine::Database::parse_classified(sql).unwrap();
+        let grants = |bits: u8| {
+            let mut g = docsql_core::useradmin::UserGrants {
+                admin: false,
+                ..Default::default()
+            };
+            g.table_privs.insert("tgt".into(), bits);
+            g.table_privs.insert("src".into(), 0xFF);
+            g
+        };
+        let upd = parse(
+            "MERGE INTO tgt USING src ON tgt.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = src.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)",
+        );
+        // MERGE used to fall into the DDL refusal for every non-admin.
+        let r = authorize_statement(
+            Some(&db),
+            &upd.stmt,
+            &upd.tx,
+            upd.is_write,
+            &grants(PRIV_INSERT | PRIV_UPDATE),
+        );
+        assert!(
+            r.is_ok(),
+            "readwrite-equivalent bits must authorize a MERGE: {r:?}"
+        );
+        // UPDATE-only grant cannot run the INSERT arm.
+        assert!(authorize_statement(
+            Some(&db),
+            &upd.stmt,
+            &upd.tx,
+            upd.is_write,
+            &grants(PRIV_UPDATE)
+        )
+        .is_err());
+        // Matching arms only: an update-only MERGE passes with just UPDATE.
+        let upd_only = parse(
+            "MERGE INTO tgt USING src ON tgt.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = src.v",
+        );
+        assert!(authorize_statement(
+            Some(&db),
+            &upd_only.stmt,
+            &upd_only.tx,
+            upd_only.is_write,
+            &grants(PRIV_UPDATE)
+        )
+        .is_ok());
+        let _ = PRIV_DELETE;
+    }
+
+    #[test]
+    fn bind_params_treats_bracket_identifiers_as_opaque() {
+        // `[col?]` is a T-SQL identifier; the ? inside is data. Binding used
+        // to substitute it (or error on the count).
+        let out = bind_params("SELECT [col?], name FROM t WHERE id = ?", &[Value::Int(7)]).unwrap();
+        assert!(out.contains("[col?]"), "{out}");
+        assert!(out.ends_with("7"), "{out}");
+        // ]] escape inside brackets stays intact.
+        let out = bind_params("SELECT [a]]?b] FROM t", &[]).unwrap();
+        assert_eq!(out, "SELECT [a]]?b] FROM t");
+    }
+
+    #[test]
     fn bind_params_is_quote_aware_and_escapes_values() {
         // Plain positional binding of every value type.
         assert_eq!(
@@ -8820,7 +9058,7 @@ mod security_tests {
         let docsql_core::engine::AnyStmt::Sql(stmt) = &p.stmt else {
             panic!("expected a SQL statement");
         };
-        let targets = docsql_core::engine::Database::stmt_read_targets(stmt).unwrap();
+        let targets = docsql_core::engine::Database::stmt_read_targets(stmt, &|_| false).unwrap();
         assert!(
             targets.contains(&"information_schema.columns".to_string()),
             "{targets:?}"

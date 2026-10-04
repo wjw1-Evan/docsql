@@ -132,6 +132,22 @@ impl AuthStore {
         if self.creds.is_some() {
             return Err(SetupError::Exists);
         }
+        // The FILE is the source of truth: an operator may have dropped a
+        // credential file in place after this process started (k8s secret
+        // late mount, copied from another host). Memory said "setup mode"
+        // — without this recheck the first visitor's setup would overwrite
+        // that account.
+        match std::fs::read(&self.path) {
+            Ok(bytes) => match parse_creds(&bytes) {
+                Ok(_) => return Err(SetupError::Exists),
+                // A corrupt file refuses setup for the same reason open
+                // refuses to start: silently re-running setup on a gated
+                // console must not be possible.
+                Err(e) => return Err(SetupError::Invalid(format!("auth file corrupt: {e}"))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SetupError::Io(e.to_string())),
+        }
         self.write(&creds).map_err(SetupError::Io)?;
         self.creds = Some(creds.clone());
         Ok(creds)

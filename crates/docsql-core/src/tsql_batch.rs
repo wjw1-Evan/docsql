@@ -388,9 +388,13 @@ impl TsqlSession {
                         // inside the failed try body does not survive.
                         self.error_ctx = Some((error_number(&e), e.to_string()));
                         self.last_error = error_number(&e);
-                        self.run_stmts(catch_, exec, budget, depth)
-                            .await
-                            .map(|_| ())
+                        // BREAK/CONTINUE raised INSIDE the CATCH body
+                        // propagates to the enclosing WHILE too — swallowing
+                        // it turned a two-iteration loop into an unbounded
+                        // one that kept committing real writes.
+                        let caught = self.run_stmts(catch_, exec, budget, depth).await;
+                        self.error_ctx = saved;
+                        return caught;
                     }
                 };
                 self.error_ctx = saved;
@@ -863,6 +867,21 @@ fn skip_case_expr(sql: &str, lower: &[u8], mut j: usize) -> Option<usize> {
                 }
                 j = (j + 2).min(b.len());
             }
+            c if c.is_ascii_alphabetic()
+                && j > 0
+                && (b[j - 1].is_ascii_alphanumeric()
+                    || matches!(b[j - 1], b'_' | b'@' | b'#' | b'$' | b'.')) =>
+            {
+                // Identifier tail (`@end`, `_end`, `1end`, `t.end`): data,
+                // not a keyword — skipping only one byte let the "end" tail
+                // close a block early.
+                while j < b.len()
+                    && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'@' | b'#' | b'$'))
+                {
+                    j += 1;
+                }
+                continue;
+            }
             c if c.is_ascii_alphabetic() => {
                 let mut k = j;
                 while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
@@ -935,6 +954,18 @@ fn batch_begin_depth(s: &str) -> i32 {
                     i += 1;
                 }
                 i = (i + 2).min(b.len());
+                continue;
+            }
+            c if c.is_ascii_alphabetic()
+                && i > 0
+                && (b[i - 1].is_ascii_alphanumeric()
+                    || matches!(b[i - 1], b'_' | b'@' | b'#' | b'$' | b'.')) =>
+            {
+                while i < b.len()
+                    && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'@' | b'#' | b'$'))
+                {
+                    i += 1;
+                }
                 continue;
             }
             c if c.is_ascii_alphabetic() => {
@@ -1225,6 +1256,19 @@ impl<'a> Parser<'a> {
                         j += 1;
                     }
                     j = (j + 2).min(b.len());
+                }
+                c if c.is_ascii_alphabetic()
+                    && j > 0
+                    && (b[j - 1].is_ascii_alphanumeric()
+                        || matches!(b[j - 1], b'_' | b'@' | b'#' | b'$' | b'.')) =>
+                {
+                    while j < b.len()
+                        && (b[j].is_ascii_alphanumeric()
+                            || matches!(b[j], b'_' | b'@' | b'#' | b'$'))
+                    {
+                        j += 1;
+                    }
+                    continue;
                 }
                 c if c.is_ascii_alphabetic() => {
                     let mut k = j;
@@ -1941,7 +1985,9 @@ impl<'a> Parser<'a> {
         match self.i.checked_sub(1).and_then(|p| self.b.get(p)) {
             // `.` means qualified column access (`t.use`, `t.case`): the
             // word after it is an identifier, never a keyword.
-            Some(prev) => !prev.is_ascii_alphanumeric() && *prev != b'_' && *prev != b'.',
+            Some(prev) => {
+                !prev.is_ascii_alphanumeric() && !matches!(prev, b'_' | b'.' | b'@' | b'#' | b'$')
+            }
             None => true,
         }
     }
@@ -2089,6 +2135,25 @@ impl<'a> Parser<'a> {
                     self.i = (self.i + 2).min(self.b.len());
                     continue;
                 }
+                c if c.is_ascii_alphabetic()
+                    && self
+                        .i
+                        .checked_sub(1)
+                        .and_then(|p| self.b.get(p))
+                        .is_some_and(|prev| {
+                            prev.is_ascii_alphanumeric()
+                                || matches!(prev, b'_' | b'@' | b'#' | b'$' | b'.')
+                        }) =>
+                {
+                    // Identifier tail (@end/_end/1end/t.end): not a keyword.
+                    while self.i < self.b.len()
+                        && (self.b[self.i].is_ascii_alphanumeric()
+                            || matches!(self.b[self.i], b'_' | b'@' | b'#' | b'$'))
+                    {
+                        self.i += 1;
+                    }
+                    continue;
+                }
                 c if c.is_ascii_alphabetic() => {
                     let word = self.peek_word().unwrap_or_default().to_vec();
                     if word == b"case" {
@@ -2170,10 +2235,41 @@ fn parse_throw(args: &str, form: ThrowForm) -> Option<(i64, String)> {
     let code = code_arg
         .and_then(|p| p.parse::<i64>().ok())
         .unwrap_or(50000);
-    let message = message_arg
+    let mut message = message_arg
         .map(unquote_literal)
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_THROW_MESSAGE.into());
+    if form == ThrowForm::RaiseError && parts.len() > 3 {
+        // printf-style substitution arguments ride parts[3..] (already
+        // run-time-substituted text): %s/%d/%i replace in order, %% is a
+        // literal percent. Dropping them used to leave the placeholders in
+        // the raised message.
+        let vals: Vec<String> = parts.iter().skip(3).map(|p| unquote_literal(p)).collect();
+        let mut out = String::with_capacity(message.len());
+        let mut vi = 0usize;
+        let mut chars = message.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('s' | 'd' | 'i') => {
+                    if let Some(v) = vals.get(vi) {
+                        out.push_str(v);
+                    }
+                    vi += 1;
+                }
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        }
+        message = out;
+    }
     Some((code, message))
 }
 
@@ -2250,8 +2346,60 @@ pub fn is_insert_statement(sql: &str) -> bool {
     // byte landed inside a multi-byte character (a plain emoji statement
     // took the connection down).
     let b = sql.as_bytes();
-    (b.len() >= i + 6 && b[i..i + 6].eq_ignore_ascii_case(b"INSERT"))
-        || (b.len() >= i + 5 && b[i..i + 5].eq_ignore_ascii_case(b"MERGE"))
+    if b.len() >= i + 6 && b[i..i + 6].eq_ignore_ascii_case(b"INSERT") {
+        return true;
+    }
+    if b.len() >= i + 5 && b[i..i + 5].eq_ignore_ascii_case(b"MERGE") {
+        return true;
+    }
+    // `WITH cte AS (…) INSERT …`: the CTE prefix hides the verb — walk the
+    // CTE list (multiple definitions, optional column lists, RECURSIVE
+    // keyword) and sniff the verb after it.
+    if b.len() >= i + 4 && b[i..i + 4].eq_ignore_ascii_case(b"WITH") {
+        let mut j = i + 4;
+        loop {
+            while j < b.len() && b[j] != b'(' {
+                j += 1;
+            }
+            if j >= b.len() {
+                break;
+            }
+            let mut depth = 0i32;
+            while j < b.len() {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j >= b.len() {
+                break;
+            }
+            let after = sql[j + 1..].trim_start();
+            let lower = after.to_ascii_lowercase();
+            if lower.starts_with("as") {
+                // That was the optional column list, not the body.
+                continue;
+            }
+            let mut k = j + 1;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < b.len() && b[k] == b',' {
+                // another CTE definition follows the comma
+                j = k + 1;
+                continue;
+            }
+            return is_insert_statement(after);
+        }
+    }
+    false
 }
 
 /// Byte offset of the first real token after leading whitespace and
@@ -2511,6 +2659,72 @@ mod tests {
         match out {
             Some(ExecResult::Rows(r)) => r.rows.clone(),
             other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catch_break_propagates_to_the_enclosing_while() {
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE w (n INT)").unwrap();
+        let mut sess = TsqlSession::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @i INT = 0\nWHILE 1 = 1\nBEGIN\n SET @i = @i + 1\n BEGIN TRY\n  IF @i = 2 THROW 50000, 'x', 1\n END TRY\n BEGIN CATCH\n  BREAK\n END CATCH\nEND\nSELECT @i AS n",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(2)]]);
+        let _ = &sess;
+    }
+
+    #[test]
+    fn variable_names_ending_in_keywords_do_not_cut_blocks() {
+        let mut db = DbExec::new();
+        let mut sess = TsqlSession::new();
+        // `@end`/`@set` 的字母尾巴曾当裸 END/SET 把块截断,整批报
+        // "Must declare the scalar variable "@"。
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @end INT = 5\nIF @end = 5\nBEGIN\n SELECT @end AS v\nEND",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(5)]]);
+        let out = run_script(&mut sess, &mut db, "DECLARE @set INT = 3\nSELECT @set AS v").unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn with_prefixed_insert_is_sniffed_as_insert() {
+        // The engine itself refuses WITH-prefixed DML loudly today; the
+        // identity sniffer must still classify it so the moment execution
+        // support lands, @@IDENTITY refreshes (the CTE prefix used to hide
+        // the verb and the identity silently stayed NULL).
+        assert!(is_insert_statement(
+            "WITH x AS (SELECT 1 AS v) INSERT INTO t (v) SELECT v FROM x"
+        ));
+        assert!(is_insert_statement(
+            "WITH a AS (SELECT 1), b AS (SELECT 2) MERGE INTO t USING b ON 1 = 1"
+        ));
+        assert!(!is_insert_statement("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!is_insert_statement("WITH x AS (SELECT 1)"));
+    }
+
+    #[test]
+    fn raiserror_substitutes_printf_arguments() {
+        let mut db = DbExec::new();
+        let mut sess = TsqlSession::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @v TEXT = 'widget'\nRAISERROR('bad %s value %d', 16, 1, @v, 42)",
+        );
+        match out {
+            Err(e) => {
+                let m = e.to_string();
+                assert!(m.contains("bad widget value 42"), "{m}");
+            }
+            other => panic!("expected error, got {other:?}"),
         }
     }
 

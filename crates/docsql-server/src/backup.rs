@@ -420,9 +420,16 @@ fn key_file_name(key: &str) -> Option<&str> {
 fn owned_keys(keys: &[String], prefix: &str) -> Vec<String> {
     keys.iter()
         .filter(|k| {
-            k.strip_prefix(prefix)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+            if prefix.is_empty() {
+                // Root-level layout: own objects are bare names (no `/`).
+                // The old `/`-strip filtered EVERYTHING out — restore,
+                // prune and reconcile all no-oped against the remote copy.
+                !k.contains('/')
+            } else {
+                k.strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+            }
         })
         .cloned()
         .collect()
@@ -485,6 +492,8 @@ async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
     // replays it unverified). One interleaved pass could upload the .sql
     // and die before its sidecar; two passes close that window.
     let mut sql_jobs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // Sidecar names THIS pass uploaded successfully.
+    let mut landed_sidecars: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in entries.flatten() {
         let Ok(name) = e.file_name().into_string() else {
             continue;
@@ -494,17 +503,33 @@ async fn reconcile_remote(s3: &crate::s3::S3Client, state: &Arc<ServerState>) {
         if !tracked || remote.contains(&cfg.object_key(&name)) {
             continue;
         }
+        let mut sidecar_landed = false;
         if name.ends_with(".sha256") {
             if let Ok(bytes) = std::fs::read(e.path()) {
-                let _ = upload_backup_bytes(state, s3, &name, &bytes).await;
+                sidecar_landed = upload_backup_bytes(state, s3, &name, &bytes).await.is_ok();
+            }
+            // A failed sidecar upload must gate its .sql: remember success
+            // for this name only; the second pass re-checks remotely.
+            if sidecar_landed {
+                landed_sidecars.insert(name);
             }
             continue;
         }
         sql_jobs.push((name, e.path()));
     }
     for (name, path) in sql_jobs {
-        let Ok(sidecar) = std::fs::read_to_string(state.backup_dir.join(format!("{name}.sha256")))
-        else {
+        let sidecar_name = format!("{name}.sha256");
+        // The .sql goes up only when its sidecar is CONFIRMED remote (this
+        // pass uploaded it, or it was already listed): the live backup
+        // path gates the same way, and a transient sidecar failure must
+        // not strand a checksum-less object the restore side would replay
+        // unverified.
+        if !remote.contains(&cfg.object_key(&sidecar_name))
+            && !landed_sidecars.contains(&sidecar_name)
+        {
+            continue;
+        }
+        let Ok(sidecar) = std::fs::read_to_string(state.backup_dir.join(&sidecar_name)) else {
             continue; // pruned pair or legacy file: nothing to reconcile
         };
         let Some(hex) = sidecar.split_whitespace().next() else {

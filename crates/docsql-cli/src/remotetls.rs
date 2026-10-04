@@ -243,9 +243,10 @@ impl TlsLink {
         &self,
         tx: std::sync::mpsc::Sender<Frame>,
         on_push: impl Fn(&Frame) + Send + 'static,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let session = self.session.clone();
-        std::thread::spawn(move || tls_reader_loop(session, tx, on_push));
+        std::thread::spawn(move || tls_reader_loop(session, tx, on_push, in_flight));
     }
 }
 
@@ -253,6 +254,7 @@ fn tls_reader_loop(
     session: Arc<Mutex<Session>>,
     tx: std::sync::mpsc::Sender<Frame>,
     on_push: impl Fn(&Frame),
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let mut plain = Vec::with_capacity(16 * 1024);
     loop {
@@ -295,11 +297,29 @@ fn tls_reader_loop(
                     plain.drain(..n);
                     if f.frame_type == proto::RESP_PUSH {
                         on_push(&f);
+                    } else if f.frame_type == proto::RESP_PONG {
+                        // keepalive answer: nobody is waiting for it
+                    } else if f.frame_type == proto::RESP_ERROR
+                        && in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0
+                    {
+                        // server-originated notice (idle kick, KILL): print,
+                        // do not queue it for the next command to misread.
+                        eprintln!("{}", String::from_utf8_lossy(&f.payload));
                     } else if tx.send(f).is_err() {
                         return; // main side closed
                     }
                 }
-                Err(docsql_core::proto::ProtoError::Truncated(..)) => break,
+                Err(docsql_core::proto::ProtoError::Truncated(..)) => {
+                    // Declared-length precheck, same rule as the plaintext
+                    // reader: a hostile/derailed server could otherwise pump
+                    // bytes into `plain` far past the 64MB cap before the
+                    // outer loop ever re-examines the buffer size.
+                    if plain.len() > proto::HEADER_LEN + crate::RECV_CAP {
+                        eprintln!("error: server advertised an oversized frame");
+                        return;
+                    }
+                    break;
+                }
                 Err(e) => {
                     eprintln!("error: protocol error: {e}");
                     return;

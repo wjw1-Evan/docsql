@@ -314,7 +314,7 @@ fn config_from_env(
     }
     if arbiter && quorum {
         return Err(
-            "DOCSQL_ARBITER and DOCSQL_QUORUM are mutually exclusive: an arbiter              votes but never fences"
+            "DOCSQL_ARBITER and DOCSQL_QUORUM are mutually exclusive: an arbiter votes but never fences"
                 .to_string(),
         );
     }

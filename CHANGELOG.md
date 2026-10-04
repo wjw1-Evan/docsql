@@ -5,7 +5,107 @@
 
 ## [Unreleased]
 
-### 第四轮全模块缺陷审查修复(2026-10-04)
+### 第五轮全模块缺陷审查修复(2026-10-04)
+
+对全部模块再做一轮系统审查(16 路并行→逐条源码核实→修复+回归落各模块内;Rust 1075/.NET 197/Python 59/部署测试绿):
+
+- **查询内核(探针超集红线)**:无下界范围探针(`col < k`)与复合索引部分前缀
+  (`WHERE 首列 = ?` 用 (a,b) 索引)丢弃键列为 NULL/未覆盖列为 NULL 的行——引擎全序
+  语义下 `NULL < k` 为真、树却无 NULL 键,结果随索引存在性分叉(UPDATE/DELETE 快路径
+  同错;现无下界+可空列、部分前缀+未覆盖可空列一律回退全扫);JSON 路径索引范围探针
+  无下界同样丢提取为 NULL 的行(路径缺失/坏 JSON);哈希 join 等值桶把 Timestamp 与
+  可解析时间戳字符串拆进不同桶(ON 提升后判等的命中对被 INNER 丢行/LEFT 假未命中;
+  现可解析字符串按键入同一桶);递归 CTE 的 UNION 去重不覆盖 anchor 臂自身重复行
+  (`WITH c AS (SELECT … UNION …)` 重复种子泄漏);标量子查询多行结果静默取第一行
+  (顺序依赖的貌似合理错答案,现报 "returned more than one row");NOT(x cmp ANY/ALL …)
+  三值语义:旧的 COALESCE→FALSE 折叠在 NOT 下放行 UNKNOWN 行(Timestamp↔不可解析串
+  元素;现 CASE 形状给出精确真值表);EXPLAIN 对执行器必拒的表因子(TABLESAMPLE/
+  索引提示/别名列清单)打印正常计划(镜像契约破坏,现同拒)。
+- **写路径**:INSERT..SELECT 源含 RAND()/NEWID() 且恰好零行时按原文进 journal——对端
+  重放自掷随机、集群静默分叉(现回写确定性空语句);`INSERT OR REPLACE … ON CONFLICT
+  DO NOTHING` 先位移删旧行再跳过新行=静默净删除(现拒该组合);OR REPLACE 位移行的
+  自引用外键检查看语句前数据,同语句腾空父键+新像引用被误拒(现传终态);upsert-UPDATE
+  抬高自增列(`SET id = 更大值`)不失效 autoinc 缓存,后续自增 INSERT 撞已占 id 且
+  永久卡死(现与 UPDATE 快路径同规则失效缓存)。
+- **DDL/授权**:DROP INDEX 不回收单列 JSON 路径索引树(残留树被当同名列的标量树,
+  同名查询静默丢行+同名索引永久不可重建);读目标 walker 对「CTE 与基表同名」把自名
+  遮蔽进 body——授权/行过滤/视图依赖整体漏看该表(fail-closed 缺口,现同名即按基表
+  读计);**写路径读源的列级授权绕过**:`GRANT SELECT (a,b)` 的列限制只在纯 SELECT
+  生效,`INSERT..SELECT`/UPDATE 子查询只查表级(受限列可复制进自己的表再读回;现按
+  单表投影列归因,不可归因形状拒绝);复合 ALTER 中重写型操作之后的元数据操作被
+  静默丢弃(`ADD COLUMN b DEFAULT, ADD COLUMN c` 的 c 落库消失;现尾保存统一);
+  CTAS 显式列清单被静漠丢弃(现显式报错);validate_alter 的模拟索引根不随 RENAME
+  COLUMN 演化(合法换名组合被假拒绝);目录加载接受空列清单的 index_def(下次
+  catalog() 越界 panic,现回退单列)。
+- **存储层**:显式事务 ROLLBACK 不触发 WAL 上界检查——纯回滚工作负载(BEGIN/INSERT/
+  ROLLBACK 循环)的 WAL 与 pending_writes 双无界(现 ROLLBACK 尾 fence+sync,恢复
+  语义同时收紧);`Pager::write_page` 接受页 0(文件头)——纵深防御缺口,与读取端/
+  恢复端的 0 号拒绝对称(现响亮拒绝);堆溢出链插入从 free list 弹出的页不做自表页
+  检查、主页二次装载跳过校验(目录腐蚀可 panic,现双校验)。
+- **T-SQL**:CATCH 块内的 BREAK/CONTINUE 被吞(WHILE 无法从 CATCH 跳出,失控循环
+  写满语句预算);`@end`/`@case` 等变量名的字母尾巴被批扫描器当裸关键字截断块
+  (四个扫描器统一词首守卫);GETDATE 族读路径逐行取时钟(现读路径同 RAND 语句级
+  定值折叠);DATEDIFF(weekday) 按周日界计数(T-SQL 文档语义=按日界);CHARINDEX
+  第三参 NULL 应传播 NULL、非正应从头搜;RAISERROR 的 printf 替换参数(%s/%d)被
+  丢弃;CONVERT 数字 style 不接受带时间分量的输入;FROMPARTS 族多参静默忽略/负
+  fractions 静默回拨时钟(现精确 arity+显式拒绝);`WITH … INSERT` 嗅探不识别
+  (引擎暂拒该形态时 @@IDENTITY 静默 NULL,嗅探已备好);balanced_close/statement_end
+  扫描器不跳引号/方括号标识符(标识符内 `)`/`;` 截断跨度)。
+- **用户/安全**:`redact_sql` 不跳双引号/反引号标识符——`CREATE USER "o'brien"
+  PASSWORD '…'` 的引号内撇号使字面量扫描 desync,明文口令完整进审计日志;无
+  PASSWORD 关键字的畸形用户语句原文进日志(现 CREATE/ALTER USER 形态兜底打码全部
+  字面量);useradmin 解析错误消息 Debug 打印 token 内容(口令字面量经错误通道进
+  日志,现只报 token 类别);REVOKE 表名大小写不一致时删零行仍报成功(授权悬挂,
+  现忽略大小写匹配、按存储原形删除);非 admin 的 MERGE 被当 DDL 拒绝(现按语句
+  实际携带的 INSERT/UPDATE/DELETE 臂要求对应表特权)。
+- **服务器**:REQ_META 只读普查持独占写锁(大库上全引擎停摆,现读级+execute_read);
+  响应帧超 64MiB 编码失败被静默丢帧(客户端挂等到空闲超时,现回错误帧并断连);
+  REQ_EXECUTE 跳过 docsql_pubsub 视图重写(prepared 通道报「表不存在」);status 载荷
+  在读锁内做文件 stat(慢挂载拖住写者);journal_range 追加字节预算(512 条 × 16MiB
+  文档的 catch-up 批次可 GB 级瞬时分配);repair 阶段二选举用追赶前陈旧摘要(现优先
+  追赶后视图);quorum 降级选举不选最高 epoch(HashMap 任意序可各节点指向不同胜者
+  且不自愈);手动 PROMOTE 不清 auto_promote_frozen(降级冻结节点永不恢复自动故障
+  转移);bind_params 不跳 `[方括号]` 标识符(括号内 `?` 被当占位符)。
+- **备份/S3**:`DOCSQL_BACKUP_S3_PREFIX` 未设置时 `owned_keys` 把全部对象判为非本节点
+  ——灾备拉取/远端保留/对账整体失效(桶根布局现正确归属);reconcile 第二趟上传 .sql
+  不确认 sidecar 已落远端(瞬态失败可产生无校验和对象,恢复侧未校验重放);pubsub
+  视图重写不跳注释(注释内撇号吞掉其后文本,视图查询报「表不存在」)。
+- **Web 控制台**:/api/sessions 不入请求计数白名单;token 熔断 429 绕过请求计数
+  (安全事件在 /metrics 不可见);凭据文件带外落盘后首个访客 setup 仍可覆盖
+  (install 前复查磁盘);boot 探测失败被当「无账号门」,此后 401 永不弹登录遮罩;
+  五个 5s 轮询页无请求序号守卫(慢响应旧渲染覆盖新数据)。
+- **CLI**:交互会话中被拒的 pubsub 命令/失败的 `auth <token>;` 杀掉整个 shell 或吞掉
+  失败(现拒收=语句失败、仅传输错误退出,auth 失败计入退出码);空闲交互会话不发
+  PING 保活(DOCSQL_IDLE_TIMEOUT 下静默被踢+订阅断流);服务端主动下发的错误帧
+  (idle 踢/KILL)滞留队列被下条命令误领(现无在途请求即打印丢弃);`--csv/--json`
+  流混入人类可读确认行(affected/订阅确认/`ok`/PRINT,现走 stderr);密码提示期间
+  Ctrl-C 使终端永久残留回显关闭(SIGINT 处理器恢复 ECHO);管道下游早退触发
+  broken-pipe panic 101(恢复 SIGPIPE 默认);CSV 防护误伤 `-1e5` 科学记法文本;
+  TLS 读路径缺声明帧长预检。
+- **.NET**:连接级 API(Publish/Promote/PubsubTrim/Prepare)继承上一条命令的
+  CommandTimeout 预算(PUBLISH 走 WAL fsync,慢盘误判超时并毒化连接;显式默认预算);
+  GetOrPrepareAsync 异步路径读属性预算(欠/过预算两方向);OpenAsync 取消时排干整个
+  空闲连接池(OCE 被当死连接,现未错位的归还);WriteAsync 无取消令牌(大载荷写往
+  停读对端无限挂起);ExecuteReader 忽略 CommandBehavior.CloseConnection(依赖它的
+  调用方泄漏池名额);EF CanConnectAsync 同步建连(健康检查阻塞线程池线程);保数据
+  重建回放引擎生成的未引号索引 DDL(保留字表/列名重建失败丢用户索引,引擎侧
+  sqlite_master DDL 统一引号收口)。
+- **Python**:execute() 对意外回复帧类型静默当成功(流错位继续用,现 InterfaceError
+  判死);订阅控制超时毒化「重连后的新」连接(一次额外退避轮);空订阅集断线后读线程
+  永久退出、后续 subscribe() 永远失败(现检测死连接重建+重启读线程);畸形 JSON 载荷
+  以裸 ValueError/KeyError 逃逸(绕过 `except Error`,三处映射);autocommit=False 的
+  注定失败调用先发 BEGIN(空挂事务占住单写者引擎,现先校验后开启)。
+- **部署**:run-tests.sh 未中性化 TLS 四件(deploy/.env 为 prod 启用的 TLS 泄漏进测试
+  栈,节点拿不存在的证书路径启动即退、测试死在端口等待);web 控制台的节点切换白名单
+  不含 join 节点 node-d(join 后第四节点无法管理)。
+- **评估后不改**:rust_decimal 的 `Decimal::deserialize` 自带 scale>28 归一化(损坏
+  字节造出越界 scale 的路径不可达,审查报告基于掩码误读);RENAME/DROP COLUMN 后
+  列级授权的 cols 悬挂(纯 deny 方向、组合罕见,RENAME TABLE 的同名回写仍在);T-SQL
+  数学函数族对非数值字符串宽容返回 NULL(T-SQL 本体报 8114;全族一致宽容,翻语义
+  面大且现行为自洽);gate 窗口 pubsub id 仅节点内一致的注释已按实态修正(id 非集群
+  全局,跨节点重订阅不保证,文档已明示)。
+
+
 
 对全部模块再做一轮系统审查(15 路并行→逐条源码核实→修复+回归落各模块内;Rust 1046/.NET 197/Python 59 绿):
 
