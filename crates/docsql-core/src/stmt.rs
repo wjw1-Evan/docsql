@@ -148,6 +148,25 @@ fn find_nondet_calls(sql: &str, rand_only: bool) -> Vec<std::ops::Range<usize>> 
                     i += 1;
                 }
             }
+            b'[' => {
+                // T-SQL bracket identifier: opaque to the scan (`]]` is
+                // the escaped `]`), same as the quoted runs above — the
+                // fourth scanner shares one transparency rule. Without
+                // this arm a column literally named [rand()] looked like
+                // a RAND call and the fold rewrote the IDENTIFIER text.
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b']' {
+                        if b.get(i + 1) == Some(&b']') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {

@@ -181,3 +181,98 @@ public sealed class ProtocolBreakTests
         }
     }
 }
+
+// 第六轮审查缺陷回归:客户端层。
+// 1) Output/ReturnValue 参数被静默当 INPUT 绑定(null 进语句,读回 null);
+// 2) Transaction 与连接不绑定:错配事务下语句照 autocommit 执行;
+// 3) RewriteParameters 不跳 [方括号] 标识符:与服务端占位符扫描器分叉,
+//    [user@domain] 内的 @ 名字命中参数时把标识符改写成 [?];
+// 4) ExecuteReaderAsync 丢弃 CommandBehavior.CloseConnection(池名额泄漏)。
+public sealed class Review6BindingAndScannerTests : IClassFixture<ServerFixture>
+{
+    private readonly ServerFixture _fx;
+    public Review6BindingAndScannerTests(ServerFixture fx) => _fx = fx;
+
+    private DocsqlConnection Open()
+    {
+        var conn = new DocsqlConnection($"host=127.0.0.1;port={_fx.Port}");
+        conn.Open();
+        return conn;
+    }
+
+    [Fact]
+    public void Non_input_parameter_direction_is_rejected_loudly()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT @p";
+        var p = cmd.CreateParameter();
+        p.ParameterName = "@p";
+        p.Value = 1;
+        p.Direction = System.Data.ParameterDirection.Output;
+        cmd.Parameters.Add(p);
+        Assert.Throws<NotSupportedException>(() => cmd.ExecuteScalar());
+        Assert.ThrowsAsync<NotSupportedException>(() => cmd.ExecuteScalarAsync()).Wait();
+        Assert.Throws<NotSupportedException>(() => cmd.Prepare());
+    }
+
+    [Fact]
+    public async Task Transaction_from_another_connection_is_rejected()
+    {
+        var a = Open();
+        var b = Open();
+        using (a)
+        using (b)
+        {
+            using var tx = a.BeginTransaction();
+            using var cmd = b.CreateCommand();
+            cmd.CommandText = "SELECT 1";
+            cmd.Transaction = tx;
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => cmd.ExecuteScalarAsync());
+        }
+    }
+
+    [Fact]
+    public async Task Bracketed_identifier_containing_at_name_is_not_rewritten()
+    {
+        using var conn = Open();
+        await using var cmd = conn.CreateCommand();
+        // [user@domain] 是标识符:p 名恰与其中的 @user 段同名时,占位符
+        // 改写不得把标识符内部替换成 ?(改写后语句必然解析失败)。
+        cmd.CommandText = "SELECT [user@domain]";
+        var p = cmd.CreateParameter();
+        p.ParameterName = "@user";
+        p.Value = 5;
+        cmd.Parameters.Add(p);
+        // schemaless 未知列读 NULL:语句必须原样可执行且返回一行
+        // (基类 ExecuteScalar 对数据库 NULL 给 DBNull)。
+        var v = await cmd.ExecuteScalarAsync();
+        Assert.True(v is null or DBNull, $"expected NULL, got {v?.GetType().Name}");
+    }
+
+    [Fact]
+    public async Task Async_reader_with_close_connection_returns_the_slot()
+    {
+        var conn = Open();
+        var before = DocsqlConnectionPoolInspector.IdleCount("127.0.0.1", _fx.Port);
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1";
+        var reader = await cmd.ExecuteReaderAsync(
+            System.Data.CommandBehavior.CloseConnection);
+        await reader.DisposeAsync();
+        // 连接被 reader 关闭并归池:空闲数必须回到之前的水平(曾每次
+        // 泄漏一个名额,直到池耗尽)。
+        var after = DocsqlConnectionPoolInspector.IdleCount("127.0.0.1", _fx.Port);
+        // 借出中的连接被 reader 关闭后归还:空闲数应 +1(曾经不变 =
+        // 名额泄漏)。
+        Assert.Equal(before + 1, after);
+    }
+}
+
+/// 池空闲计数的测试观测口(只读统计,不参与协议)。
+public static class DocsqlConnectionPoolInspector
+{
+    public static int IdleCount(string host, int port) =>
+        ConnectionPool.DebugIdleCount(host, port);
+}

@@ -339,6 +339,25 @@ fn config_from_env(
                 .to_string(),
         );
     }
+    // The lost-primary trigger only probes addresses present in the voting
+    // member set: a primary missing from DOCSQL_QUORUM_MEMBERS (or spelled
+    // differently than DOCSQL_REPLICATE_TO) made the promotion a silent
+    // no-op discovered exactly at failure time.
+    if auto_promote {
+        let primary = replicate_to.as_deref().unwrap_or("").trim().to_string();
+        let known = |addr: &str| -> bool {
+            peers.iter().any(|p| p == addr)
+                || quorum_members.iter().any(|m| m == addr)
+                || quorum_arbiters.iter().any(|a| a == addr)
+        };
+        if !primary.is_empty() && !known(&primary) {
+            return Err(format!(
+                "DOCSQL_AUTO_PROMOTE: primary {primary} is not in DOCSQL_PEERS / \
+                 DOCSQL_QUORUM_MEMBERS / DOCSQL_QUORUM_ARBITERS — the lost-primary \
+                 trigger would never fire (add it to the member set)"
+            ));
+        }
+    }
     let transport_key = match getenv("DOCSQL_KEY") {
         Some(k) if !k.trim().is_empty() => {
             let key =

@@ -126,6 +126,11 @@ pub struct BackupShared {
     pub running: bool,
     pub last: Option<BackupStatus>,
     pub restore: Option<RestoreStatus>,
+    /// Monotonic id of the current/last restore: a same-file retry must
+    /// not be confused with the previous run by the drop guard (the file
+    /// name alone collided in the window between the old run's internal
+    /// completion and its guard's drop, clearing the NEW run's flag).
+    pub restore_generation: u64,
     pub remote_last: Option<RemoteUpload>,
 }
 
@@ -153,12 +158,17 @@ impl Drop for RunningFlagGuard<'_> {
     }
 }
 
-/// Same as [`RunningFlagGuard`] for the restore flag, matching the file so
-/// a stale guard never touches a newer restore's status.
-struct RestoreFlagGuard(Arc<ServerState>, String);
+/// Same as [`RunningFlagGuard`] for the restore flag, matching the file
+/// AND the restore generation so a stale guard never touches a newer
+/// restore's status (an immediate same-file retry armed while the old
+/// run's guard was still dropping).
+struct RestoreFlagGuard(Arc<ServerState>, String, u64);
 impl Drop for RestoreFlagGuard {
     fn drop(&mut self) {
         let mut b = self.0.backup.lock().unwrap_or_else(|p| p.into_inner());
+        if b.restore_generation != self.2 {
+            return;
+        }
         if let Some(r) = b.restore.as_mut() {
             if r.file == self.1 && r.running {
                 r.running = false;
@@ -268,12 +278,20 @@ async fn backup_inner(state: &Arc<ServerState>) -> Result<String, String> {
     let digest = docsql_core::kdf::sha256_parts(&[header.as_bytes(), body.as_bytes()]);
     let sidecar = state.backup_dir.join(format!("{name}.sha256"));
     let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
-    write_private(
+    if let Err(e) = write_private(
         &tmp,
         format!("{}  {}\n", docsql_core::kdf::hex(&digest), name).as_bytes(),
     )
-    .map_err(|e| format!("backup checksum write: {e}"))?;
-    rename_synced(&tmp, &sidecar).map_err(|e| format!("backup checksum rename: {e}"))?;
+    .and_then(|()| rename_synced(&tmp, &sidecar))
+    {
+        // A body left without its sidecar is a "new but unverifiable"
+        // backup: restore tolerates missing sidecars as legacy files and
+        // would replay it unverified. Remove the body (and any .tmp) —
+        // the failed status names it, and the next tick retries whole.
+        let _ = std::fs::remove_file(state.backup_dir.join(&name));
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("backup checksum: {e} ({name})"));
+    }
     prune_backups(&state.backup_dir, state.backup_keep);
     // Remote copy: the local pair is durable — push both objects to the
     // bucket and mirror retention. Failures are recorded (metric, sync
@@ -678,6 +696,15 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
         if !state.sync_queue.lock().await.closed {
             continue; // startup sync still in flight; snapshot the settled state
         }
+        // A fenced node must not mint new snapshots (design 004): its
+        // state is a minority view, and the S3 copy would become the
+        // "newest" remote backup — a DR restore from it silently rolls
+        // the majority's partition-period writes back. The manual
+        // trigger/export paths check the same denial.
+        if let Some(denial) = crate::quorum_write_denial(&state) {
+            eprintln!("backup tick skipped: {denial}");
+            continue;
+        }
         if try_begin_backup(&state) {
             if let Err(e) = finish_backup(&state).await {
                 eprintln!("backup failed: {e}");
@@ -795,7 +822,11 @@ fn parse_pitr_entry(line: &str) -> Option<(u64, i64, String)> {
 /// continuity against the base (and for overlaps between files): a trimmed
 /// journal window or a pruned incremental segment must fail the restore
 /// loudly — replaying a partial chain would silently drop committed writes.
-fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec<String>, String> {
+fn collect_pitr_entries(
+    dir: &Path,
+    base_seq: u64,
+    target_ms: i64,
+) -> Result<(Vec<String>, u64), String> {
     let mut entries: Vec<(u64, i64, String)> = Vec::new();
     // Highest journal seq any on-disk incremental segment claims to cover
     // beyond the base: the chain must reach it, or the tail (possibly the
@@ -872,7 +903,12 @@ fn collect_pitr_entries(dir: &Path, base_seq: u64, target_ms: i64) -> Result<Vec
             expected - 1
         ));
     }
-    Ok(out)
+    // The highest seq the chain actually carried (base_seq when nothing
+    // qualified): the caller audits the live journal against it — writes
+    // committed after the last export tick are not in ANY segment yet, and
+    // replaying the chain without them silently truncates the restore.
+    let chain_last = expected - 1;
+    Ok((out, chain_last))
 }
 
 /// Sentinel the snapshot-adopt path writes over voided journal text: never
@@ -980,13 +1016,20 @@ async fn export_incremental(state: &Arc<ServerState>) -> Result<(), String> {
     }
     let digest = docsql_core::kdf::sha256(&bytes);
     let tmp = state.backup_dir.join(format!("{name}.sha256.tmp"));
-    write_private(
+    let sidecar = state.backup_dir.join(format!("{name}.sha256"));
+    if let Err(e) = write_private(
         &tmp,
         format!("{}  {}\n", docsql_core::kdf::hex(&digest), name).as_bytes(),
     )
-    .map_err(|e| format!("incr checksum write: {e}"))?;
-    let sidecar = state.backup_dir.join(format!("{name}.sha256"));
-    rename_synced(&tmp, &sidecar).map_err(|e| format!("incr checksum rename: {e}"))?;
+    .and_then(|()| rename_synced(&tmp, &sidecar))
+    {
+        // Same rule as the full-backup path: a segment body without its
+        // sidecar is an unverifiable chain link restore would replay
+        // unverified — remove it and let the next tick re-export.
+        let _ = std::fs::remove_file(state.backup_dir.join(&name));
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("incr checksum: {e} ({name})"));
+    }
     prune_incr(&state.backup_dir, state.backup_keep.max(4));
     // Remote copy rides along with the local write: a disaster-recovery
     // restore to a point in time needs the base AND the whole incremental
@@ -1031,6 +1074,36 @@ fn read_incr_files(dir: &Path) -> Vec<String> {
 /// (sidecars included); PITR restarts from the next full backup. Best
 /// effort by nature (files are not transactional), but it runs before the
 /// adoption is reported Applied.
+/// Remote-side half of [`invalidate_incremental_exports`]: a snapshot
+/// adoption that voids the LOCAL incremental chain must also drop the S3
+/// copies — a disaster-recovery pull otherwise re-fetches the voided
+/// segments, and the lexicographic dedup in `collect_pitr_entries` prefers
+/// the older REAL text over the post-adoption sentinel, resurrecting the
+/// writes the majority discarded.
+pub(crate) async fn invalidate_incremental_exports_remote(state: &Arc<ServerState>) {
+    let Some(s3) = state.backup_s3.as_ref() else {
+        return;
+    };
+    let cfg = s3.config();
+    let Ok(keys) = s3.list(&cfg.prefix).await else {
+        eprintln!(
+            "sync: listing remote incrementals for invalidation failed \
+             (the next adoption retries)"
+        );
+        return;
+    };
+    for key in owned_keys(&keys, &cfg.prefix) {
+        let Some(name) = key_file_name(&key) else {
+            continue;
+        };
+        if name.starts_with("incr-") && (name.ends_with(".sql") || name.ends_with(".sha256")) {
+            if let Err(e) = s3.delete(&key).await {
+                eprintln!("sync: remote incremental delete {key} failed: {e}");
+            }
+        }
+    }
+}
+
 pub(crate) fn invalidate_incremental_exports(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1343,6 +1416,7 @@ pub(crate) async fn handle_backup(
                         crate::err_payload("backup/restore already in progress"),
                     );
                 }
+                b.restore_generation += 1;
                 b.restore = Some(RestoreStatus::started(&file));
             }
             use std::sync::atomic::Ordering;
@@ -1350,8 +1424,13 @@ pub(crate) async fn handle_backup(
             state.restore_progress.total.store(0, Ordering::Relaxed);
             let st = state.clone();
             let file_clone = file.clone();
+            let generation = state
+                .backup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .restore_generation;
             tokio::spawn(async move {
-                if let Err(e) = run_restore(&st, &file_clone, target_ms).await {
+                if let Err(e) = run_restore(&st, &file_clone, target_ms, generation).await {
                     eprintln!("restore of {file_clone} failed: {e}");
                 }
             });
@@ -1402,9 +1481,11 @@ async fn run_restore(
     state: &Arc<ServerState>,
     file: &str,
     target_ms: Option<i64>,
+    generation: u64,
 ) -> Result<usize, String> {
-    let _running = RestoreFlagGuard(state.clone(), file.to_string());
-    let res = restore_inner(state, file, target_ms).await;
+    let _running = RestoreFlagGuard(state.clone(), file.to_string(), generation);
+    let mut audit_note = None;
+    let res = restore_inner(state, file, target_ms, &mut audit_note).await;
     // Convergence pass on success: the replay fanned out every statement,
     // but peers offline (or mid-fan-out-failure) during the restore missed
     // statements. Used to be "wait for their next restart repair" — now
@@ -1487,6 +1568,12 @@ async fn run_restore(
             });
         }
     }
+    // The chain-tail audit rides along even (especially) on success.
+    match (&audit_note, &mut note) {
+        (Some(a), None) => note = Some(a.clone()),
+        (Some(a), Some(n)) => *n = format!("{n}; {a}"),
+        _ => {}
+    }
     let applied = {
         let applied = match &res {
             Ok(n) => *n,
@@ -1498,13 +1585,16 @@ async fn run_restore(
                 .load(std::sync::atomic::Ordering::Relaxed),
         };
         let mut b = state.backup.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(r) = b.restore.as_mut() {
-            if r.file == file {
-                r.running = false;
-                r.ok = res.is_ok();
-                r.error = res.as_ref().err().cloned();
-                r.converged = converged;
-                r.note = note.clone();
+        let same_run = b.restore_generation == generation;
+        if same_run {
+            if let Some(r) = b.restore.as_mut() {
+                if r.file == file {
+                    r.running = false;
+                    r.ok = res.is_ok();
+                    r.error = res.as_ref().err().cloned();
+                    r.converged = converged;
+                    r.note = note.clone();
+                }
             }
         }
         applied
@@ -1615,6 +1705,7 @@ async fn restore_inner(
     state: &Arc<ServerState>,
     file: &str,
     target_ms: Option<i64>,
+    audit_note: &mut Option<String>,
 ) -> Result<usize, String> {
     // Disaster recovery first: pull base (+ incremental chain, for a
     // point-in-time target) back from the remote copy when the local copy
@@ -1648,7 +1739,45 @@ async fn restore_inner(
                     target, head.ts_ms
                 ));
             }
-            collect_pitr_entries(&state.backup_dir, head.journal_seq, target)?
+            let (stmts, chain_last_seq) =
+                collect_pitr_entries(&state.backup_dir, head.journal_seq, target)?;
+            // Tail audit against the LIVE journal: the incremental chain
+            // ends at the last export tick — any write committed at or
+            // before the target but AFTER that export is in no segment,
+            // and replaying the chain without it silently truncates the
+            // restore while reporting ok (up to one backup interval of
+            // writes, by default a full day). Refuse loudly; the operator
+            // re-runs after the next export tick or takes a fresh full
+            // backup. (A DR restore on a node whose journal is empty
+            // cannot see the gap — the convergence pass remains the net.)
+            {
+                // Tail audit against the LIVE journal: the chain ends at
+                // the last export tick, and writes committed at or before
+                // the target but after that export are in no segment — the
+                // restore replays without them and reports ok. Surface the
+                // count in the status note (a loud eprintln too): a hard
+                // refusal misfires when this volume already ran a plain
+                // restore — its replay re-journals the base itself, and
+                // those entries are exactly the "missing" ones.
+                let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
+                if let Ok(pending) = db.journal_entries_after(chain_last_seq, 1000) {
+                    let unexported = pending
+                        .iter()
+                        .filter(|(_, ts, _)| ts.is_some_and(|t| t <= target))
+                        .count();
+                    if unexported > 0 {
+                        let msg = format!(
+                            "{unexported} journal write(s) at or before the target are not \
+                             in the incremental chain (they postdate the last export); \
+                             the restore stops at the chain tail — verify, then re-run \
+                             after the next export or a fresh full backup"
+                        );
+                        eprintln!("restore: {msg}");
+                        *audit_note = Some(msg);
+                    }
+                }
+            }
+            stmts
         }
         None => Vec::new(),
     };
@@ -2091,14 +2220,17 @@ mod tests {
         )
         .unwrap();
         // base_seq=2: everything after the base replays, ts<=400 keeps B1.
-        let out = collect_pitr_entries(dir.path(), 2, 400).unwrap();
+        let (out, chain_last) = collect_pitr_entries(dir.path(), 2, 400).unwrap();
+        // 链尾 = 链实际携带的最大 seq(ts 过滤只影响重放哪些,不影响
+        // 链覆盖到哪里;restore 侧据此对账活期刊)。
+        assert_eq!(chain_last, 5);
         assert_eq!(out, vec!["B1"], "ts 过滤");
         // base_seq=3: seq 3 is INSIDE the base dump — replaying it would
         // duplicate the write (or trip a PK); the per-entry filter drops it.
-        let out = collect_pitr_entries(dir.path(), 3, i64::MAX).unwrap();
+        let (out, _) = collect_pitr_entries(dir.path(), 3, i64::MAX).unwrap();
         assert_eq!(out, vec!["B2", "B3"], "seq<=base 不重放");
         // base_seq=0: the whole chain replays.
-        let out = collect_pitr_entries(dir.path(), 0, i64::MAX).unwrap();
+        let (out, _) = collect_pitr_entries(dir.path(), 0, i64::MAX).unwrap();
         assert_eq!(out, vec!["A1", "A2", "B1", "B2", "B3"]);
         // Checksum verification is honored for incremental files too.
         std::fs::write(
@@ -2135,7 +2267,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let out = collect_pitr_entries(dir2.path(), 2, i64::MAX).unwrap();
+        let (out, _) = collect_pitr_entries(dir2.path(), 2, i64::MAX).unwrap();
         assert_eq!(out, vec!["C2", "C3"], "哨兵占位不重放");
         // A body that stops short of its header's `to` is a truncated
         // segment: the restore must refuse instead of silently stopping at
@@ -2164,7 +2296,7 @@ mod tests {
             "-- docsql-pitr incr from=2 to=3\n{\"seq\":2,\"ts\":200,\"sql\":\"D2\"}\n{\"seq\":3,\"ts\":300,\"sql\":\"D3\"}\n",
         )
         .unwrap();
-        let out = collect_pitr_entries(dir3.path(), 0, i64::MAX).unwrap();
+        let (out, _) = collect_pitr_entries(dir3.path(), 0, i64::MAX).unwrap();
         assert_eq!(out, vec!["D1", "D2", "D3"], "重叠导出去重");
     }
 }

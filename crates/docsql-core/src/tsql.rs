@@ -460,10 +460,19 @@ fn read_shim_ident(sql: &str, i: &mut usize) -> Option<String> {
         return Some(sql[start + 1..*i - 1].replace("\"\"", "\""));
     }
     if b[*i] == b'[' {
-        // T-SQL scripts routinely bracket the name (`USE [master]`).
+        // T-SQL scripts routinely bracket the name (`USE [master]`); `]]`
+        // is the escaped `]` — stopping at the first one left the
+        // `.replace("]]", "]")` below dead and truncated the name.
         let start = *i;
         *i += 1;
-        while *i < b.len() && b[*i] != b']' {
+        while *i < b.len() {
+            if b[*i] == b']' {
+                if b.get(*i + 1) == Some(&b']') {
+                    *i += 2;
+                    continue;
+                }
+                break;
+            }
             *i += 1;
         }
         if *i >= b.len() {
@@ -663,6 +672,46 @@ fn split_parse_args(inner: &str) -> Option<(&str, &str, Option<&str>)> {
                 i = end;
                 continue;
             }
+            // Quoted/bracketed identifiers are opaque: `"x AS y"` is ONE
+            // name, and a bracketed `[as]` must not mark the type
+            // separator (`]]` is the escaped `]`).
+            b'"' | b'`' => {
+                let quote = b[i];
+                if let Some(ws) = word_start.take() {
+                    check_word(ws, i, depth);
+                }
+                i += 1;
+                while i < b.len() {
+                    if b[i] == quote {
+                        if b.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'[' => {
+                if let Some(ws) = word_start.take() {
+                    check_word(ws, i, depth);
+                }
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b']' {
+                        if b.get(i + 1) == Some(&b']') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
             b'(' => {
                 if let Some(ws) = word_start.take() {
                     check_word(ws, i, depth);
@@ -804,8 +853,18 @@ fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
                 continue;
             }
             b'[' => {
+                // `]]` is the escaped `]` inside a bracketed identifier —
+                // stopping at the FIRST `]` mis-splits `[a]],b]` at its
+                // interior comma (same opacity rule as balanced_close).
                 i += 1;
-                while i < b.len() && b[i] != b']' {
+                while i < b.len() {
+                    if b[i] == b']' {
+                        if b.get(i + 1) == Some(&b']') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
                     i += 1;
                 }
                 i += 1;
@@ -1894,6 +1953,7 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
                 Value::Bool(true) => a.clone(),
                 // T-SQL treats a NULL condition as false…
                 Value::Null => b.clone(),
+                Value::Bool(false) => b.clone(),
                 // …but a non-boolean condition is a type error, not a
                 // silent else-branch.
                 other => {
@@ -4404,6 +4464,32 @@ mod tests {
         // LIKE-class style brackets in a bare ident position pass through
         // the fast path untouched when nothing else triggers a rewrite.
         assert_eq!(preprocess("SELECT 1"), "SELECT 1");
+        // 第六轮审查回归:方括号标识符的 ]] 转义——USE [a]]b] 解析出名
+        // "a]b"(此前停在第一个 ],被当非语句尾原文保留)。
+        assert_eq!(preprocess("USE [a]]b]"), "PRAGMA tsql_use = 'a]b'");
+        // CONVERT 参数切分对 [a]],b] 类方括号标识符不透明。
+        assert_eq!(
+            preprocess("SELECT CONVERT(INT, [a]],b])"),
+            "SELECT __TSQL_CONVERT__('INT', \"a],b\")"
+        );
+    }
+
+    /// 第六轮审查回归:IIF 条件为 false 曾落进"非布尔"报错臂(第五轮补
+    /// Null 臂时丢了 Bool(false)),任何假条件查询整语句必挂。
+    #[test]
+    fn iif_false_condition_takes_the_else_branch() {
+        let f = |c: Value| {
+            scalar("IIF", &[c, v_str("a"), v_str("b")])
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(f(Value::Bool(false)), v_str("b"));
+        assert_eq!(f(Value::Bool(true)), v_str("a"));
+        assert_eq!(f(Value::Null), v_str("b"));
+        // 非布尔条件仍然响亮报错。
+        assert!(scalar("IIF", &[Value::Int(1), v_str("a"), v_str("b")])
+            .unwrap()
+            .is_err());
     }
 
     /// Second edge sweep: date-part arithmetic corners, FORMAT token runs,

@@ -143,7 +143,9 @@ echo "== 8. persistent pub/sub across nodes =="
 # 8.1 实时投递:node-a 后台订阅(输出落宿主临时文件),node-b 发布。
 ch="ops-$(date +%s)"
 tmp=$(mktemp)
-( printf "subscribe %s latest;\n" "$ch"; sleep 4; printf "exit;\n" ) \
+# 订阅存活窗口与 single-test 对齐(5s):docker exec 冷启动 >1s 时,
+# 4s 窗口会在发布抵达前掉线(publish receivers=0 假红)。
+( printf "subscribe %s latest;\n" "$ch"; sleep 5; printf "exit;\n" ) \
   | docker exec -i docsql-a docsql-cli connect "$A" >"$tmp" 2>&1 &
 sub=$!
 # 轮询等订阅确认(docker exec 冷启动可能 >1s,固定 sleep 会抢跑)。

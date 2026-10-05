@@ -27,6 +27,7 @@ const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(3);
 
 /// One established TLS connection to a protocol endpoint.
+#[derive(Clone)]
 pub struct TlsLink {
     session: Arc<Mutex<Session>>,
 }
@@ -304,7 +305,13 @@ fn tls_reader_loop(
                     {
                         // server-originated notice (idle kick, KILL): print,
                         // do not queue it for the next command to misread.
-                        eprintln!("{}", String::from_utf8_lossy(&f.payload));
+                        // Same terminal-escape scrub the plain reader applies
+                        // (KILL echoes statement text; error text is peer
+                        // input like any payload).
+                        eprintln!(
+                            "{}",
+                            crate::sanitize_terminal(&String::from_utf8_lossy(&f.payload))
+                        );
                     } else if tx.send(f).is_err() {
                         return; // main side closed
                     }

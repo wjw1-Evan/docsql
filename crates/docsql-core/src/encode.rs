@@ -342,9 +342,79 @@ pub fn extract_field(buf: &[u8], field: &str) -> Result<Option<Value>, EncodeErr
     Ok(None)
 }
 
+/// [`extract_field`] plus the schemaless dotted-key fallback the generic
+/// path's `lookup_col` applies: a bare name resolves against the last dot
+/// segment of the keys, but only when EVERY top-level key contains a dot
+/// (joined rows / `{"a.x": 1}`-shaped docs). Without it the unindexed
+/// ORDER BY window keyed such rows as NULL while the generic sort keyed
+/// them by the suffixed field — the chosen window rows themselves could
+/// differ, not just tie order.
+pub fn extract_field_lookup(buf: &[u8], field: &str) -> Result<Option<Value>, EncodeError> {
+    // Pass 1: exact field (decode on hit, skip everything else).
+    if let Some(v) = extract_field(buf, field)? {
+        return Ok(Some(v));
+    }
+    // Pass 2: prove the all-dotted precondition, then take the FIRST key
+    // ending in ".<field>" (encoding preserves the BTreeMap's sorted
+    // order — same pick as lookup_col's `doc.iter().find`).
+    let mut d = Decoder::new(buf);
+    if d.u8()? != 7 {
+        return Ok(None);
+    }
+    let len = d.u32()? as usize;
+    let suffix = format!(".{field}");
+    for i in 0..len {
+        let key = d.string()?;
+        if !key.contains('.') {
+            return Ok(None);
+        }
+        if key.ends_with(&suffix) {
+            let v = d.value()?;
+            // Remaining entries still owe the all-dotted proof.
+            for _ in i + 1..len {
+                let k = d.string()?;
+                if !k.contains('.') {
+                    return Ok(None);
+                }
+                d.skip_value()?;
+            }
+            return Ok(Some(v));
+        }
+        d.skip_value()?;
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_field_lookup_mirrors_lookup_col_dotted_fallback() {
+        let doc = |pairs: &[(&str, Value)]| {
+            let mut o = std::collections::BTreeMap::new();
+            for (k, v) in pairs {
+                o.insert(k.to_string(), v.clone());
+            }
+            encode_to_vec(&Value::Object(o)).unwrap()
+        };
+        // All-dotted keys: bare name resolves via the ".x" suffix.
+        let b = doc(&[("a.x", Value::Int(3)), ("a.y", Value::Int(1))]);
+        assert_eq!(extract_field_lookup(&b, "x").unwrap(), Some(Value::Int(3)));
+        // Mixed keys (one without a dot): no fallback — NULL, like
+        // lookup_col refusing to leak single-table dotted columns.
+        let b = doc(&[("a.x", Value::Int(3)), ("plain", Value::Int(9))]);
+        assert_eq!(extract_field_lookup(&b, "x").unwrap(), None);
+        // Exact field wins over the suffix shape.
+        let b = doc(&[("x", Value::Int(7)), ("a.x", Value::Int(8))]);
+        assert_eq!(extract_field_lookup(&b, "x").unwrap(), Some(Value::Int(7)));
+        // No matching suffix.
+        let b = doc(&[("a.z", Value::Int(1))]);
+        assert_eq!(extract_field_lookup(&b, "x").unwrap(), None);
+        // Non-object root.
+        let b = encode_to_vec(&Value::Int(1)).unwrap();
+        assert_eq!(extract_field_lookup(&b, "x").unwrap(), None);
+    }
 
     fn roundtrip(v: Value) {
         let enc = encode_to_vec(&v).unwrap();

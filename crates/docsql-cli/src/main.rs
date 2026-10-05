@@ -204,6 +204,9 @@ fn main() {
         std::process::exit(2);
     });
     let format = args.format;
+    // Machine-readable streams stay pure: push lines (like every note) go
+    // to stderr once --csv/--json is chosen.
+    set_push_lines_stderr(matches!(format, Format::Csv | Format::Json));
     let script = args.script;
     match args.mode {
         CliMode::Remote { addr, token, user } => {
@@ -308,6 +311,30 @@ fn statements_ready(sql: &str) -> bool {
                         let mut j = k;
                         while j < b.len() && b[j].is_ascii_whitespace() {
                             j += 1;
+                        }
+                        // Comments between BEGIN and the transaction
+                        // keyword are transparent (`BEGIN /* lock */
+                        // TRANSACTION;`): skipping only whitespace made
+                        // j point at '/', no keyword matched, and the
+                        // shell swallowed the whole transaction into a
+                        // phantom block.
+                        loop {
+                            if b.get(j) == Some(&b'-') && b.get(j + 1) == Some(&b'-') {
+                                while j < b.len() && b[j] != b'\n' {
+                                    j += 1;
+                                }
+                            } else if b.get(j) == Some(&b'/') && b.get(j + 1) == Some(&b'*') {
+                                let mut k = j + 2;
+                                while k + 1 < b.len() && !(b[k] == b'*' && b[k + 1] == b'/') {
+                                    k += 1;
+                                }
+                                j = if k + 1 < b.len() { k + 2 } else { b.len() };
+                            } else {
+                                break;
+                            }
+                            while j < b.len() && b[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
                         }
                         // `BEGIN;` / `BEGIN WORK;` are the DOCUMENTED
                         // transaction spellings, not block openers: the
@@ -614,6 +641,10 @@ struct Remote {
     /// flight (idle-timeout kicks, KILL notifications) instead of queueing
     /// them for the NEXT command to misread as its own response.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Serializes plain-socket writes between the main thread and the
+    /// keepalive thread (TLS needs none: TlsLink::send holds the session
+    /// mutex for the whole frame).
+    plain_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// Transport half owned by the main thread: the plain TCP stream, or the
@@ -697,6 +728,7 @@ impl Remote {
             writer,
             queue: rx,
             in_flight,
+            plain_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -706,23 +738,47 @@ impl Remote {
     /// reader thread swallows the PONG so it can never shift the
     /// request/response pairing.
     fn spawn_keepalive(&self) {
-        let writer = match &self.writer {
-            Outbound::Plain(s) => s.try_clone(),
-            Outbound::Tls(_) => return, // TLS link shares the session; the
-                                        // reader thread already keeps the socket warm with reads.
+        // Both transports need REAL keepalives: the reader thread's reads
+        // are local socket polls and never reset the server's idle timer,
+        // so a TLS-only session was still kicked by DOCSQL_IDLE_TIMEOUT.
+        // The plain path serializes against the main thread's multi-syscall
+        // frame writes via `plain_lock` (a PING slipping between a large
+        // frame's write() calls corrupts both streams); TLS writes already
+        // serialize under the session mutex inside TlsLink::send.
+        let (plain, tls, plain_lock) = match &self.writer {
+            Outbound::Plain(s) => (s.try_clone().ok(), None, Some(self.plain_lock.clone())),
+            Outbound::Tls(link) => (None, Some(link.clone()), None),
         };
-        let Ok(writer) = writer else { return };
+        if plain.is_none() && tls.is_none() {
+            return;
+        }
         let in_flight = self.in_flight.clone();
         std::thread::spawn(move || {
             let interval = std::time::Duration::from_secs(25);
-            let mut writer = writer;
             loop {
                 std::thread::sleep(interval);
                 if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    if let Ok(bytes) = Frame::new(proto::REQ_PING, vec![]).encode() {
-                        if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
-                            return;
+                    let Ok(bytes) = Frame::new(proto::REQ_PING, vec![]).encode() else {
+                        continue;
+                    };
+                    // Lock FIRST, then re-check: the main thread may have
+                    // started a request between the load and the lock.
+                    let _guard = plain_lock
+                        .as_ref()
+                        .map(|l| l.lock().unwrap_or_else(|p| p.into_inner()));
+                    if in_flight.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                        continue;
+                    }
+                    let sent = match (&plain, &tls) {
+                        (Some(w), _) => {
+                            let mut w = w;
+                            w.write_all(&bytes).is_ok() && w.flush().is_ok()
                         }
+                        (_, Some(link)) => link.send(&bytes).is_ok(),
+                        _ => false,
+                    };
+                    if !sent {
+                        return;
                     }
                 }
             }
@@ -734,6 +790,13 @@ impl Remote {
         let bytes = frame.encode().map_err(|e| e.to_string())?;
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Hold the plain-write lock across the whole frame so the
+        // keepalive's PING can never interleave bytes mid-frame.
+        let _guard = if matches!(self.writer, Outbound::Plain(_)) {
+            Some(self.plain_lock.lock().unwrap_or_else(|p| p.into_inner()))
+        } else {
+            None
+        };
         let sent = self.writer.send_frame(&bytes);
         if sent.is_err() {
             self.in_flight
@@ -900,28 +963,50 @@ fn sanitize_terminal(s: &str) -> String {
     out
 }
 
+/// Machine-readable mode (--csv/--json): batch consumers parse stdout as
+/// ONE pure document — push lines (like every note_line) go to stderr so a
+/// `subscribe …` inside a scripted session cannot corrupt the stream.
+static PUSH_LINES_TO_STDERR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_push_lines_stderr(on: bool) {
+    PUSH_LINES_TO_STDERR.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn print_push(f: &Frame) {
+    let say = |msg: String| {
+        if PUSH_LINES_TO_STDERR.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
     if let Ok(Value::Object(o)) = docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
     {
         let s = |k: &str| sanitize_terminal(o.get(k).and_then(|v| v.as_str()).unwrap_or(""));
         let id = o.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         if s("kind") == "pmessage" {
-            println!(
+            say(format!(
                 "[pubsub] pmessage {} {} #{} {}",
                 s("pattern"),
                 s("channel"),
                 id,
                 s("payload")
-            );
+            ));
         } else {
-            println!("[pubsub] message {} #{} {}", s("channel"), id, s("payload"));
+            say(format!(
+                "[pubsub] message {} #{} {}",
+                s("channel"),
+                id,
+                s("payload")
+            ));
         }
         return;
     }
-    println!(
+    say(format!(
         "[pubsub] {}",
         sanitize_terminal(&String::from_utf8_lossy(&f.payload))
-    );
+    ));
 }
 
 /// AUTH against a token-protected server (REQ_AUTH frame). Returns success.

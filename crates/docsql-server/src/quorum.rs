@@ -330,7 +330,7 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                 let view = quorum.view_of(primary);
                 let primary_head = view.as_ref().and_then(|v| v.journal_head);
                 let primary_origin = view.as_ref().and_then(|v| v.node_id.clone());
-                let lag_ok = match (primary_head, primary_origin, state.catchup_window) {
+                let lag_ok = match (primary_head, primary_origin.clone(), state.catchup_window) {
                     (None, _, _) | (_, None, _) => false, // never saw the primary/its identity: cannot judge
                     // Zero window = UNBOUNDED retention: every lag is
                     // acceptable (the comment above says so; the old
@@ -359,16 +359,32 @@ async fn supervise(state: &Arc<ServerState>, quorum: &Quorum) {
                         Some(detail),
                     );
                 } else if !state.promote_lag_warned.swap(true, Ordering::SeqCst) {
-                    eprintln!(
-                        "docsql-quorum: primary {primary} lost but local journal is behind beyond DOCSQL_CATCHUP_WINDOW — staying read-only (promoting would orphan the writes the primary confirmed)"
-                    );
+                    // Distinguish "cannot judge" (this process never probed
+                    // the primary successfully — e.g. it was already down at
+                    // startup, or the replica restarted during the outage)
+                    // from "judged and behind": the old single message told
+                    // operators to chase a journal lag that may not exist.
+                    let never_saw = primary_head.is_none() || primary_origin.is_none();
+                    let reason = if never_saw {
+                        eprintln!(
+                            "docsql-quorum: primary {primary} lost but this process never \
+                             completed a probe of it — lag cannot be judged, staying \
+                             read-only (check DOCSQL_QUORUM_MEMBERS covers the primary)"
+                        );
+                        "auto: primary never successfully probed; lag unknown, staying read-only"
+                    } else {
+                        eprintln!(
+                            "docsql-quorum: primary {primary} lost but local journal is behind beyond DOCSQL_CATCHUP_WINDOW — staying read-only (promoting would orphan the writes the primary confirmed)"
+                        );
+                        "auto: lag beyond catch-up window; staying read-only"
+                    };
                     crate::querylog::sync_event(
                         &state.sync_log,
                         "promote",
                         primary,
                         None,
                         false,
-                        Some("auto: lag beyond catch-up window; staying read-only".into()),
+                        Some(reason.into()),
                     );
                 }
             } else if quorum.last_seen_head(primary).is_some() {

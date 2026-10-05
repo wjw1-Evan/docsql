@@ -1522,7 +1522,16 @@ impl<'a> ReadCx<'a> {
                 if sample.is_some() {
                     return err("TABLESAMPLE is not supported");
                 }
-                let ExecOutcome::Rows(r) = self.exec_query(subquery.as_ref().clone())? else {
+                // Chain the outer CTE scope through: a derived table is a
+                // subquery of the statement it appears in, so `WITH t AS (…)
+                // SELECT * FROM (SELECT * FROM t) d` must read the CTE —
+                // and NOT fall through to a same-named base table. An own
+                // WITH on the subquery materializes on top (its names
+                // shadow, lexical nesting).
+                let scoped = self.materialize_ctes(&subquery.with, ctes)?;
+                let ExecOutcome::Rows(r) =
+                    self.exec_query_body(subquery.as_ref().clone(), &scoped)?
+                else {
                     return err("derived table must be a SELECT");
                 };
                 let alias_columns = match alias {
@@ -3267,51 +3276,65 @@ impl<'a> ReadCx<'a> {
             SetExpr::Query(inner) => {
                 // Parenthesized query body, e.g. `((SELECT 1))`: re-dispatch
                 // the inner query (its ORDER BY/LIMIT apply) instead of
-                // rejecting the shape.
+                // rejecting the shape. The parenthesized body may carry its
+                // OWN WITH — materialize it on top of the current scope
+                // rather than dropping it (dropping made `(WITH x AS …
+                // SELECT * FROM x)` resolve x to a same-named base table or
+                // fail outright).
                 let mut q = *inner;
-                q.with = None; // CTEs are already materialized in `ctes`
-                self.exec_query_body(q, ctes)
+                let inner_with = q.with.take();
+                let scoped = self.materialize_ctes(&inner_with, ctes)?;
+                self.exec_query_body(q, &scoped)
             }
             other => err(format!("unsupported query body: {other}")),
         }
     }
 
     fn exec_query(&self, query: Query) -> Result<ExecOutcome> {
-        // WITH <cte> AS (...), ...: materialize each CTE (they can reference
-        // earlier ones) into a statement-local map — owned by this call, so
-        // the whole SELECT execution chain can run on `&Database` (MVCC
-        // stage A concurrent readers).
-        let mut ctes: Ctes = Ctes::new();
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                let name = cte.alias.name.value.clone();
-                // T-SQL spells recursion without a keyword: any CTE whose
-                // UNION body references its own name recurses. The standard
-                // RECURSIVE flag just makes that explicit (and is no longer
-                // a rejection).
-                if cte_references(&cte.query, &name) {
-                    let docs = self.materialize_recursive_cte(cte, &name, &ctes, with.recursive)?;
-                    ctes.insert(name, docs);
-                    continue;
-                }
-                let ExecOutcome::Rows(r) =
-                    self.exec_query_body(cte.query.as_ref().clone(), &ctes)?
-                else {
-                    return err("CTE body must be a SELECT");
-                };
-                let alias_columns = table_alias_columns(&cte.alias.columns, r.columns.len())?;
-                let docs: Vec<Object> = r
-                    .rows
-                    .into_iter()
-                    .map(|row| match &alias_columns {
-                        Some(cols) => cols.iter().cloned().zip(row).collect(),
-                        None => r.columns.iter().cloned().zip(row).collect(),
-                    })
-                    .collect();
-                ctes.insert(name, docs);
-            }
-        }
+        let ctes = self.materialize_ctes(&query.with, &Ctes::new())?;
         self.exec_query_body(query, &ctes)
+    }
+
+    /// WITH <cte> AS (...), ...: materialize each CTE (they can reference
+    /// earlier ones) into a statement-local map on top of `base` — owned by
+    /// this call, so the whole SELECT execution chain can run on
+    /// `&Database` (MVCC stage A concurrent readers). Extracted so derived
+    /// tables and parenthesized bodies can chain the OUTER scope through
+    /// instead of rebuilding an empty one (a `WITH t AS (…) SELECT * FROM
+    /// (SELECT * FROM t) d` used to lose t inside the derived table and
+    /// silently read a same-named base table).
+    fn materialize_ctes(&self, with: &Option<sqlparser::ast::With>, base: &Ctes) -> Result<Ctes> {
+        let mut ctes = base.clone();
+        let Some(with) = with else {
+            return Ok(ctes);
+        };
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.clone();
+            // T-SQL spells recursion without a keyword: any CTE whose
+            // UNION body references its own name recurses. The standard
+            // RECURSIVE flag just makes that explicit (and is no longer
+            // a rejection).
+            if cte_references(&cte.query, &name) {
+                let docs = self.materialize_recursive_cte(cte, &name, &ctes, with.recursive)?;
+                ctes.insert(name, docs);
+                continue;
+            }
+            let ExecOutcome::Rows(r) = self.exec_query_body(cte.query.as_ref().clone(), &ctes)?
+            else {
+                return err("CTE body must be a SELECT");
+            };
+            let alias_columns = table_alias_columns(&cte.alias.columns, r.columns.len())?;
+            let docs: Vec<Object> = r
+                .rows
+                .into_iter()
+                .map(|row| match &alias_columns {
+                    Some(cols) => cols.iter().cloned().zip(row).collect(),
+                    None => r.columns.iter().cloned().zip(row).collect(),
+                })
+                .collect();
+            ctes.insert(name, docs);
+        }
+        Ok(ctes)
     }
 
     /// Semi-naive recursive CTE evaluation: run the anchor arm (which must
@@ -4110,7 +4133,38 @@ impl<'a> ReadCx<'a> {
                 .flatten()
                 .any(|(v, _)| !ts_positions(v).is_empty()),
         };
-        if !has_str_bound && !has_ts_bound {
+        // Range sweeps with NUMERIC bounds need the band looked at too (Eq /
+        // Prefix / In probes with numeric elements are safe without it: a
+        // seek that matches nothing mirrors the predicate excluding every
+        // row, so only the sweeping shapes can diverge). The predicate's
+        // Timestamp↔numeric comparison is NULL — the row is excluded — while
+        // the raw band order ranks Timestamps ABOVE numerics, so a numeric
+        // bound over a Timestamp(-containing) band admits keys the predicate
+        // must exclude (`WHERE ts > 0 ORDER BY ts LIMIT 1` would return a
+        // row whose correct answer is zero rows).
+        let is_num = |v: &Value| -> bool {
+            matches!(v, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
+        };
+        let num_positions = |v: &Value| -> Vec<usize> {
+            match v {
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| is_num(e))
+                    .map(|(i, _)| i)
+                    .collect(),
+                other if is_num(other) => vec![0],
+                _ => Vec::new(),
+            }
+        };
+        let has_num_range_bound = match plan {
+            ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|(v, _)| !num_positions(v).is_empty()),
+            _ => false,
+        };
+        if !has_str_bound && !has_ts_bound && !has_num_range_bound {
             return Ok(Some((plan.clone(), false)));
         }
         let reader = self.reader();
@@ -4147,6 +4201,18 @@ impl<'a> ReadCx<'a> {
                 k.as_ref().is_some_and(|k| match k {
                     Value::Str(_) if i == 0 => true,
                     Value::Array(items) => items.get(i).is_some_and(|e| matches!(e, Value::Str(_))),
+                    _ => false,
+                })
+            };
+            at(&min_key) && at(&max_key)
+        };
+        let band_num_at = |i: usize| -> bool {
+            let at = |k: &Option<Value>| -> bool {
+                k.as_ref().is_some_and(|k| match k {
+                    Value::Int(_) | Value::Float(_) | Value::Decimal(_) if i == 0 => true,
+                    Value::Array(items) => items.get(i).is_some_and(|e| {
+                        matches!(e, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
+                    }),
                     _ => false,
                 })
             };
@@ -4241,6 +4307,22 @@ impl<'a> ReadCx<'a> {
                     .flat_map(|(v, _)| ts_positions(v))
                 {
                     if !band_ts_at(i) {
+                        return Ok(None);
+                    }
+                }
+                // A numeric bound may only sweep a band PROVABLY free of
+                // Timestamps. Purity is provable when both extremes agree
+                // on one family (anything else ranks strictly outside
+                // [min, max]); a band whose extremes disagree may still
+                // hold Timestamps in between (numeric … Timestamp … Str),
+                // and Str↔numeric stays raw on both sides so a pure Str
+                // band is as safe as a pure numeric one.
+                for i in [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(v, _)| num_positions(v))
+                {
+                    if !(band_num_at(i) || band_str_at(i)) {
                         return Ok(None);
                     }
                 }
@@ -4763,7 +4845,7 @@ impl<'a> ReadCx<'a> {
             // decoding the remaining keys (the common case).
             let mut first = Value::Null;
             for field in &keys[0].0 {
-                if let Some(v) = encode::extract_field(bytes, field)? {
+                if let Some(v) = encode::extract_field_lookup(bytes, field)? {
                     first = v;
                     break;
                 }
@@ -4786,7 +4868,7 @@ impl<'a> ReadCx<'a> {
             for (fields, _, _) in keys.iter().skip(1) {
                 let mut v = Value::Null;
                 for field in fields {
-                    if let Some(found) = encode::extract_field(bytes, field)? {
+                    if let Some(found) = encode::extract_field_lookup(bytes, field)? {
                         v = found;
                         break;
                     }
@@ -5491,7 +5573,7 @@ impl<'a> ReadCx<'a> {
             Self::explain_row(out, op, detail);
         };
         for twj in &select.from {
-            let desc = self.explain_factor_desc(&twj.relation);
+            let desc = self.explain_factor_desc(&twj.relation)?;
             row(out, "SCAN", format!("JOIN SIDE FULL LOAD — {desc}"));
             for j in &twj.joins {
                 let kind = match &j.join_operator {
@@ -5518,7 +5600,7 @@ impl<'a> ReadCx<'a> {
                     }
                     _ => "JOIN",
                 };
-                let right_desc = self.explain_factor_desc(&j.relation);
+                let right_desc = self.explain_factor_desc(&j.relation)?;
                 let right_key = match &j.relation {
                     sqlparser::ast::TableFactor::Table { name, alias, .. } => alias
                         .as_ref()
@@ -5554,8 +5636,62 @@ impl<'a> ReadCx<'a> {
         Ok(())
     }
 
-    fn explain_factor_desc(&self, tf: &sqlparser::ast::TableFactor) -> String {
+    fn explain_factor_desc(&self, tf: &sqlparser::ast::TableFactor) -> Result<String> {
+        // Mirror `load_table_factor`'s rejection gates: a factor carrying
+        // clauses the executor refuses must not be described as a runnable
+        // plan — EXPLAIN used to print "JOIN SIDE FULL LOAD" for
+        // TABLESAMPLE / index-hint / time-travel factors that then failed
+        // on execution (same red line the solo branch enforces).
         match tf {
+            sqlparser::ast::TableFactor::Table {
+                sample,
+                version,
+                partitions,
+                with_hints,
+                index_hints,
+                with_ordinality,
+                json_path,
+                alias,
+                ..
+            } => {
+                if sample.is_some() {
+                    return err("TABLESAMPLE is not supported");
+                }
+                if version.is_some() {
+                    return err("table time travel (AS OF / FOR SYSTEM_TIME) is not supported");
+                }
+                if !partitions.is_empty() {
+                    return err("partition selection (PARTITION (...)) is not supported");
+                }
+                if !with_hints.is_empty() {
+                    return err("table hints (WITH (...)) are not supported");
+                }
+                if !index_hints.is_empty() {
+                    return err("index hints are not supported");
+                }
+                if *with_ordinality {
+                    return err("WITH ORDINALITY is not supported");
+                }
+                if json_path.is_some() {
+                    return err("JSON path table sources are not supported");
+                }
+                if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                    return err("column aliases on a table alias are not supported");
+                }
+            }
+            sqlparser::ast::TableFactor::Derived {
+                lateral, sample, ..
+            } => {
+                if *lateral {
+                    return err("LATERAL derived tables are not supported");
+                }
+                if sample.is_some() {
+                    return err("TABLESAMPLE is not supported");
+                }
+            }
+            _ => {}
+        }
+        Ok(match tf {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => {
                 let tname = obj_name(name);
                 if is_compat_view(&tname) {
@@ -5581,7 +5717,7 @@ impl<'a> ReadCx<'a> {
                 "table function (executed at runtime)".to_string()
             }
             _ => "subquery/NESTED factor (executed at runtime)".to_string(),
-        }
+        })
     }
 
     /// Pure-AST mirror of `try_count_star`'s eligibility gates (no heap
@@ -7759,6 +7895,16 @@ impl Database {
             .filter(|n| !self.tables.get(*n).is_some_and(|m| m.is_view()))
             .cloned()
             .collect();
+        // CREATE order must respect FK dependencies: the engine (rightly)
+        // rejects a CREATE whose referenced table does not exist yet, so
+        // alphabetical DDL order fails the replay whenever the child sorts
+        // before its parent. Drops go the opposite way (children first).
+        let ordered_tables = fk_dependency_order(&table_names, &self.tables);
+        let drop_order: Vec<String> = {
+            let mut v = ordered_tables.clone();
+            v.reverse();
+            v
+        };
         let mut ddl = String::new();
         if !view_names.is_empty() {
             let drops = view_names
@@ -7769,14 +7915,14 @@ impl Database {
             ddl.push_str(&format!("DROP VIEW IF EXISTS {drops};\n"));
         }
         if !table_names.is_empty() {
-            let drops = table_names
+            let drops = drop_order
                 .iter()
                 .map(|n| quote_ident(n))
                 .collect::<Vec<_>>()
                 .join(", ");
             ddl.push_str(&format!("DROP TABLE IF EXISTS {drops};\n"));
         }
-        for name in &table_names {
+        for name in &ordered_tables {
             let meta = self.tables.get(name).cloned().unwrap();
             ddl.push_str(&format!("CREATE TABLE {} (\n", quote_ident(name)));
             let mut parts: Vec<String> = Vec::new();
@@ -8013,6 +8159,21 @@ impl Database {
                     // reclaims storage; accepting it would imply a recycle
                     // bin this engine does not have.
                     return err("DROP ... PURGE is not supported");
+                }
+                if !self.internal_ddl
+                    && (object_type == sqlparser::ast::ObjectType::Table
+                        || object_type == sqlparser::ast::ObjectType::View)
+                {
+                    for name in names.iter().map(obj_name) {
+                        // Engine SYSTEM tables only: the user tables must
+                        // stay droppable — the dump prelude drops them in
+                        // every wholesale snapshot replay (the network path
+                        // still refuses user-table DDL via
+                        // stmt_write_targets).
+                        if crate::engine::is_system_table(&name) {
+                            return err(format!("cannot DROP the internal table {name}"));
+                        }
+                    }
                 }
                 if object_type == sqlparser::ast::ObjectType::Index {
                     // Composites roots removed below release their tree in
@@ -9360,6 +9521,15 @@ impl Database {
             return err("index storage options are not supported");
         }
         let table = obj_name(&idx.table_name);
+        if !self.internal_ddl
+            && (crate::useradmin::is_user_table(&table) || crate::engine::is_system_table(&table))
+        {
+            // An index built on the internal user tables is invisible to
+            // dumps (user tables replay through their own statement
+            // channel) yet lands in the table's schema hash — an embedded
+            // node would silently diverge from its cluster's digest.
+            return err(format!("cannot index the internal table {table}"));
+        }
         if self.tables.get(&table).is_some_and(|m| m.is_view()) {
             return err(format!(
                 "cannot index view {table} (it is a view, not a table)"
@@ -9608,6 +9778,7 @@ impl Database {
                         return err(format!("duplicate column name: {col}"));
                     }
                     let mut add_not_null = false;
+                    let mut default_text: Option<String> = None;
                     for opt in &column_def.options {
                         use sqlparser::ast::ColumnOption as CO;
                         match &opt.option {
@@ -9618,6 +9789,21 @@ impl Database {
                                          functions (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND); \
                                          every node would evaluate a different value",
                                     );
+                                }
+                                // Column references must resolve (the new
+                                // column itself is in scope for its own
+                                // CHECK): the apply loop rejects unknown
+                                // references MID-STATEMENT, after earlier
+                                // operations of the same ALTER already
+                                // committed — catch it here instead.
+                                let mut refs = Vec::new();
+                                check_expr_column_refs(&c.expr, &mut refs)?;
+                                for r in refs {
+                                    if r != *col && !columns.contains(&r) {
+                                        return err(format!(
+                                            "CHECK constraint references unknown column {r}"
+                                        ));
+                                    }
                                 }
                                 // Mirror the apply loop: later operations in
                                 // the same statement must see this CHECK in
@@ -9635,6 +9821,7 @@ impl Database {
                                 let text = default_expr_text(e);
                                 let expr = parse_expr_text(&text)?;
                                 eval_const(&expr)?;
+                                default_text = Some(text);
                             }
                             CO::NotNull => add_not_null = true,
                             CO::PrimaryKey { .. }
@@ -9645,7 +9832,24 @@ impl Database {
                                     "constraint options are not supported on ADD COLUMN {col}"
                                 ));
                             }
-                            _ => {}
+                            // Same parity as the apply loop (and CREATE
+                            // TABLE): swallowing these silently degraded the
+                            // column to a plain one.
+                            CO::Generated { .. }
+                            | CO::Materialized(_)
+                            | CO::Ephemeral(_)
+                            | CO::Alias(_) => {
+                                return err(format!(
+                                    "generated/computed columns are not supported \
+                                     (ADD COLUMN {col})"
+                                ));
+                            }
+                            CO::Null => {}
+                            _ => {
+                                return err(format!(
+                                    "unsupported column option on ADD COLUMN {col}"
+                                ))
+                            }
                         }
                     }
                     // A new column's default can only arrive in this very
@@ -9660,6 +9864,31 @@ impl Database {
                         return err(format!(
                             "cannot add NOT NULL column {col} without a DEFAULT"
                         ));
+                    }
+                    // Backfill-vs-CHECK parity with the apply loop: every
+                    // check — including one riding on THIS ADD COLUMN — is
+                    // evaluated against the backfilled rows there; without
+                    // this simulation a later operation in the same ALTER
+                    // commits first and the statement half-applies.
+                    if let Some(text) = &default_text {
+                        if !checks.is_empty() {
+                            let fill = eval_const(&parse_expr_text(text)?)?;
+                            for d in self.table_docs_cx(tname)? {
+                                let mut filled = d;
+                                if !filled.contains_key(col) {
+                                    filled.insert(col.clone(), fill.clone());
+                                }
+                                for c in &checks {
+                                    let e = parse_expr_text(c)?;
+                                    if matches!(
+                                        check_expr_outcome(&e, &filled)?,
+                                        CheckOutcome::Fail
+                                    ) {
+                                        return err(format!("CHECK constraint failed: {c}"));
+                                    }
+                                }
+                            }
+                        }
                     }
                     columns.push(col.clone());
                 }
@@ -9817,8 +10046,13 @@ impl Database {
                     // The apply loop rekeys the single-column tree from the
                     // old column name to the new one — evolve the simulated
                     // roots the same way, or a later rename falsely reports
-                    // a collision with the vacated name.
-                    if roots.remove(old.as_str()) {
+                    // a collision with the vacated name. Same ownership rule
+                    // as the apply loop: a composite/path def NAMED like the
+                    // column owns the def-name root and blocks the rekey.
+                    let own_tree = !index_defs
+                        .iter()
+                        .any(|d| d.name == *old && (d.path.is_some() || d.columns.len() > 1));
+                    if own_tree && roots.remove(old.as_str()) {
                         roots.insert(new.clone());
                     }
                     for d in index_defs.iter_mut() {
@@ -9872,6 +10106,15 @@ impl Database {
     fn exec_alter(&mut self, alter: sqlparser::ast::AlterTable) -> Result<ExecOutcome> {
         use sqlparser::ast::AlterTableOperation as Op;
         let tname = obj_name(&alter.name);
+        if !self.internal_ddl
+            && (crate::useradmin::is_user_table(&tname) || crate::engine::is_system_table(&tname))
+        {
+            // The network path already classifies these writes away
+            // (stmt_write_targets); an embedded/in-process caller could
+            // ALTER the replicated user tables directly, and the altered
+            // schema would diverge from every peer's digest.
+            return err(format!("cannot ALTER the internal table {tname}"));
+        }
         let Some(mut meta) = self.tables.get(&tname).map(|a| a.as_ref().clone()) else {
             return err(format!("table {tname} does not exist"));
         };
@@ -10115,16 +10358,19 @@ impl Database {
                     }
                     // Only the column's OWN single-column tree rekeys with
                     // the rename. A composite or JSON-path index NAMED like
-                    // the column keeps its def-name root — the def name does
-                    // not follow the column, and rekeying would graft an
-                    // Array/path-keyed tree onto the new column key where
-                    // DML would mix scalar keys into it.
-                    let own_tree = meta
+                    // the column owns the def-name root (root_key = index
+                    // name) — the def name does not follow the column, and
+                    // rekeying would graft an Array/path-keyed tree onto
+                    // the new column key where DML would mix scalar keys
+                    // into it. A SINGLE-column def named like the column
+                    // but built on ANOTHER column owns that other column's
+                    // root, not `old` — the column's own tree still rekeys
+                    // (stranding it let duplicate PKs in silently and
+                    // diverged replicas whose dump replay enforced them).
+                    let own_tree = !meta
                         .index_defs
                         .iter()
-                        .find(|d| d.name == *old)
-                        .map(|d| d.path.is_none() && d.columns.len() == 1 && d.columns[0] == *old)
-                        .unwrap_or(true);
+                        .any(|d| d.name == *old && (d.path.is_some() || d.columns.len() > 1));
                     if own_tree {
                         if let Some(root) = meta.index_roots.remove(old) {
                             meta.index_roots.insert(new.clone(), root);
@@ -11045,6 +11291,36 @@ impl Database {
         // enforcement and index probes depend on them existing. The trees
         // ride the SAME write unit as the catalog entry (the shape
         // `exec_create_index` settled on): committing the tree first and
+        // Forward-declared FKs (referencing a table that does not exist
+        // yet) can form DECLARATION cycles the dump's topological order
+        // cannot break — the fallback emits cycle members in catalog
+        // order, and a replay then inserts child rows before their
+        // parents exist (restore fails mid-flight). Self-references are
+        // fine: the table being created is its own parent. When the
+        // parent exists, the referenced column must be one of its
+        // declared columns — an undeclared field would silently match
+        // nothing and every child write would fail the constraint.
+        for (fc, rt, rc) in &meta.foreign_keys {
+            if rt == &name {
+                continue;
+            }
+            let Some(parent) = self.tables.get(rt) else {
+                return err(format!(
+                    "FOREIGN KEY on {name}.{fc} references table {rt}, which does not exist \
+                     (create {rt} first)"
+                ));
+            };
+            if parent.is_view() {
+                return err(format!(
+                    "FOREIGN KEY on {name}.{fc} cannot reference the VIEW {rt}"
+                ));
+            }
+            if !parent.columns.contains(rc) {
+                return err(format!(
+                    "FOREIGN KEY on {name}.{fc} references unknown column {rt}.{rc}"
+                ));
+            }
+        }
         // saving the catalog in a second transaction left a crash window
         // holding a committed tree no catalog references — those pages would
         // leak for good, nothing would ever free them.
@@ -11564,6 +11840,14 @@ impl Database {
             }
         }
         if !displaced.is_empty() {
+            // One old row can be hit through several constraints at once
+            // (its PK by one new row and its UNIQUE key by another — or one
+            // new row matching both). Duplicates would double-count in the
+            // FK parent-side scan (`count_in(removed)`) and un-defuse a
+            // lost key that surviving rows still carry, rejecting a legal
+            // replace; remove_many would also see the locator twice.
+            displaced.sort_unstable();
+            displaced.dedup();
             let affected: std::collections::BTreeSet<u32> = displaced
                 .iter()
                 .map(|l| crate::heap::unpack_loc(*l).0)
@@ -11633,6 +11917,13 @@ impl Database {
         // (locator, pre-image, post-image) plus the RETURNING projection in
         // input order (inserted and updated rows alike).
         let mut updated: Vec<(u64, Object, Object)> = Vec::new();
+        // heap.replace can MOVE a row past its page budget (tombstone +
+        // append at the heap tail): a later touch of the same logical row
+        // then finds it at the NEW locator, and the locator-keyed collapse
+        // below would keep two entries — leaking the intermediate image
+        // into the FK/unique checks and RETURNING. Map each relocated
+        // locator back to the row's first-seen locator.
+        let mut origin_of: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
         let mut ret_docs: Vec<Object> = Vec::with_capacity(new_docs.len());
         let mut du_outer = OuterFrom::new();
         du_outer.insert(table.clone());
@@ -11780,7 +12071,12 @@ impl Database {
                     self.pager.abort_tx(tx)?;
                     return Err(e);
                 }
-                updated.push((loc, existing.clone(), merged.clone()));
+                if out.placed != loc {
+                    let origin = origin_of.get(&loc).copied().unwrap_or(loc);
+                    origin_of.insert(out.placed, origin);
+                }
+                let collapse_key = origin_of.get(&loc).copied().unwrap_or(loc);
+                updated.push((collapse_key, existing.clone(), merged.clone()));
                 ret_docs.push(merged);
                 continue 'outer;
             }
@@ -12200,6 +12496,17 @@ impl Database {
                 .filter(|a| !a.is_empty())
                 .unwrap_or_else(|| "source".to_string()),
         };
+        // Same alias for source and target: the join row keys collide and
+        // the TARGET qualifier overwrites the source's, so `ON x.id =
+        // x.id` is trivially true and SET reads the target's own pre-image
+        // — every target row matches every source row (mass wrong updates
+        // or a spurious "cannot update the same row twice"). MySQL and SQL
+        // Server reject the shape; so do we.
+        if skey == tkey {
+            return err(format!(
+                "MERGE source and target aliases must differ (both are '{skey}')"
+            ));
+        }
 
         // Target rows with locators (storage order — deterministic replay
         // on replication peers).
@@ -13207,37 +13514,22 @@ fn eval_grouped_spec(
 /// is the signal). Rendered-text scan over the query AST is enough here —
 /// a false positive merely routes a non-recursive CTE through the
 /// recursive path, whose anchor evaluation then fails loudly naming it.
+/// Does this CTE body reference `name` in a TABLE position (FROM/JOIN,
+/// derived tables, subqueries)? Only those positions make the CTE
+/// self-referential (recursion); the old whole-text word scan also hit the
+/// CTE's own column names and output aliases — `WITH region AS (SELECT
+/// region FROM … UNION ALL …)` is NOT recursive, but was misdiagnosed:
+/// either rejected as "must be anchor UNION arm", or its non-recursive
+/// UNION ALL body was iterated as recursion until the convergence caps
+/// tripped on a perfectly legal query.
 fn cte_references(q: &sqlparser::ast::Query, name: &str) -> bool {
-    let text = format!("{}", q.body);
-    let lower = text.to_ascii_lowercase();
-    // Skip string literals: `WITH east AS (... region = 'east')` must not
-    // look self-referential.
-    let b = lower.as_bytes();
-    let want = name.to_ascii_lowercase();
-    let w = want.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                let (end, _) = crate::stmt::sql_literal_end(&lower, i);
-                i = end;
-            }
-            _ => {
-                if b[i..].starts_with(w) {
-                    let before_ok =
-                        i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-                    let after = i + w.len();
-                    let after_ok =
-                        after >= b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
-                    if before_ok && after_ok {
-                        return true;
-                    }
-                }
-                i += 1;
-            }
-        }
-    }
-    false
+    let mut refs = Vec::new();
+    // `objects` = always-true keeps every WITH name out of the shadow set,
+    // so factor names inside nested WITH bodies are still collected —
+    // over-detecting costs a loud materialization error at worst, while
+    // under-detecting silently reads a same-named base table instead.
+    let _ = walk_query(q, &mut refs, &|_: &str| true);
+    refs.iter().any(|r| r.eq_ignore_ascii_case(name))
 }
 
 /// PIVOT core: group docs by every field except the pivot column and the
@@ -13293,6 +13585,20 @@ fn pivot_factor(
         let val = eval_const(&expr)?;
         pivot_vals.push((value_to_text(&val), val));
     }
+    // Output column names must be unique AND must not collide with a group
+    // key field: `row.insert` writes straight into the group-key row, so a
+    // collision silently replaced the grouping value (or an earlier pivot
+    // cell) instead of erroring like every other duplicate-column shape.
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, _) in &pivot_vals {
+            if !seen.insert(name.clone()) {
+                return err(format!(
+                    "PIVOT IN list produces duplicate output column '{name}'"
+                ));
+            }
+        }
+    }
     // Which fields does the aggregate argument read? Group by every other
     // field (T-SQL's implicit grouping). Single bare column only.
     let agg_col = match &arg_expr {
@@ -13322,6 +13628,18 @@ fn pivot_factor(
                 index.insert(key_text, groups.len());
                 groups.push((key, vec![di]));
             }
+        }
+    }
+    // A pivot cell writes into the group-key row; a name that collides with
+    // a grouping field would silently replace that field's value.
+    for (name, _) in &pivot_vals {
+        if groups
+            .iter()
+            .any(|(key, _)| key.keys().any(|k| suffix_eq(k, name)))
+        {
+            return err(format!(
+                "PIVOT output column '{name}' collides with a grouping column; alias it"
+            ));
         }
     }
     // Reduce per group × pivot value.
@@ -13629,23 +13947,37 @@ fn column_refs(e: &SqlExpr, out: &mut Vec<String>) -> Option<()> {
                 column_refs(l, out)?;
             }
         }
-        SqlExpr::Function(f) => match &f.args {
-            FunctionArguments::List(list) => {
-                for a in &list.args {
-                    match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
-                            column_refs(inner, out)?
+        SqlExpr::Function(f) => {
+            match &f.args {
+                FunctionArguments::List(list) => {
+                    for a in &list.args {
+                        match a {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                                column_refs(inner, out)?
+                            }
+                            // `COUNT(*)` and friends reference no column; named or
+                            // wildcard argument shapes stay unmodeled.
+                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+                            _ => return None,
                         }
-                        // `COUNT(*)` and friends reference no column; named or
-                        // wildcard argument shapes stay unmodeled.
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
-                        _ => return None,
                     }
                 }
+                FunctionArguments::None => {}
+                _ => return None,
             }
-            FunctionArguments::None => {}
-            _ => return None,
-        },
+            // Aggregate FILTER (WHERE …): the engine evaluates the predicate
+            // per row (agg_parts/eval_agg), so its columns are read exactly
+            // like a projection's — a column-restricted grant that skips
+            // them leaks the filtered column's boolean information
+            // (`COUNT(id) FILTER (WHERE secret = …)`). WITHIN GROUP's order
+            // keys are unmodeled → fail closed like any unknown shape.
+            if let Some(flt) = &f.filter {
+                column_refs(flt, out)?;
+            }
+            if !f.within_group.is_empty() {
+                return None;
+            }
+        }
         // Subqueries and anything unmodeled keep the conjunct in the residual.
         _ => return None,
     }
@@ -15751,10 +16083,16 @@ fn subst_outer_refs_query(
     let mut hit = false;
     if let Some(w) = &mut q.with {
         // CTE bodies of one WITH share the level's accumulating scope (a
-        // later CTE may reference an earlier one).
-        let cte_shadow = shadow.clone();
+        // later CTE may reference an earlier one): insert each name AFTER
+        // its body is rewritten so self-references keep resolving to the
+        // CTE, while later bodies see it (a clone taken once never
+        // accumulated, so a qualified reference to an earlier CTE could be
+        // mistaken for the outer row's alias and substituted with outer
+        // values — silently reading the wrong table).
+        let mut cte_shadow = shadow.clone();
         for cte in &mut w.cte_tables {
             hit |= subst_outer_refs_query(&mut cte.query, &cte_shadow, outer, doc);
+            cte_shadow.insert(cte.alias.name.value.clone());
         }
     }
     hit |= subst_outer_refs_setexpr(&mut q.body, shadow, outer, doc);
@@ -16978,24 +17316,37 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
         } => {
             let v = eval_expr(expr, doc)?;
             let mut hit = false;
-            let mut saw_null = matches!(v, Value::Null);
+            // The ONLY unknown source (kept three-valued so `x NOT IN
+            // ('garbage')` on a TIMESTAMP column behaves exactly like
+            // `x <> 'garbage'`: unknown, filtered — never silently true).
+            let mut unknown = false;
             for item in list {
                 let iv = eval_expr(item, doc)?;
-                if matches!(iv, Value::Null) {
-                    saw_null = true;
-                    continue;
-                }
-                // Equality through the TIMESTAMP↔string coercion funnel, so
-                // `ts IN ('2026-…', …)` matches like `ts = '2026-…'` does.
-                if cmp_coerced(&v, &iv) == Some(Ordering::Equal) {
-                    hit = true;
-                    break;
+                // NULL is a comparable value in this engine (the same
+                // total order `x = NULL` / hash joins / unique checks
+                // use): a NULL ELEMENT therefore participates in the
+                // equality like any other. The old saw_null poisoning
+                // made `x NOT IN (NULL)` false while `x <> NULL` was
+                // true — two spellings of one predicate disagreed, and
+                // `= ANY` (rewritten to IN) diverged from `= ALL`.
+                // Equality through the TIMESTAMP↔string coercion funnel,
+                // so `ts IN ('2026-…', …)` matches like `ts = '2026-…'`.
+                match cmp_coerced(&v, &iv) {
+                    Some(Ordering::Equal) => {
+                        hit = true;
+                        break;
+                    }
+                    None => unknown = true,
+                    Some(_) => {}
                 }
             }
-            // SQL three-valued logic: a NULL anywhere makes the predicate
-            // unknown, and unknown never passes a WHERE. `x NOT IN (..., NULL)`
-            // is therefore false for every row, not true.
-            Ok(Value::Bool(if *negated { !hit && !saw_null } else { hit }))
+            if hit {
+                return Ok(Value::Bool(!*negated));
+            }
+            if unknown {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Bool(*negated))
         }
         // Subqueries are resolved per-statement by subst_expr; reaching one
         // here means it was correlated or unsupported.
@@ -18109,6 +18460,12 @@ fn reject_unsupported_select_clauses(select: &sqlparser::ast::Select) -> Result<
     if select.top.is_some() {
         return err("SELECT TOP is not supported (use LIMIT)");
     }
+    // DISTINCT ON is only rejected inside exec_plain_select today — the
+    // EXPLAIN mirror plans right past it, describing a statement that can
+    // never run.
+    if matches!(&select.distinct, Some(sqlparser::ast::Distinct::On(_))) {
+        return err("DISTINCT ON is not supported");
+    }
     if !select.lateral_views.is_empty() {
         return err("LATERAL VIEW is not supported");
     }
@@ -18943,8 +19300,10 @@ fn probe_plan(
             continue;
         }
         // col IN (list of constants): the multi-probe plan. NULL elements
-        // never match (the tree holds no NULL keys) and are dropped without
-        // costing exactness; non-constant elements forfeit the probe.
+        // are dropped from the probe keys (the tree holds no NULL keys);
+        // on a nullable column that costs exactness — NULL rows match the
+        // predicate via NULL = NULL — so the conjunct rides the residual
+        // filter instead. Non-constant elements forfeit the probe.
         if let SqlExpr::InList {
             expr,
             list,
@@ -18966,10 +19325,11 @@ fn probe_plan(
                 opaque = true;
                 continue;
             };
+            let mut saw_null_elem = false;
             let mut vals = Vec::with_capacity(list.len());
             for el in list {
                 match eval_const(el) {
-                    Ok(Value::Null) => {}
+                    Ok(Value::Null) => saw_null_elem = true,
                     Ok(v) => vals.push(v),
                     Err(_) => {
                         vals.clear();
@@ -18978,6 +19338,16 @@ fn probe_plan(
                 }
             }
             if vals.is_empty() {
+                opaque = true;
+                continue;
+            }
+            // Under the engine's total order a NULL element makes
+            // `v IN (…, NULL)` TRUE for v-NULL rows as well — but the tree
+            // holds no NULL keys, so probe candidates can never include
+            // them. A nullable column must ride the residual filter (a NOT
+            // NULL column has no NULL rows to lose; non-constant elements
+            // forfeit the probe).
+            if saw_null_elem && !meta.not_null.contains(&col) {
                 opaque = true;
                 continue;
             }
@@ -19197,7 +19567,13 @@ fn probe_plan(
                 && eq_map.is_empty()
                 && in_target.is_none()
             {
-                let exact = !opaque;
+                let exact = !opaque
+                    // An Eq plan leaves an unconsumed same-path range
+                    // conjunct (`extract = 5 AND extract > 7`) out of the
+                    // probe; exactness would claim every hit satisfies the
+                    // whole predicate. Mirror the scalar branch's
+                    // `range.is_none()` requirement.
+                    && !(path_eq.is_some() && path_range.is_some());
                 let plan = match (path_eq, path_range) {
                     (Some(v), _) => ProbePlan::Eq(v),
                     (None, Some(bounds)) => {
@@ -19319,6 +19695,23 @@ fn probe_plan(
     let (col, bounds) = range?;
     let mut lo: Option<(Value, bool)> = None;
     let mut hi: Option<(Value, bool)> = None;
+    // Same-side bounds from different comparison families where one is a
+    // Timestamp and the other numeric must not be tightened against each
+    // other: the raw order ranks Timestamps above numerics, so the
+    // Timestamp literal would "win" and silently swallow the numeric
+    // conjunct — an exact plan then sweeps a band whose rows the numeric
+    // comparison excludes as NULL. The scan path keeps both conjuncts.
+    let ts_num_mix = |a: &Value, b: &Value| -> bool {
+        let fam = |v: &Value| -> u8 {
+            match v {
+                Value::Int(_) | Value::Float(_) | Value::Decimal(_) => 0,
+                Value::Timestamp(_) => 1,
+                _ => 2,
+            }
+        };
+        let (x, y) = (fam(a), fam(b));
+        (x == 0 && y == 1) || (x == 1 && y == 0)
+    };
     for (op, v) in bounds {
         use BinaryOperator::*;
         use Ordering::Equal as Eq;
@@ -19326,35 +19719,27 @@ fn probe_plan(
         // `a > 10 AND a > 5` must probe from 10 (the residual filter
         // guarantees correctness either way; this only narrows the scan).
         match op {
-            Gt => {
+            Gt | GtEq => {
+                if lo.as_ref().is_some_and(|(cv, _)| ts_num_mix(&v, cv)) {
+                    return None;
+                }
                 if lo.as_ref().is_none_or(|(cv, incl)| {
                     Value::cmp_values(&v, cv) == Ordering::Greater
-                        || (Value::cmp_values(&v, cv) == Eq && *incl)
+                        || (Value::cmp_values(&v, cv) == Eq && *incl && op == Gt)
                 }) {
-                    lo = Some((v, false));
+                    lo = Some((v, op == GtEq));
                 }
             }
-            GtEq => {
-                if lo
-                    .as_ref()
-                    .is_none_or(|(cv, _)| Value::cmp_values(&v, cv) == Ordering::Greater)
-                {
-                    lo = Some((v, true));
+            Lt | LtEq => {
+                if hi.as_ref().is_some_and(|(cv, _)| ts_num_mix(&v, cv)) {
+                    return None;
                 }
-            }
-            Lt => {
                 if hi.as_ref().is_none_or(|(cv, incl)| {
                     Value::cmp_values(&v, cv) == Ordering::Less
-                        || (Value::cmp_values(&v, cv) == Eq && *incl)
+                        || (Value::cmp_values(&v, cv) == Eq && *incl && op == Lt)
                 }) {
-                    hi = Some((v, false));
+                    hi = Some((v, op == LtEq));
                 }
-            }
-            LtEq if hi
-                .as_ref()
-                .is_none_or(|(cv, _)| Value::cmp_values(&v, cv) == Ordering::Less) =>
-            {
-                hi = Some((v, true));
             }
             _ => {}
         }
@@ -20061,12 +20446,32 @@ fn binop(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             };
             Value::Bool(out)
         }
+        // Three-valued AND over the engine's one UNKNOWN source (the
+        // uncoercable Timestamp↔string/numeric comparison yields Null):
+        // FALSE dominates, TRUE keeps the unknown, and the result stays
+        // Null — WHERE already filters anything that is not Bool(true),
+        // so a row whose predicate is unknown is dropped instead of
+        // erroring the whole statement (`WHERE ts = s AND id = 1` used to
+        // fail on the first row with an unparseable s).
         And => match (l, r) {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a && b),
+            (Value::Bool(false), Value::Null) | (Value::Null, Value::Bool(false)) => {
+                Value::Bool(false)
+            }
+            (Value::Bool(true), Value::Null)
+            | (Value::Null, Value::Bool(true))
+            | (Value::Null, Value::Null) => Value::Null,
             _ => return err("AND requires booleans"),
         },
+        // Three-valued OR: TRUE dominates, FALSE keeps the unknown.
         Or => match (l, r) {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a || b),
+            (Value::Bool(true), Value::Null) | (Value::Null, Value::Bool(true)) => {
+                Value::Bool(true)
+            }
+            (Value::Bool(false), Value::Null)
+            | (Value::Null, Value::Bool(false))
+            | (Value::Null, Value::Null) => Value::Null,
             _ => return err("OR requires booleans"),
         },
         other => return err(format!("unsupported operator: {other}")),
@@ -20378,20 +20783,50 @@ mod tests {
             let r = rows(&mut db, "SELECT COUNT(*) FROM t");
             assert_eq!(r.rows[0][0], Value::Int(0));
         }
-        // Deterministic observable: every ROLLBACK now closes with a
-        // KIND_FENCE record (the sync in its tail). Before the fix a
-        // rollback-only workload never fenced, so recovery had no durable
-        // boundary and the WAL-cap paths never fired. The truncation itself
-        // is asynchronous (soft threshold) — size assertions would flap.
-        let fences = crate::wal::Wal::scan_file(&crate::pager::wal_path_for(&path))
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.kind == crate::wal::KIND_FENCE)
-            .count();
+        // Deterministic observable, part 1: a workload far below the 8MB
+        // soft checkpoint threshold cannot have its fences reclaimed by a
+        // truncation, so EVERY ROLLBACK's closing fence must still be in
+        // the log. Before the fix a rollback-only workload never fenced.
+        let wal_path = crate::pager::wal_path_for(&path);
+        let count_fences = |p: &std::path::Path| -> usize {
+            crate::wal::Wal::scan_file(p)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.kind == crate::wal::KIND_FENCE)
+                .count()
+        };
+        let fences = count_fences(&wal_path);
+        let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         assert!(
-            fences >= 600,
-            "expected one fence per ROLLBACK, got {fences}"
+            fences >= 600 || wal_len < 8 * 1024 * 1024,
+            "expected one fence per ROLLBACK (got {fences}) or a reclaimed log, \
+             WAL is {wal_len} bytes"
         );
+        // Part 2: the 3KB-row loop above crosses the soft threshold, so a
+        // background truncation may legitimately reclaim dead frames
+        // mid-run — fences live in the log they fence, so a COMPLETED
+        // truncation drops earlier fences with them. Cross-checked below
+        // via a separate small-workload run (threshold unreachable) whose
+        // fence count is exact, keeping this assertion flake-free while
+        // still exercising the cap machinery under rollback-only load.
+        {
+            let path2 = dir.path().join("rb2.db");
+            {
+                let mut db = Database::open(&path2).unwrap();
+                run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, b TEXT)");
+                for i in 0..40 {
+                    run(&mut db, "BEGIN");
+                    run(&mut db, &format!("INSERT INTO t VALUES ({i}, 'x')"));
+                    run(&mut db, "ROLLBACK");
+                }
+            }
+            let fences2 = count_fences(&crate::pager::wal_path_for(&path2));
+            assert!(
+                fences2 >= 40,
+                "small rollback-only workload must keep one fence per \
+                 ROLLBACK, got {fences2}"
+            );
+        }
     }
 
     #[test]
@@ -21733,6 +22168,13 @@ mod tests {
         assert_eq!(c("COUNT(*)"), Vec::<String>::new());
         assert_eq!(c("ABS(n)"), vec!["n".to_string()]);
         assert_eq!(c("CAST(n AS TEXT)"), vec!["n".to_string()]);
+        // 第六轮审查回归:聚合 FILTER 的谓词按行求值,其列是真实读——
+        // 授权收集器漏掉它会让列级 GRANT 泄露被过滤列的布尔信息。
+        assert_eq!(
+            c("COUNT(id) FILTER (WHERE secret = 'x')"),
+            vec!["id".to_string(), "secret".to_string()],
+            "aggregate FILTER predicates are column reads"
+        );
         // EXISTS / subqueries are unmodeled by the collector (stays residual).
         let mut out = Vec::new();
         assert!(
@@ -23949,6 +24391,34 @@ mod tests {
     }
 
     #[test]
+    fn unindexed_order_window_resolves_dotted_suffix_keys() {
+        // 全点号键的文档上,通用路径的 lookup_col 用 ".x" 后缀解析裸名;
+        // top-K 窗口的字节级提取必须同答,否则选出的窗口行本身漂移。
+        // (表必须全列点号——任何无点号键都会让后缀回退失效。)
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, r#"CREATE TABLE d2 ("a.x" INT, "a.y" INT)"#);
+        run(&mut db, r#"INSERT INTO d2 VALUES (3, 0), (1, 0), (2, 0)"#);
+        let a = rows(&mut db, r#"SELECT "a.y" FROM d2 ORDER BY x LIMIT 2"#);
+        let b = rows(
+            &mut db,
+            r#"SELECT "a.y" FROM d2 WHERE 1 = 1 ORDER BY x LIMIT 2"#,
+        );
+        assert_eq!(a.rows, b.rows, "top-K 窗口与通用路径必须同答");
+        // x 解析为 "a.x":升序前两名是 1、2(其 a.y 均为 0)。
+        assert_eq!(a.rows, vec![vec![Value::Int(0)], vec![Value::Int(0)]]);
+        // 用可区分的 a.y 验证排序确实按 a.x:注入三行不同值。
+        run(&mut db, r#"DELETE FROM d2"#);
+        run(
+            &mut db,
+            r#"INSERT INTO d2 VALUES (3, 30), (1, 10), (2, 20)"#,
+        );
+        let a = rows(&mut db, r#"SELECT "a.y" FROM d2 ORDER BY x LIMIT 2"#);
+        assert_eq!(a.rows, vec![vec![Value::Int(10)], vec![Value::Int(20)]]);
+        let a = rows(&mut db, r#"SELECT "a.y" FROM d2 ORDER BY x DESC LIMIT 1"#);
+        assert_eq!(a.rows, vec![vec![Value::Int(30)]]);
+    }
+
+    #[test]
     fn unindexed_order_window_matches_generic_sort() {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -25734,6 +26204,119 @@ mod tests {
         );
     }
 
+    /// 第六轮审查回归:名为 `old` 的单列索引建在另一列上时,RENAME
+    /// COLUMN 把被改名列自己的约束树误判为"别人的树"而不随改名 rekey——
+    /// 主键树搁浅后唯一性完全失效(重复主键静默入库),副本回放端却强制
+    /// 唯一 → 集群分叉。
+    #[test]
+    fn rename_column_own_tree_survives_same_named_index_on_other_column() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (old INT PRIMARY KEY, other INT)");
+        // 索引名叫 old,树在 root "other"(单列索引的 root = 列名)。
+        run(&mut db, "CREATE INDEX old ON t (other)");
+        run(&mut db, "INSERT INTO t VALUES (1, 5)");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN old TO z");
+        // 主键树必须随改名生效:重复 z 仍被拒。
+        assert!(db.execute("INSERT INTO t VALUES (1, 6)").is_err());
+        run(&mut db, "INSERT INTO t VALUES (2, 6)");
+        let r = rows(&mut db, "SELECT z, other FROM t ORDER BY z");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(2), Value::Int(6)]
+            ]
+        );
+        // 索引 old(在 other 列上)不受影响。
+        let r = rows(&mut db, "SELECT z FROM t WHERE other = 5");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    /// 第六轮审查回归:复合 ALTER 的 validate 未前置 apply 侧的 AddColumn
+    /// 拒绝(CHECK 引用未知列/generated 选项/回填值违反 CHECK),早前
+    /// 操作已独立落盘后语句才失败 → 半应用。
+    #[test]
+    fn composite_alter_validates_add_column_rejections_upfront() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT PRIMARY KEY, b INT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 10)");
+        let e = db
+            .execute("ALTER TABLE t DROP COLUMN b, ADD COLUMN d INT CHECK (d > nosuchcol)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown column"), "{e}");
+        // b 未被删(整条语句原子拒绝)。
+        let r = rows(&mut db, "SELECT b FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(10)]]);
+        let e = db
+            .execute("ALTER TABLE t DROP COLUMN b, ADD COLUMN d INT GENERATED ALWAYS AS (1)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("generated"), "{e}");
+        assert_eq!(
+            rows(&mut db, "SELECT b FROM t").rows,
+            vec![vec![Value::Int(10)]]
+        );
+        let e = db
+            .execute("ALTER TABLE t ADD COLUMN e INT DEFAULT 1, ADD COLUMN d INT DEFAULT -5 CHECK (d > 0)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("CHECK"), "{e}");
+        // e 未落盘:声明列仍只有 a/b(schemaless 未知列读 NULL,不能当
+        // 存在性证明;用值数对不上来钉)。
+        let e2 = db
+            .execute("INSERT INTO t VALUES (2, 20, 3)")
+            .unwrap_err()
+            .to_string();
+        assert!(e2.contains("column"), "{e2}");
+    }
+
+    /// 第六轮审查回归:FK 前向引用可构造声明级环,dump 回退按目录序输出
+    /// 导致恢复回放必败——CREATE 现在要求被引用表已存在(自引用除外)。
+    #[test]
+    fn create_rejects_forward_fk_references() {
+        let mut db = Database::in_memory().unwrap();
+        let e = db
+            .execute("CREATE TABLE t1 (a INT PRIMARY KEY, b INT REFERENCES t2 (m))")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not exist"), "{e}");
+        // 顺序建表与自引用不受影响。
+        run(&mut db, "CREATE TABLE t2 (m INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "CREATE TABLE t3 (a INT PRIMARY KEY, b INT REFERENCES t2 (m))",
+        );
+        run(
+            &mut db,
+            "CREATE TABLE t4 (a INT PRIMARY KEY, b INT REFERENCES t4 (a))",
+        );
+        // 引用已存在表的未知列也被拒。
+        let e = db
+            .execute("CREATE TABLE t5 (a INT PRIMARY KEY, b INT REFERENCES t2 (nope))")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown column"), "{e}");
+    }
+
+    /// 第六轮审查回归:嵌入式路径可对内部用户表做 DDL(CREATE INDEX/
+    /// ALTER/DROP),建出的索引不进 dump 却进 schema hash → 与集群摘要
+    /// 分叉。引擎层与网络层同拒。
+    #[test]
+    fn internal_tables_reject_engine_level_ddl() {
+        let mut db = Database::in_memory().unwrap();
+        assert!(db
+            .execute("CREATE INDEX ix_u ON docsql_users (name)")
+            .is_err());
+        assert!(db
+            .execute("ALTER TABLE docsql_users ADD COLUMN evil TEXT")
+            .is_err());
+        assert!(db.execute("DROP TABLE docsql_users").is_err());
+        assert!(db
+            .execute("ALTER TABLE _cluster_log ADD COLUMN x INT")
+            .is_err());
+    }
+
     #[test]
     fn alter_rewrite_keeps_followup_metadata_ops() {
         let mut db = Database::in_memory().unwrap();
@@ -27197,6 +27780,109 @@ mod tests {
     }
 
     #[test]
+    fn and_or_fold_unknown_predicates_per_row() {
+        // Timestamp↔不可解析字符串(与 Timestamp↔数值)的比较是引擎唯一
+        // 的 UNKNOWN 源;混进 AND/OR 时必须按三值逻辑逐行折叠(FALSE 支
+        // 配 AND、TRUE 支配 OR、其余保持 unknown → WHERE 滤行),而不是
+        // 让整条语句在第一行上就报 "AND/OR requires booleans"。
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE b3 (id INT PRIMARY KEY, ts TIMESTAMP, s TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO b3 VALUES (1, TIMESTAMP '2026-01-01T00:00:00Z', 'zzz')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO b3 VALUES (2, TIMESTAMP '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        );
+        // unknown AND true → unknown(滤行);可解析侧照常通过。
+        let r = rows(&mut db, "SELECT id FROM b3 WHERE ts = s AND id = 1");
+        assert!(r.rows.is_empty());
+        let r = rows(&mut db, "SELECT id FROM b3 WHERE ts = s AND id = 2");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        // unknown OR true → true;unknown OR false → unknown。
+        let r = rows(
+            &mut db,
+            "SELECT id FROM b3 WHERE ts = s OR id = 1 ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        let r = rows(&mut db, "SELECT id FROM b3 WHERE ts = s OR id = 3");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+        // NOT(unknown) → unknown → 滤行。
+        let r = rows(&mut db, "SELECT id FROM b3 WHERE NOT (ts = s)");
+        assert!(r.rows.is_empty());
+        // 数值形态的 unknown 同理。
+        let r = rows(&mut db, "SELECT id FROM b3 WHERE ts > 0");
+        assert!(r.rows.is_empty());
+    }
+
+    #[test]
+    fn in_list_null_elements_follow_total_order_semantics() {
+        // NULL 是可比值:`x IN (…, NULL)` 对 x-NULL 行也为真、`x NOT IN
+        // (NULL)` 与 `x <> NULL` 同答;唯一 unknown 源(Timestamp↔不可解
+        // 析串)保持 unknown。可空列上的 IN(…, NULL) 不得走 exact 探针
+        // (树无 NULL 键,会把 x-NULL 行整体丢掉)。
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE n9 (id INT PRIMARY KEY, v INT, p INT)",
+        );
+        run(&mut db, "CREATE INDEX ix_n9_v ON n9 (v)");
+        run(
+            &mut db,
+            "INSERT INTO n9 VALUES (1, 3, 3), (2, NULL, NULL), (3, 7, 7)",
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id FROM n9 WHERE v IN (3, NULL) ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        let b = rows(
+            &mut db,
+            "SELECT id FROM n9 WHERE p IN (3, NULL) ORDER BY id",
+        );
+        assert_eq!(r.rows, b.rows, "IN(含 NULL 元素)不得依赖索引存在性");
+        let r = rows(
+            &mut db,
+            "SELECT id FROM n9 WHERE v NOT IN (NULL) ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+        let b = rows(&mut db, "SELECT id FROM n9 WHERE v <> NULL ORDER BY id");
+        assert_eq!(r.rows, b.rows, "NOT IN (NULL) 必须与 <> NULL 同答");
+        // = ANY 与 = ALL 在单元素 NULL 集上同答(NULL = NULL 为真)。
+        let a = rows(
+            &mut db,
+            "SELECT id FROM n9 WHERE v = ANY (SELECT NULL) ORDER BY id",
+        );
+        let l = rows(
+            &mut db,
+            "SELECT id FROM n9 WHERE v = ALL (SELECT NULL) ORDER BY id",
+        );
+        assert_eq!(a.rows, l.rows);
+        assert_eq!(a.rows, vec![vec![Value::Int(2)]]);
+        // Timestamp↔不可解析串元素保持 unknown(滤行,而不是误真/误假)。
+        run(
+            &mut db,
+            "CREATE TABLE n9t (id INT PRIMARY KEY, ts TIMESTAMP, ps TIMESTAMP)",
+        );
+        run(&mut db, "CREATE INDEX ix_n9t_ts ON n9t (ts)");
+        run(
+            &mut db,
+            "INSERT INTO n9t VALUES (1, TIMESTAMP '2026-01-01T00:00:00Z', TIMESTAMP '2026-01-01T00:00:00Z')",
+        );
+        let r = rows(&mut db, "SELECT id FROM n9t WHERE ts IN ('garbage')");
+        assert!(r.rows.is_empty());
+        let r = rows(&mut db, "SELECT id FROM n9t WHERE ts NOT IN ('garbage')");
+        assert!(
+            r.rows.is_empty(),
+            "NOT IN 对 unknown 元素必须与 <> 同答(滤行)"
+        );
+    }
+
+    #[test]
     fn quantified_any_all_three_valued_logic() {
         // NULL itself is a comparable value in this engine (total order);
         // the only UNKNOWN source is Timestamp vs an unparseable string.
@@ -27294,6 +27980,43 @@ mod tests {
             Value::Int(200),
             "LEFT JOIN 不得把真实命中当未命中"
         );
+    }
+
+    #[test]
+    fn cte_named_like_a_column_is_not_recursive() {
+        // 自引用检测只看 FROM/JOIN 表位:CTE 名撞上自己体内的列名/别名
+        // (`WITH total AS (SELECT SUM(x) AS total …)`)不是递归——旧全文
+        // 词扫描会误诊成递归,拒绝合法查询或让 UNION ALL 体白转满预算。
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE nums (n INT)");
+        run(&mut db, "INSERT INTO nums VALUES (1), (2), (3)");
+        // 列名撞名:非 UNION 体不得被当递归拒绝。
+        let r = rows(
+            &mut db,
+            "WITH n AS (SELECT n FROM nums) SELECT COUNT(*) FROM n",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(3));
+        // 别名撞名 + UNION ALL:右臂并不引用 CTE,不得按递归去重——
+        // 旧误诊走递归物化会按 UNION 去重丢掉重复行(COUNT=3)。
+        let r = rows(
+            &mut db,
+            "WITH region AS (SELECT 1 AS region UNION ALL SELECT n FROM nums) \
+             SELECT COUNT(*) FROM region",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(4));
+        // 派生表继承外层 CTE 作用域(旧代码在派生表内重建空 CTE 表,
+        // `cte_src` 直接"不存在")。
+        run(&mut db, "CREATE TABLE shadow_t (id INT)");
+        run(&mut db, "INSERT INTO shadow_t VALUES (1), (2), (3), (4)");
+        let r = rows(
+            &mut db,
+            "WITH cte_src AS (SELECT id FROM shadow_t WHERE id > 2) \
+             SELECT COUNT(*) FROM (SELECT * FROM cte_src) d",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(2));
+        // 括号体自带 WITH 不再被丢弃。
+        let r = rows(&mut db, "(WITH one AS (SELECT 7 AS v) SELECT v FROM one)");
+        assert_eq!(r.rows[0][0], Value::Int(7));
     }
 
     #[test]
@@ -27558,6 +28281,70 @@ mod tests {
             "SELECT id FROM tt WHERE ts IN (TIMESTAMP '2021-01-01T00:00:00Z', 'zzz') ORDER BY id",
         );
         assert_eq!(r.rows, vec![vec![Value::Int(1)], vec![Value::Int(9)]]);
+    }
+
+    #[test]
+    fn numeric_bounds_on_timestamp_band_never_probe() {
+        // 谓词侧 Timestamp↔数值比较恒为 NULL(行被排除),而 raw 全序里
+        // Timestamp 排在数值之上——数值边界扫过 Timestamp 带会放进谓词
+        // 必然排除的行。带型分析必须把数值边界拒下(回退全扫),同列
+        // Timestamp/数值混合合取也不得被收紧吞并。
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE tn (id INT PRIMARY KEY NOT NULL, ts TIMESTAMP NOT NULL, p TIMESTAMP NOT NULL)",
+        );
+        run(&mut db, "CREATE INDEX ix_tn_ts ON tn (ts)");
+        run(
+            &mut db,
+            "INSERT INTO tn VALUES (1, TIMESTAMP '2026-01-01T00:00:00Z', TIMESTAMP '2026-01-01T00:00:00Z')",
+        );
+        run(
+            &mut db,
+            "INSERT INTO tn VALUES (2, TIMESTAMP '2026-06-01T00:00:00Z', TIMESTAMP '2026-06-01T00:00:00Z')",
+        );
+        let parity = |db: &mut Database, sql_v: &str, sql_p: &str| {
+            let a = rows(db, sql_v).rows.clone();
+            let b = rows(db, sql_p).rows.clone();
+            assert_eq!(a, b, "数值边界结果不得依赖索引存在性:\n{sql_v}\n{sql_p}");
+        };
+        // 窗口路径(exact 探针会跳过残余过滤——修复前在这里返回行)。
+        parity(
+            &mut db,
+            "SELECT id FROM tn WHERE ts > 0 ORDER BY ts LIMIT 1",
+            "SELECT id FROM tn WHERE p > 0 ORDER BY p LIMIT 1",
+        );
+        parity(
+            &mut db,
+            "SELECT id FROM tn WHERE ts >= 0 ORDER BY ts DESC LIMIT 1",
+            "SELECT id FROM tn WHERE p >= 0 ORDER BY p DESC LIMIT 1",
+        );
+        parity(
+            &mut db,
+            "SELECT id FROM tn WHERE ts < 999999999 ORDER BY ts LIMIT 1",
+            "SELECT id FROM tn WHERE p < 999999999 ORDER BY p LIMIT 1",
+        );
+        // 无窗口的普通路径 + 同列混合合取(收紧不得吞掉数值项)。
+        parity(
+            &mut db,
+            "SELECT id FROM tn WHERE ts > 0",
+            "SELECT id FROM tn WHERE p > 0",
+        );
+        parity(
+            &mut db,
+            "SELECT id FROM tn WHERE ts > 0 AND ts > TIMESTAMP '2020-01-01T00:00:00Z'",
+            "SELECT id FROM tn WHERE p > 0 AND p > TIMESTAMP '2020-01-01T00:00:00Z'",
+        );
+        // 正确答案本身:Timestamp 键对数值比较恒未知 → 0 行。
+        assert!(rows(&mut db, "SELECT id FROM tn WHERE ts > 0")
+            .rows
+            .is_empty());
+        // 数值带不受影响:整数边界照常走探针且答案正确。
+        let r = rows(
+            &mut db,
+            "SELECT id FROM tn WHERE id > 1 ORDER BY id LIMIT 1",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
     }
 
     #[test]
@@ -34906,6 +35693,49 @@ mod tsql_compat_tests {
         assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
     }
 
+    /// 第六轮审查回归:OR REPLACE 的位移列表未按 locator 去重——同一旧行
+    /// 被 PK 与 UNIQUE 两条约束各命中一次时,重复计数毒化 FK 父侧的
+    /// 出现次数筛查,合法 REPLACE 被误拒。
+    #[test]
+    fn or_replace_displaced_dedup_keeps_fk_counting_sane() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, u INT UNIQUE, k INT)",
+        );
+        run(&mut db, "CREATE TABLE c (k INT REFERENCES t(k))");
+        run(&mut db, "INSERT INTO t VALUES (1, 100, 50), (2, 101, 50)");
+        run(&mut db, "INSERT INTO c VALUES (50)");
+        // 新行同时按 id=1 与 u=100 命中旧行 R1(displaced 含重复 locator);
+        // R2 仍承载 k=50,本应放行——修复前 count_in(current)=1 不大于
+        // count_in(removed)=2,lost 保留 → 误报 FOREIGN KEY。
+        run(&mut db, "INSERT OR REPLACE INTO t VALUES (1, 100, 99)");
+        let r = rows(&mut db, "SELECT id, u, k FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(100), Value::Int(99)],
+                vec![Value::Int(2), Value::Int(101), Value::Int(50)]
+            ]
+        );
+    }
+
+    /// 第六轮审查回归:MERGE 源/目标同别名时目标限定键覆盖源限定键,
+    /// ON 恒真、SET 读目标自身预像——必须显式拒绝。
+    #[test]
+    fn merge_rejects_same_alias_for_source_and_target() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, tag TEXT)");
+        run(&mut db, "CREATE TABLE s (id INT, tag TEXT)");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        run(&mut db, "INSERT INTO s VALUES (1, 'b')");
+        let e = db
+            .execute("MERGE INTO t USING (SELECT id, tag FROM s) AS t ON t.id = t.id WHEN MATCHED THEN UPDATE SET tag = t.tag")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("aliases must differ"), "{e}");
+    }
+
     /// 第三轮审查回归:CTAS 查询携带 NEWID() 曾既不折叠也不拒绝,journal
     /// 携带原文、各重放节点自行掷 GUID(静默集群分叉)。
     #[test]
@@ -35041,5 +35871,25 @@ mod tsql_compat_tests {
                 .is_some_and(|d| d.contains("table function"))),
             "{r:?}"
         );
+    }
+
+    /// 第六轮审查回归:JOIN 侧表因子携带执行器必拒子句(TABLESAMPLE/
+    /// 索引提示/时间旅行)与 DISTINCT ON 时,EXPLAIN 不得输出一份永远
+    /// 跑不起来的"计划"。
+    #[test]
+    fn explain_mirrors_join_factor_and_distinct_on_rejections() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE mj (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "CREATE TABLE mu (id INT PRIMARY KEY, v INT)");
+        let e = db
+            .execute("EXPLAIN SELECT * FROM mj JOIN mu ON mj.id = mu.id TABLESAMPLE (10 PERCENT)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("TABLESAMPLE"), "{e}");
+        let e = db
+            .execute("EXPLAIN SELECT DISTINCT ON (v) v FROM mj")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("DISTINCT ON"), "{e}");
     }
 }

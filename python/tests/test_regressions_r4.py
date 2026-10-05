@@ -88,6 +88,7 @@ def _stub_subscriber(on_message=lambda m: None):
     st._write_lock = threading.Lock()
     st._control_busy = False
     st._closed = threading.Event()
+    st._generation = 0
     st._conn = _StubConn(_StubTransport())
     st._reader = None
     return st
@@ -145,7 +146,7 @@ def test_resubscribe_push_dispatch_runs_outside_write_lock(monkeypatch):
     monkeypatch.setattr(submod, "connect", lambda **kw: conn)
     monkeypatch.setattr(submod.time, "sleep", lambda s: None)  # skip backoff
 
-    assert st._resubscribe() is True
+    assert st._resubscribe(st._generation) is True
     assert inner_done.wait(5), "callback re-entered control under the write lock while resubscribing"
     assert st._channels == {"outer": "latest", "inner": "latest"}
 
@@ -201,7 +202,7 @@ def test_close_during_backoff_sleep_never_connects(monkeypatch):
         st._closed.set()  # close() fires while the reader is mid-backoff
 
     monkeypatch.setattr(submod.time, "sleep", sleep_sets_closed)
-    assert st._resubscribe() is False
+    assert st._resubscribe(st._generation) is False
     assert connects == [], "reconnect attempted after close()"
 
 
@@ -220,7 +221,7 @@ def test_close_racing_connect_install_closes_fresh_connection(monkeypatch):
 
     monkeypatch.setattr(submod, "connect", fake_connect)
     monkeypatch.setattr(submod.time, "sleep", lambda s: None)
-    assert st._resubscribe() is False
+    assert st._resubscribe(st._generation) is False
     assert len(conns) == 1 and conns[0].closed, "freshly installed connection leaked"
 
 
@@ -238,7 +239,7 @@ def test_close_racing_drain_closes_installed_connection(monkeypatch):
     conn = _StubConn(tr)
     monkeypatch.setattr(submod, "connect", lambda **kw: conn)
     monkeypatch.setattr(submod.time, "sleep", lambda s: None)
-    assert st._resubscribe() is False
+    assert st._resubscribe(st._generation) is False
     assert conn.closed, "confirmed-but-closed resubscribe leaked its connection"
 
 
@@ -448,7 +449,7 @@ def test_resubscribe_drains_stale_replies_and_clears_flag(monkeypatch):
     monkeypatch.setattr(submod, "connect", lambda **kw: conn)
     monkeypatch.setattr(submod.time, "sleep", lambda s: None)
 
-    assert st._resubscribe() is True
+    assert st._resubscribe(st._generation) is True
     assert st._replies_stale is False
     assert st._replies.qsize() == 0
     # The fresh control sequence went out on the new wire.
@@ -473,3 +474,23 @@ def test_lone_surrogate_param_via_execute(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT 1")
         assert cur.fetchall() == [(1,)]
+
+
+# ---- 第六轮审查回归:读者代际 -------------------------------------------------
+
+
+def test_stale_generation_resubscribe_never_overwrites(monkeypatch):
+    """_control 重建连接并递增代际后,退避中醒来的旧读者不得覆盖新连接
+    (更不许再起第二条读线程/多带一条泄漏的 socket)。"""
+    st = _stub_subscriber()
+    st._channels = {"ch": "latest"}
+    fresh = _StubConn(_StubTransport(frames=[(0, RESP_PONG, b"")]))
+    st._conn = fresh
+    st._generation = 1  # _control 已重建并递增
+    calls = []
+    monkeypatch.setattr(submod, "connect", lambda **kw: calls.append(kw) or _StubConn(_StubTransport()))
+    monkeypatch.setattr(submod.time, "sleep", lambda s: None)
+    # 旧代际的 resubscribe 立即让位:不拨号、不安装、不覆盖。
+    assert st._resubscribe(0) is False
+    assert st._conn is fresh
+    assert calls == []

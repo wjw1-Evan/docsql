@@ -885,7 +885,9 @@ pub async fn run(cfg: ServerConfig) -> std::io::Result<()> {
             eprintln!("sync: gate still open after bootstrap exit; draining the queue");
             let deadline = tokio::time::Instant::now() + SYNC_WATCHDOG_GRACE;
             if tokio::time::timeout_at(deadline, async {
-                drain_sync_queue(&st, false).await;
+                // Watchdog close: the owning task is gone, this node is
+                // serving — the gate must close.
+                drain_sync_queue(&st, false, true).await;
                 flush_gate_pubsub_notify(&st).await;
             })
             .await
@@ -1675,7 +1677,9 @@ pub async fn handle_connection(
                     break;
                 }
                 if let Err(e) = inbound_replay.check(&frame.payload) {
-                    let _ = tx.send(Frame::new(proto::RESP_ERROR, err_payload(&e))).await;
+                    let _ = tx
+                        .send(Frame::new(proto::RESP_ERROR, err_payload(&e)))
+                        .await;
                     break;
                 }
                 match crypto::open(
@@ -1734,9 +1738,7 @@ pub async fn handle_connection(
                     || (state.cluster_token.is_none()
                         && (token_authed
                             || (state.auth_token.is_none()
-                                && !state
-                                    .has_users
-                                    .load(std::sync::atomic::Ordering::SeqCst)))));
+                                && !state.has_users.load(std::sync::atomic::Ordering::SeqCst)))));
             // Least-privilege gate: a read-only-token connection may read
             // and subscribe, but every durable write is refused here so
             // no handler can accidentally apply one.
@@ -1762,8 +1764,7 @@ pub async fn handle_connection(
                     || sub.as_deref() == Some("trim")
                     || (frame.frame_type == proto::REQ_SQL && {
                         let sql = proto::decode_sql(&frame.payload).unwrap_or_default();
-                        docsql_core::engine::Database::is_write_statement(&sql)
-                            || tx_control(&sql)
+                        docsql_core::engine::Database::is_write_statement(&sql) || tx_control(&sql)
                     })
                     || (frame.frame_type == proto::REQ_EXECUTE && {
                         // The prepared template decides the statement kind —
@@ -1808,10 +1809,9 @@ pub async fn handle_connection(
                 // session (same race the login path already closes).
                 let refreshed = {
                     let mut db = state.db.write().unwrap_or_else(|p| p.into_inner());
-                    let grants =
-                        docsql_core::useradmin::resolve_grants(&mut db, &name)
-                            .ok()
-                            .flatten();
+                    let grants = docsql_core::useradmin::resolve_grants(&mut db, &name)
+                        .ok()
+                        .flatten();
                     let epoch = state.grants_epoch.load(std::sync::atomic::Ordering::SeqCst);
                     grants.map(|g| (UserAuth { name, grants: g }, epoch))
                 };
@@ -1830,8 +1830,7 @@ pub async fn handle_connection(
                         .await;
                     break;
                 }
-                let (auth, epoch) =
-                    refreshed.expect("none case breaks above before reaching here");
+                let (auth, epoch) = refreshed.expect("none case breaks above before reaching here");
                 user = Some(auth);
                 user_epoch = epoch;
             }
@@ -1849,8 +1848,8 @@ pub async fn handle_connection(
             // A flagged REQ_STATUS is the peer status probe (compat-mode joins
             // need it before any token exists); an unflagged one is a client
             // asking for topology and stays gated.
-            let peer_probe = frame.frame_type == proto::REQ_STATUS
-                && frame.flags & FLAG_REPLICATION != 0;
+            let peer_probe =
+                frame.frame_type == proto::REQ_STATUS && frame.flags & FLAG_REPLICATION != 0;
             // The data plane closes with the anonymous era; the replication
             // channel (REQ_SQL_SEQ/REQ_DIGEST/REQ_SYNC/…) deliberately does
             // NOT — token-less peers' AUTH is vacuous and join/fanout depend
@@ -1880,6 +1879,9 @@ pub async fn handle_connection(
                         | proto::REQ_SESSIONS
                         | proto::REQ_KILL
                         | proto::REQ_SESSION_RESET
+                        | proto::REQ_UNSUBSCRIBE
+                        | proto::REQ_PUNSUBSCRIBE
+                        | proto::REQ_CLOSE_STMT
                 )
             {
                 let _ = tx
@@ -1976,6 +1978,13 @@ pub async fn handle_connection(
                     // configured every AUTH succeeds (auth disabled).
                     // Failures are counted per source IP; past the
                     // threshold the source is locked out for a window.
+                    //
+                    // One identity per connection, same rule REQ_AUTH_USER
+                    // already enforces: re-AUTH over a session holding a
+                    // user/token kept the OLD user's grants alive under the
+                    // NEW role (a mixed session — no escalation, since each
+                    // gate re-checks its own identity, but never a clean
+                    // state either).
                     let token = String::from_utf8_lossy(&frame.payload);
                     let cluster_match = state.cluster_token.as_ref().is_some_and(|ct| {
                         crypto::constant_time_eq(token.as_bytes(), ct.as_bytes())
@@ -1996,6 +2005,13 @@ pub async fn handle_connection(
                     if cluster_match {
                         role = ConnRole::Peer;
                         token_authed = true;
+                        // Re-AUTH is the documented mid-session credential
+                        // switch (CLI `auth <token>;`): the token role
+                        // REPLACES any user identity instead of stacking on
+                        // it — a user login's grants surviving under a token
+                        // role was a mixed session whose every gate had to
+                        // remember which identity it checked.
+                        user = None;
                         session.set_identity("cluster peer");
                         state.auth_failures.lock().await.remove(source_ip);
                         audit(true, "cluster token accepted", &state);
@@ -2011,6 +2027,7 @@ pub async fn handle_connection(
                             state.auth_token.is_none() && state.read_token.is_none();
                         if client_match || auth_disabled {
                             role = ConnRole::Client;
+                            user = None; // the token/anonymous role replaces the user identity
                             if client_match {
                                 token_authed = true;
                                 session.set_identity("client token");
@@ -2025,6 +2042,7 @@ pub async fn handle_connection(
                         } else if read_match {
                             role = ConnRole::ReadOnly;
                             token_authed = true;
+                            user = None; // same replacement rule
                             session.set_identity("read-only token");
                             state.auth_failures.lock().await.remove(source_ip);
                             audit(true, "read token accepted", &state);
@@ -2122,23 +2140,23 @@ pub async fn handle_connection(
                             .unwrap_or_default(),
                         ))
                     } else {
-                    // Topology, paths and journal windows are node-operational
-                    // detail: user logins need the admin role for it (token
-                    // connections are the operator's own credential).
-                    if role == ConnRole::ReadOnly
-                        || user.as_ref().is_some_and(|u| !u.grants.admin)
-                    {
-                        Some(Frame::new(
-                            proto::RESP_ERROR,
-                            err_payload("cluster status requires the admin role"),
-                        ))
-                    } else {
-                        // Read-only node report for cluster monitoring; not an SQL
-                        // statement, so it bypasses the query log.
-                        let payload = serde_json::to_vec(&status_payload(&state).await)
-                            .unwrap_or_else(|_| b"{}".to_vec());
-                        Some(Frame::new(proto::RESP_STATUS, payload))
-                    }
+                        // Topology, paths and journal windows are node-operational
+                        // detail: user logins need the admin role for it (token
+                        // connections are the operator's own credential).
+                        if role == ConnRole::ReadOnly
+                            || user.as_ref().is_some_and(|u| !u.grants.admin)
+                        {
+                            Some(Frame::new(
+                                proto::RESP_ERROR,
+                                err_payload("cluster status requires the admin role"),
+                            ))
+                        } else {
+                            // Read-only node report for cluster monitoring; not an SQL
+                            // statement, so it bypasses the query log.
+                            let payload = serde_json::to_vec(&status_payload(&state).await)
+                                .unwrap_or_else(|_| b"{}".to_vec());
+                            Some(Frame::new(proto::RESP_STATUS, payload))
+                        }
                     }
                 }
                 proto::REQ_SESSION_RESET if authed => {
@@ -2155,8 +2173,7 @@ pub async fn handle_connection(
                     // Activity monitor: seeing other connections' current
                     // statements is admin-only (statement texts carry data
                     // values; the audit-log rule applies).
-                    if role == ConnRole::ReadOnly
-                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    if role == ConnRole::ReadOnly || user.as_ref().is_some_and(|u| !u.grants.admin)
                     {
                         Some(Frame::new(
                             proto::RESP_ERROR,
@@ -2173,8 +2190,7 @@ pub async fn handle_connection(
                     // your OWN connection is refused loudly — the operator
                     // should disconnect instead, and the console must not be
                     // able to sever the very leg it is managing through.
-                    if role == ConnRole::ReadOnly
-                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    if role == ConnRole::ReadOnly || user.as_ref().is_some_and(|u| !u.grants.admin)
                     {
                         Some(Frame::new(
                             proto::RESP_ERROR,
@@ -2190,7 +2206,9 @@ pub async fn handle_connection(
                         if id == conn_id {
                             Some(Frame::new(
                                 proto::RESP_ERROR,
-                                err_payload("refusing to kill your own connection; disconnect instead"),
+                                err_payload(
+                                    "refusing to kill your own connection; disconnect instead",
+                                ),
                             ))
                         } else {
                             let sessions = state.sessions.lock().await;
@@ -2214,8 +2232,7 @@ pub async fn handle_connection(
                     // The statement audit log carries other users' data
                     // values (only PASSWORD literals are redacted): same
                     // admin rule as reading the user tables.
-                    if role == ConnRole::ReadOnly
-                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    if role == ConnRole::ReadOnly || user.as_ref().is_some_and(|u| !u.grants.admin)
                     {
                         Some(Frame::new(
                             proto::RESP_ERROR,
@@ -2236,8 +2253,7 @@ pub async fn handle_connection(
                     // Full catalog shape (tables, columns, row counts, paths):
                     // admin-only for user logins, same boundary as the audit
                     // log above.
-                    if role == ConnRole::ReadOnly
-                        || user.as_ref().is_some_and(|u| !u.grants.admin)
+                    if role == ConnRole::ReadOnly || user.as_ref().is_some_and(|u| !u.grants.admin)
                     {
                         Some(Frame::new(
                             proto::RESP_ERROR,
@@ -2279,7 +2295,12 @@ pub async fn handle_connection(
                     // Post-row-filter text when a filter rewrote the
                     // statement (None = record the user's original).
                     let mut logged_effective: Option<String> = None;
-                    let resp = match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly) {
+                    let resp = match querylog::try_serve_log_view(
+                        &sql,
+                        &state,
+                        user.as_ref(),
+                        role == ConnRole::ReadOnly,
+                    ) {
                         // 读日志的查询本身不写日志(避免读日志刷日志)。
                         Some(f) => f,
                         None => {
@@ -2332,20 +2353,29 @@ pub async fn handle_connection(
                                         peer: peer.clone(),
                                         stmt_identity: None,
                                     };
-                                    match tsql_session
-                                        .run_batch(&sql, &mut exec)
-                                        .await
-                                    {
+                                    match tsql_session.run_batch(&sql, &mut exec).await {
                                         Ok(out) => {
                                             for msg in tsql_session.take_prints() {
                                                 eprintln!("conn {conn_id} PRINT: {msg}");
                                             }
                                             exec_result_frame(out)
                                         }
-                                        Err(e) => Frame::new(
-                                            proto::RESP_ERROR,
-                                            err_payload(&e.to_string()),
-                                        ),
+                                        Err(e) => {
+                                            // Drain PRINTs on the failure
+                                            // path too: batch scripts report
+                                            // progress before failing, and
+                                            // the CLI already keeps them —
+                                            // dropping them here hid exactly
+                                            // the output that explains the
+                                            // failure.
+                                            for msg in tsql_session.take_prints() {
+                                                eprintln!("conn {conn_id} PRINT: {msg}");
+                                            }
+                                            Frame::new(
+                                                proto::RESP_ERROR,
+                                                err_payload(&e.to_string()),
+                                            )
+                                        }
                                     }
                                 }
                                 None => {
@@ -2362,16 +2392,15 @@ pub async fn handle_connection(
                                             .unwrap_or_else(|p| p.into_inner())
                                             .table_exists("docsql_pubsub")
                                     };
-                                    let (effective, allow_system) = if is_replication
-                                        || user_table_wins
-                                    {
-                                        (sql.clone(), false)
-                                    } else {
-                                        match pubsub::try_rewrite_pubsub_view(&sql) {
-                                            Some(rewritten) => (rewritten, true),
-                                            None => (sql.clone(), false),
-                                        }
-                                    };
+                                    let (effective, allow_system) =
+                                        if is_replication || user_table_wins {
+                                            (sql.clone(), false)
+                                        } else {
+                                            match pubsub::try_rewrite_pubsub_view(&sql) {
+                                                Some(rewritten) => (rewritten, true),
+                                                None => (sql.clone(), false),
+                                            }
+                                        };
                                     logged = true;
                                     // Client statements get the wall-clock
                                     // budget; replication apply must run
@@ -2397,58 +2426,38 @@ pub async fn handle_connection(
                                     // targets) — anything unauthorized or
                                     // unclassifiable falls through to the
                                     // original path and its error.
-                                    let tx_owner_active = state
-                                        .tx_owner
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .is_some();
-                                    let parsed_stmt =
-                                        Database::parse_classified(&effective).ok();
-                                    // The db reference is load-bearing: view
-                                    // base-table expansion (a view over
-                                    // docsql_users must refuse non-admins
-                                    // HERE, or the MVCC fast path leaks the
-                                    // hashes the write tier refuses). The
-                                    // guard is a microsecond-scale read lock.
-                                    let authorized = match (&parsed_stmt, &user) {
-                                        (Some(p), Some(u)) => {
-                                            let db_ref =
-                                                state.db.read().unwrap_or_else(|p| p.into_inner());
-                                            authorize_statement(
-                                                Some(&db_ref),
-                                                &p.stmt,
-                                                &p.tx,
-                                                p.is_write,
-                                                &u.grants,
-                                            )
-                                            .is_ok()
-                                        }
-                                        (Some(_), None) => true, // token/开放连接
-                                        _ => false,
-                                    };
                                     let read_eligible = !is_replication
-                                        && !tx_owner_active
-                                        && authorized
-                                        && parsed_stmt.as_ref().is_some_and(|p| {
-                                            !p.is_write
-                                                && p.tx == TxControl::None
-                                                && matches!(
-                                                    &p.stmt,
-                                                    AnyStmt::Sql(s) if matches!(
-                                                        &**s,
-                                                        sqlparser::ast::Statement::Query(q) if q.with.is_none()
-                                                    )
-                                                )
-                                        });
+                                        && classify_read_eligible(
+                                            &state,
+                                            &effective,
+                                            user.as_ref(),
+                                        );
                                     if read_eligible {
-                                        execute_read_sql(
+                                        let (resp, rowcount) = execute_read_sql(
                                             &state,
                                             &effective,
                                             stmt_deadline,
                                             user.as_ref(),
                                             &mut logged_effective,
                                         )
-                                        .await
+                                        .await;
+                                        // Same session bookkeeping the write
+                                        // branch below applies: the read tier
+                                        // owns @@ERROR/@@ROWCOUNT for its
+                                        // statements too (it used to leave
+                                        // the last interpreted statement's
+                                        // values in place).
+                                        if resp.frame_type == proto::RESP_ERROR {
+                                            tsql_session.note_error(
+                                                docsql_core::tsql_batch::error_code_from_text(
+                                                    &String::from_utf8_lossy(&resp.payload),
+                                                ),
+                                            );
+                                        } else {
+                                            tsql_session.note_error(0);
+                                        }
+                                        tsql_session.note_rowcount(rowcount);
+                                        resp
                                     } else {
                                         let (resp, identity) = execute_sql_with_identity(
                                             &state,
@@ -2477,7 +2486,9 @@ pub async fn handle_connection(
                                         // later batch sees this statement's
                                         // effects.
                                         if !is_replication {
-                                            if docsql_core::tsql_batch::is_insert_statement(&effective) {
+                                            if docsql_core::tsql_batch::is_insert_statement(
+                                                &effective,
+                                            ) {
                                                 tsql_session.note_identity(
                                                     identity.map(docsql_core::Value::Int),
                                                 );
@@ -2495,6 +2506,7 @@ pub async fn handle_connection(
                                                 // 成功语句留下 stale 错误码。
                                                 tsql_session.note_error(0);
                                             }
+                                            tsql_session.note_rowcount(resp_row_count(&resp));
                                         }
                                         resp
                                     }
@@ -2536,9 +2548,7 @@ pub async fn handle_connection(
                     } else if prepared.len() >= MAX_PREPARED_STATEMENTS {
                         Some(Frame::new(
                             proto::RESP_ERROR,
-                            err_payload(
-                                "prepare: too many prepared statements on this connection",
-                            ),
+                            err_payload("prepare: too many prepared statements on this connection"),
                         ))
                     } else {
                         let h = next_stmt_handle;
@@ -2572,66 +2582,108 @@ pub async fn handle_connection(
                             bind_params(tpl, &params),
                             format!("{tpl}  [{} bound parameter(s)]", params.len()),
                         ),
-                        None => (Err("execute: unknown statement handle".to_string()), String::new()),
+                        None => (
+                            Err("execute: unknown statement handle".to_string()),
+                            String::new(),
+                        ),
                     };
-                        match rendered {
-                            Ok(mut sql) => {
-                                let started = std::time::Instant::now();
-                                let deadline = state
-                                    .statement_timeout
-                                    .map(|t| std::time::Instant::now() + t);
-                                // Same docsql_pubsub decision as the REQ_SQL
-                                // arm: a user table by that name must not be
-                                // shadowed by the compat view here either —
-                                // the prepared path used to skip the rewrite
-                                // and fail with "no such table".
-                                if !state
-                                    .db
-                                    .read()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .table_exists("docsql_pubsub")
-                                {
-                                    if let Some(rewritten) =
-                                        pubsub::try_rewrite_pubsub_view(&sql)
-                                    {
-                                        sql = rewritten;
-                                    }
+                    match rendered {
+                        Ok(mut sql) => {
+                            let started = std::time::Instant::now();
+                            let deadline = state
+                                .statement_timeout
+                                .map(|t| std::time::Instant::now() + t);
+                            // Same docsql_pubsub decision as the REQ_SQL
+                            // arm: a user table by that name must not be
+                            // shadowed by the compat view here either —
+                            // the prepared path used to skip the rewrite
+                            // and fail with "no such table".
+                            if !state
+                                .db
+                                .read()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .table_exists("docsql_pubsub")
+                            {
+                                if let Some(rewritten) = pubsub::try_rewrite_pubsub_view(&sql) {
+                                    sql = rewritten;
                                 }
-                                let mut exec_logged_sql: Option<String> = None;
-                                let (resp, logged) =
-                                    match querylog::try_serve_log_view(&sql, &state, user.as_ref(), role == ConnRole::ReadOnly)
-                                    {
-                                    // 读日志的查询本身不写日志(避免读日志刷日志)。
-                                    Some(f) => ((f, None), false),
-                                    None => (
-                                        execute_sql_with_identity(
-                                            &state,
-                                            &sql,
-                                            false,
-                                            false,
-                                            Some(conn_id),
-                                            false,
-                                            None,
-                                            user.as_ref(),
-                                            deadline,
-                                            &mut exec_logged_sql,
-                                        )
-                                        .await,
-                                        true,
-                                    ),
-                                };
+                            }
+                            let mut exec_logged_sql: Option<String> = None;
+                            // Activity monitor + MVCC parity: a prepared
+                            // SELECT is the same read-only statement its
+                            // REQ_SQL twin is — route it through the
+                            // read tier (it used to take the exclusive
+                            // write lock for every parameterized
+                            // SELECT, freezing the node's writers), and
+                            // keep the session's statement counter
+                            // current either way.
+                            session.start_statement(&sql);
+                            let read_eligible = classify_read_eligible(&state, &sql, user.as_ref());
+                            let (resp, logged) = match querylog::try_serve_log_view(
+                                &sql,
+                                &state,
+                                user.as_ref(),
+                                role == ConnRole::ReadOnly,
+                            ) {
+                                // 读日志的查询本身不写日志(避免读日志刷日志)。
+                                Some(f) => ((f, None), false),
+                                None if read_eligible => {
+                                    let (f, _rc) = execute_read_sql(
+                                        &state,
+                                        &sql,
+                                        deadline,
+                                        user.as_ref(),
+                                        &mut exec_logged_sql,
+                                    )
+                                    .await;
+                                    // The row count is consumed below via
+                                    // resp_row_count, same as the REQ_SQL
+                                    // fast path.
+                                    ((f, None), true)
+                                }
+                                None => (
+                                    execute_sql_with_identity(
+                                        &state,
+                                        &sql,
+                                        false,
+                                        false,
+                                        Some(conn_id),
+                                        false,
+                                        None,
+                                        user.as_ref(),
+                                        deadline,
+                                        &mut exec_logged_sql,
+                                    )
+                                    .await,
+                                    true,
+                                ),
+                            };
                             let (resp, identity) = resp;
+                            if logged {
+                                // @@ERROR/@@ROWCOUNT parity with the REQ_SQL
+                                // fast paths (a failed EXECUTE used to leave
+                                // the previous statement's code/current
+                                // count in place).
+                                if resp.frame_type == proto::RESP_ERROR {
+                                    tsql_session.note_error(
+                                        docsql_core::tsql_batch::error_code_from_text(
+                                            &String::from_utf8_lossy(&resp.payload),
+                                        ),
+                                    );
+                                } else {
+                                    tsql_session.note_error(0);
+                                }
+                                tsql_session.note_rowcount(resp_row_count(&resp));
+                            }
+                            session.finish_statement();
                             // Same session bookkeeping as the REQ_SQL fast
                             // path: a parameterized INSERT owns the
                             // connection's @@IDENTITY/SCOPE_IDENTITY, and a
                             // later batch must see this statement's effects
                             // (it used to keep the previous fast-path
                             // INSERT's id).
-                            if logged
-                                && docsql_core::tsql_batch::is_insert_statement(&sql)
-                            {
-                                tsql_session
-                                    .note_identity(identity.map(docsql_core::Value::Int));
+                            if logged && docsql_core::tsql_batch::is_insert_statement(&sql) {
+                                tsql_session.note_identity(identity.map(docsql_core::Value::Int));
                             }
                             if logged {
                                 querylog::record(
@@ -2686,7 +2738,8 @@ pub async fn handle_connection(
                             // position exact.
                             let queued = if docsql_core::engine::Database::is_write_statement(&sql)
                             {
-                                gate_enqueue(&state, Some((node_id.clone(), seq)), &sql, false).await
+                                gate_enqueue(&state, Some((node_id.clone(), seq)), &sql, false)
+                                    .await
                             } else {
                                 None
                             };
@@ -2716,47 +2769,45 @@ pub async fn handle_connection(
                                             )),
                                         ))
                                     } else {
-                                    let _origin_guard = origin_lock.lock_owned().await;
-                                    let already_applied = {
-                                        let mut db = state
-                                            .db
-                                            .write()
-                                            .unwrap_or_else(|p| p.into_inner());
-                                        db.position_get(&node_id)
-                                            .ok()
-                                            .flatten()
-                                            .is_some_and(|pos| pos >= seq)
-                                    };
-                                    if already_applied {
-                                        Some(Frame::new(
-                                            proto::RESP_AFFECTED,
-                                            0u64.to_le_bytes().to_vec(),
-                                        ))
-                                    } else {
-                                    let started = std::time::Instant::now();
-                                    let resp = execute_sql(
-                                        &state,
-                                        &sql,
-                                        false,
-                                        true,
-                                        None,
-                                        false,
-                                        Some((&node_id, seq)),
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                    // Same audit trail as plain REQ_SQL applies.
-                                    querylog::record(
-                                        &state,
-                                        &peer,
-                                        &sql,
-                                        started.elapsed().as_secs_f64() * 1000.0,
-                                        &resp,
-                                        true,
-                                    );
-                                    Some(resp)
-                                    }
+                                        let _origin_guard = origin_lock.lock_owned().await;
+                                        let already_applied = {
+                                            let mut db =
+                                                state.db.write().unwrap_or_else(|p| p.into_inner());
+                                            db.position_get(&node_id)
+                                                .ok()
+                                                .flatten()
+                                                .is_some_and(|pos| pos >= seq)
+                                        };
+                                        if already_applied {
+                                            Some(Frame::new(
+                                                proto::RESP_AFFECTED,
+                                                0u64.to_le_bytes().to_vec(),
+                                            ))
+                                        } else {
+                                            let started = std::time::Instant::now();
+                                            let resp = execute_sql(
+                                                &state,
+                                                &sql,
+                                                false,
+                                                true,
+                                                None,
+                                                false,
+                                                Some((&node_id, seq)),
+                                                None,
+                                                None,
+                                            )
+                                            .await;
+                                            // Same audit trail as plain REQ_SQL applies.
+                                            querylog::record(
+                                                &state,
+                                                &peer,
+                                                &sql,
+                                                started.elapsed().as_secs_f64() * 1000.0,
+                                                &resp,
+                                                true,
+                                            );
+                                            Some(resp)
+                                        }
                                     }
                                 }
                             }
@@ -2824,9 +2875,9 @@ pub async fn handle_connection(
                 proto::REQ_PUNSUBSCRIBE if authed => Some(
                     handle_unsubscribe(&state, conn_id, &frame, pubsub::SubKind::Pattern).await,
                 ),
-                proto::REQ_PUBSUB if authed => {
-                    Some(handle_pubsub_cmd(&state, &frame, user.as_ref(), &peer, replication_ok).await)
-                }
+                proto::REQ_PUBSUB if authed => Some(
+                    handle_pubsub_cmd(&state, &frame, user.as_ref(), &peer, replication_ok).await,
+                ),
                 proto::REQ_BACKUP if authed => {
                     Some(backup::handle_backup(&state, role, &frame, user.as_ref(), &peer).await)
                 }
@@ -3305,6 +3356,28 @@ fn exec_result_frame(out: Option<docsql_core::tsql_batch::ExecResult>) -> Frame 
     }
 }
 
+/// Rows affected/returned by a response frame, for @@ROWCOUNT bookkeeping
+/// on the fast paths (RESP_AFFECTED carries a LE u64; RESP_ROWS carries the
+/// JSON result whose `rows` array length is the count; anything else is 0).
+fn resp_row_count(f: &Frame) -> u64 {
+    if f.frame_type == proto::RESP_AFFECTED {
+        let mut bytes = [0u8; 8];
+        let n = f.payload.len().min(8);
+        bytes[..n].copy_from_slice(&f.payload[..n]);
+        return u64::from_le_bytes(bytes);
+    }
+    if f.frame_type == proto::RESP_ROWS {
+        if let Ok(docsql_core::Value::Object(obj)) =
+            docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
+        {
+            if let Some(docsql_core::Value::Array(rows)) = obj.get("rows") {
+                return rows.len() as u64;
+            }
+        }
+    }
+    0
+}
+
 fn outcome_frame<E: std::fmt::Display>(outcome: std::result::Result<ExecOutcome, E>) -> Frame {
     match outcome {
         Ok(ExecOutcome::Rows(r)) => {
@@ -3344,7 +3417,7 @@ async fn execute_read_sql(
     deadline: Option<std::time::Instant>,
     user: Option<&UserAuth>,
     logged_sql: &mut Option<String>,
-) -> Frame {
+) -> (Frame, u64) {
     // Row-filter enforcement for the MVCC read tier (execute_sql_inner
     // does the same for every other user-carrying path; a statement goes
     // through exactly one of the two).
@@ -3361,7 +3434,7 @@ async fn execute_read_sql(
                 }
                 Err(m) => {
                     drop(db);
-                    return outcome_frame(Err::<ExecOutcome, _>(m));
+                    return (outcome_frame(Err::<ExecOutcome, _>(m)), 0);
                 }
             }
         } else {
@@ -3370,15 +3443,76 @@ async fn execute_read_sql(
     } else {
         sql
     };
+    // The read tier must feed the same statement counters the write tier
+    // does (execute_sql_with_identity): SELECTs are the dominant statement
+    // class, and a metrics object that only counts writes misstates the
+    // node's error rate as zero.
+    state
+        .metrics
+        .statements_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let view = {
         let db = state.db.read().unwrap_or_else(|p| p.into_inner());
         db.read_view()
     };
     view.set_statement_deadline(deadline);
-    let resp = outcome_frame(view.execute(sql));
+    let outcome = view.execute(sql);
+    // Row count for the caller's @@ROWCOUNT bookkeeping (SELECTs count the
+    // rows they return, like the interpreter's rowset statements do).
+    let rowcount = match &outcome {
+        Ok(ExecOutcome::Rows(r)) => r.rows.len() as u64,
+        Ok(ExecOutcome::Affected(n)) => *n,
+        Err(_) => 0,
+    };
+    let resp = outcome_frame(outcome);
+    if resp.frame_type == proto::RESP_ERROR {
+        state
+            .metrics
+            .statement_errors_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     view.set_statement_deadline(None);
     drop(view); // ends the pager snapshot
-    resp
+    (resp, rowcount)
+}
+
+/// The MVCC read-tier eligibility test shared by the REQ_SQL and
+/// REQ_EXECUTE arms: a classified read-only single SELECT (no CTE, no
+/// transaction control) with no open transaction owner, passing the same
+/// authorization the write tier applies. Anything else falls through to
+/// the exclusive path and its error.
+fn classify_read_eligible(state: &ServerState, sql: &str, user: Option<&UserAuth>) -> bool {
+    if state
+        .tx_owner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+    {
+        return false;
+    }
+    let Ok(p) = Database::parse_classified(sql) else {
+        return false;
+    };
+    if p.is_write || p.tx != TxControl::None {
+        return false;
+    }
+    if !matches!(
+        &p.stmt,
+        AnyStmt::Sql(s) if matches!(&**s, sqlparser::ast::Statement::Query(q) if q.with.is_none())
+    ) {
+        return false;
+    }
+    // The db reference is load-bearing: view base-table expansion (a view
+    // over docsql_users must refuse non-admins HERE, or the MVCC fast path
+    // leaks the hashes the write tier refuses). The guard is a
+    // microsecond-scale read lock.
+    match user {
+        Some(u) => {
+            let db_ref = state.db.read().unwrap_or_else(|p| p.into_inner());
+            authorize_statement(Some(&db_ref), &p.stmt, &p.tx, p.is_write, &u.grants).is_ok()
+        }
+        None => true, // token/开放连接
+    }
 }
 
 /// Assemble the REQ_STATUS payload: everything a monitoring console needs to
@@ -3796,6 +3930,19 @@ fn apply_row_filters(
                 }
                 _ => String::new(),
             };
+            // UPDATE ... FROM evaluates the WHERE over the MERGED image
+            // (row keys are `alias.col`): the injected predicate's bare
+            // columns resolve through lookup_col's suffix fallback and can
+            // bind to a FROM table's same-named column — a controlled FROM
+            // table short-circuits the filter for every row. Refuse the
+            // shape (fail-closed, same treatment as JOIN/子查询).
+            if u.from.is_some() && filtered.contains(&lower(&table)) {
+                return Err(format!(
+                    "row filter on {table}: UPDATE ... FROM evaluates its WHERE over the \
+                     joined image, where the filter's bare columns can bind to the FROM \
+                     tables; rewrite without FROM or use an unrestricted grant"
+                ));
+            }
             if let Some(pred) = lookup(&table) {
                 u.selection = Some(and_into_sel(u.selection.take(), pred));
                 rewritten_tables.push(table.to_ascii_lowercase());
@@ -3814,6 +3961,18 @@ fn apply_row_filters(
                         d.selection = Some(and_into_sel(d.selection.take(), pred));
                         rewritten_tables.push(table.to_ascii_lowercase());
                     }
+                }
+            }
+        }
+        Statement::Explain { statement, .. } => {
+            // `EXPLAIN SELECT … FROM <filtered table>`: the walker counts
+            // the inner query's reads as deep occurrences, so rewrite the
+            // inner SELECT the same way — a restricted user can inspect
+            // the plan of exactly the statements they may run (this used
+            // to refuse, while the doc comment claimed support).
+            if let Statement::Query(q) = statement.as_mut() {
+                if let SetExpr::Select(select) = q.body.as_mut() {
+                    rewrite_select_factor(select.as_mut(), filters, &mut rewritten_tables);
                 }
             }
         }
@@ -6886,7 +7045,7 @@ async fn finish_snapshot_adopt<'a>(
     script_len: usize,
 ) {
     seed_positions(state, heads);
-    let drain_failures = drain_sync_queue(state, true).await;
+    let drain_failures = drain_sync_queue(state, true, true).await;
     drop(order);
     flush_gate_pubsub_notify(state).await;
     if drain_failures == 0 {
@@ -6940,7 +7099,20 @@ async fn finish_snapshot_adopt<'a>(
 /// transaction delays the gate closing but never merges queued writes
 /// into it; the drain waits with a loud heartbeat rather than give up on
 /// acknowledged data.
-async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) -> u64 {
+async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool, close: bool) -> u64 {
+    let result = drain_inner(state, order_held, close).await;
+    // Per-connection push frames arrive in id order only if the backlog's
+    // messages (smaller ids) notify BEFORE this drain releases the write
+    // order — a local PUBLISH that acquires the order next would otherwise
+    // deliver a LARGER id first (the queue's items were committed under
+    // this order, so their notify belongs to it too). notify is a registry
+    // lock plus bounded channel sends: microseconds, not worth an await
+    // outside the guard.
+    flush_gate_pubsub_notify(state).await;
+    result
+}
+
+async fn drain_inner(state: &Arc<ServerState>, order_held: bool, close: bool) -> u64 {
     /// Extra in-place attempts for an acknowledged queued write whose replay
     /// errored: a transient failure (I/O, lock) must not strand data the
     /// origin already acknowledged. Permanent failures (duplicate keys from
@@ -6977,7 +7149,15 @@ async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool) -> u64 {
             let mut gate = state.sync_queue.lock().await;
             match gate.pending.front() {
                 None => {
-                    gate.closed = true;
+                    // Only a TERMINAL drain closes the gate: a process
+                    // drain (mid-repair, between catch-up and the snapshot
+                    // fallback) keeps it open so inbound replication writes
+                    // keep queueing — closing here dropped the adoption
+                    // window's writes back to the 30s direct-path timeout,
+                    // the exact failure mode the queue exists to prevent.
+                    if close {
+                        gate.closed = true;
+                    }
                     break;
                 }
                 Some(q) => q.clone(),
@@ -7137,7 +7317,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                                 return;
                             }
                             JoinApply::LocalData => {
-                                drain_sync_queue(&state, false).await;
+                                drain_sync_queue(&state, false, true).await;
                                 flush_gate_pubsub_notify(&state).await;
                                 return;
                             }
@@ -7161,7 +7341,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                 "bootstrap sync: peers hold no data (born-empty cluster); \
                  serving fresh — later writes fan out from the data holders"
             );
-            drain_sync_queue(&state, false).await;
+            drain_sync_queue(&state, false, true).await;
             flush_gate_pubsub_notify(&state).await;
             querylog::sync_event(
                 &state.sync_log,
@@ -7193,7 +7373,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                         "bootstrap sync: local writes arrived while peers hold data; \
                          serving (fan-out keeps the mesh converged)"
                     );
-                    drain_sync_queue(&state, false).await;
+                    drain_sync_queue(&state, false, true).await;
                     flush_gate_pubsub_notify(&state).await;
                     querylog::sync_event(
                         &state.sync_log,
@@ -7231,7 +7411,7 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
         tokio::time::sleep(SYNC_RETRY_DELAY).await;
     }
     eprintln!("bootstrap sync gave up after {SYNC_ROUNDS} rounds ({last_err}); serving fresh");
-    drain_sync_queue(&state, false).await;
+    drain_sync_queue(&state, false, true).await;
     flush_gate_pubsub_notify(&state).await;
     querylog::sync_event(
         &state.sync_log,
@@ -7369,7 +7549,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                         // the next pull; replays are order-idempotent,
                         // and any residual divergence still lands in the
                         // snapshot fallback).
-                        drain_sync_queue(&state, false).await;
+                        drain_sync_queue(&state, false, false).await;
                         flush_gate_pubsub_notify(&state).await;
                         // Fresh digest check: the mesh kept writing while
                         // the backlog replayed.
@@ -7406,7 +7586,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                                     true,
                                     Some(format!("{total} ops from {} origins", plan.len())),
                                 );
-                                drain_sync_queue(&state, false).await;
+                                drain_sync_queue(&state, false, true).await;
                                 flush_gate_pubsub_notify(&state).await;
                                 return;
                             }
@@ -7446,7 +7626,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
         };
         match decide_repair(&local, &reports) {
             RepairDecision::Converged => {
-                drain_sync_queue(&state, false).await;
+                drain_sync_queue(&state, false, true).await;
                 flush_gate_pubsub_notify(&state).await;
                 return;
             }
@@ -7456,7 +7636,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
                      picked this node's state as the reference",
                     round + 1
                 );
-                drain_sync_queue(&state, false).await;
+                drain_sync_queue(&state, false, true).await;
                 flush_gate_pubsub_notify(&state).await;
                 return;
             }
@@ -7496,7 +7676,7 @@ async fn repair_sync(state: Arc<ServerState>, peers: Vec<String>) {
         "rejoin repair gave up; serving local state (divergent peers \
          repair on their own restart)"
     );
-    drain_sync_queue(&state, false).await;
+    drain_sync_queue(&state, false, true).await;
     flush_gate_pubsub_notify(&state).await;
     querylog::sync_event(
         &state.sync_log,
@@ -7791,6 +7971,10 @@ async fn apply_repair_sync(
         .pitr_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     crate::backup::invalidate_incremental_exports(&state.backup_dir);
+    // The S3 copies of the voided chain must not outlive the adoption
+    // either: a DR restore pulls them back and the majority-discarded
+    // writes replay (see invalidate_incremental_exports_remote).
+    crate::backup::invalidate_incremental_exports_remote(state).await;
     // Probe-round floor before the drain, fresh heads after — same order
     // and same reasoning as the join path (see finish_snapshot_adopt).
     finish_snapshot_adopt(
@@ -8501,14 +8685,16 @@ mod security_tests {
         assert!(run("SELECT id FROM other UNION SELECT id FROM sales"));
         // View over the filtered table (transitively).
         assert!(run("SELECT * FROM v"));
-        // UPDATE ... FROM another table is NOT a bypass: the filter ANDs
-        // into the WHERE, so every candidate sales row still satisfies it.
-        let out = apply_row_filters(
-            &db,
-            "UPDATE sales SET id = 1 FROM other WHERE other.id = sales.id",
-            &m,
-        )
-        .unwrap();
+        // UPDATE ... FROM evaluates its WHERE over the MERGED image: the
+        // injected predicate's bare `region` can bind a same-named column
+        // of the FROM table (a controlled table short-circuits the filter
+        // for every row) — refuse, same treatment as JOIN/子查询(第六轮
+        // 审查:旧断言只验证了谓词文本落进 WHERE,没验证它绑到哪)。
+        assert!(run(
+            "UPDATE sales SET id = 1 FROM other WHERE other.id = sales.id"
+        ));
+        // 无 FROM 的 UPDATE 照常注入。
+        let out = apply_row_filters(&db, "UPDATE sales SET id = 1 WHERE id = 2", &m).unwrap();
         assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
         // T-SQL-ish unparseable text mentioning the table.
         assert!(run("DECLARE @x INT; SELECT id FROM sales"));

@@ -2681,6 +2681,8 @@ function openClusterTab() {
       body.innerHTML = html;
     };
     t.load = async () => {
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq;
       try {
         const data = await api.get('/api/cluster');
         if (seq !== t.reqSeq) return;
@@ -2788,6 +2790,8 @@ function openSessionsTab() {
       body.innerHTML = html;
     };
     t.load = async () => {
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq;
       try {
         const data = await api.get('/api/sessions');
         if (seq !== t.reqSeq) return;
@@ -2827,12 +2831,18 @@ function openUsersTab() {
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
     t.render = (data) => usersPage.render(t, data);
     t.load = async () => {
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq;
       let data;
       try {
         data = await api.get('/api/users');
         if (seq !== t.reqSeq) return;
         if (!data.error) {
           const meta = await api.get('/api/meta');
+          // Second await: the node may have switched while the meta call
+          // was in flight — a stale table list must not ride the fresh
+          // user payload.
+          if (seq !== t.reqSeq) return;
           data.tables = (meta.tables || []).map(x => x.name).filter(n => n);
         }
       } catch (e) { data = {error: e.message}; }
@@ -3160,6 +3170,8 @@ function openBackupTab() {
       $$('[data-restore]', body).forEach(b => b.onclick = () => doRestore(b.dataset.restore));
     };
     t.load = async () => {
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq;
       try {
         const v = await api.get('/api/backup');
         if (seq !== t.reqSeq) return;
@@ -3277,6 +3289,8 @@ function openLogsTab() {
       body.innerHTML = html;
     };
     t.load = async () => {
+      t.reqSeq = (t.reqSeq || 0) + 1;
+      const seq = t.reqSeq;
       try {
         const data = await api.get('/api/logs?limit=' + t.limit);
         if (seq !== t.reqSeq) return;
@@ -3330,8 +3344,14 @@ const explorer = {
   meta: null, expanded: new Set(['tables']), selPath: null, unreachable: false,
   _timer: null,
   async refresh() {
+    // Node-switch guard: a refresh from the PREVIOUS node may land after
+    // the switch and overwrite the tree with the old node's catalog — the
+    // browser then shows tables that are not on the node queries actually
+    // execute against.
+    const seq = (this._fetchSeq = (this._fetchSeq || 0) + 1);
     try {
       const meta = await api.get('/api/meta');
+      if (seq !== this._fetchSeq) return;
       // 远程节点代理失败(不可达/拒绝认证)走 in-band error,不点亮整页。
       if (meta && meta.error) {
         this.meta = null;

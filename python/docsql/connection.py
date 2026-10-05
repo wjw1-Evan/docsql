@@ -154,6 +154,12 @@ class _Transport:
             # kill subscriber reader threads.
             self._shutdown_sock()
             raise OperationalError(f"TLS handshake with {host}:{port} failed: {e}") from e
+        except OSError as e:
+            # The handshake window also surfaces plain OSError family
+            # members (RST → ConnectionResetError, a silent peer →
+            # timeout): those escaped unmapped too.
+            self._shutdown_sock()
+            raise OperationalError(f"TLS handshake with {host}:{port} failed: {e}") from e
         except Exception:
             self._shutdown_sock()
             raise
@@ -575,6 +581,15 @@ class Cursor:
                 raise ProgrammingError(
                     "parameters must be a sequence of values, not a str/bytes "
                     "literal — wrap single values as (value,)"
+                )
+            if isinstance(parameters, dict) or not hasattr(parameters, "__iter__"):
+                # A dict iterates as its KEYS (binding column names as
+                # data); a scalar raises a bare TypeError that escapes
+                # every `except Error` recovery path. Both are rejected as
+                # parameter-shape mistakes, sqlite3-style.
+                raise ProgrammingError(
+                    "parameters must be a sequence of values (tuple/list), "
+                    f"got {type(parameters).__name__} — wrap single values as (value,)"
                 )
             _params = list(parameters)
             _handle = self._prepare(operation)

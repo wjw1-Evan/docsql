@@ -363,10 +363,23 @@ pub(crate) fn try_serve_log_view(
     }
     let limit = match tail.first() {
         None => 100,
-        Some(&"limit") => match tail.get(1).and_then(|w| w.parse::<usize>().ok()) {
-            Some(n) if tail.len() == 2 => n,
-            _ => return Some(err_frame("docsql_log view: bad LIMIT")),
-        },
+        Some(&"limit") => {
+            // The word tokenizer drops signs: `LIMIT -1` must not silently
+            // read as LIMIT 1. Only whitespace may separate the keyword
+            // from its (unsigned) number; anything else is a bad LIMIT.
+            let clean_gap = words
+                .iter()
+                .rposition(|w| *w == "limit")
+                .and_then(|li| {
+                    toks.get(li + 1)
+                        .map(|(ns, _)| lower[toks[li].1..*ns].chars().all(char::is_whitespace))
+                })
+                .unwrap_or(false);
+            match tail.get(1).and_then(|w| w.parse::<usize>().ok()) {
+                Some(n) if tail.len() == 2 && clean_gap => n,
+                _ => return Some(err_frame("docsql_log view: bad LIMIT")),
+            }
+        }
         Some(_) => {
             return Some(err_frame(
                 "docsql_log view: WHERE/GROUP BY/JOIN are not supported \

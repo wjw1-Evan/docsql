@@ -78,7 +78,16 @@ class Subscriber:
         self._control_busy = False
         self._closed = threading.Event()
         self._conn = None
-        self._reader = threading.Thread(target=self._run, name="docsql-subscriber", daemon=True)
+        # Reader-thread generation: bumped every time _control rebuilds the
+        # wire and spawns a fresh reader. A reader whose generation is stale
+        # (the old one still parked in a reconnect backoff when the user
+        # thread rebuilt) must exit instead of racing the new reader — two
+        # readers on one transport interleave frame bytes, and the loser's
+        # uninstalled connection leaks against the server's budget.
+        self._generation = 0
+        self._reader = threading.Thread(
+            target=self._run, args=(self._generation,), name="docsql-subscriber", daemon=True
+        )
         self._conn = connect(**self._conn_kwargs)
         self._reader.start()
 
@@ -169,8 +178,12 @@ class Subscriber:
                     except Exception:
                         pass
                     self._conn = connect(**self._conn_kwargs)
+                    self._generation += 1
                     self._reader = threading.Thread(
-                        target=self._run, name="docsql-subscriber", daemon=True
+                        target=self._run,
+                        args=(self._generation,),
+                        name="docsql-subscriber",
+                        daemon=True,
                     )
                     self._reader.start()
         payload = json.dumps(body).encode("utf-8")
@@ -272,14 +285,17 @@ class Subscriber:
             if prev is None or mid > prev:
                 self._last_id[channel] = mid
 
-    def _run(self):
+    def _run(self, gen):
         """Reader-thread main loop: read until the connection breaks, then
-        (optionally) reconnect + resubscribe and keep going."""
-        while not self._closed.is_set():
+        (optionally) reconnect + resubscribe and keep going. `gen` is this
+        thread's generation: a stale reader (the user thread rebuilt the
+        wire via _control while this one was in a backoff sleep) steps out
+        instead of competing with its successor."""
+        while not self._closed.is_set() and gen == self._generation:
             try:
-                self._read_frames()
+                self._read_frames(gen)
             except Exception:
-                if self._closed.is_set():
+                if self._closed.is_set() or gen != self._generation:
                     return
                 if self._on_disconnect is not None:
                     try:
@@ -288,13 +304,13 @@ class Subscriber:
                         pass
                 if not self._auto or not (self._channels or self._patterns):
                     return
-                if not self._resubscribe():
+                if not self._resubscribe(gen):
                     return
                 # Loop: keep reading on the fresh connection.
 
-    def _read_frames(self):
+    def _read_frames(self, gen):
         idle_polls = 0
-        while not self._closed.is_set():
+        while not self._closed.is_set() and gen == self._generation:
             got = self._conn._transport.read_frame_poll(_POLL_SECONDS)
             if got is None:
                 idle_polls += 1
@@ -333,28 +349,40 @@ class Subscriber:
             else:
                 self._replies.put(got)
 
-    def _resubscribe(self):
+    def _resubscribe(self, gen):
         """Reconnect and replay the missed tail; False when the node stays
         unreachable for the attempt budget."""
         delay = 1.0
         for _ in range(self._attempts):
-            if self._closed.is_set():
+            if self._closed.is_set() or gen != self._generation:
                 return False
             time.sleep(delay)
             # close() may have fired DURING the sleep: its join(5s) can have
             # already timed out (backoff sleeps grow to 8s), so close()'s
             # post-join sweep has run — a connection installed now would
             # never be swept and leak against the server's conn budget.
-            if self._closed.is_set():
+            if self._closed.is_set() or gen != self._generation:
                 return False
             delay = min(delay * 2, 8.0)
             try:
-                self._conn = connect(**self._conn_kwargs)
+                new_conn = connect(**self._conn_kwargs)
             except Exception:
                 # Transport-level failures too (TLS handshake, protocol
                 # garbage): catching only Error used to let them escape the
                 # reader thread entirely, killing the subscriber silently.
                 continue
+            # Compare-and-install under the write lock: _control's rebuild
+            # may have replaced the wire while this thread slept — an
+            # unconditional install overwrote the NEWER connection (leaking
+            # its socket) and left two readers on one transport.
+            with self._write_lock:
+                if self._closed.is_set() or gen != self._generation:
+                    try:
+                        new_conn.close()
+                    except Exception:
+                        pass
+                    return False
+                self._conn = new_conn
             if self._closed.is_set():
                 # close() raced the install: nobody will ever read or close
                 # this socket (close()'s own sweep has already passed).

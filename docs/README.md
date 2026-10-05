@@ -54,6 +54,8 @@
 | [复合索引设计](design/001-composite-indexes.md) | 复合键 = `Value::Array`、root_key 泛化与判重语义(已实施) |
 | [溢出页链设计](design/002-overflow-page-chains.md) | >4KB 文档的堆层分帧布局、链页回收(已实施) |
 | [MVCC 读并发设计](design/003-mvcc-read-concurrency.md) | 快照读分阶段路线、锁兼容矩阵(阶段 A/B 已实施) |
+| [自动故障转移设计](design/004-automatic-failover.md) | QUORUM 多数派栅栏、AUTO_PROMOTE、仲裁者(已实施) |
+| [JSON 路径索引设计](design/005-json-path-indexes.md) | 路径树键提取与查询同源、root_key=索引名(已实施) |
 
 ## 五分钟速览
 

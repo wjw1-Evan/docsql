@@ -211,6 +211,13 @@ internal static class ConnectionPool
     /// 变量(重复 DECLARE 报错、@@IDENTITY 读到别人的值)。往返本身同时完成
     /// 验活(应答到达即 TCP 与帧通路完好);对端不认识该帧时按死连接处理,
     /// 换新建连接(新连接天然是干净会话)。</summary>
+    /// Test-only observation: how many idle connections one pool slot
+    /// currently holds (leak assertions on CloseConnection behavior).
+    internal static int DebugIdleCount(string host, int port)
+    {
+        return Pools.Values.Sum(slot => slot.Idle.Count);
+    }
+
     private static readonly Frame SessionResetFrame =
         new(FrameType.ReqSessionReset, 0, 0, Array.Empty<byte>());
 
@@ -298,9 +305,18 @@ internal static class ConnectionPool
                     // 发送之前(连接未 Broken、帧流未错位)的连接可归还;
                     // 已 Broken 的(读等待中被取消,应答帧仍会送达)照常
                     // 丢弃 —— 归还它等于给下一个借出者留一具错位尸体。
+                    // 归还走 ReturnToIdle:与 ClearAll 的 Closed+排空 原子
+                    // 交错下,裸 Append 会把连接塞进已注销槽的队列里
+                    // (socket 泄漏),与正常 Return 是同一竞态。
                     if (!proto.Broken)
                     {
-                        slot.Idle.Append(proto);
+                        ReturnToIdle(slot, proto);
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref Discarded);
+                        proto.Dispose();
+                        slot.Permits.Release();
                     }
                     throw;
                 }
@@ -319,6 +335,31 @@ internal static class ConnectionPool
         {
             slot.Permits.Release();
             throw;
+        }
+    }
+
+    /// Borrow-side return (cancellation paths): the permit is still held
+    /// by THIS caller, so the enqueue mirrors Return's locked body without
+    /// releasing twice.
+    private static void ReturnToIdle(Slot slot, ProtocolConnection proto)
+    {
+        lock (slot.Sync)
+        {
+            if (slot.Closed)
+            {
+                Interlocked.Increment(ref Discarded);
+                proto.Dispose();
+                slot.Permits.Release();
+                return;
+            }
+            proto.ReadTimeoutMs = ProtocolConnection.DefaultReadTimeoutMs;
+            slot.Idle.Enqueue(proto);
+        }
+        slot.Permits.Release();
+        while (slot.Idle.Count > slot.MaxSize && slot.Idle.TryDequeue(out var excess))
+        {
+            Interlocked.Increment(ref Discarded);
+            excess.Dispose();
         }
     }
 
@@ -882,9 +923,15 @@ public sealed class DocsqlCommand : DbCommand
         var frame = await ExecuteAsync(cancellationToken).ConfigureAwait(false);
         return frame.Type switch
         {
-            FrameType.RespRows => new DocsqlDataReader(frame.Payload),
-            FrameType.RespAffected => new DocsqlDataReader(
-                Array.Empty<byte>(), DecodeAffected(frame.Payload)),
+            // Same CloseConnection wiring as the sync path: without it an
+            // async reader never returned its connection to the pool — the
+            // semaphore slot leaked on every call until the pool reported
+            // exhausted.
+            FrameType.RespRows => WireCloseBehavior(
+                new DocsqlDataReader(frame.Payload), behavior),
+            FrameType.RespAffected => WireCloseBehavior(
+                new DocsqlDataReader(Array.Empty<byte>(), DecodeAffected(frame.Payload)),
+                behavior),
             _ => throw new DocsqlException(ErrorText(frame)),
         };
     }
@@ -909,12 +956,39 @@ public sealed class DocsqlCommand : DbCommand
         return new Frame(FrameType.ReqExecute, 0, 0, Encoding.UTF8.GetBytes(sb.ToString()));
     }
 
+    /// Parameter directions and Transaction binding the protocol cannot
+    /// honor: the wire has no output parameters and no transaction ids —
+    /// an Output/ReturnValue parameter was silently bound as INPUT data
+    /// (null into the statement), and a Transaction from another
+    /// connection (or a closed generation of this one) executed the
+    /// statement in AUTOCOMMIT while the caller believed it rolled back
+    /// with the transaction.
+    private void ValidateExecutionBinding()
+    {
+        foreach (DocsqlParameter p in Parameters)
+        {
+            if (p.Direction != ParameterDirection.Input)
+            {
+                throw new NotSupportedException(
+                    $"parameter {p.ParameterName}: the wire protocol has no output "
+                    + $"parameters (Direction={p.Direction} is unsupported)");
+            }
+        }
+        if (Transaction is DocsqlTransaction tx
+            && (!ReferenceEquals(tx.OwningConnection, Connection) || !tx.StillOwnsConnection))
+        {
+            throw new InvalidOperationException(
+                "the command's Transaction is not active on its connection");
+        }
+    }
+
     private Frame Execute()
     {
         if (Connection is not { State: ConnectionState.Open } conn)
         {
             throw new InvalidOperationException("connection is not open");
         }
+        ValidateExecutionBinding();
         // CommandTimeout 驱动读取预算(0 = ADO.NET 默认无限制,这里落到连接
         // 默认的 30s 读超时,而不是原来的永久阻塞)。
         conn.Proto.ReadTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : 30_000;
@@ -938,6 +1012,7 @@ public sealed class DocsqlCommand : DbCommand
         {
             throw new InvalidOperationException("connection is not open");
         }
+        ValidateExecutionBinding();
         int readTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : 30_000;
         if (Parameters.Count == 0)
         {
@@ -1001,6 +1076,30 @@ public sealed class DocsqlCommand : DbCommand
                     if (sql[j] == '\'')
                     {
                         if (j + 1 < sql.Length && sql[j + 1] == '\'')
+                        {
+                            j += 2;
+                            continue;
+                        }
+                        j++;
+                        break;
+                    }
+                    j++;
+                }
+                sb.Append(sql[i..j]);
+                i = j;
+                continue;
+            }
+            if (c == '[')
+            {
+                // T-SQL bracketed identifier ([some@ident], ]] escapes the
+                // closing bracket): same opacity as the quoted forms — the
+                // server-side placeholder scanner skips the same context.
+                int j = i + 1;
+                while (j < sql.Length)
+                {
+                    if (sql[j] == ']')
+                    {
+                        if (j + 1 < sql.Length && sql[j + 1] == ']')
                         {
                             j += 2;
                             continue;
@@ -1197,6 +1296,7 @@ public sealed class DocsqlCommand : DbCommand
         {
             throw new InvalidOperationException("connection is not open");
         }
+        ValidateExecutionBinding();
         if (Parameters.Count > 0)
         {
             var (template, _) = RewriteParameters();
@@ -1681,6 +1781,10 @@ public sealed class DocsqlTransaction : DbTransaction
 
     protected override DbConnection DbConnection => _conn;
 
+    /// The connection this transaction opened on (see StillOwnsConnection):
+    /// command-side binding checks compare against it.
+    internal DbConnection OwningConnection => _conn;
+
     /// <summary>建保存点。</summary>
     public override void Save(string savePointName)
     {
@@ -1730,7 +1834,7 @@ public sealed class DocsqlTransaction : DbTransaction
     /// 连接已 Close(未重开)时 <see cref="DocsqlConnection.Proto"/> getter 会抛
     /// InvalidOperationException,Dispose/Commit/Rollback 会从守卫里逃出该异常
     /// 而非走设计的 closed 分支。</summary>
-    private bool StillOwnsConnection =>
+    internal bool StillOwnsConnection =>
         _conn.ProtoOrNull is { } proto && ReferenceEquals(proto, _protoAtBegin);
 
     /// <summary>物理连接换代守卫:Close/Open 之后连接对象可能租到另一条物理线

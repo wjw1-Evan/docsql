@@ -113,6 +113,14 @@ impl TsqlSession {
     pub fn note_error(&mut self, code: i64) {
         self.last_error = code;
     }
+
+    /// Record the affected/returned row count of a fast-path statement so
+    /// a later batch's @@ROWCOUNT reads it (the fast paths used to leave
+    /// the interpreter's stale value in place — `UPDATE …; SELECT
+    /// @@ROWCOUNT` across two frames read 0 or an older statement's count).
+    pub fn note_rowcount(&mut self, n: u64) {
+        self.rowcount = n;
+    }
 }
 
 impl TsqlSession {
@@ -311,6 +319,10 @@ impl TsqlSession {
                     .and_then(|row| row.into_iter().next())
                     .unwrap_or(Value::Null);
                 self.prints.push(engine::value_to_text(&v));
+                // T-SQL zeroes @@ROWCOUNT on PRINT (and on the transaction
+                // statements): `UPDATE …; PRINT 'x'; IF @@ROWCOUNT = 0 …`
+                // must not see the UPDATE's count.
+                self.rowcount = 0;
                 Ok(None)
             }
             Stmt::If { cond, then, else_ } => {
@@ -385,8 +397,13 @@ impl TsqlSession {
                     }
                     Err(e) => {
                         // The catch gets the message; flow control raised
-                        // inside the failed try body does not survive.
-                        self.error_ctx = Some((error_number(&e), e.to_string()));
+                        // inside the failed try body does not survive. The
+                        // transport suffix "(error N)" is metadata for
+                        // @@ERROR, not part of the message: keeping it made
+                        // ERROR_MESSAGE() echo the suffix and every nested
+                        // re-THROW append another one.
+                        let bare = strip_error_suffix(&e.to_string());
+                        self.error_ctx = Some((error_number(&e), bare));
                         self.last_error = error_number(&e);
                         // BREAK/CONTINUE raised INSIDE the CATCH body
                         // propagates to the enclosing WHILE too — swallowing
@@ -538,7 +555,7 @@ impl TsqlSession {
                             name => {
                                 return err(format!(
                                     "@@{} is not supported; supported system variables are \
-                                     @@ROWCOUNT and @@VERSION",
+                                     @@ROWCOUNT, @@ERROR, @@IDENTITY and @@VERSION",
                                     String::from_utf8_lossy(name)
                                 ))
                             }
@@ -669,6 +686,21 @@ fn error_number(e: &SqlError) -> i64 {
 /// otherwise. Public for hosts that execute statements outside the
 /// interpreter and only hold the rendered error text (they must keep the
 /// session's @@ERROR current the same way).
+/// Remove the trailing "(error N)" transport suffix from a rendered error
+/// text (if any), so ERROR_MESSAGE() reports the message the way THROW
+/// spelled it.
+fn strip_error_suffix(text: &str) -> String {
+    if let Some(idx) = text.rfind("(error ") {
+        let rest = &text[idx + 7..];
+        if let Some(end) = rest.find(')') {
+            if rest[end + 1..].trim().is_empty() && rest[..end].parse::<i64>().is_ok() {
+                return text[..idx].trim_end().to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
 pub fn error_code_from_text(text: &str) -> i64 {
     if let Some(idx) = text.rfind("(error ") {
         let rest = &text[idx + 7..];
@@ -766,6 +798,10 @@ enum Stmt {
 const STATEMENT_STARTERS: &[&str] = &[
     "select",
     "insert",
+    // A newline followed by a WITH…SELECT (CTE) begins a new statement —
+    // leaving it out merged `SELECT 'a'\nWITH c AS (…) SELECT …` into one
+    // Plain the engine could never parse.
+    "with",
     "update",
     "delete",
     "merge",
@@ -1862,14 +1898,39 @@ impl<'a> Parser<'a> {
                 return err(format!("SELECT @{name} expects an expression"));
             }
             assigns.push((name, expr));
-            // Whitespace only: a newline here is a statement boundary the
-            // tail read must see (full trivia-skipping would swallow the
-            // next statement into the tail).
-            while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\r') {
-                self.i += 1;
+            // A comma separated from the assignment only by trivia
+            // (spaces, newlines, comments) still continues the list:
+            // `SELECT @a = 1\n, @b = 2` used to end the list at the
+            // newline and silently drop @b into the query tail. Pure
+            // lookahead — the cursor only advances when the comma is
+            // real, so a newline that truly separates statements stays a
+            // boundary for read_plain (no statement starts with a comma).
+            let mut j = self.i;
+            while j < self.b.len() {
+                match self.b[j] {
+                    b' ' | b'\t' | b'\r' | b'\n' => j += 1,
+                    b'-' if self.b.get(j + 1) == Some(&b'-') => {
+                        while j < self.b.len() && self.b[j] != b'\n' {
+                            j += 1;
+                        }
+                    }
+                    b'/' if self.b.get(j + 1) == Some(&b'*') => {
+                        let mut k = j + 2;
+                        while k + 1 < self.b.len() && !(self.b[k] == b'*' && self.b[k + 1] == b'/')
+                        {
+                            k += 1;
+                        }
+                        j = if k + 1 < self.b.len() {
+                            k + 2
+                        } else {
+                            self.b.len()
+                        };
+                    }
+                    _ => break,
+                }
             }
-            if self.b.get(self.i) == Some(&b',') {
-                self.i += 1;
+            if self.b.get(j) == Some(&b',') {
+                self.i = j + 1;
                 continue;
             }
             break;
@@ -2047,6 +2108,15 @@ impl<'a> Parser<'a> {
     /// The statement governed by IF/WHILE/ELSE: a BEGIN…END block or one
     /// plain statement.
     fn parse_governed(&mut self, depth: usize) -> Result<Vec<Stmt>> {
+        // The single-statement fallback below re-dispatches into
+        // parse_one_stmt → parse_if/parse_while → parse_governed WITHOUT a
+        // BEGIN block, so the depth must grow HERE too: `IF 1=1 IF 1=1 …`
+        // chains recursed with the caller's depth and never hit the cap —
+        // a ~64KB batch stack-overflowed the connection thread (a crash,
+        // not an error frame).
+        if depth > MAX_BLOCK_DEPTH {
+            return err("batch block nesting exceeds the supported depth");
+        }
         if self.peek_word() == Some(b"begin") && self.begin_opens_block() {
             // `BEGIN TRY`/`BEGIN CATCH` directly under IF/WHILE/ELSE is the
             // compound TRY…CATCH statement, not a plain block: parse_block
@@ -2084,8 +2154,10 @@ impl<'a> Parser<'a> {
         // Same dispatch as the top level: a governed body may be a
         // SET/SELECT assignment, DECLARE, PRINT, TRY…CATCH or a nested
         // IF/WHILE — the old plain-run fallback substituted variables
-        // before the assignment could write them.
-        self.parse_one_stmt(depth)
+        // before the assignment could write them. depth+1 keeps the
+        // IF/WHILE/ELSE-IF chain under MAX_BLOCK_DEPTH (see the guard at
+        // the top of this function).
+        self.parse_one_stmt(depth + 1)
     }
 
     /// Statements of a BEGIN…END block, consuming the matching END.
@@ -2660,6 +2732,82 @@ mod tests {
             Some(ExecResult::Rows(r)) => r.rows.clone(),
             other => panic!("expected rows, got {other:?}"),
         }
+    }
+
+    /// 第六轮审查回归:IF/WHILE/ELSE-IF 单语句体递归不涨深度——约 64KB
+    /// 的 `IF 1=1 IF 1=1 …` 批在解析期打爆连接线程栈(进程 abort)。
+    #[test]
+    fn deep_if_chain_is_rejected_not_a_stack_overflow() {
+        let mut db = DbExec::new();
+        let mut sess = TsqlSession::new();
+        let mut sql = String::new();
+        for _ in 0..2000 {
+            sql.push_str("IF 1 = 1 ");
+        }
+        sql.push_str("SELECT 1 AS v");
+        let out = run_script(&mut sess, &mut db, &sql);
+        assert!(
+            out.is_err(),
+            "deep IF chain must be rejected loudly, got {out:?}"
+        );
+        let msg = out.unwrap_err().to_string();
+        assert!(msg.contains("depth"), "{msg}");
+    }
+
+    /// 第六轮审查回归:普通语句后换行开头的 WITH…SELECT 曾被并入同一条
+    /// Plain,整批解析失败。
+    #[test]
+    fn newline_with_select_starts_a_new_statement() {
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE nums (n INT)").unwrap();
+        db.db.execute("INSERT INTO nums VALUES (2)").unwrap();
+        let mut sess = TsqlSession::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "SELECT 'a' AS x\nWITH c AS (SELECT n FROM nums) SELECT * FROM c",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(2)]]);
+    }
+
+    /// 第六轮审查回归:`SELECT @a = 1`⏎`, @b = 2` 的换行逗号曾终止赋值
+    /// 列表,@b 静默不赋值。
+    #[test]
+    fn select_assignment_comma_after_newline_continues_list() {
+        let mut db = DbExec::new();
+        let mut sess = TsqlSession::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @a INT, @b INT\nSELECT @a = 7\n, @b = 9\nSELECT @a + @b AS s",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(16)]]);
+    }
+
+    /// 第六轮审查回归:ERROR_MESSAGE() 曾携带并逐层累积 "(error N)" 传输
+    /// 后缀;PRINT 不再保留上一条语句的 @@ROWCOUNT。
+    #[test]
+    fn error_message_has_no_transport_suffix_and_print_zeroes_rowcount() {
+        let mut db = DbExec::new();
+        db.db.execute("CREATE TABLE em (n INT)").unwrap();
+        db.db.execute("INSERT INTO em VALUES (1)").unwrap();
+        let mut sess = TsqlSession::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "BEGIN TRY\n THROW 52000, 'original', 1\nEND TRY\nBEGIN CATCH\n SELECT ERROR_MESSAGE() AS m\nEND CATCH",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Str("original".into())]]);
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "UPDATE em SET n = n\nPRINT 'x'\nSELECT @@ROWCOUNT AS rc",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out), vec![vec![Value::Int(0)]]);
     }
 
     #[test]

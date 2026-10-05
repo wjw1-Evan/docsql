@@ -109,9 +109,12 @@ docker compose --profile cluster --profile join up -d node-d
   - 控制台/API 调用要求 `confirm` 字段逐字重复文件名;
 - **手工归档/重放**:
 
+  运行层是 `FROM scratch`(容器内没有 ls/cat):文件检查一律走 `docker cp`。
+
   ```bash
-  bk=$(docker exec docsql-prod-single ls /data/backups | grep -E '^backup-.*\.sql$' | sort | tail -1)
-  docker exec docsql-prod-single cat "/data/backups/$bk" | docker exec -i docsql-prod-single docsql-cli connect 127.0.0.1:7600
+  mkdir -p /tmp/docsql-archive && docker cp docsql-prod-single:/data/backups/. /tmp/docsql-archive/
+  bk=$(ls /tmp/docsql-archive | grep -E '^backup-.*\.sql$' | sort | tail -1)
+  cat "/tmp/docsql-archive/$bk" | docker exec -i docsql-prod-single docsql-cli connect 127.0.0.1:7600
   ```
 
 备份状态在 `REQ_STATUS.backup` 与控制台备份页可见;每次备份成败写入同步日志。
@@ -165,7 +168,7 @@ docker compose --profile cluster --profile join up -d node-d
 | `DOCSQL_UPSTREAM` | 无 | 默认管理节点(启动参数 > 此变量 > `DOCSQL_PEERS` 首条) |
 | `DOCSQL_WEB_AUTH_FILE` | 无 | 控制台账号门凭据文件;空/未设 = 关闭(API 开放,浏览器无令牌输入),已设 = 首次强制 setup |
 | `DOCSQL_WEB_COOKIE_SECURE` | 0 | HTTPS 反代下置 1(会话 Cookie Secure) |
-| `DOCSQL_WEB_TRUST_PROXY` | 0 | 1 = 按 `X-Forwarded-For` **末跳**分桶(登录锁定/审计);多级反代需在最近一层重写 XFF 为仅客户端地址 |
+| `DOCSQL_WEB_TRUST_PROXY` | 0 | 1 = 按 `X-Forwarded-For` **末跳**分桶(登录锁定/审计);多级反代需在最近一层重写 XFF 为仅客户端地址。**开启后 web 端口必须只对反代可达**:能直连发布端口的请求可自伪造整条 XFF(含末跳)轮换锁定桶,暴力破解防线失效 |
 | `DOCSQL_WEB_TLS_CERT` / `_KEY` | 无 | PEM 证书/私钥路径,同时设置即以 HTTPS 服务(只设其一拒绝启动) |
 
 **配置快速失败**:以上数值变量非法值一律拒绝启动(exit 2),不静默回退。
@@ -179,7 +182,9 @@ docker compose --profile cluster --profile join up -d node-d
   scrape_configs:
     - job_name: docsql
       static_configs:
-        - targets: ["web:18710"]
+        # Prometheus 跑在宿主机:目标是 web 控制台的映射端口;
+        # 跑在 compose 网络内则用服务名与容器端口(node-web-single:7700)。
+        - targets: ["127.0.0.1:18710"]
   ```
 
   指标族(节点标签 `node`):`docsql_node_up`、`docsql_node_info`、`docsql_uptime_seconds`、
@@ -193,7 +198,7 @@ docker compose --profile cluster --profile join up -d node-d
 
 ## 健康检查与优雅停机
 
-- compose healthcheck 用镜像自带 CLI 对节点 PING(interval 5s / retries 10);
+- compose healthcheck 用镜像自带 CLI 对节点 PING(interval 5s / timeout 3s / retries 60 / start_period 30s;大 WAL 恢复期节点合法不可达,retries 特意放大);
 - 节点与控制台处理 SIGTERM/SIGINT:停止接受新连接 → 存量连接限时排空(节点最长 10s)→ 进程退出;
   未收尾事务由断连回滚 + WAL 恢复兜底。`docker stop` 与编排器滚动发布安全。
 

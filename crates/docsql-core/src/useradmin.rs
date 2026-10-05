@@ -310,6 +310,22 @@ fn find_top_level_word(sql: &str, word: &str, from: usize, last: bool) -> Option
                     i += 1;
                 }
             }
+            // Comments are opaque: a TO inside one (`GRANT … WHERE x = 1
+            // /* TO ghost */ TO alice`) must not count as the clause
+            // marker — the mis-split turned a legal grant into a parse
+            // error. Same skip the to_at scanner already applies.
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut j = i + 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                i = if j + 1 < b.len() { j + 2 } else { b.len() };
+            }
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             _ if depth == 0 && is_word_start(b, i) => {
@@ -403,7 +419,7 @@ fn parse_grant_with_filter(sql: &str) -> Result<UserAdminStmt, String> {
             cols,
             row_filter: Some(predicate.to_string()),
         }),
-        other => Err(format!("row filters apply to table grants, not {other:?}")),
+        _ => Err("row filters apply to table grants, not another statement kind".to_string()),
     }
 }
 
@@ -484,7 +500,10 @@ impl Cursor {
     fn name_raw(&mut self) -> Result<String, String> {
         match self.next() {
             Some(Tok::Word(w)) => Ok(w),
-            other => Err(format!("expected a name, found {other:?}")),
+            other => Err(format!(
+                "expected a name, found {}",
+                Cursor::tok_kind(&other)
+            )),
         }
     }
     /// Comma-separated list of case-preserved table names.
@@ -511,7 +530,12 @@ impl Cursor {
         let take_one = |c: &mut Cursor| -> Result<Vec<TablePriv>, String> {
             let w = match c.next() {
                 Some(Tok::Word(w)) => w,
-                other => return Err(format!("expected a privilege, found {other:?}")),
+                other => {
+                    return Err(format!(
+                        "expected a privilege, found {}",
+                        Cursor::tok_kind(&other)
+                    ))
+                }
             };
             if w.eq_ignore_ascii_case("ALL") {
                 if let Some(Tok::Word(nextw)) = c.peek() {
@@ -555,7 +579,12 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
         c.kw("PASSWORD")?;
         let password = match c.next() {
             Some(Tok::Str(s)) => s,
-            other => return Err(format!("expected a quoted password, found {other:?}")),
+            other => {
+                return Err(format!(
+                    "expected a quoted password, found {}",
+                    Cursor::tok_kind(&other)
+                ))
+            }
         };
         c.expect_end()?;
         return Ok(if verb("CREATE", "USER") {
@@ -591,7 +620,12 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
     // role-membership grant.
     let first_word = match c.peek() {
         Some(Tok::Word(w)) => w.clone(),
-        other => return Err(format!("expected a role or privilege, found {other:?}")),
+        other => {
+            return Err(format!(
+                "expected a role or privilege, found {}",
+                Cursor::tok_kind(&other.cloned())
+            ))
+        }
     };
     let is_priv_form = matches!(
         first_word.to_uppercase().as_str(),
@@ -608,7 +642,12 @@ fn parse_tokens(toks: Vec<Tok>) -> Result<UserAdminStmt, String> {
             cols = c.name_list_raw()?;
             match c.next() {
                 Some(Tok::RParen) => {}
-                other => return Err(format!("expected ')' after column list, found {other:?}")),
+                other => {
+                    return Err(format!(
+                        "expected ')' after column list, found {}",
+                        Cursor::tok_kind(&other)
+                    ))
+                }
             }
         }
         c.kw("ON")?;
@@ -1898,6 +1937,46 @@ mod tests {
     /// credentials) — keep them out of source literals.
     fn test_pw() -> String {
         ["pa", "ss", "w0", "rd", "12", "34"].concat()
+    }
+
+    /// 第六轮审查回归:解析错误的 token 打印曾内嵌原文——裸词密码经
+    /// `CREATE USER eve PASSWORD 12345678` 的错误消息进查询日志/审计
+    /// 文件,redact_sql 只覆盖 sql 字段拦不住 error 字段。
+    #[test]
+    fn parse_errors_never_echo_token_contents() {
+        let pw = ["12", "34", "56", "78"].concat();
+        let sql = format!("CREATE USER eve PASSWORD {pw}");
+        match parse(&sql) {
+            Some(Err(msg)) => {
+                assert!(!msg.contains(&pw), "error leaks the token text: {msg}");
+                assert!(msg.contains("quoted password"), "{msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        for sql in [
+            "CREATE USER eve PASSWORD \"secret\"",
+            "GRANT SELECT ON t TO",
+            "GRANT (SELECT) ON t TO alice",
+            "GRANT SELECT () ON t TO alice",
+        ] {
+            if let Some(Err(msg)) = parse(sql) {
+                assert!(!msg.contains("secret"), "{msg}");
+            }
+        }
+    }
+
+    /// 第六轮审查回归:谓词切分对 /* … */ 注释不感知——注释内的顶层 TO
+    /// 曾被当子句标记,合法 GRANT 被拒。
+    #[test]
+    fn row_filter_grant_tolerates_comments_before_to() {
+        match parse("GRANT SELECT ON t WHERE x = 1 /* TO ghost */ TO alice") {
+            Some(Ok(UserAdminStmt::GrantTable { .. })) => {}
+            other => panic!("expected a parsed grant, got {other:?}"),
+        }
+        match parse("GRANT SELECT ON t WHERE x = 1 -- note\n TO alice") {
+            Some(Ok(UserAdminStmt::GrantTable { .. })) => {}
+            other => panic!("expected a parsed grant, got {other:?}"),
+        }
     }
 
     /// 未闭合的双引号标识符必须报错(曾把余下全文吞成一个名字,畸形
