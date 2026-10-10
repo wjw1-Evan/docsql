@@ -2704,8 +2704,7 @@ pub async fn handle_connection(
                                 && !is_repl
                                 && docsql_core::tsql_batch::is_insert_statement(&sql)
                             {
-                                tsql_session
-                                    .note_identity(identity.map(docsql_core::Value::Int));
+                                tsql_session.note_identity(identity.map(docsql_core::Value::Int));
                             }
                             if logged {
                                 querylog::record(
