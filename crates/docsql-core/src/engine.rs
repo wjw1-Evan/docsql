@@ -8680,14 +8680,57 @@ impl Database {
                         self.check_fk_parent_delete_skipping(name, &removed, &[], &targets, None)?;
                     }
                 }
-                for name in &targets {
-                    if self.tables.contains_key(name) {
+                // One pager transaction for the WHOLE batch: each table's
+                // rewrite used to commit its own transaction, so a mid-list
+                // failure left earlier tables emptied AND committed while
+                // the failed statement never reached the journal — replicas
+                // kept rows the origin lost. Any failure now aborts the
+                // batch and restores the in-memory catalog snapshot.
+                let touched: Vec<String> = targets
+                    .iter()
+                    .filter(|n| self.tables.contains_key(*n))
+                    .cloned()
+                    .collect();
+                let catalog_snapshot: Vec<(String, Option<std::sync::Arc<TableMeta>>)> = touched
+                    .iter()
+                    .map(|n| (n.clone(), self.tables.get(n).cloned()))
+                    .collect();
+                let mut tx = self.pager.begin_tx();
+                let batch = (|| -> Result<()> {
+                    for name in &touched {
                         let mut meta = self
                             .tables
                             .get(name)
                             .map(|a| a.as_ref().clone())
                             .unwrap_or_default();
-                        self.rewrite_table(name, &mut meta, Vec::new())?;
+                        self.rewrite_table_tx(
+                            &mut tx,
+                            name,
+                            &mut meta,
+                            Vec::new(),
+                            true,
+                            Vec::new(),
+                        )?;
+                    }
+                    Ok(())
+                })();
+                match batch {
+                    Ok(()) => {
+                        self.commit_pager_tx(tx)?;
+                    }
+                    Err(e) => {
+                        for (name, old) in catalog_snapshot {
+                            match old {
+                                Some(m) => {
+                                    self.tables.insert(name, m);
+                                }
+                                None => {
+                                    self.tables.remove(&name);
+                                }
+                            }
+                        }
+                        self.pager.abort_tx(tx)?;
+                        return Err(e);
                     }
                 }
                 Ok(ExecOutcome::Affected(0))
@@ -8740,13 +8783,40 @@ impl Database {
         free_old: bool,
         dead_trees: Vec<(String, u32)>,
     ) -> Result<()> {
+        let mut tx = self.pager.begin_tx();
+        if let Err(e) = self.rewrite_table_tx(&mut tx, table, meta, docs, free_old, dead_trees) {
+            // Same failure semantics as the old inline body: the staged
+            // pages never reach the data file (Tx's drop restores them),
+            // and the in-memory catalog entry was already restored by
+            // rewrite_table_tx's save-failure path or never swapped.
+            self.pager.abort_tx(tx)?;
+            return Err(e);
+        }
+        self.commit_pager_tx(tx)?;
+        Ok(())
+    }
+
+    /// [`Self::rewrite_table_inner`] on a CALLER-OWNED transaction: the
+    /// TRUNCATE batch rewrites several tables inside ONE pager transaction
+    /// so a mid-list failure rolls the whole statement back (each table
+    /// used to commit its own rebuild, leaving earlier tables emptied and
+    /// committed while the failed statement never reached the journal —
+    /// replicas kept rows the origin lost).
+    fn rewrite_table_tx(
+        &mut self,
+        tx: &mut crate::pager::Tx,
+        table: &str,
+        meta: &mut TableMeta,
+        docs: Vec<Object>,
+        free_old: bool,
+        dead_trees: Vec<(String, u32)>,
+    ) -> Result<()> {
         let mut heap = Heap {
             pages: Vec::new(),
             overflow_free: meta.overflow_free.clone(),
             dropped: Vec::new(),
         };
         let cols: Vec<String> = meta.index_roots.keys().cloned().collect();
-        let mut tx = self.pager.begin_tx();
         // Release old storage BEFORE the rebuild: allocations below then pop
         // those pages back (same transaction, so the catalog switch and the
         // page rewrites are atomic; snapshots rebuild old versions from the
@@ -8756,24 +8826,24 @@ impl Database {
             // only by the old slots' head pointers; free them too or every
             // rewrite/TRUNCATE of a table with oversized documents orphans
             // the chains (the file grows without bound under churn).
-            crate::heap::free_overflow_chains(&self.pager, &mut tx, &meta.pages)?;
+            crate::heap::free_overflow_chains(&self.pager, tx, &meta.pages)?;
             for &p in &meta.pages {
-                self.pager.free_page(&mut tx, p)?;
+                self.pager.free_page(tx, p)?;
             }
             for (root_key, &root) in &meta.index_roots {
                 for p in BTree::open(root)
-                    .collect_pages(&PageReader::current(&self.pager), &tx)
+                    .collect_pages(&PageReader::current(&self.pager), tx)
                     .map_err(|e| index_err(root_key, e))?
                 {
-                    self.pager.free_page(&mut tx, p)?;
+                    self.pager.free_page(tx, p)?;
                 }
             }
             for (root_key, root) in &dead_trees {
                 for p in BTree::open(*root)
-                    .collect_pages(&PageReader::current(&self.pager), &tx)
+                    .collect_pages(&PageReader::current(&self.pager), tx)
                     .map_err(|e| index_err(root_key, e))?
                 {
-                    self.pager.free_page(&mut tx, p)?;
+                    self.pager.free_page(tx, p)?;
                 }
             }
         }
@@ -8782,11 +8852,11 @@ impl Database {
             // Rebuilds walk every row (ALTER/RENAME on a large table must
             // stay interruptible like every other long row loop).
             self.stmt_deadline.check()?;
-            let loc = heap.insert(&self.pager, &mut tx, doc)?;
+            let loc = heap.insert(&self.pager, tx, doc)?;
             pairs.push((loc, doc.clone()));
         }
         let roots = self.build_trees(
-            &mut tx,
+            tx,
             &pairs,
             &cols,
             &cols
@@ -8827,7 +8897,7 @@ impl Database {
         self.autoinc_cache.remove(table);
         self.tables
             .insert(table.to_string(), std::sync::Arc::new(meta.clone()));
-        if let Err(e) = self.save_catalog_into(&mut tx) {
+        if let Err(e) = self.save_catalog_into(tx) {
             match prev_meta {
                 Some(old) => {
                     *meta = old.as_ref().clone();
@@ -8839,7 +8909,6 @@ impl Database {
             }
             return Err(e);
         }
-        self.commit_pager_tx(tx)?;
         Ok(())
     }
 
@@ -11968,6 +12037,60 @@ impl Database {
                     }
                 }
             }
+        } else if replace
+            && indexed.is_empty()
+            && composite_uniques.is_empty()
+            && (meta.primary_key.is_some() || !meta.unique.is_empty())
+            && !new_docs.is_empty()
+        {
+            // Legacy layout: the constraint columns predate trees, so no
+            // probe can locate the rows OR REPLACE displaces — the rows
+            // survived into the whole-set unique check and failed the very
+            // keys they were replacing. Find them by content instead
+            // (new tables always build trees; only legacy volumes land
+            // here). Intra-batch duplicates keep the tree path's
+            // "later row wins" semantics.
+            let constraint_cols: Vec<&String> =
+                meta.primary_key.iter().chain(meta.unique.iter()).collect();
+            let key_of = |d: &Object| -> Option<Vec<Vec<u8>>> {
+                let mut parts = Vec::with_capacity(constraint_cols.len());
+                for c in &constraint_cols {
+                    let v = d.get(*c)?;
+                    // NULL keys never displace (trees hold no NULL keys).
+                    if matches!(v, Value::Null) {
+                        return None;
+                    }
+                    parts.push(encode::encode_to_vec(v).ok()?);
+                }
+                Some(parts)
+            };
+            let mut last_at: std::collections::BTreeMap<Vec<Vec<u8>>, usize> =
+                std::collections::BTreeMap::new();
+            for (i, d) in new_docs.iter().enumerate() {
+                if let Some(k) = key_of(d) {
+                    last_at.insert(k, i);
+                }
+            }
+            let kept: Vec<Object> = new_docs
+                .iter()
+                .enumerate()
+                .filter(|(i, d)| {
+                    let Some(k) = key_of(d) else {
+                        return true;
+                    };
+                    last_at.get(&k).is_some_and(|&j| j == *i)
+                })
+                .map(|(_, d)| d.clone())
+                .collect();
+            let old_pairs = self.table_pairs_cx(&table)?;
+            for (loc, od) in old_pairs {
+                if let Some(k) = key_of(&od) {
+                    if kept.iter().any(|n| key_of(n).as_deref() == Some(&k[..])) {
+                        displaced.push(loc);
+                    }
+                }
+            }
+            new_docs = kept;
         }
         if !displaced.is_empty() {
             // One old row can be hit through several constraints at once
@@ -36660,5 +36783,83 @@ mod tsql_compat_tests {
         assert!(db.table_exists_ci("docsql_pubsub"), "case variant missed");
         assert!(!db.table_exists_ci("docsql_pubsub2"));
         assert!(!db.table_exists_ci("docsql_pubsu"));
+    }
+
+    /// 第七轮收尾:TRUNCATE 多表(含 CASCADE 扩表)整批单事务——全部
+    /// 目标一起清空;FK 校验先行,父子的清单整体合法才动手。
+    #[test]
+    fn truncate_multiple_tables_and_cascade() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY, v INT)");
+        run(
+            &mut db,
+            "CREATE TABLE c (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES p (id))",
+        );
+        run(&mut db, "INSERT INTO p (id, v) VALUES (1, 10), (2, 20)");
+        run(&mut db, "INSERT INTO c (id, pid) VALUES (1, 1), (2, 2)");
+        run(&mut db, "TRUNCATE p, c");
+        let r = rows(
+            &mut db,
+            "SELECT (SELECT COUNT(*) FROM p) + (SELECT COUNT(*) FROM c) AS n",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(0), "{r:?}");
+        // CASCADE reaches the child transitively.
+        run(&mut db, "INSERT INTO p (id, v) VALUES (3, 30)");
+        run(&mut db, "INSERT INTO c (id, pid) VALUES (3, 3)");
+        run(&mut db, "TRUNCATE p CASCADE");
+        let r = rows(
+            &mut db,
+            "SELECT (SELECT COUNT(*) FROM p) + (SELECT COUNT(*) FROM c) AS n",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(0), "{r:?}");
+        // The batch stays reloadable and re-insertable after the truncate.
+        run(&mut db, "INSERT INTO p (id, v) VALUES (4, 40)");
+        let r = rows(&mut db, "SELECT v FROM p");
+        assert_eq!(r.rows[0][0], Value::Int(40), "{r:?}");
+    }
+
+    /// 第七轮收尾:OR REPLACE 在「约束列无树」的 legacy 形态表上按内容
+    /// 找被替行——替换语义恢复(旧行移除、新行落位),不再撞自身键报
+    /// UNIQUE 错误;批内同键后者胜,与树路径一致。
+    #[test]
+    fn or_replace_on_treeless_constraint_table_replaces() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES (1, 'old'), (2, 'keep')",
+        );
+        // Manufacture the legacy layout: the constraint column predates its
+        // tree (old volumes carry this shape; new tables always build one).
+        if let Some(m) = db.tables.get_mut("t") {
+            let m = std::sync::Arc::make_mut(m);
+            m.index_roots.remove("id");
+        }
+        run(
+            &mut db,
+            "INSERT OR REPLACE INTO t (id, v) VALUES (1, 'new')",
+        );
+        let r = rows(&mut db, "SELECT v FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("new".into())],
+                vec![Value::Str("keep".into())]
+            ],
+            "{r:?}"
+        );
+        // Intra-batch duplicate keys: later row wins.
+        run(
+            &mut db,
+            "INSERT OR REPLACE INTO t (id, v) VALUES (3, 'a'), (3, 'b')",
+        );
+        let r = rows(&mut db, "SELECT v FROM t WHERE id = 3");
+        assert_eq!(r.rows, vec![vec![Value::Str("b".into())]], "{r:?}");
+        // The whole-set unique check still fires on a genuinely new key.
+        let e = db
+            .execute("INSERT INTO t (id, v) VALUES (2, 'dup')")
+            .unwrap_err()
+            .to_string();
+        assert!(e.to_uppercase().contains("UNIQUE"), "{e}");
     }
 }

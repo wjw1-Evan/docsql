@@ -282,18 +282,28 @@ pub(crate) fn try_serve_log_view(
         }
     }
     let lower = sql.to_lowercase();
-    if !lower.trim_start().starts_with("select") {
-        return None;
-    }
     // The view is served only when docsql_log is the FROM target: a query
     // like `WHERE note = 'docsql_log'` (or a same-named column of another
     // table) must reach the engine untouched, not swap in log rows.
     let toks = word_tokens(&lower);
     let words: Vec<&str> = toks.iter().map(|(a, b)| &lower[*a..*b]).collect();
-    if !words
+    let names_view = words
         .windows(2)
-        .any(|w| w[0] == "from" && w[1] == "docsql_log")
-    {
+        .any(|w| w[0] == "from" && w[1] == "docsql_log");
+    let trimmed = lower.trim_start();
+    if !trimmed.starts_with("select") {
+        // EXPLAIN/WITH spellings that name the view must fail honestly:
+        // falling through to the engine answers "no such table" for a view
+        // the plain SELECT serves fine.
+        if names_view && (trimmed.starts_with("explain") || trimmed.starts_with("with")) {
+            return Some(err_frame(
+                "docsql_log view supports a direct SELECT only \
+                 (EXPLAIN/WITH over it is not servable)",
+            ));
+        }
+        return None;
+    }
+    if !names_view {
         return None;
     }
     const COLS: [&str; 7] = [
