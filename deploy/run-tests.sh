@@ -4,6 +4,10 @@
 #   ./deploy/run-tests.sh                            # build local image (:local,
 #                                                    # in-build cargo test gate) then test
 #   DOCSQL_DEV_IMAGE_TAG=<tag> ./deploy/run-tests.sh # test an existing image, no build
+#   DOCSQL_RUN_TESTS=false ./deploy/run-tests.sh     # build WITHOUT the in-build cargo
+#                                                    # test gate (memory-constrained
+#                                                    # Docker Desktop; run cargo test
+#                                                    # locally first — CI runs it anyway)
 #
 # Data safety: the suites need a clean slate, so they run on dedicated
 # throwaway volumes (DOCSQL_DEV_DATA_PREFIX=docsql-dev-testdata). The regular

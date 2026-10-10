@@ -171,8 +171,17 @@ internal static partial class SchemaSync
         // 换名后按原文重放:索引名全库唯一,DROP 原表即释放旧名,DDL 文本里
         // 的表名在 RENAME 之后重新成立。
         var indexDdls = ExistingIndexSqls(conn, table).ToList();
+        // Table-level constraints (hand-made UNIQUE(...)/CHECK/FOREIGN KEY on
+        // the external table) exist ONLY in the original CREATE TABLE text —
+        // sqlite_master exposes it now. Re-attach them to the rebuilt shape:
+        // losing them silently dropped enforcement (duplicate emails stopped
+        // failing after a keep-data rebuild).
+        var extraConstraints = ExtractTableLevelConstraints(conn, table);
+        var targetColumns = extraConstraints.Length > 0
+            ? createColumns + ", " + extraConstraints
+            : createColumns;
         Exec(conn, $"DROP TABLE IF EXISTS {Quote(temp)}");
-        Exec(conn, $"CREATE TABLE {Quote(temp)} ({createColumns})");
+        Exec(conn, $"CREATE TABLE {Quote(temp)} ({targetColumns})");
         var copyColumns = ExistingColumns(conn, table).ToList();
         if (copyColumns.Count > 0)
         {
@@ -202,6 +211,21 @@ internal static partial class SchemaSync
             // 同上:破坏性阶段发现对方已完成,本方清理退场。
             TryDrop(conn, temp);
             return;
+        }
+        catch (Exception ex)
+            when (ex.Message.Contains("referenced by VIEW", StringComparison.Ordinal)
+                || ex.Message.Contains("referenced by view", StringComparison.Ordinal))
+        {
+            // The engine's view-dependency guard refuses the DROP. A keep-data
+            // rebuild can never succeed while a user view names this table:
+            // rethrow an actionable error (drop the view or add the missing
+            // primary key by hand) INSTEAD of letting every future context
+            // redo the full table copy and fail the same way.
+            TryDrop(conn, temp);
+            throw new InvalidOperationException(
+                $"cannot rebuild table '{table}' to enforce its model primary key: a VIEW " +
+                "depends on the table (drop the view first, or create the primary key " +
+                $"manually). Inner error: {ex.Message}", ex);
         }
         foreach (var ddl in indexDdls)
         {
@@ -236,6 +260,72 @@ internal static partial class SchemaSync
                 yield return sql;
             }
         }
+    }
+
+    /// <summary>原表 CREATE TABLE 文本里的表级约束子句(UNIQUE(...)/
+    /// CHECK(...)/FOREIGN KEY ...):列定义之外的 parts,原样保留。旧的
+    /// 引擎把表行 sql 留空,保数据重建后这些约束静默消失;现在从 DDL
+    /// 文本重新挂回目标形状。逗号按括号深度切分,字符串/引号标识符不透明。</summary>
+    private static string ExtractTableLevelConstraints(DbConnection conn, string table)
+    {
+        string? ddl = null;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '" +
+                table.Replace("'", "''") + "'";
+            ddl = cmd.ExecuteScalar() as string;
+        }
+        if (string.IsNullOrWhiteSpace(ddl))
+        {
+            return string.Empty;
+        }
+        var open = ddl.IndexOf('(');
+        var close = ddl.LastIndexOf(')');
+        if (open < 0 || close <= open)
+        {
+            return string.Empty;
+        }
+        var body = ddl.Substring(open + 1, close - open - 1);
+        // Split top-level commas: parens nest, quoted identifiers ("a,b") and
+        // string literals ('a,b') are opaque.
+        var parts = new List<string>();
+        var depth = 0;
+        var sb = new System.Text.StringBuilder();
+        char quote = '\0';
+        foreach (var ch in body)
+        {
+            if (quote != '\0')
+            {
+                sb.Append(ch);
+                if (ch == quote) quote = '\0';
+                continue;
+            }
+            if (ch is '"' or '\'')
+            {
+                quote = ch;
+                sb.Append(ch);
+                continue;
+            }
+            if (ch == '(') depth++;
+            if (ch == ')') depth--;
+            if (ch == ',' && depth == 0)
+            {
+                parts.Add(sb.ToString());
+                sb.Clear();
+                continue;
+            }
+            sb.Append(ch);
+        }
+        if (sb.Length > 0) parts.Add(sb.ToString());
+        var kept = parts
+            .Select(p => p.Trim())
+            .Where(p => p.StartsWith("UNIQUE", StringComparison.OrdinalIgnoreCase)
+                || p.StartsWith("CHECK", StringComparison.OrdinalIgnoreCase)
+                || p.StartsWith("FOREIGN KEY", StringComparison.OrdinalIgnoreCase)
+                || p.StartsWith("PRIMARY KEY", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        return string.Join(", ", kept);
     }
 
     private static bool TableExists(DbConnection conn, string table)
@@ -373,11 +463,15 @@ internal static partial class SchemaSync
 
                 try
                 {
-                    // Unique drift: an existing index with the same name but
-                    // without UNIQUE would be silently kept by IF NOT EXISTS,
-                    // so the constraint never gets enforced. Drop and recreate.
-                    if (index.IsUnique && ExistingIndexSql(conn, table, iname) is { } ddl
-                        && !ddl.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
+                    // Unique drift, BOTH directions: an existing same-named
+                    // index whose UNIQUE-ness disagrees with the model would
+                    // be silently kept by IF NOT EXISTS. Missing UNIQUE
+                    // leaves the constraint unenforced; a stale UNIQUE (the
+                    // model dropped IsUnique) keeps rejecting legitimate
+                    // duplicate values forever. Drop and recreate either way.
+                    if (ExistingIndexSql(conn, table, iname) is { } ddl
+                        && ddl.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase)
+                            != index.IsUnique)
                     {
                         using var drop = conn.CreateCommand();
                         drop.CommandText = $"DROP INDEX IF EXISTS {Quote(iname)}";

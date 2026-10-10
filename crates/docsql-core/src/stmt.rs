@@ -529,6 +529,108 @@ pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
     chunks
 }
 
+/// Split a script into GO-separated T-SQL batches. Quote/comment/bracket
+/// aware, same scanner rules as [`text_chunks`]; the GO lines themselves
+/// are dropped. A `;` is NOT a batch boundary here — it is a statement
+/// terminator INSIDE a batch, and the batch interpreter must keep
+/// @variables alive across it (`text_chunks` emits chunk edges for both
+/// spellings; feeding those to the interpreter used to clear the variables
+/// at every semicolon).
+pub fn go_batches(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut batches = Vec::new();
+    let mut cur = String::new();
+    let mut line_begin = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            cur.push(c);
+            i += 1;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == '\'' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '[' {
+            cur.push(c);
+            i += 1;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == ']' {
+                    if chars.get(i + 1) == Some(&']') {
+                        cur.push(*chars.get(i + 1).unwrap());
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                cur.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            cur.push('/');
+            cur.push('*');
+            i += 2;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    cur.push('*');
+                    cur.push('/');
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\n' {
+            let line = cur[line_begin..].trim();
+            let bare = line.strip_suffix(';').unwrap_or(line).trim();
+            if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
+                cur.truncate(line_begin);
+                while cur.ends_with(char::is_whitespace) {
+                    cur.pop();
+                }
+                batches.push(std::mem::take(&mut cur));
+                line_begin = 0;
+                i += 1;
+                continue;
+            }
+            cur.push(c);
+            line_begin = cur.len();
+            i += 1;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    let line = cur[line_begin..].trim();
+    let bare = line.strip_suffix(';').unwrap_or(line).trim();
+    if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
+        cur.truncate(line_begin);
+        while cur.ends_with(char::is_whitespace) {
+            cur.pop();
+        }
+    }
+    batches.push(cur);
+    batches
+}
+
 /// Split `sql` into individual statement texts.
 ///
 /// A single-statement input is returned verbatim (trimmed) so the common

@@ -277,7 +277,7 @@ pub(crate) fn try_serve_log_view(
     // swapped in audit rows. Let the catalog decide which one exists.
     {
         let db = state.db.read().unwrap_or_else(|p| p.into_inner());
-        if db.table_exists("docsql_log") {
+        if db.table_exists_ci("docsql_log") {
             return None;
         }
     }
@@ -388,8 +388,17 @@ pub(crate) fn try_serve_log_view(
         }
     };
 
+    // SQL semantics: ORDER BY ranks the WHOLE set, LIMIT then cuts it.
+    // Taking the newest `limit` entries first and sorting that subset
+    // answered `ORDER BY ts_ms ASC LIMIT 10` with "the newest 10, sorted"
+    // instead of "the oldest 10".
     let mut docs: Vec<Object> = Vec::new();
-    for e in state.query_log.snapshot().iter().rev().take(limit) {
+    let snapshot = state.query_log.snapshot();
+    let selected: Vec<&crate::querylog::LogEntry> = match &order {
+        Some((_, _)) => snapshot.iter().collect(),
+        None => snapshot.iter().rev().take(limit).collect(),
+    };
+    for e in selected {
         let mut o = Object::new();
         o.insert("ts_ms".into(), Value::Int(e.ts_ms as i64));
         o.insert("peer".into(), Value::Str(e.peer.clone()));
@@ -417,6 +426,7 @@ pub(crate) fn try_serve_log_view(
                 ord.reverse()
             }
         });
+        docs.truncate(limit);
     }
     let out_cols: Vec<&str> = if proj.is_empty() { COLS.to_vec() } else { proj };
     let mut obj = Object::new();

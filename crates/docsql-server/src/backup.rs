@@ -665,16 +665,31 @@ pub async fn backup_task(state: Arc<ServerState>, interval_secs: u64) {
     let mut first = true;
     loop {
         tick.tick().await;
+        // Retry a remote incremental-chain invalidation that has not been
+        // confirmed clean (the marker is written at adoption; see
+        // invalidate_incremental_exports_remote).
+        if state.backup_s3.is_some() && state.backup_dir.join(REMOTE_INVAL_MARKER).exists() {
+            invalidate_incremental_exports_remote(&state).await;
+        }
         // Incremental export runs on EVERY tick (cheap, journal-bounded):
         // skipping it on the fresh-base first tick would leave the PITR
         // chain behind across restarts.
         if state.sync_queue.lock().await.closed && try_begin_backup(&state) {
-            // RunningFlagGuard:export_incremental panic 时 running 标志在
-            // unwind 中也能复位,定时备份不会卡死到重启(与 finish_backup
-            // 同一形态)。
-            let _running = RunningFlagGuard(&state);
-            if let Err(e) = export_incremental(&state).await {
-                eprintln!("incremental export failed: {e}");
+            // A fenced node must not vouch for ANY durable export — the
+            // quorum gate below states it for full backups, and an
+            // incremental segment uploaded from a minority view re-arms
+            // exactly the same DR risk (a restore replays writes the
+            // majority partition ruled away).
+            if let Some(denial) = crate::quorum_write_denial(&state) {
+                eprintln!("incremental export tick skipped: {denial}");
+            } else {
+                // RunningFlagGuard:export_incremental panic 时 running 标志在
+                // unwind 中也能复位,定时备份不会卡死到重启(与 finish_backup
+                // 同一形态)。
+                let _running = RunningFlagGuard(&state);
+                if let Err(e) = export_incremental(&state).await {
+                    eprintln!("incremental export failed: {e}");
+                }
             }
         }
         // Full backup freshness: first tick writes one when none exists or
@@ -1080,15 +1095,35 @@ fn read_incr_files(dir: &Path) -> Vec<String> {
 /// segments, and the lexicographic dedup in `collect_pitr_entries` prefers
 /// the older REAL text over the post-adoption sentinel, resurrecting the
 /// writes the majority discarded.
+/// Marker file recording a remote incremental-chain invalidation that has
+/// not been confirmed clean yet: the backup tick retries while it exists,
+/// so a transient S3 outage during adoption cannot leave voided segments
+/// fetchable forever (the one-shot delete had no retry path — a node that
+/// never re-adopts kept them until DR pulled them back).
+const REMOTE_INVAL_MARKER: &str = ".remote-incr-inval-pending";
+
 pub(crate) async fn invalidate_incremental_exports_remote(state: &Arc<ServerState>) {
     let Some(s3) = state.backup_s3.as_ref() else {
         return;
     };
     let cfg = s3.config();
+    // Record the intent FIRST: a crash or S3 outage mid-way must leave the
+    // marker so the backup tick keeps retrying.
+    let marker = state.backup_dir.join(REMOTE_INVAL_MARKER);
+    if let Err(e) = std::fs::write(&marker, b"") {
+        eprintln!("sync: cannot record remote incremental invalidation ({e}); continuing");
+    }
+    let remote_incr_left = |keys: &[String]| {
+        owned_keys(keys, &cfg.prefix).iter().any(|k| {
+            key_file_name(k).is_some_and(|n| {
+                n.starts_with("incr-") && (n.ends_with(".sql") || n.ends_with(".sha256"))
+            })
+        })
+    };
     let Ok(keys) = s3.list(&cfg.prefix).await else {
         eprintln!(
             "sync: listing remote incrementals for invalidation failed \
-             (the next adoption retries)"
+             (the backup tick retries while the marker remains)"
         );
         return;
     };
@@ -1101,6 +1136,14 @@ pub(crate) async fn invalidate_incremental_exports_remote(state: &Arc<ServerStat
                 eprintln!("sync: remote incremental delete {key} failed: {e}");
             }
         }
+    }
+    // Clear the marker only when a fresh listing confirms the prefix is
+    // clean — a failed delete or a listing error keeps the retry alive.
+    match s3.list(&cfg.prefix).await {
+        Ok(keys) if !remote_incr_left(&keys) => {
+            let _ = std::fs::remove_file(&marker);
+        }
+        _ => {}
     }
 }
 

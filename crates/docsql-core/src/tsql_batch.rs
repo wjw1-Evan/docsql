@@ -152,49 +152,49 @@ impl TsqlSession {
         self.prints.clear();
         self.last_result = None;
         let mut budget = MAX_BATCH_STATEMENTS;
-        let mut first_chunk = true;
-        // `;` inside an open BEGIN…END block must not split the batch:
-        // text_chunks is block-blind (it also feeds the engine's plain
-        // statement path, where BEGIN is the transaction statement), so
-        // merge chunks while a block stays open. Transaction-style
-        // `BEGIN … COMMIT` scripts simply coalesce into one chunk, which
-        // parse_batch then runs as sequential statements.
-        let mut merged: Vec<String> = Vec::new();
-        for chunk in stmt::text_chunks(sql) {
-            if let Some(last) = merged.last_mut() {
-                if batch_begin_depth(last) > 0 {
-                    last.push('\n');
-                    last.push_str(&chunk);
-                    continue;
-                }
-            }
-            merged.push(chunk);
-        }
-        for chunk in merged {
-            let chunk = chunk.trim();
-            if chunk.is_empty() {
-                // An empty chunk exists only around a dropped separator
-                // (a leading GO leaves one before the real batch): it still
-                // ends the previous batch, so the NEXT chunk must not ride
-                // `first_chunk` and inherit the old variables.
-                first_chunk = false;
-                continue;
-            }
-            if !first_chunk {
+        // Batch boundaries are GO lines ONLY: `;` is a statement terminator
+        // INSIDE a batch and must not kill @variables (T-SQL). text_chunks
+        // emits chunk edges for both spellings, and clearing the variables
+        // at every chunk edge made every semicolon-terminated script fail
+        // with "Must declare the scalar variable".
+        for (seg_i, segment) in stmt::go_batches(sql).into_iter().enumerate() {
+            if seg_i > 0 {
                 // GO ends a batch: variables die with it (T-SQL). @@ROWCOUNT
                 // survives — a new batch may read what the last one did.
                 self.vars.clear();
             }
-            first_chunk = false;
-            let stmts = parse_batch(chunk)?;
-            for stmt in stmts {
-                if let Some(flow) = self.run_stmt(stmt, exec, &mut budget, 0).await? {
-                    // Flow control reaching batch scope is an error:
-                    // BREAK/CONTINUE belong to a WHILE.
-                    return err(format!(
-                        "{} is only allowed inside a WHILE loop",
-                        flow.name()
-                    ));
+            // `;` inside an open BEGIN…END block must not split the batch:
+            // text_chunks is block-blind (it also feeds the engine's plain
+            // statement path, where BEGIN is the transaction statement), so
+            // merge chunks while a block stays open. Transaction-style
+            // `BEGIN … COMMIT` scripts simply coalesce into one chunk, which
+            // parse_batch then runs as sequential statements.
+            let mut merged: Vec<String> = Vec::new();
+            for chunk in stmt::text_chunks(&segment) {
+                if let Some(last) = merged.last_mut() {
+                    if batch_begin_depth(last) > 0 {
+                        last.push('\n');
+                        last.push_str(&chunk);
+                        continue;
+                    }
+                }
+                merged.push(chunk);
+            }
+            for chunk in merged {
+                let chunk = chunk.trim();
+                if chunk.is_empty() {
+                    continue;
+                }
+                let stmts = parse_batch(chunk)?;
+                for stmt in stmts {
+                    if let Some(flow) = self.run_stmt(stmt, exec, &mut budget, 0).await? {
+                        // Flow control reaching batch scope is an error:
+                        // BREAK/CONTINUE belong to a WHILE.
+                        return err(format!(
+                            "{} is only allowed inside a WHILE loop",
+                            flow.name()
+                        ));
+                    }
                 }
             }
         }
@@ -1622,6 +1622,18 @@ impl<'a> Parser<'a> {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 b',' | b';' if depth == 0 => break,
+                // A CASE expression in a SET/DECLARE initializer: skip the
+                // whole block so its inner ELSE (a statement starter) does
+                // not end the assignment mid-expression — same arm
+                // read_plain/read_condition carry.
+                _ if depth == 0
+                    && c_is_alpha
+                    && self.at_word_start()
+                    && self.word_at_is(&["case"]) =>
+                {
+                    self.skip_case_block();
+                    continue;
+                }
                 _ if depth == 0
                     && c_is_alpha
                     && self.at_word_start()
@@ -2502,6 +2514,13 @@ fn leading_trivia_end(text: &str) -> usize {
 /// Strip one layer of single quotes; anything else returns as-is.
 fn unquote_literal(s: &str) -> String {
     let t = s.trim();
+    // T-SQL national string prefix: N'msg' is the same text literal, the
+    // prefix only selects the national form (one UTF-8 text type here).
+    // Strip a single N/n immediately followed by the opening quote.
+    let t = match t.as_bytes() {
+        [b'N' | b'n', b'\'', ..] => &t[1..],
+        _ => t,
+    };
     // Only unquote a SINGLE well-formed literal: `'x' + 'y'` (a
     // concatenation) starts and ends with a quote too, and peeling one
     // layer mangled the message into `x' + 'y` with the inner quotes
@@ -3793,5 +3812,55 @@ mod tests {
         assert!(needs_interpretation("SELECT SUSER_SNAME()"));
         assert!(needs_interpretation("SELECT ERROR_MESSAGE()"));
         assert!(!needs_interpretation("SELECT 1"));
+    }
+
+    /// 第七轮审查回归:`;` 是批内语句终止符,@变量跨分号存活;
+    /// GO 仍然是唯一的批边界(变量死亡)。
+    #[test]
+    fn semicolons_do_not_end_batches_but_go_does() {
+        let mut sess = TsqlSession::new();
+        let mut db = DbExec::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @x INT = 5;\nSET @x = @x + 1;\nSELECT @x AS v;",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(6));
+        // Across a GO the variable dies.
+        let e = run_script(&mut sess, &mut db, "SELECT @x AS v\nGO\nSELECT @x AS v").unwrap_err();
+        assert!(e.to_string().contains("declare"), "{e}");
+        // Loop bodies with semicolons survive too.
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @i INT = 0;\nWHILE @i < 3\nBEGIN\n SET @i = @i + 1;\nEND;\nSELECT @i AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Int(3));
+    }
+
+    /// 第七轮审查回归:SET/DECLARE 初始化器里的多行 CASE 整体跳过,
+    /// 内部换行后的 ELSE 不再截断赋值表达式。
+    #[test]
+    fn assign_expr_skips_multiline_case() {
+        let mut sess = TsqlSession::new();
+        let mut db = DbExec::new();
+        let out = run_script(
+            &mut sess,
+            &mut db,
+            "DECLARE @x INT = 1\nSET @v = CASE WHEN @x = 1 THEN 'a'\nELSE 'b' END\nSELECT @v AS v",
+        )
+        .unwrap();
+        assert_eq!(rows_of(&out)[0][0], Value::Str("a".into()));
+    }
+
+    /// 第七轮审查回归:RAISERROR/THROW 的 N'…' 前缀字面量按文本剥离。
+    #[test]
+    fn raiserror_national_literal_unquoted() {
+        let mut sess = TsqlSession::new();
+        let mut db = DbExec::new();
+        let e = run_script(&mut sess, &mut db, "RAISERROR(N'nmsg', 16, 1)").unwrap_err();
+        assert!(e.to_string().contains("nmsg"), "{}", e.to_string());
     }
 }

@@ -1574,7 +1574,10 @@ fn build_user_admin_statement(b: &UsersActionBody) -> Result<String, String> {
             let Some(table) = &b.table else {
                 return Err("缺少表名".into());
             };
-            if table.is_empty() || table.len() > 128 {
+            if table.is_empty() || table.chars().count() > 128 {
+                // chars(), not bytes: table names may be any Unicode (the
+                // engine accepts them), and a 43-CJK-char name is 129 bytes
+                // — the byte bound rejected tables the engine itself takes.
                 return Err("表名长度必须为 1-128 个字符".into());
             }
             let keyword = if b.action == "grant_table" {

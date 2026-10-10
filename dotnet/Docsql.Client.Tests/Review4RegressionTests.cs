@@ -270,6 +270,60 @@ public sealed class Review6BindingAndScannerTests : IClassFixture<ServerFixture>
     }
 }
 
+// 第七轮审查缺陷回归:客户端层。
+// 1) RentAsync 取消路径双重释放借出名额(每次取消净 +1,MaxPoolSize 静默失效);
+// 2) Reader.Close() 不履行 CommandBehavior.CloseConnection(仅 Dispose 履行)。
+public sealed class Review7PoolAndReaderTests : IClassFixture<ServerFixture>
+{
+    private readonly ServerFixture _fx;
+    public Review7PoolAndReaderTests(ServerFixture fx) => _fx = fx;
+
+    private DocsqlConnection Open()
+    {
+        var conn = new DocsqlConnection($"host=127.0.0.1;port={_fx.Port}");
+        conn.Open();
+        return conn;
+    }
+
+    [Fact]
+    public async Task Sync_reader_close_honors_close_connection_behavior()
+    {
+        var conn = Open();
+        var before = DocsqlConnectionPoolInspector.IdleCount("127.0.0.1", _fx.Port);
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1";
+        var reader = cmd.ExecuteReader(System.Data.CommandBehavior.CloseConnection);
+        reader.Close(); // NOT Dispose:Close 必须与 Dispose 等效(SqlClient 契约)
+        var after = DocsqlConnectionPoolInspector.IdleCount("127.0.0.1", _fx.Port);
+        Assert.Equal(before + 1, after);
+    }
+
+    [Fact]
+    public async Task Cancelled_open_async_keeps_the_pool_usable()
+    {
+        // A pre-cancelled token fails the permit wait itself; the old outer
+        // catch then released a permit that was never acquired (each cancel
+        // net-inflated the semaphore). Smoke level: repeated cancels must
+        // leave the pool fully usable afterwards.
+        var cs = $"host=127.0.0.1;port={_fx.Port}";
+        for (var i = 0; i < 3; i++)
+        {
+            var cts = new CancellationTokenSource();
+            cts.Cancel();
+            var conn = new DocsqlConnection(cs);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => conn.OpenAsync(cts.Token));
+        }
+        using (var ok = new DocsqlConnection(cs))
+        {
+            await ok.OpenAsync(CancellationToken.None);
+            using var cmd = ok.CreateCommand();
+            cmd.CommandText = "SELECT 42 AS v";
+            Assert.Equal(42L, await cmd.ExecuteScalarAsync());
+        }
+    }
+}
+
 /// 池空闲计数的测试观测口(只读统计,不参与协议)。
 public static class DocsqlConnectionPoolInspector
 {

@@ -44,7 +44,7 @@ fn is_tsql_type_name(word: &str) -> bool {
     // bare name is the special case. The suffix is validated but kept in
     // the type text: `cast_value` understands the sized forms.
     let (base, suffix) = match w.find('(') {
-        Some(idx) if w.ends_with(')') => (&w[..idx], Some(&w[idx + 1..w.len() - 1])),
+        Some(idx) if w.ends_with(')') => (w[..idx].trim(), Some(&w[idx + 1..w.len() - 1])),
         Some(_) => return false,
         None => (w, None),
     };
@@ -1573,7 +1573,33 @@ fn scalar_impl(name: &str, args: &[Value]) -> Res<Value> {
         },
         "DATEFROMPARTS" => from_parts_call(name, args, [None, None, None, None]),
         "DATETIMEFROMPARTS" => from_parts_call(name, args, [Some(3), Some(4), Some(5), Some(6)]),
-        "SMALLDATETIMEFROMPARTS" => from_parts_call(name, args, [Some(3), Some(4), None, None]),
+        // T-SQL signature is (yyyy, mm, dd, hh, mi, s): SMALLDATETIME keeps
+        // minute precision and rounds the seconds (>= 30 carries a minute);
+        // the old 5-arg arm rejected every canonical 6-arg call.
+        "SMALLDATETIMEFROMPARTS" => {
+            if args.len() != 6 {
+                return err(format!(
+                    "function {name} takes exactly 6 arguments, got {}",
+                    args.len()
+                ));
+            }
+            let secs = match int_arg(&args[5], name, 5)? {
+                Some(n) => n,
+                None => return Ok(Value::Null),
+            };
+            let (extra_min, _dropped_s) = if secs >= 30 { (1, secs) } else { (0, secs) };
+            let shifted = [
+                args[0].clone(),
+                args[1].clone(),
+                args[2].clone(),
+                args[3].clone(),
+                match int_arg(&args[4], name, 4)? {
+                    Some(n) => Value::Int(n + extra_min),
+                    None => return Ok(Value::Null),
+                },
+            ];
+            from_parts_call(name, &shifted, [Some(3), Some(4), None, None])
+        }
         "DATETIME2FROMPARTS" | "DATETIMEOFFSETFROMPARTS" => {
             // (y, m, d, h, mi, s, fractions[, precision]) — the offset
             // variant carries two offset args before precision; both are
@@ -2395,8 +2421,8 @@ fn two_arg_datepart(
 /// Styles the CONVERT implementation knows (output rendering plus the input
 /// restyle table). Anything else is a parameter error even under TRY_CONVERT.
 const KNOWN_CONVERT_STYLES: &[i64] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 20, 21, 23, 25, 101, 102, 103, 104, 105, 106,
-    107, 108, 110, 111, 112, 113, 114, 120, 121, 126, 127,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 20, 21, 23, 25, 100, 101, 102, 103, 104, 105,
+    106, 107, 108, 109, 110, 111, 112, 113, 114, 120, 121, 126, 127,
 ];
 
 fn convert_call(args: &[Value], try_cast: bool) -> Res<Value> {
@@ -2497,8 +2523,10 @@ fn convert_with_style(ty: &str, v: &Value, style: Option<i64>) -> Res<Value> {
             Value::Null => Ok(Value::Null),
             Value::Str(s) => {
                 let iso = match style {
-                    None | Some(0) | Some(20) | Some(21) | Some(23) | Some(25) | Some(100)
-                    | Some(120) | Some(121) | Some(126) | Some(127) => s.clone(),
+                    None | Some(0) | Some(9) | Some(20) | Some(21) | Some(23) | Some(25)
+                    | Some(100) | Some(109) | Some(120) | Some(121) | Some(126) | Some(127) => {
+                        s.clone()
+                    }
                     Some(n) => restyle_to_iso(s, n)?,
                 };
                 crate::engine::cast_value(Value::Str(iso), ty)
@@ -2534,10 +2562,27 @@ fn format_style(ms: i64, style: i64) -> Res<Value> {
     let (y, mo, d) = civil_from_days(days);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let mon3 = &MONTH_NAMES[(mo - 1) as usize][..3];
-    let _h12 = if h % 12 == 0 { 12 } else { h % 12 };
     let (yy, y4) = ((y % 100).abs(), format!("{y:04}"));
     let (d2, m2) = (format!("{d:02}"), format!("{mo:02}"));
     let text = match style {
+        // 0/100: "mon dd yyyy hh:miAM" (2-digit year for 0, 4-digit for
+        // 100); 9/109: the same shape with ":ss:mmm" before the meridian.
+        // These are the DEFAULT renderings, so the validation table must
+        // accept them and the renderer must answer.
+        0 | 100 | 9 | 109 => {
+            let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+            let mer = if h < 12 { "AM" } else { "PM" };
+            let yr = if style == 0 || style == 9 {
+                format!("{yy:02}")
+            } else {
+                y4.clone()
+            };
+            if style == 9 || style == 109 {
+                format!("{mon3} {d:02} {yr} {h12:02}:{mi:02}:{s:02}:{mill:03}{mer}")
+            } else {
+                format!("{mon3} {d:02} {yr} {h12:02}:{mi:02}{mer}")
+            }
+        }
         1 => format!("{m2}/{d2}/{yy:02}"),
         101 => format!("{m2}/{d2}/{y4}"),
         2 => format!("{yy:02}.{m2}.{d2}"),
@@ -2694,7 +2739,12 @@ fn format_fn(args: &[Value]) -> Res<Value> {
         let rest: String = chars.collect();
         let numeric_shape = c.is_ascii_alphabetic() && rest.chars().all(|d| d.is_ascii_digit());
         if numeric_shape && !rest.is_empty() {
-            let prec: usize = rest.parse().unwrap_or(2);
+            // Parse instead of defaulting: a precision string outside
+            // usize ("D99999999999999999999") used to silently fall back
+            // to 2, bypassing format_numeric's loud precision cap.
+            let prec: usize = rest
+                .parse()
+                .map_err(|_| SqlError::Message(format!("FORMAT: invalid precision in '{fmt}'")))?;
             return format_numeric(v, c, prec);
         }
         if numeric_shape {
@@ -4231,16 +4281,33 @@ mod tests {
             ]),
             Timestamp(parse_timestamp_ms("2026-01-02T03:04:05.500Z").unwrap())
         );
-        // SMALLDATETIMEFROMPARTS ignores seconds.
+        // SMALLDATETIMEFROMPARTS: 6-arg T-SQL signature; the seconds round
+        // to the nearest minute (>= 30 carries).
         assert_eq!(
             scalar(
                 "SMALLDATETIMEFROMPARTS",
-                &[Int(2026), Int(1), Int(2), Int(3), Int(4)]
+                &[Int(2026), Int(1), Int(2), Int(3), Int(4), Int(29)]
             )
             .unwrap()
             .unwrap(),
             Timestamp(parse_timestamp_ms("2026-01-02T03:04:00Z").unwrap())
         );
+        assert_eq!(
+            scalar(
+                "SMALLDATETIMEFROMPARTS",
+                &[Int(2026), Int(1), Int(2), Int(3), Int(4), Int(30)]
+            )
+            .unwrap()
+            .unwrap(),
+            Timestamp(parse_timestamp_ms("2026-01-02T03:05:00Z").unwrap())
+        );
+        // 5-arg spelling is a loud arity error now (T-SQL takes 6).
+        assert!(scalar(
+            "SMALLDATETIMEFROMPARTS",
+            &[Int(2026), Int(1), Int(2), Int(3), Int(4)]
+        )
+        .unwrap()
+        .is_err());
         // Out-of-domain FROMPARTS is loud.
         assert!(scalar(
             "DATETIMEFROMPARTS",

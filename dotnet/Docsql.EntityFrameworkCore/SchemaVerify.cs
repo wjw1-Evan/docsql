@@ -174,6 +174,12 @@ internal static partial class SchemaSync
             if (expectedUniqueIndexes.Contains(iname)
                 && !actual.Sql.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
                 return false;
+            // 反向漂移:实际仍是 UNIQUE 而模型已取消 IsUnique —— 免迁移
+            // 部署的常规操作。校验看不到它,旧约束就永远强制(合法的
+            // 重复值写入持续报 UNIQUE 冲突,且每个上下文都判「已收敛」)。
+            if (!expectedUniqueIndexes.Contains(iname)
+                && actual.Sql.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
+                return false;
             // 表与列序漂移:同名索引换了表/列时 EF 视为同一索引,只有比较
             // sqlite_master 的 SQL 才能发现(否则旧约束永远留着)。
             if (expectedIndexTable.TryGetValue(iname, out var expectedTable)

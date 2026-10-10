@@ -464,7 +464,15 @@ impl Heap {
                     continue; // tombstone
                 }
                 let bytes = slot_document_bytes(reader, None, pid, &page, off, len)?;
-                let (v, _) = encode::decode_prefix(&bytes)?;
+                let (v, used) = encode::decode_prefix(&bytes)?;
+                if used != bytes.len() {
+                    // Same loud-corruption rule as the B-tree cell decoder:
+                    // trailing bytes mean the slot (or its directory length)
+                    // is corrupt, and quietly truncating the read would let
+                    // the next dump/backup re-serialize the shortened object,
+                    // laundering the corruption into "legal" data.
+                    return Err(HeapError::Page(pid, "document slot has trailing bytes"));
+                }
                 match v {
                     Value::Object(o) => out.push(o),
                     // `insert` only ever stores object roots: a scalar root
@@ -543,7 +551,10 @@ impl Heap {
                 continue;
             }
             let bytes = slot_document_bytes(reader, Some(tx), page, &buf, off, len)?;
-            let (v, _) = encode::decode_prefix(&bytes)?;
+            let (v, used) = encode::decode_prefix(&bytes)?;
+            if used != bytes.len() {
+                return Err(HeapError::Page(page, "document slot has trailing bytes"));
+            }
             match v {
                 Value::Object(o) => out.push((pack_loc(page, i), o)),
                 _ => return Err(HeapError::Page(page, "non-object document root")),
@@ -566,7 +577,10 @@ impl Heap {
             return Ok(None);
         }
         let bytes = slot_document_bytes(reader, None, page, &buf, off, len)?;
-        let (v, _) = encode::decode_prefix(&bytes)?;
+        let (v, used) = encode::decode_prefix(&bytes)?;
+        if used != bytes.len() {
+            return Err(HeapError::Page(page, "document slot has trailing bytes"));
+        }
         match v {
             Value::Object(o) => Ok(Some(o)),
             // Same loud corruption rule as `scan`: object roots only. The

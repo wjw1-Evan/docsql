@@ -2048,6 +2048,12 @@ pub async fn handle_connection(
                             audit(true, "read token accepted", &state);
                             Some(Frame::new(proto::RESP_AFFECTED, b"ok(read-only)".to_vec()))
                         } else {
+                            // Audit every rejected attempt, not just the
+                            // lockout trip: single/under-threshold failures
+                            // were invisible in the sync log (REQ_LOGS auth
+                            // trail), while every user-login failure is
+                            // recorded — same baseline rule for tokens.
+                            audit(false, "token rejected", &state);
                             record_auth_failure(&state, source_ip).await;
                             Some(Frame::new(proto::RESP_ERROR, err_payload("bad token")))
                         }
@@ -2390,7 +2396,7 @@ pub async fn handle_connection(
                                             .db
                                             .read()
                                             .unwrap_or_else(|p| p.into_inner())
-                                            .table_exists("docsql_pubsub")
+                                            .table_exists_ci("docsql_pubsub")
                                     };
                                     let (effective, allow_system) =
                                         if is_replication || user_table_wins {
@@ -2590,9 +2596,20 @@ pub async fn handle_connection(
                     match rendered {
                         Ok(mut sql) => {
                             let started = std::time::Instant::now();
-                            let deadline = state
-                                .statement_timeout
-                                .map(|t| std::time::Instant::now() + t);
+                            // Replication parity with the REQ_SQL arm: a
+                            // FLAG_REPLICATION EXECUTE applies what a peer
+                            // already confirmed — no statement deadline (a
+                            // slow node must still converge), origin/journal
+                            // under the replication flag (not this node's),
+                            // and never the read tier.
+                            let is_repl = replication_ok;
+                            let deadline = if is_repl {
+                                None
+                            } else {
+                                state
+                                    .statement_timeout
+                                    .map(|t| std::time::Instant::now() + t)
+                            };
                             // Same docsql_pubsub decision as the REQ_SQL
                             // arm: a user table by that name must not be
                             // shadowed by the compat view here either —
@@ -2602,7 +2619,7 @@ pub async fn handle_connection(
                                 .db
                                 .read()
                                 .unwrap_or_else(|p| p.into_inner())
-                                .table_exists("docsql_pubsub")
+                                .table_exists_ci("docsql_pubsub")
                             {
                                 if let Some(rewritten) = pubsub::try_rewrite_pubsub_view(&sql) {
                                     sql = rewritten;
@@ -2618,7 +2635,8 @@ pub async fn handle_connection(
                             // keep the session's statement counter
                             // current either way.
                             session.start_statement(&sql);
-                            let read_eligible = classify_read_eligible(&state, &sql, user.as_ref());
+                            let read_eligible =
+                                !is_repl && classify_read_eligible(&state, &sql, user.as_ref());
                             let (resp, logged) = match querylog::try_serve_log_view(
                                 &sql,
                                 &state,
@@ -2646,8 +2664,8 @@ pub async fn handle_connection(
                                         &state,
                                         &sql,
                                         false,
-                                        false,
-                                        Some(conn_id),
+                                        is_repl,
+                                        if is_repl { None } else { Some(conn_id) },
                                         false,
                                         None,
                                         user.as_ref(),
@@ -2659,7 +2677,7 @@ pub async fn handle_connection(
                                 ),
                             };
                             let (resp, identity) = resp;
-                            if logged {
+                            if logged && !is_repl {
                                 // @@ERROR/@@ROWCOUNT parity with the REQ_SQL
                                 // fast paths (a failed EXECUTE used to leave
                                 // the previous statement's code/current
@@ -2682,20 +2700,33 @@ pub async fn handle_connection(
                             // later batch must see this statement's effects
                             // (it used to keep the previous fast-path
                             // INSERT's id).
-                            if logged && docsql_core::tsql_batch::is_insert_statement(&sql) {
-                                tsql_session.note_identity(identity.map(docsql_core::Value::Int));
+                            if logged
+                                && !is_repl
+                                && docsql_core::tsql_batch::is_insert_statement(&sql)
+                            {
+                                tsql_session
+                                    .note_identity(identity.map(docsql_core::Value::Int));
                             }
                             if logged {
                                 querylog::record(
                                     &state,
                                     &peer,
-                                    // A row-filter rewrite wins over the
-                                    // template display: the log must show
-                                    // the enforced statement.
-                                    exec_logged_sql.as_deref().unwrap_or(&log_sql),
+                                    // Always the TEMPLATE for EXECUTE. The
+                                    // row-filter rewrite embeds the RENDERED
+                                    // bound values; displaying it re-leaked
+                                    // the application secrets (tokens, API
+                                    // keys) the template-only rule exists to
+                                    // keep out of the audit log. The
+                                    // enforced predicate text lives in the
+                                    // grants table already.
+                                    &if exec_logged_sql.is_some() {
+                                        format!("{log_sql}  [row filter applied]")
+                                    } else {
+                                        log_sql.clone()
+                                    },
                                     started.elapsed().as_secs_f64() * 1000.0,
                                     &resp,
-                                    false,
+                                    is_repl,
                                 );
                             }
                             Some(resp)
@@ -3250,7 +3281,7 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
                     .db
                     .read()
                     .unwrap_or_else(|p| p.into_inner())
-                    .table_exists("docsql_pubsub")
+                    .table_exists_ci("docsql_pubsub")
             };
             let (effective, allow_system) = if user_table_wins {
                 (sql.clone(), false)
@@ -3854,13 +3885,26 @@ fn apply_row_filters(
         Some(acc)
     };
     fn and_into_sel(old: Option<E>, pred: E) -> E {
+        // Parenthesize both sides as needed before AND-splicing:
+        // sqlparser's Display emits BinaryOp children WITHOUT precedence
+        // parentheses, so `user_or_tree AND filter` re-parsed as
+        // `left-most OR right-most AND …` flipped the binding and let
+        // `WHERE x = 1 OR y = 2` bypass the injected filter entirely.
+        let wrap_if_or = |e: E| match e {
+            E::BinaryOp {
+                op: sqlparser::ast::BinaryOperator::Or,
+                ..
+            } => E::Nested(Box::new(e)),
+            other => other,
+        };
+        let right = E::Nested(Box::new(pred));
         match old {
             Some(left) => E::BinaryOp {
-                left: Box::new(left),
+                left: Box::new(wrap_if_or(left)),
                 op: sqlparser::ast::BinaryOperator::And,
-                right: Box::new(pred),
+                right: Box::new(right),
             },
-            None => pred,
+            None => right,
         }
     }
     // Rewrite ONE top-level plain table factor: single-table SELECT shape.
@@ -3950,6 +3994,33 @@ fn apply_row_filters(
         }
         Statement::Delete(d) => {
             // Same two-spellings rule as the mention set above.
+            // `DELETE ... USING` evaluates the WHERE over the merged image
+            // exactly like UPDATE ... FROM: the injected predicate's bare
+            // columns can bind to a USING table's same-named column and
+            // short-circuit the filter — refuse the shape (fail-closed).
+            let del_target = match &d.from {
+                sqlparser::ast::FromTable::WithoutKeyword(v)
+                | sqlparser::ast::FromTable::WithFromKeyword(v) => {
+                    if v.len() == 1 {
+                        match &v[0].relation {
+                            TableFactor::Table { name, .. } => {
+                                docsql_core::engine::table_ref_name(name)
+                            }
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    }
+                }
+            };
+            if d.using.is_some() && !del_target.is_empty() && filtered.contains(&lower(&del_target))
+            {
+                return Err(format!(
+                    "row filter on {del_target}: DELETE ... USING evaluates its WHERE over the \
+                     joined image, where the filter's bare columns can bind to the USING \
+                     tables; rewrite without USING or use an unrestricted grant"
+                ));
+            }
             let factors = match &mut d.from {
                 sqlparser::ast::FromTable::WithoutKeyword(v) => v,
                 sqlparser::ast::FromTable::WithFromKeyword(v) => v,
@@ -4074,8 +4145,32 @@ fn authorize_statement(
                                 // readonly/readwrite blanket access must NOT
                                 // take this shortcut: the base expansion is
                                 // exactly what refuses user-table views to
-                                // those roles.
+                                // those roles. And even for a direct view
+                                // grant, the user/role subsystem stays
+                                // admin-only behind ANY depth of views —
+                                // GRANT-time checks only see the view name,
+                                // so a view whose closure names a user table
+                                // must not hand password hashes out here.
                                 if !g.readonly && !g.readwrite && g.may_select(&t) {
+                                    let mut closure: Vec<String> = bases.clone();
+                                    let mut cseen = std::collections::BTreeSet::new();
+                                    cseen.insert(t.clone());
+                                    while let Some(b) = closure.pop() {
+                                        if !cseen.insert(b.clone()) {
+                                            continue;
+                                        }
+                                        if docsql_core::useradmin::is_user_table(&b) {
+                                            return Err(
+                                                "user/role data is visible to the admin role only"
+                                                    .into(),
+                                            );
+                                        }
+                                        if let Some(deeper) =
+                                            db.and_then(|d| d.view_base_tables(&b))
+                                        {
+                                            closure.extend(deeper);
+                                        }
+                                    }
                                     continue;
                                 }
                                 depth += 1;
@@ -5171,6 +5266,18 @@ async fn forward_write(
                         .await
                         .map(|_| ())
                 }
+                // Any other RESP_ERROR is an application-layer rejection
+                // (origin cap, malformed frame, SQL failure on apply).
+                // Answering Ok made the fan-out track "forward ok=true",
+                // cleared the peer's backoff, and left the write silently
+                // missing on that peer — the digest/snapshot repair path
+                // explicitly relies on fan-out failures being visible.
+                Ok(resp) if resp.frame_type == proto::RESP_ERROR => {
+                    Err(std::io::Error::other(format!(
+                        "peer rejected sequenced write: {}",
+                        String::from_utf8_lossy(&resp.payload)
+                    )))
+                }
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
             }
@@ -6245,7 +6352,6 @@ pub(crate) const SYNC_HOLD_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// (the syncing node crashed) must not wedge the cluster's writes forever.
 pub(crate) const SYNC_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 /// One whole REQ_SYNC attempt (connect + quiesce + dump stream).
-pub(crate) const SYNC_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// Dump chunks are reassembled by the joiner, so the split only has to fall
 /// on a UTF-8 char boundary; the bound keeps frames well under the 64 MB cap.
 pub(crate) const SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -6690,6 +6796,26 @@ async fn handle_hold(state: &Arc<ServerState>, frame: &Frame) -> Frame {
     if !advertise.is_empty() {
         let mut peers = state.peers.lock().await;
         if !peers.contains(&advertise) && !is_self_peer(&state.listen, &advertise).await {
+            // Re-check the cap INSIDE the critical section: the pre-order
+            // check sampled the list without holding it, and two
+            // concurrent HOLDs could both pass before either pushed,
+            // breaching the per-write fan-out bound (handle_sync registers
+            // under its own write_order and has no such race).
+            if peers.len() >= MAX_DYNAMIC_PEERS {
+                drop(peers);
+                // Undo the hold just armed: dropping the guard releases the
+                // write gate, and the loud error tells the joiner it was
+                // never registered (a silent skip would freeze a joiner
+                // that believes it is in the fan-out set).
+                state.holds.lock().await.remove(&id);
+                return Frame::new(
+                    proto::RESP_ERROR,
+                    err_payload(&format!(
+                        "cluster join: peer list full ({MAX_DYNAMIC_PEERS}), \
+                         restart with an explicit DOCSQL_PEERS list"
+                    )),
+                );
+            }
             peers.push(advertise.clone());
             querylog::sync_event(&state.sync_log, "join", &advertise, None, true, None);
         }
@@ -6785,48 +6911,54 @@ enum JoinApply {
 
 /// Ask one peer for the cluster state and return the dump script.
 async fn request_sync(state: &Arc<ServerState>, peer: &str) -> std::io::Result<String> {
-    let attempt = async {
-        let (mut stream, hello, mut replay) = open_peer_conn(
-            peer,
-            state.transport_key.as_ref(),
-            fanout_auth(state),
-            state.tls_out.as_ref(),
+    // No whole-attempt budget: a multi-GB dump stream legitimately exceeds
+    // any fixed one (the old 90s cap made big joins deterministically fail
+    // and retry forever). Liveness comes from the per-connection timeouts
+    // (dial/hello/auth) and the per-frame IO_TIMEOUT below — a peer that
+    // stalls mid-stream still errors out.
+    let (mut stream, hello, mut replay) = open_peer_conn(
+        peer,
+        state.transport_key.as_ref(),
+        fanout_auth(state),
+        state.tls_out.as_ref(),
+    )
+    .await?;
+    let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
+    let frame = replication_frame(
+        proto::REQ_SYNC,
+        state
+            .advertise
+            .as_deref()
+            .map(|a| a.as_bytes().to_vec())
+            .unwrap_or_default(),
+        wire,
+    );
+    write_frame_on(&mut stream, &frame).await?;
+    let mut script = String::new();
+    loop {
+        let f = tokio::time::timeout(
+            IO_TIMEOUT,
+            read_response_frame_with_guard(&mut stream, wire, &mut replay),
         )
-        .await?;
-        let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
-        let frame = replication_frame(
-            proto::REQ_SYNC,
-            state
-                .advertise
-                .as_deref()
-                .map(|a| a.as_bytes().to_vec())
-                .unwrap_or_default(),
-            wire,
-        );
-        write_frame_on(&mut stream, &frame).await?;
-        let mut script = String::new();
-        loop {
-            let f = read_response_frame_with_guard(&mut stream, wire, &mut replay).await?;
-            match f.frame_type {
-                proto::RESP_SYNC => {
-                    script.push_str(&proto::decode_sql(&f.payload).map_err(std::io::Error::other)?);
-                }
-                proto::RESP_AFFECTED => return Ok(script),
-                proto::RESP_ERROR => {
-                    return Err(std::io::Error::other(format!(
-                        "{peer} rejected sync: {}",
-                        String::from_utf8_lossy(&f.payload)
-                    )))
-                }
-                other => {
-                    return Err(std::io::Error::other(format!(
-                        "{peer}: unexpected frame {other:#06x} during sync"
-                    )))
-                }
+        .await??;
+        match f.frame_type {
+            proto::RESP_SYNC => {
+                script.push_str(&proto::decode_sql(&f.payload).map_err(std::io::Error::other)?);
+            }
+            proto::RESP_AFFECTED => return Ok(script),
+            proto::RESP_ERROR => {
+                return Err(std::io::Error::other(format!(
+                    "{peer} rejected sync: {}",
+                    String::from_utf8_lossy(&f.payload)
+                )))
+            }
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "{peer}: unexpected frame {other:#06x} during sync"
+                )))
             }
         }
-    };
-    tokio::time::timeout(SYNC_ATTEMPT_TIMEOUT, attempt).await?
+    }
 }
 
 /// Roll an explicit transaction back, verifying it actually closed. A
@@ -7100,16 +7232,9 @@ async fn finish_snapshot_adopt<'a>(
 /// into it; the drain waits with a loud heartbeat rather than give up on
 /// acknowledged data.
 async fn drain_sync_queue(state: &Arc<ServerState>, order_held: bool, close: bool) -> u64 {
-    let result = drain_inner(state, order_held, close).await;
-    // Per-connection push frames arrive in id order only if the backlog's
-    // messages (smaller ids) notify BEFORE this drain releases the write
-    // order — a local PUBLISH that acquires the order next would otherwise
-    // deliver a LARGER id first (the queue's items were committed under
-    // this order, so their notify belongs to it too). notify is a registry
-    // lock plus bounded channel sends: microseconds, not worth an await
-    // outside the guard.
-    flush_gate_pubsub_notify(state).await;
-    result
+    // drain_inner flushes the gate's pubsub notifications while the write
+    // order is still held (ordering contract; see its tail).
+    drain_inner(state, order_held, close).await
 }
 
 async fn drain_inner(state: &Arc<ServerState>, order_held: bool, close: bool) -> u64 {
@@ -7271,6 +7396,14 @@ async fn drain_inner(state: &Arc<ServerState>, order_held: bool, close: bool) ->
         }
         total_failures += failures;
     }
+    // Flush the backlog notifications BEFORE `_order` drops (it drops at
+    // this function's return): per-connection push frames arrive in id
+    // order only if the queue's messages (smaller ids) notify before the
+    // write order is released — a local PUBLISH acquiring the order next
+    // would otherwise deliver a LARGER id first. The drain wrapper used to
+    // flush after this return, outside the guard, violating its own
+    // ordering contract.
+    flush_gate_pubsub_notify(state).await;
     total_failures
 }
 
@@ -7374,7 +7507,6 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
                          serving (fan-out keeps the mesh converged)"
                     );
                     drain_sync_queue(&state, false, true).await;
-                    flush_gate_pubsub_notify(&state).await;
                     querylog::sync_event(
                         &state.sync_log,
                         "bootstrap",
@@ -7412,7 +7544,6 @@ async fn bootstrap_sync(state: Arc<ServerState>, fresh: bool) {
     }
     eprintln!("bootstrap sync gave up after {SYNC_ROUNDS} rounds ({last_err}); serving fresh");
     drain_sync_queue(&state, false, true).await;
-    flush_gate_pubsub_notify(&state).await;
     querylog::sync_event(
         &state.sync_log,
         "bootstrap",
@@ -8405,55 +8536,56 @@ async fn handle_catchup(state: &Arc<ServerState>, frame: &Frame, tx: &mpsc::Send
 /// records it as the new position. Any apply error aborts the pull —
 /// the repair then falls back to snapshot adoption.
 async fn catch_up_from(state: &Arc<ServerState>, peer: &str, after: u64) -> std::io::Result<u64> {
-    let attempt = async {
-        let (mut stream, hello, mut replay) = open_peer_conn(
-            peer,
-            state.transport_key.as_ref(),
-            fanout_auth(state),
-            state.tls_out.as_ref(),
+    // No whole-attempt budget: each replayed entry durably commits (its own
+    // WAL fsync), so a full CATCHUP_WINDOW (default 100k entries) exceeds
+    // any fixed cap — the old 90s ceiling degraded every large catch-up to
+    // snapshot repair, which then failed the same way. Liveness comes from
+    // the connection timeouts and the per-frame IO_TIMEOUT.
+    let (mut stream, hello, mut replay) = open_peer_conn(
+        peer,
+        state.transport_key.as_ref(),
+        fanout_auth(state),
+        state.tls_out.as_ref(),
+    )
+    .await?;
+    let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
+    let frame = replication_frame(proto::REQ_CATCHUP, after.to_le_bytes().to_vec(), wire);
+    write_frame_on(&mut stream, &frame).await?;
+    loop {
+        let f = tokio::time::timeout(
+            IO_TIMEOUT,
+            read_response_frame_with_guard(&mut stream, wire, &mut replay),
         )
-        .await?;
-        let wire: WireKey = state.transport_key.as_ref().map(|k| (k, &hello));
-        let frame = replication_frame(proto::REQ_CATCHUP, after.to_le_bytes().to_vec(), wire);
-        write_frame_on(&mut stream, &frame).await?;
-        loop {
-            let f = tokio::time::timeout(
-                IO_TIMEOUT,
-                read_response_frame_with_guard(&mut stream, wire, &mut replay),
-            )
-            .await??;
-            match f.frame_type {
-                proto::RESP_CATCHUP => {
-                    for (_, sql) in decode_catchup_entries(&f.payload)? {
-                        let resp =
-                            execute_sql(state, &sql, false, true, None, false, None, None, None)
-                                .await;
-                        if resp.frame_type == proto::RESP_ERROR {
-                            return Err(std::io::Error::other(format!(
-                                "catch-up replay failed: {}",
-                                String::from_utf8_lossy(&resp.payload)
-                            )));
-                        }
+        .await??;
+        match f.frame_type {
+            proto::RESP_CATCHUP => {
+                for (_, sql) in decode_catchup_entries(&f.payload)? {
+                    let resp =
+                        execute_sql(state, &sql, false, true, None, false, None, None, None).await;
+                    if resp.frame_type == proto::RESP_ERROR {
+                        return Err(std::io::Error::other(format!(
+                            "catch-up replay failed: {}",
+                            String::from_utf8_lossy(&resp.payload)
+                        )));
                     }
                 }
-                proto::RESP_AFFECTED if f.payload.len() == 8 => {
-                    return Ok(u64::from_le_bytes(f.payload[..8].try_into().unwrap()));
-                }
-                proto::RESP_ERROR => {
-                    return Err(std::io::Error::other(format!(
-                        "{peer} rejected catch-up: {}",
-                        String::from_utf8_lossy(&f.payload)
-                    )));
-                }
-                other => {
-                    return Err(std::io::Error::other(format!(
-                        "{peer}: unexpected frame {other:#06x} during catch-up"
-                    )));
-                }
+            }
+            proto::RESP_AFFECTED if f.payload.len() == 8 => {
+                return Ok(u64::from_le_bytes(f.payload[..8].try_into().unwrap()));
+            }
+            proto::RESP_ERROR => {
+                return Err(std::io::Error::other(format!(
+                    "{peer} rejected catch-up: {}",
+                    String::from_utf8_lossy(&f.payload)
+                )));
+            }
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "{peer}: unexpected frame {other:#06x} during catch-up"
+                )));
             }
         }
-    };
-    tokio::time::timeout(SYNC_ATTEMPT_TIMEOUT, attempt).await?
+    }
 }
 
 #[cfg(test)]
@@ -8663,6 +8795,45 @@ mod security_tests {
         assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
         let out = filtered("INSERT INTO audit SELECT id FROM sales");
         assert!(out.to_lowercase().contains("region = 'east'"), "{out}");
+    }
+
+    /// 第七轮审查回归:注入谓词必须加括号——sqlparser Display 不给
+    /// BinaryOp 加优先级括号,`用户OR树 AND 过滤器` 重解析成
+    /// `left OR (right AND filter)`,west 行从 OR 侧漏过过滤器。
+    #[test]
+    fn row_filter_parenthesizes_against_or_bypass() {
+        // sales: (1,east),(2,west),(3,east). The user's OR spans both
+        // regions; only east rows may come back (id=2 is west and must
+        // not leak through the OR side).
+        let rows = filtered_rows("SELECT id FROM sales WHERE id = 1 OR id = 2 ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![vec![docsql_core::value::Value::Int(1)]],
+            "{rows:?}"
+        );
+        // The rewritten text carries the parenthesized filter.
+        let out = filtered("SELECT id FROM sales WHERE id = 1 OR id = 2");
+        assert!(
+            out.contains("(region = 'east')") || out.contains("(region='east')"),
+            "{out}"
+        );
+    }
+
+    /// 第七轮审查回归:DELETE ... USING 与 UPDATE ... FROM 同构,合并像上
+    /// 裸列谓词可绑 USING 表同名列短路过滤器——拒绝(fail-closed)。
+    #[test]
+    fn row_filter_refuses_delete_using() {
+        let mut db = filters_db();
+        db.execute("CREATE TABLE other (id INT, region TEXT)")
+            .unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("sales".to_string(), vec!["region = 'east'".to_string()]);
+        assert!(apply_row_filters(
+            &db,
+            "DELETE FROM sales USING other WHERE sales.id = other.id",
+            &m
+        )
+        .is_err());
     }
 
     #[test]

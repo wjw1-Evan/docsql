@@ -299,7 +299,14 @@ fn is_ident_byte(b: u8) -> bool {
 pub fn try_rewrite_pubsub_view(sql: &str) -> Option<String> {
     let lower = sql.to_ascii_lowercase();
     let trimmed = lower.trim_start();
-    if !trimmed.starts_with("select") || !lower.contains("docsql_pubsub") {
+    // EXPLAIN/WITH lead-ins ride along: the needle scan covers the whole
+    // text either way, and refusing them made `EXPLAIN SELECT … FROM
+    // docsql_pubsub` fail with "no such table" while the bare SELECT
+    // worked.
+    let starts_query = trimmed.starts_with("select")
+        || trimmed.starts_with("explain")
+        || trimmed.starts_with("with");
+    if !starts_query || !lower.contains("docsql_pubsub") {
         return None;
     }
     let needle = b"docsql_pubsub";

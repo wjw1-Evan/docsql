@@ -173,8 +173,16 @@ internal static class ConnectionPool
         /// into the now-unreachable queue (it would leak its socket).</summary>
         public volatile bool Closed;
 
-        public Slot(int maxSize)
+        /// <summary>Endpoint this slot serves (test observability: the debug
+        /// idle count filters on it, so parallel fixtures on distinct ports
+        /// cannot pollute each other's assertions).</summary>
+        public readonly string Host;
+        public readonly int Port;
+
+        public Slot(string host, int port, int maxSize)
         {
+            Host = host;
+            Port = port;
             MaxSize = Math.Max(1, maxSize);
             Permits = new SemaphoreSlim(MaxSize, MaxSize);
         }
@@ -204,7 +212,7 @@ internal static class ConnectionPool
     }
 
     internal static Slot SlotOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
-        Pools.GetOrAdd(KeyOf(p, keyOverride), _ => new Slot(p.MaxPoolSize));
+        Pools.GetOrAdd(KeyOf(p, keyOverride), _ => new Slot(p.Host, p.Port, p.MaxPoolSize));
 
     /// <summary>借出即重置:T-SQL 会话状态(@变量/@@IDENTITY/@@ROWCOUNT)挂在
     /// 物理连接上,随连接入池存活 —— 不重置的话,下一个借出者继承上一位的
@@ -215,7 +223,14 @@ internal static class ConnectionPool
     /// currently holds (leak assertions on CloseConnection behavior).
     internal static int DebugIdleCount(string host, int port)
     {
-        return Pools.Values.Sum(slot => slot.Idle.Count);
+        // Filter on the endpoint: the old implementation ignored its
+        // arguments and summed EVERY slot, so a parallel test class's
+        // connection returns landed in this count and made the per-slot
+        // assertions flake.
+        return Pools.Values
+            .Where(slot => slot.Port == port
+                && string.Equals(slot.Host, host, StringComparison.OrdinalIgnoreCase))
+            .Sum(slot => slot.Idle.Count);
     }
 
     private static readonly Frame SessionResetFrame =
@@ -285,6 +300,15 @@ internal static class ConnectionPool
                 $"pool exhausted: all {slot.MaxSize} connection(s) to {p.Host}:{p.Port} " +
                 $"were still in use after {timeoutMs} ms");
         }
+        // A CANCELLED WaitAsync throws above, BEFORE any permit is acquired:
+        // the release in the outer catch below is only correct once the
+        // permit is held. (The old shape released on that path too, and
+        // every cancelled Open net-inflated the semaphore past MaxPoolSize.)
+        // Set once an OCE path below has already released the borrow permit
+        // (ReturnToIdle releases internally; the broken-discard branch
+        // releases explicitly). The outer catch must not release it a
+        // SECOND time.
+        var permitReleased = false;
         try
         {
             while (slot.Idle.TryDequeue(out var proto))
@@ -318,6 +342,7 @@ internal static class ConnectionPool
                         proto.Dispose();
                         slot.Permits.Release();
                     }
+                    permitReleased = true;
                     throw;
                 }
                 catch
@@ -331,7 +356,7 @@ internal static class ConnectionPool
             return await DocsqlConnection.ConnectAndAuthAsync(p, keyOverride, timeoutMs, cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch
+        catch (Exception) when (!permitReleased)
         {
             slot.Permits.Release();
             throw;
@@ -1523,7 +1548,19 @@ public sealed class DocsqlDataReader : DbDataReader
     public override bool HasRows => _rows.Count > 0;
     public override bool IsClosed => _closed;
 
-    public override void Close() => _closed = true;
+    public override void Close()
+    {
+        // Close and Dispose are equivalent (SqlClient contract), and
+        // CommandBehavior.CloseConnection means "when the READER closes":
+        // honoring it only in Dispose leaked the pool permit for callers
+        // that finish with reader.Close() instead of `using`.
+        if (_closed)
+        {
+            return;
+        }
+        _closed = true;
+        _closeOnDispose?.Close();
+    }
 
     // ADO.NET contract: IsClosed flips on Dispose — EF's RelationalDataReader
     // double-dispose guard and Dapper read the flag to dedupe cleanup.

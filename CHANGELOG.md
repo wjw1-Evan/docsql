@@ -5,6 +5,103 @@
 
 ## [Unreleased]
 
+### 第七轮全模块缺陷审查修复(2026-10-10)
+
+对全部模块再做一轮系统审查(18 路并行审查→逐条源码核实→修复+回归落各模块内;Rust 1120/.NET 203/Python 58/部署测试绿):
+
+- **安全(两处高危)**:行级过滤授权注入谓词不加括号——sqlparser 回显 BinaryOp
+  不带优先级括号,`WHERE x = 1 OR y = 2` 重解析成 `x=1 OR (y=2 AND 过滤器)`,
+  未授权地区/租户行从 OR 侧整段漏过(SELECT/UPDATE/DELETE 全部可绕,现注入两侧
+  按需加括);`DELETE … USING` 与 UPDATE..FROM 同构却未拒,注入谓词裸列经后缀
+  回退绑到 USING 表同名列、受控表恒真短路过滤(现 fail-closed 拒绝)。视图捷径
+  (直接视图授权跳过基表检查)不看视图闭包,`CREATE VIEW v AS SELECT … FROM
+  docsql_users` + 授权即可让非 admin 读到密码哈希(现闭包含用户表即拒);readonly
+  角色成员身份静默作废直接授予的 DML 表级权限(权限并集语义恢复);REQ_EXECUTE
+  行过滤改写把渲染后的绑定参数明文写进查询日志(密钥保护的唯一场景被改写文本击穿,
+  现恒记模板 + 标记);bad-token 认证失败不写逐次审计事件(等保留痕补齐);兼容
+  视图 shadow 守卫按精确名匹配,`DocSQL_PubSub` 大小写变体用户表的 SELECT 被静默
+  改写到系统表(INSERT 落真表、SELECT 读系统行的分裂;新 table_exists_ci)。
+- **查询内核**:相关子查询的外层引用藏在包装节点(IS NULL/SUBSTRING)下时代入
+  遍历漏走——残留引用在内层读 NULL,`DELETE … WHERE EXISTS(… t.x IS NULL)` 把
+  整表删光(代入/审计两处遍历补共享子节点兜底);集合运算子查询各臂 FROM 名不进
+  内层作用域,限定列引用被误判相关子查询报错;LEFT JOIN 未匹配行的 NULL 补齐只按
+  右表首行键形(schemaless 右表后插行的新键漏补,后缀回退泄漏左表同名列值);
+  ROWNUM 裸键注入 JOIN 产物后关闭非限定列后缀解析(静默 NULL + WHERE 丢行),聚合
+  +ROWNUM 由静默 NULL 过滤改显式报错;JSON_ARRAY_CONTAINS/NULLIF/DECODE/GREATEST/
+  LEAST 绕过 Timestamp↔字符串比较提升漏斗(EF List&lt;DateTime&gt;.Contains 静默恒空);
+  值列表子查询(IN/=ANY/ALL)多列静默取首列(IN 漏命中,现基数错误);ILIKE 整串
+  lowercase 改变字符数(İ 展开两字符,`_` 计数失真,现按字符折叠);括号包裹的
+  WHERE 谓词不解包,整个探针/窗口快路径失联退化为全表扫描;JSON 路径范围探针取最
+  松界(`a>10 AND a>18` 从 10 探起,标量分支同源取紧界);`ROUND(DECIMAL, n)` 的
+  n 超域先夹取(2^32 截断成 scale 0、i64::MIN 取负 debug 构建 panic)。
+- **探针一致性(红线)**:限定名/引号点分字段与探针剥前缀的分叉——表存字面点分键
+  (`"v.x"` 一个键)时,eval 按字面键优先而探针剥成裸列走树,有索引即丢行/丢更新/
+  丢删除(现 TableMeta 增粘性 dotted_keys 标记:首个点分字面键写入时置位,置位表上
+  剥前缀路径整体回退;引号含点标识符一律不剥);全点分键的单表文档被误判 join 形
+  态,裸列查询经后缀回退读点分键(结果依赖索引存在性,现后缀回退要求 ≥2 个不同限
+  定前缀)。
+- **写路径**:UPDATE..FROM/DELETE..USING/MERGE 的派生表源携带 RAND/NEWID() 时漏检
+  (扫描只看 JOIN ON,子查询内执行后 journal 原文重放各自重掷、集群静默分叉;现全
+  表因子扫描);`ALTER TABLE … ADD COLUMN … DEFAULT NOW()/RAND()` 对非空表回填本节
+  点值且无回写(对端各自回填,摘要永久分叉;现非空表拒绝,空表保留默认)。
+- **DDL**:`ALTER TABLE … RENAME TO` 缺 `#临时表`/兼容字典视图名守卫(RENAME TO
+  dual 后写入不可读、dump 不可重放);列级 `UNIQUE UNIQUE` 重复声明不去重(树维护
+  对同键二次插入,表永久不可写);DROP INDEX 解除列级唯一时把"含该列的复合唯一索
+  引"误当同列来源(复合从不保证单列唯一,约束解除不掉且 schema_hash 分叉);RENAME
+  COLUMN 到含引号标识符时 CHECK 文本裸拼新名破坏词法(INSERT 解析即挂、dump 不可
+  重放,现按需引号拼写);ALTER 元数据收尾保存失败的内存目录无快照恢复(下一次成
+  功写把半应用状态持久化给对端,现三处先快照后回滚)。
+- **存储**:heap 文档槽尾随字节静默截短读取(单字节位翻转的截短像被 dump/backup
+  重新序列化"洗白"成合法数据,现三处读路径校验消费数=槽长,与 B 树同规);free 截
+  断对在途后台 fsync 的 covered_len 竞态——完成回调把截断前采样值写回,下一次 free
+  截断在无覆盖 fsync 的情况下丢 WAL(崩溃丢已提交事务;现仅在无排队/在途同步时信
+  任 covered_len);flush_pending 从首键重试,单页持续 EIO 堵死整个队列(改快照遍
+  历,失败页留队、后续页照常落盘)。
+- **T-SQL**:`;` 被当批分隔符,@变量跨分号全部死亡(标准分号风格脚本全灭;GO 重
+  回唯一批边界);SET/DECLARE 初始化器里的多行 CASE 缺整体跳过臂(ELSE 行截断赋
+  值,整批解析失败);RAISERROR/THROW 的 N'…' 消息带引号原样抛出;CONVERT style
+  0/9/100/109(默认 mon dd yyyy hh:miAM 形)验证层拒绝;SMALLDATETIMEFROMPARTS 按
+  5 参实现(T-SQL 签名 6 参,秒按 30 秒界进分钟);`VARCHAR (10)` 空格写法类型名
+  不 trim 导致 CONVERT 不改写;FORMAT 的超域精度串静默按 2 处理(绕过精度上限,
+  现报错)。
+- **服务器/复制**:带 FLAG_REPLICATION 的 REQ_EXECUTE 按本节点客户端写执行(挂语
+  句超时违反"复制 apply 不带 deadline"红线、以本节点 origin 二次扇出;现与 REQ_SQL
+  臂同源分流);sequenced 扇出把副本应用层拒绝当成功(origin 上限/SQL 失败等,
+  "forward ok=true"绿灯下写静默丢失,现翻译为扇出失败让 digest 修复可见);join/
+  catch-up 的 90 秒固定预算罩住整条 dump 流与逐条持久回放(多 GB 库/整窗口回放
+  确定性超时→退化快照→同样超时,现预算只到每帧 IO 超时层);REQ_HOLD 的动态 peer
+  上限检查在锁外采样(并发 HOLD 突破 64 上限,现临界区复查);drain 后的 pubsub
+  backlog notify 在 write_order 释放后才冲刷(本地后到 PUBLISH 先推大 id,违反
+  per-connection id 序契约,现移回 guard 存活期内);docsql_log 视图先取最新 N 条
+  再排序(ASC 查询拿到"最新 N 条升序"而非"最旧 N 条");EXPLAIN/WITH 前缀不进
+  pubsub 视图改写(对视图报 no such table)。
+- **备份/DR**:定时增量导出(PITR 段)完全绕过 quorum 写栅栏——被栅栏节点的少数
+  派分歧写被每个 tick 导出并上传 S3,DR 恢复时复活被多数派裁决丢弃的写(现与全量
+  同门拒绝);快照采纳的远端增量段清理失败无重试(瞬时 S3 故障后作废段可被 DR 拉
+  回复活,现持久 marker + 备份 tick 复核直至远端前缀清净)。
+- **.NET**:RentAsync 取消路径双重释放借出名额(每次取消净 +1,MaxPoolSize 静默失
+  效;含取消发生在名额等待本身的新路径);Reader.Close() 不履行
+  CommandBehavior.CloseConnection(仅 Dispose 履行,Close 收尾的调用方池名额泄漏);
+  Subscriber 控制超时投毒不关 socket(阻塞中的读者仍会把迟到推送投递给已重建的应
+  用,重建窗口双投递);EF 先校验后同步对 unique 漂移单向检测(取消 IsUnique 后旧
+  UNIQUE 约束永不收敛,现双向+先删后建);保数据重建静默丢表级 UNIQUE/CHECK/FK
+  (引擎 sqlite_master 表行现输出完整 CREATE TABLE DDL,.NET 重建前提取约束重新挂
+  回);重建的 DROP 被视图依赖拒绝时异常裸穿(每个上下文整表拷贝后失败,EF 永不
+  可用,现转可操作错误并清理临时表);DebugIdleCount 忽略端点参数求全部池和(并
+  行测试类互相污染断言,修为按 host:port 过滤)。
+- **Python**:Subscriber 连接重建路径不清 `_replies_stale`/不排空回复队列(超时后
+  按提示重试永久超时,对象不可再用;现镜像 _resubscribe 收尾)。
+- **Web 控制台**:用户页 catch 路径缺 reqSeq 守卫(迟到失败响应整页覆盖新内容且无
+  轮询自愈);数据页闭包 meta 终身陈旧(RENAME/切节点后行编辑/删除按旧键构造
+  WHERE,键列失去唯一性后可命中多行;现动作时重解析);查询历史把未脱敏 SQL 明文
+  写入 localStorage(CREATE/ALTER USER 的密码长存浏览器,现按服务端同规则打码);
+  用户页表名按字节数判长(Unicode 表名 129 字节被拒,与引擎/文案不一致)。
+- **CLI**:尾部分隔符残段(部署脚本的标准 `GO` 尾巴/`;;`)在全部语句执行后作为
+  语句发给引擎——假失败 exit 1,管道重试撞"表已存在"(现识别为分隔符忽略);
+  `help;` 无条件写 stdout 污染 --csv/--json 机器可读流(改 stderr 分流);`exit;`
+  哨兵在 -f 脚本模式下失效变 SQL 解析错误(现脚本内同样生效);`connect --user`
+  漏写地址时把 `--user` 当地址拨号(现用法错误 exit 2)。
+
 ### 第五轮全模块缺陷审查修复(2026-10-04)
 
 对全部模块再做一轮系统审查(16 路并行→逐条源码核实→修复+回归落各模块内;Rust 1075/.NET 197/Python 59/部署测试绿):

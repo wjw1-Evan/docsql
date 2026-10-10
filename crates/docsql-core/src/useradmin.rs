@@ -1767,11 +1767,6 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
     // Unrestricted SELECT grants (blanket roles included) void column
     // restrictions on that table — privileges are a union.
     let mut unrestricted: BTreeSet<String> = BTreeSet::new();
-    if out.readonly || out.readwrite {
-        // Blanket read access: no column restriction and no row filter can
-        // narrow it (filters attach to explicit SELECT grants only).
-        return Ok(Some(out));
-    }
     for d in db.table_docs_cx(GRANTS_TABLE).unwrap_or_default() {
         let (Some(grantee), Some(priv_name), Some(tbl)) = (
             d.get("grantee").and_then(|v| v.as_str()),
@@ -1786,7 +1781,17 @@ pub fn resolve_grants(db: &mut Database, name: &str) -> Result<Option<UserGrants
         let Some(p) = TablePriv::parse(priv_name) else {
             continue;
         };
+        // Table privileges are a UNION and blanket roles never subtract:
+        // the old early return for readonly/readwrite members silently
+        // voided every direct DML grant (`GRANT INSERT ON t TO eve` plus
+        // `GRANT readonly TO eve` left may_dml(t, INSERT) false).
         *out.table_privs.entry(tbl.to_string()).or_insert(0) |= p.bit();
+        if out.readonly || out.readwrite {
+            // Blanket read access: no column restriction and no row filter
+            // can narrow it (filters attach to explicit SELECT grants only)
+            // — keep collecting bits, skip the restriction dimensions.
+            continue;
+        }
         let cols: Option<Vec<String>> = d
             .get("cols")
             .and_then(|v| v.as_str())
@@ -2849,6 +2854,27 @@ mod tests {
         assert_eq!(
             redact_sql("SELECT password FROM t"),
             "SELECT password FROM t"
+        );
+    }
+
+    /// 第七轮审查回归:权限是并集——readonly 成员身份不得静默作废
+    /// 直接授予的 DML 表级权限(`GRANT readonly TO eve` +
+    /// `GRANT INSERT ON t TO eve` 后 may_dml(t, INSERT) 必须为真)。
+    #[test]
+    fn readonly_membership_does_not_void_direct_dml_grants() {
+        let mut db = Database::in_memory().unwrap();
+        db.ensure_user_tables().unwrap();
+        let pw = test_pw();
+        db.execute(&format!("CREATE USER eve PASSWORD '{pw}'"))
+            .unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("GRANT INSERT ON t TO eve").unwrap();
+        db.execute("GRANT readonly TO eve").unwrap();
+        let g = resolve_grants(&mut db, "eve").unwrap().expect("user");
+        assert!(g.readonly, "role membership must register");
+        assert!(
+            g.may_dml("t", TablePriv::Insert.bit()),
+            "readonly membership must not void the direct INSERT grant: {g:?}"
         );
     }
 }

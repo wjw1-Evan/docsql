@@ -41,6 +41,8 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        RUN_TESTS: "${DOCSQL_RUN_TESTS:-true}"
     image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-a
     command: ["/data/docsql.db", "0.0.0.0:7600"]
@@ -265,6 +267,8 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        RUN_TESTS: "${DOCSQL_RUN_TESTS:-true}"
     image: "${DOCSQL_DEV_IMAGE:-ghcr.io/wjw1-evan/docsql}:${DOCSQL_DEV_IMAGE_TAG:-local}"
     container_name: docsql-single
     command: ["/data/docsql.db", "0.0.0.0:7600"]

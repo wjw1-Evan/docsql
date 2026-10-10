@@ -133,6 +133,18 @@ fn parse_args<I: Iterator<Item = String>>(it: I) -> Result<CliArgs, String> {
         }
     }
     if rest.first().map(String::as_str) == Some("connect") {
+        // The address slot must be an address: `connect --user alice` (a
+        // forgotten address) used to dial "--user" as the host and failed
+        // with a misleading socket error after a token-leak warning.
+        if let Some(a) = rest.get(1) {
+            if a.starts_with("--") {
+                eprintln!(
+                    "DocSQL: connect expects an address before any options\n\n{}",
+                    usage()
+                );
+                std::process::exit(2);
+            }
+        }
         let addr = rest
             .get(1)
             .cloned()
@@ -453,10 +465,15 @@ fn statements_ready(sql: &str) -> bool {
 
 /// Split a complete buffer into executable statements (quote/comment aware).
 /// A split failure returns the buffer as one chunk so the engine reports the
-/// real parse error.
+/// real parse error — except the "separator-only tail" shape (a trailing GO
+/// line or `;;`): those are not statements, and feeding them to the engine
+/// failed the whole script with exit 1 AFTER its real statements had already
+/// applied (deployment pipelines read a false failure and retried into
+/// "table already exists").
 fn split_ready(buf: &str) -> Vec<String> {
     match docsql_core::stmt::split_statements(buf) {
         Ok(parts) => parts.into_iter().filter(|p| !p.trim().is_empty()).collect(),
+        Err(e) if e.contains("empty statement") => Vec::new(),
         Err(_) => vec![buf.trim().to_string()],
     }
 }
@@ -471,10 +488,10 @@ fn run_embedded(
     format: Format,
     script: Option<&str>,
     input: impl std::io::Read,
-    // stdin REPL semantics: `exit;`/`help;` sentinels and the EOF flush.
-    // Stays on for PIPED stdin — every deployment helper drives the shell
-    // through heredocs ending in `exit;`.
-    interactive: bool,
+    // stdin REPL semantics: the `exit;`/`help;` sentinels and the EOF flush.
+    // The sentinels now fire in script/piped mode too, so the flag is kept
+    // only for signature stability (unused).
+    _interactive: bool,
     // An SQL error exits non-zero: -f scripts AND piped-stdin batch runs
     // (`docsql app.db < migrate.sql` used to exit 0; CI read a false
     // success). A terminal session keeps the REPL alive.
@@ -507,14 +524,17 @@ fn run_embedded(
             continue;
         }
         // Same buffer gate for the sentinels: a line that happens to be
-        // `help`/`exit;` inside a literal must stay data.
+        // `help`/`exit;` inside a literal must stay data. `exit;` ends a
+        // script/piped batch too — the usage text tells deployment authors
+        // to end heredocs with it, and a stored script with that trailing
+        // line must not hand "exit" to the SQL parser.
         if stmt.trim().is_empty() {
-            if interactive && (trimmed == "exit;" || trimmed == "exit") {
+            if trimmed == "exit;" || trimmed == "exit" {
                 done = true;
                 break;
             }
             if trimmed == "help;" || trimmed == "help" {
-                print_embedded_help();
+                print_embedded_help(format);
                 continue;
             }
         }
@@ -620,13 +640,17 @@ impl docsql_core::tsql_batch::BatchExecutor for EmbeddedBatchExec<'_> {
     }
 }
 
-fn print_embedded_help() {
-    println!(
-        "exit;                         leave the shell\n\
-         help;                         this summary\n\
-         SQL ends with ';' — multiple statements per line are executed in order\n\
-         flags: --csv | --json (row output), -f <script.sql> (batch, fail-fast)"
-    );
+fn print_embedded_help(format: Format) {
+    // Machine-readable streams stay pure: the help text rides stderr in
+    // --csv/--json mode (same rule as banners and confirmation lines).
+    let text = "exit;                         leave the shell\n\
+                help;                         this summary\n\
+                SQL ends with ';' — multiple statements per line are executed in order\n\
+                flags: --csv | --json (row output), -f <script.sql> (batch, fail-fast)";
+    match format {
+        Format::Csv | Format::Json => eprintln!("{text}"),
+        _ => println!("{text}"),
+    }
 }
 
 /// Remote-mode connection. A dedicated reader thread pulls frames off the

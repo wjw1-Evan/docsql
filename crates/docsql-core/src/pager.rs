@@ -1091,33 +1091,45 @@ impl Pager {
     /// Write `pending_writes` through to the data file and update the pool.
     /// A page is removed from the queue only after its write succeeded (and
     /// only if it is still the same image — a newer commit may have replaced
-    /// it meanwhile): on an I/O failure the failing page and the rest stay
-    /// queued (their WAL records are already durable and replay on reopen);
-    /// popping first would strand a page in neither queue nor pool.
+    /// it meanwhile): on an I/O failure the failing page stays queued (its
+    /// WAL records are already durable and replay on reopen). The pass
+    /// walks a snapshot of the queue instead of retrying the head forever —
+    /// a persistently failing page must not pin the head and wedge every
+    /// later page (and with them all checkpoint gates) behind it; each page
+    /// keeps only its latest image, so per-page order is preserved even
+    /// when some pages are skipped.
     fn flush_pending(&self) -> Result<()> {
-        loop {
-            let front = {
-                let p = lock(&self.pending_writes);
-                p.iter().next().map(|(k, v)| (*k, v.clone()))
+        let keys: Vec<u32> = lock(&self.pending_writes).keys().copied().collect();
+        let mut last_err: Option<PagerError> = None;
+        for id in keys {
+            let data = match lock(&self.pending_writes).get(&id) {
+                Some(v) => v.clone(),
+                None => continue, // retired by a concurrent pass
             };
-            let Some((id, data)) = front else {
-                break;
-            };
-            self.write_file_page(id, &data)?;
-            {
-                let mut p = lock(&self.pending_writes);
-                // Only retire the image we wrote: a concurrent commit may
-                // have queued a newer one for the same page while the write
-                // was in flight.
-                if p.get(&id).map(|v| v == &data) == Some(true) {
-                    p.remove(&id);
+            match self.write_file_page(id, &data) {
+                Ok(()) => {
+                    {
+                        let mut p = lock(&self.pending_writes);
+                        // Only retire the image we wrote: a concurrent commit
+                        // may have queued a newer one for the same page while
+                        // the write was in flight.
+                        if p.get(&id).map(|v| v == &data) == Some(true) {
+                            p.remove(&id);
+                        }
+                    }
+                    if let Some(pg) = lock(&self.pool).map.get_mut(&id) {
+                        pg.data = data;
+                    }
                 }
-            }
-            if let Some(pg) = lock(&self.pool).map.get_mut(&id) {
-                pg.data = data;
+                Err(e) => last_err = Some(e),
             }
         }
-        Ok(())
+        match last_err {
+            // Only surface when pages REMAIN queued: a transient failure on
+            // a page a concurrent pass already retired is not an error.
+            Some(e) if !lock(&self.pending_writes).is_empty() => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Free truncation: if a completed background sync already covers the
@@ -1128,7 +1140,15 @@ impl Pager {
     fn free_truncate_if_covered(&self, len: u64) -> Result<bool> {
         let covered = {
             let st = lock(&self.ckpt.st);
-            st.last_ok && st.covered_len >= len
+            // A queued or in-flight sync sampled its `covered` value BEFORE
+            // this call: its completion callback would write that
+            // pre-truncation value back over the post-truncation zero, and
+            // the NEXT free truncation would then drop WAL bytes whose page
+            // images were never fsynced (silently losing committed
+            // transactions on a crash). Only a covering sync with no pending
+            // successor may license a truncation — the hard-limit path has
+            // its own wait loop and is unaffected.
+            st.last_ok && st.completed == st.started && !st.requested && st.covered_len >= len
         };
         if !covered {
             return Ok(false);

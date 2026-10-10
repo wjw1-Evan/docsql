@@ -235,6 +235,12 @@ public sealed class DocsqlSubscriber : IDisposable
                 // 迟到的应答永远不会被错认成别的请求的确认。
                 _deadReason = "订阅请求超时;连接状态不可信,请重建连接";
                 _dead = true;
+                // Dispose the transport too: the reader thread is parked in
+                // Receive() and only sees _dead at the loop top AFTER the
+                // next frame arrives — a late push would still be dispatched
+                // to an application that already started rebuilding, racing
+                // the fresh subscription with duplicate delivery.
+                _proto.Dispose();
                 FireError(new DocsqlException(_deadReason));
                 throw new DocsqlException(_deadReason);
             }

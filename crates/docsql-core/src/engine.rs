@@ -378,6 +378,13 @@ pub(crate) struct TableMeta {
     /// see heap.rs / docs/design/002): reused by the next oversized insert.
     /// Persisted in the catalog; empty for tables without overflow history.
     overflow_free: Vec<u32>,
+    /// Sticky marker: some stored document carries a literal dotted field
+    /// name ("a.b" as ONE key). Eval resolves a qualified reference `a.b`
+    /// by that exact key first, so on such a table a qualifier-stripped
+    /// index probe is not a superset — probes and index-ordered windows
+    /// must refuse stripped names while it is set. Written once when the
+    /// first dotted field lands; never cleared (conservative is correct).
+    dotted_keys: bool,
     /// User view: the AS query text (CREATE VIEW). `None` for real tables.
     /// Views live in the same catalog namespace (one name, one object); a
     /// SELECT naming one expands to this query's rows. No storage, no
@@ -1794,12 +1801,24 @@ impl<'a> ReadCx<'a> {
                 // Same display rule as information_schema: engine/user
                 // storage tables are not listed to readers.
                 .filter(|(n, _)| !is_internal_table(n))
-                .map(|(n, _)| {
+                .map(|(n, m)| {
                     Object::from([
                         ("type".into(), Value::Str("table".into())),
                         ("name".into(), Value::Str(n.clone())),
                         ("tbl_name".into(), Value::Str(n.clone())),
-                        ("sql".into(), Value::Str(String::new())),
+                        // Full DDL text (same generator as dump_script): the
+                        // EF keep-data rebuild reads it to re-attach
+                        // table-level UNIQUE/CHECK/FOREIGN KEY constraints
+                        // the model does not know about — an empty text
+                        // silently dropped them from every rebuilt table.
+                        (
+                            "sql".into(),
+                            if m.is_view() {
+                                Value::Str(String::new())
+                            } else {
+                                Value::Str(create_table_ddl(n, m))
+                            },
+                        ),
                     ])
                 })
                 .collect();
@@ -3022,8 +3041,7 @@ impl<'a> ReadCx<'a> {
         // Oracle ROWNUM pseudo-column: number each row right after it is
         // retrieved (before WHERE and before ORDER BY — Oracle semantics).
         // Injected only when the statement references it, and only for the
-        // non-aggregated path (aggregates + ROWNUM error on the missing
-        // column, which is the honest refusal).
+        // non-aggregated path (aggregates + ROWNUM is refused below).
         let group_exprs: Vec<SqlExpr> = match &select.group_by {
             sqlparser::ast::GroupByExpr::Expressions(e, modifiers) => {
                 // MySQL `WITH ROLLUP` / ClickHouse `WITH TOTALS` modifiers
@@ -3041,7 +3059,14 @@ impl<'a> ReadCx<'a> {
         };
         let grouping_sets = expand_grouping_sets(&group_exprs)?;
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
-        let rownum_wanted = select_refs_rownum(&select) && !is_aggregate;
+        // With GROUP BY/aggregates ROWNUM has no row stream to number — the
+        // schemaless NULL read silently passed `ROWNUM <= n` filters, so
+        // refuse loudly instead.
+        let refs_rownum = select_refs_rownum(&select);
+        if refs_rownum && is_aggregate {
+            return err("ROWNUM is not supported combined with GROUP BY or aggregate projections");
+        }
+        let rownum_wanted = refs_rownum && !is_aggregate;
         let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
         // SELECT-list window functions (`… OVER (…)`) need the full
         // filtered rowset: the ORDER BY+LIMIT fast paths below would hand
@@ -3529,6 +3554,7 @@ impl<'a> ReadCx<'a> {
                     return reject();
                 }
                 let r = self.subquery_result(q)?;
+                single_col_rows(&r)?;
                 if r.rows.len() > 1 {
                     // Silently taking the first row makes the result depend
                     // on scan order — a wrong answer that looks plausible.
@@ -3553,6 +3579,7 @@ impl<'a> ReadCx<'a> {
                     return reject();
                 }
                 let r = self.subquery_result(subquery)?;
+                single_col_rows(&r)?;
                 let list = r
                     .rows
                     .iter()
@@ -3594,6 +3621,7 @@ impl<'a> ReadCx<'a> {
                     // `= ANY` is an IN list: cheaper than an OR chain and
                     // the shape the planner already understands.
                     let r = self.subquery_result(q)?;
+                    single_col_rows(&r)?;
                     let list = r
                         .rows
                         .iter()
@@ -3821,6 +3849,7 @@ impl<'a> ReadCx<'a> {
             SqlExpr::Value(sqlparser::ast::Value::Null.into())
         }
         let r = self.subquery_result(q)?;
+        single_col_rows(&r)?;
         if r.rows.is_empty() {
             // ANY over the empty set is FALSE, ALL is TRUE (standard).
             return value_to_literal(Value::Bool(!any));
@@ -3965,12 +3994,18 @@ impl<'a> ReadCx<'a> {
                 }
             }
             SetExpr::SetOperation { left, right, .. } => {
-                self.collect_correlated_in_body(left, from_names, hits);
-                self.collect_correlated_in_body(right, from_names, hits);
+                // Each arm's own FROM names shadow at its level (mirror of
+                // the Query arm): passing the parent set straight through
+                // misread a qualified arm-local reference as correlated.
+                for arm in [left, right] {
+                    let mut nested = from_names.clone();
+                    collect_setexpr_from_names(arm, &mut nested);
+                    self.collect_correlated_in_body(arm, &nested, hits);
+                }
             }
             SetExpr::Query(inner) => {
                 let mut nested = from_names.clone();
-                collect_from_names(inner, &mut nested);
+                collect_setexpr_from_names(&inner.body, &mut nested);
                 self.collect_correlated_in_body(&inner.body, &nested, hits);
             }
             _ => {}
@@ -6128,6 +6163,10 @@ impl Database {
                                     foreign_keys,
                                     index_roots,
                                     overflow_free,
+                                    dotted_keys: matches!(
+                                        m.get("dotted_keys"),
+                                        Some(Value::Bool(true))
+                                    ),
                                 }),
                             );
                         }
@@ -6343,6 +6382,9 @@ impl Database {
                             .collect(),
                     ),
                 );
+            }
+            if meta.dotted_keys {
+                m.insert("dotted_keys".into(), Value::Bool(true));
             }
             tables.insert(name.clone(), Value::Object(m));
         }
@@ -6972,6 +7014,17 @@ impl Database {
         self.tables.contains_key(name)
     }
 
+    /// ASCII-case-insensitive catalog probe: the server-side compat-view
+    /// rewrites (docsql_pubsub / docsql_log) must not shadow a user table
+    /// under ANY spelling of the name — an exact-only probe let
+    /// `DocSQL_PubSub` INSERT land in the real table while the SELECT was
+    /// silently rewritten onto the system view.
+    pub fn table_exists_ci(&self, name: &str) -> bool {
+        self.tables
+            .keys()
+            .any(|k| k.len() == name.len() && k.eq_ignore_ascii_case(name))
+    }
+
     /// Arm the cooperative deadline for the statement about to execute
     /// (server-side statement timeout). Engine-global, not per connection:
     /// the caller MUST clear it (`set_statement_deadline(None)`) once the
@@ -7059,6 +7112,29 @@ impl Database {
             Some(a) => Some(std::sync::Arc::make_mut(a)),
             None => None,
         }
+    }
+
+    /// Feed every NEW document image a write statement produced: the first
+    /// literal dotted field name ("a.b" as ONE key) sticks the table's
+    /// `dotted_keys` marker (see TableMeta). Returns true when the marker
+    /// was just set — callers fold that into their layout-sync condition so
+    /// the marker reaches the catalog in the same transaction.
+    fn note_dotted_fields<'a>(
+        &mut self,
+        table: &str,
+        mut docs: impl Iterator<Item = &'a Object>,
+    ) -> bool {
+        if self.tables.get(table).is_some_and(|m| m.dotted_keys) {
+            return false;
+        }
+        if !docs.any(|d| d.keys().any(|k| k.contains('.'))) {
+            return false;
+        }
+        if let Some(m) = self.catalog_mut(table) {
+            m.dotted_keys = true;
+            return true;
+        }
+        false
     }
 
     pub(crate) fn table_docs_cx(&self, table: &str) -> Result<Vec<Object>> {
@@ -7924,47 +8000,8 @@ impl Database {
         }
         for name in &ordered_tables {
             let meta = self.tables.get(name).cloned().unwrap();
-            ddl.push_str(&format!("CREATE TABLE {} (\n", quote_ident(name)));
-            let mut parts: Vec<String> = Vec::new();
-            for col in &meta.columns {
-                let mut def = quote_ident(col);
-                if meta.autoguid.as_deref() == Some(col.as_str()) {
-                    def.push_str(" GUID AUTOINCREMENT");
-                } else if meta.autoinc.as_deref() == Some(col.as_str()) {
-                    def.push_str(" INT AUTOINCREMENT");
-                } else {
-                    // Declared types are not enforced (document storage);
-                    // TEXT round-trips the column shape without pretending
-                    // to preserve the original declaration.
-                    def.push_str(" TEXT");
-                }
-                if meta.primary_key.as_deref() == Some(col.as_str()) {
-                    def.push_str(" PRIMARY KEY");
-                }
-                if meta.constraint_unique.contains(col) {
-                    def.push_str(" UNIQUE");
-                }
-                if meta.not_null.contains(col) {
-                    def.push_str(" NOT NULL");
-                }
-                if let Some((_, expr)) = meta.defaults.iter().find(|(c, _)| c == col) {
-                    def.push_str(&format!(" DEFAULT ({expr})"));
-                }
-                parts.push(def);
-            }
-            for chk in &meta.checks {
-                parts.push(format!("CHECK ({chk})"));
-            }
-            for (lc, rt, rc) in &meta.foreign_keys {
-                parts.push(format!(
-                    "FOREIGN KEY ({}) REFERENCES {} ({})",
-                    quote_ident(lc),
-                    quote_ident(rt),
-                    quote_ident(rc)
-                ));
-            }
-            ddl.push_str(&parts.join(",\n"));
-            ddl.push_str("\n);\n");
+            ddl.push_str(&create_table_ddl(name, &meta));
+            ddl.push('\n');
             for d in &meta.index_defs {
                 // Path indexes (design 005) re-emit as the JSON_EXTRACT
                 // expression they were created from — replay parses it back
@@ -8257,14 +8294,23 @@ impl Database {
                                     // on the same column keep it enforced.
                                     // Composite unique indexes never join
                                     // meta.unique, so single-column lift
-                                    // rules cover everything here.
+                                    // rules cover everything here. The
+                                    // "other source" test must name the
+                                    // column AS ITS SINGLE key: a composite
+                                    // unique index containing the column
+                                    // never guaranteed single-column
+                                    // uniqueness, and counting it kept the
+                                    // dropped constraint enforced forever
+                                    // (schema hash divergence included).
                                     if def.unique
                                         && def.columns.len() == 1
                                         && !meta.constraint_unique.contains(&def.columns[0])
                                         && meta.primary_key.as_deref()
                                             != Some(def.columns[0].as_str())
                                         && !meta.index_defs.iter().any(|d| {
-                                            d.columns.contains(&def.columns[0]) && d.unique
+                                            d.unique
+                                                && d.columns.len() == 1
+                                                && d.columns[0] == def.columns[0]
                                         })
                                     {
                                         meta.unique.retain(|c| c != &def.columns[0]);
@@ -9052,6 +9098,12 @@ impl Database {
         // IS the whole final table here — untouched rows included).
         self.check_fk_parent_delete_skipping(&tname, &old_changed, &out, &[], Some(&out))?;
         let changed = changed_docs.clone();
+        // Sticky dotted-field marker on the LOCAL meta clone: rewrite_table
+        // persists exactly this meta, so a self.tables write here would be
+        // overwritten by the rewrite's own catalog save.
+        if !meta.dotted_keys && out.iter().any(|d| d.keys().any(|k| k.contains('.'))) {
+            meta.dotted_keys = true;
+        }
         self.rewrite_table(&tname, &mut meta, out)?;
         if let Some(ret) = &update_returning {
             return project_returning(ret, &changed);
@@ -9245,7 +9297,9 @@ impl Database {
         for p in std::mem::take(&mut heap.dropped) {
             self.pager.free_page(&mut tx, p)?;
         }
-        if heap.pages != meta.pages
+        let dotted_now = self.note_dotted_fields(&tname, updates.iter().map(|(_, _, new)| new));
+        if dotted_now
+            || heap.pages != meta.pages
             || roots != meta.index_roots
             || heap.overflow_free != meta.overflow_free
         {
@@ -10064,7 +10118,7 @@ impl Database {
                     }
                     checks = checks
                         .iter()
-                        .map(|c| rename_ident_in_text(c, old, new))
+                        .map(|c| rename_ident_in_text(c, old, &ident_spelling(new)))
                         .collect();
                 }
                 Op::RenameTable { table_name } => {
@@ -10082,6 +10136,20 @@ impl Database {
                     if is_system_table(&new_name) || crate::useradmin::is_user_table(&new_name) {
                         return err(format!(
                             "table name {new_name} is reserved for internal use"
+                        ));
+                    }
+                    // Same parity as CREATE TABLE: a # temp-table name is
+                    // refused outright, and a compat dictionary name would
+                    // shadow the table at FROM-resolution — writes would
+                    // land but SELECTs would read the dictionary instead,
+                    // and dump_script would emit a CREATE the replay guard
+                    // rejects (backup/restore and join snapshots fail).
+                    if new_name.starts_with('#') {
+                        return err("temp tables (#name/##name) are not supported");
+                    }
+                    if is_compat_view(&new_name) {
+                        return err(format!(
+                            "table name {new_name} is reserved for the compatibility dictionary views"
                         ));
                     }
                     // Stored view SQL is not rewritten: a view left pointing
@@ -10209,6 +10277,20 @@ impl Database {
                     if let Some((_, text)) = meta.defaults.iter().find(|(c, _)| c == &col).cloned()
                     {
                         let e = parse_expr_text(&text)?;
+                        // A wall-clock/random default would backfill THIS
+                        // node's clock/roll into every existing row with no
+                        // resolved-text rewrite — replaying peers stamp
+                        // their own values and the tables diverge. Refuse
+                        // while there are rows to backfill (an empty table
+                        // keeps the default text for future INSERTs, which
+                        // do rewrite deterministically).
+                        if expr_calls_wall_clock(&e) && !self.table_docs_cx(&tname)?.is_empty() {
+                            return err(
+                                "ADD COLUMN cannot backfill a wall-clock or random DEFAULT \
+                                 (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE/RAND) into existing \
+                                 rows; supply the column explicitly on INSERT instead",
+                            );
+                        }
                         let fill = eval_const(&e)?;
                         let docs = self.table_docs_cx(&tname)?;
                         let filled: Vec<Object> = docs
@@ -10437,7 +10519,7 @@ impl Database {
                     meta.checks = meta
                         .checks
                         .iter()
-                        .map(|c| rename_ident_in_text(c, old, new))
+                        .map(|c| rename_ident_in_text(c, old, &ident_spelling(new)))
                         .collect();
                     let docs = self.table_docs_cx(&tname)?;
                     let renamed: Vec<Object> = docs
@@ -10469,6 +10551,15 @@ impl Database {
                         .map(|(n, _)| n.clone())
                         .collect();
                     if !referrers.is_empty() {
+                        // Snapshot the referrer entries: a failed catalog
+                        // save must leave memory matching disk — the next
+                        // successful write persists whatever sits in memory,
+                        // so a diverged (rewritten-but-unsaved) entry would
+                        // silently drift to peers.
+                        let before: Vec<(String, std::sync::Arc<TableMeta>)> = referrers
+                            .iter()
+                            .filter_map(|n| self.tables.get(n).map(|m| (n.clone(), m.clone())))
+                            .collect();
                         for name in referrers {
                             if let Some(entry) = self.tables.get_mut(&name) {
                                 let m = std::sync::Arc::make_mut(entry);
@@ -10479,7 +10570,12 @@ impl Database {
                                 }
                             }
                         }
-                        self.save_catalog()?;
+                        if let Err(e) = self.save_catalog() {
+                            for (n, m) in before {
+                                self.tables.insert(n, m);
+                            }
+                            return Err(e);
+                        }
                     }
                 }
                 Op::RenameTable { table_name } => {
@@ -10567,6 +10663,13 @@ impl Database {
                         .filter(|(_, m)| m.foreign_keys.iter().any(|(_, rt, _)| rt == &tname))
                         .map(|(n, _)| n.clone())
                         .collect();
+                    // Snapshot first: a failed catalog save must restore the
+                    // referrer entries, or memory diverges from disk (the
+                    // next successful write would persist the divergence).
+                    let before: Vec<(String, std::sync::Arc<TableMeta>)> = referrers
+                        .iter()
+                        .filter_map(|n| self.tables.get(n).map(|m| (n.clone(), m.clone())))
+                        .collect();
                     for name in referrers {
                         if let Some(m) = self.tables.get_mut(&name) {
                             let m = std::sync::Arc::make_mut(m);
@@ -10577,7 +10680,12 @@ impl Database {
                             }
                         }
                     }
-                    self.save_catalog()?;
+                    if let Err(e) = self.save_catalog() {
+                        for (n, m) in before {
+                            self.tables.insert(n, m);
+                        }
+                        return Err(e);
+                    }
                     return Ok(ExecOutcome::Affected(0));
                 }
                 other => return err(format!("unsupported ALTER TABLE operation: {other}")),
@@ -10587,9 +10695,22 @@ impl Database {
         // operations after it in the same statement (ADD COLUMN without a
         // DEFAULT, a CHECK) only touched the local `meta` and were silently
         // dropped. Save the final state unconditionally — the extra save
-        // after a bare rewrite is idempotent.
+        // after a bare rewrite is idempotent. A failed save restores the
+        // in-memory entry: the next successful write persists whatever is
+        // in memory, so leaving the new meta would diverge from disk.
+        let prev = self.tables.get(&tname).cloned();
         self.tables.insert(tname.clone(), std::sync::Arc::new(meta));
-        self.save_catalog()?;
+        if let Err(e) = self.save_catalog() {
+            match prev {
+                Some(old) => {
+                    self.tables.insert(tname.clone(), old);
+                }
+                None => {
+                    self.tables.remove(&tname);
+                }
+            }
+            return Err(e);
+        }
         Ok(ExecOutcome::Affected(0))
     }
 
@@ -11084,8 +11205,17 @@ impl Database {
                             Some(&u.nulls_distinct),
                             None,
                         )?;
-                        meta.unique.push(col.name.value.clone());
-                        meta.constraint_unique.push(col.name.value.clone());
+                        // Deduplicate like the table-level constraint below:
+                        // `a INT UNIQUE UNIQUE` pushed the column twice, the
+                        // tree-maintenance loop inserted the same key twice,
+                        // and the table was permanently unwritable.
+                        let col = col.name.value.clone();
+                        if !meta.unique.contains(&col) {
+                            meta.unique.push(col.clone());
+                        }
+                        if !meta.constraint_unique.contains(&col) {
+                            meta.constraint_unique.push(col);
+                        }
                     }
                     CO::NotNull => meta.not_null.push(col.name.value.clone()),
                     CO::Null => {}
@@ -12314,7 +12444,15 @@ impl Database {
         for p in std::mem::take(&mut heap.dropped) {
             self.pager.free_page(&mut tx, p)?;
         }
-        if heap.pages != meta.pages
+        let dotted_now = self.note_dotted_fields(
+            &table,
+            placed
+                .iter()
+                .map(|(_, d)| d)
+                .chain(updated.iter().map(|(_, _, new)| new)),
+        );
+        if dotted_now
+            || heap.pages != meta.pages
             || roots != meta.index_roots
             || heap.overflow_free != meta.overflow_free
         {
@@ -12895,7 +13033,14 @@ impl Database {
         for p in std::mem::take(&mut heap.dropped) {
             self.pager.free_page(&mut tx, p)?;
         }
-        if heap.pages != meta.pages
+        let dotted_now = self.note_dotted_fields(
+            &tname,
+            inserted_docs
+                .iter()
+                .chain(updates.iter().map(|(_, _, new)| new)),
+        );
+        if dotted_now
+            || heap.pages != meta.pages
             || roots != meta.index_roots
             || heap.overflow_free != meta.overflow_free
         {
@@ -14094,29 +14239,31 @@ fn merged_row(l: &Object, right: &Object) -> Object {
 }
 
 /// LEFT/INNER join's unmatched left row: the right side's columns padded
-/// with NULL. `right_sample` is any qualified right row (row schemas vary,
-/// the first row is the historical convention). An EMPTY right side has no
-/// sample, so `right_cols` (the factor's planned columns) pads the keys —
-/// without them a same-named left column answers the suffix fallback and
-/// masquerades as the right value (`WHERE r.id IS NULL` never fires).
+/// with NULL. The pad set is the union of every qualified right row's keys
+/// (row schemas vary in a schemaless store — padding only the FIRST row's
+/// keys left a column only later rows carry unpadded, and the suffix
+/// fallback answered it with the left side's same-named value). An EMPTY
+/// right side has no sample, so `right_cols` (the factor's planned columns)
+/// pads the keys — without them a same-named left column answers the
+/// suffix fallback and masquerades as the right value (`WHERE r.id IS
+/// NULL` never fires).
 fn null_extended_left(
     l: &Object,
-    right_sample: Option<&Object>,
+    qright: &[Object],
     right_key: &str,
     right_cols: Option<&[String]>,
 ) -> Object {
     let mut merged = l.clone();
-    match right_sample {
-        Some(sample) => {
-            for k in sample.keys() {
-                merged.insert(k.clone(), Value::Null);
+    if qright.is_empty() {
+        if let Some(cols) = right_cols {
+            for c in cols {
+                merged.insert(format!("{right_key}.{c}"), Value::Null);
             }
         }
-        None => {
-            if let Some(cols) = right_cols {
-                for c in cols {
-                    merged.insert(format!("{right_key}.{c}"), Value::Null);
-                }
+    } else {
+        for row in qright {
+            for k in row.keys() {
+                merged.insert(k.clone(), Value::Null);
             }
         }
     }
@@ -14252,7 +14399,7 @@ fn hash_join(
             }
         }
         if !matched && left_join {
-            out.push(null_extended_left(l, qright.first(), right_key, right_cols));
+            out.push(null_extended_left(l, qright, right_key, right_cols));
         }
     }
     if right_join {
@@ -14319,7 +14466,7 @@ fn join_rows(
             }
         }
         if !matched && left_join {
-            out.push(null_extended_left(l, qright.first(), right_key, right_cols));
+            out.push(null_extended_left(l, &qright, right_key, right_cols));
         }
     }
     if right_join {
@@ -14444,11 +14591,31 @@ fn query_calls_newid(q: &Query) -> bool {
     false
 }
 
+/// A FROM factor carrying nondeterministic calls: derived-table
+/// subqueries and table-function arguments evaluate per execution — a
+/// journal replay of the original text would re-roll them on every peer
+/// and silently fork the cluster. Covers the relation itself and every
+/// joined relation.
+fn factor_calls_newid(factor: &sqlparser::ast::TableFactor) -> bool {
+    match factor {
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => query_calls_newid(subquery),
+        sqlparser::ast::TableFactor::TableFunction { expr, .. } => calls_newid(expr),
+        _ => false,
+    }
+}
+
+fn twj_calls_newid(twj: &sqlparser::ast::TableWithJoins) -> bool {
+    factor_calls_newid(&twj.relation) || twj.joins.iter().any(|j| factor_calls_newid(&j.relation))
+}
+
 fn setexpr_calls_newid(body: &sqlparser::ast::SetExpr) -> bool {
     use sqlparser::ast::SetExpr;
     match body {
         SetExpr::Select(sel) => {
             for twj in &sel.from {
+                if twj_calls_newid(twj) {
+                    return true;
+                }
                 for j in &twj.joins {
                     if let Some(e) = join_on_expr(&j.join_operator) {
                         if calls_newid(e) {
@@ -14511,10 +14678,11 @@ fn stmt_calls_newid(stmt: &Statement) -> bool {
             u.assignments.iter().any(|a| calls_newid(&a.value))
                 || u.selection.as_ref().is_some_and(calls_newid)
                 || join_ons(&u.table)
+                || twj_calls_newid(&u.table)
                 || u.from.as_ref().is_some_and(|f| match f {
                     sqlparser::ast::UpdateTableFromKind::BeforeSet(twjs)
                     | sqlparser::ast::UpdateTableFromKind::AfterSet(twjs) => {
-                        twjs.iter().any(join_ons)
+                        twjs.iter().any(|t| join_ons(t) || twj_calls_newid(t))
                     }
                 })
         }
@@ -14522,10 +14690,10 @@ fn stmt_calls_newid(stmt: &Statement) -> bool {
             d.selection.as_ref().is_some_and(calls_newid)
                 || d.using
                     .as_ref()
-                    .is_some_and(|twjs| twjs.iter().any(join_ons))
+                    .is_some_and(|twjs| twjs.iter().any(|t| join_ons(t) || twj_calls_newid(t)))
                 || match &d.from {
                     FromTable::WithFromKeyword(twjs) | FromTable::WithoutKeyword(twjs) => {
-                        twjs.iter().any(join_ons)
+                        twjs.iter().any(|t| join_ons(t) || twj_calls_newid(t))
                     }
                 }
         }
@@ -14537,7 +14705,8 @@ fn stmt_calls_newid(stmt: &Statement) -> bool {
             c.query.as_ref().is_some_and(|q| query_calls_newid(q))
         }
         Statement::Merge(m) => {
-            calls_newid(&m.on)
+            factor_calls_newid(&m.source)
+                || calls_newid(&m.on)
                 || m.clauses.iter().any(|c| {
                     c.predicate.as_ref().is_some_and(calls_newid)
                         || match &c.action {
@@ -15625,6 +15794,22 @@ fn eval_assignments(
 /// boundaries — a byte walk would panic slicing into a multibyte identifier,
 /// and non-ASCII chars count as identifier characters so the `a` inside
 /// `éa` can never match.
+/// Replacement spelling for a renamed identifier inside stored SQL text
+/// (CHECK expressions): bare when the name is a plain word, quoted (with
+/// `""` escaping) otherwise — a `"` in the new name must not break the
+/// lexical structure of the stored text (dump replays it verbatim).
+fn ident_spelling(name: &str) -> String {
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if plain {
+        name.to_string()
+    } else {
+        crate::stmt::sql_quote_ident(name)
+    }
+}
+
 fn rename_ident_in_text(text: &str, old: &str, new: &str) -> String {
     fn is_word(c: char) -> bool {
         !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '$'
@@ -15696,8 +15881,26 @@ fn text_references_ident(text: &str, name: &str) -> bool {
 /// Collect the table names and aliases a query reads in its own FROM, so
 /// qualified references to anything else can be flagged as correlated.
 fn collect_from_names(q: &Query, out: &mut std::collections::BTreeSet<String>) {
-    if let sqlparser::ast::SetExpr::Select(sel) = &*q.body {
-        from_list_names(&sel.from, out);
+    collect_setexpr_from_names(&q.body, out);
+}
+
+/// FROM names of a subquery body, recursing through set-operation arms and
+/// nested query bodies — a body-level Select-only scan collected nothing
+/// for `SELECT … FROM a UNION SELECT … FROM b`, making every qualified arm
+/// reference look correlated.
+fn collect_setexpr_from_names(
+    body: &sqlparser::ast::SetExpr,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(sel) => from_list_names(&sel.from, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_setexpr_from_names(left, out);
+            collect_setexpr_from_names(right, out);
+        }
+        SetExpr::Query(inner) => collect_setexpr_from_names(&inner.body, out),
+        _ => {}
     }
 }
 
@@ -16062,7 +16265,15 @@ fn subst_outer_refs_expr(
                 hit |= subst_outer_refs_expr(flt, shadow, outer, doc);
             }
         }
-        _ => {}
+        // Shared traversal (mirror of expr_mentions_outer above): an outer
+        // reference under a wrapper node (IS NULL/SUBSTRING/TRIM/…) must be
+        // substituted too — leaving it reads the outer column as NULL (or an
+        // inner same-name column via suffix fallback) inside the subquery.
+        _ => {
+            for c in child_exprs_mut(e) {
+                hit |= subst_outer_refs_expr(c, shadow, outer, doc);
+            }
+        }
     }
     hit
 }
@@ -16558,7 +16769,15 @@ fn collect_correlated_refs(
             }
         }
         SqlExpr::Cast { expr, .. } => collect_correlated_refs(expr, from_names, catalog, hits),
-        _ => {}
+        // Shared traversal (mirror of expr_mentions_outer): a qualified outer
+        // reference under a wrapper node (IS NULL/SUBSTRING/…) is still a
+        // correlation; missing it let the subquery fall back to the
+        // schemaless NULL read.
+        _ => {
+            for c in child_exprs(e) {
+                collect_correlated_refs(c, from_names, catalog, hits);
+            }
+        }
     }
 }
 
@@ -16973,12 +17192,35 @@ fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
     }
     // Unqualified name on JOINED rows (every key is "alias.col"): take the
     // FIRST source in row order (BTreeMap order is deterministic; matches
-    // left-table-first convention). Restricted to join-shaped rows: a
-    // single-table doc with a literal dotted column ("x.v") must not leak
-    // into bare `v` — index trees only ever key the bare name, so the
-    // generic path answering what a probe cannot see made query results
-    // depend on whether an index exists.
-    if !doc.keys().all(|k| k.contains('.')) {
+    // left-table-first convention). Restricted to genuinely join-shaped
+    // rows — every key qualified AND at least two distinct qualifiers. A
+    // single-table doc whose only fields are literal dotted names ("g.x")
+    // has one prefix: the suffix answer made query results depend on
+    // whether an index exists (trees only ever key the bare name). The
+    // injected ROWNUM pseudo-column is a bare key that must not disqualify
+    // a joined row from the fallback.
+    let mut qualifiers = 0usize;
+    let mut last_prefix = "";
+    let mut join_shaped = true;
+    for k in doc.keys() {
+        if k == "ROWNUM" {
+            continue;
+        }
+        match k.rfind('.') {
+            Some(i) => {
+                let p = &k[..i];
+                if p != last_prefix {
+                    qualifiers += 1;
+                    last_prefix = p;
+                }
+            }
+            None => {
+                join_shaped = false;
+                break;
+            }
+        }
+    }
+    if !join_shaped || qualifiers < 2 {
         return Ok(Value::Null);
     }
     let suffix = format!(".{name}");
@@ -17152,7 +17394,19 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                 (Value::Null, _) | (_, Value::Null) => false,
                 (Value::Str(s), Value::Str(pat)) => {
                     let (s, pat) = if ci {
-                        (s.to_lowercase(), pat.to_lowercase())
+                        // Char-wise case fold: a full-string to_lowercase()
+                        // changes the CHARACTER COUNT for some Unicode
+                        // (U+0130 'İ' expands to two chars), skewing `_`
+                        // wildcard counts. Folding each char to its first
+                        // lowercase char keeps pattern and text aligned.
+                        (
+                            s.chars()
+                                .map(|c| c.to_lowercase().next().unwrap_or(c))
+                                .collect::<String>(),
+                            pat.chars()
+                                .map(|c| c.to_lowercase().next().unwrap_or(c))
+                                .collect::<String>(),
+                        )
                     } else {
                         (s.clone(), pat.clone())
                     };
@@ -17826,7 +18080,10 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 // decimal crate only rounds toward positive scale, so
                 // pre-scale by the magnitude, round at scale 0, scale back.
                 let digits = match args.get(1) {
-                    Some(Value::Int(d)) => *d,
+                    // Clamp like the Float branch: a huge i64 truncated to
+                    // u32 picked an arbitrary scale (2^32 → 0), and
+                    // i64::MIN negated below overflowed in debug builds.
+                    Some(Value::Int(d)) => (*d).clamp(-15, 28),
                     _ => 0,
                 };
                 if digits >= 0 {
@@ -17868,10 +18125,15 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         }
         "NULLIF" => {
             exact_arity(name, args, 2)?;
-            if Value::cmp_values(arg(args, 0, name)?, arg(args, 1, name)?) == Ordering::Equal {
+            let a = arg(args, 0, name)?;
+            let b = arg(args, 1, name)?;
+            // Same comparison funnel as `=` (cmp_coerced): a Timestamp↔
+            // parseable-string pair must null out here exactly as the
+            // equality predicate matches it.
+            if cmp_coerced(a, b) == Some(Ordering::Equal) {
                 Value::Null
             } else {
-                args[0].clone()
+                a.clone()
             }
         }
         "SUBSTR" | "SUBSTRING" => {
@@ -17986,26 +18248,27 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         "JSON_ARRAY_CONTAINS" => {
             exact_arity(name, args, 2)?;
             let (haystack, needle) = (arg(args, 0, name)?, arg(args, 1, name)?);
+            // Membership uses the same comparison funnel as `IN`/`=`
+            // (cmp_coerced): EF serializes DateTime elements to ISO strings
+            // while the typed needle arrives as a Timestamp — the raw total
+            // order never equates the two, silently emptying the query.
+            let contains = |items: &[Value]| {
+                items
+                    .iter()
+                    .any(|it| cmp_coerced(it, needle) == Some(Ordering::Equal))
+            };
             let items: &[Value] = match haystack {
                 Value::Null => return Ok(Value::Null),
                 Value::Array(items) => items,
                 Value::Str(s) => match crate::json::from_str(s) {
                     Ok(Value::Array(items)) => {
-                        return Ok(Value::Bool(
-                            items
-                                .iter()
-                                .any(|it| Value::cmp_values(it, needle) == Ordering::Equal),
-                        ))
+                        return Ok(Value::Bool(contains(&items)));
                     }
                     _ => return Ok(Value::Bool(false)),
                 },
                 _ => return Ok(Value::Bool(false)),
             };
-            Value::Bool(
-                items
-                    .iter()
-                    .any(|it| Value::cmp_values(it, needle) == Ordering::Equal),
-            )
+            Value::Bool(contains(items))
         }
         // ---- Oracle-style function family (compatibility surface) ----
         "NVL" => {
@@ -18039,7 +18302,10 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 let matched = match (expr, s) {
                     (Value::Null, Value::Null) => true,
                     (Value::Null, _) | (_, Value::Null) => false,
-                    (a, b) => Value::cmp_values(a, b) == Ordering::Equal,
+                    // Same comparison funnel as `=` (cmp_coerced): a
+                    // Timestamp↔parseable-string pair must decode-match
+                    // exactly as the equality predicate matches it.
+                    (a, b) => cmp_coerced(a, b) == Some(Ordering::Equal),
                 };
                 if matched {
                     return Ok(args[i + 1].clone());
@@ -18136,7 +18402,10 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             }
             let mut best = args[0].clone();
             for v in &args[1..] {
-                let o = Value::cmp_values(v, &best);
+                // Prefer the coercion funnel (a Timestamp↔parseable-string
+                // pair orders by time, like the predicates do); the total
+                // order settles cross-type mixes that never coerce.
+                let o = cmp_coerced(v, &best).unwrap_or_else(|| Value::cmp_values(v, &best));
                 let better = if name == "GREATEST" {
                     o == Ordering::Greater
                 } else {
@@ -19053,7 +19322,10 @@ fn str_prefix_successor(prefix: &str) -> Option<String> {
     Some(chars.into_iter().collect())
 }
 
-/// Flatten the top-level AND chain of a WHERE expression.
+/// Flatten the top-level AND chain of a WHERE expression. Parenthesized
+/// conjuncts unwrap transparently (`(a = 1) AND b = 'x'`): a Nested node
+/// carries no semantics of its own, and skipping it used to hide every
+/// conjunct from the probe/window planners.
 fn flatten_and<'a>(e: &'a SqlExpr, out: &mut Vec<&'a SqlExpr>) {
     if let SqlExpr::BinaryOp {
         left,
@@ -19063,19 +19335,44 @@ fn flatten_and<'a>(e: &'a SqlExpr, out: &mut Vec<&'a SqlExpr>) {
     {
         flatten_and(left, out);
         flatten_and(right, out);
+    } else if let SqlExpr::Nested(inner) = e {
+        flatten_and(inner, out);
     } else {
         out.push(e);
     }
 }
 
+/// Spelling of a probe conjunct's column reference. A quoted identifier
+/// WITH a dot is a literal field name ("v.x" as ONE key): eval resolves it
+/// by that exact key, so a qualifier-stripped probe would read a different
+/// column than the residual/row evaluation — the conjunct must stay opaque
+/// (no probe) instead.
+fn probe_col_name(e: &SqlExpr) -> Option<String> {
+    match e {
+        SqlExpr::Identifier(i) if i.value.contains('.') => None,
+        SqlExpr::Identifier(i) => Some(i.value.clone()),
+        SqlExpr::CompoundIdentifier(_) => Some(expr_name(e)),
+        _ => None,
+    }
+}
+
 /// Resolve a column reference (bare, table- or alias-qualified) to its bare
-/// column name when it names a column of this table.
-fn unqualified_col(ident: &str, table: &str, alias: Option<&str>) -> Option<String> {
+/// column name when it names a column of this table. `dotted` is the
+/// table's literal-dotted-field marker: while set, a qualifier-stripped
+/// reference may collide with a literal "a.b" key (eval tries that key
+/// first), so stripping is refused.
+fn unqualified_col(ident: &str, table: &str, alias: Option<&str>, dotted: bool) -> Option<String> {
     if let Some(c) = ident.strip_prefix(&format!("{table}.")) {
+        if dotted {
+            return None;
+        }
         return Some(c.to_string());
     }
     if let Some(a) = alias {
         if let Some(c) = ident.strip_prefix(&format!("{a}.")) {
+            if dotted {
+                return None;
+            }
             return Some(c.to_string());
         }
     }
@@ -19107,7 +19404,12 @@ fn order_walk_index(
         if o.options.nulls_first.is_some() {
             return None;
         }
-        let col = unqualified_col(&expr_name(effective[i]), table, alias)?;
+        let col = unqualified_col(
+            &probe_col_name(effective[i])?,
+            table,
+            alias,
+            meta.dotted_keys,
+        )?;
         let this_asc = o.options.asc.unwrap_or(true);
         if i == 0 {
             asc = this_asc;
@@ -19164,15 +19466,20 @@ fn resolve_indexed_col(
         let cols = meta.index_columns_of(col);
         (cols.len() == 1 && cols[0] == col).then(|| col.to_string())
     };
-    if let Some(col) = ident.strip_prefix(&format!("{table}.")) {
-        if let Some(c) = scalar_root(col) {
-            return Some(c);
-        }
-    }
-    if let Some(a) = alias {
-        if let Some(col) = ident.strip_prefix(&format!("{a}.")) {
+    // While the table carries literal dotted field names, eval may answer a
+    // qualified reference through the exact "a.b" key — the stripped tree
+    // window is not a superset, so refuse to strip.
+    if !meta.dotted_keys {
+        if let Some(col) = ident.strip_prefix(&format!("{table}.")) {
             if let Some(c) = scalar_root(col) {
                 return Some(c);
+            }
+        }
+        if let Some(a) = alias {
+            if let Some(col) = ident.strip_prefix(&format!("{a}.")) {
+                if let Some(c) = scalar_root(col) {
+                    return Some(c);
+                }
             }
         }
     }
@@ -19190,10 +19497,12 @@ fn resolve_indexed_col(
 /// is implied by the probe, so callers may trust the entry count and stop a
 /// window walk at the requested end (no residual re-filter).
 /// Collapse the collected range bounds (op, value) into ProbePlan's
-/// (lo, hi) pair: the lowest bound wins on each side (repeated
-/// inequalities narrow; the probe re-filters row-exactly anyway when the
-/// plan is inexact, and an exact plan cannot carry contradicting bounds
-/// because eq_conflict/path conflict detection refuses those shapes).
+/// (lo, hi) pair: the TIGHTEST bound wins on each side — repeated
+/// inequalities narrow, mirroring the scalar branch's invariant
+/// (`a > 10 AND a > 18` must probe from 18). The probe re-filters
+/// row-exactly anyway when the plan is inexact, and an exact plan cannot
+/// carry contradicting bounds because eq_conflict/path conflict detection
+/// refuses those shapes.
 fn path_bound(bounds: &[(BinaryOperator, Value)], lower: bool) -> Option<(Value, bool)> {
     let mut best: Option<(Value, bool)> = None;
     for (op, v) in bounds {
@@ -19206,8 +19515,10 @@ fn path_bound(bounds: &[(BinaryOperator, Value)], lower: bool) -> Option<(Value,
             None => (v.clone(), inclusive),
             Some((bv, bi)) => {
                 let ord = Value::cmp_values(&bv, v);
-                if (lower && ord == std::cmp::Ordering::Greater)
-                    || (!lower && ord == std::cmp::Ordering::Less)
+                // Keep the bound that narrows the window: the larger lower
+                // bound / the smaller upper bound.
+                if (lower && ord == std::cmp::Ordering::Less)
+                    || (!lower && ord == std::cmp::Ordering::Greater)
                 {
                     (v.clone(), inclusive)
                 } else {
@@ -19265,9 +19576,9 @@ fn probe_plan(
                 opaque = true;
                 continue;
             }
-            let name = match expr.as_ref() {
-                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(expr),
-                _ => {
+            let name = match probe_col_name(expr.as_ref()) {
+                Some(n) => n,
+                None => {
                     opaque = true;
                     continue;
                 }
@@ -19314,9 +19625,9 @@ fn probe_plan(
                 opaque = true;
                 continue;
             }
-            let name = match expr.as_ref() {
-                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(expr),
-                _ => {
+            let name = match probe_col_name(expr.as_ref()) {
+                Some(n) => n,
+                None => {
                     opaque = true;
                     continue;
                 }
@@ -19374,9 +19685,9 @@ fn probe_plan(
                 opaque = true;
                 continue;
             }
-            let name = match expr.as_ref() {
-                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(expr),
-                _ => {
+            let name = match probe_col_name(expr.as_ref()) {
+                Some(n) => n,
+                None => {
                     opaque = true;
                     continue;
                 }
@@ -19485,9 +19796,9 @@ fn probe_plan(
                 continue;
             }
         };
-        let name = match col_ref {
-            SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => expr_name(col_ref),
-            _ => {
+        let name = match probe_col_name(col_ref) {
+            Some(n) => n,
+            None => {
                 opaque = true;
                 continue;
             }
@@ -19541,7 +19852,7 @@ fn probe_plan(
     let covered = |cols: &[String], map: &std::collections::BTreeMap<String, Value>| -> bool {
         let mut seen = std::collections::BTreeSet::new();
         map.keys().all(|k| {
-            let Some(name) = unqualified_col(k, table, alias) else {
+            let Some(name) = unqualified_col(k, table, alias, meta.dotted_keys) else {
                 return false;
             };
             cols.contains(&name) && seen.insert(name)
@@ -19612,7 +19923,7 @@ fn probe_plan(
         let mut bare_eq: std::collections::BTreeMap<String, Value> =
             std::collections::BTreeMap::new();
         for (k, v) in &eq_map {
-            if let Some(name) = unqualified_col(k, table, alias) {
+            if let Some(name) = unqualified_col(k, table, alias, meta.dotted_keys) {
                 bare_eq.insert(name, v.clone());
             }
         }
@@ -19673,7 +19984,8 @@ fn probe_plan(
             && in_target.is_none()
             && eq_map.len() == 1
             && eq_map.iter().all(|(k, ev)| {
-                unqualified_col(k, table, alias).as_deref() == Some(&col) && *ev == v
+                unqualified_col(k, table, alias, meta.dotted_keys).as_deref() == Some(&col)
+                    && *ev == v
             });
         return Some((col, ProbePlan::Eq(v), exact));
     }
@@ -20542,6 +20854,69 @@ fn values_equal_null_safe(a: &Value, b: &Value) -> bool {
 /// FROM must compare exactly like `=`/`<`/`>` do. `None` mirrors the
 /// comparison-unknown result those operators report for an unparseable
 /// string against a TIMESTAMP.
+/// The full CREATE TABLE text for one catalog entry (columns, constraints)
+/// — shared by dump_script and the sqlite_master table rows, so clients
+/// (the EF keep-data rebuild) see the same constraint set the dump would
+/// re-create.
+fn create_table_ddl(name: &str, meta: &TableMeta) -> String {
+    let mut ddl = format!("CREATE TABLE {} (\n", quote_ident(name));
+    let mut parts: Vec<String> = Vec::new();
+    for col in &meta.columns {
+        let mut def = quote_ident(col);
+        if meta.autoguid.as_deref() == Some(col.as_str()) {
+            def.push_str(" GUID AUTOINCREMENT");
+        } else if meta.autoinc.as_deref() == Some(col.as_str()) {
+            def.push_str(" INT AUTOINCREMENT");
+        } else {
+            // Declared types are not enforced (document storage);
+            // TEXT round-trips the column shape without pretending
+            // to preserve the original declaration.
+            def.push_str(" TEXT");
+        }
+        if meta.primary_key.as_deref() == Some(col.as_str()) {
+            def.push_str(" PRIMARY KEY");
+        }
+        if meta.constraint_unique.contains(col) {
+            def.push_str(" UNIQUE");
+        }
+        if meta.not_null.contains(col) {
+            def.push_str(" NOT NULL");
+        }
+        if let Some((_, expr)) = meta.defaults.iter().find(|(c, _)| c == col) {
+            def.push_str(&format!(" DEFAULT ({expr})"));
+        }
+        parts.push(def);
+    }
+    for chk in &meta.checks {
+        parts.push(format!("CHECK ({chk})"));
+    }
+    for (lc, rt, rc) in &meta.foreign_keys {
+        parts.push(format!(
+            "FOREIGN KEY ({}) REFERENCES {} ({})",
+            quote_ident(lc),
+            quote_ident(rt),
+            quote_ident(rc)
+        ));
+    }
+    ddl.push_str(&parts.join(",\n"));
+    ddl.push_str("\n);");
+    ddl
+}
+
+/// Rows of a single-column value-list subquery (scalar / IN / ANY / ALL):
+/// more than one output column is a cardinality error. The old silent
+/// `row.first()` read only the first column and dropped visible matches
+/// from IN lists.
+fn single_col_rows(r: &QueryResult) -> Result<()> {
+    if r.columns.len() > 1 {
+        return err(format!(
+            "subquery returns {} columns; a single column is required here",
+            r.columns.len()
+        ));
+    }
+    Ok(())
+}
+
 fn cmp_coerced(a: &Value, b: &Value) -> Option<Ordering> {
     coerce_timestamp_operands(a.clone(), b.clone()).map(|(a, b)| Value::cmp_values(&a, &b))
 }
@@ -35891,5 +36266,399 @@ mod tsql_compat_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("DISTINCT ON"), "{e}");
+    }
+
+    /// 第七轮审查回归:相关子查询的外层引用藏在包装节点(IS NULL/
+    /// SUBSTRING)下时,代入遍历必须照样替换——残留引用在内层读 NULL,
+    /// DELETE 形态曾把整表删光。
+    #[test]
+    fn correlated_outer_ref_under_wrapper_nodes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, x INT)");
+        run(&mut db, "CREATE TABLE a (y INT)");
+        run(
+            &mut db,
+            "INSERT INTO t (id, x) VALUES (1, NULL), (2, 5), (3, 7)",
+        );
+        run(&mut db, "INSERT INTO a (y) VALUES (0)");
+        // IS NULL under EXISTS: only the NULL-x row matches the subquery.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM a WHERE t.x IS NULL) ORDER BY id",
+        );
+        assert_eq!(r.rows.len(), 1, "{r:?}");
+        assert_eq!(r.rows[0][0], Value::Int(1));
+        // SUBSTRING wrapper: same table joined, substring of outer value.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM a WHERE SUBSTRING(t.x, 1, 1) = '5') ORDER BY id",
+        );
+        assert_eq!(r.rows.len(), 1, "{r:?}");
+        assert_eq!(r.rows[0][0], Value::Int(2));
+        // The DELETE shape that used to wipe the whole table.
+        run(
+            &mut db,
+            "DELETE FROM t WHERE EXISTS (SELECT 1 FROM a WHERE t.x IS NULL)",
+        );
+        let r = rows(&mut db, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(2), "{r:?}");
+    }
+
+    /// 第七轮审查回归:集合运算子查询的各臂 FROM 名是内层作用域,
+    /// 限定列引用不得误判为相关子查询。
+    #[test]
+    fn set_operation_subquery_arms_are_inner_scope() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (x INT)");
+        run(&mut db, "CREATE TABLE a (x INT)");
+        run(&mut db, "INSERT INTO t (x) VALUES (1), (2)");
+        run(&mut db, "INSERT INTO a (x) VALUES (2)");
+        let r = rows(
+            &mut db,
+            "SELECT x FROM t WHERE t.x IN (SELECT a.x FROM a UNION SELECT a.x FROM a)",
+        );
+        assert_eq!(r.rows.len(), 1, "{r:?}");
+        assert_eq!(r.rows[0][0], Value::Int(2));
+        // EXISTS body as a set operation must work too.
+        let r = rows(
+            &mut db,
+            "SELECT x FROM t WHERE EXISTS (SELECT a.x FROM a WHERE a.x = 1 UNION SELECT 2)",
+        );
+        assert_eq!(r.rows.len(), 2, "{r:?}");
+    }
+
+    /// 第七轮审查回归:LEFT JOIN 未匹配行的 NULL 补齐用右表全部行的
+    /// 键形并集(首行形状不够——schemaless 右表后插的行带新键)。
+    #[test]
+    fn left_join_null_padding_uses_key_union() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT, y INT)");
+        run(&mut db, "CREATE TABLE b (x INT, y INT)");
+        run(&mut db, "INSERT INTO a (id, y) VALUES (1, 100), (3, 100)");
+        // First right row lacks y; a later row carries it.
+        run(&mut db, "INSERT INTO b (x) VALUES (1)");
+        run(&mut db, "INSERT INTO b (x, y) VALUES (9, 1)");
+        let r = rows(
+            &mut db,
+            "SELECT a.id, b.y FROM a LEFT JOIN b ON a.id = b.x ORDER BY a.id",
+        );
+        // id=3 unmatched: b.y must read NULL, not leak a.y = 100.
+        assert_eq!(r.rows.len(), 2, "{r:?}");
+        assert_eq!(r.rows[1][0], Value::Int(3));
+        assert!(matches!(r.rows[1][1], Value::Null), "{r:?}");
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) AS n FROM a LEFT JOIN b ON a.id = b.x WHERE b.y IS NULL",
+        );
+        assert_eq!(r.rows[0][0], Value::Int(1), "{r:?}");
+    }
+
+    /// 第七轮审查回归:ROWNUM 注入 JOIN 产物后非限定列仍走后缀解析;
+    /// 聚合 + ROWNUM 显式报错而非静默 NULL 过滤。
+    #[test]
+    fn rownum_over_joined_rows_and_aggregate_refusal() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (id INT, x INT)");
+        run(&mut db, "CREATE TABLE b (id INT, y INT)");
+        run(&mut db, "INSERT INTO a (id, x) VALUES (1, 10)");
+        run(&mut db, "INSERT INTO b (id, y) VALUES (1, 20)");
+        let r = rows(&mut db, "SELECT ROWNUM, x, y FROM a JOIN b ON a.id = b.id");
+        assert_eq!(r.rows.len(), 1, "{r:?}");
+        assert_eq!(r.rows[0][1], Value::Int(10), "{r:?}");
+        assert_eq!(r.rows[0][2], Value::Int(20), "{r:?}");
+        let e = db
+            .execute("SELECT COUNT(*) FROM a WHERE ROWNUM <= 2")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ROWNUM"), "{e}");
+    }
+
+    /// 第七轮审查回归:NULLIF/DECODE/GREATEST/JSON_ARRAY_CONTAINS 走与
+    /// 谓词相同的比较提升漏斗(Timestamp ↔ 可解析字符串)。
+    #[test]
+    fn equality_family_uses_coercion_funnel() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(
+            &mut db,
+            "SELECT NULLIF(TIMESTAMP '2026-09-16T00:00:00Z', '2026-09-16') IS NULL AS a, \
+             DECODE(TIMESTAMP '2026-09-16T00:00:00Z', '2026-09-16', 'hit', 'miss') AS b, \
+             GREATEST(TIMESTAMP '2026-09-16T00:00:00Z', '2026-01-01') AS c, \
+             JSON_ARRAY_CONTAINS('[\"2026-01-01T00:00:00Z\"]', TIMESTAMP '2026-01-01T00:00:00Z') AS d",
+        );
+        let row = &r.rows[0];
+        assert_eq!(row[0], Value::Bool(true), "NULLIF {r:?}");
+        assert_eq!(row[1], Value::Str("hit".into()), "DECODE {r:?}");
+        assert!(
+            matches!(row[2], Value::Timestamp(..)),
+            "GREATEST must keep the Timestamp, got {r:?}"
+        );
+        assert_eq!(row[3], Value::Bool(true), "JSON_ARRAY_CONTAINS {r:?}");
+    }
+
+    /// 第七轮审查回归:ROUND 的 DECIMAL 分支对超域 digits 先夹取——
+    /// 2^32 截断成 scale 0 与 i64::MIN 取负 panic 都是静默/崩溃错误。
+    #[test]
+    fn round_decimal_digits_clamped() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(
+            &mut db,
+            "SELECT ROUND(CAST(1.567 AS DECIMAL), 4294967296) = CAST(1.567 AS DECIMAL) AS a, \
+             ROUND(CAST(1.5 AS DECIMAL), 0-9223372036854775807-1) AS b",
+        );
+        // 2^32 clamps to scale 28: value unchanged, no silent scale-0 read.
+        assert_eq!(r.rows[0][0], Value::Bool(true), "{r:?}");
+        // -2^63 clamps to -15: rounds at tens, value 1.5 -> 0.
+        assert_eq!(r.rows[0][1].to_string(), "0", "{r:?}");
+    }
+
+    /// 第七轮审查回归:值列表子查询多列是基数错误,响亮报错而非取首列。
+    #[test]
+    fn multi_column_list_subquery_is_loud() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, b INT)");
+        run(&mut db, "INSERT INTO t (a, b) VALUES (1, 5), (2, 6)");
+        let e = db
+            .execute("SELECT 5 IN (SELECT a, b FROM t)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("columns"), "{e}");
+        let e = db
+            .execute("SELECT 1 = ANY (SELECT a, b FROM t)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("columns"), "{e}");
+    }
+
+    /// 第七轮审查回归:ILIKE 折叠按字符进行——İ(U+0130)整串 lowercase
+    /// 展开成两个字符,`_` 计数失真。
+    #[test]
+    fn ilike_folds_per_char() {
+        let mut db = Database::in_memory().unwrap();
+        let r = rows(&mut db, "SELECT 'İİ' ILIKE '__' AS a, 'İİ' LIKE '__' AS b");
+        assert_eq!(r.rows[0][0], Value::Bool(true), "{r:?}");
+        assert_eq!(r.rows[0][1], Value::Bool(true), "{r:?}");
+    }
+
+    /// 第七轮审查回归:限定名/引号点分字段与探针的一致性——带字面
+    /// 点分键的表上,查询结果不得依赖索引存在性;引号 "v.x" 引用不剥
+    /// 限定前缀。
+    #[test]
+    fn dotted_literal_fields_and_probe_parity() {
+        let mk = |idx: bool| {
+            let mut db = Database::in_memory().unwrap();
+            run(&mut db, "CREATE TABLE v (x INT)");
+            if idx {
+                run(&mut db, "CREATE INDEX iv ON v(x)");
+            }
+            run(&mut db, "INSERT INTO v (x) VALUES (9)");
+            run(&mut db, "UPDATE v SET \"v.x\" = 5");
+            db
+        };
+        for idx in [false, true] {
+            let mut db = mk(idx);
+            // eval tries the literal "v.x" key first — the stripped probe
+            // used to disagree whenever the index existed.
+            let r = rows(&mut db, "SELECT x FROM v WHERE v.x = 5");
+            assert_eq!(r.rows.len(), 1, "idx={idx} qualified: {r:?}");
+            let r = rows(&mut db, "SELECT x FROM v WHERE \"v.x\" = 5");
+            assert_eq!(r.rows.len(), 1, "idx={idx} quoted: {r:?}");
+            let r = rows(&mut db, "SELECT x FROM v WHERE x = 9");
+            assert_eq!(r.rows.len(), 1, "idx={idx} bare: {r:?}");
+        }
+        // UPDATE/DELETE fast paths share the guard.
+        let mut db = mk(true);
+        run(&mut db, "UPDATE v SET x = 11 WHERE v.x = 5");
+        let r = rows(&mut db, "SELECT x FROM v");
+        assert_eq!(r.rows[0][0], Value::Int(11), "{r:?}");
+    }
+
+    /// 第七轮审查回归:全点分键的单表文档不再是"join 形态",裸列查询
+    /// 不经后缀回退读点分键——有/无索引同答。
+    #[test]
+    fn single_table_dotted_only_docs_reject_suffix_fallback() {
+        let mk = |idx: bool| {
+            let mut db = Database::in_memory().unwrap();
+            run(&mut db, "CREATE TABLE g (\"g.x\" INT)");
+            run(&mut db, "INSERT INTO g (\"g.x\") VALUES (5)");
+            run(&mut db, "ALTER TABLE g ADD COLUMN x INT");
+            if idx {
+                run(&mut db, "CREATE INDEX ig ON g(x)");
+            }
+            db
+        };
+        for idx in [false, true] {
+            let mut db = mk(idx);
+            let r = rows(&mut db, "SELECT COUNT(*) AS n FROM g WHERE x = 5");
+            assert_eq!(r.rows[0][0], Value::Int(0), "idx={idx}: {r:?}");
+            // The literal dotted field still reads by its exact name.
+            let r = rows(&mut db, "SELECT \"g.x\" FROM g WHERE \"g.x\" = 5");
+            assert_eq!(r.rows.len(), 1, "idx={idx}: {r:?}");
+        }
+    }
+
+    /// 第七轮审查回归:括号包裹的谓词透明解包,探针不失联。
+    #[test]
+    fn parenthesized_predicate_still_probes() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE p (a INT, b TEXT)");
+        run(&mut db, "CREATE INDEX ipa ON p(a)");
+        run(&mut db, "INSERT INTO p (a, b) VALUES (1, 'x'), (2, 'y')");
+        let r = rows(&mut db, "EXPLAIN SELECT * FROM p WHERE (a = 1)");
+        assert!(!r.rows.is_empty(), "{r:?}");
+        let text = format!("{r:?}");
+        assert!(text.to_uppercase().contains("PROBE"), "{text}");
+        // Behavior: same answers with and without parens.
+        let r = rows(&mut db, "SELECT a FROM p WHERE (a = 1) AND b = 'x'");
+        assert_eq!(r.rows.len(), 1, "{r:?}");
+    }
+
+    /// 第七轮审查回归:UPDATE..FROM / DELETE..USING / MERGE..USING 的
+    /// 派生表源携带 RAND/NEWID 时必须拒绝——journal 原文重放会各自
+    /// 重掷,集群静默分叉。
+    #[test]
+    fn nondeterministic_derived_table_sources_in_writes_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(&mut db, "INSERT INTO t (id, v) VALUES (1, 1), (2, 2)");
+        let e = db
+            .execute("UPDATE t SET v = 99 FROM (SELECT RAND() AS r) AS x WHERE t.id = CASE WHEN x.r > 0.5 THEN 1 ELSE 2 END")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RAND") || e.contains("NEWID"), "{e}");
+        let e = db
+            .execute("DELETE FROM t USING (SELECT RAND() AS r) AS x WHERE t.id = CASE WHEN x.r > 0.5 THEN 1 ELSE 2 END")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RAND") || e.contains("NEWID"), "{e}");
+        let e = db
+            .execute("MERGE INTO t USING (SELECT RAND() AS r) AS s ON t.id = CASE WHEN s.r > 0.5 THEN 1 ELSE 2 END WHEN MATCHED THEN UPDATE SET v = 99")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RAND") || e.contains("NEWID"), "{e}");
+        // Nothing was applied by the rejected statements.
+        let r = rows(&mut db, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(2), "{r:?}");
+    }
+
+    /// 第七轮审查回归:ADD COLUMN DEFAULT NOW()/RAND() 对非空表回填
+    /// 本节点值且无回写——拒绝;空表保留默认文本(后续 INSERT 走定值
+    /// 回写,安全)。
+    #[test]
+    fn add_column_wallclock_default_backfill_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY)");
+        run(&mut db, "INSERT INTO t (id) VALUES (1)");
+        let e = db
+            .execute("ALTER TABLE t ADD COLUMN ts TIMESTAMP DEFAULT NOW()")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("DEFAULT"), "{e}");
+        // Empty table keeps the default for future INSERTs.
+        run(&mut db, "CREATE TABLE e (id INT PRIMARY KEY)");
+        run(
+            &mut db,
+            "ALTER TABLE e ADD COLUMN ts TIMESTAMP DEFAULT NOW()",
+        );
+        run(&mut db, "INSERT INTO e (id) VALUES (1)");
+        let r = rows(&mut db, "SELECT ts IS NOT NULL AS has FROM e");
+        assert_eq!(r.rows[0][0], Value::Bool(true), "{r:?}");
+    }
+
+    /// 第七轮审查回归:RENAME TO 补齐 CREATE 的保留名守卫(#临时表/
+    /// 兼容字典视图名)——否则数据写入后不可读且 dump 不可重放。
+    #[test]
+    fn rename_to_reserved_names_rejected() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT)");
+        let e = db
+            .execute("ALTER TABLE t RENAME TO dual")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("reserved"), "{e}");
+        let e = db
+            .execute("ALTER TABLE t RENAME TO ALL_TABLES")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("reserved"), "{e}");
+        let e = db
+            .execute("ALTER TABLE t RENAME TO #x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("#"), "{e}");
+        // Sanity: the table is still readable under its old name.
+        let r = rows(&mut db, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(r.rows[0][0], Value::Int(0), "{r:?}");
+    }
+
+    /// 第七轮审查回归:列级 UNIQUE 重复声明去重(`a INT UNIQUE UNIQUE`
+    /// 曾把树维护做成对同键二次插入,表永久不可写)。
+    #[test]
+    fn duplicate_column_unique_decl_deduplicated() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT UNIQUE UNIQUE)");
+        run(&mut db, "INSERT INTO t (a) VALUES (1)");
+        run(&mut db, "INSERT INTO t (a) VALUES (2)");
+        let e = db
+            .execute("INSERT INTO t (a) VALUES (1)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.to_uppercase().contains("UNIQUE"), "{e}");
+    }
+
+    /// 第七轮审查回归:DROP INDEX 解除列级唯一时,含该列的**复合**
+    /// UNIQUE 索引不算同列来源(复合唯一从不保证单列唯一)。
+    #[test]
+    fn drop_index_lifts_unique_only_from_single_column_sources() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, b INT)");
+        run(&mut db, "CREATE UNIQUE INDEX u1 ON t(a)");
+        run(&mut db, "CREATE UNIQUE INDEX u2 ON t(a, b)");
+        run(&mut db, "INSERT INTO t (a, b) VALUES (1, 1)");
+        run(&mut db, "INSERT INTO t (a, b) VALUES (2, 2)");
+        run(&mut db, "DROP INDEX u1");
+        // Only (a, b) uniqueness remains enforced: (1, 3) is legal now.
+        run(&mut db, "INSERT INTO t (a, b) VALUES (1, 3)");
+        // And the composite still fires.
+        let e = db
+            .execute("INSERT INTO t (a, b) VALUES (1, 3)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.to_uppercase().contains("UNIQUE"), "{e}");
+    }
+
+    /// 第七轮审查回归:RENAME COLUMN 到含引号的标识符,CHECK 文本里的
+    /// 新名必须走引号拼写——裸拼破坏词法,该表一切 INSERT 解析即挂、
+    /// dump 不可重放。
+    #[test]
+    fn rename_column_quotes_tricky_names_in_checks() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (a INT, CHECK (a > 0))");
+        run(&mut db, "INSERT INTO t (a) VALUES (1)");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN a TO \"x\"\"y\"");
+        // The rewritten CHECK must still parse and enforce.
+        run(&mut db, "INSERT INTO t (\"x\"\"y\") VALUES (5)");
+        let e = db
+            .execute("INSERT INTO t (\"x\"\"y\") VALUES (0)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.to_uppercase().contains("CHECK"), "{e}");
+        // dump must replay (the quoted spelling round-trips).
+        let script = db.dump_script().unwrap();
+        let mut fresh = Database::in_memory().unwrap();
+        for stmt in script.split(';').filter(|s| !s.trim().is_empty()) {
+            run(&mut fresh, stmt);
+        }
+    }
+
+    /// 第七轮审查回归:table_exists_ci 覆盖 ASCII 大小写变体——兼容视图
+    /// 改写的 shadow 守卫靠它挡 `DocSQL_PubSub` 这类用户表。
+    #[test]
+    fn table_exists_ci_matches_ascii_case_variants() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE \"DocSQL_PubSub\" (x INT)");
+        assert!(db.table_exists("DocSQL_PubSub"));
+        assert!(db.table_exists_ci("docsql_pubsub"), "case variant missed");
+        assert!(!db.table_exists_ci("docsql_pubsub2"));
+        assert!(!db.table_exists_ci("docsql_pubsu"));
     }
 }

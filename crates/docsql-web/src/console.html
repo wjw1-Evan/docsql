@@ -993,9 +993,15 @@ function setsToInserts(sets, table) {
 // 查询历史(localStorage,上限 100 条):执行(含失败)都记录,便于重试。
 const QHIST_KEY = 'docsql.qhist';
 function qhistAll() { try { return JSON.parse(lsGet(QHIST_KEY) || '[]'); } catch { return []; } }
+function redactLocalSql(s) {
+  // Mirror the server's PASSWORD redaction before the text lands in
+  // localStorage: the history outlives the tab (and may ride browser-profile
+  // sync), so a CREATE/ALTER USER statement must not keep its plaintext.
+  return s.replace(/(PASSWORD\s+)('[^']*'|"[^"]*")/gi, "$1'***'");
+}
 function qhistPush(entry) {
   const h = qhistAll();
-  h.unshift({sql: entry.sql.slice(0, 4000), ms: entry.ms, ok: entry.ok, ts: entry.ts});
+  h.unshift({sql: redactLocalSql(entry.sql.slice(0, 4000)), ms: entry.ms, ok: entry.ok, ts: entry.ts});
   // 序列化别漏:数组直接进 setItem 会被隐式 String() 成 "[object Object]",
   // 下一次读取 JSON.parse 失败、历史静默清零(冒烟实测)。
   lsSet(QHIST_KEY, JSON.stringify(h.slice(0, 100)));
@@ -2509,12 +2515,13 @@ function openDataTab(tableName, meta) {
         // 当前页快照:数据网格导出只导「正在看的这一页」(200 行/页,
         // 全表导出走查询工作台的 LIMIT 查询 + 导出)。
         t.pageSet = {columns: r.columns, rows: r.rows};
-        const keys = tableKeys(meta);
+        const m = explorer.tableMeta(tableName) || meta;
+        const keys = tableKeys(m);
         renderGrid(t.host, r.columns, r.rows, keys.length ? {
           onRowClick: row => { t.selected = row; },
           btns: row => [
-            {label: T('编辑'), title: T('编辑此行(按主键 UPDATE)'), act: () => editRowDialog(tableName, meta, r.columns, row, t.load)},
-            {label: T('删除'), cls: 'danger', title: T('删除此行(按主键)'), act: () => deleteRowDialog(tableName, meta, r.columns, row, t.load)},
+            {label: T('编辑'), title: T('编辑此行(按主键 UPDATE)'), act: () => editRowDialog(tableName, m, r.columns, row, t.load)},
+            {label: T('删除'), cls: 'danger', title: T('删除此行(按主键)'), act: () => deleteRowDialog(tableName, m, r.columns, row, t.load)},
           ],
         } : {});
         range();
@@ -2845,7 +2852,7 @@ function openUsersTab() {
           if (seq !== t.reqSeq) return;
           data.tables = (meta.tables || []).map(x => x.name).filter(n => n);
         }
-      } catch (e) { data = {error: e.message}; }
+      } catch (e) { if (seq !== t.reqSeq) return; data = {error: e.message}; }
       t.render(data);
       $('[data-at]', t.el).textContent = T('更新于 {0}', new Date().toLocaleTimeString());
     };

@@ -177,6 +177,17 @@ class Subscriber:
                         self._conn.close()
                     except Exception:
                         pass
+                    # Mirror _resubscribe's teardown for the fresh link: a
+                    # stale _replies_stale (set by a previous timeout) made
+                    # the new reader drop this attempt's ACK as a "late
+                    # reply" — every retry then timed out again and the
+                    # Subscriber stayed permanently unsubscribable.
+                    while True:
+                        try:
+                            self._replies.get_nowait()
+                        except queue.Empty:
+                            break
+                    self._replies_stale = False
                     self._conn = connect(**self._conn_kwargs)
                     self._generation += 1
                     self._reader = threading.Thread(

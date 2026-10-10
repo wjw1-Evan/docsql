@@ -917,7 +917,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 日期时间 | `GETDATE/GETUTCDATE/SYSDATETIME/SYSUTCDATETIME`（引擎仅 UTC）、`DATEADD/DATEDIFF/DATEDIFF_BIG`（边界跨越语义、月末钳制）、`DATEPART/DATENAME`（全部 datepart 缩写）、`YEAR/MONTH/DAY/DAYOFYEAR`、`EOMONTH`、`DATEFROMPARTS` 与 `*FROMPARTS` 族、`ISDATE/ISNUMERIC` |
 | 字符串 | `LEFT/RIGHT`、`CHARINDEX`、`REPLACE`、`REPLICATE`、`REVERSE`、`SPACE`、`STR`、`QUOTENAME`、`ASCII/CHAR/NCHAR/UNICODE`、`CONCAT_WS`、`TRANSLATE`、`STUFF`、`STRING_ESCAPE`（json）、`FORMAT`（常用数字/日期 token，未知 token 报错） |
 | 数学 | `FLOOR/CEILING/POWER/SQRT/SQUARE/EXP/LOG/LOG10/SIGN/PI` 与三角函数族 |
-| 转换 | `CONVERT(type, value[, style])`（常用日期 style 双向：23/101/112/120/121/126 等；未知 style 报错）、`TRY_CAST/TRY_CONVERT/PARSE/TRY_PARSE`（失败 → NULL；PARSE 文化仅 en-US） |
+| 转换 | `CONVERT(type, value[, style])`（常用日期 style 双向：0/9/100/109 与 23/101/112/120/121/126 等（0/100=mon dd yyyy hh:miAM 默认形、9/109 带毫秒同形）；未知 style 报错）、`TRY_CAST/TRY_CONVERT/PARSE/TRY_PARSE`（失败 → NULL；PARSE 文化仅 en-US） |
 | 逻辑 | `IIF`、`CHOOSE`、`ISNULL` |
 | 标识/元数据 | `NEWID/NEWSEQUENTIALID`（UUIDv7；**仅 SELECT/INSERT** —— INSERT 走回写把生成值作为字面量扇出，UPDATE/DELETE/MERGE 显式报错）、`DB_NAME/DB_ID/SERVERPROPERTY`、`CHECKSUM/BINARY_CHECKSUM`、`HASHBYTES`（MD5/SHA1/SHA2_256） |
 | 表值函数 | `FROM STRING_SPLIT(s, sep[, 1]) AS t`、`FROM GENERATE_SERIES(a, b[, step]) AS t`、`FROM OPENJSON(json) AS t`（默认 key/value/type 形状；`WITH` 子句报错；NULL 输入得空行集） |
