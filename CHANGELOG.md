@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+(暂无)
+
+## [0.9.1] - 2026-10-11
+
 ### 第七轮全模块缺陷审查修复(2026-10-10)
 
 对全部模块再做一轮系统审查(18 路并行审查→逐条源码核实→修复+回归落各模块内;Rust 1120/.NET 203/Python 58/部署测试绿):
@@ -108,6 +112,20 @@
   检查撞自身键报 UNIQUE 错而非替换(现按约束键内容找被替行,批内同键后者胜,
   与树路径语义一致)。另:docsql_log 视图对 EXPLAIN/WITH 拼法诚实报
   "仅支持直接 SELECT"(原落引擎误报 no such table)。
+
+### 第六轮全模块缺陷审查修复(2026-10-08)
+
+18 路并行审查→逐条源码核实→修复+回归落各模块内(Rust 807/.NET 201/Python 60/部署测试绿),要点:
+
+- **查询内核**:探针数值边界 vs Timestamp 键带分析分叉(`ts > 0` 恒 Null 而树序 Timestamp>数值,exact 窗口放进谓词排除的行;带型分析扩展数值边界+收紧异族合取 bail);JSON path exact 守卫未消费 range 合取;`IN (NULL)`/`=ANY`/`=ALL` 的全序与三值语义分叉(NULL 元素现为可比值+唯一 unknown 源保持 unknown);AND/OR 三值传播(Timestamp↔不可解析串混进合取整语句报错→逐行滤行);`cte_references` 全文词扫描误诊自引用;派生表/括号体丢弃外层 CTE 作用域;`cte_shadow` 未随 WITH 累积;PIVOT 输出列撞分组键/互撞静默覆盖(现拒);top-K 窗口 dotted-suffix 键提取回退;EXPLAIN 镜像补 JOIN 侧表因子必拒子句+DISTINCT ON。
+- **写路径**:OR REPLACE 位移列表重复 locator 毒化 FK 父侧计数(合法 REPLACE 误拒);upsert 多触点行迁移后 locator 折叠失效(中间像泄进 FK/唯一/RETURNING;origin_of 追踪);MERGE 源/目标同别名目标键覆盖源键恒真匹配(现拒)。
+- **DDL**:RENAME COLUMN own_tree 判定过宽(名为列名的单列索引建在另一列时约束树搁浅=重复主键静默入库+副本分叉);复合 ALTER validate 前置 AddColumn 三类 apply 拒绝;FK 前向引用可构造声明级环使 dump 不可重放(CREATE 现要求被引用表/列存在;dump CREATE 段改 FK 拓扑序、DROP 反序);引擎层 CREATE INDEX/ALTER/DROP 守卫系统表。
+- **安全**:column_refs 不遍历聚合 FILTER 谓词(列级授权经 `COUNT(id) FILTER(WHERE secret)` 泄露布尔信息;WITHIN GROUP fail-closed);useradmin 六处错误 Debug 打印 token 原文;find_top_level_word 注释不感知。
+- **T-SQL**:IIF 假条件落非布尔臂整语句必挂;批解析 IF/WHILE/ELSE-IF 链不涨深度(~64KB 帧栈溢出打崩进程);WITH 缺语句起始词;SELECT 赋值换行逗号终止列表;ERROR_MESSAGE() 累积传输后缀;PRINT 不清零 @@ROWCOUNT;四个扫描器的 @end/@case/]]/方括号/标识符透明。
+- **服务器**:读级绕过 statements/errors 计数与 @@ERROR/@@ROWCOUNT 喂养;REQ_EXECUTE 永不走读级+缺会话记账;REQ_AUTH 重认证残留 user 混叠;匿名门补三帧;批失败丢 PRINT;行过滤 UPDATE..FROM 拒+EXPLAIN 臂;drain_sync_queue 过程性 drain 提前关 sync 门;gate 队内 PUBLISH 移入 write_order;docsql_log LIMIT -1 词元丢负号;AUTO_PROMOTE 主地址校验;quorum lag 文案。
+- **备份/DR**:S3 增量段不随采纳清理(被裁决写复活);restore 同名重试 guard 误清 run 标志;sidecar 写失败清理;PITR 链尾对账;定时备份绕过 quorum 栅栏。
+- **Web/CLI/.NET/Python**:五页 reqSeq 修复;explorer.refresh 守卫;CLI 推送行 stderr、TLS 保活、明文写 TOCTOU、错误帧 sanitize、BEGIN/*..*/TRAN 探测;Python Subscriber 双读线程竞态(代际+compare-and-install)、execute 参数白名单、TLS OSError 映射;.NET ExecuteReaderAsync 丢 CloseConnection、RentAsync 取消归还、非 Input 方向拒、Transaction 连接校验、RewriteParameters 方括号。
+- **部署/文档**:multinode 订阅窗口对齐、operations 备份示例容器化、README 设计索引、workflow 注释、TRUST_PROXY 风险入档;rollback fence 测试断言改截断感知。
 
 ### 第五轮全模块缺陷审查修复(2026-10-04)
 
