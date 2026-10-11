@@ -30,8 +30,8 @@
     --tree-sel: #cce4f7; --tree-hover: #e8f2fc; --tree-sel-bd: #99d1ff;
     --grid-hd: #f5f6f7; --grid-bd: #dcdfe3; --grid-hover: #f0f7fd;
     --err: #e81123; --ok: #107c10; --warn: #ff8c00;
-    --txt: #1a1a1a; --txt2: #555; --txt3: #888;
-    --null-fg: #a5a5a5; --dim-fg: #999;
+    --txt: #1a1a1a; --txt2: #555; --txt3: #6f6f6f;
+    --null-fg: #767676; --dim-fg: #8a8a8a;
     --mono: ui-monospace, Menlo, Consolas, monospace;
     --ui: "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
     --sql-kw: #0000c0; --sql-str: #a31515; --sql-num: #800000; --sql-cm: #008000; --sql-fn: #c7254e;
@@ -51,7 +51,7 @@
     --shadow-dlg: 0 6px 24px rgba(0,0,0,.25);
     --overlay: rgba(0,0,0,.25); --overlay-strong: rgba(0,0,0,.35);
     --toast-bg: #323130; --toast-fg: #fff;
-    --sb-busy: #ff8c00; --sb-err: #e81123;
+    --sb-busy: #b45309; --sb-err: #e81123;
   }
   html[data-theme="dark"] {
     color-scheme: dark;
@@ -64,7 +64,7 @@
     --grid-hd: #28292e; --grid-bd: #3b3d44; --grid-hover: rgba(61,143,209,.12);
     --err: #f0574d; --ok: #43b05c; --warn: #e8a33d;
     --txt: #e6e6e6; --txt2: #b6bac2; --txt3: #7f848e;
-    --null-fg: #6f747d; --dim-fg: #767b85;
+    --null-fg: #8a9099; --dim-fg: #82878f;
     --sql-kw: #569cd6; --sql-str: #ce9178; --sql-num: #b5cea8; --sql-cm: #6a9955; --sql-fn: #dcdcaa;
     --sel-bg: rgba(61,143,209,.40);
     --pur-fg: #c3a6f0; --pur-bg: rgba(150,110,220,.16); --pur-bd: rgba(150,110,220,.35);
@@ -265,6 +265,8 @@
                     box-shadow: inset 0 2px 0 var(--accent); }
   .res-pane { flex: 1; overflow: auto; display: none; min-height: 0; }
   .res-pane.active { display: block; }
+  /* 结果区空状态(未执行 / 0 行):给用户一个明确的「这里还没东西」而不是空白 */
+  .res-empty { color: var(--txt3); font-style: italic; padding: 28px 16px; text-align: center; }
   .msg-list { font: 12px/1.7 var(--mono); padding: 6px 10px; -webkit-user-select: text; user-select: text; }
   .msg-list .m-err { color: var(--err); }
   .msg-list .m-ok { color: var(--ok); }
@@ -822,6 +824,25 @@ const EN = {
   '节点 {0} 不可用:': 'Node {0} unavailable: ', '节点 {0} · 不可用': 'Node {0} · unavailable',
   '对象资源管理器刷新失败': 'Object Explorer refresh failed', '刷新失败:{0}': 'Refresh failed: {0}',
   '全部折叠': 'Collapse All', '新建表': 'New Table', '＋表': '+ Table',
+  '查询历史(localStorage,最多 100 条;点击重填编辑器)': 'Query history (localStorage, up to 100; click to refill editor)',
+  '导出当前结果为 CSV(RFC 4180)': 'Export current result as CSV (RFC 4180)',
+  '导出当前结果为 JSON': 'Export current result as JSON',
+  '导出当前页为 CSV': 'Export current page as CSV',
+  '导出当前页为 JSON': 'Export current page as JSON',
+  '只看耗时达到阈值的数据日志': 'Show only data-log queries reaching the slow threshold',
+  '受管节点的实时连接 · GET/POST /api/sessions · 终止 = 当前语句完成后关闭连接':
+    'Live connections of the managed node · GET/POST /api/sessions · Kill = close after current statement',
+  '正在读取会话…': 'Loading sessions…',
+  '时间戳:UTC ISO 文本(可省略秒/毫秒/Z,可带 ±HH:MM 偏移)':
+    'Timestamp: UTC ISO text (seconds/ms/Z optional, ±HH:MM offset allowed)',
+  '非有限 REAL:NaN / inf / -inf,或改填有限数值': 'Non-finite REAL: NaN / inf / -inf, or enter a finite value',
+  '列 {0}:需要时间戳文本(如 2026-01-01T08:00:00.000Z;或勾选 NULL)':
+    'Column {0}: timestamp text required (e.g. 2026-01-01T08:00:00.000Z; or check NULL)',
+  '结果共 {0} 行,超出渲染上限,仅显示前 {1} 行;排序与行操作仅作用于已显示部分,请用 LIMIT 收窄':
+    'Result has {0} rows, above render limit; showing first {1}. Sorting and row actions apply to displayed rows only — narrow with LIMIT',
+  '加载失败': 'Load failed', '停用': 'Off',
+  '执行查询以查看结果(F5 执行,Ctrl+F5 仅语法检查)': 'Run a query to see results (F5 execute, Ctrl+F5 syntax check only)',
+  '查询成功,未返回行': 'Query succeeded, no rows returned',
 };
 
 // 翻译 + {0}{1}… 占位符替换。EN 缺键回退中文原文。
@@ -970,15 +991,6 @@ function setToJsonObjects(set) {
     return o;
   });
 }
-// SQL 字面量:NULL / 数字 / 布尔原样;对象(JSON 标记 $dec/$ts/$bytes 等)
-// 序列化为 JSON 文本入库 —— 精确标量重放请走备份而不是 INSERT 导出。
-function sqlLiteral(v) {
-  if (v === null || v === undefined) return 'NULL';
-  if (typeof v === 'number') return String(v);
-  if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
-  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-  return "'" + s.replace(/'/g, "''") + "'";
-}
 function setsToInserts(sets, table) {
   const q = '"' + String(table).replace(/"/g, '""') + '"';
   const out = [];
@@ -1109,7 +1121,7 @@ function accountDialog() {
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`,
     '#acc-cur');
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m || ''; };
     const cur = $('#acc-cur', ov).value;
     const u = $('#acc-user', ov).value.trim();
@@ -1127,8 +1139,8 @@ function accountDialog() {
       closeModal();
       ui.toast(T('账号已更新'));
     } catch (e) { err(T('请求失败:{0}', e.message)); }
-  };
-  ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
+  });
+  ov.onkeydown = (e) => { if (enterSubmits(e)) $('[data-ok]', ov).click(); };
 }
 
 /* ================= 关于 DocSQL Studio ================= */
@@ -1213,10 +1225,16 @@ const ui = {
     $('#st-ready').textContent = text ? '' : T('就绪');
   },
   toast(msg, isErr) {
+    // 同文案限流 + 数量上限:管理页每 5s 轮询失败曾持续叠同文案错误 toast。
+    const host = $('#toasts');
+    for (const el of Array.from(host.children)) {
+      if (el.textContent === msg) return;
+    }
+    while (host.children.length >= 4) host.firstChild.remove();
     const el = document.createElement('div');
     el.className = 'toast' + (isErr ? ' err' : '');
     el.textContent = msg;
-    $('#toasts').appendChild(el);
+    host.appendChild(el);
     setTimeout(() => el.remove(), isErr ? 5000 : 2600);
   }
 };
@@ -1346,6 +1364,19 @@ document.addEventListener('click', () => ctx.close());
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('#tree')) ctx.close(); });
 
 /* ================= 弹窗表单 ================= */
+// Enter 提交守卫:输入法组合期间的 Enter 是「确认候选词」而非提交
+// (isComposing / keyCode 229 = IME 组合态;中文输入法按 Enter 上屏曾误触发表单提交)。
+const enterSubmits = (e) => e.key === 'Enter' && !e.isComposing && e.keyCode !== 229;
+// 弹窗「确定」防重:执行期间禁用按钮,双击/连点不再重复执行
+// (慢节点下连点「创建」曾发出两次 CREATE TABLE,第二次报「已存在」像创建失败)。
+const guardOk = (ov, fn) => {
+  const btn = $('[data-ok]', ov);
+  btn.onclick = async (...a) => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { return await fn(...a); } finally { btn.disabled = false; }
+  };
+};
 function closeModal() { const ov = $('#overlay'); ov.style.display = 'none'; ov.innerHTML = ''; ov.onkeydown = null; }
 function showModal(html, focusSel) {
   const ov = $('#overlay');
@@ -1361,7 +1392,7 @@ function dialog(title, fields, okText, onOk) {
     fields.map(f => `<div class="row"><label>${esc(f.label)}</label><input type="${esc(f.type||'text')}" data-f="${esc(f.name)}" value="${esc(f.value||'')}" placeholder="${esc(f.ph||'')}"></div>`).join('') +
     `<div class="err-line" data-err></div></div><div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${esc(okText)}</button></div></div>`,
     'input[data-f]');
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const vals = {};
     fields.forEach(f => { vals[f.name] = $(`input[data-f="${f.name}"]`, ov).value.trim(); });
     try { await onOk(vals, (m) => { $('[data-err]', ov).textContent = m || ''; });
@@ -1371,8 +1402,8 @@ function dialog(title, fields, okText, onOk) {
       // 不动、毫无反馈,像「点了没反应」。
       if (!e || e.message !== 'cancel') $('[data-err]', ov).textContent = (e && e.message) || String(e);
     }
-  };
-  ov.onkeydown = (e) => { if (e.key === 'Enter') $('[data-ok]', ov).click(); };
+  });
+  ov.onkeydown = (e) => { if (enterSubmits(e)) $('[data-ok]', ov).click(); };
 }
 
 /* ---------- 新建表(mongo-express 式入口 + 列编辑网格)---------- */
@@ -1427,7 +1458,7 @@ function newTableDialog() {
       if (sel.value !== 'GUID' && sel.value !== 'INT') sel.value = 'INT';
     }
   });
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
     const name = $('[data-t="name"]', ov).value.trim();
     if (!name) return err(T('请输入表名'));
@@ -1452,12 +1483,13 @@ function newTableDialog() {
     try { r = await api.post('/api/sql', {sql}); }
     catch (e) { ui.status(T('创建失败'), 'err'); return err(e.message); }
     if (r.kind === 'error') { ui.status(T('创建失败'), 'err'); return err(r.message); }
+    ui.status('');
     ui.toast(T('已创建表 {0}', name));
     explorer.refreshSoon();
     closeModal();
-  };
+  });
   ov.onkeydown = (e) => {
-    if (e.key === 'Enter' && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
+    if (enterSubmits(e) && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
   };
 }
 
@@ -1512,7 +1544,7 @@ function editTableDialog(tableName, meta, after) {
     const del = e.target.closest('button[data-delcol]');
     if (del) { const tr = del.closest('tr'); tr.parentElement.removeChild(tr); }
   });
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
     const cols = $$('tr[data-col]', ov).map(tr => ({
       name: $('[data-c="name"]', tr).value.trim(),
@@ -1559,13 +1591,14 @@ function editTableDialog(tableName, meta, after) {
       ui.status(T('部分保存'), 'err');
       return err(T('第 {0} 条失败:{1}(其前的语句已生效)', r.error.statement + 1, r.error.message));
     }
+    ui.status('');
     ui.toast(T('已更新表 {0}', tableName));
     explorer.refreshSoon();
     if (after) after();
     closeModal();
-  };
+  });
   ov.onkeydown = (e) => {
-    if (e.key === 'Enter' && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
+    if (enterSubmits(e) && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
   };
 }
 
@@ -1682,14 +1715,15 @@ function insertDocDialog(tableName, meta, after) {
     catch (e) { ui.status(T('插入失败'), 'err'); return err(e.message); }
     if (r.kind === 'error') { ui.status(T('插入失败'), 'err'); return err(r.message); }
     if (r.kind === 'batch' && r.error) { ui.status(T('插入失败'), 'err'); return err(T('第 {0} 条:{1}', r.error.statement + 1, r.error.message)); }
+    ui.status('');
     ui.toast(T('已插入 {0} 行到 {1}', docs.length, tableName));
     explorer.refreshSoon();
     closeModal();
     if (after) after();
   };
-  $('[data-ok]', ov).onclick = submit;
+  guardOk(ov, submit);
   ov.onkeydown = (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.matches('textarea')) { e.preventDefault(); submit(); }
+    if (enterSubmits(e) && (e.ctrlKey || e.metaKey) && e.target.matches('textarea')) { e.preventDefault(); submit(); }
   };
 }
 
@@ -1761,7 +1795,7 @@ async function editRowDialog(tableName, meta, cols, row, after) {
     chk.onchange = sync;
     sync();
   });
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
     const setParts = [];
     for (let i = 0; i < cols.length; i++) {
@@ -1815,12 +1849,13 @@ async function editRowDialog(tableName, meta, cols, row, after) {
     try { r = await api.post('/api/sql', {sql}); }
     catch (e) { ui.status(T('更新失败'), 'err'); return err(e.message); }
     if (r.kind === 'error') { ui.status(T('更新失败'), 'err'); return err(r.message); }
+    ui.status('');
     ui.toast(T('已更新该行'));
     closeModal();
     if (after) after();
-  };
+  });
   ov.onkeydown = (e) => {
-    if (e.key === 'Enter' && e.target.matches('input[type=text],input[type=number]')) $('[data-ok]', ov).click();
+    if (enterSubmits(e) && e.target.matches('input[type=text],input[type=number]')) $('[data-ok]', ov).click();
   };
 }
 
@@ -1833,17 +1868,18 @@ function deleteRowDialog(tableName, meta, cols, row, after) {
     <pre style="white-space:pre-wrap;word-break:break-all;margin:6px 0;font-family:var(--mono);font-size:12px;color:var(--txt2);background:var(--chrome2);border:1px solid var(--border);padding:8px;border-radius:3px">${esc(sql)}</pre>
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary danger" data-ok>${T('删除该行')}</button></div></div>`);
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
     ui.status(T('正在删除…'), 'busy');
     let r;
     try { r = await api.post('/api/sql', {sql}); }
     catch (e) { ui.status(T('删除失败'), 'err'); return err(e.message); }
     if (r.kind === 'error') { ui.status(T('删除失败'), 'err'); return err(r.message); }
+    ui.status('');
     ui.toast(T('已删除该行'));
     closeModal();
     if (after) after();
-  };
+  });
 }
 
 /* ---------- 索引管理(引擎仅支持单列;修改 = 按新定义重建)---------- */
@@ -1906,7 +1942,7 @@ function indexDialog(tableName, def, oldName) {
     <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${editing ? T('重建') : T('创建')}</button></div></div>`,
     'input[data-f="name"]');
   const fail = (msg) => { ui.status(editing ? T('重建索引失败') : T('创建索引失败'), 'err'); $('[data-err]', ov).textContent = msg; };
-  $('[data-ok]', ov).onclick = async () => {
+  guardOk(ov, async () => {
     const err = (msg) => { $('[data-err]', ov).textContent = msg || ''; };
     const name = $('input[data-f="name"]', ov).value.trim();
     const col = $('select[data-f="col"]', ov).value;
@@ -1949,9 +1985,9 @@ function indexDialog(tableName, def, oldName) {
       explorer.refreshSoon();
       closeModal();
     } catch (e) { fail(e.message); }
-  };
+  });
   ov.onkeydown = (e) => {
-    if (e.key === 'Enter' && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
+    if (enterSubmits(e) && e.target.matches('input[type=text]')) $('[data-ok]', ov).click();
   };
 }
 
@@ -2328,6 +2364,7 @@ function openQueryTab(title, sql, autoRun) {
         <div class="res-pane" data-rp="messages"><div class="msg-list"></div></div>
       </div></div>`;
     t.editor = makeEditor($('.ed-host', t.el), sql || '');
+    $('[data-rp="results"]', t.el).innerHTML = `<div class="res-empty">${T('执行查询以查看结果(F5 执行,Ctrl+F5 仅语法检查)')}</div>`;
     layout.applyEditor(t.el);
     t.msg = (text, cls) => { const d = document.createElement('div');
       if (cls) d.className = 'm-' + cls; d.textContent = text;
@@ -2428,6 +2465,8 @@ async function execQuery(t, selectedOnly) {
         lab.textContent = T('结果 {0}({1} 行)', idx + 1, o.rows.length); results.appendChild(lab); }
       t.currentSets.push({columns: o.columns, rows: o.rows});
       renderGrid(results, o.columns, o.rows);
+      if (!o.rows.length) { const d = document.createElement('div'); d.className = 'res-empty';
+        d.textContent = T('查询成功,未返回行'); results.appendChild(d); }
       t.msg(T('({0} 行)', o.rows.length) + (idx === undefined ? '' : T(' — 结果 {0}', idx + 1)), 'info');
     } else if (o.kind === 'affected') {
       t.msg(T('({0} 行受影响)', o.count), 'ok');
@@ -2511,7 +2550,7 @@ function openDataTab(tableName, meta) {
         const r = await api.post('/api/sql', {sql: `SELECT * FROM "${qident(tableName)}" ORDER BY 1 LIMIT ${limit} OFFSET ${offset}`});
         if (seq !== t.reqSeq) return;
         t.host.innerHTML = '';
-        if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; return; }
+        if (r.kind === 'error') { t.host.innerHTML = `<div class="msg-list"><div class="m-err">${esc(r.message)}</div></div>`; ui.status(T('加载失败'), 'err'); return; }
         // 当前页快照:数据网格导出只导「正在看的这一页」(200 行/页,
         // 全表导出走查询工作台的 LIMIT 查询 + 导出)。
         t.pageSet = {columns: r.columns, rows: r.rows};
@@ -2528,7 +2567,7 @@ function openDataTab(tableName, meta) {
         ui.status(T('{0}:共 {1} 行', tableName, t.total));
         $('[data-do="prev"]', t.el).disabled = t.offset <= 0;
         $('[data-do="next"]', t.el).disabled = t.offset + t.limit >= t.total;
-      } catch (e) { ui.toast(e.message, true); }
+      } catch (e) { ui.status(T('加载失败'), 'err'); ui.toast(e.message, true); }
     };
     $('[data-do="refresh"]', t.el).onclick = t.load;
     $('[data-do="prev"]', t.el).onclick = () => { t.offset = Math.max(0, t.offset - t.limit); t.load(); };
@@ -3009,7 +3048,7 @@ const usersPage = {
       if (r.error) return err(r.error);
       ui.toast(T('已更新')); closeModal(); t.load();
     };
-    $('[data-ok]', ov).onclick = () => run('grant_role', m => $('[data-err]', ov).textContent = m || '');
+    guardOk(ov, () => run('grant_role', m => $('[data-err]', ov).textContent = m || ''));
     $('[data-remove]', ov).onclick = () => run('revoke_role', m => $('[data-err]', ov).textContent = m || '');
   },
 
@@ -3037,7 +3076,7 @@ const usersPage = {
       <div class="err-line" data-err></div></div>
       <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`,
       'input[type="checkbox"]');
-    $('[data-ok]', ov).onclick = async () => {
+    guardOk(ov, async () => {
       const err = $('[data-err]', ov);
       err.textContent = '';
       const want = {};
@@ -3058,7 +3097,7 @@ const usersPage = {
         if (r.error) { err.textContent = r.error; return; }
       }
       ui.toast(T('表级权限已更新')); closeModal(); t.load();
-    };
+    });
   },
 };
 
@@ -3135,7 +3174,7 @@ function openBackupTab() {
           : `<span style="color:var(--err)">● ${T('失败')}</span> ${esc(last.error || '')}`);
       const iv = +v.interval_secs || 0;
       // 「间隔关闭」与按钮「关闭」同形异义:这里指未启用,英文是 Off 而非 Close。
-      const ivHtml = !iv ? `<span class="null">${LANG === 'en' ? 'Off' : '关闭'}</span>`
+      const ivHtml = !iv ? `<span class="null">${T('停用')}</span>`
         : (iv % 86400 === 0 ? `${iv / 86400}<small> ${T('天')}</small>` : `${iv}<small> ${T('秒')}</small>`);
       const cards = [
         [ivHtml, T('自动备份间隔(DOCSQL_BACKUP_INTERVAL_SECS)')],
@@ -3744,7 +3783,7 @@ explorer.bind();
 (async () => { if (await authGate.boot()) startApp(); })();
 $('#auth-ok').onclick = () => authGate.submit();
 $$('#auth-ov input').forEach(inp => inp.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') authGate.submit();
+  if (enterSubmits(e)) authGate.submit();
 }));
 </script>
 </body>

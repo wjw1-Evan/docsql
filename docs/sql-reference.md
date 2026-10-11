@@ -2,7 +2,7 @@
 
 本参考按 Transact-SQL 参考（MSDN）的组织方式编写：每条语句给出**语法**、**参数**、**备注**与**示例**。
 
-DocSQL 的 SQL 方言以 **SQL 标准**为基准，并兼容 SQLite（`sqlite_master`、`LIMIT` 变体、`REPLACE INTO`）、Oracle（`DUAL`、`ROWNUM`、`NVL` 函数族、字典视图、`MERGE`）与 SQL Server/EF 生态（`information_schema`、`x != TRUE` 软删语义、`JSON_ARRAY_CONTAINS`、T-SQL 表达式层——函数族/`TOP`/方括号/`CONVERT` 等见 [T-SQL 兼容面](#tsql-sql-server兼容面)）。未实现的语法一律在解析/执行层**显式报错**，不静默忽略；完整清单见[不支持的语法](#不支持的语法)。
+DocSQL 的 SQL 方言以 **SQL 标准**为基准，并兼容 SQLite（`sqlite_master`、`LIMIT` 变体、`REPLACE INTO`）、Oracle（`DUAL`、`ROWNUM`、`NVL` 函数族、字典视图、`MERGE`）与 SQL Server/EF 生态（`information_schema`、`x != TRUE` 软删语义、`JSON_ARRAY_CONTAINS`、T-SQL 表达式层——函数族/`TOP`/方括号/`CONVERT` 等见 [T-SQL 兼容面](#t-sqlsql-server兼容面)）。未实现的语法一律在解析/执行层**显式报错**，不静默忽略；完整清单见[不支持的语法](#不支持的语法)。
 
 ## 目录
 
@@ -24,6 +24,8 @@ DocSQL 的 SQL 方言以 **SQL 标准**为基准，并兼容 SQLite（`sqlite_ma
 - [函数](#函数)
 - [系统视图与元数据](#系统视图与元数据)
 - [兼容性与限制](#兼容性与限制)
+- [T-SQL（SQL Server）兼容面](#t-sqlsql-server兼容面)
+- [T-SQL 数据操作实例](#t-sql-数据操作实例)
 - [不支持的语法](#不支持的语法)
 - [另请参阅](#另请参阅)
 
@@ -214,7 +216,7 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 | `CROSS JOIN`、`a, b` | 笛卡尔积 |
 | `DUAL` | Oracle 哑表（单行零列，大小写不敏感） |
 
-**不支持**：`NATURAL JOIN`、`LATERAL`、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）——均显式报错（`STRING_SPLIT`/`GENERATE_SERIES`/`OPENJSON` 表函数与 `CROSS/OUTER APPLY` 已支持，见 [T-SQL 兼容面](#tsqlsql-server兼容面)）。
+**不支持**：`NATURAL JOIN`、`LATERAL`、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态（`AS OF`）——均显式报错（`STRING_SPLIT`/`GENERATE_SERIES`/`OPENJSON` 表函数与 `CROSS/OUTER APPLY` 已支持，见 [T-SQL 兼容面](#t-sqlsql-server兼容面)）。
 
 兼容字典视图名(`DUAL`/`sqlite_master`/`sqlite_temporal_master`/`information_schema.*`/`USER_TABLES`/`ALL_TABLES`/`USER_TAB_COLUMNS`/`ALL_TAB_COLUMNS`/`USER_INDEXES`/`ALL_INDEXES`)是**保留名**:FROM 解析永远让字典视图优先,CREATE TABLE/VIEW 占用这些名字显式报错(建得出写进不去的影子数据必须拒绝)。
 
@@ -224,7 +226,7 @@ SELECT ... { UNION | INTERSECT | EXCEPT | MINUS } [ ALL | DISTINCT ] SELECT ...
 - **分组扩展**：`ROLLUP(a,b)` 展开为 `(a,b),(a),()`；`CUBE(a,b)` 展开为全部子集；`GROUPING SETS` 为显式列表；多项扩展按笛卡尔积组合；重复/嵌套分组集合报错，CUBE 上限 12 个元素。缺失分组键在输出行中为 `NULL`，用 `GROUPING()` 区分。
 - **聚合修饰**：`COUNT/SUM/... ( [DISTINCT] expr ) [ FILTER (WHERE condition) ]`；`FILTER` 先过滤行再做 DISTINCT 与聚合。
 - **集合运算**：两臂列数必须一致（列名取左）；`UNION`/`INTERSECT`/`EXCEPT` 默认去重，`ALL` 保留多重集（`INTERSECT ALL`/`EXCEPT ALL` 按最小计数）。
-- **CTE**：仅非递归；`WITH RECURSIVE` 报错。CTE 与派生表一样支持别名列。
+- **CTE**：非递归与递归均支持（`WITH [RECURSIVE]`，锚点 `UNION [ALL]` 递归臂，见 [T-SQL 兼容面](#t-sqlsql-server兼容面)）。CTE 与派生表一样支持别名列。
 - **子查询**：支持标量、`IN`、`EXISTS`、`ANY/SOME/ALL`。**相关子查询**逐行绑定外层行值求值：
   外层引用必须写限定名(`别名.列`/`表名.列`)，支持 SELECT 的 `WHERE`/投影/`ORDER BY` 与
   UPDATE·DELETE 的 `WHERE`、UPDATE 的 `SET`；内层 FROM 的同名别名正确遮蔽外层；
@@ -793,7 +795,7 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 
 | 分类 | 函数 | 说明 |
 |---|---|---|
-| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`（LEN 不计尾随空格）、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`（另支持 `TRIM('ab' FROM x)` 字符集形式）、`CONCAT(a, b, ...)`（NULL 当空串;`\|\|` 仍传染） | 位置按字符计;除 CONCAT 外 NULL 输入返回 NULL;`SUBSTR` 遵循 SQLite 规则——起点 0 位于虚拟首位（`substr('abcde',0,2)` 得 `'a'`）、负长度取起点之前的字符、负起点从末尾数;T-SQL 字符串函数族（LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT）见[T-SQL 兼容面](#tsql-sql-server兼容面) |
+| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`（LEN 不计尾随空格）、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`（另支持 `TRIM('ab' FROM x)` 字符集形式）、`CONCAT(a, b, ...)`（NULL 当空串;`\|\|` 仍传染） | 位置按字符计;除 CONCAT 外 NULL 输入返回 NULL;`SUBSTR` 遵循 SQLite 规则——起点 0 位于虚拟首位（`substr('abcde',0,2)` 得 `'a'`）、负长度取起点之前的字符、负起点从末尾数;T-SQL 字符串函数族（LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT）见[T-SQL 兼容面](#t-sqlsql-server兼容面) |
 | 数值 | `ABS`、`ROUND(x [, digits])` | ROUND 对 DECIMAL 精确四舍五入（半离零），FLOAT 保持浮点 |
 | 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF` | |
 | 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`timestamp`/`blob`/`array`/`object` |
@@ -875,7 +877,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | `_cluster_pos` | `node_id TEXT PRIMARY KEY, seq INT` | 各来源节点已应用位点 |
 | `_cluster_id` | `id TEXT` | 本节点持久身份 |
 
-系统表允许 `SELECT`，写入/DDL 一律拒绝（按 AST 写目标分类）。`PUBLISH`/`TRIM` 是协议命令而非 SQL（见 README）。
+系统表允许 `SELECT`，写入/DDL 一律拒绝（按 AST 写目标分类）。`PUBLISH`/`TRIM` 是协议命令而非 SQL（见[功能清单 · 发布订阅](features.md#5-发布订阅pubsub持久化)）。
 
 ## 兼容性与限制
 
@@ -892,7 +894,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 主键类型 | 仅单列；复合唯一用 `CREATE UNIQUE INDEX` |
 | 相关子查询 | 已支持：外层引用须限定名，行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的 WHERE 与 SET)逐行求值；JOIN ON/GROUP BY/HAVING 内相关、未限定外层引用仍显式报错 |
 | 窗口函数 | 已支持（见[窗口函数](#窗口函数)）；`WINDOW` 子句、`QUALIFY`、自定义窗口帧不支持 |
-| 递归 CTE | 不支持（显式报错） |
+| 递归 CTE | 已支持（`WITH [RECURSIVE]` 锚点 `UNION [ALL]` 递归臂，见 [T-SQL 兼容面](#t-sqlsql-server兼容面)） |
 | `SELECT t.*` | 不支持（用 `*`） |
 | `GROUP BY` 输出别名 | 不支持（显式报错）；`GROUP BY 1` 按常量 1 处理，无序号语义 |
 | 外键动作 | 仅 RESTRICT 式，`ON DELETE/UPDATE` 报错 |
@@ -905,9 +907,9 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 
 `FROM DUAL`、`ROWNUM`、`FETCH FIRST/NEXT n ROWS ONLY`、`MINUS`、`NVL/NVL2/DECODE/INSTR/LPAD/RPAD/GREATEST/LEAST/TO_NUMBER/TO_CHAR/SYSDATE`、`ALL_*`/`USER_*` 字典视图、`MERGE` 与 `DECODE` 的 `NULL = NULL` 匹配语义。
 
-### T-SQL（SQL Server）兼容面
+## T-SQL（SQL Server）兼容面
 
-**已支持**（表达式/查询/记号层，实现见 `core/tsql.rs`）：
+**已支持**（表达式/查询/记号层，实现见 `crates/docsql-core/src/tsql.rs`）：
 
 | 类别 | 内容 |
 |---|---|
@@ -938,7 +940,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 | 类别 | 语法 |
 |---|---|
 | SELECT | `INTO`、`FOR XML/JSON`、`OPTION (...)`、`FOR SYSTEM_TIME`、`TOP ... PERCENT` |
-| CTE/连接 | `WITH RECURSIVE` 已支持（见上表）；递归体必须是 `锚点 UNION [ALL] 递归臂`（其他集合形状报错） |
+| CTE/连接 | 非 `锚点 UNION [ALL] 递归臂` 形状的递归 CTE（`WITH RECURSIVE` 本身已支持，见上表） |
 | 运算符/变量 | `@@ROWCOUNT`/`@@VERSION`/`@@ERROR`/`@@IDENTITY` 之外的 `@@` 系统变量 |
 | FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`APPLY` 子查询形式、未知表函数、`TABLESAMPLE`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | DML | `OUTPUT INSERTED/DELETED...`（用 `RETURNING`）、`MERGE ... OUTPUT`、`MERGE WHEN MATCHED THEN DELETE`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` 多表删除（用 `DELETE ... USING`） |
@@ -950,7 +952,7 @@ SQLite 兼容的 DDL 自省视图（EF Core schema 同步使用），行：`type
 
 `WINDOW` 子句、`QUALIFY`、APPLY 子查询形式等结构性缺口见[不支持的语法](#不支持的语法)。
 
-### T-SQL 数据操作实例
+## T-SQL 数据操作实例
 
 以下实例基于同一个办公用品订单库，全部在本引擎上实测通过（关键输出以 `-- →` 注释摘录）。嵌入式 CLI（`docsql <db>`）、`docsql-cli connect` 远程会话、控制台 SQL 编辑器均可执行；`PRINT` 消息在远程会话落在服务进程 stderr（嵌入式 CLI 打到本地 stdout）。约定：在 CTE/派生表里引用带表别名的列时显式写 `AS 别名`（当前不带别名的限定列名会原样物化，外层同名引用得到 NULL）。
 
@@ -1104,7 +1106,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 | 子查询/CTE | JOIN ON/GROUP BY/HAVING 内的相关引用、`APPLY` 子查询形式(未限定名的外层引用无法与缺列区分,读 NULL——请写限定名) |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符（请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`）、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `DEFAULT VALUES`、`ON CONFLICT DO REPLACE`、无匹配唯一约束的 `ON CONFLICT` 目标;upsert-UPDATE 的 SET/WHERE 内子查询引用 `EXCLUDED`/`VALUES()` |
-| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式/部分/JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
+| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引（JSON_EXTRACT 路径以外）、部分索引、UNIQUE JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句（`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等）与约束装饰（`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`） |
 | T-SQL 专有 | `OUTPUT`（用 `RETURNING`）、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |
@@ -1117,4 +1119,5 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 - [已知边界与定位](limitations.md)——架构边界与路线图
 - [安全指南](security.md)——鉴权、用户与角色部署
 - [运维手册](operations.md)——备份、恢复、集群运维
-- [驱动与协议](drivers.md)——ADO.NET / EF Core / CLI / REST
+- [客户端与驱动](drivers.md)——ADO.NET / EF Core / CLI / Python / 线协议
+- [REST API 与功能清单](features.md)——控制台 REST 端点与按模块能力列表

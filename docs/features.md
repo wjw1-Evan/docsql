@@ -137,18 +137,18 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
 - 相关子查询:外层引用须限定名,行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的
   WHERE 与 SET)逐行求值;JOIN ON/GROUP BY/HAVING 内相关仍显式报错(未限定外层引用与缺列不可区分,读 NULL——请写限定名);
 - 不支持(均显式报错,不静默吞掉):`WINDOW`/`QUALIFY`、自定义窗口帧、`DISTINCT ON`、
-  `WITH RECURSIVE`、`NATURAL JOIN`、`LATERAL`、
+  `NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`、`TOP ... PERCENT`、
   `ON CONFLICT DO REPLACE`;
-  T-SQL 专有形式(变量 `@p`/`@@ROWCOUNT`、`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、
-  `IDENTITY(1,1)`、`CROSS/OUTER APPLY`、`PIVOT`、`sys.*`、存储过程/`IF`/`WHILE` 等过程层)同样报错;
+  T-SQL 专有形式(`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、`IDENTITY(1,1)`、
+  `sys.*`、`EXEC`/存储过程层)同样报错;
 - **T-SQL 表达式层已支持**(见 SQL 参考 · T-SQL 兼容面):`SELECT TOP [WITH TIES]`、
   `[方括号]` 标识符、`N'…'` 字面量、字符串 `+` 拼接、位运算 `& | ^ ~`、
   `LIKE '[a-z]'/[^…]` 字符类、日期/字符串/数学/转换(CONVERT 带 style、TRY_CAST/TRY_CONVERT/PARSE)/
   逻辑(IIF/CHOOSE)/哈希(HASHBYTES MD5/SHA1/SHA2_256)函数族、`NEWID()`(SELECT/INSERT,写路径定值回写)、
   `GETDATE()` 族(写路径折叠为字面量)、表值函数 `STRING_SPLIT`/`GENERATE_SERIES`/`OPENJSON`,
   以及 `SET <option>`/`USE`/`PRINT`/`GO` 会话垫片(接受并忽略,PRAGMA 同通道);
-- **T-SQL 批/控制流**(`core/tsql_batch.rs`,逐连接会话):`DECLARE @x`/`SET @x`/`SELECT @a = …`、
+- **T-SQL 批/控制流**(`crates/docsql-core/src/tsql_batch.rs`,逐连接会话):`DECLARE @x`/`SET @x`/`SELECT @a = …`、
   `IF … ELSE`、`BEGIN…END`、`WHILE` + `BREAK`/`CONTINUE`、`BEGIN TRY…CATCH` + `THROW`/`RAISERROR`
   (CATCH 内 `ERROR_MESSAGE()`/`ERROR_NUMBER()`,裸 `THROW` 重抛)、`@@ROWCOUNT`/`@@ERROR`/`@@VERSION`、
   会话身份函数替换(`SUSER_SNAME()` 族,经连接上下文);变量替换走 `value_literal`,
@@ -216,7 +216,7 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 | 自动索引 | PRIMARY KEY / 表声明 UNIQUE 随建表创建 B+ 树(`sqlite_autoindex_*`) |
 | 普通索引 | `CREATE INDEX` 单列;点查/范围探测走索引 |
 | 复合索引 | `CREATE INDEX idx ON t (a, b)`,键 = `Value::Array` 按列序;`a=? AND b=?` 点查、前导列前缀探测 |
-| JSON 路径索引 | `CREATE INDEX idx ON t (JSON_EXTRACT(doc, '$.a.b[0]'))`,树键 = 列内 JSON 文本的路径提取值;`WHERE JSON_EXTRACT(doc,'$.…') =/ constituency…` 等值与范围走索引探测(EXPLAIN 可见,dump 往返);UNIQUE 路径显式拒绝 |
+| JSON 路径索引 | `CREATE INDEX idx ON t (JSON_EXTRACT(doc, '$.a.b[0]'))`,树键 = 列内 JSON 文本的路径提取值;`WHERE JSON_EXTRACT(doc,'$.…') = / > / < …` 等值与范围走索引探测(EXPLAIN 可见,dump 往返);UNIQUE 路径显式拒绝 |
 | 唯一索引 | `CREATE UNIQUE INDEX`;重复键在写入时拒绝 |
 | 约束唯一 | 表级单列 UNIQUE 与 `CREATE UNIQUE INDEX`(含复合)由引擎判重;DECIMAL 按数值、Int/Float 跨类型数值比较 |
 | 回收 | 模型/手工删索引即回收树;`DROP INDEX` 清理定义 |
@@ -370,8 +370,8 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 | EF Core(`Docsql.EntityFrameworkCore`) | 原生提供程序(不依赖 SQLite):EnsureCreated + 惰性建表 + 模型/索引(含复合)自动同步、LINQ/Include、`decimal`→DECIMAL、`byte[]`→BLOB、`DateOnly/TimeOnly`、`List.Contains`→IN、字符串方法→LIKE;**实体集合属性 `List<T>`(JSON 数组)的 `Contains` 翻译为 `JSON_ARRAY_CONTAINS`(常量/跨列/取反/数值元素)**;`Dictionary<string,object>` 映射为 JSON 文本(读写与变更跟踪,成员不参与 SQL 翻译);`Database.Migrate()` 显式报错 |
 | Aspire | `AddDocsql` / `AddDocsqlCluster` / `WithWebConsole` / `WithDataVolume` + 消费侧 `AddDocsqlConnection` / `AddDocsqlDbContext`;见 [Aspire 指南](aspire.md) |
 | CLI(`docsql-cli`) | 嵌入式(直接开数据文件)与远程 shell;`--csv`/`--json` 导出;`-f script.sql` 批量(快速失败);内联 pub/sub 命令;`--user` 登录(密码走环境/提示) |
-| Python(`python/`,DB-API 2.0) | 纯标准库 DB-API 2.0 驱动:`qmark` 参数**服务端绑定**、`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、`bytes`↔BLOB(`$bytes`)、原生 TLS(stdlib ssl,`tls_ca` 可选验证)、原生 pub/sub `Subscriber`(专用连接 + 专职读线程 + 断线按最后 id 续传)、`DOCSQL_KEY` 帧加密(`cryptography` 选装);pytest 29 用例起真实 server 全绿 |
-| 线协议(自研驱动) | v1 二进制一句话一帧;`REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT` 服务端绑定;复制帧、`REQ_STATUS`、`REQ_BACKUP`、订阅帧;参数支持 `$dec`/`$bytes` 精确标记;帧定义见 `core/proto.rs` 模块头 |
+| Python(`python/`,DB-API 2.0) | 纯标准库 DB-API 2.0 驱动:`qmark` 参数**服务端绑定**、`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、`bytes`↔BLOB(`$bytes`)、原生 TLS(stdlib ssl,`tls_ca` 可选验证)、原生 pub/sub `Subscriber`(专用连接 + 专职读线程 + 断线按最后 id 续传)、`DOCSQL_KEY` 帧加密(`cryptography` 选装);pytest 套件起真实 server 全绿(用例见 `python/tests/`) |
+| 线协议(自研驱动) | v1 二进制一句话一帧;`REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT` 服务端绑定;复制帧、`REQ_STATUS`、`REQ_BACKUP`、订阅帧;参数支持 `$dec`/`$bytes` 精确标记;帧定义见 `crates/docsql-core/src/proto.rs` 模块头 |
 
 ## 11. 可观测性
 

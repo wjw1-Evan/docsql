@@ -30,7 +30,7 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
 - dev 栈数据节点与 web 控制台完整透传 `DOCSQL_TLS_*`(与 prod 同形);web 控制台服务另透传
   出站 `DOCSQL_TLS_CONNECT`/`DOCSQL_TLS_CA`(数据面开 TLS 后控制台才能拨号)。
 - dev compose 镜像可整体覆写:`DOCSQL_DEV_IMAGE`(默认 `ghcr.io/wjw1-evan/docsql`,fork 仓库
-  CI 与本地复用 alike);tag 仍走 `DOCSQL_DEV_IMAGE_TAG`。
+  的 CI 与本地开发共用同一变量);tag 仍走 `DOCSQL_DEV_IMAGE_TAG`。
 - 节点与控制台镜像 tag 分别由 `DOCSQL_DEV_IMAGE_TAG`(默认 `local`)与 `DOCSQL_IMAGE_TAG`
   (生产 `.env`,默认 `latest`)控制,两栈互不影响。
 
@@ -137,7 +137,7 @@ docker compose --profile cluster --profile join up -d node-d
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DOCSQL_MAX_CONN` | 0(不限) | 并发连接上限,超限立即拒绝 |
+| `DOCSQL_MAX_CONN` | 1024 | 并发连接上限,超限立即拒绝;`0` = 不限 |
 | `DOCSQL_IDLE_TIMEOUT` | 0(不限) | 空闲会话秒数,超时主动断开 |
 | `DOCSQL_STATEMENT_TIMEOUT_MS` | 0(不限) | 客户端语句墙钟预算,超时报错回滚;复制 apply 与恢复重放不受限 |
 | `DOCSQL_ASYNC_COMMIT` | 0 | 1 = 组提交(~2ms 丢失窗口;PUBLISH 仍推送前强制 fsync) |

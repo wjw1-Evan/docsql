@@ -287,7 +287,7 @@ builder.AddDockerComposeEnvironment("deployment");
 | `WithWebConsole(port?, consoleName?)` | 伴生控制台(账号门默认开启,凭据卷 `/auth`) |
 | `WithImageTag(...)` | 钉镜像版本(Aspire 通用) |
 | `WithEnvironment(name, value)` | 任意服务器运行时变量(Aspire 通用) |
-| `DocsqlServerResource.ProtocolPort` 等常量 | `7600` / `7700` / `/data/docsql.db` |
+| `DocsqlHostingExtensions.ProtocolPort` 等常量 | `7600` / `7700` / `/data/docsql.db` |
 
 ## 12. 参考
 

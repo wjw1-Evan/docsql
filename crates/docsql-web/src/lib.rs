@@ -41,7 +41,7 @@
 //! authenticate with the process's own `DOCSQL_TOKEN`.
 
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -444,6 +444,17 @@ async fn security_headers(
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    // 点击劫持纵深防御:控制台凭据页被任意站点 iframe 嵌套时,用户在
+    // 嵌套上下文里看不出异样(DENY 全拒,本控制台无合法嵌入场景);
+    // Referer 不外带 API 路径(查询/管理端点路径不随外链泄漏)。
+    h.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     resp
 }

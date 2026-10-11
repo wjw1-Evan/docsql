@@ -236,7 +236,7 @@ docsql connect 127.0.0.1:7600 --user analyst   # 密码走 DOCSQL_PASSWORD 或�
 
 ## 驱动作者:线协议参数化
 
-v1 二进制协议(`core/proto.rs`),一句一帧。服务端 prepared statements 三帧:
+v1 二进制协议(`crates/docsql-core/src/proto.rs`),一句一帧。服务端 prepared statements 三帧:
 
 | 帧 | 载荷 | 响应 |
 |---|---|---|
@@ -248,4 +248,4 @@ v1 二进制协议(`core/proto.rs`),一句一帧。服务端 prepared statements
 - 句柄按连接隔离,连接断开即失效;
 - 参数类型:JSON `null/bool/number/string`(嵌套对象/数组按 JSON 文本绑定);精确标量用标记对象:`$dec`(十进制文本 → `CAST(… AS DECIMAL)`)、`$ts`(UTC 毫秒整数 → TIMESTAMP 值)、`$bytes`(整数数组 → `x'…'` hex 字面量);响应中 DECIMAL 为 `{"$dec":"…"}`、非有限浮点为 `{"$float":"NaN"|"inf"|"-inf"}`、TIMESTAMP 为 `{"$ts":毫秒}`、BLOB 为 `{"$bytes":[…]}`;
 - 授权、`DOCSQL_STATEMENT_TIMEOUT_MS`、审计与 REQ_SQL 完全同路径;
-- 订阅帧、REQ_STATUS(含 `metrics` 运行时计数器)等其余帧见 `core/proto.rs` 模块头注释(权威)。
+- 订阅帧、REQ_STATUS(含 `metrics` 运行时计数器)等其余帧见 `crates/docsql-core/src/proto.rs` 模块头注释(权威)。
