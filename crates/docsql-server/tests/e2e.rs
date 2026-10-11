@@ -8027,12 +8027,16 @@ async fn wait_listening(addr: &str) {
 #[tokio::test]
 async fn auto_promote_fires_on_primary_loss() {
     const TOK: &str = "p2-cluster-tok";
+    // Per-run temp dir: literal db names left stale files behind on an
+    // interrupted run, and a truncated WAL then refused to open FOREVER
+    // (the node never came up; found via a printed run() error).
+    let dir = tempfile::tempdir().unwrap();
     // Primary on a reserved addr (its handle lets the test kill it).
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let primary_addr = l.local_addr().unwrap().to_string();
     drop(l);
     let p_cfg = docsql_server::ServerConfig {
-        db_path: std::path::PathBuf::from("p2-primary.db"),
+        db_path: dir.path().join("p2-primary.db"),
         listen: primary_addr.clone(),
         auth_token: None,
         read_token: None,
@@ -8078,7 +8082,7 @@ async fn auto_promote_fires_on_primary_loss() {
     let replica_addr = l.local_addr().unwrap().to_string();
     drop(l);
     let r_cfg = docsql_server::ServerConfig {
-        db_path: std::path::PathBuf::from("p2-replica.db"),
+        db_path: dir.path().join("p2-replica.db"),
         listen: replica_addr.clone(),
         auth_token: None,
         read_token: None,
@@ -8155,11 +8159,12 @@ async fn auto_promote_fires_on_primary_loss() {
 #[tokio::test]
 async fn auto_promote_stays_readonly_when_lag_exceeds_window() {
     const TOK: &str = "p2-lag-tok";
+    let dir = tempfile::tempdir().unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let primary_addr = l.local_addr().unwrap().to_string();
     drop(l);
     let p_cfg = docsql_server::ServerConfig {
-        db_path: std::path::PathBuf::from("p2-lag-primary.db"),
+        db_path: dir.path().join("p2-lag-primary.db"),
         listen: primary_addr.clone(),
         auth_token: None,
         read_token: None,
@@ -8203,7 +8208,7 @@ async fn auto_promote_stays_readonly_when_lag_exceeds_window() {
     let replica_addr = l.local_addr().unwrap().to_string();
     drop(l);
     let r_cfg = docsql_server::ServerConfig {
-        db_path: std::path::PathBuf::from("p2-lag-replica.db"),
+        db_path: dir.path().join("p2-lag-replica.db"),
         listen: replica_addr.clone(),
         auth_token: None,
         read_token: None,

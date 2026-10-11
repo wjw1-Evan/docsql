@@ -300,6 +300,7 @@
   table.grid { border-collapse: collapse; font: 12px/1.5 var(--mono); -webkit-user-select: text; user-select: text; }
   .grid th, .grid td { border: 1px solid var(--grid-bd); padding: 2px 8px; text-align: left;
                        white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+  .grid td:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
   .grid th { background: var(--grid-hd); position: sticky; top: 0; z-index: 2; cursor: pointer;
              font-family: var(--ui); font-weight: 600; color: var(--txt2); }
   .grid th .sort-ind { color: var(--accent); margin-inline-start: 3px; }
@@ -552,6 +553,7 @@ let LANG = LANGS.indexOf(document.documentElement.lang) >= 0 ? document.document
 const EN = {
   /* —— 通用 —— */
   '查找': 'Find', '未找到': 'not found',
+  '每页行数': 'Rows per page',
   '取消': 'Cancel', '保存': 'Save', '创建': 'Create', '删除': 'Delete', '关闭': 'Close',
   '刷新': 'Refresh', '确定': 'OK', '执行': 'Execute', '分析': 'Analyze', '编辑': 'Edit',
   '删除该行': 'Delete Row', '恢复': 'Restore', '移除': 'Remove', '授予': 'Grant',
@@ -894,6 +896,7 @@ const EN = {
 const AR = {
   /* —— 通用 —— */
   '查找': 'بحث', '未找到': 'غير موجود',
+  '每页行数': 'صفوف لكل صفحة',
   '取消': 'إلغاء', '保存': 'حفظ', '创建': 'إنشاء', '删除': 'حذف', '关闭': 'إغلاق',
   '刷新': 'تحديث', '确定': 'موافق', '执行': 'تشغيل', '分析': 'تحليل', '编辑': 'تحرير',
   '删除该行': 'حذف الصف', '恢复': 'استعادة', '移除': 'إزالة', '授予': 'منح',
@@ -1234,6 +1237,7 @@ const AR = {
 /* 法语。 */
 const FR = {
   '查找': 'Rechercher', '未找到': 'introuvable',
+  '每页行数': 'Lignes par page',
   /* —— 通用 —— */
   '取消': 'Annuler', '保存': 'Enregistrer', '创建': 'Créer', '删除': 'Supprimer', '关闭': 'Fermer',
   '刷新': 'Actualiser', '确定': 'OK', '执行': 'Exécuter', '分析': 'Analyser', '编辑': 'Modifier',
@@ -1575,6 +1579,7 @@ const FR = {
 /* 俄语。 */
 const RU = {
   '查找': 'Поиск', '未找到': 'не найдено',
+  '每页行数': 'Строк на странице',
   /* —— 通用 —— */
   '取消': 'Отмена', '保存': 'Сохранить', '创建': 'Создать', '删除': 'Удалить', '关闭': 'Закрыть',
   '刷新': 'Обновить', '确定': 'ОК', '执行': 'Выполнить', '分析': 'Анализ', '编辑': 'Изменить',
@@ -1916,6 +1921,7 @@ const RU = {
 /* 西班牙语。 */
 const ES = {
   '查找': 'Buscar', '未找到': 'no encontrado',
+  '每页行数': 'Filas por página',
   /* —— 通用 —— */
   '取消': 'Cancelar', '保存': 'Guardar', '创建': 'Crear', '删除': 'Eliminar', '关闭': 'Cerrar',
   '刷新': 'Actualizar', '确定': 'Aceptar', '执行': 'Ejecutar', '分析': 'Analizar', '编辑': 'Editar',
@@ -2884,6 +2890,39 @@ function dialog(title, fields, okText, onOk) {
 
 /* ---------- 新建表(mongo-express 式入口 + 列编辑网格)---------- */
 const COL_TYPES = ['ANY', 'INT', 'TEXT', 'REAL', 'BOOLEAN', 'GUID'];
+// 列编辑网格公共件(新建/编辑两个对话框共用,仅列行模板与锁定策略不同):
+// 表头、「+ 添加列」/删除列的事件委托、读取器(读取全部字段——disabled
+// 的锁定值照样可读,调用方各取所需)。
+function colGridHeader() {
+  return `<tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
+    <th title="${esc(T('主键'))}">PK</th><th title="${esc(T('非空'))}">NOT NULL</th><th title="${esc(T('自增'))}">AUTO</th><th></th></tr>`;
+}
+function bindColGrid(ov, colRow) {
+  $('[data-addcol]', ov).onclick = () => {
+    $('[data-cols]', ov).insertAdjacentHTML('beforeend', colRow({}));
+    const rows = $$('tr[data-col]', ov);
+    $('input[data-c="name"]', rows[rows.length - 1]).focus();
+  };
+  ov.addEventListener('click', (e) => {
+    const del = e.target.closest('button[data-delcol]');
+    // tr.remove() 而非 parentElement.removeChild:#overlay 是复用元素,
+    // 每次开对话框都会叠加一个委托 listener —— 连开两次后同一次删除
+    // 点击跑两遍,第二遍时 tr 已脱离(parentElement=null),removeChild
+    // 在此抛过 TypeError;remove() 对已脱离节点是无操作。
+    if (del) del.closest('tr')?.remove();
+  });
+  return {
+    readCols: () => $$('tr[data-col]', ov).map(tr => ({
+      name: $('[data-c="name"]', tr).value.trim(),
+      type: $('[data-c="type"]', tr).value,
+      dflt: $('[data-c="dflt"]', tr).value.trim(),
+      pk: $('[data-c="pk"]', tr).checked,
+      nn: $('[data-c="nn"]', tr).checked,
+      ai: $('[data-c="ai"]', tr).checked,
+      orig: tr.dataset.orig || null,
+    })),
+  };
+}
 function newTableDialog() {
   const colRow = (c) => `<tr data-col>
     <td><input type="text" data-c="name" value="${esc(c.name || '')}" placeholder="${esc(T('列名'))}"></td>
@@ -2896,8 +2935,7 @@ function newTableDialog() {
   const ov = showModal(`<div class="dialog" style="min-width:min(640px, calc(100vw - 24px));max-width:720px"><h3>${T('新建表')}</h3><div class="body">
     <div class="row"><label>${T('表名')}</label><input type="text" data-t="name" placeholder="${esc(T('如 users'))}"></div>
     <div>
-      <table class="colgrid"><thead><tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
-        <th title="${esc(T('主键'))}">PK</th><th title="${esc(T('非空'))}">NOT NULL</th><th title="${esc(T('自增'))}">AUTO</th><th></th></tr></thead>
+      <table class="colgrid"><thead>${colGridHeader()}</thead>
       <tbody data-cols>${colRow({name: 'id', type: 'INT', pk: true, nn: true})}${colRow({})}</tbody></table>
       <div style="margin-top:6px"><button data-addcol>${T('+ 添加列')}</button></div>
     </div>
@@ -2905,23 +2943,7 @@ function newTableDialog() {
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('创建')}</button></div></div>`,
     '[data-t="name"]');
-  const readCols = () => $$('tr[data-col]', ov).map(tr => ({
-    name: $('[data-c="name"]', tr).value.trim(),
-    type: $('[data-c="type"]', tr).value,
-    dflt: $('[data-c="dflt"]', tr).value.trim(),
-    pk: $('[data-c="pk"]', tr).checked,
-    nn: $('[data-c="nn"]', tr).checked,
-    ai: $('[data-c="ai"]', tr).checked,
-  }));
-  $('[data-addcol]', ov).onclick = () => {
-    $('[data-cols]', ov).insertAdjacentHTML('beforeend', colRow({}));
-    const rows = $$('tr[data-col]', ov);
-    $('input[data-c="name"]', rows[rows.length - 1]).focus();
-  };
-  ov.addEventListener('click', (e) => {
-    const del = e.target.closest('[data-delcol]');
-    if (del) { const tr = del.closest('tr'); tr.parentElement.removeChild(tr); }
-  });
+  const { readCols } = bindColGrid(ov, colRow);
   // PK 隐含 NOT NULL 的联动(DocSQL 的 PK 不隐含 NOT NULL,这里替用户勾上,可手动取消)
   ov.addEventListener('change', (e) => {
     if (e.target.matches('[data-c="pk"]') && e.target.checked) {
@@ -3003,32 +3025,17 @@ function editTableDialog(tableName, meta, after) {
   const ov = showModal(`<div class="dialog" style="min-width:min(640px, calc(100vw - 24px));max-width:720px"><h3>${T('编辑表 — {0}', esc(tableName))}</h3><div class="body">
     <div class="row"><label>${T('表名')}</label><input type="text" value="${esc(tableName)}" disabled title="${esc(T('重命名表请使用 ALTER TABLE ... RENAME TO'))}"></div>
     <div>
-      <table class="colgrid"><thead><tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
-        <th title="${esc(T('主键'))}">PK</th><th title="${esc(T('非空'))}">NOT NULL</th><th title="${esc(T('自增'))}">AUTO</th><th></th></tr></thead>
+      <table class="colgrid"><thead>${colGridHeader()}</thead>
       <tbody data-cols>${rowsHTML}</tbody></table>
       <div style="margin-top:6px"><button data-addcol>${T('+ 添加列')}</button></div>
     </div>
     <div class="hint">${T('已有列可改名与删除(主键列除外),类型/约束/默认值不可在线修改;新增列支持类型 + 默认值 + NOT NULL(带默认值时自动回填存量行,NOT NULL 必须带默认值;ADD COLUMN 不支持 PK/UNIQUE/自增)。变更按「重命名 → 删除 → 新增」顺序执行,出错前的语句已生效。')}</div>
     <div class="err-line" data-err></div></div>
     <div class="foot"><button data-cancel>${T('取消')}</button><button class="primary" data-ok>${T('保存')}</button></div></div>`);
-  $('[data-addcol]', ov).onclick = () => {
-    $('[data-cols]', ov).insertAdjacentHTML('beforeend', colRow({}));
-    const rows = $$('tr[data-col]', ov);
-    $('input[data-c="name"]', rows[rows.length - 1]).focus();
-  };
-  ov.addEventListener('click', (e) => {
-    const del = e.target.closest('button[data-delcol]');
-    if (del) { const tr = del.closest('tr'); tr.parentElement.removeChild(tr); }
-  });
+  const { readCols } = bindColGrid(ov, colRow);
   guardOk(ov, async () => {
     const err = (m) => { $('[data-err]', ov).textContent = m; };
-    const cols = $$('tr[data-col]', ov).map(tr => ({
-      name: $('[data-c="name"]', tr).value.trim(),
-      type: $('[data-c="type"]', tr).value,
-      dflt: $('[data-c="dflt"]', tr).value.trim(),
-      nn: $('[data-c="nn"]', tr).checked,
-      orig: tr.dataset.orig || null,
-    }));
+    const cols = readCols();
     if (cols.some(c => !c.name)) return err(T('存在空列名'));
     const names = new Set();
     for (const c of cols) {
@@ -5388,6 +5395,17 @@ const lang = {
 /* ================= 全局事件 ================= */
 function execActive() { const t = tabs.activeQuery(); if (t) execQuery(t); else ui.toast(T('当前没有查询窗口')); }
 function parseActive() { const t = tabs.activeQuery(); if (t) parseQuery(t); }
+
+// 网格单元格复制:单元格点击可聚焦(td tabindex=-1),聚焦态按 Ctrl+C
+// 把剪贴板目标替换为单元格显示文本(copy 事件免剪贴板权限;textarea 的
+// 选区复制不受影响——仅当焦点真在 td 上时才接管)。
+document.addEventListener('copy', (e) => {
+  const ae = document.activeElement;
+  if (ae && ae.tagName === 'TD' && ae.closest('.grid')) {
+    e.clipboardData.setData('text/plain', ae.textContent.trim());
+    e.preventDefault();
+  }
+});
 
 document.addEventListener('keydown', (e) => {
   const inField = /INPUT|TEXTAREA/.test(document.activeElement.tagName);

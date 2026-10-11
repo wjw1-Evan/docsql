@@ -456,6 +456,19 @@ async fn security_headers(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    // CSP 纵深(诚实子集):script/style 的 unsafe-inline 是单文件内联
+    // 架构(3700 行 console.html,含内联事件处理器)所必需,nonce 化
+    // 需要全量重写,不在本层强行;仍然拦住的是 object/base 注入、表单
+    // 外发与任意框架嵌套——连接与子资源全部限定同源。
+    h.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             connect-src 'self'; object-src 'none'; base-uri 'none'; \
+             form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
     resp
 }
 
