@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh">
+<html lang="en" dir="ltr">
 <head>
 <meta charset="utf-8">
 <meta name="description" content="DocSQL console">
@@ -12,13 +12,21 @@
     t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
   document.documentElement.dataset.theme = t; })();
 /* 语言引导:与主题同理,首帧前定 <html lang> 与 dir(阿拉伯语 RTL)。
-   手动切换过(有存储值)用存储值,否则跟随浏览器语言主子标签;六语
-   (联合国官方语言:中/英/阿/法/俄/西)之外一律英文。 */
+   默认英语:手动切换过(有存储值)用存储值;否则按操作系统/浏览器的
+   语言偏好列表(navigator.languages)依次匹配,取第一门命中六语的;
+   全不命中或探测不到(Intl 兜底再试一次)一律默认英语。 */
 (() => { let l = null; try { l = localStorage.getItem('docsql.lang'); } catch (e) {}
   const LANGS = ['zh', 'en', 'ar', 'fr', 'ru', 'es'];
   if (LANGS.indexOf(l) < 0) {
-    const p = (navigator.language || 'en').toLowerCase().split('-')[0];
-    l = LANGS.indexOf(p) >= 0 ? p : 'en';
+    const prefs = ((navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language])
+      .filter(Boolean).map(s => String(s).toLowerCase().split('-')[0]);
+    if (!prefs.length) {
+      try { prefs.push(String(Intl.DateTimeFormat().resolvedOptions().locale).toLowerCase().split('-')[0]); } catch (e) {}
+    }
+    l = 'en';
+    for (let i = 0; i < prefs.length; i++) {
+      if (LANGS.indexOf(prefs[i]) >= 0) { l = prefs[i]; break; }
+    }
   }
   document.documentElement.lang = l;
   document.documentElement.dir = l === 'ar' ? 'rtl' : 'ltr'; })();
@@ -156,7 +164,8 @@
 
   /* ---------- 工具栏 ---------- */
   #toolbar {
-    display: flex; align-items: center; gap: 6px; height: 36px; padding: 0 8px;
+    display: flex; align-items: center; gap: 6px; min-height: 36px; padding: 2px 8px;
+    flex-wrap: wrap;   /* 窄屏:按钮换行而不是被裁切 */
     background: var(--chrome2); border-bottom: 1px solid var(--border); flex: none;
   }
   #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
@@ -239,7 +248,15 @@
 
   /* ---------- 查询编辑器 ---------- */
   .q-wrap { flex: 1; display: flex; flex-direction: column; min-height: 120px; }
-  .editor { flex: 1.2; display: flex; min-height: 90px; background: var(--doc-bg); overflow: hidden; }
+  .editor { flex: 1.2; display: flex; min-height: 90px; background: var(--doc-bg); overflow: hidden; position: relative; }
+  /* Ctrl+F 查找浮层:叠加在编辑器右上(RTL 下自动换到左上,逻辑属性) */
+  .ed-find {
+    position: absolute; top: 4px; inset-inline-end: 10px; z-index: 5;
+    display: flex; gap: 6px; align-items: center;
+    background: var(--chrome2); border: 1px solid var(--border); border-radius: 3px;
+    padding: 2px 6px; box-shadow: 0 1px 4px rgba(0,0,0,.15);
+  }
+  .ed-find input { width: 140px; }
   .gutter {
     flex: none; width: 44px; background: var(--chrome); border-right: 1px solid var(--border2);
     overflow: hidden; text-align: right; padding: 6px 6px 6px 0;
@@ -458,7 +475,7 @@
 
 <!-- 控制台账号:首次使用设置 / 登录(DOCSQL_WEB_AUTH_FILE 启用时) -->
 <div id="auth-ov" style="display:none">
-  <div class="dialog" style="min-width:380px">
+  <div class="dialog" style="min-width:min(380px, calc(100vw - 24px))">
     <h3 id="auth-title">登录 DocSQL Studio</h3>
     <div class="body">
       <div class="row"><label data-i18n>用户名</label><input type="text" id="auth-user" autocomplete="username"></div>
@@ -521,18 +538,20 @@ const authOverlayVisible = () => $('#auth-ov').style.display === 'flex';
 
 /* ================= 多语言(联合国六种官方语言)================= */
 // 源语言是中文:界面文本以中文字符串本身为键,其余语言只维护各自翻译,
-// 缺失键回退中文(永不出现 undefined 文案)。语言存 localStorage
-// ('docsql.lang'),未手动选择过则跟随浏览器语言(<head> 引导脚本已定
-// <html lang> 与 dir)。切换即时生效:静态文本 data-i18n 重排 + 已打开
-// 标签页按各自 load/render 重渲染,不刷新页面、不丢查询编辑器内容。
+// 缺失键回退中文(永不出现 undefined 文案)。默认英语:语言存 localStorage
+// ('docsql.lang'),未手动选择过则按操作系统/浏览器语言偏好列表自动选择
+// (<head> 引导脚本已定 <html lang> 与 dir,全不命中默认英文)。切换即时
+// 生效:静态文本 data-i18n 重排 + 已打开标签页按各自 load/render 重渲染,
+// 不刷新页面、不丢查询编辑器内容。
 // 阿拉伯语为 RTL:<html dir="rtl"> + CSS 逻辑属性(inset-inline-start 等)
 // 随方向翻转;SQL 编辑器/数据网格/JSON 编辑域恒 LTR(技术内容)。
 const LANGS = ['zh', 'en', 'ar', 'fr', 'ru', 'es'];
 // 菜单展示名:各语言原生名,永不翻译自身。
 const LANG_NAMES = { zh: '中文', en: 'English', ar: 'العربية', fr: 'Français', ru: 'Русский', es: 'Español' };
-let LANG = LANGS.indexOf(document.documentElement.lang) >= 0 ? document.documentElement.lang : 'zh';
+let LANG = LANGS.indexOf(document.documentElement.lang) >= 0 ? document.documentElement.lang : 'en';
 const EN = {
   /* —— 通用 —— */
+  '查找': 'Find', '未找到': 'not found',
   '取消': 'Cancel', '保存': 'Save', '创建': 'Create', '删除': 'Delete', '关闭': 'Close',
   '刷新': 'Refresh', '确定': 'OK', '执行': 'Execute', '分析': 'Analyze', '编辑': 'Edit',
   '删除该行': 'Delete Row', '恢复': 'Restore', '移除': 'Remove', '授予': 'Grant',
@@ -874,6 +893,7 @@ const EN = {
    界面文案现代标准阿拉伯语;◀/▶ 箭头在 RTL 下方向语义反转,分页按钮不放箭头。 */
 const AR = {
   /* —— 通用 —— */
+  '查找': 'بحث', '未找到': 'غير موجود',
   '取消': 'إلغاء', '保存': 'حفظ', '创建': 'إنشاء', '删除': 'حذف', '关闭': 'إغلاق',
   '刷新': 'تحديث', '确定': 'موافق', '执行': 'تشغيل', '分析': 'تحليل', '编辑': 'تحرير',
   '删除该行': 'حذف الصف', '恢复': 'استعادة', '移除': 'إزالة', '授予': 'منح',
@@ -1213,6 +1233,7 @@ const AR = {
 
 /* 法语。 */
 const FR = {
+  '查找': 'Rechercher', '未找到': 'introuvable',
   /* —— 通用 —— */
   '取消': 'Annuler', '保存': 'Enregistrer', '创建': 'Créer', '删除': 'Supprimer', '关闭': 'Fermer',
   '刷新': 'Actualiser', '确定': 'OK', '执行': 'Exécuter', '分析': 'Analyser', '编辑': 'Modifier',
@@ -1553,6 +1574,7 @@ const FR = {
 
 /* 俄语。 */
 const RU = {
+  '查找': 'Поиск', '未找到': 'не найдено',
   /* —— 通用 —— */
   '取消': 'Отмена', '保存': 'Сохранить', '创建': 'Создать', '删除': 'Удалить', '关闭': 'Закрыть',
   '刷新': 'Обновить', '确定': 'ОК', '执行': 'Выполнить', '分析': 'Анализ', '编辑': 'Изменить',
@@ -1893,6 +1915,7 @@ const RU = {
 
 /* 西班牙语。 */
 const ES = {
+  '查找': 'Buscar', '未找到': 'no encontrado',
   /* —— 通用 —— */
   '取消': 'Cancelar', '保存': 'Guardar', '创建': 'Crear', '删除': 'Eliminar', '关闭': 'Cerrar',
   '刷新': 'Actualizar', '确定': 'Aceptar', '执行': 'Ejecutar', '分析': 'Analizar', '编辑': 'Editar',
@@ -2521,7 +2544,7 @@ function copyText(text, okMsg) {
 }
 function accountDialog() {
   if (!authGate.active) return;
-  const ov = showModal(`<div class="dialog" style="min-width:380px"><h3>${T('修改控制台账号')}</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:min(380px, calc(100vw - 24px))"><h3>${T('修改控制台账号')}</h3><div class="body">
     <div class="row"><label>${T('当前密码')}</label><input type="password" id="acc-cur" autocomplete="current-password"></div>
     <div class="row"><label>${T('新用户名')}</label><input type="text" id="acc-user" value="${esc(authGate.lastUser || '')}" autocomplete="username"></div>
     <div class="row"><label>${T('新密码')}</label><input type="password" id="acc-pass" placeholder="${esc(T('留空则不修改密码'))}" autocomplete="new-password"></div>
@@ -2576,7 +2599,7 @@ function aboutDialog() {
   const logo = SVG(`<ellipse cx="8" cy="4" rx="6" ry="2.3" stroke-width="1.2"/>
     <path d="M2 4v8c0 1.27 2.7 2.3 6 2.3s6-1.03 6-2.3V4" stroke-width="1.2"/>
     <path d="M2 8c0 1.27 2.7 2.3 6 2.3S14 9.27 14 8" stroke-width="1.2"/>`);
-  const ov = showModal(`<div class="dialog about-dialog" style="min-width:470px;max-width:560px">
+  const ov = showModal(`<div class="dialog about-dialog" style="min-width:min(470px, calc(100vw - 24px));max-width:560px">
     <h3>${T('关于 DocSQL Studio')}</h3>
     <div class="body about">
       <div class="about-hero">
@@ -2870,7 +2893,7 @@ function newTableDialog() {
     <td style="text-align:center"><input type="checkbox" data-c="nn"${c.nn ? ' checked' : ''}></td>
     <td style="text-align:center"><input type="checkbox" data-c="ai"${c.ai ? ' checked' : ''}></td>
     <td><button class="delcol" data-delcol title="${esc(T('删除此列'))}">✕</button></td></tr>`;
-  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>${T('新建表')}</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:min(640px, calc(100vw - 24px));max-width:720px"><h3>${T('新建表')}</h3><div class="body">
     <div class="row"><label>${T('表名')}</label><input type="text" data-t="name" placeholder="${esc(T('如 users'))}"></div>
     <div>
       <table class="colgrid"><thead><tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
@@ -2977,7 +3000,7 @@ function editTableDialog(tableName, meta, after) {
     name: c.name, type: c.data_type || 'ANY', pk: c.primary_key,
     nn: !c.nullable, ai: c.autoinc, dflt: c.default || '',
   }, c.name)).join('');
-  const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:720px"><h3>${T('编辑表 — {0}', esc(tableName))}</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:min(640px, calc(100vw - 24px));max-width:720px"><h3>${T('编辑表 — {0}', esc(tableName))}</h3><div class="body">
     <div class="row"><label>${T('表名')}</label><input type="text" value="${esc(tableName)}" disabled title="${esc(T('重命名表请使用 ALTER TABLE ... RENAME TO'))}"></div>
     <div>
       <table class="colgrid"><thead><tr><th style="width:30%">${T('列名')}</th><th style="width:16%">${T('类型')}</th><th style="width:26%">${T('默认值')}</th>
@@ -3142,7 +3165,7 @@ function fmtCell(v) {
 function insertDocDialog(tableName, meta, after) {
   const cols = meta && meta.columns ? meta.columns.filter(c => !c.autoinc) : [];
   const tpl = JSON.stringify(Object.fromEntries(cols.map(c => [c.name, c.primary_key || !c.nullable ? 1 : ''])), null, 2) || '{}';
-  const ov = showModal(`<div class="dialog" style="min-width:540px;max-width:680px"><h3>${T('插入文档 — {0}', esc(tableName))}</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:min(540px, calc(100vw - 24px));max-width:680px"><h3>${T('插入文档 — {0}', esc(tableName))}</h3><div class="body">
     <div class="hint">${T('输入 JSON 文档:对象插入一行,数组批量插入多行。允许包含未在表结构中声明的字段(文档式存储)。')}</div>
     <textarea class="json-edit" data-t="doc" spellcheck="false">${esc(tpl)}</textarea>
     <div class="err-line" data-err></div></div>
@@ -3233,7 +3256,7 @@ async function editRowDialog(tableName, meta, cols, row, after) {
       <td>${rowFieldCell(n, row[i], ro)}</td>
       <td style="text-align:center"><input type="checkbox" data-null="1"${row[i] === null ? ' checked' : ''}${ro ? ` disabled title="${esc(T('自增列不可修改'))}"` : ''} title="${esc(T('值为 NULL'))}"></td></tr>`;
   }).join('');
-  const ov = showModal(`<div class="dialog" style="min-width:560px;max-width:660px"><h3>${T('编辑行 — {0}', esc(tableName))}</h3><div class="body">
+  const ov = showModal(`<div class="dialog" style="min-width:min(560px, calc(100vw - 24px));max-width:660px"><h3>${T('编辑行 — {0}', esc(tableName))}</h3><div class="body">
     <table class="colgrid"><thead><tr><th style="width:34%">${T('列')}</th><th>${T('值')}</th><th style="width:12%">NULL</th></tr></thead>
       <tbody>${trs}</tbody></table>
     <div class="hint">${T('按主键定位该行并执行 UPDATE(集群按写路径扇出)。勾选 NULL 的值保存为 NULL;自增列只读。')}</div>
@@ -3687,6 +3710,48 @@ function makeEditor(container, initial, onChange) {
     gutterIn.innerHTML = Array.from({length: lines}, (_, i) => i + 1).join('<br>');
   };
   const sync = () => { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; gutterIn.style.transform = `translateY(${-ta.scrollTop}px)`; };
+  // 查找浮层(Ctrl+F):Enter 下一个 / Shift+Enter 上一个 / Esc 关闭。
+  // 命中后焦点交还编辑器(选区可见、可直接复制),浮层留驻可 Esc 关。
+  const findBox = document.createElement('div');
+  findBox.className = 'ed-find';
+  findBox.style.display = 'none';
+  findBox.innerHTML = `<input type="text" data-find placeholder="${esc(T('查找'))}"><span class="cnt" data-cnt></span>`;
+  ed.appendChild(findBox);
+  const findInput = $('[data-find]', findBox), findCnt = $('[data-cnt]', findBox);
+  const findOpen = () => {
+    findBox.style.display = 'flex';
+    findInput.focus();
+    findInput.select();
+  };
+  const doFind = (dir) => {
+    const q = findInput.value;
+    if (!q) return;
+    const hay = ta.value, lq = q.toLowerCase(), lh2 = hay.toLowerCase();
+    let idx = -1;
+    if (dir > 0) {
+      idx = lh2.indexOf(lq, ta.selectionEnd);
+      if (idx < 0) idx = lh2.indexOf(lq);           // 环绕
+    } else {
+      idx = lh2.slice(0, ta.selectionStart).lastIndexOf(lq);
+      if (idx < 0) idx = lh2.lastIndexOf(lq);       // 环绕
+    }
+    if (idx < 0) { findCnt.textContent = T('未找到'); return; }
+    const total = lh2.split(lq).length - 1;
+    const nth = lh2.slice(0, idx).split(lq).length;
+    findCnt.textContent = `${nth}/${total}`;
+    ta.focus();
+    ta.setSelectionRange(idx, idx + q.length);
+    // 把命中行滚到视口中部(按行号×行高的粗略定位,不用 scrollIntoView
+    // ——那会滚动整个页面而不是编辑器)。
+    const line = hay.slice(0, idx).split('\n').length - 1;
+    const lh = parseFloat(getComputedStyle(ta).lineHeight) || 16;
+    ta.scrollTop = Math.max(0, line * lh - ta.clientHeight / 2);
+    sync();
+  };
+  findInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doFind(e.shiftKey ? -1 : 1); }
+    else if (e.key === 'Escape') { e.preventDefault(); findBox.style.display = 'none'; ta.focus(); }
+  });
   ta.addEventListener('input', () => { render(); if (onChange) onChange(ta.value); });
   ta.addEventListener('scroll', sync);
   ta.addEventListener('keydown', (e) => {
@@ -3695,6 +3760,27 @@ function makeEditor(container, initial, onChange) {
       ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
       ta.selectionStart = ta.selectionEnd = s + 2; render();
       if (onChange) onChange(ta.value); }
+    else if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+      // 行注释切换:选中行(无选区=光标行)全部已注释→去注释,否则加
+      // `-- `(已注释的行保持不动,混合时统一加)。
+      e.preventDefault();
+      const v = ta.value, s = ta.selectionStart, en = ta.selectionEnd;
+      const ls = v.lastIndexOf('\n', s - 1) + 1;
+      let le = v.indexOf('\n', en); if (le < 0) le = v.length;
+      const lines = v.slice(ls, le).split('\n');
+      const strip = lines.length > 0 && lines.every(l => l.trimStart().startsWith('--'));
+      const out = lines.map(l => strip
+        ? l.replace(/^(\s*)--[ ]?/, '$1')
+        : (/^\s*--/.test(l) ? l : l.replace(/^(\s*)/, '$1-- '))
+      ).join('\n');
+      ta.value = v.slice(0, ls) + out + v.slice(le);
+      ta.selectionStart = ls; ta.selectionEnd = ls + out.length;
+      render(); if (onChange) onChange(ta.value);
+    }
+    else if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+      e.preventDefault();
+      findOpen();
+    }
   });
   render();
   return {
@@ -3776,9 +3862,11 @@ function renderGrid(container, cols, rows, opts) {
     const body = shown.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
       `<td class="rownum">${ri + 1}</td>` +
       row.map(v => {
-        if (v === null) return `<td title="NULL"><span class="null">NULL</span></td>`;
+        // tabindex=-1:单元格点击可聚焦(programmatic focus),全局 copy
+        // 监听据此把 Ctrl+C 的目标换成单元格文本——数据核对场景高频。
+        if (v === null) return `<td title="NULL" tabindex="-1"><span class="null">NULL</span></td>`;
         const txt = capStr(fmtCell(v), CELL_TEXT_CAP);
-        return `<td title="${esc(capStr(fmtCell(v), CELL_TITLE_CAP))}">${esc(txt)}</td>`;
+        return `<td title="${esc(capStr(fmtCell(v), CELL_TITLE_CAP))}" tabindex="-1">${esc(txt)}</td>`;
       }).join('') +
       (btns ? `<td class="rowact">${(btns(row, ri) || []).map((b, i) =>
         `<button data-bt="${ri}:${i}"${b.cls ? ` class="${esc(b.cls)}"` : ''}${b.title ? ` title="${esc(b.title)}"` : ''}>${esc(b.label)}</button>`).join('')}</td>` : '') +
@@ -3922,7 +4010,7 @@ function openQueryTab(title, sql, autoRun) {
             <td style="max-width:480px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.sql)}">${esc(e.sql)}</td>
           </tr>`).join('')
         : `<tr><td colspan="3" style="color:var(--txt3)">${T('没有历史记录(执行过的查询会出现在这里)。')}</td></tr>`;
-      const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:860px"><h3>${T('查询历史')}</h3>
+      const ov = showModal(`<div class="dialog" style="min-width:min(640px, calc(100vw - 24px));max-width:860px"><h3>${T('查询历史')}</h3>
         <div class="body" style="max-height:60vh;overflow:auto;padding:0">
           <table class="grid"><thead><tr><th>${T('时间')}</th><th>${T('耗时')}</th><th>SQL</th></tr></thead><tbody>${rows}</tbody></table>
         </div>
@@ -4029,7 +4117,9 @@ function openDataTab(tableName, meta) {
         <span class="title">${esc(tableName)}</span>
         <button data-do="refresh" data-i18n-title title="刷新并重新统计行数(翻页使用缓存的行数)"><span data-i18n>刷新</span></button>
         <button data-do="prev"><span data-i18n>◀ 上一页</span></button>
+        <span class="meta" data-pager><input data-page type="number" min="1" step="1" style="width:54px"> / <span data-pages>1</span></span>
         <button data-do="next"><span data-i18n>下一页 ▶</span></button>
+        <select data-size data-i18n-title title="每页行数">${[50, 100, 200, 500, 1000].map(n => `<option value="${n}"${n === 200 ? ' selected' : ''}>${n}</option>`).join('')}</select>
         <span class="meta" data-range></span>
         <div class="spacer"></div>
         <button data-do="edit" data-i18n-title title="编辑表结构(列编辑网格)"><span data-i18n>编辑表…</span></button>
@@ -4040,7 +4130,15 @@ function openDataTab(tableName, meta) {
         <button data-do="drop" class="danger"><span data-i18n>删除表…</span></button>
       </div><div class="res-wrap"><div class="res-pane active grid-host" style="display:block"></div></div>`;
     t.host = $('.grid-host', t.el);
-    const range = () => { $('[data-range]', t.el).textContent = t.offset === 0 && t.total === 0 ? T('(空表)') : T('第 {0}–{1} 行,共 {2} 行', t.offset + 1, Math.min(t.offset + t.limit, t.total), t.total); };
+    const range = () => {
+      $('[data-range]', t.el).textContent = t.offset === 0 && t.total === 0 ? T('(空表)') : T('第 {0}–{1} 行,共 {2} 行', t.offset + 1, Math.min(t.offset + t.limit, t.total), t.total);
+      // 页码跳转器:当前页 / 总页数(行数缓存是快照,页数随之)。
+      const pages = Math.max(1, Math.ceil((t.total || 0) / t.limit));
+      $('[data-pages]', t.el).textContent = pages;
+      const pageInput = $('[data-page]', t.el);
+      pageInput.max = pages;
+      if (document.activeElement !== pageInput) pageInput.value = Math.floor(t.offset / t.limit) + 1;
+    };
     t.load = async () => {
       // 快速连点翻页会产生并发在途请求:序号淘汰旧响应,并快照本场的
       // 分页参数 —— 否则慢的旧响应最后落地,网格内容与行号标签/按钮
@@ -4080,6 +4178,25 @@ function openDataTab(tableName, meta) {
     $('[data-do="refresh"]', t.el).onclick = () => { t.countDirty = true; t.load(); };
     $('[data-do="prev"]', t.el).onclick = () => { t.offset = Math.max(0, t.offset - t.limit); t.load(); };
     $('[data-do="next"]', t.el).onclick = () => { t.offset += t.limit; t.load(); };
+    // 页码跳转:输入页码回车/失焦直达(钳到 1..总页数);十万行表不再
+    // 逐页点「下一页」。
+    const jumpPage = () => {
+      const pages = Math.max(1, Math.ceil((t.total || 0) / t.limit));
+      const n = Math.min(pages, Math.max(1, Math.floor(+$('[data-page]', t.el).value || 1)));
+      t.offset = (n - 1) * t.limit;
+      t.load();
+    };
+    const pageInput = $('[data-page]', t.el);
+    pageInput.addEventListener('keydown', (e) => {
+      if (enterSubmits(e)) { e.preventDefault(); pageInput.blur(); jumpPage(); }
+    });
+    pageInput.addEventListener('blur', jumpPage);
+    // 页大小:切换后回第一页(旧偏移在新页大小下语义不明)。
+    $('[data-size]', t.el).onchange = (e) => {
+      t.limit = +e.target.value;
+      t.offset = 0;
+      t.load();
+    };
     $('[data-do="edit"]', t.el).onclick = () => editTableDialog(tableName, explorer.tableMeta(tableName) || meta, t.load);
     $('[data-do="insert"]', t.el).onclick = () => insertDocDialog(tableName, meta, () => { t.countDirty = true; t.load(); });
     $('[data-do="query"]', t.el).onclick = () => openQueryTab(() => T('查询: {0}', tableName), `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
@@ -4577,7 +4694,7 @@ const usersPage = {
       <td style="font-family:var(--mono)">${esc(tbl)}</td>
       ${PRIVS.map(p => `<td style="text-align:center"><input type="checkbox" data-t="${esc(tbl)}" data-p="${p}"${(current[tbl] || []).includes(p) ? ' checked' : ''}></td>`).join('')}
     </tr>`;
-    const ov = showModal(`<div class="dialog" style="min-width:640px;max-width:760px"><h3>${T('表级权限 — {0}', esc(name))}${kind === 'role' ? T('(角色)') : ''}</h3><div class="body">
+    const ov = showModal(`<div class="dialog" style="min-width:min(640px, calc(100vw - 24px));max-width:760px"><h3>${T('表级权限 — {0}', esc(name))}${kind === 'role' ? T('(角色)') : ''}</h3><div class="body">
       <table class="colgrid"><thead><tr><th style="width:34%">${T('表')}</th>${PRIVS.map(p => `<th>${p}</th>`).join('')}</tr></thead>
       <tbody>${tables.map(row).join('')}</tbody></table>
       <div class="hint">${kind === 'user' ? T('此处编辑直接授予的表级权限;用户通过角色获得的权限请在「角色」区管理(它们不在此显示)。') : T('角色的表级权限对其全部成员生效。')}</div>
