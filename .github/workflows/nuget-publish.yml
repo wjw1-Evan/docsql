@@ -36,6 +36,23 @@ jobs:
             --store-password-in-clear-text \
             --name github \
             "https://nuget.pkg.github.com/wjw1-Evan/index.json"
+          # GitHub Packages intermittently answers 5xx/timeouts; a failed
+          # push used to fail the whole release and need a manual re-run.
+          # Retry each package with backoff; --skip-duplicate keeps re-runs
+          # idempotent (409 on an already-pushed version is success).
           for pkg in out/*.nupkg; do
-            dotnet nuget push "$pkg" --source github --skip-duplicate
+            name=$(basename "$pkg")
+            ok=""
+            for i in 1 2 3 4 5; do
+              if dotnet nuget push "$pkg" --source github --skip-duplicate; then
+                ok=1
+                break
+              fi
+              echo "push $name failed (attempt $i); retrying in 20s"
+              sleep 20
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::push $name failed after 5 attempts"
+              exit 1
+            fi
           done

@@ -210,6 +210,9 @@ public sealed class SavepointApiTests : IClassFixture<ServerFixture>
     }
 }
 
+// 清池/借出名额计数依赖全局池状态:入 pooling-counters 串行集合,
+// 防并发 ClearAll 击穿(见 Review7PoolAndReaderTests 注释)。
+[Collection("pooling-counters")]
 public sealed class PoolCapacityTests : IClassFixture<ServerFixture>
 {
     private readonly ServerFixture _fx;

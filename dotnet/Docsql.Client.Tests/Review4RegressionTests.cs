@@ -125,7 +125,9 @@ public sealed class ReaderAndTransactionGuardTests : IClassFixture<ServerFixture
     }
 }
 
-/// <summary>4):归还与注销的 TOCTOU。修复后检查+入队在池锁内原子。</summary>
+/// <summary>4):归还与注销的 TOCTOU。修复后检查+入队在池锁内原子。
+/// 清池/计数依赖全局池状态:入串行集合(见 Review7 注释)。</summary>
+[Collection("pooling-counters")]
 public sealed class PoolReturnRaceTests : IClassFixture<ServerFixture>
 {
     private readonly ServerFixture _fx;
@@ -188,6 +190,8 @@ public sealed class ProtocolBreakTests
 // 3) RewriteParameters 不跳 [方括号] 标识符:与服务端占位符扫描器分叉,
 //    [user@domain] 内的 @ 名字命中参数时把标识符改写成 [?];
 // 4) ExecuteReaderAsync 丢弃 CommandBehavior.CloseConnection(池名额泄漏)。
+// Async_reader 断言池空闲计数:入串行集合,防并发 ClearAll 击穿采样。
+[Collection("pooling-counters")]
 public sealed class Review6BindingAndScannerTests : IClassFixture<ServerFixture>
 {
     private readonly ServerFixture _fx;
@@ -273,6 +277,9 @@ public sealed class Review6BindingAndScannerTests : IClassFixture<ServerFixture>
 // 第七轮审查缺陷回归:客户端层。
 // 1) RentAsync 取消路径双重释放借出名额(每次取消净 +1,MaxPoolSize 静默失效);
 // 2) Reader.Close() 不履行 CommandBehavior.CloseConnection(仅 Dispose 履行)。
+// 池计数断言依赖全局池状态:与 ClearAll 调用方(PoolingTests/PoolReturnRace/
+// PoolCapacity)同串行集合,并发清池曾把 before/after 采样击穿(CI 实锤)。
+[Collection("pooling-counters")]
 public sealed class Review7PoolAndReaderTests : IClassFixture<ServerFixture>
 {
     private readonly ServerFixture _fx;
