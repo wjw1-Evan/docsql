@@ -65,8 +65,9 @@ enum CliMode {
 /// The one-shot usage text (`--help` / `-h`; also the tail of any
 /// unknown-flag error).
 fn usage() -> String {
-    "\
-DocSQL shell
+    format!(
+        "\
+DocSQL shell {}
 
   docsql <file.db>               embedded mode (SQL from stdin)
   docsql :memory:                embedded in-memory
@@ -78,9 +79,25 @@ DocSQL shell
 Options:
   -f, --file <script.sql>  execute a script file instead of stdin
       --csv | --json       row output format (default: aligned table)
+      --table              aligned table output (default)
   -h, --help               this text
-"
-    .to_string()
+  -V, --version            print version
+
+Environment:
+  DOCSQL_TOKEN              token for `connect` when none is given
+  DOCSQL_PASSWORD           password for `--user` login (hidden prompt otherwise)
+  DOCSQL_TLS_CONNECT=1      dial the server over TLS
+  DOCSQL_TLS_CA=<pem>       verify the server certificate against a CA bundle
+  DOCSQL_CLI_TIMEOUT_MS     round-trip budget (0 disables; invalid values warn
+                            and fall back to the 600000 ms default)
+
+Exit status: 0 success; 1 failed SQL in a script (`-f`/piped stdin),
+  connection loss, or an unwritable database; 2 bad usage or failed login;
+  130 terminated by SIGINT. Interactive sessions exit 0 even after SQL
+  errors (same as psql).
+",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Parsed startup options. Pure over an injected argument iterator so the
@@ -211,6 +228,10 @@ fn main() {
         println!("{}", usage());
         return;
     }
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("docsql-cli {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let args = parse_args(argv.into_iter()).unwrap_or_else(|e| {
         eprintln!("DocSQL: {e}");
         std::process::exit(2);
@@ -242,7 +263,10 @@ fn main() {
             });
             // stderr, not stdout: --json/--csv batch consumers parse the
             // stream and a banner line breaks them at the first byte.
-            eprintln!("DocSQL — type SQL statements ending with ';', quit with exit;");
+            eprintln!(
+                "DocSQL {} — {path}; type SQL ending with ';', quit with exit;",
+                env!("CARGO_PKG_VERSION")
+            );
             let stdin = std::io::BufReader::new(std::io::stdin().lock());
             // Two orthogonal flags (see run_embedded): stdin REPL
             // semantics vs batch fail-fast error codes.
@@ -483,15 +507,73 @@ fn split_ready(buf: &str) -> Vec<String> {
 /// script mode an SQL error fails fast (exit 1); interactive sessions report
 /// the error and keep their normal exit status. A dangling trailing
 /// statement without `;` still executes at EOF.
+/// Top-level shell sentinels, case-insensitive and tolerant of the `quit`
+/// spelling: `EXIT`, `quit;`, `Help` all work like sqlite3/psql reflexes
+/// expect. Recognized only BETWEEN statements (callers gate on an empty
+/// buffer), never mid-literal.
+enum Sentinel {
+    Exit,
+    Help,
+    No,
+}
+
+fn shell_sentinel(trimmed: &str) -> Sentinel {
+    let bare = trimmed.trim_end_matches(';').trim().to_ascii_lowercase();
+    match bare.as_str() {
+        "exit" | "quit" => Sentinel::Exit,
+        "help" => Sentinel::Help,
+        _ => Sentinel::No,
+    }
+}
+
+/// `.`- and `\`-prefixed lines are sqlite3/psql meta-command muscle memory
+/// (`.exit`, `\q`); no SQL statement starts with either byte, so guide the
+/// user instead of letting the parser emit a baffling syntax error.
+fn is_meta_command_line(trimmed: &str) -> bool {
+    trimmed.starts_with('.') || trimmed.starts_with('\\')
+}
+
+fn meta_command_hint() {
+    eprintln!(
+        "unsupported meta-command; type help; for shell commands \
+         (exit/quit, auth, subscribe, publish)"
+    );
+}
+
+/// REPL prompt for interactive terminals: `docsql> ` between statements,
+/// `...> ` while a multi-line statement buffers (psql/sqlite3 semantics;
+/// without it a carriage return after `CREATE TABLE t (` looked like a
+/// hang). Non-tty stdin and machine formats stay silent.
+fn prompt_next(on: bool, fresh: bool) {
+    if !on {
+        return;
+    }
+    print!("{}", if fresh { "docsql> " } else { "...> " });
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// One-line preview of a statement for error context in SCRIPT mode (the
+/// operator's terminal already shows what they typed; a 200-line migration
+/// script does not).
+fn preview_stmt(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    let mut s: String = first.chars().take(60).collect();
+    if first.chars().count() > 60 {
+        s.push('…');
+    }
+    s
+}
+
 fn run_embedded(
     db: &mut Database,
     format: Format,
     script: Option<&str>,
     input: impl std::io::Read,
-    // stdin REPL semantics: the `exit;`/`help;` sentinels and the EOF flush.
-    // The sentinels now fire in script/piped mode too, so the flag is kept
-    // only for signature stability (unused).
-    _interactive: bool,
+    // stdin REPL semantics: the terminal prompt (`docsql> `/`...> `) shows
+    // only for an interactive terminal run; the sentinels fire in script/
+    // piped mode too.
+    interactive: bool,
     // An SQL error exits non-zero: -f scripts AND piped-stdin batch runs
     // (`docsql app.db < migrate.sql` used to exit 0; CI read a false
     // success). A terminal session keeps the REPL alive.
@@ -510,6 +592,8 @@ fn run_embedded(
     let mut stmt = String::new();
     let mut done = false;
     let mut tsql = docsql_core::tsql_batch::TsqlSession::new();
+    let prompt_on = interactive && !fail_fast && matches!(format, Format::Table);
+    prompt_next(prompt_on, true);
     for line in std::io::BufReader::new(source).lines() {
         let line = line.unwrap_or_else(|e| {
             eprintln!("read error: {e}");
@@ -521,34 +605,53 @@ fn run_embedded(
         // span lines and dumps reproduce blank lines verbatim, so eating
         // them mid-statement silently corrupted stored documents.
         if trimmed.is_empty() && stmt.trim().is_empty() {
+            prompt_next(prompt_on, true);
             continue;
         }
         // Same buffer gate for the sentinels: a line that happens to be
         // `help`/`exit;` inside a literal must stay data. `exit;` ends a
-        // script/piped batch too — the usage text tells deployment authors
-        // to end heredocs with it, and a stored script with that trailing
-        // line must not hand "exit" to the SQL parser.
+        // script/piped batch too — a stored script with that trailing line
+        // must not hand "exit" to the SQL parser (the remote loop uses the
+        // same rule; behavior must not depend on the mode).
         if stmt.trim().is_empty() {
-            if trimmed == "exit;" || trimmed == "exit" {
-                done = true;
-                break;
+            match shell_sentinel(trimmed) {
+                Sentinel::Exit => {
+                    done = true;
+                    break;
+                }
+                Sentinel::Help => {
+                    print_embedded_help(format);
+                    prompt_next(prompt_on, true);
+                    continue;
+                }
+                Sentinel::No => {}
             }
-            if trimmed == "help;" || trimmed == "help" {
-                print_embedded_help(format);
+            if is_meta_command_line(trimmed) {
+                meta_command_hint();
+                prompt_next(prompt_on, true);
                 continue;
             }
         }
         stmt.push_str(&line);
         stmt.push('\n');
         if !statements_ready(&stmt) {
+            prompt_next(prompt_on, false);
             continue;
         }
         run_embedded_chunk(db, &mut tsql, &stmt, format, !fail_fast);
         stmt.clear();
+        prompt_next(prompt_on, true);
     }
-    // Scripts tolerate a missing final `;`.
+    // Scripts tolerate a missing final `;`. An interactive terminal does
+    // not: Ctrl+D with a dangling buffer means "abandon this", and running
+    // a half-typed DELETE just because it lacked a semicolon is how
+    // accidents happen (psql clears the buffer on first Ctrl+D too).
     if !done && !stmt.trim().is_empty() {
-        run_embedded_chunk(db, &mut tsql, &stmt, format, !fail_fast);
+        if fail_fast {
+            run_embedded_chunk(db, &mut tsql, &stmt, format, !fail_fast);
+        } else {
+            eprintln!("(discarded incomplete statement without a trailing ';')");
+        }
     }
 }
 
@@ -584,6 +687,9 @@ fn run_embedded_chunk(
                     note_line(format, &format!("PRINT: {msg}"));
                 }
                 eprintln!("error: {e}");
+                if !interactive {
+                    eprintln!("  in: {}", preview_stmt(text));
+                }
                 if !interactive {
                     std::process::exit(1);
                 }
@@ -643,9 +749,11 @@ impl docsql_core::tsql_batch::BatchExecutor for EmbeddedBatchExec<'_> {
 fn print_embedded_help(format: Format) {
     // Machine-readable streams stay pure: the help text rides stderr in
     // --csv/--json mode (same rule as banners and confirmation lines).
-    let text = "exit;                         leave the shell\n\
+    let text = "exit; / quit;                 leave the shell (any case; `.`/`\\` meta-commands\n\
+                                     from sqlite3/psql are not supported)\n\
                 help;                         this summary\n\
                 SQL ends with ';' — multiple statements per line are executed in order\n\
+                Ctrl+D discards an unfinished statement; exit; to leave\n\
                 flags: --csv | --json (row output), -f <script.sql> (batch, fail-fast)";
     match format {
         Format::Csv | Format::Json => eprintln!("{text}"),
@@ -837,7 +945,16 @@ impl Remote {
             Ok(v) => match v.trim().parse::<u64>() {
                 Ok(0) => None,
                 Ok(ms) => Some(std::time::Duration::from_millis(ms)),
-                Err(_) => Some(std::time::Duration::from_secs(600)),
+                Err(_) => {
+                    // Silent fallback hid the typo: the operator believed
+                    // their budget applied while scripts still hung for the
+                    // full default.
+                    eprintln!(
+                        "warning: invalid DOCSQL_CLI_TIMEOUT_MS value {v:?}; \
+                         using the default 600000 ms"
+                    );
+                    Some(std::time::Duration::from_secs(600))
+                }
             },
             _ => Some(std::time::Duration::from_secs(600)),
         };
@@ -1369,8 +1486,9 @@ fn remote_shell(
         }
     }
     eprintln!(
-        "DocSQL → {addr} — SQL over the wire, quit with exit; \
-         (`auth <token>;`, `subscribe <ch>;`, `publish <ch> <msg>;`)"
+        "DocSQL {} → {addr} — SQL over the wire, quit with exit; \
+         (`auth <token>;`, `subscribe <ch>;`, `publish <ch> <msg>;`)",
+        env!("CARGO_PKG_VERSION")
     );
     // Interactive sessions idle while the operator types: a server with
     // DOCSQL_IDLE_TIMEOUT would drop the connection mid-thought (and any
@@ -1394,8 +1512,10 @@ fn remote_shell(
     // an SQL error fails fast outside a terminal.
     let interactive = script.is_none();
     let fail_fast = !interactive || !std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let prompt_on = interactive && !fail_fast && matches!(format, Format::Table);
     let mut stmt = String::new();
     let mut stmt_failed = false;
+    prompt_next(prompt_on, true);
     for line in std::io::BufReader::new(source).lines() {
         let line = line.unwrap_or_else(|e| {
             eprintln!("read error: {e}");
@@ -1406,14 +1526,26 @@ fn remote_shell(
         // only skipped/recognized BETWEEN statements, never inside a
         // buffered multi-line literal.
         if trimmed.is_empty() && stmt.trim().is_empty() {
+            prompt_next(prompt_on, true);
             continue;
         }
         if stmt.trim().is_empty() {
-            if interactive && (trimmed == "exit" || trimmed == "exit;") {
-                break;
+            // Sentinel parity with the embedded loop (exit/quit, any case,
+            // with or without `;`): scripts ending in `exit;` must not hand
+            // the word to the SQL parser here either — mode must not change
+            // behavior.
+            match shell_sentinel(trimmed) {
+                Sentinel::Exit => break,
+                Sentinel::Help => {
+                    print_remote_help();
+                    prompt_next(prompt_on, true);
+                    continue;
+                }
+                Sentinel::No => {}
             }
-            if trimmed == "help;" || trimmed == "help" {
-                print_remote_help();
+            if is_meta_command_line(trimmed) {
+                meta_command_hint();
+                prompt_next(prompt_on, true);
                 continue;
             }
         }
@@ -1423,10 +1555,13 @@ fn remote_shell(
         // replaying a message that happens to start with "publish") run as
         // a protocol command and silently drop the line from its INSERT.
         if stmt.trim().is_empty() {
-            // Inline AUTH: a dedicated auth frame, not SQL.
-            if let Some(tok) = trimmed
-                .strip_prefix("auth ")
-                .or_else(|| trimmed.strip_prefix("AUTH "))
+            // Inline AUTH: a dedicated auth frame, not SQL. Any case
+            // (`Auth x`, `AUTH x`) — the first five bytes are ASCII.
+            let auth_arg = trimmed
+                .get(..5)
+                .filter(|p| p.eq_ignore_ascii_case("auth "))
+                .map(|_| &trimmed[5..]);
+            if let Some(tok) = auth_arg
                 .map(|t| t.trim().trim_end_matches(';').trim())
                 .filter(|t| !t.is_empty())
             {
@@ -1438,6 +1573,7 @@ fn remote_shell(
                     // an orchestrator believed the rotation succeeded.
                     stmt_failed = true;
                 }
+                prompt_next(prompt_on, true);
                 continue;
             }
             // Inline pub/sub commands (single line, `;`-terminated like SQL).
@@ -1450,12 +1586,14 @@ fn remote_shell(
                     // Only a transport loss leaves the session unusable.
                     PubsubOutcome::Transport => std::process::exit(1),
                 }
+                prompt_next(prompt_on, true);
                 continue;
             }
         }
         stmt.push_str(&line);
         stmt.push('\n');
         if !statements_ready(&stmt) {
+            prompt_next(prompt_on, false);
             continue;
         }
         // T-SQL batches (variables/control flow) go to the server as ONE
@@ -1476,6 +1614,7 @@ fn remote_shell(
                 }
             }
             stmt.clear();
+            prompt_next(prompt_on, true);
             continue;
         }
         for part in split_ready(&stmt) {
@@ -1488,34 +1627,42 @@ fn remote_shell(
                 }
             };
             if !print_frame(&f, format) && fail_fast {
+                eprintln!("  in: {}", preview_stmt(&part));
                 std::process::exit(1);
             }
             stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
         }
         stmt.clear();
+        prompt_next(prompt_on, true);
     }
     // Scripts tolerate a missing final `;`. split_ready delegates to the
     // engine's BEGIN/END-aware splitter, so a semicolon-less T-SQL block
     // still goes out as ONE frame (the server-side interpreter picks it
     // up) — pinned by semicolonless_tsql_batch_needs_whole_frame_routing.
+    // An interactive terminal discards the dangling buffer instead (same
+    // Ctrl+D-is-abandon rule as the embedded loop).
     if !stmt.trim().is_empty() {
-        for part in split_ready(&stmt) {
-            let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&part).unwrap());
-            match remote.round_trip(&frame) {
-                Ok(f) => {
-                    if !print_frame(&f, format) && fail_fast {
+        if fail_fast {
+            for part in split_ready(&stmt) {
+                let frame = Frame::new(proto::REQ_SQL, proto::encode_sql(&part).unwrap());
+                match remote.round_trip(&frame) {
+                    Ok(f) => {
+                        if !print_frame(&f, format) && fail_fast {
+                            std::process::exit(1);
+                        }
+                        stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
+                    }
+                    // Same contract as the main loop: a transport loss on the
+                    // trailing (semicolon-less) statement must fail the
+                    // script — orchestration scripts read the exit status.
+                    Err(e) => {
+                        eprintln!("{e}");
                         std::process::exit(1);
                     }
-                    stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
-                }
-                // Same contract as the main loop: a transport loss on the
-                // trailing (semicolon-less) statement must fail the script —
-                // orchestration scripts read the exit status.
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
                 }
             }
+        } else {
+            eprintln!("(discarded incomplete statement without a trailing ';')");
         }
     }
     // Interactive sessions end normally even after earlier SQL errors;
@@ -1534,7 +1681,7 @@ fn print_remote_help() {
          publish <ch> <msg...>;       durable publish, returns [id, receivers]\n\
          pubsub channels|numsub|numpat|trim <ch> <n>;\n\
          help;                        this summary\n\
-         exit;                        leave the shell\n\
+         exit; / quit;                leave the shell (any case)\n\
          SQL ends with ';' — flags: --csv | --json, -f <script.sql>"
     );
 }
@@ -1716,19 +1863,61 @@ pub fn render_json(r: &QueryResult) -> String {
     out
 }
 
+/// Terminal display width of one char (UAX #11 subset covering real data:
+/// CJK ideographs, kana, Hangul, full-width forms, and the common emoji
+/// ranges take 2 cells; combining marks and variation selectors take 0;
+/// everything else takes 1). Padded tables with CJK data were ragged when
+/// width was measured in chars.
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    match cp {
+        // Combining diacritics / variation selectors / ZWJ: no advance.
+        0x0300..=0x036F | 0x200B..=0x200F | 0xFE00..=0xFE0F => 0,
+        0x1100..=0x115F       // Hangul Jamo leading consonants
+        | 0x2E80..=0x303E     // CJK radicals / kana annotation / CJK punctuation
+        | 0x3041..=0x33FF     // kana, CJK compat ideographs, CJK ext A bound
+        | 0x3400..=0x4DBF     // CJK extension A
+        | 0x4E00..=0x9FFF     // CJK unified ideographs
+        | 0xA000..=0xA4CF     // Yi syllables
+        | 0xAC00..=0xD7A3     // Hangul syllables
+        | 0xF900..=0xFAFF     // CJK compatibility ideographs
+        | 0xFE10..=0xFE19     // vertical forms
+        | 0xFE30..=0xFE6F     // CJK compatibility / small form variants
+        | 0xFF00..=0xFF60     // fullwidth forms
+        | 0xFFE0..=0xFFE6     // fullwidth signs
+        | 0x1F300..=0x1F64F   // emoji: symbols & pictographs, transport, misc
+        | 0x1F900..=0x1F9FF   // supplemental symbols
+        | 0x20000..=0x2FFFD   // CJK extension B..F
+        | 0x30000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+/// Pad to a TERMINAL cell count (Rust's `{:<w$}` pads by chars, which
+/// disagrees with display_width on wide chars).
+fn pad_to(s: &str, w: usize) -> String {
+    let d = display_width(s);
+    if d >= w {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(w - d))
+    }
+}
+
 /// Format a result table exactly as the shell prints it (pure, testable).
 pub fn render_rows(r: &QueryResult) -> String {
-    if r.rows.is_empty() {
-        return "(no rows)\n".to_string();
-    }
-    // Widths count CHARS while the pad below pads chars: measuring bytes
-    // left CJK cells ragged (a 3-char/9-byte string padded as 9).
     // Column names are wire data too (a quoted identifier or alias can
     // carry escape sequences) — headers take the same sanitizer as the
     // cells, and the widths follow the SANITIZED text so the grid stays
-    // aligned.
+    // aligned. Empty results still print the header row (psql prints
+    // column names plus "(0 rows)"; hiding them made interactive and
+    // scripted output shapes diverge).
     let headers: Vec<String> = r.columns.iter().map(|c| sanitize_terminal(c)).collect();
-    let mut widths: Vec<usize> = headers.iter().map(|c| c.chars().count()).collect();
+    let mut widths: Vec<usize> = headers.iter().map(|c| display_width(c)).collect();
     let cells: Vec<Vec<String>> = r
         .rows
         .iter()
@@ -1747,7 +1936,7 @@ pub fn render_rows(r: &QueryResult) -> String {
         for (i, c) in row.iter().enumerate() {
             // Rows wider than the column list must not panic the client.
             if let Some(w) = widths.get_mut(i) {
-                *w = (*w).max(c.chars().count());
+                *w = (*w).max(display_width(c));
             }
         }
     }
@@ -1759,7 +1948,7 @@ pub fn render_rows(r: &QueryResult) -> String {
     let header: String = headers
         .iter()
         .zip(&widths)
-        .map(|(c, w)| format!(" {c:<w$}"))
+        .map(|(c, w)| format!(" {}", pad_to(c, *w)))
         .collect::<Vec<_>>()
         .join("|");
     let mut out = String::new();
@@ -1771,7 +1960,7 @@ pub fn render_rows(r: &QueryResult) -> String {
         let line: String = row
             .iter()
             .zip(&widths)
-            .map(|(c, w)| format!(" {c:<w$}"))
+            .map(|(c, w)| format!(" {}", pad_to(c, *w)))
             .collect::<Vec<_>>()
             .join("|");
         out.push_str(&line);
@@ -1785,6 +1974,48 @@ pub fn render_rows(r: &QueryResult) -> String {
 mod tests {
     use super::*;
     use docsql_core::engine::Database;
+
+    /// 哨兵大小写不敏感且认 quit 变体;`.`/`\` 元命令行可被识别(sqlite3/psql
+    /// 肌肉记忆走提示而非 SQL 解析错误)。
+    #[test]
+    fn shell_sentinels_case_insensitive_with_quit_variant() {
+        for s in ["exit", "EXIT", "exit;", "Quit;", " quit "] {
+            assert!(matches!(shell_sentinel(s), Sentinel::Exit), "{s}");
+        }
+        for s in ["help", "HELP;", "Help"] {
+            assert!(matches!(shell_sentinel(s), Sentinel::Help), "{s}");
+        }
+        // 不是哨兵:SQL 或普通文本(含 helpX 这类前缀重叠词)
+        for s in ["select", "exiting", "helper", ""] {
+            assert!(matches!(shell_sentinel(s), Sentinel::No), "{s}");
+        }
+        assert!(is_meta_command_line(".exit"));
+        assert!(is_meta_command_line("\\q"));
+        assert!(!is_meta_command_line("SELECT 1"));
+    }
+
+    /// CJK 全角字符占 2 个终端列,表格按显示宽度补位才对齐(按字符数
+    /// 补位曾让含中文数据的表格全部错位)。
+    #[test]
+    fn render_rows_pads_by_terminal_display_width() {
+        let r = QueryResult {
+            columns: vec!["name".into()],
+            rows: vec![
+                vec![Value::Str("甲乙丙".into())],
+                vec![Value::Str("abcdef".into())],
+            ],
+        };
+        let out = render_rows(&r);
+        let lines: Vec<&str> = out.lines().collect();
+        // 数据行按终端显示列等宽(汉字 2 列:甲乙丙=6 列,abcdef=6 列;
+        // 按字符数比较则 4≠7 —— 那正是旧 bug)
+        assert_eq!(display_width(lines[2]), display_width(lines[3]), "{out}");
+        assert!(lines[2].contains("甲乙丙"));
+        assert_eq!(display_width("甲乙丙"), 6);
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(pad_to("ab", 5), "ab   ");
+        assert_eq!(pad_to("甲乙", 5), "甲乙 "); // 4 列宽 + 1 空格
+    }
 
     /// `_end`/`1end` 等标识符后缀曾被当裸 END 提前扣减 BEGIN 深度,块体中
     /// 途被当成完整语句冲刷。
@@ -1918,7 +2149,9 @@ mod tests {
             columns: vec!["a".into()],
             rows: vec![],
         };
-        assert_eq!(render_rows(&empty), "(no rows)\n");
+        // Empty results keep the header row (psql prints column names plus
+        // "(0 rows)"); hiding them made interactive/scripted shapes diverge.
+        assert_eq!(render_rows(&empty), " a\n---\n(0 rows)\n");
 
         let r = QueryResult {
             columns: vec!["id".into(), "name".into()],
@@ -2437,11 +2670,20 @@ mod tests {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
             other => panic!("{other:?}"),
         }
-        // 交互模式在 EOF 处理悬挂语句(无结尾分号也执行)。
+        // 交互终端在 EOF 丢弃悬挂语句(无结尾分号 = 放弃;半截 DELETE
+        // 不该因缺分号而执行)——与 psql 的首个 Ctrl+D 清缓冲一致。
         let mut db2 = Database::in_memory().unwrap();
         let input2 = std::io::Cursor::new("CREATE TABLE u (id INT);\nINSERT INTO u VALUES (9)\n");
         run_embedded(&mut db2, Format::Csv, None, input2, true, false);
         match db2.execute("SELECT COUNT(*) FROM u").unwrap() {
+            ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(0)),
+            other => panic!("{other:?}"),
+        }
+        // 脚本/管道(fail_fast)仍冲刷无尾分号的末条语句。
+        let mut db3 = Database::in_memory().unwrap();
+        let input3 = std::io::Cursor::new("CREATE TABLE w (id INT);\nINSERT INTO w VALUES (9)\n");
+        run_embedded(&mut db3, Format::Csv, None, input3, false, true);
+        match db3.execute("SELECT COUNT(*) FROM w").unwrap() {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
             other => panic!("{other:?}"),
         }

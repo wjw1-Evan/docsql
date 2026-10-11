@@ -224,12 +224,22 @@ builder.AddDocsqlConnection("docsql");       // 注册 transient DocsqlConnectio
 ```
 docsql connect 127.0.0.1:7600 --user analyst   # 密码走 DOCSQL_PASSWORD 或交互提示;--user 缺值是用法错误(不静默降级匿名)
   --csv / --json        行导出(RFC 4180 CSV / JSON 对象数组;启动横幅走 stderr,批处理 stdout 恒为纯格式文档)
+  --table               对齐表格输出(默认;按终端显示宽度对齐,CJK 双宽字符不再错位)
   -f script.sql         脚本批执行(错误即退出 1)
+  -V, --version         版本号
   help;                 内联命令帮助(含 pub/sub 命令面)
 ```
 
-退出码约定:SQL 语句错误、`publish`/`subscribe`/`trim` 被拒、传输失败、坏帧均使脚本
-(fail_fast 路径)以非零退出;CSV 公式注入防护只拦 `=`/`+`/`@` 与非常规 `-` 形态,负数
+交互细节:`exit`/`quit`/`help` 大小写不敏感、可带可不带分号(嵌入与远程模式行为一致,
+脚本末尾的 `exit;` 行在两种模式下都正常结束);sqlite3/psql 风格元命令(`.exit`、`\q`)不
+支持,会给出提示而非 SQL 解析错误;交互终端显示 `docsql> ` / 多行续行 `...> ` 提示符;
+Ctrl+D 在语句缓冲非空时**丢弃**该残缺语句(半截 DELETE 不因缺分号而执行),脚本/管道输入
+仍冲刷无尾分号的末条语句;表格输出含 CJK 数据按显示宽度对齐,空结果保留表头行并显示
+`(0 rows)`;脚本错误附出错语句的单行回显(`in: …`)。
+
+退出码约定:0 = 成功(交互会话即使中途 SQL 出错也以 0 结束,与 psql 一致);1 = 脚本
+(`-f`/管道 stdin)中的 SQL 错误、`publish`/`subscribe`/`trim` 被拒、传输失败、坏帧;2 = 用法
+错误或登录失败;130 = SIGINT 终止。CSV 公式注入防护只拦 `=`/`+`/`@` 与非常规 `-` 形态,负数
 保持数值单元格。注:CLI 暂不支持 `DOCSQL_KEY` 帧加密节点(用 .NET/Python 驱动或 TLS)。
 
 订阅是专用连接 + 专职读线程(CLI 已内置):普通一问一答连接会把推送帧错当成命令响应。

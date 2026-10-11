@@ -341,6 +341,11 @@ struct TableSnapshot {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TableMeta {
+    /// Table name, mirroring the catalog key: constraint errors carry it so
+    /// multi-table statements say WHICH table failed. Rebuilt on load (the
+    /// catalog serializes the key itself, so this is never part of the
+    /// on-disk format) and empty only for synthesized/test metas.
+    name: String,
     columns: Vec<String>,
     pages: Vec<u32>,
     primary_key: Option<String>,
@@ -450,11 +455,21 @@ impl TableMeta {
             .any(|d| d.name == root_key && d.unique)
     }
 
+    /// Qualify a column with the table name for constraint errors
+    /// (`users.email`); synthesized metas without a name stay unqualified.
+    fn qual(&self, col: &str) -> String {
+        if self.name.is_empty() {
+            col.to_string()
+        } else {
+            format!("{}.{}", self.name, col)
+        }
+    }
+
     /// Validate a document against declared constraints.
     fn check(&self, doc: &Object) -> Result<()> {
         for col in &self.not_null {
             if matches!(doc.get(col), Some(Value::Null) | None) {
-                return err(format!("NOT NULL constraint failed: {col}"));
+                return err(format!("NOT NULL constraint failed: {}", self.qual(col)));
             }
         }
         for text in &self.checks {
@@ -466,7 +481,7 @@ impl TableMeta {
             // false conjunct), so the expression is evaluated with proper
             // unknown propagation.
             if matches!(check_expr_outcome(&e, doc)?, CheckOutcome::Fail) {
-                return err(format!("CHECK constraint failed: {text}"));
+                return err(format!("CHECK constraint failed on {}: {text}", self.name));
             }
         }
         Ok(())
@@ -483,7 +498,7 @@ impl TableMeta {
                     }
                     let key = encode::encode_to_vec(v).map_err(SqlError::Encode)?;
                     if !seen.insert(key) {
-                        return err(format!("UNIQUE constraint failed: {col}"));
+                        return err(format!("UNIQUE constraint failed: {}", self.qual(col)));
                     }
                 }
             }
@@ -1408,7 +1423,7 @@ impl<'a> ReadCx<'a> {
             }) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
-                None => return err(format!("unknown table function {fname}")),
+                None => return err(format!("unknown table function: {fname}")),
             };
             if docs.is_empty() {
                 if outer {
@@ -1601,7 +1616,7 @@ impl<'a> ReadCx<'a> {
                 }) {
                     Some(Ok(rows)) => rows,
                     Some(Err(e)) => return Err(e),
-                    None => return err(format!("unknown table function {fname}")),
+                    None => return err(format!("unknown table function: {fname}")),
                 };
                 let ordinal_on = vals.len() == 3 && matches!(vals[2], Value::Int(n) if n != 0);
                 rename_tablefn_docs(alias_obj, &fname, ordinal_on, &mut docs)?;
@@ -1630,7 +1645,7 @@ impl<'a> ReadCx<'a> {
                     }) {
                         Some(Ok(rows)) => rows,
                         Some(Err(e)) => return Err(e),
-                        None => return err("unknown table function OPENJSON"),
+                        None => return err("unknown table function: OPENJSON"),
                     };
                 rename_tablefn_docs(alias_obj, "OPENJSON", false, &mut docs)?;
                 return Ok(("@tablefn".into(), Some(alias_obj.name.value.clone()), docs));
@@ -1726,7 +1741,7 @@ impl<'a> ReadCx<'a> {
             }) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
-                None => return err(format!("unknown table function {fname}")),
+                None => return err(format!("unknown table function: {fname}")),
             };
             let ordinal_on = vals.len() == 3 && matches!(vals[2], Value::Int(n) if n != 0);
             rename_tablefn_docs(alias_obj, &fname, ordinal_on, &mut docs)?;
@@ -2528,7 +2543,9 @@ impl<'a> ReadCx<'a> {
                         }
                         "NTILE" => {
                             let buckets = match eval_const(args.first().ok_or_else(|| {
-                                SqlError::Message("function NTILE takes exactly 1 argument".into())
+                                SqlError::Message(
+                                    "function NTILE takes exactly 1 argument, got 0".into(),
+                                )
                             })?)? {
                                 Value::Int(b) if b >= 1 => b as usize,
                                 other => {
@@ -2767,7 +2784,7 @@ impl<'a> ReadCx<'a> {
                         let docs = match crate::tsql::table_function("OPENJSON", &[val]) {
                             Some(Ok(docs)) => docs,
                             Some(Err(e)) => return Err(e),
-                            None => return err("unknown table function OPENJSON"),
+                            None => return err("unknown table function: OPENJSON"),
                         };
                         if docs.is_empty() {
                             if outer {
@@ -2904,7 +2921,7 @@ impl<'a> ReadCx<'a> {
                     (left_join, right_join, on)
                 }
                 JoinOperator::CrossJoin(_) => (false, false, None),
-                _ => return err("unsupported join type"),
+                other => return err(format!("unsupported join type: {}", join_op_name(other))),
             };
             rows = join_rows(
                 rows,
@@ -3055,7 +3072,7 @@ impl<'a> ReadCx<'a> {
                 }
                 e.clone()
             }
-            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
+            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL is not supported"),
         };
         let grouping_sets = expand_grouping_sets(&group_exprs)?;
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
@@ -3222,7 +3239,11 @@ impl<'a> ReadCx<'a> {
                 };
                 // Column *counts* must match; names may differ (left wins).
                 if lr.columns.len() != rr.columns.len() {
-                    return err("set operation arms have different column counts");
+                    return err(format!(
+                        "set operation arms have different column counts (left {}, right {})",
+                        lr.columns.len(),
+                        rr.columns.len()
+                    ));
                 }
                 let all = set_quantifier == SetQuantifier::All;
                 match op {
@@ -5360,7 +5381,7 @@ impl<'a> ReadCx<'a> {
                 }
                 e.clone()
             }
-            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL not supported"),
+            sqlparser::ast::GroupByExpr::All(_) => return err("GROUP BY ALL is not supported"),
         };
         let is_aggregate = !group_exprs.is_empty() || select.projection.iter().any(is_agg_item);
         let distinct_all = matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All));
@@ -5558,7 +5579,8 @@ impl<'a> ReadCx<'a> {
                     out,
                     "SCAN",
                     format!(
-                        "TOP-K WINDOW ON {} BY {fields} SKIP {} LIMIT {}                          (encoded-byte key extraction)",
+                        "TOP-K WINDOW ON {} BY {fields} SKIP {} LIMIT {} \
+                         (encoded-byte key extraction)",
                         up.table, up.skip, up.take
                     ),
                 );
@@ -6147,6 +6169,7 @@ impl Database {
                             tables.insert(
                                 name.clone(),
                                 std::sync::Arc::new(TableMeta {
+                                    name: name.clone(),
                                     columns,
                                     pages,
                                     primary_key,
@@ -9737,7 +9760,7 @@ impl Database {
                 return err(format!("column {col} does not exist"));
             }
             if cols.contains(&col) {
-                return err(format!("duplicate column {col} in index {iname}"));
+                return err(format!("duplicate column name: {col} (in index {iname})"));
             }
             cols.push(col);
         }
@@ -10203,9 +10226,7 @@ impl Database {
                     // rename must too (a renamed-away table would silently
                     // vanish from every backup).
                     if is_system_table(&new_name) || crate::useradmin::is_user_table(&new_name) {
-                        return err(format!(
-                            "table name {new_name} is reserved for internal use"
-                        ));
+                        return err(format!("table name {new_name} is reserved for the engine"));
                     }
                     // Same parity as CREATE TABLE: a # temp-table name is
                     // refused outright, and a compat dictionary name would
@@ -10659,6 +10680,9 @@ impl Database {
                     }
                     let docs = self.table_docs_cx(&tname)?;
                     let old_entry = self.tables.get(&tname).cloned();
+                    // The mirrored catalog key follows the rename; constraint
+                    // errors keep naming the table users actually see.
+                    meta.name = new_name.clone();
                     // 自引用外键的 rt 跟随新名(与其它引用方一并改写)。
                     for (_, rt, _) in meta.foreign_keys.iter_mut() {
                         if *rt == tname {
@@ -10827,7 +10851,8 @@ impl Database {
                 if let Some(final_state) = self_final {
                     if !final_state.iter().any(matches_parent) {
                         return err(format!(
-                            "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
+                            "FOREIGN KEY constraint failed: {table}.{col} references \
+                             {rtable}.{rcol}"
                         ));
                     }
                     continue;
@@ -10839,7 +10864,7 @@ impl Database {
             let ref_docs = self.table_docs_cx(rtable)?;
             if !ref_docs.iter().any(matches_parent) {
                 return err(format!(
-                    "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
+                    "FOREIGN KEY constraint failed: {table}.{col} references {rtable}.{rcol}"
                 ));
             }
         }
@@ -11084,6 +11109,7 @@ impl Database {
             self.exec_query_cx(q)?;
         }
         let meta = TableMeta {
+            name: name.clone(),
             view_sql: Some(body),
             ..Default::default()
         };
@@ -11228,6 +11254,7 @@ impl Database {
                 }
             }
             let mut meta = TableMeta {
+                name: name.clone(),
                 columns: r.columns,
                 ..Default::default()
             };
@@ -11248,6 +11275,7 @@ impl Database {
             }
         }
         let mut meta = TableMeta {
+            name: name.clone(),
             columns,
             ..Default::default()
         };
@@ -11796,7 +11824,8 @@ impl Database {
             {
                 if calls_newid(e) {
                     return err(
-                        "NEWID()/NEWSEQUENTIALID() is not supported in DO UPDATE SET/WHERE                          (replication replay would diverge)",
+                        "NEWID()/NEWSEQUENTIALID() is not supported in DO UPDATE SET/WHERE \
+                         (replication replay would diverge)",
                     );
                 }
             }
@@ -11815,7 +11844,9 @@ impl Database {
                     if c.conflict_target.is_none()
             ) {
                 return err(
-                    "ON CONFLICT DO UPDATE requires a conflict target (PostgreSQL semantics) —                      name the unique key with ON CONFLICT (cols) / ON CONSTRAINT, or use the                      MySQL spelling ON DUPLICATE KEY UPDATE for any-key matching",
+                    "ON CONFLICT DO UPDATE requires a conflict target (PostgreSQL semantics) — \
+                     name the unique key with ON CONFLICT (cols) / ON CONSTRAINT, or use the \
+                     MySQL spelling ON DUPLICATE KEY UPDATE for any-key matching",
                 );
             }
             // EXCLUDED / VALUES() are rewritten only in the direct SET/WHERE
@@ -13130,7 +13161,8 @@ impl Database {
                     if !hit {
                         self.pager.abort_tx(tx)?;
                         return err(format!(
-                            "FOREIGN KEY constraint failed: {col} -> {rtable}.{rcol}"
+                            "FOREIGN KEY constraint failed: {tname}.{col} references \
+                             {rtable}.{rcol}"
                         ));
                     }
                 }
@@ -18558,7 +18590,7 @@ fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                         }
                     }
                 }
-                _ => return err("TO_NUMBER requires a text argument"),
+                _ => return err("function TO_NUMBER requires a text argument"),
             }
         }
         "TO_CHAR" => {
@@ -19404,6 +19436,35 @@ pub fn single_table_query_refs(q: &Query) -> Option<(String, Vec<String>)> {
 
 /// Map a B+ tree error to a SQL error; duplicate hits become the familiar
 /// constraint-failure message.
+/// Human spelling of a join operator for error messages (sqlparser's
+/// `JoinOperator` implements no Display).
+fn join_op_name(op: &sqlparser::ast::JoinOperator) -> &'static str {
+    use sqlparser::ast::JoinOperator as J;
+    match op {
+        J::Join(_) => "JOIN",
+        J::Inner(_) => "INNER JOIN",
+        J::Left(_) => "LEFT JOIN",
+        J::LeftOuter(_) => "LEFT OUTER JOIN",
+        J::Right(_) => "RIGHT JOIN",
+        J::RightOuter(_) => "RIGHT OUTER JOIN",
+        J::FullOuter(_) => "FULL OUTER JOIN",
+        J::CrossJoin(_) => "CROSS JOIN",
+        J::Semi(_) => "SEMI JOIN",
+        J::LeftSemi(_) => "LEFT SEMI JOIN",
+        J::RightSemi(_) => "RIGHT SEMI JOIN",
+        J::Anti(_) => "ANTI JOIN",
+        J::LeftAnti(_) => "LEFT ANTI JOIN",
+        J::RightAnti(_) => "RIGHT ANTI JOIN",
+        J::CrossApply => "CROSS APPLY",
+        J::OuterApply => "OUTER APPLY",
+        J::AsOf { .. } => "ASOF JOIN",
+        J::StraightJoin(_) => "STRAIGHT_JOIN",
+        J::ArrayJoin => "ARRAY JOIN",
+        J::LeftArrayJoin => "LEFT ARRAY JOIN",
+        J::InnerArrayJoin => "INNER ARRAY JOIN",
+    }
+}
+
 fn index_err(col: &str, e: BTreeError) -> SqlError {
     match e {
         BTreeError::Duplicate => SqlError::Message(format!("UNIQUE constraint failed: {col}")),
@@ -21151,7 +21212,11 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
                 _ => return err("not an arithmetic operator"),
             })
         }
-        _ => err(format!("non-numeric operands: {l:?} {op} {r:?}")),
+        _ => err(format!(
+            "non-numeric operands: {} {op} {}",
+            l.type_name(),
+            r.type_name()
+        )),
     }
 }
 
@@ -21160,7 +21225,7 @@ fn as_f64(v: &Value) -> Result<f64> {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
         Value::Decimal(d) => Ok(d.to_f64().unwrap_or(f64::NAN)),
-        other => err(format!("non-numeric operand: {other:?}")),
+        other => err(format!("non-numeric operand of type {}", other.type_name())),
     }
 }
 
@@ -21172,7 +21237,7 @@ fn as_decimal(v: &Value) -> Result<Decimal> {
         Value::Int(i) => Ok(Decimal::from(*i)),
         Value::Float(f) => Decimal::from_f64_retain(*f)
             .ok_or_else(|| SqlError::Message(format!("non-finite float in arithmetic: {f}"))),
-        other => err(format!("non-numeric operand: {other:?}")),
+        other => err(format!("non-numeric operand of type {}", other.type_name())),
     }
 }
 
@@ -22296,6 +22361,57 @@ mod tests {
     }
 
     #[test]
+    fn constraint_errors_carry_table_name() {
+        // NOT NULL / CHECK / FK failures must name the table: multi-table
+        // statements (JOIN, INSERT..SELECT) otherwise leave the user
+        // guessing WHICH table's column failed. UNIQUE carries the table on
+        // the set-level path (check_unique); tree-level duplicates identify
+        // the key column via the index root key.
+        let mut db = Database::in_memory().unwrap();
+        db.execute("CREATE TABLE customers (id INT PRIMARY KEY)")
+            .unwrap();
+        db.execute("INSERT INTO customers (id) VALUES (1)").unwrap();
+        db.execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT NOT NULL, \
+             cid INT REFERENCES customers (id), CHECK (id >= 0))",
+        )
+        .unwrap();
+        let e = db
+            .execute("INSERT INTO orders (id, cid) VALUES (1, 1)")
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("NOT NULL constraint failed: orders.sku"),
+            "{e}"
+        );
+        let e = db
+            .execute("INSERT INTO orders (id, sku, cid) VALUES (-1, 'x', 1)")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("CHECK constraint failed on orders"),
+            "{e}"
+        );
+        let e = db
+            .execute("INSERT INTO orders (id, sku, cid) VALUES (1, 'x', 99)")
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("FOREIGN KEY constraint failed: orders.cid references customers.id"),
+            "{e}"
+        );
+        // The .NET driver detects unique violations by the message prefix —
+        // both qualification shapes must keep it.
+        let e = db
+            .execute("INSERT INTO orders (id, sku, cid) VALUES (1, 'a', 1)")
+            .unwrap();
+        drop(e);
+        let e = db
+            .execute("INSERT INTO orders (id, sku, cid) VALUES (1, 'b', 1)")
+            .unwrap_err();
+        assert!(e.to_string().starts_with("UNIQUE constraint failed"), "{e}");
+    }
+
+    #[test]
     fn create_index_rejects_bad_targets() {
         let mut db = Database::in_memory().unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT)")
@@ -22308,7 +22424,7 @@ mod tests {
         assert!(e.to_string().contains("does not exist"), "{e}");
         // duplicate column inside one index
         let e = db.execute("CREATE INDEX i ON t (a, a)").unwrap_err();
-        assert!(e.to_string().contains("duplicate column a"), "{e}");
+        assert!(e.to_string().contains("duplicate column name: a"), "{e}");
         // duplicate name carries the name in the message
         db.execute("CREATE INDEX i ON t (a)").unwrap();
         let e = db.execute("CREATE INDEX i ON t (a)").unwrap_err();
@@ -33502,7 +33618,7 @@ mod complex_query_tests {
             .execute("CREATE INDEX cpx2 ON t (a, a)")
             .unwrap_err()
             .to_string()
-            .contains("duplicate column a"));
+            .contains("duplicate column name: a"));
         assert!(db
             .execute("CREATE INDEX cpx3 ON t (a, nope)")
             .unwrap_err()

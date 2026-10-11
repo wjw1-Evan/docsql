@@ -7199,7 +7199,7 @@ async fn sessions_frame_lists_and_kill_closes() {
     let f = a.recv().await;
     assert_eq!(f.frame_type, proto::RESP_ERROR, "{}", payload_str(&f));
     assert!(
-        payload_str(&f).contains("no such connection"),
+        payload_str(&f).contains("connection 999999 does not exist"),
         "{}",
         payload_str(&f)
     );

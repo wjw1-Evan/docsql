@@ -2228,7 +2228,9 @@ pub async fn handle_connection(
                                 }
                                 None => Some(Frame::new(
                                     proto::RESP_ERROR,
-                                    err_payload("no such connection (it may have closed; refresh)"),
+                                    err_payload(&format!(
+                                        "connection {id} does not exist (it may have closed; refresh)"
+                                    )),
                                 )),
                             }
                         }
@@ -2549,12 +2551,14 @@ pub async fn handle_connection(
                     } else if sql.len() > MAX_PREPARED_TEMPLATE_BYTES {
                         Some(Frame::new(
                             proto::RESP_ERROR,
-                            err_payload("prepare: statement template too large"),
+                            err_payload("prepare: statement template too large (max 65536 bytes)"),
                         ))
                     } else if prepared.len() >= MAX_PREPARED_STATEMENTS {
                         Some(Frame::new(
                             proto::RESP_ERROR,
-                            err_payload("prepare: too many prepared statements on this connection"),
+                            err_payload(
+                                "prepare: too many prepared statements on this connection (max 1024)",
+                            ),
                         ))
                     } else {
                         let h = next_stmt_handle;
@@ -3851,7 +3855,8 @@ fn apply_row_filters(
                 for b in bases {
                     if filtered.contains(&lower(&b)) {
                         return Err(format!(
-                            "view {t} reads row-filtered table {b};                              row filters cannot protect it through the view"
+                            "view {t} reads row-filtered table {b}; \
+                             row filters cannot protect it through the view"
                         ));
                     }
                     queue.push(b);
@@ -4057,7 +4062,9 @@ fn apply_row_filters(
         let top = rewritten_tables.iter().filter(|x| x.as_str() == *t).count();
         if deep > top {
             return Err(format!(
-                "row filter on {t}: the statement reads {t} in a position row filters                  cannot protect (subquery / JOIN / view / set operation); rewrite the                  statement or use an unrestricted grant"
+                "row filter on {t}: the statement reads {t} in a position row filters \
+                 cannot protect (subquery / JOIN / view / set operation); rewrite the \
+                 statement or use an unrestricted grant"
             ));
         }
     }
@@ -4301,7 +4308,12 @@ fn authorize_statement(
                             write_targets = targets;
                         }
                         None => {
-                            return Err("TRUNCATE ... CASCADE cannot be authorized here".into());
+                            return Err(
+                                "TRUNCATE ... CASCADE cannot be authorized while any cascade \
+                                 target fails to resolve (views or unresolvable references \
+                                 among the cascaded tables); resolve them first"
+                                    .into(),
+                            );
                         }
                     }
                 }
