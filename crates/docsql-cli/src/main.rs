@@ -267,20 +267,44 @@ fn main() {
                 "DocSQL {} — {path}; type SQL ending with ';', quit with exit;",
                 env!("CARGO_PKG_VERSION")
             );
-            let stdin = std::io::BufReader::new(std::io::stdin().lock());
             // Two orthogonal flags (see run_embedded): stdin REPL
             // semantics vs batch fail-fast error codes.
             let interactive = script.is_none();
             let fail_fast =
                 script.is_some() || !std::io::IsTerminal::is_terminal(&std::io::stdin());
-            run_embedded(
-                &mut db,
-                format,
-                script.as_deref(),
-                stdin,
-                interactive,
-                fail_fast,
-            );
+            // Line editing + history only on a real terminal: stdin AND
+            // stdout are ttys (a redirected stdout must not receive
+            // readline prompts into the machine-readable stream).
+            let readline = interactive
+                && !fail_fast
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if readline {
+                // The readline path reads the real stdin itself; a
+                // StdinLock held here would deadlock rustyline's own
+                // stdin lock for the whole session (found via sample(1):
+                // the main thread stuck in Stdin::lock's mutex wait).
+                run_embedded(
+                    &mut db,
+                    format,
+                    script.as_deref(),
+                    std::io::empty(),
+                    interactive,
+                    fail_fast,
+                    true,
+                );
+            } else {
+                let stdin = std::io::BufReader::new(std::io::stdin().lock());
+                run_embedded(
+                    &mut db,
+                    format,
+                    script.as_deref(),
+                    stdin,
+                    interactive,
+                    fail_fast,
+                    false,
+                );
+            }
         }
     }
 }
@@ -540,17 +564,106 @@ fn meta_command_hint() {
     );
 }
 
-/// REPL prompt for interactive terminals: `docsql> ` between statements,
-/// `...> ` while a multi-line statement buffers (psql/sqlite3 semantics;
-/// without it a carriage return after `CREATE TABLE t (` looked like a
-/// hang). Non-tty stdin and machine formats stay silent.
-fn prompt_next(on: bool, fresh: bool) {
-    if !on {
-        return;
+/// REPL prompt for the readline path: `docsql> ` between statements,
+/// `...> ` while a multi-line statement buffers (psql/sqlite3 semantics).
+fn line_prompt(stmt: &str) -> &'static str {
+    if stmt.trim().is_empty() {
+        "docsql> "
+    } else {
+        "...> "
     }
-    print!("{}", if fresh { "docsql> " } else { "...> " });
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+}
+
+/// Outcome of reading one input line.
+enum ReadOutcome {
+    Line(String),
+    Eof,
+    /// Ctrl-C at the readline prompt (the line being edited is dropped).
+    Interrupted,
+    Error(String),
+}
+
+/// Line source: an interactive terminal reads through rustyline (line
+/// editing, ↑/↓ history, the prompt rendered by readline itself); scripts
+/// and pipes fall back to a bare BufReader — zero prompts, no editing, the
+/// machine-readable semantics unchanged. The prompt is supplied per read by
+/// the caller (statement buffer decides main vs continuation).
+enum LineSource {
+    // Boxed: the editor is ~500 bytes; keep the enum small (clippy
+    // large_enum_variant).
+    Readline(Box<rustyline::DefaultEditor>),
+    Raw(std::io::Lines<std::io::BufReader<Box<dyn std::io::Read>>>),
+}
+
+impl LineSource {
+    fn readline_interactive() -> std::io::Result<Self> {
+        // auto history: every non-empty accepted line lands in ↑/↓ recall.
+        let config = rustyline::Config::builder().auto_add_history(true).build();
+        let mut rl = rustyline::Editor::with_config(config)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let _ = rl.load_history(&cli_history_path());
+        Ok(LineSource::Readline(Box::new(rl)))
+    }
+    fn raw(source: Box<dyn std::io::Read>) -> Self {
+        LineSource::Raw(std::io::BufReader::new(source).lines())
+    }
+    fn next_line(&mut self, prompt: &str) -> ReadOutcome {
+        match self {
+            LineSource::Readline(rl) => match rl.readline(prompt) {
+                Ok(l) => ReadOutcome::Line(l),
+                Err(rustyline::error::ReadlineError::Interrupted) => ReadOutcome::Interrupted,
+                Err(rustyline::error::ReadlineError::Eof) => ReadOutcome::Eof,
+                Err(e) => ReadOutcome::Error(e.to_string()),
+            },
+            LineSource::Raw(lines) => match lines.next() {
+                Some(Ok(l)) => ReadOutcome::Line(l),
+                Some(Err(e)) => ReadOutcome::Error(e.to_string()),
+                None => ReadOutcome::Eof,
+            },
+        }
+    }
+    /// Persist the in-memory history (session end); best effort.
+    fn save_history(&mut self) {
+        if let LineSource::Readline(rl) = self {
+            let _ = rl.save_history(&cli_history_path());
+        }
+    }
+}
+
+/// History file beside the other dotfiles (`~/.docsql_history`, the
+/// psql/sqlite3 convention) so ↑/↓ recall survives sessions; falls back
+/// to the temp dir when HOME is unset.
+fn cli_history_path() -> std::path::PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home).join(".docsql_history"),
+        None => std::env::temp_dir().join("docsql-history"),
+    }
+}
+
+/// Interactive SIGINT discipline: the handler only writes an atomic flag
+/// (async-signal-safe); the REPL consumes it at statement boundaries.
+/// Ctrl-C during a run no longer kills the session (the default
+/// disposition dropped uncommitted transactions and silently dropped
+/// subscriptions) — the interrupted buffer is discarded and the prompt
+/// returns. A statement already executing on the engine/server still runs
+/// to completion (there is no server-side cancel); the CLI just does not
+/// die or continue the batch. Scripts and pipes keep the default
+/// disposition (Ctrl-C terminating a script is what operators expect).
+static SIGINT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn cli_sigint(_sig: libc::c_int) {
+    SIGINT_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn install_interactive_sigint() {
+    let handler: extern "C" fn(libc::c_int) = cli_sigint;
+    unsafe {
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+    }
+}
+
+fn take_sigint() -> bool {
+    SIGINT_SEEN.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// One-line preview of a statement for error context in SCRIPT mode (the
@@ -569,15 +682,15 @@ fn run_embedded(
     db: &mut Database,
     format: Format,
     script: Option<&str>,
-    input: impl std::io::Read,
-    // stdin REPL semantics: the terminal prompt (`docsql> `/`...> `) shows
-    // only for an interactive terminal run; the sentinels fire in script/
-    // piped mode too.
-    interactive: bool,
+    input: impl std::io::Read + 'static,
+    // Kept for call-site symmetry with the remote loop; the readline flag
+    // below is what actually drives the interactive behavior now.
+    _interactive: bool,
     // An SQL error exits non-zero: -f scripts AND piped-stdin batch runs
     // (`docsql app.db < migrate.sql` used to exit 0; CI read a false
     // success). A terminal session keeps the REPL alive.
     fail_fast: bool,
+    readline: bool,
 ) {
     let source: Box<dyn std::io::Read> = match script {
         Some(p) => match std::fs::File::open(p) {
@@ -589,23 +702,67 @@ fn run_embedded(
         },
         None => Box::new(input),
     };
+    let mut src = if readline {
+        install_interactive_sigint();
+        match LineSource::readline_interactive() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: line editing unavailable ({e}); falling back to plain input");
+                LineSource::raw(source)
+            }
+        }
+    } else {
+        LineSource::raw(source)
+    };
     let mut stmt = String::new();
     let mut done = false;
     let mut tsql = docsql_core::tsql_batch::TsqlSession::new();
-    let prompt_on = interactive && !fail_fast && matches!(format, Format::Table);
-    prompt_next(prompt_on, true);
-    for line in std::io::BufReader::new(source).lines() {
-        let line = line.unwrap_or_else(|e| {
-            eprintln!("read error: {e}");
-            std::process::exit(1);
-        });
+    // Empty-prompt Ctrl-C twice exits (psql semantics); any accepted line
+    // or discarded buffer resets the streak.
+    let mut interrupts = 0;
+    loop {
+        let line = match src.next_line(line_prompt(&stmt)) {
+            ReadOutcome::Line(l) => l,
+            ReadOutcome::Interrupted => {
+                if stmt.trim().is_empty() {
+                    interrupts += 1;
+                    if interrupts >= 2 {
+                        println!();
+                        // exit() skips the loop tail's save_history().
+                        src.save_history();
+                        std::process::exit(130);
+                    }
+                    eprintln!("(press Ctrl+C again to exit)");
+                } else {
+                    interrupts = 0;
+                    eprintln!("(statement buffer discarded)");
+                    stmt.clear();
+                }
+                continue;
+            }
+            ReadOutcome::Eof => break,
+            ReadOutcome::Error(e) => {
+                eprintln!("read error: {e}");
+                std::process::exit(1);
+            }
+        };
+        interrupts = 0;
+        // SIGINT consumed at the statement boundary: a Ctrl-C that arrived
+        // while the previous statement executed (the engine is synchronous;
+        // the running statement is not cancellable, but the session must
+        // survive) discards whatever buffered next and returns to the
+        // prompt instead of running it.
+        if take_sigint() && !stmt.trim().is_empty() {
+            stmt.clear();
+            eprintln!("(interrupted — statement discarded)");
+            continue;
+        }
         let trimmed = line.trim();
         // A blank line BETWEEN statements is skipped; inside a buffered
         // multi-line statement it is literal payload — string literals
         // span lines and dumps reproduce blank lines verbatim, so eating
         // them mid-statement silently corrupted stored documents.
         if trimmed.is_empty() && stmt.trim().is_empty() {
-            prompt_next(prompt_on, true);
             continue;
         }
         // Same buffer gate for the sentinels: a line that happens to be
@@ -621,27 +778,24 @@ fn run_embedded(
                 }
                 Sentinel::Help => {
                     print_embedded_help(format);
-                    prompt_next(prompt_on, true);
                     continue;
                 }
                 Sentinel::No => {}
             }
             if is_meta_command_line(trimmed) {
                 meta_command_hint();
-                prompt_next(prompt_on, true);
                 continue;
             }
         }
         stmt.push_str(&line);
         stmt.push('\n');
         if !statements_ready(&stmt) {
-            prompt_next(prompt_on, false);
             continue;
         }
         run_embedded_chunk(db, &mut tsql, &stmt, format, !fail_fast);
         stmt.clear();
-        prompt_next(prompt_on, true);
     }
+    src.save_history();
     // Scripts tolerate a missing final `;`. An interactive terminal does
     // not: Ctrl+D with a dangling buffer means "abandon this", and running
     // a half-typed DELETE just because it lacked a semicolon is how
@@ -753,7 +907,9 @@ fn print_embedded_help(format: Format) {
                                      from sqlite3/psql are not supported)\n\
                 help;                         this summary\n\
                 SQL ends with ';' — multiple statements per line are executed in order\n\
+                interactive terminals get line editing + up/down history (~/.docsql_history)\n\
                 Ctrl+D discards an unfinished statement; exit; to leave\n\
+                Ctrl+C discards the current buffer (twice on an empty prompt exits)\n\
                 flags: --csv | --json (row output), -f <script.sql> (batch, fail-fast)";
     match format {
         Format::Csv | Format::Json => eprintln!("{text}"),
@@ -1509,24 +1665,72 @@ fn remote_shell(
     };
     // Same split as the embedded mode: the `exit;` sentinel stays active
     // for piped stdin (deployment helpers end every heredoc with it), while
-    // an SQL error fails fast outside a terminal.
+    // an SQL error fails fast outside a terminal. A real terminal (stdin
+    // AND stdout are ttys — a redirected stdout must not receive readline
+    // prompts) gets line editing + history.
     let interactive = script.is_none();
     let fail_fast = !interactive || !std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let prompt_on = interactive && !fail_fast && matches!(format, Format::Table);
+    let use_readline = interactive
+        && !fail_fast
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut src = if use_readline {
+        install_interactive_sigint();
+        match LineSource::readline_interactive() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: line editing unavailable ({e}); falling back to plain input");
+                LineSource::raw(source)
+            }
+        }
+    } else {
+        LineSource::raw(source)
+    };
     let mut stmt = String::new();
     let mut stmt_failed = false;
-    prompt_next(prompt_on, true);
-    for line in std::io::BufReader::new(source).lines() {
-        let line = line.unwrap_or_else(|e| {
-            eprintln!("read error: {e}");
-            std::process::exit(1);
-        });
+    // Empty-prompt Ctrl-C twice exits (psql semantics), same as embedded.
+    let mut interrupts = 0;
+    loop {
+        let line = match src.next_line(line_prompt(&stmt)) {
+            ReadOutcome::Line(l) => l,
+            ReadOutcome::Interrupted => {
+                if stmt.trim().is_empty() {
+                    interrupts += 1;
+                    if interrupts >= 2 {
+                        println!();
+                        // exit() skips the loop tail's save_history().
+                        src.save_history();
+                        std::process::exit(130);
+                    }
+                    eprintln!("(press Ctrl+C again to exit)");
+                } else {
+                    interrupts = 0;
+                    eprintln!("(statement buffer discarded)");
+                    stmt.clear();
+                }
+                continue;
+            }
+            ReadOutcome::Eof => break,
+            ReadOutcome::Error(e) => {
+                eprintln!("read error: {e}");
+                std::process::exit(1);
+            }
+        };
+        interrupts = 0;
+        // Statement-boundary SIGINT: a Ctrl-C during the previous
+        // round-trip (the wait itself is not abortable — the server keeps
+        // executing; there is no server-side cancel) discards the pending
+        // buffer and returns to the prompt instead of sending it.
+        if take_sigint() && !stmt.trim().is_empty() {
+            stmt.clear();
+            eprintln!("(interrupted — statement discarded)");
+            continue;
+        }
         let trimmed = line.trim();
         // Same rules as the embedded loop: blank lines and sentinels are
         // only skipped/recognized BETWEEN statements, never inside a
         // buffered multi-line literal.
         if trimmed.is_empty() && stmt.trim().is_empty() {
-            prompt_next(prompt_on, true);
             continue;
         }
         if stmt.trim().is_empty() {
@@ -1538,14 +1742,12 @@ fn remote_shell(
                 Sentinel::Exit => break,
                 Sentinel::Help => {
                     print_remote_help();
-                    prompt_next(prompt_on, true);
                     continue;
                 }
                 Sentinel::No => {}
             }
             if is_meta_command_line(trimmed) {
                 meta_command_hint();
-                prompt_next(prompt_on, true);
                 continue;
             }
         }
@@ -1573,7 +1775,6 @@ fn remote_shell(
                     // an orchestrator believed the rotation succeeded.
                     stmt_failed = true;
                 }
-                prompt_next(prompt_on, true);
                 continue;
             }
             // Inline pub/sub commands (single line, `;`-terminated like SQL).
@@ -1586,14 +1787,12 @@ fn remote_shell(
                     // Only a transport loss leaves the session unusable.
                     PubsubOutcome::Transport => std::process::exit(1),
                 }
-                prompt_next(prompt_on, true);
                 continue;
             }
         }
         stmt.push_str(&line);
         stmt.push('\n');
         if !statements_ready(&stmt) {
-            prompt_next(prompt_on, false);
             continue;
         }
         // T-SQL batches (variables/control flow) go to the server as ONE
@@ -1614,7 +1813,6 @@ fn remote_shell(
                 }
             }
             stmt.clear();
-            prompt_next(prompt_on, true);
             continue;
         }
         for part in split_ready(&stmt) {
@@ -1633,8 +1831,8 @@ fn remote_shell(
             stmt_failed = stmt_failed || f.frame_type == proto::RESP_ERROR;
         }
         stmt.clear();
-        prompt_next(prompt_on, true);
     }
+    src.save_history();
     // Scripts tolerate a missing final `;`. split_ready delegates to the
     // engine's BEGIN/END-aware splitter, so a semicolon-less T-SQL block
     // still goes out as ONE frame (the server-side interpreter picks it
@@ -2336,6 +2534,7 @@ mod tests {
             std::io::empty(),
             false,
             true,
+            false,
         );
         // The dangling INSERT (no final `;`) still executed.
         match db.execute("SELECT COUNT(*) FROM t").unwrap() {
@@ -2665,7 +2864,7 @@ mod tests {
              exit;\n\
              INSERT INTO t VALUES (2, 'after-exit-ignored');\n",
         );
-        run_embedded(&mut db, Format::Table, None, input, true, false);
+        run_embedded(&mut db, Format::Table, None, input, true, false, false);
         match db.execute("SELECT COUNT(*) FROM t").unwrap() {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
             other => panic!("{other:?}"),
@@ -2674,7 +2873,7 @@ mod tests {
         // 不该因缺分号而执行)——与 psql 的首个 Ctrl+D 清缓冲一致。
         let mut db2 = Database::in_memory().unwrap();
         let input2 = std::io::Cursor::new("CREATE TABLE u (id INT);\nINSERT INTO u VALUES (9)\n");
-        run_embedded(&mut db2, Format::Csv, None, input2, true, false);
+        run_embedded(&mut db2, Format::Csv, None, input2, true, false, false);
         match db2.execute("SELECT COUNT(*) FROM u").unwrap() {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(0)),
             other => panic!("{other:?}"),
@@ -2682,7 +2881,7 @@ mod tests {
         // 脚本/管道(fail_fast)仍冲刷无尾分号的末条语句。
         let mut db3 = Database::in_memory().unwrap();
         let input3 = std::io::Cursor::new("CREATE TABLE w (id INT);\nINSERT INTO w VALUES (9)\n");
-        run_embedded(&mut db3, Format::Csv, None, input3, false, true);
+        run_embedded(&mut db3, Format::Csv, None, input3, false, true, false);
         match db3.execute("SELECT COUNT(*) FROM w").unwrap() {
             ExecOutcome::Rows(r) => assert_eq!(r.rows[0][0], Value::Int(1)),
             other => panic!("{other:?}"),
@@ -2913,6 +3112,7 @@ mod tests {
             std::io::Cursor::new("INSERT INTO d VALUES ('para one\n\npara two');\n"),
             true,
             true,
+            false,
         );
         let out = db.execute("SELECT LENGTH(v) AS n FROM d").unwrap();
         let docsql_core::engine::ExecOutcome::Rows(r) = out else {
@@ -2935,6 +3135,7 @@ mod tests {
             ),
             true,
             true,
+            false,
         );
         let out = db.execute("SELECT COUNT(*) AS n FROM d").unwrap();
         let docsql_core::engine::ExecOutcome::Rows(r) = out else {

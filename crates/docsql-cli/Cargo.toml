@@ -15,6 +15,7 @@ libc = "0.2"
 # provider, same version pin as the server/web TLS stacks.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
+rustyline = "14"
 
 [dev-dependencies]
 sqlparser = "0.62"
