@@ -188,6 +188,7 @@
            transition: background-color .08s ease; }
   .tnode:hover { background: var(--tree-hover); }
   .tnode.sel { background: var(--tree-sel); outline: 1px dotted var(--tree-sel-bd); }
+  .tnode:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
   .tnode .twist { width: 14px; flex: none; text-align: center; color: var(--txt3);
                   font-size: 9px; cursor: pointer; }
   .tnode .tico { width: 17px; flex: none; display: inline-flex; }
@@ -400,24 +401,24 @@
 
 <div id="menubar">
   <span class="brand"><span class="brand-glyph" id="brand-glyph"></span>DocSQL <small>Studio</small></span>
-  <div class="menu" data-menu><span><span data-i18n>文件</span></span><div class="menu-drop">
-    <div data-act="new-query"><span data-i18n>新建查询</span><span class="kbd">Ctrl+N</span></div>
-    <div data-act="new-table"><span data-i18n>新建表…</span></div>
-    <hr>
-    <div data-act="close-tab"><span data-i18n>关闭当前文档</span></div>
-    <div data-act="account" style="display:none"><span data-i18n>修改账号…</span></div>
-    <div data-act="logout" style="display:none"><span data-i18n>退出登录</span></div>
+  <div class="menu" data-menu><span role="button" tabindex="0" aria-haspopup="menu"><span data-i18n>文件</span></span><div class="menu-drop" role="menu">
+    <div data-act="new-query" role="menuitem" tabindex="-1"><span data-i18n>新建查询</span><span class="kbd">Ctrl+N</span></div>
+    <div data-act="new-table" role="menuitem" tabindex="-1"><span data-i18n>新建表…</span></div>
+    <hr role="separator">
+    <div data-act="close-tab" role="menuitem" tabindex="-1"><span data-i18n>关闭当前文档</span></div>
+    <div data-act="account" style="display:none" role="menuitem" tabindex="-1"><span data-i18n>修改账号…</span></div>
+    <div data-act="logout" style="display:none" role="menuitem" tabindex="-1"><span data-i18n>退出登录</span></div>
   </div></div>
-  <div class="menu" data-menu><span><span data-i18n>视图</span></span><div class="menu-drop">
-    <div data-act="refresh"><span data-i18n>刷新对象资源管理器</span><span class="kbd">Ctrl+R</span></div>
-    <div data-act="dashboard"><span data-i18n>服务器仪表盘</span></div>
-    <div data-act="sessions"><span data-i18n>活动会话</span></div>
-    <div data-act="cluster"><span data-i18n>集群状态</span></div>
-    <div data-act="logs"><span data-i18n>日志</span></div>
-    <div data-act="backup"><span data-i18n>备份管理</span></div>
+  <div class="menu" data-menu><span role="button" tabindex="0" aria-haspopup="menu"><span data-i18n>视图</span></span><div class="menu-drop" role="menu">
+    <div data-act="refresh" role="menuitem" tabindex="-1"><span data-i18n>刷新对象资源管理器</span><span class="kbd">Ctrl+R</span></div>
+    <div data-act="dashboard" role="menuitem" tabindex="-1"><span data-i18n>服务器仪表盘</span></div>
+    <div data-act="sessions" role="menuitem" tabindex="-1"><span data-i18n>活动会话</span></div>
+    <div data-act="cluster" role="menuitem" tabindex="-1"><span data-i18n>集群状态</span></div>
+    <div data-act="logs" role="menuitem" tabindex="-1"><span data-i18n>日志</span></div>
+    <div data-act="backup" role="menuitem" tabindex="-1"><span data-i18n>备份管理</span></div>
   </div></div>
-  <div class="menu" data-menu><span><span data-i18n>帮助</span></span><div class="menu-drop">
-    <div data-act="about"><span data-i18n>关于 DocSQL Studio</span></div>
+  <div class="menu" data-menu><span role="button" tabindex="0" aria-haspopup="menu"><span data-i18n>帮助</span></span><div class="menu-drop" role="menu">
+    <div data-act="about" role="menuitem" tabindex="-1"><span data-i18n>关于 DocSQL Studio</span></div>
   </div></div>
 </div>
 
@@ -462,11 +463,11 @@
         <button id="exp-collapse" data-i18n-title title="全部折叠">⊖</button>
       </span>
     </div>
-    <div id="tree"></div>
+    <div id="tree" tabindex="0" role="tree" aria-label="对象资源管理器"></div>
   </div>
   <div class="splitter v" id="split-explorer" data-i18n-title title="拖动调整对象资源管理器宽度,双击恢复默认"></div>
   <div id="docarea">
-    <div id="tabstrip"></div>
+    <div id="tabstrip" role="tablist" aria-label="打开的文档"></div>
     <div id="tabcontent"></div>
   </div>
 </div>
@@ -481,7 +482,7 @@
 
 <div id="ctxmenu"></div>
 <div id="overlay"></div>
-<div id="toasts"></div>
+<div id="toasts" aria-live="polite"></div>
 
 <script>
 "use strict";
@@ -1243,6 +1244,7 @@ const ui = {
     while (host.children.length >= 4) host.firstChild.remove();
     const el = document.createElement('div');
     el.className = 'toast' + (isErr ? ' err' : '');
+    if (isErr) el.setAttribute('role', 'alert'); // 屏幕阅读器立即播报(容器 aria-live=polite 之外的强化)
     el.textContent = msg;
     host.appendChild(el);
     setTimeout(() => el.remove(), isErr ? 5000 : 2600);
@@ -1374,6 +1376,33 @@ document.addEventListener('click', () => ctx.close());
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('#tree')) ctx.close(); });
 
 /* ================= 弹窗表单 ================= */
+// 键盘导航(roving tabindex 的移动原语):容器内可见的可聚焦元素间按方向移动,
+// 返回落点元素。树/菜单/方向键导航共用;不可见(display:none 的折叠分支/隐藏
+// 菜单)自动跳过。
+const focusMove = (container, sel, dir) => {
+  const items = $$(sel, container).filter(el => el.offsetParent !== null);
+  if (!items.length) return null;
+  const idx = items.indexOf(document.activeElement);
+  const next = idx < 0 ? 0 : Math.min(items.length - 1, Math.max(0, idx + dir));
+  items[next].focus();
+  return items[next];
+};
+// 弹窗焦点陷阱:Tab/Shift+Tab 在弹窗内的可聚焦元素间循环(模态语义——
+// 焦点跑到底层页面后 Esc/Tab 就再也无法回弹窗,键盘用户被锁在外面)。
+// showModal 每次先移除再挂,防重复叠加。
+function modalTrap(e) {
+  if (e.key !== 'Tab') return;
+  const ov = $('#overlay');
+  const focusables = $$('button,input,select,textarea,[tabindex]:not([tabindex="-1"])', ov)
+    .filter(el => !el.disabled && el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !ov.contains(document.activeElement))) {
+    e.preventDefault(); last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !ov.contains(document.activeElement))) {
+    e.preventDefault(); first.focus();
+  }
+}
 // Enter 提交守卫:输入法组合期间的 Enter 是「确认候选词」而非提交
 // (isComposing / keyCode 229 = IME 组合态;中文输入法按 Enter 上屏曾误触发表单提交)。
 const enterSubmits = (e) => e.key === 'Enter' && !e.isComposing && e.keyCode !== 229;
@@ -1387,13 +1416,29 @@ const guardOk = (ov, fn) => {
     try { return await fn(...a); } finally { btn.disabled = false; }
   };
 };
-function closeModal() { const ov = $('#overlay'); ov.style.display = 'none'; ov.innerHTML = ''; ov.onkeydown = null; }
+function closeModal() {
+  const ov = $('#overlay');
+  ov.style.display = 'none'; ov.innerHTML = ''; ov.onkeydown = null;
+  ov.removeEventListener('keydown', modalTrap);
+  // 关闭后焦点还原到打开弹窗的元素(否则落到 body,键盘用户每次都要从
+  // 头 Tab 一遍);触发元素可能已被移除(行已刷新等),存在才还原。
+  if (modalPrevFocus && document.contains(modalPrevFocus)) modalPrevFocus.focus();
+  modalPrevFocus = null;
+}
+let modalPrevFocus = null;
 function showModal(html, focusSel) {
+  let prev = document.activeElement;
+  // 菜单项打开弹窗时全局 click 处理会先收起菜单:还原目标若是(已隐藏的)
+  // 菜单项,focus() 静默失败、焦点掉回 body —— 上移到菜单按钮。
+  if (prev && prev.closest('.menu-drop')) prev = $('[role="button"]', prev.closest('.menu')) || prev;
+  modalPrevFocus = prev;
   const ov = $('#overlay');
   ov.innerHTML = html;
   ov.style.display = 'flex';
   $('[data-cancel]', ov).onclick = closeModal;
   ov.onmousedown = (e) => { if (e.target === ov) closeModal(); };
+  ov.removeEventListener('keydown', modalTrap);
+  ov.addEventListener('keydown', modalTrap);
   const f = focusSel && $(focusSel, ov); if (f) f.focus();
   return ov;
 }
@@ -2143,7 +2188,10 @@ const tabs = {
     const t = { id: ++this.seq, kind, key, title };
     const stripEl = document.createElement('div');
     stripEl.className = 'tab';
-    stripEl.innerHTML = `<span class="tb-ico" style="display:inline-flex">${ICONS[tabs.kindIcon(kind)]||''}</span><span class="t">${esc(title)}</span><span class="x" title="${esc(T('关闭'))}">×</span>`;
+    stripEl.setAttribute('role', 'tab');
+    stripEl.tabIndex = -1;
+    stripEl.setAttribute('aria-selected', 'false');
+    stripEl.innerHTML = `<span class="tb-ico" style="display:inline-flex">${ICONS[tabs.kindIcon(kind)]||''}</span><span class="t">${esc(title)}</span><span class="x" title="${esc(T('关闭'))}" role="button" tabindex="-1" aria-label="${esc(T('关闭'))}">×</span>`;
     stripEl.onclick = () => this.activate(t);
     stripEl.onmousedown = (e) => { if (e.button === 1) this.close(t); };
     $('.x', stripEl).onclick = (e) => { e.stopPropagation(); this.close(t); };
@@ -2161,9 +2209,12 @@ const tabs = {
   kindIcon(kind) { return { query: 'query', data: 'table', dash: 'dashboard', cluster: 'cluster', logs: 'log', users: 'key', backup: 'server' }[kind] || 'view'; },
   activate(t) {
     this.active = t;
-    $$('.tab').forEach(el => el.classList.remove('active'));
+    $$('.tab').forEach(el => { el.classList.remove('active'); el.setAttribute('aria-selected', 'false'); el.tabIndex = -1; });
     $$('.doc').forEach(el => el.classList.remove('active'));
-    t.stripEl.classList.add('active'); t.el.classList.add('active');
+    t.stripEl.classList.add('active');
+    t.stripEl.setAttribute('aria-selected', 'true');
+    t.stripEl.tabIndex = 0; // roving tabindex:仅激活标签可 Tab 进入
+    t.el.classList.add('active');
     if (t.onActivate) t.onActivate();
   },
   close(t) {
@@ -2176,6 +2227,23 @@ const tabs = {
   byKind(kind) { return this.list.filter(t => t.kind === kind); },
   activeQuery() { return this.active && this.active.kind === 'query' ? this.active : null; }
 };
+// 标签条键盘导航(ARIA tablist 惯例):←/→ 循环切换,Home/End 跳首尾;
+// 焦点随切换移动(roving tabindex)。
+$('#tabstrip').addEventListener('keydown', (e) => {
+  const strip = e.target.closest('.tab');
+  if (!strip) return;
+  const idx = tabs.list.findIndex(t => t.stripEl === strip);
+  if (idx < 0) return;
+  let to = null;
+  if (e.key === 'ArrowRight') to = tabs.list[(idx + 1) % tabs.list.length];
+  else if (e.key === 'ArrowLeft') to = tabs.list[(idx - 1 + tabs.list.length) % tabs.list.length];
+  else if (e.key === 'Home') to = tabs.list[0];
+  else if (e.key === 'End') to = tabs.list[tabs.list.length - 1];
+  else return;
+  e.preventDefault();
+  tabs.activate(to);
+  to.stripEl.focus();
+});
 
 /* ================= SQL 高亮编辑器 ================= */
 const KW = ('SELECT FROM WHERE AND OR NOT NULL IS IN LIKE BETWEEN ORDER BY GROUP HAVING LIMIT OFFSET AS ASC DESC ' +
@@ -2303,7 +2371,7 @@ function renderGrid(container, cols, rows, opts) {
     const btns = opts.btns; // (row, ri) => [{label, title, cls, act}] per-row actions, or falsy
     const shown = data.length > RENDER_ROW_CAP ? data.slice(0, RENDER_ROW_CAP) : data;
     const head = `<th class="rownum">#</th>` + cols.map((c, i) =>
-      `<th data-ci="${i}" title="${esc(c)}">${esc(c)}${state.sortCol === i ? `<span class="sort-ind">${state.asc ? '▲' : '▼'}</span>` : ''}</th>`).join('') +
+      `<th data-ci="${i}" tabindex="0" role="columnheader" aria-sort="${state.sortCol === i ? (state.asc ? 'ascending' : 'descending') : 'none'}" title="${esc(c)}">${esc(c)}${state.sortCol === i ? `<span class="sort-ind">${state.asc ? '▲' : '▼'}</span>` : ''}</th>`).join('') +
       (btns ? '<th class="rowact"></th>' : '');
     const body = shown.map((row, ri) => `<tr${opts.onRowClick ? ` data-ri="${ri}"` : ''}>` +
       `<td class="rownum">${ri + 1}</td>` +
@@ -2319,11 +2387,21 @@ function renderGrid(container, cols, rows, opts) {
       ? `<tr><td class="rownum"></td><td colspan="${cols.length}" style="color:var(--txt3)">${T('结果共 {0} 行,超出渲染上限,仅显示前 {1} 行;排序与行操作仅作用于已显示部分,请用 LIMIT 收窄', data.length, RENDER_ROW_CAP)}</td>${btns ? '<td class="rowact"></td>' : ''}</tr>`
       : '';
     wrap.innerHTML = `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}${capNote}</tbody></table>`;
-    $$('th[data-ci]', wrap).forEach(th => th.onclick = () => {
-      const i = +th.dataset.ci;
-      if (state.sortCol === i) { if (state.asc) state.asc = false; else { state.sortCol = null; } }
-      else { state.sortCol = i; state.asc = true; }
-      draw();
+    $$('th[data-ci]', wrap).forEach(th => {
+      th.onclick = () => {
+        const i = +th.dataset.ci;
+        if (state.sortCol === i) { if (state.asc) state.asc = false; else { state.sortCol = null; } }
+        else { state.sortCol = i; state.asc = true; }
+        draw();
+        // draw() 重建表格会把焦点打到 body——键盘路径(Enter 排序)把
+        // 焦点还给同一列,方向操作才能连续;鼠标路径焦点本就在列上,无副作用。
+        const cur = $(`th[data-ci="${i}"]`, wrap);
+        if (cur) cur.focus();
+      };
+      // 键盘排序:列头可聚焦(Enter/Space 等同点击)。
+      th.onkeydown = (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); th.click(); }
+      };
     });
     if (opts.onRowClick) $$('tr[data-ri]', wrap).forEach(tr => {
       tr.onclick = () => { $$('tr', wrap).forEach(x => x.classList.remove('sel')); tr.classList.add('sel');
@@ -3449,13 +3527,22 @@ const explorer = {
     opts = opts || {};
     const children = opts.children ? `<div class="tchildren${this.expanded.has(path) ? '' : ' collapsed'}" data-ch="${esc(path)}"></div>` : '';
     const twist = opts.children ? `<span class="twist">${this.expanded.has(path) ? '▼' : '▶'}</span>` : '<span class="twist"></span>';
-    return `<div class="tnode${this.selPath === path ? ' sel' : ''}" data-path="${esc(path)}" data-kind="${esc(opts.kind || '')}" data-name="${esc(opts.name || '')}" data-more="${esc(opts.more || '')}">
+    return `<div class="tnode${this.selPath === path ? ' sel' : ''}" data-path="${esc(path)}" data-kind="${esc(opts.kind || '')}" data-name="${esc(opts.name || '')}" data-more="${esc(opts.more || '')}" role="treeitem" tabindex="-1" aria-expanded="${opts.children ? String(this.expanded.has(path)) : 'false'}">
       ${twist}<span class="tico">${icon}</span><span class="tlabel">${labelHTML}</span></div>${children}`;
   },
 
   render() {
     const m = this.meta;
     if (!m) return;
+    // 键盘焦点随重画迁移:refresh()/展开收起都会整树重建,记住焦点所在
+    // 节点的 path,重画后还原(否则方向键导航每次自动刷新都断链)。
+    const activeEl = document.activeElement;
+    const focusPath = activeEl && activeEl.classList && activeEl.classList.contains('tnode') ? activeEl.dataset.path : null;
+    const restoreFocus = () => {
+      if (!focusPath) return;
+      const again = $(`.tnode[data-path="${CSS.escape(focusPath)}"]`, $('#tree'));
+      if (again) again.focus();
+    };
     const host = api.node || (location.host || 'localhost');
     const branch = [];
     branch.push(['server', ICONS.server, api.node
@@ -3544,6 +3631,7 @@ const explorer = {
       if (el) el.innerHTML = sysViews.map(([n, d]) =>
         this.node('sys:' + n, ICONS.view, `${esc(n)} <span class="cnt" title="${esc(d)}">—</span>`, {kind: 'sysview', name: n})).join('');
     }
+    restoreFocus();
   },
 
   tableMeta(name) { return this.meta && this.meta.tables.find(t => t.name === name); },
@@ -3556,7 +3644,40 @@ const explorer = {
       const path = node.dataset.path;
       if (this.expanded.has(path)) this.expanded.delete(path); else this.expanded.add(path);
       this.render();
+      // render() 重建了整棵树——键盘展开/收起后焦点回到同一节点,
+      // 否则焦点掉回 body,方向键导航每次展开都断链。
+      const again = $(`.tnode[data-path="${CSS.escape(path)}"]`, tree);
+      if (again) again.focus();
     };
+    // 键盘导航(WAI-ARIA treeitem 惯例):↑/↓ 在可见节点间移动并选中,
+    // → 展开 / ← 收起,Enter/Space 打开(等同双击)。#tree 自身 focus 后
+    // 方向键进入第一个节点(roving tabindex:节点 tabindex=-1)。
+    tree.addEventListener('keydown', (e) => {
+      const node = e.target.closest('.tnode[data-path]');
+      if (!node) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          const first = $$('.tnode[data-path]', tree)[0];
+          if (first) { e.preventDefault(); first.focus(); }
+        }
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const el = focusMove(tree, '.tnode[data-path]', e.key === 'ArrowDown' ? 1 : -1);
+        if (el) {
+          this.selPath = el.dataset.path;
+          $$('.tnode').forEach(n => n.classList.remove('sel'));
+          el.classList.add('sel');
+        }
+      } else if (e.key === 'ArrowRight' && hasChildren(node) && !this.expanded.has(node.dataset.path)) {
+        e.preventDefault(); toggle(node);
+      } else if (e.key === 'ArrowLeft' && hasChildren(node) && this.expanded.has(node.dataset.path)) {
+        e.preventDefault(); toggle(node);
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        node.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+      }
+    });
     tree.addEventListener('click', (e) => {
       const node = e.target.closest('.tnode[data-path]');
       if (!node) return;
@@ -3753,7 +3874,13 @@ document.addEventListener('keydown', (e) => {
   const inField = /INPUT|TEXTAREA/.test(document.activeElement.tagName);
   if (e.key === 'F5') { e.preventDefault(); if (e.ctrlKey) parseActive(); else execActive(); }
   else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); execActive(); }
-  else if (e.key === 'Escape') { ctx.close(); if ($('#overlay').style.display === 'flex') closeModal(); }
+  else if (e.key === 'Escape') {
+    ctx.close();
+    // 菜单开着时 Esc 先收菜单(菜单自身的 keydown 已处理并阻止冒泡;
+    // 这里兜底鼠标路径),弹窗次之。
+    if ($$('.menu.open').length) { $$('[data-menu]').forEach(m => m.classList.remove('open')); return; }
+    if ($('#overlay').style.display === 'flex') closeModal();
+  }
   else if (!inField && (e.key === 'n' || e.key === 'N') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openQueryTab(); }
   else if (!inField && (e.key === 'r' || e.key === 'R') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); explorer.refresh(); }
 });
@@ -3775,6 +3902,42 @@ $$('[data-menu] > span').forEach(sp => {
   };
   sp.onmouseenter = () => { if ($$('.menu.open').length) {
     $$('[data-menu]').forEach(m => m.classList.remove('open')); sp.parentElement.classList.add('open'); } };
+});
+// 菜单键盘导航(ARIA menu 惯例):按钮 Enter/Space/↓ 打开并进第一项;
+// 项间 ↑/↓ 移动,Enter/Space 执行,Esc 关闭并还原焦点到菜单按钮。
+$('#menubar').addEventListener('keydown', (e) => {
+  const menu = e.target.closest('.menu');
+  if (!menu) return;
+  const btn = $('[role="button"]', menu), drop = $('.menu-drop', menu);
+  const items = $$('[data-act]', drop).filter(el => el.offsetParent !== null);
+  if (e.target === btn || e.target.closest('[data-menu] > span')) {
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      $$('[data-menu]').forEach(m => m.classList.remove('open'));
+      menu.classList.add('open');
+      // 首项聚焦放到微任务且在任务内过滤可见项:keydown 时刻菜单尚未
+      // 打开(样式未重算),此刻 offsetParent 全为 null、同步 focus()
+      // 作用在仍判定为隐藏的元素上会静默失败。
+      setTimeout(() => {
+        const first = $$('[data-act]', drop).find(el => el.offsetParent !== null);
+        if (first) first.focus();
+      }, 0);
+    }
+    return;
+  }
+  const item = e.target.closest('[data-act]');
+  if (!item) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    focusMove(drop, '[data-act]', e.key === 'ArrowDown' ? 1 : -1);
+  } else if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    item.click();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    menu.classList.remove('open');
+    if (btn) btn.focus();
+  }
 });
 document.addEventListener('click', () => $$('[data-menu]').forEach(m => m.classList.remove('open')));
 $$('.menu-drop [data-act]').forEach(item => {
