@@ -412,7 +412,10 @@
             flex-direction: column; gap: 6px; }
   .toast { background: var(--toast-bg); color: var(--toast-fg); border-radius: 4px; padding: 8px 14px;
            max-width: 380px; box-shadow: var(--shadow-pop); animation: tin .18s ease-out; }
-  .toast.err { background: var(--err); color: #fff; }
+  .toast.err { background: var(--err); color: #fff; display: flex; align-items: baseline; gap: 8px; }
+  .toast-x { flex: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+             font: 12px var(--ui); padding: 0 0 0 2px; opacity: .8; }
+  .toast-x:hover { opacity: 1; }
   @keyframes tin { from { opacity: 0; transform: translateY(6px); } }
   @keyframes ov-fade { from { opacity: 0; } }
   @keyframes dlg-pop { from { opacity: 0; transform: scale(.97) translateY(4px); } }
@@ -825,7 +828,7 @@ const EN = {
   '{0} ms': '{0} ms', '耗时': 'Duration', '仅慢查询': 'Slow only',
   '全部耗时': 'Any duration', '按耗时降序': 'Sort by duration',
   '恢复到时间点(可选)': 'Restore to timestamp (optional)',
-  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)': 'Empty = full restore; an ISO timestamp (e.g. 2026-09-29T12:00:00Z) replays the journal chain up to that moment (increments come from this node\'s journal)',
+  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点日志)': 'Empty = full restore; an ISO timestamp (e.g. 2026-09-29T12:00:00Z) replays the journal chain up to that moment (increments come from this node\'s journal)',
   '时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)': 'Cannot parse the timestamp (ISO expected, e.g. 2026-09-29T12:00:00Z)',
   '时间点恢复已开始({0} → {1})': 'Point-in-time restore started ({0} → {1})',
   '连接时长': 'Connected', '输入 KILL 确认': 'Type KILL to confirm', '已导出 {0} 行': 'Exported {0} rows',
@@ -846,7 +849,7 @@ const EN = {
   '全部': 'All', '数据日志': 'Data Log', '同步日志': 'Sync Log', '仅错误': 'Errors Only',
   '全部来源': 'All sources', '日志来源': 'Log source', '过滤:语句 / 错误 / 目标': 'Filter: statement / error / target',
   '每来源拉取条数': 'Entries to fetch per source',
-  '100 条': '100', '200 条': '200', '500 条': '500', '5s 自动刷新': '5s auto-refresh',
+  '100 条': '100', '200 条': '200', '500 条': '500',
   '共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}': '{0} entries · data {1} · sync {2} · errors {3}',
   '离线节点 {0} 个({1})': '{0} offline node(s) ({1})',
   '没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。': 'No matching log entries. The "Console" source collects statements submitted by this console; cluster deployments aggregate statement and sync logs from all nodes.',
@@ -862,7 +865,7 @@ const EN = {
   '声明 {0} 列,数据中实测 {1} 个顶层字段': '{0} declared columns; {1} top-level fields observed in the data',
   '{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除': '{0} constraint auto-index: created and maintained with the table definition; cannot be created, altered or dropped independently',
   '唯一索引': 'Unique index',
-  '引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据': 'Engine-internal storage (catch-up journal/position/node identity/pub-sub); read-only, double-click to view data',
+  '引擎内部存储(catch-up 日志/位点/节点身份/发布订阅);只读,双击查看数据': 'Engine-internal storage (catch-up journal/position/node identity/pub-sub); read-only, double-click to view data',
   '表清单(名称/页数)': 'Table list (name/pages)', '列清单(可空性/类型)': 'Column list (nullability/type)',
   'SQLite 兼容视图': 'SQLite compatibility view',
   '节点 {0} 不可用:': 'Node {0} unavailable: ', '节点 {0} · 不可用': 'Node {0} · unavailable',
@@ -1168,7 +1171,7 @@ const AR = {
   '{0} ms': '{0} ms', '耗时': 'الزمن', '仅慢查询': 'البطيء فقط',
   '全部耗时': 'أي زمن', '按耗时降序': 'ترتيب تنازلي بالزمن',
   '恢复到时间点(可选)': 'استعادة إلى نقطة زمنية (اختياري)',
-  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)': 'فارغ = استعادة كاملة؛ وطابع زمني ISO (مثل 2026-09-29T12:00:00Z) يعيد التشغيل حتى تلك اللحظة (المقاطع التزايدية من دورية هذه العقدة)',
+  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点日志)': 'فارغ = استعادة كاملة؛ وطابع زمني ISO (مثل 2026-09-29T12:00:00Z) يعيد التشغيل حتى تلك اللحظة (المقاطع التزايدية من دورية هذه العقدة)',
   '时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)': 'تعذر تحليل الطابع الزمني (المطلوب ISO، مثل 2026-09-29T12:00:00Z)',
   '时间点恢复已开始({0} → {1})': 'بدأت الاستعادة الزمنية ({0} → {1})',
   '连接时长': 'مدة الاتصال', '输入 KILL 确认': 'اكتب KILL للتأكيد', '已导出 {0} 行': 'صُدِّر {0} صفًا',
@@ -1189,7 +1192,7 @@ const AR = {
   '全部': 'الكل', '数据日志': 'سجل البيانات', '同步日志': 'سجل المزامنة', '仅错误': 'الأخطاء فقط',
   '全部来源': 'كل المصادر', '日志来源': 'مصدر السجل', '过滤:语句 / 错误 / 目标': 'تصفية: عبارة / خطأ / هدف',
   '每来源拉取条数': 'عدد الإدخالات لكل مصدر',
-  '100 条': '100', '200 条': '200', '500 条': '500', '5s 自动刷新': 'تحديث تلقائي كل 5 ثوانٍ',
+  '100 条': '100', '200 条': '200', '500 条': '500',
   '共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}': '{0} إدخالًا · بيانات {1} · مزامنة {2} · أخطاء {3}',
   '离线节点 {0} 个({1})': '{0} عقدة غير متصلة ({1})',
   '没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。': 'لا إدخالات سجل مطابقة. مصدر «وحدة التحكم» يجمع تدقيق العبارات المرسلة من هذه الوحدة؛ ونشر المجموعات يجمع سجلات العبارات والمزامنة من كل العقد.',
@@ -1205,7 +1208,7 @@ const AR = {
   '声明 {0} 列,数据中实测 {1} 个顶层字段': '{0} عمودًا معلنًا؛ {1} حقلًا علويًا ملحوظًا في البيانات',
   '{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除': 'فهرس تلقائي لقيد {0}: يُنشأ ويُصان مع تعريف الجدول؛ ولا يمكن إنشاؤه أو تعديله أو حذفه استقلالًا',
   '唯一索引': 'فهرس فريد',
-  '引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据': 'تخزين داخلي للمحرك (دورية اللحاق/المواضع/هوية العقدة/النشر والاشتراك)؛ للقراءة فقط، انقر نقرًا مزدوجًا لعرض البيانات',
+  '引擎内部存储(catch-up 日志/位点/节点身份/发布订阅);只读,双击查看数据': 'تخزين داخلي للمحرك (دورية اللحاق/المواضع/هوية العقدة/النشر والاشتراك)؛ للقراءة فقط، انقر نقرًا مزدوجًا لعرض البيانات',
   '表清单(名称/页数)': 'قائمة الجداول (الاسم/الصفحات)', '列清单(可空性/类型)': 'قائمة الأعمدة (القابلية للفراغ/النوع)',
   'SQLite 兼容视图': 'طريقة عرض متوافقة مع SQLite',
   '节点 {0} 不可用:': 'العقدة {0} غير متاحة: ', '节点 {0} · 不可用': 'العقدة {0} · غير متاحة',
@@ -1510,7 +1513,7 @@ const FR = {
   '{0} ms': '{0} ms', '耗时': 'Durée', '仅慢查询': 'Lentes seulement',
   '全部耗时': 'Toute durée', '按耗时降序': 'Trier par durée',
   '恢复到时间点(可选)': 'Restaurer à un instant (facultatif)',
-  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)': 'Vide = restauration complète ; un horodatage ISO (p. ex. 2026-09-29T12:00:00Z) rejoue la chaîne du journal jusqu\'à cet instant (les incréments viennent du journal de ce nœud)',
+  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点日志)': 'Vide = restauration complète ; un horodatage ISO (p. ex. 2026-09-29T12:00:00Z) rejoue la chaîne du journal jusqu\'à cet instant (les incréments viennent du journal de ce nœud)',
   '时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)': 'Horodatage illisible (ISO attendu, p. ex. 2026-09-29T12:00:00Z)',
   '时间点恢复已开始({0} → {1})': 'Restauration à l\'instant donné démarrée ({0} → {1})',
   '连接时长': 'Connecté', '输入 KILL 确认': 'Saisissez KILL pour confirmer', '已导出 {0} 行': '{0} lignes exportées',
@@ -1531,7 +1534,7 @@ const FR = {
   '全部': 'Tout', '数据日志': 'Journal de données', '同步日志': 'Journal de synchronisation', '仅错误': 'Erreurs seules',
   '全部来源': 'Toutes les sources', '日志来源': 'Source du journal', '过滤:语句 / 错误 / 目标': 'Filtre : instruction / erreur / cible',
   '每来源拉取条数': 'Entrées à récupérer par source',
-  '100 条': '100', '200 条': '200', '500 条': '500', '5s 自动刷新': 'actualisation 5 s',
+  '100 条': '100', '200 条': '200', '500 条': '500',
   '共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}': '{0} entrées · données {1} · synchronisation {2} · erreurs {3}',
   '离线节点 {0} 个({1})': '{0} nœud(s) hors ligne ({1})',
   '没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。': 'Aucune entrée de journal correspondante. La source « Console » regroupe l\'audit des instructions soumises par cette console ; les déploiements en cluster agrègent les journaux d\'instructions et de synchronisation de tous les nœuds.',
@@ -1547,7 +1550,7 @@ const FR = {
   '声明 {0} 列,数据中实测 {1} 个顶层字段': '{0} colonnes déclarées ; {1} champs de premier niveau observés dans les données',
   '{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除': 'Index automatique de contrainte {0} : créé et maintenu avec la définition de la table ; ne peut pas être créé, modifié ou supprimé séparément',
   '唯一索引': 'Index unique',
-  '引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据': 'Stockage interne du moteur (journal de rattrapage/position/identité du nœud/pub-sub) ; lecture seule, double-clic pour voir les données',
+  '引擎内部存储(catch-up 日志/位点/节点身份/发布订阅);只读,双击查看数据': 'Stockage interne du moteur (journal de rattrapage/position/identité du nœud/pub-sub) ; lecture seule, double-clic pour voir les données',
   '表清单(名称/页数)': 'Liste des tables (nom/pages)', '列清单(可空性/类型)': 'Liste des colonnes (nullabilité/type)',
   'SQLite 兼容视图': 'Vue de compatibilité SQLite',
   '节点 {0} 不可用:': 'Nœud {0} indisponible : ', '节点 {0} · 不可用': 'Nœud {0} · indisponible',
@@ -1852,7 +1855,7 @@ const RU = {
   '{0} ms': '{0} мс', '耗时': 'Время', '仅慢查询': 'Только медленные',
   '全部耗时': 'Любое время', '按耗时降序': 'Сортировать по времени',
   '恢复到时间点(可选)': 'Восстановление на момент времени (необязательно)',
-  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)': 'Пусто = полное восстановление; ISO-метка времени (напр. 2026-09-29T12:00:00Z) проигрывает цепочку журнала до этого момента (приращения берутся из журнала этого узла)',
+  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点日志)': 'Пусто = полное восстановление; ISO-метка времени (напр. 2026-09-29T12:00:00Z) проигрывает цепочку журнала до этого момента (приращения берутся из журнала этого узла)',
   '时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)': 'Не удалось разобрать метку времени (нужна ISO, напр. 2026-09-29T12:00:00Z)',
   '时间点恢复已开始({0} → {1})': 'Восстановление на момент времени начато ({0} → {1})',
   '连接时长': 'Подключён', '输入 KILL 确认': 'Введите KILL для подтверждения', '已导出 {0} 行': 'Экспортировано {0} строк',
@@ -1873,7 +1876,7 @@ const RU = {
   '全部': 'Все', '数据日志': 'Журнал данных', '同步日志': 'Журнал синхронизации', '仅错误': 'Только ошибки',
   '全部来源': 'Все источники', '日志来源': 'Источник журнала', '过滤:语句 / 错误 / 目标': 'Фильтр: инструкция / ошибка / цель',
   '每来源拉取条数': 'Записей на источник',
-  '100 条': '100', '200 条': '200', '500 条': '500', '5s 自动刷新': 'автообновление 5 с',
+  '100 条': '100', '200 条': '200', '500 条': '500',
   '共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}': '{0} записей · данные {1} · синхронизация {2} · ошибки {3}',
   '离线节点 {0} 个({1})': 'Узлов не в сети: {0} ({1})',
   '没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。': 'Подходящих записей журнала нет. Источник «Консоль» собирает аудит инструкций, отправленных из этой консоли; кластерные развёртывания агрегируют журналы инструкций и синхронизации всех узлов.',
@@ -1889,7 +1892,7 @@ const RU = {
   '声明 {0} 列,数据中实测 {1} 个顶层字段': 'Объявлено столбцов: {0}; полей верхнего уровня в данных: {1}',
   '{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除': 'Автоиндекс ограничения {0}: создаётся и сопровождается вместе с определением таблицы; отдельно создать, изменить или удалить нельзя',
   '唯一索引': 'Уникальный индекс',
-  '引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据': 'Внутреннее хранилище движка (журнал догона/позиции/идентичность узла/pub-sub); только чтение, двойной щелчок — просмотр данных',
+  '引擎内部存储(catch-up 日志/位点/节点身份/发布订阅);只读,双击查看数据': 'Внутреннее хранилище движка (журнал догона/позиции/идентичность узла/pub-sub); только чтение, двойной щелчок — просмотр данных',
   '表清单(名称/页数)': 'Список таблиц (имя/страницы)', '列清单(可空性/类型)': 'Список столбцов (нулабельность/тип)',
   'SQLite 兼容视图': 'Представление совместимости SQLite',
   '节点 {0} 不可用:': 'Узел {0} недоступен: ', '节点 {0} · 不可用': 'Узел {0} · недоступен',
@@ -2194,7 +2197,7 @@ const ES = {
   '{0} ms': '{0} ms', '耗时': 'Duración', '仅慢查询': 'Solo lentas',
   '全部耗时': 'Cualquier duración', '按耗时降序': 'Ordenar por duración',
   '恢复到时间点(可选)': 'Restaurar a un punto temporal (opcional)',
-  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)': 'Vacío = restauración completa; una marca ISO (p. ej. 2026-09-29T12:00:00Z) reproduce la cadena del diario hasta ese momento (los incrementos vienen del diario de este nodo)',
+  '留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点日志)': 'Vacío = restauración completa; una marca ISO (p. ej. 2026-09-29T12:00:00Z) reproduce la cadena del diario hasta ese momento (los incrementos vienen del diario de este nodo)',
   '时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)': 'No se puede analizar la marca temporal (se espera ISO, p. ej. 2026-09-29T12:00:00Z)',
   '时间点恢复已开始({0} → {1})': 'Restauración puntual iniciada ({0} → {1})',
   '连接时长': 'Conectado', '输入 KILL 确认': 'Escriba KILL para confirmar', '已导出 {0} 行': '{0} filas exportadas',
@@ -2215,7 +2218,7 @@ const ES = {
   '全部': 'Todo', '数据日志': 'Registro de datos', '同步日志': 'Registro de sincronización', '仅错误': 'Solo errores',
   '全部来源': 'Todos los orígenes', '日志来源': 'Origen del registro', '过滤:语句 / 错误 / 目标': 'Filtro: instrucción / error / destino',
   '每来源拉取条数': 'Entradas a obtener por origen',
-  '100 条': '100', '200 条': '200', '500 条': '500', '5s 自动刷新': 'autoactualización 5 s',
+  '100 条': '100', '200 条': '200', '500 条': '500',
   '共 {0} 条 · 数据 {1} · 同步 {2} · 错误 {3}': '{0} entradas · datos {1} · sincronización {2} · errores {3}',
   '离线节点 {0} 个({1})': '{0} nodo(s) sin conexión ({1})',
   '没有匹配的日志条目。「控制台」来源收录本控制台提交的语句审计;集群部署会汇总各节点的语句与同步日志。': 'No hay entradas de registro coincidentes. El origen «Consola» recoge la auditoría de instrucciones enviadas desde esta consola; los despliegues de clúster agregan los registros de instrucciones y sincronización de todos los nodos.',
@@ -2231,7 +2234,7 @@ const ES = {
   '声明 {0} 列,数据中实测 {1} 个顶层字段': '{0} columnas declaradas; {1} campos de nivel superior observados en los datos',
   '{0} 约束自动索引:随表定义创建与维护,不能单独创建、修改或删除': 'Índice automático de la restricción {0}: se crea y mantiene con la definición de la tabla; no puede crearse, modificarse ni eliminarse por separado',
   '唯一索引': 'Índice único',
-  '引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据': 'Almacenamiento interno del motor (diario de puesta al día/posición/identidad del nodo/pub-sub); solo lectura, doble clic para ver datos',
+  '引擎内部存储(catch-up 日志/位点/节点身份/发布订阅);只读,双击查看数据': 'Almacenamiento interno del motor (diario de puesta al día/posición/identidad del nodo/pub-sub); solo lectura, doble clic para ver datos',
   '表清单(名称/页数)': 'Lista de tablas (nombre/páginas)', '列清单(可空性/类型)': 'Lista de columnas (nulabilidad/tipo)',
   'SQLite 兼容视图': 'Vista de compatibilidad SQLite',
   '节点 {0} 不可用:': 'Nodo {0} no disponible: ', '节点 {0} · 不可用': 'Nodo {0} · no disponible',
@@ -2664,17 +2667,29 @@ const ui = {
   },
   toast(msg, isErr) {
     // 同文案限流 + 数量上限:管理页每 5s 轮询失败曾持续叠同文案错误 toast。
+    // 去重键走 data-msg(关闭按钮进 DOM 后 textContent 不再是纯消息)。
     const host = $('#toasts');
     for (const el of Array.from(host.children)) {
-      if (el.textContent === msg) return;
+      if (el.dataset.msg === msg) return;
     }
     while (host.children.length >= 4) host.firstChild.remove();
     const el = document.createElement('div');
     el.className = 'toast' + (isErr ? ' err' : '');
+    el.dataset.msg = msg;
     if (isErr) el.setAttribute('role', 'alert'); // 屏幕阅读器立即播报(容器 aria-live=polite 之外的强化)
     el.textContent = msg;
+    if (isErr) {
+      // 错误 toast 带手动关闭:错误细节常需要读完,固定时长消失太急;
+      // 按钮带 aria-label,消息文本本身保持可整体选中的纯文本。
+      const x = document.createElement('button');
+      x.className = 'toast-x';
+      x.setAttribute('aria-label', T('关闭'));
+      x.textContent = '✕';
+      x.onclick = () => el.remove();
+      el.appendChild(x);
+    }
     host.appendChild(el);
-    setTimeout(() => el.remove(), isErr ? 5000 : 2600);
+    setTimeout(() => el.remove(), isErr ? 8000 : 2600);
   }
 };
 
@@ -3657,6 +3672,15 @@ const tabs = {
   byKind(kind) { return this.list.filter(t => t.kind === kind); },
   activeQuery() { return this.active && this.active.kind === 'query' ? this.active : null; }
 };
+
+// 管理页轮询脚手架(集群/会话/备份/日志共用):自动刷新 checkbox 绑定 +
+// 仅激活 tab 轮询(后台 tab 不产生探测流量)+ 关 tab 清定时器。四处
+// 逐字复制曾让文案与行为各自漂移(日志页的「5s 自动刷新」即漂移产物)。
+function bindPolling(t) {
+  $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
+  t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
+  t.onClose = () => clearInterval(t.timer);
+}
 // 标签条键盘导航(ARIA tablist 惯例):←/→ 循环切换,Home/End 跳首尾;
 // 焦点随切换移动(roving tabindex)。
 $('#tabstrip').addEventListener('keydown', (e) => {
@@ -4298,7 +4322,6 @@ function openClusterTab() {
       <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在探测节点…</div></div>
     </div>`;
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
-    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     t.render = (data) => {
       const body = $('[data-body]', t.el);
       const nodes = data.nodes || [];
@@ -4370,8 +4393,7 @@ function openClusterTab() {
       } catch (e) { ui.toast(T('集群状态刷新失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生探测流量。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
-    t.onClose = () => clearInterval(t.timer);
+    bindPolling(t);
     t.load();
   });
 }
@@ -4397,7 +4419,6 @@ function openSessionsTab() {
       <div data-body><div class="msg-list" style="color:var(--txt3)" data-i18n>正在读取会话…</div></div>
     </div>`;
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
-    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     const killSession = (row) => {
       // row[1]/row[2](来源/身份)是节点侧自由文本,直接传原值:dialog()
       // 对 label 统一 esc,调用方预转义会把 & < > 显示成实体(双重转义)。
@@ -4478,8 +4499,7 @@ function openSessionsTab() {
       } catch (e) { ui.toast(T('会话列表读取失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生请求。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
-    t.onClose = () => clearInterval(t.timer);
+    bindPolling(t);
     t.load();
   });
 }
@@ -4770,7 +4790,6 @@ function openBackupTab() {
       b.disabled = false;
     };
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
-    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     // 恢复:整库覆盖级操作,输入完整备份文件名确认后才发请求。
     // 目标节点在打开对话框时锁定并随请求显式下发:api.node 存在
     // localStorage 且跨标签页共享,若等发送时才读,另一个标签页切换
@@ -4780,7 +4799,7 @@ function openBackupTab() {
       const targetLabel = targetNode || T('默认节点');
       dialog(T('恢复备份 {0} → {1}', name, targetLabel), [
         {name: 'confirm', label: T('输入 {0} 确认恢复到节点 {1}。该节点将整库重放此快照:同名表被覆盖为备份时点,集群内所有节点收敛到该状态;备份之后新建的表不受影响。', name, targetLabel), ph: name, value: ''},
-        {name: 'to', label: T('恢复到时间点(可选)') + ' — ' + T('留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点期刊)'), ph: '2026-09-29T12:00:00Z', value: ''},
+        {name: 'to', label: T('恢复到时间点(可选)') + ' — ' + T('留空 = 整份恢复;填 ISO 时间戳(如 2026-09-29T12:00:00Z)则重放到该时刻(增量段来自本节点日志)'), ph: '2026-09-29T12:00:00Z', value: ''},
       ], T('确认恢复'), async (vals, err) => {
         if (vals.confirm !== name) { err(T('输入与备份文件名不一致')); throw new Error('cancel'); }
         if (vals.to && isNaN(Date.parse(vals.to))) { err(T('时间点格式无法解析(需要 ISO 时间戳,如 2026-09-29T12:00:00Z)')); throw new Error('cancel'); }
@@ -4858,8 +4877,7 @@ function openBackupTab() {
       } catch (e) { ui.toast(T('备份状态读取失败:{0}', e.message), true); }
     };
     // 只在 tab 激活时轮询,后台 tab 不产生请求。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
-    t.onClose = () => clearInterval(t.timer);
+    bindPolling(t);
     t.load();
   });
 }
@@ -4898,7 +4916,7 @@ function openLogsTab() {
         <div class="spacer"></div>
         <button class="primary" data-do="refresh"><span data-i18n>刷新</span></button>
         <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt2)">
-          <input type="checkbox" data-do="auto" checked><span data-i18n>5s 自动刷新</span></label>
+          <input type="checkbox" data-do="auto" checked><span data-i18n>每 5 秒自动刷新</span></label>
       </div>
       <div class="res-wrap"><div class="res-pane active" data-body style="display:block;padding:0"></div></div>`;
     $$('[data-cat]', t.el).forEach(b => b.onclick = () => {
@@ -4918,7 +4936,6 @@ function openLogsTab() {
     $('[data-do="slow"]', t.el).onchange = (e) => { t.slowMs = +e.target.value; t.render(); };
     $('[data-do="sortms"]', t.el).onchange = (e) => { t.sortMs = e.target.checked; t.render(); };
     $('[data-do="refresh"]', t.el).onclick = () => t.load();
-    $('[data-do="auto"]', t.el).onchange = (e) => { t.auto = e.target.checked; };
     t.render = () => {
       const body = $('[data-body]', t.el);
       const counts = { data: 0, sync: 0, err: 0 };
@@ -5011,8 +5028,7 @@ function openLogsTab() {
       } catch (e) { ui.toast(T('日志刷新失败:{0}', e.message), true); }
     };
     // 与集群页同策略:仅在 tab 激活时轮询。
-    t.timer = setInterval(() => { if (t.auto && tabs.active === t && !authOverlayVisible()) t.load(); }, 5000);
-    t.onClose = () => clearInterval(t.timer);
+    bindPolling(t);
     t.load();
   });
 }
@@ -5141,7 +5157,7 @@ const explorer = {
       const el = $('[data-ch="systables"]', tree);
       if (el) el.innerHTML = sysTables.map(t =>
         this.node('systable:' + t.name, ICONS.table,
-          `${esc(t.name)} <span class="cnt" title="${esc(T('引擎内部存储(catch-up 期刊/位点/节点身份/发布订阅);只读,双击查看数据'))}">(${esc(t.row_count)})</span>`,
+          `${esc(t.name)} <span class="cnt" title="${esc(T('引擎内部存储(catch-up 日志/位点/节点身份/发布订阅);只读,双击查看数据'))}">(${esc(t.row_count)})</span>`,
           {kind: 'systable', name: t.name, more: t.row_count})).join('')
         || `<div class="tnode"><span class="twist"></span><span class="tlabel dim">${T('(无系统表)')}</span></div>`;
     }
@@ -5205,7 +5221,6 @@ const explorer = {
     tree.addEventListener('click', (e) => {
       const node = e.target.closest('.tnode[data-path]');
       if (!node) return;
-      const kind = node.dataset.kind;
       this.selPath = node.dataset.path;
       $$('.tnode').forEach(n => n.classList.remove('sel'));
       node.classList.add('sel');
@@ -5489,24 +5504,29 @@ document.addEventListener('keydown', (e) => {
   }
 });
 document.addEventListener('click', () => $$('[data-menu]').forEach(m => m.classList.remove('open')));
+// 菜单动作 dispatch 表:新增动作在表里加一行,不再续接 if-else 链。
+const MENU_ACTIONS = {
+  'new-query': () => openQueryTab(),
+  'new-table': () => newTableDialog(),
+  'close-tab': () => { if (tabs.active) tabs.close(tabs.active); },
+  'refresh': () => explorer.refresh(),
+  'dashboard': () => openDashboard(),
+  'sessions': () => openSessionsTab(),
+  'users': () => openUsersTab(),
+  'cluster': () => openClusterTab(),
+  'logs': () => openLogsTab(),
+  'backup': () => openBackupTab(),
+  'account': () => accountDialog(),
+  // logout 端点要求 JSON 体(与 /api/backup 同一 CSRF 门):跨站表单
+  // 发不出 application/json,空 {} 即可,成败都刷新回登录页。
+  'logout': () => fetch('/api/auth/logout', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}).finally(() => location.reload()),
+  'about': () => aboutDialog(),
+};
 $$('.menu-drop [data-act]').forEach(item => {
   item.onclick = () => {
     const act = item.dataset.act;
-    if (act === 'new-query') openQueryTab();
-    else if (act === 'new-table') newTableDialog();
-    else if (act === 'close-tab') { if (tabs.active) tabs.close(tabs.active); }
-    else if (act === 'refresh') explorer.refresh();
-    else if (act === 'dashboard') openDashboard();
-    else if (act === 'sessions') openSessionsTab();
-    else if (act === 'users') openUsersTab();
-    else if (act === 'cluster') openClusterTab();
-    else if (act === 'logs') openLogsTab();
-    else if (act === 'backup') openBackupTab();
-    else if (act === 'account') accountDialog();
-    // logout 端点要求 JSON 体(与 /api/backup 同一 CSRF 门):跨站表单
-    // 发不出 application/json,空 {} 即可,成败都刷新回登录页。
-    else if (act === 'logout') fetch('/api/auth/logout', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}).finally(() => location.reload());
-    else if (act === 'about') aboutDialog();
+    const fn = MENU_ACTIONS[act];
+    if (fn) fn();
     // 语言切换:菜单随 click 冒泡关闭,焦点还原到语言按钮。
     else if (act.indexOf('lang-') === 0) { lang.set(act.slice(5)); $('#btn-lang').focus(); }
   };
