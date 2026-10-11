@@ -342,7 +342,7 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
   (直接授予与角色携带分开展示);
 - **控制台账号**:首次强制设置用户名/密码(≥8 位),PBKDF2 凭据文件 + HttpOnly 会话 Cookie,
   连续输错锁定;「文件 → 修改账号…」需当前密码确认,改密后其它会话全部退出;
-  浏览器不持有节点令牌(连节点用服务端 `DOCSQL_TOKEN`,与 docker-compose 下发值同源),
+  浏览器不持有节点 token(连节点用服务端 `DOCSQL_TOKEN`,与 docker-compose 下发值同源),
   `DOCSQL_TOKEN` 作程序化 API 旁路;未启用 `DOCSQL_WEB_AUTH_FILE` 时 API 开放;
 - **节点切换**:工具栏下拉切换管理目标;未配置 peers 时显示单机模式。
 

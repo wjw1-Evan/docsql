@@ -166,7 +166,7 @@ docker compose --profile cluster --profile join up -d node-d
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DOCSQL_UPSTREAM` | 无 | 默认管理节点(启动参数 > 此变量 > `DOCSQL_PEERS` 首条) |
-| `DOCSQL_WEB_AUTH_FILE` | 无 | 控制台账号门凭据文件;空/未设 = 关闭(API 开放,浏览器无令牌输入),已设 = 首次强制 setup |
+| `DOCSQL_WEB_AUTH_FILE` | 无 | 控制台账号门凭据文件;空/未设 = 关闭(API 开放,浏览器无 token 输入),已设 = 首次强制 setup |
 | `DOCSQL_WEB_COOKIE_SECURE` | 0 | HTTPS 反代下置 1(会话 Cookie Secure) |
 | `DOCSQL_WEB_TRUST_PROXY` | 0 | 1 = 按 `X-Forwarded-For` **末跳**分桶(登录锁定/审计);多级反代需在最近一层重写 XFF 为仅客户端地址。**开启后 web 端口必须只对反代可达**:能直连发布端口的请求可自伪造整条 XFF(含末跳)轮换锁定桶,暴力破解防线失效 |
 | `DOCSQL_WEB_TLS_CERT` / `_KEY` | 无 | PEM 证书/私钥路径,同时设置即以 HTTPS 服务(只设其一拒绝启动) |
@@ -204,12 +204,11 @@ docker compose --profile cluster --profile join up -d node-d
 
 ## CLI
 
+CLI 用法(嵌入式/远程模式、导出格式、脚本批执行、退出码约定与交互细节)单点见
+[客户端与驱动 · CLI](drivers.md#clidocsql-cli);容器内验证节点的常用形态:
+
 ```
-docsql <file.db>                    嵌入模式
-docsql connect <addr> [token]       远程模式(--user 走用户登录,密码走 DOCSQL_PASSWORD/交互)
-  --csv | --json                    行导出格式(RFC 4180 / JSON 对象数组)
-  -f script.sql                     脚本批执行(错误即退出 1,容忍缺失末尾分号)
-  help;                             内联帮助(远程模式含 pub/sub 命令面)
+docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 ```
 
 部署测试(`./deploy/run-tests.sh`)在一次性卷(`docsql-dev-testdata-*`)上同时验证两个

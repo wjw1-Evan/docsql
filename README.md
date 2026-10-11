@@ -35,16 +35,9 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 
 ## 文档导航
 
-| 我想… | 看这里 |
-|---|---|
-| 了解数据库全部能力 | [功能总览](docs/features.md) |
-| 查 SQL 语法与函数 | [SQL 参考](docs/sql-reference.md) |
-| 用 Aspire 编排(单节点/集群/控制台) | [Aspire 集成指南](docs/aspire.md) |
-| 用 .NET ADO.NET / EF Core / CLI / 写驱动 | [客户端与驱动](docs/drivers.md) |
-| 部署、扩容、备份恢复、环境变量、监控 | [运维手册](docs/operations.md) |
-| 配用户/角色/审计/加密(等保对照) | [安全指南](docs/security.md) |
-| 确认架构边界与不支持项 | [已知边界](docs/limitations.md) |
-| 参与开发(构建/测试/门禁) | [贡献指南](CONTRIBUTING.md) · [AGENTS](AGENTS.md) |
+按任务找文档的完整对照表见 [docs/README.md](docs/README.md)(描述单点维护,避免两处漂移):
+
+[功能总览](docs/features.md) · [SQL 参考](docs/sql-reference.md) · [客户端与驱动](docs/drivers.md) · [Aspire 指南](docs/aspire.md) · [运维手册](docs/operations.md) · [安全指南](docs/security.md) · [已知边界](docs/limitations.md) · [贡献指南](CONTRIBUTING.md) · [AGENTS](AGENTS.md)
 
 ## 集群与数据安全
 

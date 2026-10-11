@@ -841,6 +841,7 @@ const EN = {
   '结果共 {0} 行,超出渲染上限,仅显示前 {1} 行;排序与行操作仅作用于已显示部分,请用 LIMIT 收窄':
     'Result has {0} rows, above render limit; showing first {1}. Sorting and row actions apply to displayed rows only — narrow with LIMIT',
   '加载失败': 'Load failed', '停用': 'Off',
+  '刷新并重新统计行数(翻页使用缓存的行数)': 'Refresh and recount rows (paging uses the cached count)',
   '执行查询以查看结果(F5 执行,Ctrl+F5 仅语法检查)': 'Run a query to see results (F5 execute, Ctrl+F5 syntax check only)',
   '查询成功,未返回行': 'Query succeeded, no rows returned',
 };
@@ -1019,6 +1020,15 @@ function qhistPush(entry) {
   lsSet(QHIST_KEY, JSON.stringify(h.slice(0, 100)));
 }
 function qhistClear() { lsDel(QHIST_KEY); }
+
+// 查询草稿(单槽,localStorage):正在编辑、尚未执行成功的 SQL。刷新或
+// 误关标签后,新建查询标签自动带回——写了一半的复杂语句不再凭空消失;
+// 执行成功即清空(失败保留,改完再试)。
+const DRAFT_KEY = 'docsql.query-draft';
+function draftSave(sql) {
+  if (sql && sql.trim()) lsSet(DRAFT_KEY, sql); else lsDel(DRAFT_KEY);
+}
+function draftLoad() { return lsGet(DRAFT_KEY) || ''; }
 
 /* ================= 控制台账号(首次使用设置 + 登录 + 修改) ================= */
 // 服务端启用 DOCSQL_WEB_AUTH_FILE 时:第一次使用强制创建账号,之后每次
@@ -2195,7 +2205,7 @@ function highlightSQL(src) {
   return out + '\n';
 }
 
-function makeEditor(container, initial) {
+function makeEditor(container, initial, onChange) {
   container.innerHTML = `<div class="editor">
     <div class="gutter"><div class="gutter-in">1</div></div>
     <div class="edit-scroll"><pre class="hl"><code></code></pre>
@@ -2209,19 +2219,20 @@ function makeEditor(container, initial) {
     gutterIn.innerHTML = Array.from({length: lines}, (_, i) => i + 1).join('<br>');
   };
   const sync = () => { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; gutterIn.style.transform = `translateY(${-ta.scrollTop}px)`; };
-  ta.addEventListener('input', render);
+  ta.addEventListener('input', () => { render(); if (onChange) onChange(ta.value); });
   ta.addEventListener('scroll', sync);
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Tab') { e.preventDefault();
       const s = ta.selectionStart, en = ta.selectionEnd;
       ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
-      ta.selectionStart = ta.selectionEnd = s + 2; render(); }
+      ta.selectionStart = ta.selectionEnd = s + 2; render();
+      if (onChange) onChange(ta.value); }
   });
   render();
   return {
     el: ed, ta,
     get value() { return ta.value; },
-    set value(v) { ta.value = v; render(); },
+    set value(v) { ta.value = v; render(); if (onChange) onChange(ta.value); },
     selectedText() { return ta.value.slice(ta.selectionStart, ta.selectionEnd).trim(); },
     focus() { ta.focus(); }
   };
@@ -2363,7 +2374,15 @@ function openQueryTab(title, sql, autoRun) {
         <div class="res-pane active" data-rp="results"></div>
         <div class="res-pane" data-rp="messages"><div class="msg-list"></div></div>
       </div></div>`;
-    t.editor = makeEditor($('.ed-host', t.el), sql || '');
+    // 草稿恢复:不带初始 SQL 的新建查询标签带回上次未执行完的草稿;
+    // 键入防抖存盘(缩进/历史重填经 editor.value setter 同样触发)。
+    // timer 挂在 t 上:执行成功清草稿时要一并取消,否则挂起的防抖
+    // 会在执行之后把最后一次键入写回(实测竞态)。
+    t.draftTimer = null;
+    t.editor = makeEditor($('.ed-host', t.el), sql || draftLoad(), (v) => {
+      clearTimeout(t.draftTimer);
+      t.draftTimer = setTimeout(() => draftSave(v), 400);
+    });
     $('[data-rp="results"]', t.el).innerHTML = `<div class="res-empty">${T('执行查询以查看结果(F5 执行,Ctrl+F5 仅语法检查)')}</div>`;
     layout.applyEditor(t.el);
     t.msg = (text, cls) => { const d = document.createElement('div');
@@ -2490,6 +2509,9 @@ async function execQuery(t, selectedOnly) {
   else ui.status(T('查询已成功执行 · 耗时 {0} ms · {1} 行', ms, rowCount));
   // 历史记录成功与失败(失败重试是历史的高频用途)。截断在 qhistPush 内。
   qhistPush({sql, ms, ok: !hasErr, ts: Date.now()});
+  // 成功的执行已经进了历史,正在编辑的草稿清空;失败的语句保留为草稿
+  // (改完再试)。挂起的防抖保存一并取消(见 openQueryTab 的竞态注释)。
+  if (!hasErr) { clearTimeout(t.draftTimer); draftSave(''); }
   t.showResults();
 }
 
@@ -2520,9 +2542,14 @@ function openDataTab(tableName, meta) {
   tabs.open('data', 'data:' + tableName, titleOf(), (t) => {
     t.titleFn = titleOf;
     t.offset = 0; t.limit = 200; t.selected = null;
+    // 行数缓存:大表每次翻页都发全表 COUNT(*) 是纯开销 —— 只有首次
+    // 打开、手动「刷新」与增删行后才重新计数;翻页/编辑行走缓存
+    // (range 显示的行数随之是快照,刷新按钮 title 已说明)。
+    t.total = undefined;
+    t.countDirty = true;
     t.el.innerHTML = `<div class="doc-bar">
         <span class="title">${esc(tableName)}</span>
-        <button data-do="refresh" data-i18n-title title="刷新"><span data-i18n>刷新</span></button>
+        <button data-do="refresh" data-i18n-title title="刷新并重新统计行数(翻页使用缓存的行数)"><span data-i18n>刷新</span></button>
         <button data-do="prev"><span data-i18n>◀ 上一页</span></button>
         <button data-do="next"><span data-i18n>下一页 ▶</span></button>
         <span class="meta" data-range></span>
@@ -2544,9 +2571,12 @@ function openDataTab(tableName, meta) {
       const seq = t.reqSeq, offset = t.offset, limit = t.limit;
       ui.status(T('正在加载 {0}…', tableName), 'busy');
       try {
-        const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${qident(tableName)}"`});
-        if (seq !== t.reqSeq) return;
-        t.total = count.kind === 'rows' ? +count.rows[0][0] : 0;
+        if (t.countDirty) {
+          const count = await api.post('/api/sql', {sql: `SELECT COUNT(*) FROM "${qident(tableName)}"`});
+          if (seq !== t.reqSeq) return;
+          t.total = count.kind === 'rows' ? +count.rows[0][0] : 0;
+          t.countDirty = false;
+        }
         const r = await api.post('/api/sql', {sql: `SELECT * FROM "${qident(tableName)}" ORDER BY 1 LIMIT ${limit} OFFSET ${offset}`});
         if (seq !== t.reqSeq) return;
         t.host.innerHTML = '';
@@ -2560,7 +2590,7 @@ function openDataTab(tableName, meta) {
           onRowClick: row => { t.selected = row; },
           btns: row => [
             {label: T('编辑'), title: T('编辑此行(按主键 UPDATE)'), act: () => editRowDialog(tableName, m, r.columns, row, t.load)},
-            {label: T('删除'), cls: 'danger', title: T('删除此行(按主键)'), act: () => deleteRowDialog(tableName, m, r.columns, row, t.load)},
+            {label: T('删除'), cls: 'danger', title: T('删除此行(按主键)'), act: () => deleteRowDialog(tableName, m, r.columns, row, () => { t.countDirty = true; t.load(); })},
           ],
         } : {});
         range();
@@ -2569,11 +2599,11 @@ function openDataTab(tableName, meta) {
         $('[data-do="next"]', t.el).disabled = t.offset + t.limit >= t.total;
       } catch (e) { ui.status(T('加载失败'), 'err'); ui.toast(e.message, true); }
     };
-    $('[data-do="refresh"]', t.el).onclick = t.load;
+    $('[data-do="refresh"]', t.el).onclick = () => { t.countDirty = true; t.load(); };
     $('[data-do="prev"]', t.el).onclick = () => { t.offset = Math.max(0, t.offset - t.limit); t.load(); };
     $('[data-do="next"]', t.el).onclick = () => { t.offset += t.limit; t.load(); };
     $('[data-do="edit"]', t.el).onclick = () => editTableDialog(tableName, explorer.tableMeta(tableName) || meta, t.load);
-    $('[data-do="insert"]', t.el).onclick = () => insertDocDialog(tableName, meta, t.load);
+    $('[data-do="insert"]', t.el).onclick = () => insertDocDialog(tableName, meta, () => { t.countDirty = true; t.load(); });
     $('[data-do="query"]', t.el).onclick = () => openQueryTab(() => T('查询: {0}', tableName), `SELECT * FROM "${qident(tableName)}" LIMIT 200;`, true);
     const exportPage = (fmt) => {
       if (!t.pageSet || !t.pageSet.rows.length) { ui.toast(T('没有可导出的结果集(先执行一条查询)。')); return; }
