@@ -757,7 +757,7 @@ DROP INDEX [ IF EXISTS ] index_name [ , ...n ]
 
 | 参数 | 说明 |
 |---|---|
-| `UNIQUE` | 唯一索引;复合唯一按**完整键组合**判重,任一列 NULL 的行跳过整键(不判重);UNIQUE 与 WHERE 组合不支持(显式报错——冲突策略看不到谓词范围的冲突) |
+| `UNIQUE` | 唯一索引;复合唯一按**完整键组合**判重,任一列 NULL 的行跳过整键(不判重);**UNIQUE + WHERE**:唯一性仅在满足谓词的行之间执行(软删除经典形态:`CREATE UNIQUE INDEX ux ON users(email) WHERE deleted = 0`——活跃邮箱唯一,已删可重复;非限定 `ON CONFLICT (列)` 目标不解析到部分唯一索引,定向冲突显式报错,未定向策略 OR IGNORE/OR REPLACE/ON DUPLICATE KEY UPDATE 由候选行满足谓词时探测部分树参与) |
 | 列清单 | 普通列名按列序构成复合键(前导列等值可走索引探测);或单个 `JSON_EXTRACT(col, '$.path')` 构成 **JSON 路径索引**(树键 = 列内 JSON 文本在路径上的提取值,`WHERE JSON_EXTRACT(col,'$.path') = / > / < …` 走索引探测,EXPLAIN 可见;路径仅 `.key`/`[n]` 段;UNIQUE 路径索引与 WHERE 组合均显式报错) |
 | `WHERE predicate` | **部分索引**:树只收满足谓词的行。谓词限行局部表达式(裸列名 + 字面量 + 运算符/标量函数/IS NULL/IN 常量/BETWEEN/LIKE;子查询/聚合/限定名显式报错)。查询能走部分索引探测的前提:查询 WHERE **蕴含**谓词(合取证明:谓词各合取项被查询合取项按规约文本匹配或等值代入逐值验证蕴含;蕴含不成立时索引对本查询不可见,回退扫描——探针永远是答案集的超集) |
 | `IF NOT EXISTS` | 同名索引已存在时静默返回 |

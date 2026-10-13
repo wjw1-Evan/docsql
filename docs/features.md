@@ -252,7 +252,7 @@ DROP TRIGGER [IF EXISTS] tg;
 | 自动索引 | PRIMARY KEY / 表声明 UNIQUE 随建表创建 B+ 树(`sqlite_autoindex_*`) |
 | 普通索引 | `CREATE INDEX` 单列;点查/范围探测走索引 |
 | 复合索引 | `CREATE INDEX idx ON t (a, b)`,键 = `Value::Array` 按列序;`a=? AND b=?` 点查、前导列前缀探测 |
-| JSON 路径索引 | `CREATE INDEX idx ON t (JSON_EXTRACT(doc, '$.a.b[0]'))`,树键 = 列内 JSON 文本的路径提取值;`WHERE JSON_EXTRACT(doc,'$.…') = / > / < …` 等值与范围走索引探测(EXPLAIN 可见,dump 往返);UNIQUE 路径显式拒绝 ;**部分索引**:`CREATE INDEX … WHERE 谓词`(树只收满足谓词的行;查询须蕴含谓词才走索引探测——合取证明/等值代入,不蕴含自动回退扫描,双生表差分守恒;UNIQUE/JSON 路径组合显式报错)|
+| JSON 路径索引 | `CREATE INDEX idx ON t (JSON_EXTRACT(doc, '$.a.b[0]'))`,树键 = 列内 JSON 文本的路径提取值;`WHERE JSON_EXTRACT(doc,'$.…') = / > / < …` 等值与范围走索引探测(EXPLAIN 可见,dump 往返);UNIQUE 路径显式拒绝 ;**部分索引**:`CREATE INDEX … WHERE 谓词`(树只收满足谓词的行;查询须蕴含谓词才走索引探测——合取证明/等值代入,不蕴含自动回退扫描,双生表差分守恒;**UNIQUE 部分索引**唯一性仅限合格行——软删除形态,OR IGNORE/OR REPLACE/ON DUPLICATE KEY UPDATE 由合格候选行探测部分树,定向 ON CONFLICT 不解析;JSON 路径组合显式报错)|
 | 唯一索引 | `CREATE UNIQUE INDEX`;重复键在写入时拒绝 |
 | 约束唯一 | 表级单列 UNIQUE 与 `CREATE UNIQUE INDEX`(含复合)由引擎判重;DECIMAL 按数值、Int/Float 跨类型数值比较 |
 | 回收 | 模型/手工删索引即回收树;`DROP INDEX` 清理定义 |

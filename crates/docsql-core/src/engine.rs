@@ -10285,19 +10285,6 @@ impl Database {
                  is column-based)",
             );
         }
-        // UNIQUE partial indexes are refused for the same family of reasons:
-        // plain INSERT enforces duplicates through the partial tree, but the
-        // conflict policies (OR REPLACE displacement / OR IGNORE skip /
-        // upsert) probe constraint COLUMNS unconditionally — they would miss
-        // predicate-scoped conflicts or mis-skip rows. The predicate also
-        // composes badly with the path extraction (a probe would need to
-        // imply the pred AND the extraction stays exact); refuse the mix.
-        if idx.unique && pred_expr.is_some() {
-            return err(
-                "UNIQUE partial indexes are not supported (conflict policies cannot see \
-                 predicate-scoped conflicts)",
-            );
-        }
         if path.is_some() && pred_expr.is_some() {
             return err("a partial index cannot combine with a JSON path index");
         }
@@ -10348,8 +10335,11 @@ impl Database {
         // column joins meta.unique, so inserts/updates enforce duplicates
         // from here on. Composite unique indexes cannot use the per-column
         // container — their tree enforces uniqueness itself (unique insert).
+        // A PARTIAL unique enforces only among its qualifying rows via the
+        // tree; the column must NOT join meta.unique (that would enforce
+        // globally, far beyond the predicate's scope).
         let composite = cols.len() > 1;
-        if idx.unique && !composite && !meta.unique.contains(&cols[0]) {
+        if idx.unique && !composite && pred_expr.is_none() && !meta.unique.contains(&cols[0]) {
             let docs = self.table_docs_cx(&table)?;
             meta.unique.push(cols[0].clone());
             meta.check_unique(&docs)?;
@@ -13034,6 +13024,16 @@ impl Database {
             .iter()
             .filter(|s| s.unique && s.cols.len() > 1)
             .collect();
+        // PARTIAL UNIQUE trees (CREATE UNIQUE INDEX … WHERE): their
+        // conflicts are predicate-scoped — a candidate row conflicts only
+        // when it ITSELF satisfies the predicate (then the hit row is in
+        // the tree by construction). Probed for the undirected policies and
+        // OR REPLACE displacement; never an ON CONFLICT target scope
+        // (resolve_conflict_columns knows constraint columns only).
+        let partial_uniques: Vec<&IdxSpec> = idx_specs
+            .iter()
+            .filter(|s| s.unique && s.pred.is_some())
+            .collect();
 
         // ON CONFLICT [target]: the target names one unique constraint whose
         // conflicts are skipped; without it every unique constraint takes
@@ -13063,7 +13063,10 @@ impl Database {
         // 扫描只看语句前的树,批内冲突随后被树级 unique 检查整条打报错;
         // 先按唯一键把「被更晚的行覆盖」的早行去掉,再走位移扫描。判重用
         // 编码字节,与树查找同源。
-        if replace && (!indexed.is_empty() || !composite_uniques.is_empty()) && new_docs.len() > 1 {
+        if replace
+            && (!indexed.is_empty() || !composite_uniques.is_empty() || !partial_uniques.is_empty())
+            && new_docs.len() > 1
+        {
             let mut last_at: std::collections::BTreeMap<(String, Vec<u8>), usize> =
                 std::collections::BTreeMap::new();
             for (i, doc) in new_docs.iter().enumerate() {
@@ -13077,6 +13080,19 @@ impl Database {
                     }
                 }
                 for spec in &composite_uniques {
+                    if let Some(k) =
+                        index_key_of_spec(doc, spec).and_then(|v| encode::encode_to_vec(&v).ok())
+                    {
+                        last_at.insert((spec.root_key.clone(), k), i);
+                    }
+                }
+                for spec in &partial_uniques {
+                    if !matches!(
+                        eval_expr(spec.pred.as_ref().expect("pred set"), doc)?,
+                        Value::Bool(true)
+                    ) {
+                        continue;
+                    }
                     if let Some(k) =
                         index_key_of_spec(doc, spec).and_then(|v| encode::encode_to_vec(&v).ok())
                     {
@@ -13097,6 +13113,14 @@ impl Database {
                         .and_then(|v| encode::encode_to_vec(&v).ok())
                         .and_then(|k| last_at.get(&(spec.root_key.clone(), k)))
                         .is_some_and(|&j| j > i)
+                }) || partial_uniques.iter().any(|spec| {
+                    matches!(
+                        eval_expr(spec.pred.as_ref().expect("pred set"), doc),
+                        Ok(Value::Bool(true))
+                    ) && index_key_of_spec(doc, spec)
+                        .and_then(|v| encode::encode_to_vec(&v).ok())
+                        .and_then(|k| last_at.get(&(spec.root_key.clone(), k)))
+                        .is_some_and(|&j| j > i)
                 });
                 if !shadowed {
                     kept.push(doc.clone());
@@ -13108,7 +13132,9 @@ impl Database {
         // Rows displaced by REPLACE INTO / OR REPLACE.
         let mut displaced: Vec<u64> = Vec::new();
         let mut displaced_docs: Vec<Object> = Vec::new();
-        if replace && (!indexed.is_empty() || !composite_uniques.is_empty()) {
+        if replace
+            && (!indexed.is_empty() || !composite_uniques.is_empty() || !partial_uniques.is_empty())
+        {
             for n in &new_docs {
                 for col in &indexed {
                     let Some(v) = n.get(col) else { continue };
@@ -13123,6 +13149,26 @@ impl Database {
                     }
                 }
                 for spec in &composite_uniques {
+                    let Some(k) = index_key_of_spec(n, spec) else {
+                        continue;
+                    };
+                    if let Some(loc) = BTree::open(roots[&spec.root_key])
+                        .get(&PageReader::current(&self.pager), &tx, &k)
+                        .map_err(|e| index_err(&spec.root_key, e))?
+                    {
+                        displaced.push(loc);
+                    }
+                }
+                // Predicate-scoped displacement: only a qualifying candidate
+                // can conflict with the partial tree (a non-qualifying row
+                // inserts beside it, displacing nothing).
+                for spec in &partial_uniques {
+                    if !matches!(
+                        eval_expr(spec.pred.as_ref().expect("pred set"), n)?,
+                        Value::Bool(true)
+                    ) {
+                        continue;
+                    }
                     let Some(k) = index_key_of_spec(n, spec) else {
                         continue;
                     };
@@ -13333,6 +13379,28 @@ impl Database {
                         // for the undirected policies too.
                         if hit.is_none() {
                             for spec in &composite_uniques {
+                                let Some(k) = index_key_of_spec(&doc, spec) else {
+                                    continue;
+                                };
+                                if let Some(loc) = BTree::open(roots[&spec.root_key])
+                                    .get(&PageReader::current(&self.pager), &tx, &k)
+                                    .map_err(|e| index_err(&spec.root_key, e))?
+                                {
+                                    hit = Some(loc);
+                                    break;
+                                }
+                            }
+                        }
+                        // Predicate-scoped conflicts: only a qualifying
+                        // candidate probes the partial tree.
+                        if hit.is_none() {
+                            for spec in &partial_uniques {
+                                if !matches!(
+                                    eval_expr(spec.pred.as_ref().expect("pred set"), &doc)?,
+                                    Value::Bool(true)
+                                ) {
+                                    continue;
+                                }
                                 let Some(k) = index_key_of_spec(&doc, spec) else {
                                     continue;
                                 };
@@ -14571,8 +14639,14 @@ fn resolve_conflict_columns(meta: &TableMeta, cols: &[String]) -> Result<String>
             return Ok(col.clone());
         }
     }
+    // Partial unique indexes are not targetable: their conflicts are
+    // predicate-scoped and the untargeted policies handle them; a targeted
+    // scope would need per-row predicate evaluation against the target.
     if let Some(def) = meta.index_defs.iter().find(|d| {
-        d.unique && d.columns.len() == cols.len() && cols.iter().all(|c| d.columns.contains(c))
+        d.pred.is_none()
+            && d.unique
+            && d.columns.len() == cols.len()
+            && cols.iter().all(|c| d.columns.contains(c))
     }) {
         return Ok(if def.columns.len() == 1 {
             def.columns[0].clone()
@@ -28312,8 +28386,8 @@ mod tests {
             ("CREATE TABLE #temp (a INT)", "temp tables"),
             ("CREATE INDEX ix_i ON t (v) INCLUDE (b)", "INCLUDE"),
             (
-                "CREATE UNIQUE INDEX ix_uw ON t (v) WHERE v > 0",
-                "UNIQUE partial indexes",
+                "CREATE INDEX ix_pj ON t (JSON_EXTRACT(v, '$.a')) WHERE v > 0",
+                "cannot combine",
             ),
             ("SELECT * FROM sys.tables", "catalog views"),
             ("SELECT * FROM sysobjects", "catalog views"),
@@ -38021,6 +38095,88 @@ mod partial_index_tests {
     }
 
     #[test]
+    fn partial_unique_enforces_only_among_qualifying_rows() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE users (id INT PRIMARY KEY, email TEXT, deleted INT NOT NULL)",
+        );
+        run(
+            &mut db,
+            "CREATE UNIQUE INDEX ux_live ON users (email) WHERE deleted = 0",
+        );
+        // The classic soft-delete pattern: live emails are unique, deleted
+        // ones may repeat freely.
+        run(&mut db, "INSERT INTO users VALUES (1, 'a@x', 0)");
+        let e = db
+            .execute("INSERT INTO users VALUES (2, 'a@x', 0)")
+            .unwrap_err();
+        assert!(e.to_string().to_uppercase().contains("UNIQUE"), "{e}");
+        // Non-qualifying rows insert beside the tree — even with the same
+        // email, even several of them.
+        run(&mut db, "INSERT INTO users VALUES (3, 'a@x', 1)");
+        run(&mut db, "INSERT INTO users VALUES (8, 'a@x', 1)");
+        // Flipping IN collides; flipping OUT frees the key.
+        let e = db
+            .execute("UPDATE users SET deleted = 0 WHERE id = 3")
+            .unwrap_err();
+        assert!(e.to_string().to_uppercase().contains("UNIQUE"), "{e}");
+        run(&mut db, "UPDATE users SET deleted = 1 WHERE id = 1");
+        run(&mut db, "INSERT INTO users VALUES (4, 'a@x', 0)");
+        // OR IGNORE: the qualifying duplicate is skipped via the partial
+        // tree (untargeted policy), not surfaced as a tree error.
+        run(&mut db, "INSERT OR IGNORE INTO users VALUES (5, 'a@x', 0)");
+        let r = rows(
+            &mut db,
+            "SELECT COUNT(*) FROM users WHERE email = 'a@x' AND deleted = 0",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        // OR REPLACE: the qualifying duplicate displaces the old row.
+        run(&mut db, "INSERT OR REPLACE INTO users VALUES (6, 'a@x', 0)");
+        let r = rows(
+            &mut db,
+            "SELECT id FROM users WHERE email = 'a@x' AND deleted = 0 ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(6)]], "{r:?}");
+        // Upsert (MySQL spelling, untargeted): conflict via the partial tree
+        // updates the row in place.
+        run(
+            &mut db,
+            "INSERT INTO users VALUES (7, 'a@x', 0) ON DUPLICATE KEY UPDATE deleted = 9",
+        );
+        let r = rows(&mut db, "SELECT deleted FROM users WHERE id = 6");
+        assert_eq!(r.rows, vec![vec![Value::Int(9)]], "{r:?}");
+        // Targeted ON CONFLICT on the partial index's column cannot resolve
+        // (conflict scopes are constraint columns) — loud, documented.
+        let e = db
+            .execute("INSERT INTO users VALUES (9, 'a@x', 0) ON CONFLICT (email) DO NOTHING")
+            .unwrap_err();
+        assert!(e.to_string().contains("email"), "{e}");
+        // Reads: the gated probe must answer exactly like a scan — after the
+        // upsert flipped id=6 out of the predicate (deleted = 9) NO row
+        // qualifies, and the deleted rows must not leak through the tree.
+        let r = rows(
+            &mut db,
+            "SELECT id FROM users WHERE deleted = 0 AND email = 'a@x' ORDER BY id",
+        );
+        assert_eq!(r.rows, Vec::<Vec<Value>>::new(), "{r:?}");
+        let r = rows(
+            &mut db,
+            "SELECT id FROM users WHERE email = 'a@x' ORDER BY id",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(3)],
+                vec![Value::Int(6)],
+                vec![Value::Int(8)]
+            ],
+            "{r:?}"
+        );
+    }
+
+    #[test]
     fn partial_index_dump_roundtrip() {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -38084,12 +38240,6 @@ mod partial_index_tests {
             .execute("CREATE INDEX px ON t (k) WHERE ghost > 0")
             .unwrap_err();
         assert!(e.to_string().contains("ghost"), "{e}");
-        // UNIQUE + partial: conflict policies cannot see predicate-scoped
-        // conflicts (v1 boundary, loud).
-        let e = db
-            .execute("CREATE UNIQUE INDEX ux ON t (k) WHERE tag = 'a'")
-            .unwrap_err();
-        assert!(e.to_string().contains("UNIQUE partial indexes"), "{e}");
         // Path + partial refused.
         let e = db
             .execute("CREATE INDEX pj ON t (JSON_EXTRACT(tag, '$.a')) WHERE k > 0")
