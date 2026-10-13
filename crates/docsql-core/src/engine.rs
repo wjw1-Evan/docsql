@@ -284,6 +284,13 @@ pub struct IndexDef {
     /// JSON text; tree keys are values extracted at this path via the same
     /// lookup `JSON_EXTRACT` uses. None = a plain column index.
     pub path: Option<String>,
+    /// Partial index (CREATE INDEX … WHERE): the predicate as SQL text. The
+    /// tree holds ONLY the rows satisfying it, so every probe over the tree
+    /// must first prove the query's WHERE implies the predicate
+    /// ([`query_implies_pred`]) — an ungated probe would silently drop the
+    /// pred-failing rows. Row-local only (no subqueries/aggregates),
+    /// validated at CREATE time.
+    pub pred: Option<String>,
 }
 
 impl IndexDef {
@@ -308,6 +315,8 @@ pub struct IndexInfo {
     /// (SQLite-style `sqlite_autoindex_*` name). Derived, never persisted,
     /// and not droppable/editable through DROP INDEX / CREATE INDEX.
     pub auto: bool,
+    /// Partial-index predicate text (None for full indexes).
+    pub pred: Option<String>,
 }
 
 /// Outcome of a multi-statement batch: statements run in order and the run
@@ -1851,7 +1860,7 @@ impl<'a> ReadCx<'a> {
                             // Order) failed to parse there — taking the user's
                             // hand-made indexes down with it.
                             Value::Str(format!(
-                                "CREATE {}INDEX {iname} ON {tbl} ({col})",
+                                "CREATE {}INDEX {iname} ON {tbl} ({col}){pred}",
                                 if d.unique { "UNIQUE " } else { "" },
                                 iname = crate::stmt::sql_quote_ident(&d.name),
                                 tbl = crate::stmt::sql_quote_ident(tbl),
@@ -1860,7 +1869,12 @@ impl<'a> ReadCx<'a> {
                                     .iter()
                                     .map(|c| crate::stmt::sql_quote_ident(c))
                                     .collect::<Vec<_>>()
-                                    .join(", ")
+                                    .join(", "),
+                                pred = d
+                                    .pred
+                                    .as_deref()
+                                    .map(|p| format!(" WHERE {p}"))
+                                    .unwrap_or_default()
                             )),
                         ),
                     ]));
@@ -5312,7 +5326,7 @@ impl<'a> ReadCx<'a> {
         }
         let akey = alias.as_ref().map(|a| a.name.value.clone());
         let Some((root_key, asc)) =
-            order_walk_index(meta, &tname, akey.as_deref(), exprs, &effective)
+            order_walk_index(meta, &tname, akey.as_deref(), selection, exprs, &effective)
         else {
             return Ok(None);
         };
@@ -6291,11 +6305,18 @@ impl Database {
                                                     .get(4)
                                                     .and_then(|v| v.as_str())
                                                     .map(String::from);
+                                                // Optional 6th element: the
+                                                // partial-index predicate text.
+                                                let pred = t
+                                                    .get(5)
+                                                    .and_then(|v| v.as_str())
+                                                    .map(String::from);
                                                 Some(IndexDef {
                                                     name: n.to_string(),
                                                     columns,
                                                     unique: u,
                                                     path,
+                                                    pred,
                                                 })
                                             }
                                             _ => None,
@@ -6639,10 +6660,14 @@ impl Database {
                                         d.columns.iter().map(|c| Value::Str(c.clone())).collect(),
                                     ),
                                 ];
-                                // 5th element only for path indexes: older
-                                // readers ignore it, so the tuple stays
-                                // compatible in both directions (design 005).
+                                // 5th element only for path indexes, 6th only
+                                // for partial indexes: older readers ignore
+                                // the tail, so the tuple stays compatible in
+                                // both directions (design 005).
                                 if let Some(p) = &d.path {
+                                    entry.push(Value::Str(p.clone()));
+                                }
+                                if let Some(p) = &d.pred {
                                     entry.push(Value::Str(p.clone()));
                                 }
                                 Value::Array(entry)
@@ -7761,6 +7786,7 @@ impl Database {
                 columns: vec![(*c).clone()],
                 unique: true,
                 auto: true,
+                pred: None,
             })
             .collect()
     }
@@ -7814,6 +7840,7 @@ impl Database {
                             columns: d.columns.clone(),
                             unique: d.unique,
                             auto: false,
+                            pred: d.pred.clone(),
                         }))
                         .collect(),
                     pages: meta.pages.len(),
@@ -8363,11 +8390,15 @@ impl Database {
                         .join(", "),
                 };
                 ddl.push_str(&format!(
-                    "CREATE {}INDEX {} ON {} ({});\n",
+                    "CREATE {}INDEX {} ON {} ({}){};\n",
                     if d.unique { "UNIQUE " } else { "" },
                     quote_ident(&d.name),
                     quote_ident(name),
-                    col_text
+                    col_text,
+                    d.pred
+                        .as_deref()
+                        .map(|p| format!(" WHERE {p}"))
+                        .unwrap_or_default()
                 ));
             }
         }
@@ -8648,7 +8679,10 @@ impl Database {
                                     // path tree left behind gets mistaken for
                                     // the column's own scalar tree, silently
                                     // hijacking probes and ORDER BY walks.
-                                    if def.columns.len() > 1 || def.path.is_some() {
+                                    if def.columns.len() > 1
+                                        || def.path.is_some()
+                                        || def.pred.is_some()
+                                    {
                                         if let Some(root) = meta.index_roots.remove(&iname) {
                                             dropped_roots.push((iname.clone(), root));
                                         }
@@ -9246,6 +9280,18 @@ impl Database {
                 .iter()
                 .map(|c| meta.root_key_unique(c))
                 .collect::<Vec<_>>(),
+            // Partial-index predicates: the rebuilt tree must hold exactly
+            // the qualifying rows or every gated probe reads wrong.
+            &cols
+                .iter()
+                .map(|k| {
+                    meta.index_defs
+                        .iter()
+                        .find(|d| d.name == *k)
+                        .and_then(|d| d.pred.as_deref())
+                        .and_then(|p| parse_expr_text(p).ok())
+                })
+                .collect::<Vec<_>>(),
         )?;
         // Keep the previous catalog entry so a failed persist can restore the
         // in-memory map — after `?` below the tx is dropped and its staged
@@ -9287,6 +9333,7 @@ impl Database {
     /// by the bare value (legacy layout); multi-column specs key by
     /// `Value::Array` over the columns in order. Unique specs reject
     /// duplicates at insert time.
+    #[allow(clippy::too_many_arguments)]
     fn build_trees(
         &mut self,
         tx: &mut crate::pager::Tx,
@@ -9295,6 +9342,7 @@ impl Database {
         cols_per_key: &[Vec<String>],
         paths_per_key: &[Option<String>],
         unique_keys: &[bool],
+        preds_per_key: &[Option<SqlExpr>],
     ) -> Result<std::collections::BTreeMap<String, u32>> {
         let mut roots = std::collections::BTreeMap::new();
         for i in 0..root_keys.len() {
@@ -9302,6 +9350,7 @@ impl Database {
             let cols = &cols_per_key[i];
             let path = paths_per_key[i].as_deref();
             let unique = unique_keys[i];
+            let pred = preds_per_key[i].as_ref();
             let mut tree = BTree::create(&self.pager, tx).map_err(|e| index_err(root_key, e))?;
             for (loc, doc) in pairs {
                 // The backfill is the expensive half of CREATE INDEX on a big
@@ -9309,6 +9358,13 @@ impl Database {
                 // without a check here the statement was uninterruptible
                 // once it entered the tree builds.
                 self.stmt_deadline.check()?;
+                // Partial index: only pred-satisfying rows enter the tree
+                // (NULL/missing fields fail the predicate like any WHERE).
+                if let Some(p) = pred {
+                    if !matches!(eval_expr(p, doc)?, Value::Bool(true)) {
+                        continue;
+                    }
+                }
                 let key = match path {
                     // JSON path index: extract from the column's JSON text
                     // with the exact lookup JSON_EXTRACT uses (design 005).
@@ -10087,9 +10143,17 @@ impl Database {
         if !idx.include.is_empty() {
             return err("CREATE INDEX INCLUDE is not supported");
         }
-        if idx.predicate.is_some() {
-            return err("partial indexes (CREATE INDEX ... WHERE) are not supported");
-        }
+        // Partial index (CREATE INDEX … WHERE): the predicate is validated
+        // against the table below; the tree then holds only the qualifying
+        // rows and every read must prove the query implies the predicate
+        // before probing (superset safety, see [`query_implies_pred`]).
+        let pred_expr = match &idx.predicate {
+            Some(e) => {
+                let p = validate_partial_pred(e)?;
+                Some(p)
+            }
+            None => None,
+        };
         if idx.using.is_some() {
             return err("index types (USING ...) are not supported");
         }
@@ -10150,6 +10214,17 @@ impl Database {
         let Some(mut meta) = self.tables.get(&table).map(|a| a.as_ref().clone()) else {
             return err(format!("table {table} does not exist"));
         };
+        // Partial-predicate columns must be declared: a ghost name would
+        // read NULL on every row and silently empty the tree.
+        if let Some(p) = &pred_expr {
+            let mut refs = std::collections::BTreeSet::new();
+            pred_columns(p, &mut refs);
+            for c in &refs {
+                if !meta.columns.contains(c) {
+                    return err(format!("column {c} does not exist"));
+                }
+            }
+        }
         // Parse the indexed columns: plain identifiers only (expression
         // indexes stay unsupported), each must exist, duplicates rejected.
         if idx.columns.is_empty() {
@@ -10210,6 +10285,22 @@ impl Database {
                  is column-based)",
             );
         }
+        // UNIQUE partial indexes are refused for the same family of reasons:
+        // plain INSERT enforces duplicates through the partial tree, but the
+        // conflict policies (OR REPLACE displacement / OR IGNORE skip /
+        // upsert) probe constraint COLUMNS unconditionally — they would miss
+        // predicate-scoped conflicts or mis-skip rows. The predicate also
+        // composes badly with the path extraction (a probe would need to
+        // imply the pred AND the extraction stays exact); refuse the mix.
+        if idx.unique && pred_expr.is_some() {
+            return err(
+                "UNIQUE partial indexes are not supported (conflict policies cannot see \
+                 predicate-scoped conflicts)",
+            );
+        }
+        if path.is_some() && pred_expr.is_some() {
+            return err("a partial index cannot combine with a JSON path index");
+        }
         let root_key = if path.is_some() {
             // Path trees are keyed by extracted values, never column values:
             // they always key by the index name and never reuse a column
@@ -10217,6 +10308,11 @@ impl Database {
             // shape; sharing one would mix value kinds in one tree).
             iname.clone()
         } else if cols.len() > 1 {
+            iname.clone()
+        } else if pred_expr.is_some() {
+            // A partial tree holds a SUBSET of the column's rows — it must
+            // never occupy the column-name root slot where ungated readers
+            // (conflict probes, constraint lookups) expect a full tree.
             iname.clone()
         } else {
             cols[0].clone()
@@ -10239,7 +10335,7 @@ impl Database {
         // is a different one.
         let mut reuse_root: Option<u32> = None;
         if let Some(&root) = meta.index_roots.get(&root_key) {
-            if path.is_none() && meta.index_columns_of(&root_key) == cols {
+            if path.is_none() && pred_expr.is_none() && meta.index_columns_of(&root_key) == cols {
                 reuse_root = Some(root);
             } else {
                 return err(format!(
@@ -10274,9 +10370,10 @@ impl Database {
                     &mut tx,
                     &pairs,
                     std::slice::from_ref(&root_key),
-                    &[cols.clone()],
-                    &[path.clone()],
-                    &[idx.unique],
+                    std::slice::from_ref(&cols),
+                    std::slice::from_ref(&path),
+                    std::slice::from_ref(&idx.unique),
+                    std::slice::from_ref(&pred_expr),
                 )?;
                 meta.index_roots.append(&mut roots);
             }
@@ -10286,6 +10383,7 @@ impl Database {
             columns: cols,
             unique: idx.unique,
             path: path.clone(),
+            pred: pred_expr.as_ref().map(|p| p.to_string()),
         });
         meta.indexes.push(iname);
         let prev_meta = self.tables.get(&table).cloned();
@@ -10482,6 +10580,26 @@ impl Database {
                         }
                         if pk.as_deref() == Some(name.as_str()) {
                             return err("cannot drop a PRIMARY KEY column");
+                        }
+                        // A partial-index predicate naming the column would
+                        // silently read NULL after the drop — every row would
+                        // fall out of the tree at the next rewrite. Refuse
+                        // like CHECK constraints do (drop the index first).
+                        if let Some(bad) = index_defs.iter().find_map(|d| {
+                            d.pred.as_deref().and_then(|p| {
+                                parse_expr_text(p)
+                                    .map(|e| {
+                                        let mut cols = std::collections::BTreeSet::new();
+                                        pred_columns(&e, &mut cols);
+                                        cols.contains(name).then(|| d.name.clone())
+                                    })
+                                    .unwrap_or(None)
+                            })
+                        }) {
+                            return err(format!(
+                                "cannot drop column {name}: partial index {bad} references it \
+                                 in its WHERE predicate"
+                            ));
                         }
                         if let Some(bad) = checks.iter().find(|c| {
                             parse_expr_text(c)
@@ -11014,6 +11132,22 @@ impl Database {
                                         .collect(),
                                     unique: d.unique,
                                     path: d.path.clone(),
+                                    pred: d.pred.clone(),
+                                }
+                            } else if d.pred.is_some() {
+                                // The predicate is SQL text over row fields:
+                                // a renamed column must not leave it naming a
+                                // ghost (its rows would silently read NULL
+                                // and drop out of the tree). Same rewrite the
+                                // CHECK texts get.
+                                IndexDef {
+                                    name: d.name.clone(),
+                                    columns: d.columns.clone(),
+                                    unique: d.unique,
+                                    path: d.path.clone(),
+                                    pred: d.pred.as_deref().map(|p| {
+                                        rename_ident_in_text(p, old, &ident_spelling(new))
+                                    }),
                                 }
                             } else {
                                 d.clone()
@@ -12500,6 +12634,7 @@ impl Database {
                     .collect::<Vec<_>>(),
                 &vec![None; constraint_cols.len()],
                 &vec![true; constraint_cols.len()],
+                &vec![None; constraint_cols.len()],
             )?;
             meta.index_roots = roots;
         }
@@ -13368,6 +13503,12 @@ impl Database {
             for spec in &idx_specs {
                 if indexed.contains(&spec.root_key) {
                     continue;
+                }
+                // Partial index: only qualifying rows enter the tree.
+                if let Some(p) = &spec.pred {
+                    if !matches!(eval_expr(p, &doc)?, Value::Bool(true)) {
+                        continue;
+                    }
                 }
                 let Some(v) = index_key_of_spec(&doc, spec) else {
                     continue;
@@ -21683,6 +21824,7 @@ fn order_walk_index(
     meta: &TableMeta,
     table: &str,
     alias: Option<&str>,
+    selection: &Option<SqlExpr>,
     exprs: &[sqlparser::ast::OrderByExpr],
     effective: &[&SqlExpr],
 ) -> Option<(String, bool)> {
@@ -21716,7 +21858,20 @@ fn order_walk_index(
             .index_defs
             .iter()
             .any(|d| d.name == *root && d.path.is_some());
-        (!is_path && meta.index_columns_of(root) == cols).then(|| (root.clone(), asc))
+        // A PARTIAL index walks only its qualifying rows: without a WHERE
+        // implying the predicate the window would silently drop the rest.
+        let partial_blocked = meta
+            .index_defs
+            .iter()
+            .find(|d| d.name == *root)
+            .and_then(|d| d.pred.as_deref())
+            .is_some_and(|p| {
+                selection
+                    .as_ref()
+                    .is_none_or(|c| !query_implies_pred(c, p, table, alias))
+            });
+        (!is_path && !partial_blocked && meta.index_columns_of(root) == cols)
+            .then(|| (root.clone(), asc))
     })
 }
 
@@ -21728,6 +21883,336 @@ fn order_walk_index(
 /// accepting `index_roots.contains_key(ident)` blindly made a column that
 /// shares a composite index's name probe an Array-keyed tree and silently
 /// return nothing.
+/// CREATE-time validation of a partial-index predicate: row-local only —
+/// bare identifiers that name table columns, literals, operators, scalar
+/// functions, IS NULL / IN (constants) / BETWEEN / LIKE. Subqueries,
+/// aggregates, window functions and qualified names are refused (a probe
+/// gate evaluates the predicate per row with the same row-local evaluator,
+/// so anything richer could diverge between gate and maintenance). The
+/// caller checks identifier existence against the table's columns.
+fn validate_partial_pred(e: &SqlExpr) -> Result<SqlExpr> {
+    let bad = |what: &str| -> Result<SqlExpr> {
+        err(format!(
+            "partial-index predicates support row-local expressions only ({what} is not allowed)"
+        ))
+    };
+    match e {
+        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => {
+            bad("a subquery")
+        }
+        SqlExpr::CompoundIdentifier(_) => bad("qualified column names (use bare column names)"),
+        SqlExpr::Function(f) => {
+            if is_agg_fn(f) {
+                return bad("an aggregate");
+            }
+            if f.over.is_some() {
+                return bad("a window function");
+            }
+            walk_partial_pred_args(f)?;
+            Ok(e.clone())
+        }
+        SqlExpr::Nested(inner) => validate_partial_pred(inner),
+        SqlExpr::UnaryOp { expr, .. } => validate_partial_pred(expr),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            validate_partial_pred(left)?;
+            validate_partial_pred(right)?;
+            Ok(e.clone())
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            validate_partial_pred(expr)?;
+            validate_partial_pred(low)?;
+            validate_partial_pred(high)?;
+            Ok(e.clone())
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            validate_partial_pred(expr)?;
+            for item in list {
+                validate_partial_pred(item)?;
+            }
+            Ok(e.clone())
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            validate_partial_pred(l)?;
+            validate_partial_pred(r)?;
+            Ok(e.clone())
+        }
+        SqlExpr::IsNull(x) | SqlExpr::IsNotNull(x) => validate_partial_pred(x),
+        SqlExpr::Cast { expr, .. } => validate_partial_pred(expr),
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            validate_partial_pred(expr)?;
+            validate_partial_pred(pattern)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                validate_partial_pred(o)?;
+            }
+            for w in conditions {
+                validate_partial_pred(&w.condition)?;
+                validate_partial_pred(&w.result)?;
+            }
+            if let Some(r) = else_result {
+                validate_partial_pred(r)?;
+            }
+            Ok(e.clone())
+        }
+        _ => Ok(e.clone()),
+    }
+}
+
+fn walk_partial_pred_args(f: &sqlparser::ast::Function) -> Result<()> {
+    if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+        for a in &list.args {
+            if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                inner,
+            )) = a
+            {
+                validate_partial_pred(inner)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect the bare column names a predicate references.
+fn pred_columns(e: &SqlExpr, out: &mut std::collections::BTreeSet<String>) {
+    match e {
+        SqlExpr::Identifier(i) => {
+            out.insert(i.value.clone());
+        }
+        SqlExpr::Nested(inner) => pred_columns(inner, out),
+        SqlExpr::UnaryOp { expr, .. } => pred_columns(expr, out),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            pred_columns(left, out);
+            pred_columns(right, out);
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            pred_columns(expr, out);
+            pred_columns(low, out);
+            pred_columns(high, out);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            pred_columns(expr, out);
+            for item in list {
+                pred_columns(item, out);
+            }
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            pred_columns(l, out);
+            pred_columns(r, out);
+        }
+        SqlExpr::IsNull(x) | SqlExpr::IsNotNull(x) => pred_columns(x, out),
+        SqlExpr::Cast { expr, .. } => pred_columns(expr, out),
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            pred_columns(expr, out);
+            pred_columns(pattern, out);
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                pred_columns(o, out);
+            }
+            for w in conditions {
+                pred_columns(&w.condition, out);
+                pred_columns(&w.result, out);
+            }
+            if let Some(r) = else_result {
+                pred_columns(r, out);
+            }
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        pred_columns(inner, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One query conjunct's equality binding: (bare column, values) — `col =
+/// const` yields one value, `col IN (consts)` the whole list. NULL never
+/// binds (it binds to nothing).
+fn pred_eq_binding(q: &SqlExpr) -> Option<(String, Vec<Value>)> {
+    match q {
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let (id_side, lit_side) = match (left.as_ref(), right.as_ref()) {
+                (SqlExpr::Identifier(i), other) => (i, other),
+                (other, SqlExpr::Identifier(i)) => (i, other),
+                _ => return None,
+            };
+            let v = eval_const(lit_side).ok()?;
+            if matches!(v, Value::Null) {
+                return None;
+            }
+            Some((id_side.value.clone(), vec![v]))
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated: false,
+            ..
+        } => {
+            let SqlExpr::Identifier(i) = expr.as_ref() else {
+                return None;
+            };
+            let vals: Option<Vec<Value>> = list.iter().map(|el| eval_const(el).ok()).collect();
+            let vals = vals?;
+            if vals.is_empty() || vals.iter().any(|v| matches!(v, Value::Null)) {
+                return None;
+            }
+            Some((i.value.clone(), vals))
+        }
+        _ => None,
+    }
+}
+
+/// Substitute every bare `col` identifier in `e` with the literal `v`
+/// (recursive over the row-local shapes [`validate_partial_pred`] accepts).
+/// Returns false when the shape escapes substitution.
+fn pred_subst_ident(e: &mut SqlExpr, col: &str, v: &Value) -> bool {
+    let mut replaced = false;
+    match e {
+        SqlExpr::Identifier(i) if i.value == col => {
+            if let Ok(lit) = value_to_literal(v.clone()) {
+                *e = lit;
+                replaced = true;
+            }
+        }
+        SqlExpr::Nested(inner) => replaced = pred_subst_ident(inner, col, v),
+        SqlExpr::UnaryOp { expr, .. } => replaced = pred_subst_ident(expr, col, v),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            let a = pred_subst_ident(left, col, v);
+            let b = pred_subst_ident(right, col, v);
+            replaced = a || b;
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            let a = pred_subst_ident(expr, col, v);
+            let b = pred_subst_ident(low, col, v);
+            let c = pred_subst_ident(high, col, v);
+            replaced = a || b || c;
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            replaced = pred_subst_ident(expr, col, v);
+            for item in list {
+                replaced |= pred_subst_ident(item, col, v);
+            }
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            let a = pred_subst_ident(l, col, v);
+            let b = pred_subst_ident(r, col, v);
+            replaced = a || b;
+        }
+        SqlExpr::IsNull(x) | SqlExpr::IsNotNull(x) => replaced = pred_subst_ident(x, col, v),
+        SqlExpr::Cast { expr, .. } => replaced = pred_subst_ident(expr, col, v),
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            let a = pred_subst_ident(expr, col, v);
+            let b = pred_subst_ident(pattern, col, v);
+            replaced = a || b;
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                replaced |= pred_subst_ident(o, col, v);
+            }
+            for w in conditions {
+                replaced |= pred_subst_ident(&mut w.condition, col, v);
+                replaced |= pred_subst_ident(&mut w.result, col, v);
+            }
+            if let Some(r) = else_result {
+                replaced |= pred_subst_ident(r, col, v);
+            }
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        replaced |= pred_subst_ident(inner, col, v);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    replaced
+}
+
+/// True when the query's WHERE clause implies the partial-index predicate —
+/// the gate that makes a probe over the partial tree a SUPERSET of the
+/// answer set (every row the WHERE keeps satisfies the predicate, so it is
+/// in the tree). Conservative conjunction proof: both sides decompose into
+/// AND-conjuncts; every predicate conjunct must be implied by some query
+/// conjunct via (a) normalized syntactic identity, or (b) equality
+/// substitution — `col = const` / `col IN (consts)` implies any
+/// single-column conjunct that evaluates TRUE under every bound value.
+/// Anything unprovable leaves the index invisible to the query (full scan /
+/// other indexes) — never wrong rows.
+fn query_implies_pred(cond: &SqlExpr, pred_text: &str, table: &str, alias: Option<&str>) -> bool {
+    let _ = (table, alias);
+    let Ok(pred) = parse_expr_text(pred_text) else {
+        return false;
+    };
+    let mut pred_terms = Vec::new();
+    flatten_and(&pred, &mut pred_terms);
+    let mut q_terms = Vec::new();
+    flatten_and(cond, &mut q_terms);
+    'every_term: for t in &pred_terms {
+        let mut t_cols = std::collections::BTreeSet::new();
+        pred_columns(t, &mut t_cols);
+        let t_key = format!("{t}");
+        for q in &q_terms {
+            if format!("{q}") == t_key {
+                continue 'every_term;
+            }
+            if let Some((col, vals)) = pred_eq_binding(q) {
+                let implied = t_cols.len() == 1
+                    && t_cols.contains(&col)
+                    && vals.iter().all(|v| {
+                        let mut sub: SqlExpr = (*t).clone();
+                        pred_subst_ident(&mut sub, &col, v)
+                            && matches!(eval_expr(&sub, &Object::new()), Ok(Value::Bool(true)))
+                    });
+                if implied {
+                    continue 'every_term;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
 fn resolve_indexed_col(
     ident: &str,
     table: &str,
@@ -21743,11 +22228,12 @@ fn resolve_indexed_col(
         }
         // A JSON path index keyed by the column's NAME (root_key == index
         // name, design 005) holds extracted values, not column values —
-        // it must never serve a scalar column probe.
+        // it must never serve a scalar column probe. Same for a PARTIAL
+        // index under that name (its tree is a gated subset).
         if meta
             .index_defs
             .iter()
-            .any(|d| d.name == col && d.path.is_some())
+            .any(|d| d.name == col && (d.path.is_some() || d.pred.is_some()))
         {
             return None;
         }
@@ -21818,6 +22304,11 @@ fn path_bound(bounds: &[(BinaryOperator, Value)], lower: bool) -> Option<(Value,
     best
 }
 
+/// A range-probe target: the tree root key plus the probed column (a FULL
+/// single-column index roots at the column itself; a gated PARTIAL index
+/// roots at its index name).
+type ProbeTarget = (String, String, Vec<(BinaryOperator, Value)>);
+
 fn probe_plan(
     cond: &SqlExpr,
     meta: &TableMeta,
@@ -21837,8 +22328,10 @@ fn probe_plan(
     // rows the other conjunct excludes, and `covered` sees a single map key
     // so the plan would be declared exact. Refuse any index plan instead.
     let mut eq_conflict = false;
-    let mut eq: Option<(String, Value)> = None;
-    let mut range: Option<(String, Vec<(BinaryOperator, Value)>)> = None;
+    // (tree root key, column name, …): a FULL single-column index roots at
+    // the column itself; a gated PARTIAL index roots at its index name.
+    let mut eq: Option<(String, String, Value)> = None;
+    let mut range: Option<ProbeTarget> = None;
     // JSON path conjuncts (design 005): JSON_EXTRACT(col,'$.p') op const.
     // One (col, path) target per plan; a second distinct target or a mix
     // with named-column conjuncts stays usable but inexact.
@@ -21847,7 +22340,29 @@ fn probe_plan(
     let mut path_range: Option<Vec<(BinaryOperator, Value)>> = None;
     // Scalar equality set: `col IN (…)` on a single-column tree. One target
     // per plan; a second IN list rides the residual filter (inexact).
-    let mut in_target: Option<(String, Vec<Value>)> = None;
+    let mut in_target: Option<(String, String, Vec<Value>)> = None;
+    // Column → tree-root resolution for probe candidates: the column's own
+    // full single-column tree, or — when the query WHERE implies the
+    // predicate — a single-column PARTIAL index (its tree keys by the index
+    // name). Not implied → the partial index is invisible (superset safety).
+    let resolve_probe = |name: &str| -> Option<(String, String)> {
+        if let Some(c) = resolve_indexed_col(name, table, alias, meta) {
+            return Some((c.clone(), c));
+        }
+        let bare = unqualified_col(name, table, alias, meta.dotted_keys)?;
+        for d in &meta.index_defs {
+            if d.pred.is_none() || d.columns.len() != 1 || d.columns[0] != *bare {
+                continue;
+            }
+            if !meta.index_roots.contains_key(&d.name) {
+                continue;
+            }
+            if query_implies_pred(cond, d.pred.as_deref().expect("pred set"), table, alias) {
+                return Some((d.name.clone(), bare.to_string()));
+            }
+        }
+        None
+    };
     for c in conjuncts {
         // col BETWEEN low AND high — a closed range on one indexed column,
         // exactly the two inclusive bounds the Range plan already walks.
@@ -21871,7 +22386,7 @@ fn probe_plan(
                     continue;
                 }
             };
-            let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+            let Some((root, col)) = resolve_probe(&name) else {
                 opaque = true;
                 continue;
             };
@@ -21884,12 +22399,13 @@ fn probe_plan(
                 continue;
             }
             match &mut range {
-                Some((c2, bounds)) if *c2 == col => {
+                Some((_, c2, bounds)) if *c2 == col => {
                     bounds.push((BinaryOperator::GtEq, lo));
                     bounds.push((BinaryOperator::LtEq, hi));
                 }
                 None => {
                     range = Some((
+                        root,
                         col,
                         vec![(BinaryOperator::GtEq, lo), (BinaryOperator::LtEq, hi)],
                     ));
@@ -21920,7 +22436,7 @@ fn probe_plan(
                     continue;
                 }
             };
-            let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+            let Some((root, col)) = resolve_probe(&name) else {
                 opaque = true;
                 continue;
             };
@@ -21951,7 +22467,7 @@ fn probe_plan(
                 continue;
             }
             match &mut in_target {
-                None => in_target = Some((col, vals)),
+                None => in_target = Some((root, col, vals)),
                 Some(_) => opaque = true, // second IN list: rides the residual filter
             }
             continue;
@@ -21980,7 +22496,7 @@ fn probe_plan(
                     continue;
                 }
             };
-            let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+            let Some((root, col)) = resolve_probe(&name) else {
                 opaque = true;
                 continue;
             };
@@ -22005,8 +22521,8 @@ fn probe_plan(
                 bounds.push((BinaryOperator::Lt, Value::Str(h)));
             }
             match &mut range {
-                Some((c2, prev)) if *c2 == col => prev.append(&mut bounds),
-                None => range = Some((col, bounds)),
+                Some((_, c2, prev)) if *c2 == col => prev.append(&mut bounds),
+                None => range = Some((root, col, bounds)),
                 _ => opaque = true,
             }
             continue;
@@ -22114,20 +22630,20 @@ fn probe_plan(
                     }
                 }
                 if eq.is_none() {
-                    if let Some(col) = resolve_indexed_col(&name, table, alias, meta) {
-                        eq = Some((col, v.clone()));
+                    if let Some((root, col)) = resolve_probe(&name) {
+                        eq = Some((root, col, v.clone()));
                     }
                 }
                 eq_map.insert(name, v);
             }
             Gt | GtEq | Lt | LtEq => {
-                let Some(col) = resolve_indexed_col(&name, table, alias, meta) else {
+                let Some((root, col)) = resolve_probe(&name) else {
                     opaque = true;
                     continue;
                 };
                 match &mut range {
-                    Some((c2, bounds)) if *c2 == col => bounds.push((op, v)),
-                    None => range = Some((col, vec![(op, v)])),
+                    Some((_, c2, bounds)) if *c2 == col => bounds.push((op, v)),
+                    None => range = Some((root, col, vec![(op, v)])),
                     _ => opaque = true,
                 }
             }
@@ -22221,6 +22737,16 @@ fn probe_plan(
             if cols.len() < 2 {
                 continue; // single-column trees take the scalar path below
             }
+            // Partial composite index: usable only when the query WHERE
+            // implies its predicate — otherwise the tree is missing rows the
+            // query keeps (superset safety).
+            if let Some(d) = meta.index_defs.iter().find(|d| d.name == *root_key) {
+                if d.pred.is_some()
+                    && !query_implies_pred(cond, d.pred.as_deref().expect("pred set"), table, alias)
+                {
+                    continue;
+                }
+            }
             let mut prefix = Vec::with_capacity(cols.len());
             for c in &cols {
                 match bare_eq.get(c) {
@@ -22266,7 +22792,7 @@ fn probe_plan(
             return Some((root_key, plan, exact));
         }
     }
-    if let Some((col, v)) = eq {
+    if let Some((root, col, v)) = eq {
         let exact = !opaque
             && range.is_none()
             && in_target.is_none()
@@ -22275,7 +22801,7 @@ fn probe_plan(
                 unqualified_col(k, table, alias, meta.dotted_keys).as_deref() == Some(&col)
                     && *ev == v
             });
-        return Some((col, ProbePlan::Eq(v), exact));
+        return Some((root, ProbePlan::Eq(v), exact));
     }
     // Equality-set probe: `col IN (…)` on a single-column tree, one bounded
     // Eq walk per element. NULL elements never match (the tree holds no NULL
@@ -22283,16 +22809,16 @@ fn probe_plan(
     // conjuncts it cannot carry stay in the residual filter and demote
     // exactness. An In plan beats a range when both exist — the list is
     // usually the tighter shape.
-    if let Some((icol, ivals)) = &in_target {
+    if let Some((iroot, _icol, ivals)) = &in_target {
         if eq.is_none() && path_target.is_none() {
             let exact = !opaque && range.is_none() && eq_map.is_empty();
-            return Some((icol.clone(), ProbePlan::In(ivals.clone()), exact));
+            return Some((iroot.clone(), ProbePlan::In(ivals.clone()), exact));
         }
         // Unconsumed: the winning plan keeps the IN list in the residual
         // filter — inexact.
         opaque = true;
     }
-    let (col, bounds) = range?;
+    let (root, col, bounds) = range?;
     let mut lo: Option<(Value, bool)> = None;
     let mut hi: Option<(Value, bool)> = None;
     // Same-side bounds from different comparison families where one is a
@@ -22355,7 +22881,7 @@ fn probe_plan(
         return None;
     }
     let exact = !opaque && eq_map.is_empty() && in_target.is_none();
-    Some((col, ProbePlan::Range { lo, hi }, exact))
+    Some((root, ProbePlan::Range { lo, hi }, exact))
 }
 
 /// Mirror a comparison operator for `lit OP col` conjuncts.
@@ -22383,6 +22909,11 @@ struct IdxSpec {
     /// JSON path index (design 005): keys come from
     /// [`json_path_key`] over `cols[0]`'s JSON text, not the column value.
     path: Option<String>,
+    /// Partial index predicate (row-local, parsed once per statement):
+    /// rows failing it never enter the tree, so [`reindex_insert`] skips
+    /// them. Removal/repoint need no check — [`BTree::delete_entry`]
+    /// no-ops on entries that were never there.
+    pred: Option<SqlExpr>,
 }
 
 /// Resolve [`IdxSpec`]s for every tree in `roots`, in root-key order
@@ -22394,15 +22925,22 @@ fn idx_specs(meta: &TableMeta, roots: &std::collections::BTreeMap<String, u32>) 
             let cols = meta.index_columns_of(k);
             // Orphaned tree (dropped composite index): no column list, so no
             // maintenance key. Keep it out of every write path.
-            (!cols.is_empty()).then(|| IdxSpec {
-                root_key: k.clone(),
-                path: meta
-                    .index_defs
-                    .iter()
-                    .find(|d| d.name == *k)
-                    .and_then(|d| d.path.clone()),
-                cols,
-                unique: meta.root_key_unique(k),
+            (!cols.is_empty()).then(|| {
+                let def = meta.index_defs.iter().find(|d| d.name == *k);
+                IdxSpec {
+                    root_key: k.clone(),
+                    path: def.and_then(|d| d.path.clone()),
+                    // Partial predicate parsed once per statement; a
+                    // malformed stored text (impossible via CREATE) leaves
+                    // the spec unfiltered — the tree then behaves full, so
+                    // the read-side gate (which re-parses and on failure
+                    // refuses the probe) still refuses to use it.
+                    pred: def
+                        .and_then(|d| d.pred.as_deref())
+                        .and_then(|p| parse_expr_text(p).ok()),
+                    cols,
+                    unique: meta.root_key_unique(k),
+                }
             })
         })
         .collect()
@@ -22617,6 +23155,14 @@ fn reindex_insert(
     loc: u64,
 ) -> Result<()> {
     for spec in specs {
+        // Partial index: a row failing the predicate never enters the tree
+        // (the removal side needs no mirror check — delete_entry no-ops on
+        // absent entries, so flips in either direction stay consistent).
+        if let Some(p) = &spec.pred {
+            if !matches!(eval_expr(p, doc)?, Value::Bool(true)) {
+                continue;
+            }
+        }
         if let Some(key) = index_key_of_spec(doc, spec) {
             let root = roots[&spec.root_key];
             let mut tree = BTree::open(root);
@@ -26316,6 +26862,7 @@ mod tests {
                     columns: vec!["id".into()],
                     unique: true,
                     auto: true,
+                    pred: None,
                 },
                 IndexInfo {
                     name: "sqlite_autoindex_users_2".into(),
@@ -26323,6 +26870,7 @@ mod tests {
                     columns: vec!["email".into()],
                     unique: true,
                     auto: true,
+                    pred: None,
                 },
                 IndexInfo {
                     name: "idx_users_name".into(),
@@ -26330,6 +26878,7 @@ mod tests {
                     columns: vec!["name".into()],
                     unique: false,
                     auto: false,
+                    pred: None,
                 },
             ]
         );
@@ -26361,6 +26910,7 @@ mod tests {
                     columns: vec!["a".into()],
                     unique: true,
                     auto: false,
+                    pred: None,
                 },
                 IndexInfo {
                     name: "ix_b".into(),
@@ -26368,6 +26918,7 @@ mod tests {
                     columns: vec!["b".into()],
                     unique: false,
                     auto: false,
+                    pred: None,
                 },
             ]
         );
@@ -27760,7 +28311,10 @@ mod tests {
             ),
             ("CREATE TABLE #temp (a INT)", "temp tables"),
             ("CREATE INDEX ix_i ON t (v) INCLUDE (b)", "INCLUDE"),
-            ("CREATE INDEX ix_w ON t (v) WHERE v > 0", "partial indexes"),
+            (
+                "CREATE UNIQUE INDEX ix_uw ON t (v) WHERE v > 0",
+                "UNIQUE partial indexes",
+            ),
             ("SELECT * FROM sys.tables", "catalog views"),
             ("SELECT * FROM sysobjects", "catalog views"),
         ] {
@@ -33668,6 +34222,7 @@ mod tx_rollback_tests {
             columns: vec!["v".into()],
             unique: false,
             path: None,
+            pred: None,
         };
         assert!(scalar.path.is_none());
         let path = IndexDef {
@@ -33675,6 +34230,7 @@ mod tx_rollback_tests {
             columns: vec!["doc".into()],
             unique: false,
             path: Some("$.a.b".into()),
+            pred: None,
         };
         assert_eq!(path.column(), "doc");
         // Path validation grammar: the accepted/rejected shapes.
@@ -37224,6 +37780,342 @@ mod read_view_tests {
 
 /// End-to-end T-SQL compatibility: everything `tsql.rs` promises, driven
 /// through the public `execute` path (preprocess → parse → executor).
+#[cfg(test)]
+mod partial_index_tests {
+    use super::*;
+
+    fn run(db: &mut Database, sql: &str) -> ExecOutcome {
+        db.execute(sql)
+            .unwrap_or_else(|e| panic!("SQL failed: {sql}\n{e}"))
+    }
+
+    fn rows(db: &mut Database, sql: &str) -> QueryResult {
+        match run(db, sql) {
+            ExecOutcome::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// Deterministic table: 60 rows, duplicate k values, three active
+    /// states. `with_index` builds the partial index `px ON (k)` (and a
+    /// composite partial `pc ON (k, id)` for the active=2 cohort); the twin
+    /// goes without — every query must return identical rows on both.
+    fn twin(with_index: bool) -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT NOT NULL, v TEXT, active INT)",
+        );
+        let mut batch = Vec::new();
+        for id in 1..=60i64 {
+            batch.push(format!(
+                "({}, {}, 'v{}', {})",
+                id,
+                (id * 7) % 23,
+                id,
+                id % 3
+            ));
+        }
+        run(
+            &mut db,
+            &format!("INSERT INTO t VALUES {}", batch.join(",")),
+        );
+        if with_index {
+            run(&mut db, "CREATE INDEX px ON t (k) WHERE active = 1");
+            run(&mut db, "CREATE INDEX pc ON t (k, id) WHERE active = 2");
+        }
+        db
+    }
+
+    /// The query battery both twins must answer identically: implied and
+    /// non-implied shapes, point/range/IN/LIKE probes, ordered windows with
+    /// and without a WHERE, aggregates.
+    fn battery(db: &mut Database) -> Vec<QueryResult> {
+        [
+            // Implied probes over the partial tree.
+            "SELECT id FROM t WHERE active = 1 AND k = 5 ORDER BY id",
+            "SELECT id FROM t WHERE active = 1 AND k > 10 AND k < 20 ORDER BY id",
+            "SELECT id FROM t WHERE active = 1 AND k IN (3, 7, 11) ORDER BY id",
+            "SELECT id FROM t WHERE active = 1 AND v LIKE 'v1%' ORDER BY id",
+            "SELECT COUNT(*) FROM t WHERE active = 1 AND k = 7",
+            // Implied ordered window (NOT NULL k, single direction).
+            "SELECT id, k FROM t WHERE active = 1 ORDER BY k DESC, id LIMIT 5",
+            // NOT implied: the partial indexes must stay invisible.
+            "SELECT id FROM t WHERE k = 5 ORDER BY id",
+            "SELECT id FROM t WHERE active = 2 AND k = 5 ORDER BY id",
+            "SELECT id FROM t WHERE k > 15 ORDER BY id",
+            // No WHERE: a partial tree must never serve an ORDER BY walk.
+            "SELECT id, k FROM t ORDER BY k, id LIMIT 5",
+            // Composite partial (active = 2 cohort), full-key equality.
+            "SELECT id FROM t WHERE active = 2 AND k = 3 AND id = 9 ORDER BY id",
+            "SELECT id FROM t WHERE active = 2 AND k = 3 ORDER BY id",
+        ]
+        .iter()
+        .map(|q| rows(db, q))
+        .collect()
+    }
+
+    #[test]
+    fn partial_index_twin_table_differential() {
+        let mut indexed = twin(true);
+        let mut plain = twin(false);
+        let a = battery(&mut indexed);
+        let b = battery(&mut plain);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.rows, y.rows, "query {i} diverges between twins");
+        }
+        // Write-path membership flips: the same statements on both twins
+        // (one maintains the partial trees, one doesn't) must converge again.
+        for sql in [
+            "INSERT INTO t VALUES (61, 5, 'v61', 1)",
+            "INSERT INTO t VALUES (62, 5, 'v62', 0)",
+            "UPDATE t SET active = 0 WHERE id = 3",
+            "UPDATE t SET active = 1 WHERE id = 12",
+            "DELETE FROM t WHERE id = 24",
+            "UPDATE t SET k = 21 WHERE id = 15",
+        ] {
+            run(&mut indexed, sql);
+            run(&mut plain, sql);
+        }
+        let a = battery(&mut indexed);
+        let b = battery(&mut plain);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.rows, y.rows, "post-write query {i} diverges");
+        }
+        // Full-table rewrites (ALTER backfill) rebuild every tree: the
+        // partial trees must come back with exactly their qualifying rows.
+        run(
+            &mut indexed,
+            "ALTER TABLE t ADD COLUMN pad TEXT DEFAULT ('p')",
+        );
+        run(
+            &mut plain,
+            "ALTER TABLE t ADD COLUMN pad TEXT DEFAULT ('p')",
+        );
+        let a = battery(&mut indexed);
+        let b = battery(&mut plain);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.rows, y.rows, "post-rewrite query {i} diverges");
+        }
+    }
+
+    #[test]
+    fn partial_index_probe_gate_explain_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("px.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(
+                &mut db,
+                "CREATE TABLE t (id INT PRIMARY KEY, k INT NOT NULL, active INT)",
+            );
+            run(
+                &mut db,
+                "INSERT INTO t VALUES (1, 5, 1), (2, 6, 1), (3, 5, 0)",
+            );
+            run(&mut db, "CREATE INDEX px ON t (k) WHERE active = 1");
+            // Implied: the plan probes the PARTIAL tree by name.
+            let r = rows(
+                &mut db,
+                "EXPLAIN SELECT id FROM t WHERE active = 1 AND k = 5",
+            );
+            let plan = match &r.rows[0][1] {
+                Value::Str(s) => s.clone(),
+                other => panic!("{other:?}"),
+            };
+            assert!(plan.contains("px"), "plan should probe px: {plan}");
+            // Not implied: full scan, the partial tree stays invisible.
+            let r = rows(&mut db, "EXPLAIN SELECT id FROM t WHERE k = 5");
+            let plan = match &r.rows[0][1] {
+                Value::Str(s) => s.clone(),
+                other => panic!("{other:?}"),
+            };
+            assert!(!plan.contains("px"), "plan must not probe px: {plan}");
+            run(&mut db, "INSERT INTO t VALUES (4, 9, 1)");
+        }
+        // The predicate persists in the catalog and keeps gating after a
+        // reopen (an ungated tree would leak the active=0 row 3 into every
+        // k=5 probe).
+        let mut db = Database::open(&path).unwrap();
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE active = 1 AND k = 5 ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        let r = rows(&mut db, "SELECT id FROM t WHERE k = 5 ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(3)]],
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn partial_index_equality_substitution_implies() {
+        // The substitution rule: a query `k = 5` implies the predicate
+        // `k > 0` (substituting 5 evaluates TRUE), so the probe may use the
+        // partial tree on `tag` — while `k = -3` does not imply it and must
+        // scan. (The probe column has no full index, or the full tree would
+        // shadow the partial one — which is the better plan anyway.)
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT NOT NULL, tag TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 5, 'a'), (2, -3, 'a'), (3, 7, 'b')",
+        );
+        run(&mut db, "CREATE INDEX pk ON t (tag) WHERE k > 0");
+        // Implied via substitution: the plan probes pk.
+        let r = rows(
+            &mut db,
+            "EXPLAIN SELECT id FROM t WHERE k = 5 AND tag = 'a'",
+        );
+        assert!(
+            matches!(&r.rows[0][1], Value::Str(s) if s.contains("pk")),
+            "{r:?}"
+        );
+        let r = rows(&mut db, "SELECT id FROM t WHERE k = 5 AND tag = 'a'");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        // The twin without the index answers identically.
+        let mut plain = Database::in_memory().unwrap();
+        run(
+            &mut plain,
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT NOT NULL, tag TEXT)",
+        );
+        run(
+            &mut plain,
+            "INSERT INTO t VALUES (1, 5, 'a'), (2, -3, 'a'), (3, 7, 'b')",
+        );
+        let r2 = rows(&mut plain, "SELECT id FROM t WHERE k = 5 AND tag = 'a'");
+        assert_eq!(r.rows, r2.rows);
+        // NOT implied (-3 > 0 fails): full scan.
+        let r = rows(
+            &mut db,
+            "EXPLAIN SELECT id FROM t WHERE k = -3 AND tag = 'a'",
+        );
+        assert!(
+            matches!(&r.rows[0][1], Value::Str(s) if !s.contains("pk")),
+            "{r:?}"
+        );
+        let r = rows(&mut db, "SELECT id FROM t WHERE k = -3 AND tag = 'a'");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+        // IN lists: every element must imply the predicate.
+        let r = rows(
+            &mut db,
+            "EXPLAIN SELECT id FROM t WHERE k IN (5, 7) AND tag = 'a'",
+        );
+        assert!(
+            matches!(&r.rows[0][1], Value::Str(s) if s.contains("pk")),
+            "{r:?}"
+        );
+        let r = rows(
+            &mut db,
+            "EXPLAIN SELECT id FROM t WHERE k IN (5, -3) AND tag = 'a'",
+        );
+        assert!(
+            matches!(&r.rows[0][1], Value::Str(s) if !s.contains("pk")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn partial_index_dump_roundtrip() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT NOT NULL, active INT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 5, 1), (2, 6, 1), (3, 5, 0)",
+        );
+        run(&mut db, "CREATE INDEX px ON t (k) WHERE active = 1");
+        let script = db.dump_script().unwrap();
+        assert!(script.contains("WHERE active = 1"), "{script}");
+        let mut dst = Database::in_memory().unwrap();
+        run(&mut dst, "BEGIN");
+        let batch = dst.execute_batch(&script);
+        assert!(batch.error.is_none(), "{:?}", batch.error);
+        run(&mut dst, "COMMIT");
+        // The restored predicate gates again: implied probe sees only the
+        // qualifying row.
+        let r = rows(
+            &mut dst,
+            "SELECT id FROM t WHERE active = 1 AND k = 5 ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        let r = rows(&mut dst, "SELECT id FROM t WHERE k = 5 ORDER BY id");
+        assert_eq!(r.rows.len(), 2, "{r:?}");
+        // And the restored index shows its predicate in sqlite_master.
+        let r = rows(&mut dst, "SELECT sql FROM sqlite_master WHERE name = 'px'");
+        assert!(
+            matches!(&r.rows[0][0], Value::Str(s) if s.contains("WHERE active = 1")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn partial_index_validation_and_alter_guards() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT, tag TEXT)",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 5, 'a')");
+        // Subquery predicate.
+        let e = db
+            .execute("CREATE INDEX px ON t (k) WHERE id IN (SELECT id FROM t)")
+            .unwrap_err();
+        assert!(e.to_string().contains("row-local"), "{e}");
+        // Aggregate predicate.
+        let e = db
+            .execute("CREATE INDEX px ON t (k) WHERE COUNT(id) > 0")
+            .unwrap_err();
+        assert!(e.to_string().contains("row-local"), "{e}");
+        // Qualified column.
+        let e = db
+            .execute("CREATE INDEX px ON t (k) WHERE t.k > 0")
+            .unwrap_err();
+        assert!(e.to_string().contains("bare column names"), "{e}");
+        // Unknown column.
+        let e = db
+            .execute("CREATE INDEX px ON t (k) WHERE ghost > 0")
+            .unwrap_err();
+        assert!(e.to_string().contains("ghost"), "{e}");
+        // UNIQUE + partial: conflict policies cannot see predicate-scoped
+        // conflicts (v1 boundary, loud).
+        let e = db
+            .execute("CREATE UNIQUE INDEX ux ON t (k) WHERE tag = 'a'")
+            .unwrap_err();
+        assert!(e.to_string().contains("UNIQUE partial indexes"), "{e}");
+        // Path + partial refused.
+        let e = db
+            .execute("CREATE INDEX pj ON t (JSON_EXTRACT(tag, '$.a')) WHERE k > 0")
+            .unwrap_err();
+        assert!(e.to_string().contains("cannot combine"), "{e}");
+        // RENAME COLUMN rewrites the predicate text.
+        run(&mut db, "CREATE INDEX px ON t (k) WHERE tag = 'a'");
+        run(&mut db, "ALTER TABLE t RENAME COLUMN tag TO label");
+        run(&mut db, "INSERT INTO t VALUES (2, 6, 'a')");
+        let r = rows(
+            &mut db,
+            "SELECT id FROM t WHERE label = 'a' AND k = 6 ORDER BY id",
+        );
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+        // DROP COLUMN named by a predicate is refused (drop the index first).
+        let e = db.execute("ALTER TABLE t DROP COLUMN label").unwrap_err();
+        assert!(
+            e.to_string().contains("partial index px references it"),
+            "{e}"
+        );
+        // Dropping the index unblocks the drop.
+        run(&mut db, "DROP INDEX px");
+        run(&mut db, "ALTER TABLE t DROP COLUMN label");
+    }
+}
+
 #[cfg(test)]
 mod tsql_compat_tests {
     use super::*;

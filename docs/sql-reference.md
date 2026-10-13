@@ -749,6 +749,7 @@ DROP TRIGGER IF EXISTS flag_big;
 ```sql
 CREATE [ UNIQUE ] INDEX [ IF NOT EXISTS ] index_name
     ON table_name ( column | JSON_EXTRACT( column , '$path' ) [ , ...n ] )
+    [ WHERE predicate ]
 DROP INDEX [ IF EXISTS ] index_name [ , ...n ]
 ```
 
@@ -756,13 +757,14 @@ DROP INDEX [ IF EXISTS ] index_name [ , ...n ]
 
 | 参数 | 说明 |
 |---|---|
-| `UNIQUE` | 唯一索引;复合唯一按**完整键组合**判重,任一列 NULL 的行跳过整键(不判重) |
-| 列清单 | 普通列名按列序构成复合键(前导列等值可走索引探测);或单个 `JSON_EXTRACT(col, '$.path')` 构成 **JSON 路径索引**(树键 = 列内 JSON 文本在路径上的提取值,`WHERE JSON_EXTRACT(col,'$.path') = / > / < …` 走索引探测,EXPLAIN 可见;路径仅 `.key`/`[n]` 段;UNIQUE 路径索引显式报错) |
+| `UNIQUE` | 唯一索引;复合唯一按**完整键组合**判重,任一列 NULL 的行跳过整键(不判重);UNIQUE 与 WHERE 组合不支持(显式报错——冲突策略看不到谓词范围的冲突) |
+| 列清单 | 普通列名按列序构成复合键(前导列等值可走索引探测);或单个 `JSON_EXTRACT(col, '$.path')` 构成 **JSON 路径索引**(树键 = 列内 JSON 文本在路径上的提取值,`WHERE JSON_EXTRACT(col,'$.path') = / > / < …` 走索引探测,EXPLAIN 可见;路径仅 `.key`/`[n]` 段;UNIQUE 路径索引与 WHERE 组合均显式报错) |
+| `WHERE predicate` | **部分索引**:树只收满足谓词的行。谓词限行局部表达式(裸列名 + 字面量 + 运算符/标量函数/IS NULL/IN 常量/BETWEEN/LIKE;子查询/聚合/限定名显式报错)。查询能走部分索引探测的前提:查询 WHERE **蕴含**谓词(合取证明:谓词各合取项被查询合取项按规约文本匹配或等值代入逐值验证蕴含;蕴含不成立时索引对本查询不可见,回退扫描——探针永远是答案集的超集) |
 | `IF NOT EXISTS` | 同名索引已存在时静默返回 |
 
 ### 备注
 
-- 表达式索引(JSON_EXTRACT 以外)、部分索引不支持(显式报错)。
+- 表达式索引(JSON_EXTRACT 以外)不支持(显式报错)。
 - `sqlite_autoindex_` 前缀为保留名;自动索引不可删除。
 - `DROP INDEX` 会把非唯一索引从 `sqlite_master` 移除,但底层 B+ 树保留继续服务非唯一探测。
 
@@ -773,6 +775,9 @@ CREATE INDEX ix_users_age ON users (age);
 CREATE UNIQUE INDEX ux_org_name ON orgs (name);
 CREATE INDEX ix_orders_multi ON orders (user_id, created_at);
 CREATE INDEX ix_doc_name ON docs (JSON_EXTRACT(doc, '$.name'));
+CREATE INDEX ix_active ON orders (created_at) WHERE status = 'active';
+SELECT * FROM orders WHERE status = 'active' AND created_at > '2026-01-01';
+  -- 蕴含谓词 → 走 ix_active(树里只有活跃单)
 SELECT * FROM docs WHERE JSON_EXTRACT(doc, '$.name') = 'svc-7';  -- 走 ix_doc_name
 DROP INDEX ix_users_age;
 ```
@@ -1212,7 +1217,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 | 子查询/CTE | JOIN ON/GROUP BY/HAVING 内的相关引用、`APPLY` 子查询形式(未限定名的外层引用无法与缺列区分,读 NULL——请写限定名) |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符(请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`)、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `DEFAULT VALUES`、`ON CONFLICT DO REPLACE`、无匹配唯一约束的 `ON CONFLICT` 目标;upsert-UPDATE 的 SET/WHERE 内子查询引用 `EXCLUDED`/`VALUES()` |
-| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引(JSON_EXTRACT 路径以外)、部分索引、UNIQUE JSON 路径索引、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句(`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等)与约束装饰(`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`);触发器的 `TEMP`/`INSTEAD OF`/语句级/`REFERENCING`/`EXECUTE FUNCTION` 变体(基础行级触发器已支持,见上) |
+| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引(JSON_EXTRACT 路径以外)、UNIQUE JSON 路径索引、UNIQUE 部分索引、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句(`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等)与约束装饰(`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`);触发器的 `TEMP`/`INSTEAD OF`/语句级/`REFERENCING`/`EXECUTE FUNCTION` 变体(基础行级触发器已支持,见上) |
 | T-SQL 专有 | `OUTPUT`(用 `RETURNING`)、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |

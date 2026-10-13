@@ -95,6 +95,13 @@ pub fn build_meta(db: &Database, db_path: &Path, started: Instant, version: &str
                     ),
                     ("unique".into(), Value::Bool(i.unique)),
                     ("auto".into(), Value::Bool(i.auto)),
+                    (
+                        "pred".into(),
+                        match &i.pred {
+                            Some(p) => str(p),
+                            None => Value::Null,
+                        },
+                    ),
                 ]))
             })
             .collect();
