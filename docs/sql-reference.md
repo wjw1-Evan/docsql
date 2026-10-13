@@ -905,7 +905,7 @@ SELECT CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM t;
 
 ### 窗口函数
 
-`… OVER ([PARTITION BY …] [ORDER BY …])`。窗口在 WHERE 之后、DISTINCT/ORDER BY/LIMIT 之前求值;
+`… OVER ([PARTITION BY …] [ORDER BY …] [frame])`。窗口在 WHERE 之后、DISTINCT/ORDER BY/LIMIT 之前求值;
 PARTITION BY 按 `cmp_values` 编码分组,ORDER BY 语义与外层 `ORDER BY` 一致
 (同 `NULLS` 规则、稳定序,并列行保持扫描序)。
 
@@ -915,20 +915,43 @@ PARTITION BY 按 `cmp_values` 编码分组,ORDER BY 语义与外层 `ORDER BY` �
 | 值 | `LAG(expr [, offset [, default]])` `LEAD(expr [, offset [, default]])` `FIRST_VALUE(expr)` `LAST_VALUE(expr)` |
 | 聚合 | `COUNT(*)` `COUNT(x)` `SUM` `AVG` `MIN` `MAX` `GROUP_CONCAT`/`STRING_AGG`,支持 `FILTER (WHERE …)`;无 ORDER BY 聚整个分区,有 ORDER BY 聚「分区首行 → 当前行及其并列行」(标准默认 RANGE 帧) |
 
+### 窗口帧(frame)
+
+```sql
+{ ROWS | RANGE | GROUPS } BETWEEN bound AND bound
+bound: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOUNDED FOLLOWING
+```
+
+- **ROWS**:按分区内的物理位置计数(`1 PRECEDING` = 上一行);边界越过分区端即空帧
+  (聚合为 NULL,COUNT 0);
+- **RANGE**:值帧——按**单个** ORDER BY 键的算术偏移划界(`[k−n, k+m]`),并列行总是
+  同进同出;偏移要求非负数值常量,键须为数值或 TIMESTAMP(TIMESTAMP 键按毫秒偏移,
+  与 `TIMESTAMP ± INTEGER` 同语义);DESC 时 `PRECEDING`/`FOLLOWING` 随排序方向翻转
+  (`PRECEDING` = 排序序上更靠前 = DESC 下数值更大);NULL 键无算术,帧即其并列行;
+- **GROUPS**:按并列组计数(`1 PRECEDING` = 前一个并列组);
+- 默认帧 = `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`(有 ORDER BY)/
+  整分区(无);显式拼写等价,行为不变;
+- 帧只作用于聚合与 `FIRST_VALUE`/`LAST_VALUE`;排名/偏移函数(`ROW_NUMBER`/`RANK`/
+  `DENSE_RANK`/`NTILE`/`LAG`/`LEAD`)带帧显式报错(标准语义与帧无关);
+- 结构规则:`UNBOUNDED PRECEDING` 不能作帧尾、`UNBOUNDED FOLLOWING` 不能作帧头、
+  帧头不得在帧尾之后(响亮报错);`RANGE` 带值偏移要求恰好一个 ORDER BY 键;
+  INTERVAL 偏移不支持(TIMESTAMP 键写整数毫秒)。
+
 ```sql
 SELECT name, salary,
        ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn,
        SUM(salary) OVER (PARTITION BY dept)        AS dept_total,   -- 整分区
        SUM(salary) OVER (ORDER BY salary)          AS running,      -- 默认帧
-       LAG(salary, 1, 0) OVER (ORDER BY salary)    AS prev
+       LAG(salary, 1, 0) OVER (ORDER BY salary)    AS prev,
+       SUM(salary) OVER (ORDER BY salary ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS moving,
+       AVG(salary) OVER (ORDER BY at RANGE BETWEEN 60000 PRECEDING AND CURRENT ROW) AS per_min
 FROM emp;
 ```
 
 - 窗口调用可出现在 SELECT 列表中(含包在算术/CASE 里的复合表达式);WHERE/HAVING/ORDER BY 内的窗口调用显式报错;
 - 与 GROUP BY 或聚合投影**不可混用**(显式报错);DISTINCT 在窗口之后求值;
-- 不支持(显式报错):`WINDOW` 命名子句、`QUALIFY`、自定义窗口帧
-  (`ROWS/RANGE/GROUPS BETWEEN …`)、`IGNORE NULLS`;默认帧可显式拼写
-  (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` 等价)。
+- 不支持(显式报错):`WINDOW` 命名子句、`QUALIFY`、`IGNORE NULLS`、RANGE 的
+  INTERVAL 偏移。
 
 ## 系统视图与元数据
 
@@ -976,7 +999,7 @@ SQLite 兼容的 DDL 自省视图(EF Core schema 同步使用),行:`type`(`table
 | 主键与 NULL | `PRIMARY KEY` 不隐含 `NOT NULL` |
 | 主键类型 | 仅单列;复合唯一用 `CREATE UNIQUE INDEX` |
 | 相关子查询 | 已支持:外层引用须限定名,行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的 WHERE 与 SET)逐行求值;JOIN ON/GROUP BY/HAVING 内相关、未限定外层引用仍显式报错 |
-| 窗口函数 | 已支持(见[窗口函数](#窗口函数));`WINDOW` 子句、`QUALIFY`、自定义窗口帧不支持 |
+| 窗口函数 | 已支持,含自定义窗口帧(见[窗口函数](#窗口函数)与[窗口帧](#窗口帧frame));`WINDOW` 子句、`QUALIFY`、RANGE 的 INTERVAL 偏移不支持 |
 | 递归 CTE | 已支持(`WITH [RECURSIVE]` 锚点 `UNION [ALL]` 递归臂,见 [T-SQL 兼容面](#t-sqlsql-server兼容面)) |
 | `SELECT t.*` | 不支持(用 `*`) |
 | `GROUP BY` 输出别名 | 不支持(显式报错);`GROUP BY 1` 按常量 1 处理,无序号语义 |
@@ -1182,7 +1205,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 
 | 类别 | 语法 |
 |---|---|
-| 窗口 | `WINDOW` 命名子句、`QUALIFY`、自定义窗口帧(`ROWS/RANGE/GROUPS BETWEEN …`) |
+| 窗口 | `WINDOW` 命名子句、`QUALIFY`、RANGE 帧的 INTERVAL 偏移(自定义 ROWS/RANGE/GROUPS 帧**已支持**,见[窗口帧](#窗口帧frame)) |
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |

@@ -2364,6 +2364,12 @@ impl<'a> ReadCx<'a> {
             let fname = f.name.to_string().to_uppercase();
             let aggregate = is_agg_name(f);
             let spec = validate_window_spec(f, &fname, aggregate)?;
+            // Custom frame (ROWS/RANGE/GROUPS BETWEEN … AND …): structure
+            // checked and offsets const-evaluated once per call.
+            let frame_plan = match &spec.window_frame {
+                Some(fr) => Some(parse_window_frame(fr, spec.order_by.len())?),
+                None => None,
+            };
             // Unknown columns evaluate to NULL on every row, which for a
             // window key silently collapses the whole computation (RANK all
             // 1s, running totals over the entire partition) — refuse the
@@ -2448,9 +2454,23 @@ impl<'a> ReadCx<'a> {
                 }
                 let sorted: Vec<usize> = keyed.iter().map(|(i, _)| *i).collect();
                 let n = sorted.len();
-                // Peer runs: run_end[p] = last position of the run holding
-                // p (consecutive order-key tuples compare equal).
+                // Peer runs: run_end[p] / run_start[p] bound the run holding
+                // p (consecutive order-key tuples compare equal);
+                // group_spans/group_of carry the same layout for GROUPS
+                // frame units. Unordered partitions treat every row as its
+                // own group.
                 let mut run_end = vec![n - 1; n];
+                let mut run_start = vec![0usize; n];
+                let mut group_spans: Vec<(usize, usize)> = if ordered {
+                    Vec::new()
+                } else {
+                    (0..n).map(|i| (i, i)).collect()
+                };
+                let mut group_of: Vec<usize> = if ordered {
+                    vec![0; n]
+                } else {
+                    (0..n).collect()
+                };
                 if ordered {
                     let mut p = 0usize;
                     while p < n {
@@ -2470,18 +2490,14 @@ impl<'a> ReadCx<'a> {
                             q += 1;
                         }
                         run_end[p..=q].fill(q);
+                        run_start[p..=q].fill(p);
+                        let gi = group_spans.len();
+                        group_spans.push((p, q));
+                        group_of[p..=q].fill(gi);
                         p = q + 1;
                     }
                 }
                 if let Some((op, arg, distinct, sep, filter)) = &agg {
-                    // Aggregate OVER: default frame = partition start
-                    // through the current row's peer run (RANGE). Without
-                    // ORDER BY the frame is the whole partition. Every
-                    // frame is a PREFIX of the partition, so one
-                    // left-to-right fold reproduces the batch `eval_agg`
-                    // over each frame exactly (same evaluation order, same
-                    // NULL/DISTINCT/FILTER and tie rules) in O(n)
-                    // evaluations instead of re-folding each frame O(n²).
                     let count_star =
                         matches!(arg, SqlExpr::Identifier(i) if i.value == "__count__");
                     // FILTER first, argument second — exactly the batch
@@ -2503,23 +2519,146 @@ impl<'a> ReadCx<'a> {
                             None
                         });
                     }
-                    let mut run = RunningAgg::new(op.clone(), sep.clone(), *distinct, count_star);
-                    let mut pushed = 0usize; // sorted rows [0..pushed) are folded in
-                    let mut p = 0usize;
-                    while p < n {
-                        let end = run_end[p];
-                        while pushed <= end {
-                            run.push_row(passes[pushed], argvals[pushed].as_ref())?;
-                            pushed += 1;
+                    // Custom frame: per-row [lo, hi] bounds over the sorted
+                    // partition.
+                    let bounds = match &frame_plan {
+                        Some(p) => Some(frame_bounds(
+                            p,
+                            &keyed,
+                            &spec.order_by,
+                            &group_spans,
+                            &group_of,
+                            n,
+                        )?),
+                        None => None,
+                    };
+                    match bounds {
+                        None => {
+                            // Default frame = partition start through the
+                            // current row's peer run (RANGE). Without ORDER
+                            // BY the frame is the whole partition. Every
+                            // frame is a PREFIX of the partition, so one
+                            // left-to-right fold reproduces the batch
+                            // `eval_agg` over each frame exactly (same
+                            // evaluation order, same NULL/DISTINCT/FILTER
+                            // and tie rules) in O(n) evaluations instead of
+                            // re-folding each frame O(n²).
+                            let mut run =
+                                RunningAgg::new(op.clone(), sep.clone(), *distinct, count_star);
+                            let mut pushed = 0usize; // sorted rows [0..pushed) are folded in
+                            let mut p = 0usize;
+                            while p < n {
+                                let end = run_end[p];
+                                while pushed <= end {
+                                    run.push_row(passes[pushed], argvals[pushed].as_ref())?;
+                                    pushed += 1;
+                                }
+                                let v = run.snapshot();
+                                for r in p..=end {
+                                    vals[sorted[r]] = v.clone();
+                                }
+                                p = end + 1;
+                            }
                         }
-                        let v = run.snapshot();
-                        for r in p..=end {
-                            vals[sorted[r]] = v.clone();
+                        Some(bounds) => {
+                            // Additive aggregates and MIN/MAX invert: the
+                            // frame slides in O(n) total. DISTINCT and
+                            // GROUP_CONCAT cannot invert — a fresh fold per
+                            // row (the GROUP_CONCAT text is inherently
+                            // frame-sized anyway).
+                            let invertible = matches!(
+                                op,
+                                AggOp::Count | AggOp::Sum | AggOp::Avg | AggOp::Min | AggOp::Max
+                            ) && !distinct;
+                            if invertible {
+                                let mut win = SlidingFrameAgg::new(op.clone(), count_star);
+                                let mut next = 0usize; // next sorted position to push
+                                for p in 0..n {
+                                    self.deadline.check()?;
+                                    let (lo, hi) = bounds[p];
+                                    if hi < lo || win.degraded {
+                                        // Empty frame (a value interval that
+                                        // excludes the key) or unrecoverable
+                                        // sliding state: fresh fold of the
+                                        // slice — an empty slice keeps the
+                                        // empty aggregate value (COUNT 0,
+                                        // SUM/AVG/MIN/MAX NULL).
+                                        let mut run = RunningAgg::new(
+                                            op.clone(),
+                                            sep.clone(),
+                                            false,
+                                            count_star,
+                                        );
+                                        for r in lo..=hi {
+                                            run.push_row(passes[r], argvals[r].as_ref())?;
+                                        }
+                                        vals[sorted[p]] = run.snapshot();
+                                        continue;
+                                    }
+                                    while next <= hi {
+                                        win.push(next, passes[next], argvals[next].as_ref())?;
+                                        next += 1;
+                                    }
+                                    win.pop_to(lo);
+                                    if win.degraded {
+                                        // The retraction this very row triggered
+                                        // was unrecoverable: fold the frame fresh
+                                        // (future rows keep taking this branch).
+                                        let mut run = RunningAgg::new(
+                                            op.clone(),
+                                            sep.clone(),
+                                            false,
+                                            count_star,
+                                        );
+                                        for r in lo..=hi {
+                                            run.push_row(passes[r], argvals[r].as_ref())?;
+                                        }
+                                        vals[sorted[p]] = run.snapshot();
+                                        continue;
+                                    }
+                                    vals[sorted[p]] = win.value();
+                                }
+                            } else {
+                                for p in 0..n {
+                                    self.deadline.check()?;
+                                    let (lo, hi) = bounds[p];
+                                    let mut run = RunningAgg::new(
+                                        op.clone(),
+                                        sep.clone(),
+                                        *distinct,
+                                        count_star,
+                                    );
+                                    for r in lo..=hi {
+                                        run.push_row(passes[r], argvals[r].as_ref())?;
+                                    }
+                                    vals[sorted[p]] = run.snapshot();
+                                }
+                            }
                         }
-                        p = end + 1;
                     }
                 } else {
                     let args = fn_args(f);
+                    // A frame clause rides only the value functions:
+                    // ranking/offset functions have frame-independent
+                    // semantics (SQL standard: they don't accept one).
+                    let takes_frame = matches!(fname.as_str(), "FIRST_VALUE" | "LAST_VALUE");
+                    if frame_plan.is_some() && !takes_frame {
+                        return err(format!(
+                            "window function {fname} does not accept a frame clause"
+                        ));
+                    }
+                    // FIRST/LAST_VALUE walk the frame: default bounds are
+                    // partition start .. peer-run end (the RANGE default).
+                    let scalar_bounds = if takes_frame {
+                        Some(match &frame_plan {
+                            Some(p) => {
+                                frame_bounds(p, &keyed, &spec.order_by, &group_spans, &group_of, n)?
+                            }
+                            None => (0..n).map(|p| (0, run_end[p])).collect(),
+                        })
+                    } else {
+                        None
+                    };
                     match fname.as_str() {
                         "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
                             if !args.is_empty() {
@@ -2609,10 +2748,13 @@ impl<'a> ReadCx<'a> {
                                     args.len()
                                 ));
                             }
+                            let bounds = scalar_bounds
+                                .as_ref()
+                                .expect("computed for the frame-taking functions");
                             for (p, &ri) in sorted.iter().enumerate() {
                                 self.deadline.check()?;
-                                let end = if ordered { run_end[p] } else { n - 1 };
-                                let target = if fname == "FIRST_VALUE" { 0 } else { end };
+                                let (lo, hi) = bounds[p];
+                                let target = if fname == "FIRST_VALUE" { lo } else { hi };
                                 vals[ri] = eval_expr(&args[0], &rows[sorted[target]])?;
                             }
                         }
@@ -15988,6 +16130,254 @@ impl RunningAgg {
     }
 }
 
+/// Sliding-frame aggregate for custom window frames (ROWS/RANGE/GROUPS
+/// BETWEEN): the frame's rows live in a FIFO deque and every aggregate is
+/// maintained incrementally — push advances the frame's high edge, `pop_to`
+/// its low edge. Both edges only move forward (frame bounds are monotone
+/// over the sorted partition), so the whole computation is O(n) pushes and
+/// pops. SUM/AVG removal mirrors [`add_values`]; an unrecoverable inverse
+/// (Int overflow — the batch fold NULLs there too) sets `degraded` and the
+/// caller refolds that partition's remaining rows from the frame slice.
+/// DISTINCT and GROUP_CONCAT cannot invert and never route here.
+struct SlidingFrameAgg {
+    op: AggOp,
+    count_star: bool,
+    kept: i64,
+    nonnull: i64,
+    sum: Option<Value>,
+    avg_dec_mode: bool,
+    avg_vals: std::collections::VecDeque<Value>,
+    avg_dec: Decimal,
+    avg_f64: f64,
+    /// Monotone candidate deque for MIN/MAX: (sorted position, value).
+    /// The front is the current extremum, earliest on ties — exactly the
+    /// batch reduce's first-wins rule.
+    extreme: std::collections::VecDeque<(usize, Value)>,
+    /// The frame's rows in order: (sorted position, FILTER-kept, argument).
+    window: std::collections::VecDeque<(usize, bool, Option<Value>)>,
+    degraded: bool,
+}
+
+impl SlidingFrameAgg {
+    fn new(op: AggOp, count_star: bool) -> Self {
+        Self {
+            op,
+            count_star,
+            kept: 0,
+            nonnull: 0,
+            sum: None,
+            avg_dec_mode: false,
+            avg_vals: std::collections::VecDeque::new(),
+            avg_dec: Decimal::ZERO,
+            avg_f64: 0.0,
+            extreme: std::collections::VecDeque::new(),
+            window: std::collections::VecDeque::new(),
+            degraded: false,
+        }
+    }
+
+    /// Fold the row at sorted position `pos` into the state (frame high edge
+    /// advances). Same fold order and NULL/FILTER rules as
+    /// [`RunningAgg::push_row`].
+    fn push(&mut self, pos: usize, kept: bool, argval: Option<&Value>) -> Result<()> {
+        self.window.push_back((pos, kept, argval.cloned()));
+        if kept {
+            self.kept += 1;
+        }
+        let Some(argval) = argval else {
+            return Ok(());
+        };
+        if matches!(argval, Value::Null) {
+            return Ok(());
+        }
+        match self.op {
+            AggOp::Min => {
+                while self
+                    .extreme
+                    .back()
+                    .is_some_and(|(_, b)| Value::cmp_values(b, argval) == Ordering::Greater)
+                {
+                    self.extreme.pop_back();
+                }
+                self.extreme.push_back((pos, argval.clone()));
+                return Ok(());
+            }
+            AggOp::Max => {
+                while self
+                    .extreme
+                    .back()
+                    .is_some_and(|(_, b)| Value::cmp_values(b, argval) == Ordering::Less)
+                {
+                    self.extreme.pop_back();
+                }
+                self.extreme.push_back((pos, argval.clone()));
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.nonnull += 1;
+        match self.op {
+            AggOp::Count => {}
+            AggOp::Sum => {
+                let next = match self.sum.take() {
+                    None => add_values(Value::Int(0), argval.clone())?,
+                    Some(s) => add_values(s, argval.clone())?,
+                };
+                self.sum = Some(next);
+            }
+            AggOp::Avg => match argval {
+                Value::Decimal(d) => {
+                    if !self.avg_dec_mode {
+                        self.avg_dec_mode = true;
+                        self.avg_dec = Decimal::ZERO;
+                        for v in std::mem::take(&mut self.avg_vals) {
+                            self.avg_dec = self
+                                .avg_dec
+                                .checked_add(as_decimal(&v)?)
+                                .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                        }
+                    }
+                    self.avg_dec = self
+                        .avg_dec
+                        .checked_add(*d)
+                        .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                }
+                other => {
+                    if self.avg_dec_mode {
+                        self.avg_dec = self
+                            .avg_dec
+                            .checked_add(as_decimal(other)?)
+                            .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                    } else {
+                        self.avg_vals.push_back(other.clone());
+                        self.avg_f64 += match other {
+                            Value::Int(i) => *i as f64,
+                            Value::Float(f) => *f,
+                            _ => return err("AVG of non-numeric"),
+                        };
+                    }
+                }
+            },
+            AggOp::Min | AggOp::Max | AggOp::GroupConcat => {}
+        }
+        Ok(())
+    }
+
+    /// Retract the frame's low edge: pop every row left of sorted position
+    /// `lo` and undo its contribution. `Min`/`Max` drop their deque fronts.
+    fn pop_to(&mut self, lo: usize) {
+        while self.window.front().is_some_and(|(pos, _, _)| *pos < lo) {
+            let (pos, kept, arg) = self.window.pop_front().expect("checked above");
+            if matches!(self.op, AggOp::Min | AggOp::Max) {
+                if self.extreme.front().is_some_and(|(p, _)| *p == pos) {
+                    self.extreme.pop_front();
+                }
+                continue;
+            }
+            if kept {
+                self.kept -= 1;
+            }
+            let Some(v) = arg else { continue };
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            self.nonnull -= 1;
+            match self.op {
+                AggOp::Count => {}
+                AggOp::Sum => match self.sum.take() {
+                    // A sticky-NULL (Int overflow) or absent sum cannot be
+                    // inverted — the caller refolds from the slice.
+                    None | Some(Value::Null) => {
+                        self.degraded = true;
+                        self.sum = Some(Value::Null);
+                    }
+                    Some(s) => match sub_values(s, v.clone()) {
+                        Ok(next) => {
+                            if matches!(next, Value::Null) {
+                                self.degraded = true;
+                            }
+                            self.sum = Some(next);
+                        }
+                        Err(_) => self.degraded = true,
+                    },
+                },
+                AggOp::Avg => match v {
+                    Value::Decimal(d) => {
+                        // A Decimal push flips the mode permanently; undoing
+                        // one before any flip means state is inconsistent.
+                        if !self.avg_dec_mode {
+                            self.degraded = true;
+                        } else {
+                            match self.avg_dec.checked_sub(d) {
+                                Some(nd) => self.avg_dec = nd,
+                                None => self.degraded = true,
+                            }
+                        }
+                    }
+                    other => {
+                        if self.avg_dec_mode {
+                            match as_decimal(&other)
+                                .ok()
+                                .and_then(|d| self.avg_dec.checked_sub(d))
+                            {
+                                Some(nd) => self.avg_dec = nd,
+                                None => self.degraded = true,
+                            }
+                        } else {
+                            match self.avg_vals.pop_front() {
+                                Some(front) => {
+                                    let f = match front {
+                                        Value::Int(i) => i as f64,
+                                        Value::Float(f) => f,
+                                        _ => {
+                                            self.degraded = true;
+                                            0.0
+                                        }
+                                    };
+                                    self.avg_f64 -= f;
+                                }
+                                None => self.degraded = true,
+                            }
+                        }
+                    }
+                },
+                AggOp::Min | AggOp::Max | AggOp::GroupConcat => {}
+            }
+        }
+    }
+
+    /// Aggregate value over the current frame — mirrors
+    /// [`RunningAgg::snapshot`] field for field.
+    fn value(&self) -> Value {
+        match self.op {
+            AggOp::Count => Value::Int(if self.count_star {
+                self.kept
+            } else {
+                self.nonnull
+            }),
+            AggOp::Sum => self.sum.clone().unwrap_or(Value::Null),
+            AggOp::Avg => {
+                if self.nonnull == 0 {
+                    Value::Null
+                } else if self.avg_dec_mode {
+                    self.avg_dec
+                        .checked_div(Decimal::from(self.nonnull))
+                        .map(Value::Decimal)
+                        .unwrap_or(Value::Null)
+                } else {
+                    Value::Float(self.avg_f64 / self.nonnull as f64)
+                }
+            }
+            AggOp::Min | AggOp::Max => self
+                .extreme
+                .front()
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null),
+            AggOp::GroupConcat => Value::Null,
+        }
+    }
+}
+
 /// Declared column names of a real-table table factor (views and CTEs have
 /// no meta columns — their rows carry the keys already).
 fn collect_factor_columns(
@@ -16395,26 +16785,9 @@ fn validate_window_spec<'a>(
             n.value
         ));
     }
-    if let Some(frame) = &spec.window_frame {
-        // Both spellings of the standard default frame are accepted:
-        // `RANGE UNBOUNDED PRECEDING` (shorthand) and the explicit
-        // `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
-        let is_default = matches!(frame.units, sqlparser::ast::WindowFrameUnits::Range)
-            && matches!(
-                frame.start_bound,
-                sqlparser::ast::WindowFrameBound::Preceding(None)
-            )
-            && matches!(
-                frame.end_bound,
-                None | Some(sqlparser::ast::WindowFrameBound::CurrentRow)
-            );
-        if !is_default {
-            return err(format!(
-                "window frames other than the default (ROWS/RANGE/GROUPS ...) \
-                 are not supported: {fname}"
-            ));
-        }
-    }
+    // Frames are accepted (SQL:2003 ROWS/RANGE/GROUPS BETWEEN … AND …);
+    // the structural rules and offset shapes are checked by
+    // [`parse_window_frame`] in `compute_windows`.
     if matches!(
         f.null_treatment,
         Some(sqlparser::ast::NullTreatment::IgnoreNulls)
@@ -16422,6 +16795,476 @@ fn validate_window_spec<'a>(
         return err(format!("IGNORE NULLS is not supported: {fname}"));
     }
     Ok(spec)
+}
+
+/// Parsed custom window frame ([`parse_window_frame`]): bounds are checked
+/// and offsets const-evaluated once per window call, not per partition.
+#[derive(Clone, Debug)]
+enum WindowFramePlan {
+    /// `ROWS BETWEEN … AND …`: bounds are row counts within the (sorted)
+    /// partition.
+    Rows {
+        start: FrameRowBound,
+        end: FrameRowBound,
+    },
+    /// `GROUPS BETWEEN … AND …`: bounds count PEER GROUPS, mapped back to
+    /// row spans through the partition's run layout.
+    Groups {
+        start: FrameRowBound,
+        end: FrameRowBound,
+    },
+    /// `RANGE BETWEEN … AND …`: value bounds are arithmetic shifts of the
+    /// single ORDER BY key.
+    Range {
+        start: FrameValueBound,
+        end: FrameValueBound,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FrameRowBound {
+    Unbounded,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+#[derive(Clone, Debug)]
+enum FrameValueBound {
+    Unbounded,
+    Preceding(Value),
+    CurrentRow,
+    Following(Value),
+    UnboundedFollowing,
+}
+
+/// Rank bounds in frame order (a start must not come after its end).
+fn frame_row_rank(b: &FrameRowBound) -> u8 {
+    match b {
+        FrameRowBound::Unbounded => 0,
+        FrameRowBound::Preceding(_) => 1,
+        FrameRowBound::CurrentRow => 2,
+        FrameRowBound::Following(_) => 3,
+        FrameRowBound::UnboundedFollowing => 4,
+    }
+}
+
+fn frame_value_rank(b: &FrameValueBound) -> u8 {
+    match b {
+        FrameValueBound::Unbounded => 0,
+        FrameValueBound::Preceding(_) => 1,
+        FrameValueBound::CurrentRow => 2,
+        FrameValueBound::Following(_) => 3,
+        FrameValueBound::UnboundedFollowing => 4,
+    }
+}
+
+/// Validate structure and const-eval offsets. `order_len` is the ORDER BY
+/// key count — RANGE value bounds shift THE sort key, so they demand
+/// exactly one (SQL standard).
+fn parse_window_frame(
+    frame: &sqlparser::ast::WindowFrame,
+    order_len: usize,
+) -> Result<WindowFramePlan> {
+    // The bare `ROWS 3 PRECEDING` spelling means `BETWEEN … AND CURRENT ROW`.
+    let end_default = frame
+        .end_bound
+        .clone()
+        .unwrap_or(sqlparser::ast::WindowFrameBound::CurrentRow);
+    let row_bound = |b: &sqlparser::ast::WindowFrameBound| -> Result<FrameRowBound> {
+        Ok(match b {
+            sqlparser::ast::WindowFrameBound::Preceding(None) => FrameRowBound::Unbounded,
+            sqlparser::ast::WindowFrameBound::Preceding(Some(e)) => {
+                FrameRowBound::Preceding(row_offset(e)?)
+            }
+            sqlparser::ast::WindowFrameBound::CurrentRow => FrameRowBound::CurrentRow,
+            sqlparser::ast::WindowFrameBound::Following(Some(e)) => {
+                FrameRowBound::Following(row_offset(e)?)
+            }
+            sqlparser::ast::WindowFrameBound::Following(None) => FrameRowBound::UnboundedFollowing,
+        })
+    };
+    Ok(match frame.units {
+        sqlparser::ast::WindowFrameUnits::Rows => {
+            let (start, end) = (row_bound(&frame.start_bound)?, row_bound(&end_default)?);
+            if frame_row_rank(&start) > frame_row_rank(&end)
+                || match (start, end) {
+                    (FrameRowBound::Preceding(a), FrameRowBound::Preceding(b)) => a < b,
+                    (FrameRowBound::Following(a), FrameRowBound::Following(b)) => a > b,
+                    _ => false,
+                }
+            {
+                return err("window frame start cannot be after its end");
+            }
+            WindowFramePlan::Rows { start, end }
+        }
+        sqlparser::ast::WindowFrameUnits::Groups => {
+            let (start, end) = (row_bound(&frame.start_bound)?, row_bound(&end_default)?);
+            if frame_row_rank(&start) > frame_row_rank(&end)
+                || match (start, end) {
+                    (FrameRowBound::Preceding(a), FrameRowBound::Preceding(b)) => a < b,
+                    (FrameRowBound::Following(a), FrameRowBound::Following(b)) => a > b,
+                    _ => false,
+                }
+            {
+                return err("window frame start cannot be after its end");
+            }
+            WindowFramePlan::Groups { start, end }
+        }
+        sqlparser::ast::WindowFrameUnits::Range => {
+            let value_bound = |b: &sqlparser::ast::WindowFrameBound| -> Result<FrameValueBound> {
+                Ok(match b {
+                    sqlparser::ast::WindowFrameBound::Preceding(None) => FrameValueBound::Unbounded,
+                    sqlparser::ast::WindowFrameBound::Preceding(Some(e)) => {
+                        FrameValueBound::Preceding(range_offset(e)?)
+                    }
+                    sqlparser::ast::WindowFrameBound::CurrentRow => FrameValueBound::CurrentRow,
+                    sqlparser::ast::WindowFrameBound::Following(Some(e)) => {
+                        FrameValueBound::Following(range_offset(e)?)
+                    }
+                    sqlparser::ast::WindowFrameBound::Following(None) => {
+                        FrameValueBound::UnboundedFollowing
+                    }
+                })
+            };
+            let (start, end) = (value_bound(&frame.start_bound)?, value_bound(&end_default)?);
+            // Structural order: UNBOUNDED PRECEDING < n PRECEDING < CURRENT
+            // ROW < n FOLLOWING < UNBOUNDED FOLLOWING, with equal-shape
+            // offset comparisons (`5 PRECEDING` to `2 PRECEDING` is legal,
+            // the reverse frames nothing and the standard refuses it).
+            let misplaced = match (&start, &end) {
+                (FrameValueBound::Preceding(a), FrameValueBound::Preceding(b)) => {
+                    Value::cmp_values(a, b) == Ordering::Less
+                }
+                (FrameValueBound::Following(a), FrameValueBound::Following(b)) => {
+                    Value::cmp_values(a, b) == Ordering::Greater
+                }
+                _ => false,
+            };
+            if frame_value_rank(&start) > frame_value_rank(&end) || misplaced {
+                return err("window frame start cannot be after its end");
+            }
+            // A value offset shifts the single sort key; without exactly one
+            // ORDER BY key there is nothing to shift. UNBOUNDED / CURRENT ROW
+            // spellings stay legal unordered (they degenerate to the whole
+            // partition / the peer set, which unordered makes everything).
+            let has_offset = |b: &FrameValueBound| {
+                matches!(
+                    b,
+                    FrameValueBound::Preceding(_) | FrameValueBound::Following(_)
+                )
+            };
+            if (has_offset(&start) || has_offset(&end)) && order_len != 1 {
+                return err(
+                    "RANGE with a value offset requires exactly one ORDER BY key                      (the frame shifts THE sort key)",
+                );
+            }
+            WindowFramePlan::Range { start, end }
+        }
+    })
+}
+
+/// ROWS/GROUPS offsets: non-negative integer constants.
+fn row_offset(e: &SqlExpr) -> Result<u64> {
+    match eval_const(e)? {
+        Value::Int(k) if k >= 0 => Ok(k as u64),
+        other => err(format!(
+            "ROWS/GROUPS frame offsets must be non-negative integers, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// RANGE offsets: non-negative numeric constants (Int/Float/Decimal).
+/// INTERVAL spellings are rejected — TIMESTAMP keys shift by integer
+/// milliseconds, mirroring the engine's TIMESTAMP ± INTEGER arithmetic.
+fn range_offset(e: &SqlExpr) -> Result<Value> {
+    if matches!(e, SqlExpr::Interval(_)) {
+        return err(
+            "INTERVAL frame offsets are not supported (TIMESTAMP keys take an integer              millisecond offset: RANGE BETWEEN 60000 PRECEDING AND CURRENT ROW)",
+        );
+    }
+    match eval_const(e)? {
+        v @ (Value::Int(_) | Value::Float(_) | Value::Decimal(_)) => {
+            if Value::cmp_values(&v, &Value::Int(0)) == Ordering::Less {
+                return err("RANGE frame offsets must be non-negative");
+            }
+            Ok(v)
+        }
+        other => err(format!(
+            "RANGE frame offsets must be numeric constants, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn frame_offset_f64(off: &Value) -> Result<f64> {
+    match off {
+        Value::Int(k) => Ok(*k as f64),
+        Value::Float(f) => Ok(*f),
+        Value::Decimal(d) => Ok(d.to_f64().unwrap_or(f64::NAN)),
+        _ => err("RANGE frame offset must be numeric"),
+    }
+}
+
+/// Shift a RANGE frame endpoint: `key ± off`, direction-aware, mirroring the
+/// engine's arithmetic (Decimal exact, Int checked, TIMESTAMP ± integer ms
+/// with the 0001..=9999 domain). `None` = the endpoint fell outside the
+/// value domain (Int/Timestamp overflow) — the interval is unbounded on
+/// that side, never a silent truncation.
+fn shift_range_key(key: &Value, off: &Value, up: bool) -> Result<Option<Value>> {
+    match (key, off) {
+        (Value::Null, _) => Ok(None),
+        (Value::Int(k), Value::Int(o)) => {
+            let v = if up {
+                k.checked_add(*o)
+            } else {
+                k.checked_sub(*o)
+            };
+            Ok(v.map(Value::Int))
+        }
+        (Value::Float(k), _) => {
+            let f = frame_offset_f64(off)?;
+            Ok(Some(Value::Float(if up { k + f } else { k - f })))
+        }
+        (Value::Int(_), Value::Float(_)) => {
+            let f = frame_offset_f64(off)?;
+            let k = match key {
+                Value::Int(k) => *k as f64,
+                _ => unreachable!("matched above"),
+            };
+            Ok(Some(Value::Float(if up { k + f } else { k - f })))
+        }
+        (Value::Decimal(_), _) | (Value::Int(_), Value::Decimal(_)) => {
+            let (a, b) = (as_decimal(key)?, as_decimal(off)?);
+            let v = if up {
+                a.checked_add(b)
+            } else {
+                a.checked_sub(b)
+            };
+            Ok(v.map(Value::Decimal))
+        }
+        (Value::Timestamp(t), Value::Int(o)) => {
+            let v = if up {
+                t.checked_add(*o)
+            } else {
+                t.checked_sub(*o)
+            };
+            // Outside 0001..=9999 there is no canonical instant: the bound
+            // covers everything up to the domain edge.
+            Ok(v.filter(|ms| crate::value::is_valid_timestamp_ms(*ms))
+                .map(Value::Timestamp))
+        }
+        _ => err("RANGE value offsets need a numeric or TIMESTAMP ORDER BY key"),
+    }
+}
+
+/// Inverse of [`add_values`] for sliding-window SUM removal: the same type
+/// rules mirrored (Decimal exact, Int checked, Float binary). `None` where
+/// the inverse is unrecoverable (Int overflow — the batch fold NULLs there
+/// too), so the caller can fall back to a fresh fold of the frame.
+fn sub_values(a: Value, b: Value) -> Result<Value> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if matches!(a, Value::Decimal(_)) || matches!(b, Value::Decimal(_)) {
+        let (x, y) = (as_decimal(&a)?, as_decimal(&b)?);
+        return Ok(x.checked_sub(y).map(Value::Decimal).unwrap_or(Value::Null));
+    }
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => {
+            Ok(x.checked_sub(y).map(Value::Int).unwrap_or(Value::Null))
+        }
+        (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 - y)),
+        (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x - y as f64)),
+        (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x - y)),
+        _ => err("SUM of non-numeric values"),
+    }
+}
+
+/// First partition position whose ORDER BY key is at-or-after `target` in
+/// sort order (`upper = false`), or strictly after it (`upper = true`). The
+/// partition's keys are monotone under the sort comparator, so a plain
+/// binary search applies; direction (ASC/DESC) and NULL placement ride the
+/// same [`cmp_maybe_null`] the sort used.
+fn window_key_search(
+    keyed: &[(usize, Vec<Value>)],
+    target: &Value,
+    nulls_first: Option<bool>,
+    asc: bool,
+    upper: bool,
+) -> usize {
+    let pred = |v: &Value| {
+        let o = cmp_maybe_null(v, target, nulls_first);
+        if upper {
+            if asc {
+                o == Ordering::Greater
+            } else {
+                o == Ordering::Less
+            }
+        } else if asc {
+            o != Ordering::Less
+        } else {
+            o != Ordering::Greater
+        }
+    };
+    let (mut lo, mut hi) = (0usize, keyed.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(&keyed[mid].1[0]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// Per-row frame bounds `[lo, hi]` (inclusive sorted positions) for one
+/// partition. `group_spans`/`group_of` carry the peer-group layout for
+/// GROUPS units. Monotone by construction — bounds only move forward as the
+/// current row advances, which the sliding aggregators rely on.
+fn frame_bounds(
+    plan: &WindowFramePlan,
+    keyed: &[(usize, Vec<Value>)],
+    order_by: &[sqlparser::ast::OrderByExpr],
+    group_spans: &[(usize, usize)],
+    group_of: &[usize],
+    n: usize,
+) -> Result<Vec<(usize, usize)>> {
+    let clamp = |k: u64| (k as usize).min(n);
+    Ok(match plan {
+        WindowFramePlan::Rows { start, end } => (0..n)
+            .map(|p| {
+                // `lo` may legally exceed `n - 1` (an offset frame past the
+                // partition end) — that is an EMPTY frame, aggregate-of-
+                // nothing, never a clamp onto the last row.
+                let lo = match start {
+                    FrameRowBound::Unbounded => 0,
+                    FrameRowBound::Preceding(k) => p.saturating_sub(clamp(*k)),
+                    FrameRowBound::CurrentRow => p,
+                    FrameRowBound::Following(k) => p + clamp(*k),
+                    FrameRowBound::UnboundedFollowing => n,
+                };
+                let hi = match end {
+                    FrameRowBound::Unbounded => 0,
+                    FrameRowBound::Preceding(k) => p.saturating_sub(clamp(*k)),
+                    FrameRowBound::CurrentRow => p,
+                    FrameRowBound::Following(k) => (p + clamp(*k)).min(n - 1),
+                    FrameRowBound::UnboundedFollowing => n - 1,
+                };
+                (lo, hi)
+            })
+            .collect(),
+        WindowFramePlan::Groups { start, end } => {
+            let groups = group_spans.len();
+            (0..n)
+                .map(|p| {
+                    let g = group_of[p];
+                    let g_lo = match start {
+                        FrameRowBound::Unbounded => 0,
+                        FrameRowBound::Preceding(k) => g.saturating_sub(*k as usize),
+                        FrameRowBound::CurrentRow => g,
+                        FrameRowBound::Following(k) => (g + *k as usize).min(groups - 1),
+                        FrameRowBound::UnboundedFollowing => groups - 1,
+                    };
+                    let g_hi = match end {
+                        FrameRowBound::Unbounded => 0,
+                        FrameRowBound::Preceding(k) => g.saturating_sub(*k as usize),
+                        FrameRowBound::CurrentRow => g,
+                        FrameRowBound::Following(k) => (g + *k as usize).min(groups - 1),
+                        FrameRowBound::UnboundedFollowing => groups - 1,
+                    };
+                    let lo = if matches!(start, FrameRowBound::Following(_)) {
+                        // A start past the last group: empty frame.
+                        group_spans.get(g_lo).map(|s| s.0).unwrap_or(n)
+                    } else {
+                        group_spans[g_lo].0
+                    };
+                    (lo, group_spans[g_hi].1)
+                })
+                .collect()
+        }
+        WindowFramePlan::Range { start, end } => {
+            if order_by.is_empty() {
+                // Unordered RANGE: every row is a peer of every other, so
+                // any frame covers the whole partition.
+                return Ok(vec![(0, n - 1); n]);
+            }
+            let nf = order_by[0].options.nulls_first;
+            let asc = order_by[0].options.asc.unwrap_or(true);
+            let mut out = Vec::with_capacity(n);
+            for p in 0..n {
+                let key = &keyed[p].1[0];
+                if matches!(key, Value::Null) {
+                    // NULL keys have no arithmetic: the frame is their peer
+                    // run (NULLs equal only NULLs, SQL semantics).
+                    let lo = window_key_search(keyed, key, nf, asc, false);
+                    let hi = window_key_search(keyed, key, nf, asc, true).saturating_sub(1);
+                    out.push((lo, hi));
+                    continue;
+                }
+                // PRECEDING/FOLLOWING are SORT-ORDER relative: ASC `n
+                // PRECEDING` = n value units DOWN, DESC `n PRECEDING` = n
+                // value units UP. The value interval [vlo, vhi] reads the
+                // START bound on one side and the END bound on the other,
+                // per direction; the position search then targets the
+                // matching endpoint (ASC keys ascend: lo hunts vlo, hi vhi;
+                // DESC keys descend: lo hunts vhi, hi vlo).
+                let bound_value = |b: &FrameValueBound| -> Result<Option<Value>> {
+                    match b {
+                        FrameValueBound::Unbounded | FrameValueBound::UnboundedFollowing => {
+                            Ok(None)
+                        }
+                        FrameValueBound::CurrentRow => Ok(Some(key.clone())),
+                        FrameValueBound::Preceding(v) => shift_range_key(key, v, !asc),
+                        FrameValueBound::Following(v) => shift_range_key(key, v, asc),
+                    }
+                };
+                let (lo_v, hi_v) = if asc {
+                    (bound_value(start)?, bound_value(end)?)
+                } else {
+                    (bound_value(end)?, bound_value(start)?)
+                };
+                let (mut lo, mut hi) = if asc {
+                    (
+                        match lo_v {
+                            None => 0,
+                            Some(t) => window_key_search(keyed, &t, nf, true, false),
+                        },
+                        match hi_v {
+                            None => n - 1,
+                            Some(t) => window_key_search(keyed, &t, nf, true, true),
+                        },
+                    )
+                } else {
+                    (
+                        match hi_v {
+                            None => 0,
+                            Some(t) => window_key_search(keyed, &t, nf, false, false),
+                        },
+                        match lo_v {
+                            None => n - 1,
+                            Some(t) => window_key_search(keyed, &t, nf, false, true),
+                        },
+                    )
+                };
+                // `hi` is the first-strictly-after search position; the
+                // inclusive end is one before it. Zero means NO key reached
+                // the far endpoint: an empty frame, which the consumers read
+                // as `hi < lo` — drop `hi` to 0 and push `lo` past it.
+                if hi == 0 {
+                    hi = 0;
+                    lo = lo.max(1);
+                } else {
+                    hi -= 1;
+                }
+                out.push((lo, hi));
+            }
+            out
+        }
+    })
 }
 
 /// Build a rows result from RETURNING items over the affected documents.
@@ -33420,6 +34263,43 @@ mod window_tests {
             .collect()
     }
 
+    /// Numeric column reader tolerant of Int/Float/Decimal (AVG returns
+    /// Float even over Int frames; SUM over Decimal stays Decimal).
+    fn num_col(r: &QueryResult, c: usize) -> Vec<f64> {
+        r.rows
+            .iter()
+            .map(|row| match &row[c] {
+                Value::Int(i) => *i as f64,
+                Value::Float(f) => *f,
+                Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
+                other => panic!("expected number, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn opt_int_col(r: &QueryResult, c: usize) -> Vec<Option<i64>> {
+        r.rows
+            .iter()
+            .map(|row| match &row[c] {
+                Value::Int(i) => Some(*i),
+                Value::Null => None,
+                other => panic!("expected int?, got {other:?}"),
+            })
+            .collect()
+    }
+    fn opt_num_col(r: &QueryResult, c: usize) -> Vec<Option<f64>> {
+        r.rows
+            .iter()
+            .map(|row| match &row[c] {
+                Value::Int(i) => Some(*i as f64),
+                Value::Float(f) => Some(*f),
+                Value::Decimal(d) => Some(d.to_f64().unwrap_or(f64::NAN)),
+                Value::Null => None,
+                other => panic!("expected number?, got {other:?}"),
+            })
+            .collect()
+    }
+
     fn win_db() -> Database {
         let mut db = Database::in_memory().unwrap();
         run(
@@ -33432,6 +34312,315 @@ mod window_tests {
              (4,'b','p',10),(5,'b','q',40)",
         );
         db
+    }
+
+    // ===== Custom window frames (ROWS/RANGE/GROUPS BETWEEN … AND …) =====
+
+    #[test]
+    fn frame_rows_slides_every_aggregate() {
+        let mut db = win_db();
+        // Sorted by salary (ties by name): p(10), y(20), z(20), x(30), q(40).
+        let r = rows(
+            &mut db,
+            "SELECT name, \
+             SUM(salary) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) s, \
+             COUNT(*) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) c, \
+             AVG(salary) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) a, \
+             MIN(salary) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) mn, \
+             MAX(salary) OVER (ORDER BY salary ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) mx \
+             FROM e ORDER BY salary, name",
+        );
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        assert_eq!(int_col(&r, 1), vec![10, 30, 40, 50, 70]);
+        assert_eq!(int_col(&r, 2), vec![1, 2, 2, 2, 2]);
+        // AVG over Int frames returns a Float: 10.0, 15.0, 20.0, 25.0, 35.0.
+        assert_eq!(num_col(&r, 3), vec![10.0, 15.0, 20.0, 25.0, 35.0]);
+        assert_eq!(int_col(&r, 4), vec![10, 10, 20, 20, 30]);
+        assert_eq!(int_col(&r, 5), vec![10, 20, 20, 30, 40]);
+    }
+
+    #[test]
+    fn frame_rows_prefix_suffix_and_unbounded() {
+        let mut db = win_db();
+        // Running total under an explicit default spelling must equal the
+        // implicit default frame.
+        let r = rows(
+            &mut db,
+            "SELECT SUM(salary) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING \
+             AND CURRENT ROW) FROM e ORDER BY salary, name",
+        );
+        assert_eq!(int_col(&r, 0), vec![10, 30, 50, 80, 120]);
+        // Suffix window: the low edge slides, the high edge pins to the end.
+        let r = rows(
+            &mut db,
+            "SELECT SUM(salary) OVER (ORDER BY salary ROWS BETWEEN CURRENT ROW \
+             AND UNBOUNDED FOLLOWING) FROM e ORDER BY salary, name",
+        );
+        assert_eq!(int_col(&r, 0), vec![120, 110, 90, 70, 40]);
+        // Both edges offset from the current row; trailing rows frame
+        // nothing and aggregate to NULL (COUNT stays 0).
+        let r = rows(
+            &mut db,
+            "SELECT name, SUM(salary) OVER (ORDER BY salary, name ROWS BETWEEN 2 FOLLOWING \
+             AND 3 FOLLOWING) s, COUNT(*) OVER (ORDER BY salary, name ROWS BETWEEN 2 FOLLOWING \
+             AND 3 FOLLOWING) c FROM e ORDER BY salary, name",
+        );
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        // p: y+z+x? no — positions 2..3 = z+x = 50; y: x+q = 70; z: q = 40;
+        // x and q frame past the end: empty — SUM NULL, COUNT 0.
+        assert_eq!(
+            opt_int_col(&r, 1),
+            vec![Some(50), Some(70), Some(40), None, None]
+        );
+        assert_eq!(int_col(&r, 2), vec![2, 2, 1, 0, 0]);
+    }
+
+    #[test]
+    fn frame_range_value_intervals_include_peers() {
+        let mut db = win_db();
+        // RANGE shifts the sort KEY, so peer rows always travel together.
+        // Sorted salaries: 10, 20, 20, 30, 40.
+        let r = rows(
+            &mut db,
+            "SELECT name, \
+             SUM(salary) OVER (ORDER BY salary RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) s \
+             FROM e ORDER BY salary, name",
+        );
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        assert_eq!(int_col(&r, 1), vec![10, 40, 40, 30, 40]);
+        // Explicit default spelling: running total with peers.
+        let r = rows(
+            &mut db,
+            "SELECT SUM(salary) OVER (ORDER BY salary RANGE BETWEEN UNBOUNDED PRECEDING \
+             AND CURRENT ROW) FROM e ORDER BY salary, name",
+        );
+        assert_eq!(int_col(&r, 0), vec![10, 50, 50, 80, 120]);
+        // Interval that no key falls into: the empty frame aggregates to
+        // NULL (COUNT 0).
+        let r = rows(
+            &mut db,
+            "SELECT name, SUM(salary) OVER (ORDER BY salary RANGE BETWEEN 2 PRECEDING \
+             AND 1 PRECEDING) s, COUNT(*) OVER (ORDER BY salary RANGE BETWEEN 2 PRECEDING \
+             AND 1 PRECEDING) c FROM e ORDER BY salary, name",
+        );
+        // [k-2, k-1] misses every salary here: empty frame = SUM NULL, COUNT 0.
+        assert_eq!(
+            opt_int_col(&r, 1),
+            vec![None, None, None, None, None],
+            "{r:?}"
+        );
+        assert_eq!(int_col(&r, 2), vec![0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn frame_range_desc_and_wide_intervals() {
+        let mut db = win_db();
+        // DESC: `1 PRECEDING` means one unit LARGER (the sort direction
+        // flips, not the arithmetic).
+        let r = rows(
+            &mut db,
+            "SELECT name, SUM(salary) OVER (ORDER BY salary DESC RANGE BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) s FROM e ORDER BY salary DESC, name",
+        );
+        assert_eq!(str_col(&r, 0), vec!["q", "x", "y", "z", "p"]);
+        assert_eq!(int_col(&r, 1), vec![40, 30, 40, 40, 10]);
+        // A wide symmetric interval groups the whole neighborhood.
+        let r = rows(
+            &mut db,
+            "SELECT name, SUM(salary) OVER (ORDER BY salary RANGE BETWEEN 5 PRECEDING \
+             AND 5 FOLLOWING) s FROM e ORDER BY salary, name",
+        );
+        assert_eq!(int_col(&r, 1), vec![10, 40, 40, 30, 40]);
+    }
+
+    #[test]
+    fn frame_groups_counts_peer_groups() {
+        let mut db = win_db();
+        // Peer groups by salary: {10},{20,20},{30},{40}. One group each way.
+        let r = rows(
+            &mut db,
+            "SELECT name, SUM(salary) OVER (ORDER BY salary GROUPS BETWEEN 1 PRECEDING \
+             AND 1 FOLLOWING) s FROM e ORDER BY salary, name",
+        );
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        assert_eq!(int_col(&r, 1), vec![50, 80, 80, 110, 70]);
+        // CURRENT ROW start pins the frame to the own group.
+        let r = rows(
+            &mut db,
+            "SELECT name, SUM(salary) OVER (ORDER BY salary GROUPS BETWEEN CURRENT ROW \
+             AND 1 FOLLOWING) s FROM e ORDER BY salary, name",
+        );
+        // y/z ride their own group plus {30}: 20+20+30 = 70.
+        assert_eq!(int_col(&r, 1), vec![50, 70, 70, 70, 40]);
+    }
+
+    #[test]
+    fn frame_first_last_value_walk_the_frame() {
+        let mut db = win_db();
+        let r = rows(
+            &mut db,
+            "SELECT name, salary, \
+             FIRST_VALUE(salary) OVER (ORDER BY salary, name ROWS BETWEEN 1 PRECEDING \
+             AND 1 FOLLOWING) f, \
+             LAST_VALUE(salary) OVER (ORDER BY salary, name ROWS BETWEEN 1 PRECEDING \
+             AND 1 FOLLOWING) l \
+             FROM e ORDER BY salary, name",
+        );
+        assert_eq!(str_col(&r, 0), vec!["p", "y", "z", "x", "q"]);
+        assert_eq!(int_col(&r, 2), vec![10, 10, 20, 20, 30]);
+        assert_eq!(int_col(&r, 3), vec![20, 20, 30, 40, 40]);
+        // The default frame keeps its historical RANGE semantics: LAST_VALUE
+        // lands on the peer-run end, not the row.
+        let r = rows(
+            &mut db,
+            "SELECT name, LAST_VALUE(salary) OVER (ORDER BY salary) FROM e \
+             ORDER BY salary, name",
+        );
+        assert_eq!(int_col(&r, 1), vec![10, 20, 20, 30, 40]);
+    }
+
+    #[test]
+    fn frame_partitions_decimal_filter_distinct_and_concat() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (g TEXT, k INT, v DECIMAL)");
+        // CAST literals: bare `1.0` parses as Float (documented boundary),
+        // and this test exercises the DECIMAL exact-sum path.
+        run(
+            &mut db,
+            "INSERT INTO t VALUES ('a',1,CAST('10.5' AS DECIMAL)),('a',2,CAST('20.0' AS DECIMAL)),\
+             ('a',3,CAST('30.5' AS DECIMAL)),('b',1,CAST('1.0' AS DECIMAL)),\
+             ('b',2,CAST('2.0' AS DECIMAL)),('b',3,CAST('3.0' AS DECIMAL))",
+        );
+        // Partitioned frames never leak across the boundary.
+        let r = rows(
+            &mut db,
+            "SELECT g, k, SUM(v) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) s FROM t ORDER BY g, k",
+        );
+        assert_eq!(str_col(&r, 0), vec!["a", "a", "a", "b", "b", "b"]);
+        // DECIMAL sums stay exact: 10.5 / 30.5 / 50.5 and 1.0 / 3.0 / 5.0.
+        assert_eq!(num_col(&r, 2), vec![10.5, 30.5, 50.5, 1.0, 3.0, 5.0]);
+        // FILTER rides the frame.
+        let r = rows(
+            &mut db,
+            "SELECT k, SUM(v) FILTER (WHERE v > 1.0) OVER (ORDER BY k ROWS BETWEEN \
+             UNBOUNDED PRECEDING AND CURRENT ROW) s FROM t WHERE g = 'b' ORDER BY k",
+        );
+        // k=1's own row is filtered out and nothing precedes it: NULL.
+        assert_eq!(opt_num_col(&r, 1), vec![None, Some(2.0), Some(5.0)]);
+        // DISTINCT and GROUP_CONCAT fold fresh per row (non-invertible).
+        let r = rows(
+            &mut db,
+            "SELECT k, COUNT(DISTINCT k % 2) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING \
+             AND 1 FOLLOWING) d, GROUP_CONCAT(k) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING \
+             AND 1 FOLLOWING) gc FROM t WHERE g = 'b' ORDER BY k",
+        );
+        // k%2 over each row's frame: k=1 sees {1,0}, k=2 sees {1,0,1}, k=3 {0,1}.
+        assert_eq!(int_col(&r, 1), vec![2, 2, 2]);
+        assert_eq!(str_col(&r, 2), vec!["1,2", "1,2,3", "2,3"]);
+    }
+
+    #[test]
+    fn frame_range_timestamp_key_shifts_by_milliseconds() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE ev (ts TIMESTAMP, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO ev VALUES (TIMESTAMP '2026-01-01 00:00:00', 1), \
+             (TIMESTAMP '2026-01-01 00:00:30', 2), \
+             (TIMESTAMP '2026-01-01 00:01:00', 4), \
+             (TIMESTAMP '2026-01-01 00:02:00', 8)",
+        );
+        // 60s = 60000 ms: each row sums its own 60-second window.
+        let r = rows(
+            &mut db,
+            "SELECT v, SUM(v) OVER (ORDER BY ts RANGE BETWEEN 60000 PRECEDING \
+             AND CURRENT ROW) s FROM ev ORDER BY ts",
+        );
+        assert_eq!(int_col(&r, 0), vec![1, 2, 4, 8]);
+        assert_eq!(int_col(&r, 1), vec![1, 3, 7, 12]);
+    }
+
+    #[test]
+    fn frame_range_matches_manual_interval_scan() {
+        // Differential: the RANGE bounds (binary search over the sorted
+        // partition) must agree with a plain interval predicate over the
+        // same rows — 60 deterministic rows with duplicate keys.
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, k INT, v INT)");
+        let mut batch = Vec::new();
+        for id in 1..=60i64 {
+            batch.push(format!("({},{},{})", id, (id * 13) % 17, id));
+        }
+        run(
+            &mut db,
+            &format!("INSERT INTO t VALUES {}", batch.join(",")),
+        );
+        let r = rows(
+            &mut db,
+            "SELECT id, SUM(v) OVER (ORDER BY k RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) w \
+             FROM t ORDER BY id",
+        );
+        let r2 = rows(
+            &mut db,
+            "SELECT a.id, (SELECT SUM(b.v) FROM t b WHERE b.k >= a.k - 2 AND b.k <= a.k + 2) m \
+             FROM t a ORDER BY a.id",
+        );
+        assert_eq!(r.rows, r2.rows, "window frame vs manual interval scan");
+    }
+
+    #[test]
+    fn frame_sum_overflow_degrades_to_fresh_folds() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (1, 9223372036854775807), (2, 1), (3, -1), (4, 5)",
+        );
+        // Sliding SUM hits the Int overflow wall mid-window: the sticky-NULL
+        // state cannot be inverted, so the affected rows refold their frames
+        // fresh — and every value must equal the batch aggregate over the
+        // same rows (the batch fold NULLs on the same overflow).
+        let r = rows(
+            &mut db,
+            "SELECT id, SUM(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) s \
+             FROM t ORDER BY id",
+        );
+        let got: Vec<Option<i64>> = r
+            .rows
+            .iter()
+            .map(|row| match &row[1] {
+                Value::Int(i) => Some(*i),
+                Value::Null => None,
+                other => panic!("expected int?, got {other:?}"),
+            })
+            .collect();
+        // id1: [MAX] = MAX; id2: [MAX,1] overflows → NULL; id3: [MAX,1,-1]
+        // overflows → NULL; id4: [1,-1,5] = 5.
+        assert_eq!(
+            got,
+            vec![Some(9223372036854775807), None, None, Some(5),],
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn frame_null_keys_and_partition_boundaries_stay_sane() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (k INT, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (NULL,1),(NULL,2),(1,4),(2,8)",
+        );
+        // NULL keys have no arithmetic: their frame is their peer run.
+        let r = rows(
+            &mut db,
+            "SELECT k, v, SUM(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) s \
+             FROM t ORDER BY k NULLS FIRST, v",
+        );
+        assert_eq!(int_col(&r, 1), vec![1, 2, 4, 8]);
+        // k=1: [0,1] → 4; k=2: [1,2] → 4+8 = 12.
+        assert_eq!(int_col(&r, 2), vec![3, 3, 4, 12]);
     }
 
     #[test]
@@ -33579,14 +34768,32 @@ mod window_tests {
                 .contains("not supported combined with GROUP BY"),
             "{e}"
         );
-        // Non-default frame.
+        // A frame clause rides only FIRST/LAST_VALUE — ranking/offset
+        // functions have frame-independent semantics and refuse one loudly.
         let e = db
             .execute(
-                "SELECT SUM(salary) OVER (ORDER BY salary \
+                "SELECT ROW_NUMBER() OVER (ORDER BY salary \
                  ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM e",
             )
             .unwrap_err();
-        assert!(e.to_string().contains("window frames"), "{e}");
+        assert!(e.to_string().contains("does not accept a frame"), "{e}");
+        // A RANGE value offset shifts THE sort key: without exactly one
+        // ORDER BY key there is nothing to shift.
+        let e = db
+            .execute("SELECT SUM(salary) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM e")
+            .unwrap_err();
+        assert!(e.to_string().contains("exactly one ORDER BY key"), "{e}");
+        // Frame start after frame end is refused (standard).
+        let e = db
+            .execute(
+                "SELECT SUM(salary) OVER (ORDER BY salary \
+                 ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM e",
+            )
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("start cannot be after its end"),
+            "{e}"
+        );
         // Named window (needs the WINDOW clause, which is refused).
         let e = db.execute("SELECT RANK() OVER (w) FROM e").unwrap_err();
         assert!(e.to_string().contains("WINDOW"), "{e}");
