@@ -674,16 +674,69 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, String> {
         return Ok(vec![chunks[0].trim().to_string()]);
     }
     let mut out = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
+    let mut i = 0;
+    while i < chunks.len() {
+        let chunk = chunks[i].clone();
         if crate::useradmin::parse(&chunk).is_some() {
             out.push(chunk.trim().to_string());
+            i += 1;
             continue;
         }
-        let stmts = Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&chunk))
-            .map_err(|e| e.to_string())?;
-        for s in stmts {
-            out.push(format!("{s};"));
+        let up = chunk.trim_start().to_ascii_uppercase();
+        let trigger_start =
+            up.starts_with("CREATE TRIGGER") || up.starts_with("CREATE OR REPLACE TRIGGER");
+        if !trigger_start {
+            let stmts = Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&chunk))
+                .map_err(|e| e.to_string())?;
+            for s in stmts {
+                out.push(format!("{s};"));
+            }
+            i += 1;
+            continue;
         }
+        // Trigger body: the BEGIN … END block carries bare `;` separators
+        // the splitter must not honor. Absorb chunks until the accumulated
+        // text parses to one CLOSED trigger (a BeginEnd body); a Sequence
+        // parse or an error means the body is still open — never accept it,
+        // that would silently drop the statement tail.
+        let mut acc = chunk.clone();
+        loop {
+            let closed = match Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&acc))
+            {
+                Ok(stmts) => {
+                    stmts.len() == 1
+                        && matches!(
+                            stmts.first(),
+                            Some(sqlparser::ast::Statement::CreateTrigger(ct)) if matches!(
+                                ct.statements.as_ref(),
+                                Some(sqlparser::ast::ConditionalStatements::BeginEnd(_))
+                            )
+                        )
+                }
+                Err(_) => false,
+            };
+            if closed {
+                let stmts = Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&acc))
+                    .map_err(|e| e.to_string())?;
+                for s in stmts {
+                    out.push(format!("{s};"));
+                }
+                break;
+            }
+            i += 1;
+            match chunks.get(i) {
+                Some(next) => {
+                    acc.push_str("; ");
+                    acc.push_str(next.trim());
+                }
+                None => {
+                    Parser::parse_sql(&GenericDialect {}, &crate::tsql::preprocess(&acc))
+                        .map_err(|e| e.to_string())?;
+                    return Err("unterminated trigger body (missing END)".into());
+                }
+            }
+        }
+        i += 1;
     }
     if out.is_empty() {
         return Err("empty statement".into());

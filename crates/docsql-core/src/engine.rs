@@ -5833,9 +5833,67 @@ impl<'a> ReadCx<'a> {
     }
 }
 
+/// One row trigger's definition (`CREATE TRIGGER`). Stored in the catalog
+/// (`triggers` key) and re-parsed from the AST at CREATE time; replication
+/// replays the creating DDL verbatim on every node, so the body must be
+/// deterministic — enforced by [`Database::exec_create_trigger`], never
+/// assumed.
+#[derive(Clone, Debug)]
+pub(crate) struct TriggerDef {
+    /// Global unique name (one namespace with tables/views/indexes is NOT
+    /// enforced — SQLite likewise scopes nothing; uniqueness among triggers
+    /// is what DROP TRIGGER resolves).
+    pub(crate) name: String,
+    /// Target table (never a view, never a system/internal table).
+    pub(crate) table: String,
+    /// BEFORE or AFTER (INSTEAD OF is rejected at CREATE time).
+    pub(crate) before: bool,
+    pub(crate) insert: bool,
+    pub(crate) delete: bool,
+    /// UPDATE trigger. `Some(cols)` = UPDATE OF: fire only when the
+    /// statement assigns at least one listed column.
+    pub(crate) update: bool,
+    pub(crate) update_of: Option<Vec<String>>,
+    /// WHEN predicate over NEW./OLD. references, stored as SQL text.
+    /// Evaluated per row after substitution; false/NULL skips the body.
+    pub(crate) when: Option<String>,
+    pub(crate) body: Vec<TriggerAction>,
+}
+
+/// One statement of a trigger body. `Sql` re-executes verbatim with
+/// NEW./OLD. references substituted per row; `Raise` aborts the statement.
+#[derive(Clone, Debug)]
+pub(crate) enum TriggerAction {
+    Sql(String),
+    /// `SELECT RAISE(ABORT|FAIL, 'msg')` — both spellings abort the
+    /// statement (DocSQL statement atomicity makes them equivalent; SQLite's
+    /// FAIL would leave prior rows of the statement applied, which this
+    /// engine's all-or-nothing statements never do). `RAISE(IGNORE)` and
+    /// `RAISE(ROLLBACK)` are rejected at CREATE time.
+    Raise {
+        fail: bool,
+        msg: String,
+    },
+}
+
+/// Max trigger cascade depth (a trigger body statement firing further
+/// triggers). SQLite allows deep cascades and dies on its own budget; ours
+/// is loud at 16 so an infinite `t1 → t2 → t1` cycle errors instead of
+/// hanging the single writer.
+const MAX_TRIGGER_DEPTH: u8 = 16;
+
 pub struct Database {
     pager: std::sync::Arc<Pager>,
     tables: std::collections::BTreeMap<String, std::sync::Arc<TableMeta>>,
+    /// Row triggers by name (see [`TriggerDef`]). Only the write path ever
+    /// reads this map, always under the engine write lock — no snapshot
+    /// plumbing (unlike `tables`, catalog snapshots don't carry triggers;
+    /// trigger bodies never read triggers).
+    triggers: std::collections::BTreeMap<String, TriggerDef>,
+    /// Trigger-body execution depth (> 0 = a triggering statement is
+    /// mid-flight under its statement guard; nested DML joins that guard
+    /// instead of opening its own).
+    trigger_depth: u8,
     /// Async-commit mode (MongoDB-style journal interval): every statement
     /// commit skips the WAL fsync; a background flusher batches fsyncs.
     /// Trades bounded (ms) loss window on power failure for throughput.
@@ -5972,6 +6030,7 @@ impl Database {
             pager.commit_tx(tx)?;
         }
         let mut tables = std::collections::BTreeMap::new();
+        let mut triggers = std::collections::BTreeMap::new();
         // New format: a magic-headed chain of pages. Legacy databases keep a
         // raw encoded catalog on page 1 — decode it in place; the first
         // catalog save rewrites it in the new format.
@@ -6195,11 +6254,77 @@ impl Database {
                         }
                     }
                 }
+                // Row triggers (see [`TriggerDef`]). Same tolerant decode as
+                // the table metas: a malformed entry is skipped, not fatal —
+                // the encoder above only ever writes the shapes decoded here.
+                if let Some(Value::Object(ts)) = o.get("triggers") {
+                    for (name, td) in ts {
+                        let Some(Value::Object(t)) = Some(td) else {
+                            continue;
+                        };
+                        let (Some(table), Some(before), Some(insert), Some(delete), Some(update)) = (
+                            t.get("table").and_then(|v| v.as_str()),
+                            t.get("before").and_then(|v| v.as_bool()),
+                            t.get("insert").and_then(|v| v.as_bool()),
+                            t.get("delete").and_then(|v| v.as_bool()),
+                            t.get("update").and_then(|v| v.as_bool()),
+                        ) else {
+                            continue;
+                        };
+                        let update_of = match t.get("update_of") {
+                            Some(Value::Array(a)) => Some(
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        };
+                        let when = t.get("when").and_then(|v| v.as_str()).map(String::from);
+                        let body = match t.get("body") {
+                            Some(Value::Array(a)) => a
+                                .iter()
+                                .filter_map(|x| match x {
+                                    Value::Array(parts) => match (
+                                        parts.first().and_then(|v| v.as_str()),
+                                        parts.get(1).and_then(|v| v.as_str()),
+                                    ) {
+                                        (Some("sql"), Some(text)) => {
+                                            Some(TriggerAction::Sql(text.to_string()))
+                                        }
+                                        (Some("raise"), Some(msg)) => Some(TriggerAction::Raise {
+                                            fail: matches!(parts.get(2), Some(Value::Bool(true))),
+                                            msg: msg.to_string(),
+                                        }),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => vec![],
+                        };
+                        triggers.insert(
+                            name.clone(),
+                            TriggerDef {
+                                name: name.clone(),
+                                table: table.to_string(),
+                                before,
+                                insert,
+                                delete,
+                                update,
+                                update_of,
+                                when,
+                                body,
+                            },
+                        );
+                    }
+                }
             }
         }
         Ok(Database {
             pager: std::sync::Arc::new(pager),
             tables,
+            triggers,
+            trigger_depth: 0,
             async_commit: false,
             pending_sync: false,
             write_unit: 0,
@@ -6413,6 +6538,60 @@ impl Database {
         }
         let mut cat = Object::new();
         cat.insert("tables".into(), Value::Object(tables));
+        // Row triggers: absent when none exist, so a trigger-free catalog
+        // keeps its exact historical byte shape (older readers ignore the
+        // key; trigger-free volumes never gain one).
+        if !self.triggers.is_empty() {
+            let mut ts = Object::new();
+            for d in self.triggers.values() {
+                ts.insert(
+                    d.name.clone(),
+                    Value::Object(Object::from([
+                        ("table".into(), Value::Str(d.table.clone())),
+                        ("before".into(), Value::Bool(d.before)),
+                        ("insert".into(), Value::Bool(d.insert)),
+                        ("delete".into(), Value::Bool(d.delete)),
+                        ("update".into(), Value::Bool(d.update)),
+                        (
+                            "update_of".into(),
+                            match &d.update_of {
+                                Some(cols) => Value::Array(
+                                    cols.iter().map(|c| Value::Str(c.clone())).collect(),
+                                ),
+                                None => Value::Null,
+                            },
+                        ),
+                        (
+                            "when".into(),
+                            match &d.when {
+                                Some(w) => Value::Str(w.clone()),
+                                None => Value::Null,
+                            },
+                        ),
+                        (
+                            "body".into(),
+                            Value::Array(
+                                d.body
+                                    .iter()
+                                    .map(|a| match a {
+                                        TriggerAction::Sql(text) => Value::Array(vec![
+                                            Value::Str("sql".into()),
+                                            Value::Str(text.clone()),
+                                        ]),
+                                        TriggerAction::Raise { fail, msg } => Value::Array(vec![
+                                            Value::Str("raise".into()),
+                                            Value::Str(msg.clone()),
+                                            Value::Bool(*fail),
+                                        ]),
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ])),
+                );
+            }
+            cat.insert("triggers".into(), Value::Object(ts));
+        }
         let bytes = encode::encode_to_vec(&Value::Object(cat))?;
         self.write_catalog_pages(tx, &bytes)?;
         Ok(())
@@ -7584,8 +7763,11 @@ impl Database {
         }
         // Wiped tables may be recreated from a snapshot: drop their
         // AUTOINCREMENT watermarks with them or the recreated table resumes
-        // from a stale counter (see DROP TABLE).
+        // from a stale counter (see DROP TABLE). Triggers die too — the
+        // snapshot replay recreates them from its own CREATE TRIGGER block
+        // (emitted after the data, pg_dump style).
         self.autoinc_cache.clear();
+        self.triggers.clear();
         self.save_catalog_into(&mut tx)?;
         self.commit_pager_tx(tx)?;
         Ok(())
@@ -8091,6 +8273,16 @@ impl Database {
                 }
             }
         }
+        // Triggers come AFTER the data (pg_dump semantics): the dumped rows
+        // already include every effect their firing ever produced, and
+        // replaying the INSERTs with live triggers would fire them again —
+        // duplicated audit rows, doubled cascades. Created post-data, the
+        // restore reproduces the snapshot byte-for-byte and the triggers arm
+        // only for statements that run after it.
+        for d in self.triggers.values() {
+            ddl.push_str(&create_trigger_sql(d));
+            ddl.push_str(";\n");
+        }
         // Users/roles last of all: `GRANT … ON <object>` validates that the
         // target exists, and a grant on a VIEW must replay after that view
         // is created (emitting them before the view block made every dump
@@ -8202,9 +8394,17 @@ impl Database {
         }
     }
 
-    fn exec_stmt(&mut self, stmt: Statement) -> Result<ExecOutcome> {
+    fn exec_stmt_inner(&mut self, stmt: Statement) -> Result<ExecOutcome> {
         match stmt {
             Statement::CreateTable(create) => self.exec_create(create),
+            Statement::CreateTrigger(ct) => self.exec_create_trigger(ct),
+            Statement::DropTrigger(dt) => {
+                if dt.option.is_some() {
+                    return err("DROP TRIGGER CASCADE / RESTRICT is not supported");
+                }
+                let names: Vec<ObjectName> = std::iter::once(dt.trigger_name.clone()).collect();
+                self.exec_drop_trigger(&names, dt.if_exists)
+            }
             Statement::CreateView(view) => self.exec_create_view(view),
             Statement::Drop {
                 object_type,
@@ -8518,6 +8718,11 @@ impl Database {
                     for name in &view_dropping {
                         self.tables.remove(name);
                     }
+                    // A dropped table's triggers die with it (SQLite
+                    // semantics) — a surviving trigger would dangle on the
+                    // table name and misfire when a new table takes it.
+                    self.triggers
+                        .retain(|_, d| !drop_set.contains(d.table.as_str()));
                     self.save_catalog_into(&mut tx)?;
                     Ok(())
                 })();
@@ -9190,6 +9395,27 @@ impl Database {
         // IS the whole final table here — untouched rows included).
         self.check_fk_parent_delete_skipping(&tname, &old_changed, &out, &[], Some(&out))?;
         let changed = changed_docs.clone();
+        // Row triggers: BEFORE over the pre/post image pairs while the old
+        // state is still the committed truth, AFTER once the rewrite landed.
+        let changed_cols: Vec<String> = assignments
+            .iter()
+            .filter_map(|a| match &a.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(c) => Some(obj_name(c)),
+                _ => None,
+            })
+            .collect();
+        let fire_update = !changed_docs.is_empty() && self.triggers_exist_for(&tname);
+        if fire_update {
+            for (old, new) in old_changed.iter().zip(changed_docs.iter()) {
+                self.fire_row_triggers(
+                    &tname,
+                    true,
+                    TriggerFireEvent::Update(Some(&changed_cols)),
+                    Some(old),
+                    Some(new),
+                )?;
+            }
+        }
         // Sticky dotted-field marker on the LOCAL meta clone: rewrite_table
         // persists exactly this meta, so a self.tables write here would be
         // overwritten by the rewrite's own catalog save.
@@ -9197,6 +9423,17 @@ impl Database {
             meta.dotted_keys = true;
         }
         self.rewrite_table(&tname, &mut meta, out)?;
+        if fire_update {
+            for (old, new) in old_changed.iter().zip(changed_docs.iter()) {
+                self.fire_row_triggers(
+                    &tname,
+                    false,
+                    TriggerFireEvent::Update(Some(&changed_cols)),
+                    Some(old),
+                    Some(new),
+                )?;
+            }
+        }
         if let Some(ret) = &update_returning {
             return project_returning(ret, &changed);
         }
@@ -9299,6 +9536,27 @@ impl Database {
         };
         let mut roots = meta.index_roots.clone();
         let idx_specs = idx_specs(&meta, &roots);
+        // BEFORE UPDATE over the pre/post pairs while the old images are
+        // still the committed truth (rows update in place below).
+        let update_changed_cols: Vec<String> = assignments
+            .iter()
+            .filter_map(|a| match &a.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(c) => Some(obj_name(c)),
+                _ => None,
+            })
+            .collect();
+        let fire_update = self.triggers_exist_for(&tname);
+        if fire_update {
+            for (_, old, new) in &updates {
+                self.fire_row_triggers(
+                    &tname,
+                    true,
+                    TriggerFireEvent::Update(Some(&update_changed_cols)),
+                    Some(old),
+                    Some(new),
+                )?;
+            }
+        }
         let mut tx = self.pager.begin_tx();
         // Pass 1: drop every updated row's old index entries before any
         // replacement lands — a multi-row unique-key shift (SET id = id + 1,
@@ -9404,6 +9662,18 @@ impl Database {
             )?;
         }
         self.commit_pager_tx(tx)?;
+        // AFTER UPDATE once the new images are committed.
+        if fire_update {
+            for (_, old, new) in &updates {
+                self.fire_row_triggers(
+                    &tname,
+                    false,
+                    TriggerFireEvent::Update(Some(&update_changed_cols)),
+                    Some(old),
+                    Some(new),
+                )?;
+            }
+        }
         // Explicit ids may bump the AUTOINCREMENT watermark.
         if let Some(col) = &meta.autoinc {
             if assignments
@@ -9531,7 +9801,19 @@ impl Database {
         // `DELETE FROM self_ref_table` may clear parent and child rows
         // together (SQLite/PG statement-final semantics).
         self.check_fk_parent_delete_skipping(&tname, &removed, &[], &[], Some(&kept))?;
+        // BEFORE DELETE while the rows are still the committed truth.
+        let fire_delete = !removed.is_empty() && self.triggers_exist_for(&tname);
+        if fire_delete {
+            for doc in &removed {
+                self.fire_row_triggers(&tname, true, TriggerFireEvent::Delete, Some(doc), None)?;
+            }
+        }
         self.rewrite_table(&tname, &mut meta, kept)?;
+        if fire_delete {
+            for doc in &removed {
+                self.fire_row_triggers(&tname, false, TriggerFireEvent::Delete, Some(doc), None)?;
+            }
+        }
         if let Some(ret) = &returning {
             return project_returning(ret, &removed);
         }
@@ -9591,6 +9873,13 @@ impl Database {
         };
         let mut roots = meta.index_roots.clone();
         let idx_specs = idx_specs(&meta, &roots);
+        // BEFORE DELETE while the rows are still the committed truth.
+        let fire_delete = self.triggers_exist_for(&tname);
+        if fire_delete {
+            for (_, doc) in &targets {
+                self.fire_row_triggers(&tname, true, TriggerFireEvent::Delete, Some(doc), None)?;
+            }
+        }
         let mut tx = self.pager.begin_tx();
         let affected: std::collections::BTreeSet<u32> = targets
             .iter()
@@ -9637,6 +9926,11 @@ impl Database {
         // Deleted rows may have held the AUTOINCREMENT watermark.
         self.autoinc_cache.remove(&tname);
         let removed: Vec<Object> = targets.into_iter().map(|(_, d)| d).collect();
+        if fire_delete {
+            for doc in &removed {
+                self.fire_row_triggers(&tname, false, TriggerFireEvent::Delete, Some(doc), None)?;
+            }
+        }
         let count = removed.len() as u64;
         if let Some(ret) = returning {
             return project_returning(ret, &removed);
@@ -11002,6 +11296,501 @@ impl Database {
     /// one expands to the stored query's rows (see `load_table_factor`).
     /// The body is dry-run once at create time so missing tables/columns
     /// fail loudly, and `CREATE OR REPLACE` re-points an existing view.
+    // ===== Row triggers (CREATE TRIGGER / DROP TRIGGER) =====
+    //
+    // Replication red line: the creating DDL rides the journal like every
+    // other write and every node fires the same bodies over the same rows,
+    // so a body may contain NOTHING nondeterministic — no NEWID()/RAND(),
+    // no wall-clock calls, no INSERT omitting an auto-GUID column, no
+    // INSERT leaving a wall-clock DEFAULT to be filled. Each is refused at
+    // CREATE time: at fire time the divergence has already happened by the
+    // time anyone could notice.
+    fn exec_create_trigger(&mut self, ct: sqlparser::ast::CreateTrigger) -> Result<ExecOutcome> {
+        if ct.or_alter {
+            return err("CREATE OR ALTER TRIGGER is not supported (use CREATE OR REPLACE TRIGGER)");
+        }
+        if ct.temporary {
+            return err("TEMP triggers are not supported");
+        }
+        if ct.is_constraint {
+            return err("CONSTRAINT triggers are not supported");
+        }
+        if !ct.referencing.is_empty() {
+            return err("REFERENCING (transition tables) is not supported");
+        }
+        if ct.characteristics.is_some() {
+            return err("trigger characteristics (DEFERRABLE / INITIALLY …) are not supported");
+        }
+        if ct.exec_body.is_some() {
+            return err("EXECUTE FUNCTION triggers are not supported (use a BEGIN … END body)");
+        }
+        if ct.statements_as {
+            return err("AS trigger bodies are not supported (use BEGIN … END)");
+        }
+        let before = match ct.period {
+            Some(sqlparser::ast::TriggerPeriod::Before) => true,
+            Some(sqlparser::ast::TriggerPeriod::After) => false,
+            Some(sqlparser::ast::TriggerPeriod::InsteadOf) => {
+                return err("INSTEAD OF triggers are not supported (views are not writable)");
+            }
+            Some(sqlparser::ast::TriggerPeriod::For) | None => {
+                return err("trigger requires BEFORE or AFTER");
+            }
+        };
+        match ct.trigger_object {
+            None => {}
+            Some(sqlparser::ast::TriggerObjectKind::ForEach(
+                sqlparser::ast::TriggerObject::Row,
+            ))
+            | Some(sqlparser::ast::TriggerObjectKind::For(sqlparser::ast::TriggerObject::Row)) => {}
+            Some(_) => {
+                return err(
+                    "statement-level triggers (FOR EACH STATEMENT) are not supported (triggers are row-level)",
+                );
+            }
+        }
+        if ct.events.len() != 1 {
+            return err("exactly one event (INSERT / UPDATE / DELETE) per trigger");
+        }
+        let (insert, delete, update, update_of) = match ct
+            .events
+            .into_iter()
+            .next()
+            .expect("checked above")
+        {
+            sqlparser::ast::TriggerEvent::Insert => (true, false, false, None),
+            sqlparser::ast::TriggerEvent::Delete => (false, true, false, None),
+            sqlparser::ast::TriggerEvent::Update(cols) => (
+                false,
+                false,
+                true,
+                if cols.is_empty() {
+                    None
+                } else {
+                    Some(cols.iter().map(|i| i.value.clone()).collect())
+                },
+            ),
+            sqlparser::ast::TriggerEvent::Truncate => {
+                return err(
+                    "TRUNCATE triggers are not supported (row triggers fire on DELETE; TRUNCATE itself fires none)",
+                );
+            }
+        };
+        let name = obj_name(&ct.name);
+        let table = obj_name(&ct.table_name);
+        if crate::engine::is_system_table(&table) || is_internal_table(&table) {
+            return err(format!("triggers cannot target the internal table {table}"));
+        }
+        let Some(tmeta) = self.tables.get(&table).cloned() else {
+            return err(format!("table {table} does not exist"));
+        };
+        if tmeta.is_view() {
+            return err(format!("cannot create a trigger on view {table}"));
+        }
+        // WHEN: only NEW./OLD. references over literals and operators — an
+        // unqualified column name would silently read NULL and skip every
+        // firing.
+        let when = match &ct.condition {
+            Some(e) => {
+                validate_trigger_when(e)?;
+                Some(e.to_string())
+            }
+            None => None,
+        };
+        let body_statements = match &ct.statements {
+            Some(cs) => cs.statements().clone(),
+            None => return err("trigger body is required (BEGIN … END)"),
+        };
+        if body_statements.is_empty() {
+            return err("trigger body is empty");
+        }
+        let mut body = Vec::with_capacity(body_statements.len());
+        for s in &body_statements {
+            body.push(self.validate_trigger_body_stmt(s)?);
+        }
+        if self.triggers.contains_key(&name) && !ct.or_replace {
+            return err(format!("trigger {name} already exists"));
+        }
+        self.triggers.insert(
+            name.clone(),
+            TriggerDef {
+                name,
+                table,
+                before,
+                insert,
+                delete,
+                update,
+                update_of,
+                when,
+                body,
+            },
+        );
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
+    /// CREATE-time validation of one trigger body statement: the accepted
+    /// shapes (INSERT / UPDATE / DELETE / `SELECT RAISE(ABORT|FAIL, …)`)
+    /// plus the determinism gates that keep every replaying node in
+    /// agreement. Returns the catalog form.
+    fn validate_trigger_body_stmt(&self, stmt: &Statement) -> Result<TriggerAction> {
+        match stmt {
+            Statement::Insert(i) => {
+                let sqlparser::ast::TableObject::TableName(n) = &i.table else {
+                    return err("trigger body INSERT must target a simple table");
+                };
+                let t = obj_name(n);
+                self.validate_trigger_target(&t)?;
+                let tmeta = self.tables.get(&t).cloned().unwrap_or_default();
+                // INSERT would otherwise rewrite NEWID per row, and RAND()
+                // would re-roll on every replaying node — same gate the
+                // direct path applies to INSERT ... SELECT sources.
+                let text = stmt.to_string();
+                if crate::stmt::mentions_nondet_call(&text) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are not allowed in trigger bodies \
+                         (each node would generate different values)",
+                    );
+                }
+                if crate::stmt::mentions_wall_clock(&text) {
+                    return err(
+                        "wall-clock functions are not allowed in trigger bodies (each node would stamp its own clock)",
+                    );
+                }
+                // A wall-clock DEFAULT on the TARGET table would be filled
+                // per node at fire time even though the body text is clean:
+                // the body must supply those columns explicitly.
+                let cols: Vec<String> = i.columns.iter().map(obj_name).collect();
+                let positional = cols.is_empty();
+                for (col, text) in &tmeta.defaults {
+                    let Ok(e) = parse_expr_text(text) else {
+                        continue;
+                    };
+                    if expr_calls_wall_clock(&e) && (positional || !cols.iter().any(|c| c == col)) {
+                        return err(format!(
+                            "trigger body INSERT into {t} omits column {col}, whose DEFAULT is a \
+                             wall-clock call (each node would stamp its own clock); supply the \
+                             column explicitly"
+                        ));
+                    }
+                }
+                // An auto-GUID fill is a random id per node. The body must
+                // carry an explicit non-NULL value for that column.
+                if let Some(gcol) = &tmeta.autoguid {
+                    // Positional INSERT maps values onto the DECLARED column
+                    // list; an explicit list must name the column itself.
+                    let idx: Option<usize> = if positional {
+                        tmeta.columns.iter().position(|c| c == gcol)
+                    } else {
+                        cols.iter().position(|c| c == gcol)
+                    };
+                    let values: Option<&Vec<SqlExpr>> =
+                        i.source.as_ref().and_then(|q| match &*q.body {
+                            SetExpr::Values(v) => v.rows.first().map(|r| &r.content),
+                            _ => None,
+                        });
+                    let supplied: Option<&SqlExpr> = match (idx, values) {
+                        (Some(i), Some(vals)) => vals.get(i),
+                        _ => None,
+                    };
+                    let explicit = match supplied {
+                        // NULL literal still triggers the fill at fire time.
+                        Some(SqlExpr::Value(v)) => !matches!(v.value, sqlparser::ast::Value::Null),
+                        // NEW.col / OLD.col references and expressions cannot
+                        // be proven non-NULL here; the runtime NULL-fill is a
+                        // documented edge (substitute a literal to be safe).
+                        Some(_) => true,
+                        None => false,
+                    };
+                    if !explicit {
+                        return err(format!(
+                            "trigger body INSERT into {t} must supply the auto-generated GUID \
+                             column {gcol} explicitly (each node would generate a different id)"
+                        ));
+                    }
+                }
+            }
+            Statement::Update(u) => {
+                let sqlparser::ast::TableFactor::Table { name, .. } = &u.table.relation else {
+                    return err("trigger body UPDATE must target a simple table");
+                };
+                let t = obj_name(name);
+                self.validate_trigger_target(&t)?;
+                if crate::stmt::mentions_nondet_call(&stmt.to_string()) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are not allowed in trigger bodies \
+                         (each node would generate different values)",
+                    );
+                }
+                if crate::stmt::mentions_wall_clock(&stmt.to_string()) {
+                    return err(
+                        "wall-clock functions are not allowed in trigger bodies (each node would stamp its own clock)",
+                    );
+                }
+            }
+            Statement::Delete(d) => {
+                let sqlparser::ast::FromTable::WithFromKeyword(twjs) = &d.from else {
+                    return err("trigger body DELETE must target a simple table");
+                };
+                let Some(sqlparser::ast::TableFactor::Table { name, .. }) =
+                    twjs.first().map(|t| &t.relation)
+                else {
+                    return err("trigger body DELETE must target a simple table");
+                };
+                let t = obj_name(name);
+                self.validate_trigger_target(&t)?;
+                if crate::stmt::mentions_nondet_call(&stmt.to_string()) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are not allowed in trigger bodies \
+                         (each node would generate different values)",
+                    );
+                }
+                if crate::stmt::mentions_wall_clock(&stmt.to_string()) {
+                    return err(
+                        "wall-clock functions are not allowed in trigger bodies (each node would stamp its own clock)",
+                    );
+                }
+            }
+            Statement::Query(q) => return raise_action(q),
+            other => {
+                return err(format!(
+                    "unsupported trigger body statement ({other}); INSERT / UPDATE / DELETE / \
+                     SELECT RAISE(ABORT|FAIL, …) only"
+                ));
+            }
+        }
+        Ok(TriggerAction::Sql(stmt.to_string()))
+    }
+
+    fn validate_trigger_target(&self, t: &str) -> Result<()> {
+        if crate::engine::is_system_table(t) || is_internal_table(t) {
+            return err(format!(
+                "trigger bodies cannot write the internal table {t}"
+            ));
+        }
+        let Some(m) = self.tables.get(t) else {
+            return err(format!("table {t} does not exist"));
+        };
+        if m.is_view() {
+            return err(format!("trigger bodies cannot write view {t}"));
+        }
+        Ok(())
+    }
+
+    fn exec_drop_trigger(&mut self, names: &[ObjectName], if_exists: bool) -> Result<ExecOutcome> {
+        for n in names {
+            let t = obj_name(n);
+            if !self.triggers.contains_key(&t) && !if_exists {
+                return err(format!("trigger {t} does not exist"));
+            }
+        }
+        for n in names {
+            self.triggers.remove(&obj_name(n));
+        }
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
+    /// True when any trigger targets `table` — the zero-cost gate for the
+    /// statement guard on deployments without triggers.
+    fn triggers_exist_for(&self, table: &str) -> bool {
+        self.triggers.values().any(|d| d.table == table)
+    }
+
+    /// Trigger names defined on `table` (object explorer / console meta),
+    /// catalog (name) order.
+    pub fn trigger_names_of(&self, table: &str) -> Vec<String> {
+        self.triggers
+            .values()
+            .filter(|d| d.table == table)
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    /// Fire matching row triggers for one row image. `old`/`new` carry the
+    /// OLD./NEW. images (None where the event has none: INSERT has no OLD,
+    /// DELETE no NEW). `changed` names the columns an UPDATE assigns — an
+    /// UPDATE OF trigger fires only when they intersect.
+    fn fire_row_triggers(
+        &mut self,
+        table: &str,
+        before: bool,
+        ev: TriggerFireEvent<'_>,
+        old: Option<&Object>,
+        new: Option<&Object>,
+    ) -> Result<()> {
+        if self.triggers.is_empty() {
+            return Ok(());
+        }
+        let matched: Vec<TriggerDef> = self
+            .triggers
+            .values()
+            .filter(|d| {
+                d.table == table
+                    && d.before == before
+                    && match ev {
+                        TriggerFireEvent::Insert => d.insert,
+                        TriggerFireEvent::Delete => d.delete,
+                        TriggerFireEvent::Update(changed) => {
+                            d.update
+                                && match (&d.update_of, changed) {
+                                    (None, _) | (_, None) => true,
+                                    (Some(of), Some(ch)) => {
+                                        ch.iter().any(|c| of.iter().any(|o| o == c))
+                                    }
+                                }
+                        }
+                    }
+            })
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            return Ok(());
+        }
+        if self.trigger_depth >= MAX_TRIGGER_DEPTH {
+            return err(format!(
+                "trigger nesting too deep (>{MAX_TRIGGER_DEPTH}); likely an infinite trigger cycle"
+            ));
+        }
+        self.trigger_depth += 1;
+        // The triggering statement's canonical rewrite and assigned id are
+        // ITS replication state — body statements get their own (validated
+        // deterministic, so discarded) and the outer values come back.
+        let saved_resolved = self.resolved_sql.take();
+        let saved_last_id = self.last_insert_id.take();
+        let r = self.run_trigger_bodies(&matched, table, old, new);
+        self.resolved_sql = saved_resolved;
+        self.last_insert_id = saved_last_id;
+        self.trigger_depth -= 1;
+        r
+    }
+
+    fn run_trigger_bodies(
+        &mut self,
+        defs: &[TriggerDef],
+        firing_table: &str,
+        old: Option<&Object>,
+        new: Option<&Object>,
+    ) -> Result<()> {
+        for d in defs {
+            if let Some(w) = &d.when {
+                let mut e = parse_expr_text(w)?;
+                subst_new_old_expr(&mut e, old, new)?;
+                // WHEN passes only on TRUE (false and NULL skip, SQL
+                // semantics).
+                if !matches!(eval_expr(&e, &Object::new())?, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            for a in &d.body {
+                self.stmt_deadline.check()?;
+                match a {
+                    TriggerAction::Raise { msg, .. } => {
+                        return err(format!("RAISE in trigger {}: {msg}", d.name));
+                    }
+                    TriggerAction::Sql(text) => {
+                        let stmts = Parser::parse_sql(&GenericDialect {}, text)
+                            .map_err(|e| SqlError::Parse(e.to_string()))?;
+                        let Some(mut stmt) = stmts.into_iter().next() else {
+                            continue;
+                        };
+                        // MySQL's rule, for the same reason: the triggering
+                        // statement's row images are staged in ITS pager
+                        // transaction until it commits — a body write to the
+                        // same table would apply against the pre-statement
+                        // pages and be overwritten when the outer statement
+                        // commits. Reads stay legal (they see the committed
+                        // pre-statement state deterministically, origin and
+                        // replays alike).
+                        if let Some(t) = trigger_dml_target(&stmt) {
+                            if t == firing_table {
+                                return err(format!(
+                                    "cannot modify table {t} from a trigger on {t} while a \
+                                     statement on {t} is in progress (split the write onto a \
+                                     second table)"
+                                ));
+                            }
+                        }
+                        subst_new_old_stmt(&mut stmt, old, new)?;
+                        let text = stmt.to_string();
+                        if text_has_trigger_ref_outside_literals(&text) {
+                            return err(
+                                "NEW./OLD. references inside a subquery are not supported in \
+                                 trigger bodies",
+                            );
+                        }
+                        let parsed = Self::parse_classified(&text)?;
+                        self.execute_parsed(parsed)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Statement guard for DML aimed at a trigger-carrying table: the
+    /// statement and every trigger it fires commit or vanish together.
+    /// Zero cost when no trigger targets the statement's table (the guard
+    /// never opens) — trigger-less deployments keep their exact write path.
+    fn exec_stmt(&mut self, stmt: Statement) -> Result<ExecOutcome> {
+        if self.trigger_depth == 0 {
+            if let Some(t) = trigger_dml_target(&stmt) {
+                if self.triggers_exist_for(&t) {
+                    return self.run_with_trigger_guard(move |slf| slf.exec_stmt_inner(stmt));
+                }
+            }
+        }
+        self.exec_stmt_inner(stmt)
+    }
+
+    fn run_with_trigger_guard(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> Result<ExecOutcome>,
+    ) -> Result<ExecOutcome> {
+        if self.tx_snapshot.is_some() {
+            // Inside an explicit transaction the statement-local revert is a
+            // savepoint (page-undo mark + catalog snapshot): the transaction
+            // and its earlier statements stay.
+            let mark = self.pager.undo_mark();
+            self.pager.undo_savepoint()?;
+            let snap = self.catalog_snapshot();
+            let r = run(self);
+            if r.is_err() {
+                let mut undo = self.pager.take_undo_to(mark);
+                // sync_catalog=false — the journal replay already restored
+                // the catalog pages (same cheap path as ROLLBACK TO).
+                self.restore_transaction(snap, &mut undo, false)?;
+            }
+            return r;
+        }
+        // Autocommit: statement + triggers fuse into one write unit (one
+        // WAL fsync, crash loses all of them together), and any failure
+        // reverts pages (undo journal) and catalog (snapshot) exactly like
+        // a transaction ROLLBACK — a half-fired statement never survives.
+        self.pager.begin_undo();
+        let snap = self.catalog_snapshot();
+        let mut unit = self.write_unit();
+        let r = run(&mut unit);
+        match r {
+            Ok(out) => {
+                unit.end()?;
+                self.pager.end_undo();
+                Ok(out)
+            }
+            Err(e) => {
+                // Mirror ROLLBACK: void the deferred frames BEFORE writing
+                // the revert, or the revert's fence would commit the failed
+                // work on a torn crash.
+                let db: &mut Database = &mut unit;
+                db.pager.abort_deferred()?;
+                let mut undo = db.pager.take_undo();
+                db.restore_transaction(snap, &mut undo, true)?;
+                unit.end()?;
+                Err(e)
+            }
+        }
+    }
+
     fn exec_create_view(&mut self, view: sqlparser::ast::CreateView) -> Result<ExecOutcome> {
         if view.materialized {
             return err("materialized views are not supported (CREATE VIEW only)");
@@ -12172,6 +12961,12 @@ impl Database {
                 &[],
                 Some(&final_rows),
             )?;
+            // OR REPLACE displacement is a real row deletion: DELETE
+            // triggers fire for it (SQLite semantics), BEFORE before the
+            // removal lands, AFTER once the row is gone.
+            for d in &displaced_docs {
+                self.fire_row_triggers(&table, true, TriggerFireEvent::Delete, Some(d), None)?;
+            }
             let moves = heap.remove_many(&self.pager, &mut tx, &displaced)?;
             for loc in &displaced {
                 let Some((_, doc)) = before.iter().find(|(l, _)| l == loc) else {
@@ -12189,6 +12984,9 @@ impl Database {
                     *old_l,
                     *new_l,
                 )?;
+            }
+            for d in &displaced_docs {
+                self.fire_row_triggers(&table, false, TriggerFireEvent::Delete, Some(d), None)?;
             }
         }
 
@@ -12211,7 +13009,25 @@ impl Database {
         let mut ret_docs: Vec<Object> = Vec::with_capacity(new_docs.len());
         let mut du_outer = OuterFrom::new();
         du_outer.insert(table.clone());
+        // Upsert arms fire UPDATE triggers with the arm's assigned columns
+        // (UPDATE OF gating applies to them too).
+        let du_changed: Option<Vec<String>> = if do_update {
+            Some(
+                du_assignments
+                    .iter()
+                    .filter_map(|a| match &a.target {
+                        sqlparser::ast::AssignmentTarget::ColumnName(c) => Some(obj_name(c)),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
         'outer: for doc in new_docs.into_iter() {
+            // BEFORE INSERT fires before conflict resolution, per candidate
+            // row (SQLite ordering: triggers, then constraints).
+            self.fire_row_triggers(&table, true, TriggerFireEvent::Insert, None, Some(&doc))?;
             // Conflict probe shared by skip (DO NOTHING / OR IGNORE) and
             // upsert (DO UPDATE): locate the conflicting row's locator.
             // Untargeted = any unique constraint (first hit wins, PK probes
@@ -12362,6 +13178,24 @@ impl Database {
                 let collapse_key = origin_of.get(&loc).copied().unwrap_or(loc);
                 updated.push((collapse_key, existing.clone(), merged.clone()));
                 ret_docs.push(merged);
+                // An upsert that updated in place fires the UPDATE triggers
+                // (SQLite/PostgreSQL semantics), not the INSERT ones.
+                let changed = du_changed.as_deref();
+                let fired_new = ret_docs.last().expect("just pushed");
+                self.fire_row_triggers(
+                    &table,
+                    true,
+                    TriggerFireEvent::Update(changed),
+                    Some(existing),
+                    Some(fired_new),
+                )?;
+                self.fire_row_triggers(
+                    &table,
+                    false,
+                    TriggerFireEvent::Update(changed),
+                    Some(existing),
+                    Some(fired_new),
+                )?;
                 continue 'outer;
             }
             let loc = match heap.insert(&self.pager, &mut tx, &doc) {
@@ -12408,6 +13242,14 @@ impl Database {
                 ret_docs.push(doc.clone());
             }
             placed.push((loc, doc));
+            // AFTER INSERT: the row (and its tree entries) is in place.
+            self.fire_row_triggers(
+                &table,
+                false,
+                TriggerFireEvent::Insert,
+                None,
+                Some(&placed.last().expect("just pushed").1),
+            )?;
         }
         if let Some(e) = insert_failed {
             self.pager.abort_tx(tx)?;
@@ -15801,6 +16643,425 @@ fn obj_name(name: &ObjectName) -> String {
             other => other.to_string(),
         })
         .unwrap_or_default()
+}
+
+/// Which event a [`Database::fire_row_triggers`] call is firing for; the
+/// UPDATE arm carries the columns the statement assigns (UPDATE OF gating).
+enum TriggerFireEvent<'a> {
+    Insert,
+    Delete,
+    Update(Option<&'a [String]>),
+}
+
+/// Target table of a DML statement, for the trigger statement guard in
+/// [`Database::exec_stmt`]. `None` for shapes the guard does not cover
+/// (multi-table FROM lists etc. — those never had row images to fire over).
+fn trigger_dml_target(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Insert(i) => match &i.table {
+            sqlparser::ast::TableObject::TableName(n) => Some(obj_name(n)),
+            _ => None,
+        },
+        Statement::Update(u) => match &u.table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(obj_name(name)),
+            _ => None,
+        },
+        Statement::Delete(d) => match &d.from {
+            sqlparser::ast::FromTable::WithFromKeyword(twjs) => {
+                twjs.first().and_then(|t| match &t.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => Some(obj_name(name)),
+                    _ => None,
+                })
+            }
+            sqlparser::ast::FromTable::WithoutKeyword(_) => None,
+        },
+        Statement::Merge(m) => match &m.table {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(obj_name(name)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// WHEN validation: only NEW./OLD. references over literals and operators.
+/// An unqualified column would silently read NULL (schemaless semantics)
+/// and skip every firing — refuse instead.
+fn validate_trigger_when(e: &SqlExpr) -> Result<()> {
+    match e {
+        SqlExpr::Identifier(_) => err(
+            "WHEN must reference columns as NEW.col / OLD.col (an unqualified name would read NULL)",
+        ),
+        SqlExpr::CompoundIdentifier(parts) => {
+            let head = parts
+                .first()
+                .map(|p| p.value.to_ascii_uppercase())
+                .unwrap_or_default();
+            if head != "NEW" && head != "OLD" {
+                return err("WHEN must reference columns as NEW.col / OLD.col");
+            }
+            Ok(())
+        }
+        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => {
+            err("subqueries are not supported in a trigger WHEN clause")
+        }
+        SqlExpr::Nested(e) => validate_trigger_when(e),
+        SqlExpr::UnaryOp { expr, .. } => validate_trigger_when(expr),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            validate_trigger_when(left)?;
+            validate_trigger_when(right)
+        }
+        SqlExpr::Between { expr, low, high, .. } => {
+            validate_trigger_when(expr)?;
+            validate_trigger_when(low)?;
+            validate_trigger_when(high)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            validate_trigger_when(expr)?;
+            for item in list {
+                validate_trigger_when(item)?;
+            }
+            Ok(())
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            validate_trigger_when(l)?;
+            validate_trigger_when(r)
+        }
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => validate_trigger_when(e),
+        SqlExpr::Cast { expr, .. } => validate_trigger_when(expr),
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            validate_trigger_when(expr)?;
+            validate_trigger_when(pattern)
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                validate_trigger_when(o)?;
+            }
+            for w in conditions {
+                validate_trigger_when(&w.condition)?;
+                validate_trigger_when(&w.result)?;
+            }
+            if let Some(r) = else_result {
+                validate_trigger_when(r)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        validate_trigger_when(inner)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Recognize the trigger-body `SELECT RAISE(ABORT|FAIL, 'msg')` statement
+/// (SQLite spelling). Everything else in a SELECT-shaped body is refused —
+/// a bare SELECT has no effect in a trigger body and only ever meant
+/// RAISE here.
+fn raise_action(q: &sqlparser::ast::Query) -> Result<TriggerAction> {
+    if q.with.is_some() || !q.limit_clause.is_none() || !matches!(&*q.body, SetExpr::Select(_)) {
+        return err(
+            "only SELECT RAISE(ABORT|FAIL, 'msg') is supported in trigger bodies (other SELECTs have no effect)",
+        );
+    }
+    let SetExpr::Select(sel) = &*q.body else {
+        unreachable!("checked above");
+    };
+    if !sel.from.is_empty() || sel.selection.is_some() {
+        return err("RAISE must be a plain SELECT RAISE(ABORT|FAIL, 'msg') (no FROM / WHERE)");
+    }
+    if sel.projection.len() != 1 {
+        return err("RAISE takes exactly one projection");
+    }
+    let sqlparser::ast::SelectItem::UnnamedExpr(SqlExpr::Function(f)) = &sel.projection[0] else {
+        return err("only SELECT RAISE(ABORT|FAIL, 'msg') is supported in trigger bodies");
+    };
+    if !f.name.to_string().eq_ignore_ascii_case("RAISE") {
+        return err("only SELECT RAISE(ABORT|FAIL, 'msg') is supported in trigger bodies");
+    }
+    let list = match &f.args {
+        sqlparser::ast::FunctionArguments::List(l) => l,
+        _ => return err("RAISE requires (ABORT|FAIL, 'message')"),
+    };
+    if list.args.len() != 2 {
+        return err(
+            "RAISE(IGNORE)/RAISE(ROLLBACK) are not supported — use RAISE(ABORT|FAIL, 'message')",
+        );
+    }
+    let kind = match &list.args[0] {
+        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            SqlExpr::Identifier(i),
+        )) => i.value.to_ascii_uppercase(),
+        _ => {
+            return err("RAISE first argument must be ABORT or FAIL");
+        }
+    };
+    if kind != "ABORT" && kind != "FAIL" {
+        return err(format!(
+            "RAISE({kind}) is not supported (use ABORT or FAIL; DocSQL statements are \
+             atomic so both roll the statement back — IGNORE/ROLLBACK have no separate effect)"
+        ));
+    }
+    let msg = match &list.args[1] {
+        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            SqlExpr::Value(v),
+        )) => match &v.value {
+            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+            _ => return err("RAISE message must be a string literal"),
+        },
+        _ => return err("RAISE message must be a string literal"),
+    };
+    Ok(TriggerAction::Raise {
+        fail: kind == "FAIL",
+        msg,
+    })
+}
+
+/// Substitute NEW.col / OLD.col references with the row image's values
+/// (recursively through the expression shapes a trigger body uses).
+/// References to the image the event does not have (NEW on DELETE, OLD on
+/// INSERT — SQLite semantics) read NULL.
+fn subst_new_old_expr(e: &mut SqlExpr, old: Option<&Object>, new: Option<&Object>) -> Result<()> {
+    match e {
+        SqlExpr::CompoundIdentifier(parts)
+            if parts.len() >= 2
+                && matches!(parts[0].value.to_ascii_uppercase().as_str(), "NEW" | "OLD") =>
+        {
+            let head = parts[0].value.to_ascii_uppercase();
+            let leaf = parts.last().map(|p| p.value.clone()).unwrap_or_default();
+            let img = match (head.as_str(), old, new) {
+                ("NEW", _, Some(n)) => n,
+                ("OLD", Some(o), _) => o,
+                _ => {
+                    // No such image for this event: NULL, like SQLite.
+                    *e = value_to_literal(Value::Null)?;
+                    return Ok(());
+                }
+            };
+            let v = img.get(&leaf).cloned().unwrap_or(Value::Null);
+            *e = value_to_literal(v)?;
+        }
+        SqlExpr::Nested(inner) => subst_new_old_expr(inner, old, new)?,
+        SqlExpr::UnaryOp { expr, .. } => subst_new_old_expr(expr, old, new)?,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            subst_new_old_expr(left, old, new)?;
+            subst_new_old_expr(right, old, new)?;
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            subst_new_old_expr(expr, old, new)?;
+            subst_new_old_expr(low, old, new)?;
+            subst_new_old_expr(high, old, new)?;
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            subst_new_old_expr(expr, old, new)?;
+            for item in list {
+                subst_new_old_expr(item, old, new)?;
+            }
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            subst_new_old_expr(l, old, new)?;
+            subst_new_old_expr(r, old, new)?;
+        }
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => subst_new_old_expr(e, old, new)?,
+        SqlExpr::Cast { expr, .. } => subst_new_old_expr(expr, old, new)?,
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            subst_new_old_expr(expr, old, new)?;
+            subst_new_old_expr(pattern, old, new)?;
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                subst_new_old_expr(o, old, new)?;
+            }
+            for w in conditions {
+                subst_new_old_expr(&mut w.condition, old, new)?;
+                subst_new_old_expr(&mut w.result, old, new)?;
+            }
+            if let Some(r) = else_result {
+                subst_new_old_expr(r, old, new)?;
+            }
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        subst_new_old_expr(inner, old, new)?;
+                    }
+                }
+            }
+        }
+        // Subquery interiors are NOT substituted — a NEW./OLD. that
+        // survived down there is caught by the literal-skipping scan on the
+        // rendered text (loud error, never a silent NULL read).
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Apply [`subst_new_old_expr`] over a trigger body statement's expression
+/// surfaces (INSERT VALUES / upsert arm, UPDATE SET + WHERE, DELETE WHERE).
+fn subst_new_old_stmt(
+    stmt: &mut Statement,
+    old: Option<&Object>,
+    new: Option<&Object>,
+) -> Result<()> {
+    match stmt {
+        Statement::Insert(i) => {
+            if let Some(q) = &mut i.source {
+                if let SetExpr::Values(v) = &mut *q.body {
+                    for row in &mut v.rows {
+                        for e in row.content.iter_mut() {
+                            subst_new_old_expr(e, old, new)?;
+                        }
+                    }
+                }
+            }
+            if let Some(sqlparser::ast::OnInsert::OnConflict(c)) = &mut i.on {
+                if let sqlparser::ast::OnConflictAction::DoUpdate(du) = &mut c.action {
+                    for a in &mut du.assignments {
+                        subst_new_old_expr(&mut a.value, old, new)?;
+                    }
+                    if let Some(sel) = &mut du.selection {
+                        subst_new_old_expr(sel, old, new)?;
+                    }
+                }
+            }
+        }
+        Statement::Update(u) => {
+            for a in &mut u.assignments {
+                subst_new_old_expr(&mut a.value, old, new)?;
+            }
+            if let Some(s) = &mut u.selection {
+                subst_new_old_expr(s, old, new)?;
+            }
+        }
+        Statement::Delete(d) => {
+            if let Some(s) = &mut d.selection {
+                subst_new_old_expr(s, old, new)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// True when the rendered statement still carries a NEW. / OLD. reference
+/// outside a string literal — the catch-all for substitution walkers that
+/// deliberately do not descend into subqueries. Quote-aware via
+/// [`crate::stmt::sql_literal_end`] so a literal mentioning "NEW." never
+/// false-positives.
+fn text_has_trigger_ref_outside_literals(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                let (end, _) = crate::stmt::sql_literal_end(sql, i);
+                i = end;
+            }
+            b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == q {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'N' | b'n' | b'O' | b'o' => {
+                let word_start =
+                    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if !word_start
+                    && i + 4 <= bytes.len()
+                    && (sql[i..i + 3].eq_ignore_ascii_case("new")
+                        || sql[i..i + 3].eq_ignore_ascii_case("old"))
+                    && bytes[i + 3] == b'.'
+                {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Canonical CREATE TRIGGER text for a stored definition (dump/join
+/// snapshots). Body statements re-emit verbatim (they were stored from the
+/// parsed AST's own rendering), so replay parses exactly what was accepted.
+fn create_trigger_sql(d: &TriggerDef) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "CREATE TRIGGER {} {} {} ON {} ",
+        crate::stmt::sql_quote_ident(&d.name),
+        if d.before { "BEFORE" } else { "AFTER" },
+        if d.insert {
+            "INSERT".to_string()
+        } else if d.delete {
+            "DELETE".to_string()
+        } else {
+            match &d.update_of {
+                Some(cols) => format!(
+                    "UPDATE OF {}",
+                    cols.iter()
+                        .map(|c| crate::stmt::sql_quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => "UPDATE".to_string(),
+            }
+        },
+        crate::stmt::sql_quote_ident(&d.table)
+    );
+    if let Some(w) = &d.when {
+        let _ = write!(s, "WHEN {w} ");
+    }
+    s.push_str("BEGIN ");
+    for a in &d.body {
+        match a {
+            TriggerAction::Sql(text) => {
+                s.push_str(text.trim_end().trim_end_matches(';'));
+                s.push_str("; ");
+            }
+            TriggerAction::Raise { fail, msg } => {
+                let _ = write!(
+                    s,
+                    "SELECT RAISE({}, {}); ",
+                    if *fail { "FAIL" } else { "ABORT" },
+                    crate::stmt::sql_string_literal(msg)
+                );
+            }
+        }
+    }
+    s.push_str("END");
+    s
 }
 
 fn expr_name(e: &SqlExpr) -> String {
@@ -36977,5 +38238,581 @@ mod tsql_compat_tests {
             .unwrap_err()
             .to_string();
         assert!(e.to_uppercase().contains("UNIQUE"), "{e}");
+    }
+
+    // ===== Row triggers =====
+
+    fn apply_dump(script: &str) -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "BEGIN");
+        let batch = db.execute_batch(script);
+        assert!(
+            batch.error.is_none(),
+            "dump replay failed: {:?}",
+            batch.error
+        );
+        run(&mut db, "COMMIT");
+        db
+    }
+
+    #[test]
+    fn trigger_fires_after_insert_update_delete() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE audit (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER ta AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('ins ' || NEW.id); END",
+        );
+        run(
+            &mut db,
+            "CREATE TRIGGER tu AFTER UPDATE ON t FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('upd ' || OLD.v || '→' || NEW.v); END",
+        );
+        run(
+            &mut db,
+            "CREATE TRIGGER td AFTER DELETE ON t FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('del ' || OLD.id); END",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+        run(&mut db, "UPDATE t SET v = 'x' WHERE id = 1");
+        run(&mut db, "DELETE FROM t WHERE id = 2");
+        let r = rows(&mut db, "SELECT note FROM audit ORDER BY note");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("del 2".into())],
+                vec![Value::Str("ins 1".into())],
+                vec![Value::Str("ins 2".into())],
+                vec![Value::Str("upd a→x".into())],
+            ],
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_when_and_update_of_gating() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE orders (id INT, status TEXT, n INT)");
+        run(&mut db, "CREATE TABLE stats (k TEXT PRIMARY KEY, n INT)");
+        run(&mut db, "INSERT INTO stats VALUES ('done', 0)");
+        run(
+            &mut db,
+            "CREATE TRIGGER tg AFTER UPDATE OF status ON orders FOR EACH ROW \
+             WHEN (NEW.id > 1) BEGIN \
+             UPDATE stats SET n = n + 1 WHERE k = 'done'; END",
+        );
+        run(
+            &mut db,
+            "INSERT INTO orders VALUES (1, 'new', 9), (2, 'new', 0)",
+        );
+        // An UPDATE of a different column does not fire an UPDATE OF trigger.
+        run(&mut db, "UPDATE orders SET n = 9 WHERE id = 2");
+        // UPDATE OF the listed column fires per row; WHEN filters row 1 out.
+        run(
+            &mut db,
+            "UPDATE orders SET status = 'done' WHERE id IN (1, 2)",
+        );
+        let r = rows(&mut db, "SELECT n FROM stats WHERE k = 'done'");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        // The WHEN-skipped row still got its own column change.
+        let r = rows(&mut db, "SELECT status FROM orders WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Str("done".into())]], "{r:?}");
+    }
+
+    #[test]
+    fn trigger_before_raise_aborts_statement_atomically() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE guard (min INT)");
+        run(&mut db, "INSERT INTO guard VALUES (0)");
+        // BEFORE INSERT RAISE: the check runs while the old state is live.
+        run(
+            &mut db,
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW \
+             BEGIN SELECT RAISE(ABORT, 'inserts disabled'); END",
+        );
+        let e = db
+            .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("inserts disabled"), "{e}");
+        // Statement atomicity: the multi-row INSERT left NOTHING behind.
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]], "{r:?}");
+        // DROP TRIGGER removes the gate.
+        run(&mut db, "DROP TRIGGER tr");
+        run(&mut db, "INSERT INTO t VALUES (1, 'a')");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        // WHEN + RAISE: the constraint only bites negative values.
+        run(
+            &mut db,
+            "CREATE TRIGGER tn BEFORE INSERT ON t FOR EACH ROW \
+             WHEN (NEW.id < 0) BEGIN SELECT RAISE(FAIL, 'negative id'); END",
+        );
+        let e = db
+            .execute("INSERT INTO t VALUES (-5, 'bad')")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("negative id"), "{e}");
+        run(&mut db, "INSERT INTO t VALUES (5, 'ok')");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+    }
+
+    #[test]
+    fn trigger_cascades_between_tables_with_depth_budget() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE a (v INT)");
+        run(&mut db, "CREATE TABLE b (v INT)");
+        run(&mut db, "CREATE TABLE log (v TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER a2b AFTER INSERT ON a FOR EACH ROW \
+             BEGIN INSERT INTO b VALUES (NEW.v + 1); END",
+        );
+        run(
+            &mut db,
+            "CREATE TRIGGER b2a AFTER INSERT ON b FOR EACH ROW \
+             BEGIN INSERT INTO a VALUES (NEW.v + 1); END",
+        );
+        run(
+            &mut db,
+            "CREATE TRIGGER lg AFTER INSERT ON b FOR EACH ROW \
+             BEGIN INSERT INTO log VALUES ('b=' || NEW.v); END",
+        );
+        // a→b→a→b… is a cycle: the cascade must stop loudly, not hang the
+        // single writer.
+        let e = db
+            .execute("INSERT INTO a VALUES (0)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nesting too deep"), "{e}");
+        // The failed statement leaves NOTHING (guard revert).
+        let r = rows(&mut db, "SELECT COUNT(*) FROM b");
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]], "{r:?}");
+        // A bounded cascade completes: remove the cycle, keep the chain.
+        run(&mut db, "DROP TRIGGER b2a");
+        run(&mut db, "INSERT INTO a VALUES (0)");
+        let r = rows(&mut db, "SELECT v FROM b");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM log");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+    }
+
+    #[test]
+    fn trigger_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trig.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+            run(&mut db, "CREATE TABLE audit (note TEXT)");
+            run(
+                &mut db,
+                "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO audit VALUES (NEW.v); END",
+            );
+            run(&mut db, "INSERT INTO t VALUES (1, 'first')");
+        }
+        let mut db = Database::open(&path).unwrap();
+        run(&mut db, "INSERT INTO t VALUES (2, 'second')");
+        let r = rows(&mut db, "SELECT note FROM audit ORDER BY note");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("first".into())],
+                vec![Value::Str("second".into())],
+            ],
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_drop_table_drops_triggers() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT)");
+        run(&mut db, "CREATE TABLE other (id INT)");
+        run(&mut db, "CREATE TABLE audit (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('t'); END",
+        );
+        run(
+            &mut db,
+            "CREATE TRIGGER to2 AFTER INSERT ON other FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('other'); END",
+        );
+        run(&mut db, "DROP TABLE t");
+        // The surviving trigger still works…
+        run(&mut db, "INSERT INTO other VALUES (1)");
+        let r = rows(&mut db, "SELECT note FROM audit");
+        assert_eq!(r.rows, vec![vec![Value::Str("other".into())]], "{r:?}");
+        // …and the dropped table's trigger is gone: recreating the table
+        // must not resurrect it.
+        run(&mut db, "CREATE TABLE t (id INT)");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM audit");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+    }
+
+    #[test]
+    fn trigger_dump_roundtrip_does_not_refire() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE audit (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES (NEW.v); END",
+        );
+        run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+        let r = rows(&mut db, "SELECT COUNT(*) FROM audit");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+        let script = db.dump_script().unwrap();
+        // Triggers are dumped AFTER the data (pg_dump order): replaying the
+        // INSERTs with live triggers would double every effect.
+        let insert_pos = script.find("INSERT INTO \"t\"").expect("data in dump");
+        let trigger_pos = script.find("CREATE TRIGGER").expect("trigger in dump");
+        assert!(insert_pos < trigger_pos, "{script}");
+        let mut dst = apply_dump(&script);
+        // Replayed data: exactly the original rows, trigger effects included
+        // exactly once.
+        let r = rows(&mut dst, "SELECT COUNT(*) FROM t");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+        let r = rows(&mut dst, "SELECT COUNT(*) FROM audit");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+        // The trigger is live for POST-restore statements.
+        run(&mut dst, "INSERT INTO t VALUES (3, 'c')");
+        let r = rows(&mut dst, "SELECT COUNT(*) FROM audit");
+        assert_eq!(r.rows, vec![vec![Value::Int(3)]], "{r:?}");
+    }
+
+    #[test]
+    fn trigger_replication_replay_converges() {
+        // The replication model: every node replays the same statement text
+        // over the same state and fires the same triggers. Two independent
+        // databases executing the identical journal text must converge
+        // byte-for-byte.
+        let build = || -> Database {
+            let mut db = Database::in_memory().unwrap();
+            run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+            run(&mut db, "CREATE TABLE audit (id INT, v TEXT)");
+            run(
+                &mut db,
+                "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO audit VALUES (NEW.id, NEW.v); END",
+            );
+            db
+        };
+        let mut a = build();
+        let mut b = build();
+        let journal = [
+            "INSERT INTO t VALUES (1, 'x'), (2, 'y')",
+            "UPDATE t SET v = 'z' WHERE id = 1",
+            "DELETE FROM t WHERE id = 2",
+        ];
+        for sql in journal {
+            run(&mut a, sql);
+            run(&mut b, sql);
+        }
+        for q in [
+            "SELECT * FROM t ORDER BY id",
+            "SELECT * FROM audit ORDER BY id",
+        ] {
+            assert_eq!(rows(&mut a, q).rows, rows(&mut b, q).rows, "{q}");
+        }
+    }
+
+    #[test]
+    fn trigger_rejected_bodies_are_loud() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT)");
+        run(&mut db, "CREATE TABLE g (id GUID AUTOINCREMENT, v TEXT)");
+        run(
+            &mut db,
+            "CREATE TABLE w (v TEXT DEFAULT (NOW()), other TEXT)",
+        );
+        run(&mut db, "CREATE VIEW vv AS SELECT 1 AS x");
+        // Random ids diverge the cluster.
+        let e = db
+            .execute(
+                "CREATE TRIGGER bad1 AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO g (v) VALUES (NEW.id); END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("GUID"), "{e}");
+        // Explicit id is fine.
+        run(
+            &mut db,
+            "CREATE TRIGGER ok1 AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO g (id, v) VALUES (1, NEW.id); END",
+        );
+        run(&mut db, "DROP TRIGGER ok1");
+        // A NULL literal still triggers the per-node fill.
+        let e = db
+            .execute(
+                "CREATE TRIGGER bad2 AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO g (id, v) VALUES (NULL, 'x'); END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("GUID"), "{e}");
+        // Wall-clock DEFAULT on the target table fills per node — the body
+        // must not omit that column.
+        let e = db
+            .execute(
+                "CREATE TRIGGER bad3 AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO w (other) VALUES ('x'); END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("wall-clock"), "{e}");
+        // Supplying the defaulted column explicitly is fine.
+        run(
+            &mut db,
+            "CREATE TRIGGER ok3 AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO w (v, other) VALUES ('x', 'y'); END",
+        );
+        run(&mut db, "DROP TRIGGER ok3");
+        // NEWID in the body.
+        let e = db
+            .execute(
+                "CREATE TRIGGER bad4 AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO g (id, v) VALUES (NEWID(), 'x'); END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("NEWID"), "{e}");
+        // Views and internal tables are not trigger targets.
+        let e = db
+            .execute("CREATE TRIGGER bad5 AFTER INSERT ON vv FOR EACH ROW BEGIN DELETE FROM t; END")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("view"), "{e}");
+        // Statement-level triggers are not supported.
+        let e = db
+            .execute(
+                "CREATE TRIGGER bad6 AFTER INSERT ON t FOR EACH STATEMENT BEGIN DELETE FROM t; END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("row-level"), "{e}");
+        // A non-RAISE SELECT has no place in a body.
+        let e = db
+            .execute("CREATE TRIGGER bad7 AFTER INSERT ON t FOR EACH ROW BEGIN SELECT 1; END")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("RAISE"), "{e}");
+        // RAISE(IGNORE) / ROLLBACK forms are refused.
+        let e = db
+            .execute(
+                "CREATE TRIGGER bad8 AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN SELECT RAISE(IGNORE); END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ABORT|FAIL"), "{e}");
+        // Duplicate names are refused; OR REPLACE swaps the body.
+        run(
+            &mut db,
+            "CREATE TRIGGER dup AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO t VALUES (1); END",
+        );
+        let e = db
+            .execute(
+                "CREATE TRIGGER dup AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO t VALUES (2); END",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("already exists"), "{e}");
+        run(
+            &mut db,
+            "CREATE OR REPLACE TRIGGER dup AFTER DELETE ON t FOR EACH ROW \
+             BEGIN INSERT INTO t VALUES (3); END",
+        );
+        let any = db.triggers.get("dup").expect("replaced");
+        assert!(any.delete, "{any:?}");
+    }
+
+    #[test]
+    fn trigger_preserves_resolved_sql_and_last_insert_id() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE g (id GUID AUTOINCREMENT, v TEXT)");
+        run(&mut db, "CREATE TABLE audit (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER tg AFTER INSERT ON g FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('logged'); END",
+        );
+        run(&mut db, "INSERT INTO g (v) VALUES ('a')");
+        // The triggering INSERT's canonical rewrite (random GUID shipped as a
+        // literal) must survive the trigger firing untouched.
+        let resolved = db.take_resolved_sql().expect("resolved rewrite");
+        assert!(resolved.starts_with("INSERT INTO"), "{resolved}");
+        assert!(resolved.contains(", 'a')"), "{resolved}");
+        // And the replica replaying that text lands the same audit row count.
+        let mut peer = Database::in_memory().unwrap();
+        run(&mut peer, "CREATE TABLE g (id GUID AUTOINCREMENT, v TEXT)");
+        run(&mut peer, "CREATE TABLE audit (note TEXT)");
+        run(
+            &mut peer,
+            "CREATE TRIGGER tg AFTER INSERT ON g FOR EACH ROW \
+             BEGIN INSERT INTO audit VALUES ('logged'); END",
+        );
+        run(&mut peer, &resolved);
+        let r = rows(&mut peer, "SELECT COUNT(*) FROM audit");
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{r:?}");
+        let r = rows(&mut peer, "SELECT id, v FROM g");
+        assert_eq!(r.rows.len(), 1, "{r:?}");
+        // The outer statement's assigned id is reported, not the body's.
+        let _ = db.take_resolved_sql();
+    }
+
+    #[test]
+    fn trigger_explicit_tx_statement_failure_keeps_transaction() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY)");
+        run(&mut db, "CREATE TABLE log (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO log VALUES ('n' || NEW.id); END",
+        );
+        run(&mut db, "BEGIN");
+        run(&mut db, "INSERT INTO t VALUES (1)");
+        // A statement whose trigger fails rolls back ONLY that statement;
+        // the transaction and its earlier statement stay.
+        let e = db
+            .execute("INSERT INTO t VALUES (1)") // PK collision inside the tx
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("UNIQUE"), "{e}");
+        run(&mut db, "INSERT INTO t VALUES (2)");
+        run(&mut db, "COMMIT");
+        let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+            "{r:?}"
+        );
+        let r = rows(&mut db, "SELECT note FROM log ORDER BY note");
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("n1".into())], vec![Value::Str("n2".into())]],
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_upsert_arm_fires_update_triggers() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE log (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER ti AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO log VALUES ('ins'); END",
+        );
+        run(
+            &mut db,
+            "CREATE TRIGGER tu AFTER UPDATE OF v ON t FOR EACH ROW \
+             BEGIN INSERT INTO log VALUES ('upd ' || OLD.v || '→' || NEW.v); END",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES (1, 'a') \
+             ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        );
+        run(
+            &mut db,
+            "INSERT INTO t (id, v) VALUES (1, 'b') \
+             ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        );
+        let r = rows(&mut db, "SELECT note FROM log");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Value::Str("ins".into())],
+                vec![Value::Str("upd a→b".into())],
+            ],
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_replace_displacement_fires_delete_triggers() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+        run(&mut db, "CREATE TABLE log (note TEXT)");
+        run(
+            &mut db,
+            "CREATE TRIGGER td AFTER DELETE ON t FOR EACH ROW \
+             BEGIN INSERT INTO log VALUES ('del ' || OLD.id); END",
+        );
+        run(
+            &mut db,
+            "INSERT OR REPLACE INTO t (id, v) VALUES (1, 'a'), (2, 'b')",
+        );
+        run(&mut db, "INSERT OR REPLACE INTO t (id, v) VALUES (1, 'c')");
+        let r = rows(&mut db, "SELECT note FROM log");
+        assert_eq!(r.rows, vec![vec![Value::Str("del 1".into())]], "{r:?}");
+        let r = rows(&mut db, "SELECT v FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![Value::Str("c".into())]], "{r:?}");
+    }
+
+    #[test]
+    fn trigger_split_statements_keeps_bodies_intact() {
+        // execute_batch must treat the multi-statement body as ONE statement.
+        let mut db = Database::in_memory().unwrap();
+        let batch = "CREATE TABLE t (id INT); \
+                     CREATE TABLE log (note TEXT); \
+                     CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW \
+                     BEGIN INSERT INTO log VALUES ('n' || NEW.id); UPDATE log SET note = note; END; \
+                     INSERT INTO t VALUES (7)";
+        for stmt in crate::stmt::split_statements(batch).unwrap() {
+            db.execute(&stmt).unwrap();
+        }
+        let r = rows(&mut db, "SELECT note FROM log");
+        assert_eq!(r.rows, vec![vec![Value::Str("n7".into())]], "{r:?}");
+        // CASE … END inside the body must not terminate the merge early.
+        let mut db2 = Database::in_memory().unwrap();
+        let batch2 = "CREATE TABLE t (id INT, w TEXT); \
+                      CREATE TABLE mirror (id INT, w TEXT); \
+                      CREATE TRIGGER tc AFTER INSERT ON t FOR EACH ROW \
+                      BEGIN INSERT INTO mirror VALUES (NEW.id, \
+                      CASE WHEN NEW.id > 1 THEN 'big' ELSE 'small' END); END; \
+                      INSERT INTO t VALUES (5, 'x')";
+        for stmt in crate::stmt::split_statements(batch2).unwrap() {
+            db2.execute(&stmt).unwrap();
+        }
+        let r = rows(&mut db2, "SELECT w FROM mirror WHERE id = 5");
+        assert_eq!(r.rows, vec![vec![Value::Str("big".into())]], "{r:?}");
+        // A body write to the firing statement's own table is refused at
+        // fire time (MySQL semantics — the statement's row images are still
+        // staged in its own transaction).
+        run(
+            &mut db2,
+            "CREATE TRIGGER bad_same AFTER INSERT ON t FOR EACH ROW \
+             BEGIN DELETE FROM t WHERE id = NEW.id; END",
+        );
+        let e = db2
+            .execute("INSERT INTO t VALUES (6, 'y')")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("cannot modify table t from a trigger on t"),
+            "{e}"
+        );
+        // An unterminated body is a loud error, never a truncated trigger.
+        assert!(crate::stmt::split_statements(
+            "CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO log VALUES (1);"
+        )
+        .is_err());
     }
 }

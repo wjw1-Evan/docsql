@@ -112,6 +112,17 @@ pub fn build_meta(db: &Database, db_path: &Path, started: Instant, version: &str
             ),
             ("index_defs".into(), Value::Array(index_defs)),
             ("columns".into(), Value::Array(columns)),
+            // Row triggers on this table (names only; the console shows
+            // them as a read-only branch — creation/dropping stays SQL).
+            (
+                "triggers".into(),
+                Value::Array(
+                    db.trigger_names_of(&t.name)
+                        .into_iter()
+                        .map(|c| str(&c))
+                        .collect(),
+                ),
+            ),
             // Data-side schema: union of top-level field names across the
             // table's documents (what SELECT * projects). Declared columns
             // never auto-sync with schemaless writes; this is how the object

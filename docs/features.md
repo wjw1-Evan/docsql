@@ -65,11 +65,14 @@ CREATE [UNIQUE] INDEX idx ON t (a, b);                  -- 复合(键按列序)
 DROP INDEX idx;
 CREATE [OR REPLACE] VIEW v AS SELECT ...;    -- 只读命名查询;SELECT 穿透
 DROP VIEW [IF EXISTS] v [CASCADE];           -- 引用检查;CASCADE 连带删依赖视图
+CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW   -- 行级触发器:BEFORE/AFTER
+BEGIN ... END;                               -- × INSERT/UPDATE [OF cols]/DELETE
+DROP TRIGGER [IF EXISTS] tg;
 ```
 
 - 表级 `PRIMARY KEY` / `UNIQUE`(仅单列,复合请用 `CREATE UNIQUE INDEX`)/ `CHECK` / `FOREIGN KEY` 支持;`AUTOINCREMENT`/`AUTO_INCREMENT`;
 - PK 与表声明 UNIQUE 的 B+ 树**随建表自动创建**(`sqlite_autoindex_<表>_<n>`,派生展示);
-- `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;`CREATE TRIGGER`/`CREATE MATERIALIZED VIEW` 不支持(显式报错);
+- `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;`CREATE MATERIALIZED VIEW` 不支持(显式报错);
 - `CREATE TABLE ... INHERITS`/`WITHOUT ROWID` 等存储布局子句与 `DEFERRABLE`/`NULLS NOT DISTINCT`/`MATCH FULL` 等约束装饰显式报错,不静默忽略;
 - 删除基表/视图前做依赖检查(视图引用默认拒绝,`CASCADE` 连带删除);`DROP TABLE ... CASCADE` 移除引用子表的外键声明。
 
@@ -202,7 +205,38 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 - 依赖完整性:删除基表/视图默认被依赖检查拒绝,`CASCADE` 连带删除依赖视图;
 - 备份/dump/join 快照按依赖拓扑序携带视图定义。
 
-### 3.7 并发读(MVCC 快照读)
+### 3.7 触发器
+
+```sql
+CREATE TRIGGER audit_ins AFTER INSERT ON orders FOR EACH ROW
+WHEN (NEW.amount > 1000)
+BEGIN
+    INSERT INTO audit (order_id, amount) VALUES (NEW.id, NEW.amount);
+END;
+DROP TRIGGER [IF EXISTS] tg;
+```
+
+- **行级触发器**(SQLite 语法):`BEFORE`/`AFTER` × `INSERT` / `UPDATE [OF 列…]` / `DELETE`,
+  每行一次;`FOR EACH ROW` 可省略(默认即行级);
+- 体 = `BEGIN … END` 内的 `INSERT`/`UPDATE`/`DELETE` 语句序列,或
+  `SELECT RAISE(ABORT|FAIL, '消息')`(中断语句;语句原子性使两种拼写等价);
+- `NEW.col`/`OLD.col` 行像引用与 `WHEN (谓词)` 门控(谓词只含 NEW./OLD./字面量/运算符;
+  DELETE 无 NEW、INSERT 无 OLD,读作 NULL);
+- **语句级原子性**:触发语句与其触发的全部体语句同生共死——任一语句失败(含 RAISE、
+  级联深度超限)整条回滚,autocommit 与显式事务内语义一致(显式事务内只回滚本语句);
+- **同表写拒绝**(MySQL 同款规则):触发体不得修改「正在被触发语句操作的那张表」
+  (触发语句的行像仍在它自己的事务里暂存);读同表合法;
+- **级联**:体语句可触发其它表上的触发器,深度预算 16 层,超限响亮报错(防环);
+- **复制确定性红线**(建触发器时强制校验,违反即拒绝):体内不得出现
+  `NEWID()`/`RAND()`/墙钟函数;体 INSERT 的目标表若是 auto-GUID 表必须显式提供该列、
+  若有墙钟 DEFAULT 列必须显式提供该列——每个节点都会重放同一条语句并各自触发,
+  任何节点本地生成的值都会静默分叉;
+- `DROP TABLE` 连带删除其触发器;`TRUNCATE`/`MERGE` 不触发行触发器;备份/dump 在
+  **数据之后**携带触发器(pg_dump 语义:转储行已含全部触发效果,先建触发器会二次触发);
+- 已知边界:NEW 像只读(BEFORE 触发器不能改写待写入的行);体内子查询中不可引用
+  NEW./OLD.;`INSTEAD OF`/语句级/`REFERENCING`/`EXECUTE FUNCTION`/TEMP 显式报错。
+
+### 3.8 并发读(MVCC 快照读)
 
 - SELECT 在读锁微秒级建立**无锁视图**后全程锁外执行:长查询不阻塞写入,写不阻塞读;
 - 快照依赖 WAL 历史;极端写压下快照被截断时读取**响亮报** `snapshot too old`(可重试),

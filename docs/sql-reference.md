@@ -18,6 +18,7 @@ DocSQL 的 SQL 方言以 **SQL 标准**为基准,并兼容 SQLite(`sqlite_master
 - [ALTER TABLE](#alter-table)
 - [TRUNCATE TABLE / DROP TABLE](#truncate-table--drop-table)
 - [CREATE VIEW / DROP VIEW](#create-view--drop-view)
+- [CREATE TRIGGER / DROP TRIGGER](#create-trigger--drop-trigger)
 - [CREATE INDEX / DROP INDEX](#create-index--drop-index)
 - [事务语句](#事务语句)
 - [用户与角色语句](#用户与角色语句)
@@ -657,6 +658,88 @@ DROP VIEW active_users;
 ```
 
 
+## CREATE TRIGGER / DROP TRIGGER
+
+行级触发器:表上的 INSERT/UPDATE/DELETE 每影响一行,按 BEFORE/AFTER 时机执行
+`BEGIN … END` 体内的一组语句(SQLite 语法)。
+
+### 语法
+
+```sql
+CREATE [ OR REPLACE ] TRIGGER trigger_name
+    BEFORE | AFTER
+    INSERT | DELETE | UPDATE [ OF column [ , ...n ] ]
+    ON table_name
+    [ FOR EACH ROW ]
+    [ WHEN ( predicate ) ]
+BEGIN
+    body_statement ; [ body_statement ; ... ]
+END
+
+DROP TRIGGER [ IF EXISTS ] trigger_name
+```
+
+### 参数
+
+| 参数 | 说明 |
+|---|---|
+| `BEFORE` / `AFTER` | 触发时机;`INSTEAD OF` 显式报错(视图不可写) |
+| 事件 | `INSERT` / `DELETE` / `UPDATE`;`UPDATE OF 列…` 只在语句为这些列赋值时触发;`TRUNCATE` 事件显式报错 |
+| `FOR EACH ROW` | 可省略(默认即行级);`FOR EACH STATEMENT` 显式报错 |
+| `WHEN (谓词)` | 行级门控:只含 `NEW.col`/`OLD.col`、字面量与运算符;FALSE/NULL 跳过体 |
+| 体语句 | `INSERT` / `UPDATE` / `DELETE`,或 `SELECT RAISE(ABORT\|FAIL, '消息')`(中断语句) |
+
+### 备注
+
+- `NEW.col` / `OLD.col` 是行像引用:INSERT 只有 NEW、DELETE 只有 OLD、UPDATE 两者都有;
+  缺失的像读作 NULL。NEW 像只读(BEFORE 触发器不能改写待写入的行)。
+- **语句级原子性**:触发语句与其触发的全部体语句同生共死——任一体语句失败
+  (约束、RAISE、级联超限)整条语句回滚;显式事务内只回滚该语句,事务保留。
+- **同表写拒绝**:体不得修改「正在被触发语句操作的那张表」(触发语句的行像仍在
+  它自己的事务里暂存;MySQL 同款规则),读同表合法。
+- **级联**:体语句可触发其它表上的触发器,深度预算 16 层,超限响亮报错。
+- **复制确定性红线**(建触发器时校验,违反即拒绝):体内不得出现
+  `NEWID()`/`NEWSEQUENTIALID()`/`RAND()`/墙钟函数;体 INSERT 的目标表若是
+  auto-GUID 表必须显式提供该列、目标表存在墙钟 DEFAULT 的列时必须显式提供该列。
+- 体中的子查询可以出现,但子查询内部不可引用 `NEW.`/`OLD.`(触发时报错)。
+- `DROP TABLE` 连带删除该表的触发器;`TRUNCATE`/`MERGE` 不触发行触发器;
+  触发器定义随 catalog 持久化、随备份/join 快照传播(dump 在数据之后、用户之前
+  携带 CREATE TRIGGER——转储行已含全部触发效果,先建触发器会二次触发)。
+- 触发器要求 admin 角色(与其它 DDL 一致)。
+- 显式报错:TEMP / `CONSTRAINT` / `REFERENCING`(过渡表)/ `EXECUTE FUNCTION` /
+  `AS` 体 / `DEFERRABLE` 族 / 多事件 OR 组合 / `RAISE(IGNORE)` 与 `RAISE(ROLLBACK)`。
+
+### 示例
+
+```sql
+CREATE TABLE orders (id INT PRIMARY KEY, amount DECIMAL(10,2), status TEXT);
+CREATE TABLE audit (note TEXT);
+CREATE TABLE big_orders (id INT, amount DECIMAL(10,2));
+
+-- 审计 + WHEN 门控
+CREATE TRIGGER audit_upd AFTER UPDATE OF status ON orders FOR EACH ROW
+WHEN (NEW.status = 'done')
+BEGIN
+    INSERT INTO audit (note) VALUES ('order ' || NEW.id || ' done');
+END;
+
+-- 级联到另一张表
+CREATE TRIGGER flag_big AFTER INSERT ON orders FOR EACH ROW
+BEGIN
+    INSERT INTO big_orders (id, amount) VALUES (NEW.id, NEW.amount);
+END;
+
+-- RAISE 作为约束执法
+CREATE TRIGGER no_negative BEFORE UPDATE ON orders FOR EACH ROW
+WHEN (NEW.amount < 0)
+BEGIN
+    SELECT RAISE(ABORT, 'amount must be >= 0');
+END;
+
+DROP TRIGGER IF EXISTS flag_big;
+```
+
+
 ## CREATE INDEX / DROP INDEX
 
 创建/删除索引。索引名在数据库范围内唯一。
@@ -1106,7 +1189,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 | 子查询/CTE | JOIN ON/GROUP BY/HAVING 内的相关引用、`APPLY` 子查询形式(未限定名的外层引用无法与缺列区分,读 NULL——请写限定名) |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符(请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`)、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `DEFAULT VALUES`、`ON CONFLICT DO REPLACE`、无匹配唯一约束的 `ON CONFLICT` 目标;upsert-UPDATE 的 SET/WHERE 内子查询引用 `EXCLUDED`/`VALUES()` |
-| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引(JSON_EXTRACT 路径以外)、部分索引、UNIQUE JSON 路径索引、`CREATE TRIGGER`、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句(`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等)与约束装饰(`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`) |
+| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引(JSON_EXTRACT 路径以外)、部分索引、UNIQUE JSON 路径索引、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句(`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等)与约束装饰(`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`);触发器的 `TEMP`/`INSTEAD OF`/语句级/`REFERENCING`/`EXECUTE FUNCTION` 变体(基础行级触发器已支持,见上) |
 | T-SQL 专有 | `OUTPUT`(用 `RETURNING`)、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |
