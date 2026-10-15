@@ -65,6 +65,8 @@ CREATE [UNIQUE] INDEX idx ON t (a, b);                  -- 复合(键按列序)
 DROP INDEX idx;
 CREATE [OR REPLACE] VIEW v AS SELECT ...;    -- 只读命名查询;SELECT 穿透
 DROP VIEW [IF EXISTS] v [CASCADE];           -- 引用检查;CASCADE 连带删依赖视图
+CREATE MATERIALIZED VIEW mv AS SELECT ...;   -- 物化:真实存储可读可建索引
+REFRESH MATERIALIZED VIEW mv;                -- 按存储查询重算(确定性校验)
 CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW   -- 行级触发器:BEFORE/AFTER
 BEGIN ... END;                               -- × INSERT/UPDATE [OF cols]/DELETE
 DROP TRIGGER [IF EXISTS] tg;
@@ -72,7 +74,7 @@ DROP TRIGGER [IF EXISTS] tg;
 
 - 表级 `PRIMARY KEY` / `UNIQUE`(仅单列,复合请用 `CREATE UNIQUE INDEX`)/ `CHECK` / `FOREIGN KEY` 支持;`AUTOINCREMENT`/`AUTO_INCREMENT`;
 - PK 与表声明 UNIQUE 的 B+ 树**随建表自动创建**(`sqlite_autoindex_<表>_<n>`,派生展示);
-- `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;`CREATE MATERIALIZED VIEW` 不支持(显式报错);
+- `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;物化视图不可写(REFRESH 重算)、不可嵌套物化视图(显式报错);
 - `CREATE TABLE ... INHERITS`/`WITHOUT ROWID` 等存储布局子句与 `DEFERRABLE`/`NULLS NOT DISTINCT`/`MATCH FULL` 等约束装饰显式报错,不静默忽略;
 - 删除基表/视图前做依赖检查(视图引用默认拒绝,`CASCADE` 连带删除);`DROP TABLE ... CASCADE` 移除引用子表的外键声明。
 
@@ -205,7 +207,10 @@ DROP VIEW [IF EXISTS] v [CASCADE];          -- 被引用时默认拒绝,CASCADE 
 - 授权按视图名发放:读视图只需视图授权(基表权限收口),写语句经视图读源需基表授权
   (fail-closed 展开);删除视图同步清理授权记录;
 - 依赖完整性:删除基表/视图默认被依赖检查拒绝,`CASCADE` 连带删除依赖视图;
-- 备份/dump/join 快照按依赖拓扑序携带视图定义。
+- 备份/dump/join 快照按依赖拓扑序携带视图定义;
+- **物化视图**(CREATE MATERIALIZED VIEW / REFRESH):真实表存储、可读可建索引、不可写;
+  基表变化不自动传播,REFRESH 单语句原子重算;查询确定性校验(禁 NEWID/RAND/墙钟——
+  REFRESH 每节点重放);dump 在数据之后携带 CREATE,回放按恢复后基表重算(陈旧行不跨快照)。
 
 ### 3.7 触发器
 

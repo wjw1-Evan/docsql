@@ -230,6 +230,9 @@ pub struct ParsedStatement {
 pub enum AnyStmt {
     Sql(Box<Statement>),
     UserAdmin(crate::useradmin::UserAdminStmt),
+    /// REFRESH MATERIALIZED VIEW (hand-parsed: sqlparser 0.62's generic
+    /// dialect has no REFRESH statement). Carries the view name.
+    RefreshMatview(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +270,9 @@ pub struct TableInfo {
     /// uniqueness behind each name, not just the name list.
     pub index_defs: Vec<IndexInfo>,
     pub pages: usize,
+    /// Materialized view (CREATE MATERIALIZED VIEW): table reads, writes
+    /// refused, REFRESH recomputes.
+    pub matview: bool,
 }
 
 /// One CREATE INDEX definition as recorded in the catalog.
@@ -404,6 +410,14 @@ pub(crate) struct TableMeta {
     /// SELECT naming one expands to this query's rows. No storage, no
     /// indexes, no writes.
     view_sql: Option<String>,
+    /// Materialized view: the AS query text (CREATE MATERIALIZED VIEW).
+    /// Unlike `view_sql` this object HAS storage — a real table materialized
+    /// from the query at CREATE/REFRESH time, readable (and indexable) like
+    /// any table, but not writable (REFRESH MATERIALIZED VIEW recomputes
+    /// it). The stored query is determinism-validated at CREATE: REFRESH
+    /// replays it on every node, and a RAND()/wall-clock result would
+    /// silently fork the cluster.
+    matview_sql: Option<String>,
 }
 
 impl TableMeta {
@@ -411,6 +425,12 @@ impl TableMeta {
     /// stored table.
     pub(crate) fn is_view(&self) -> bool {
         self.view_sql.is_some()
+    }
+
+    /// True when this catalog entry is a materialized view: real storage,
+    /// table reads, writes refused (REFRESH recomputes it).
+    pub(crate) fn is_matview(&self) -> bool {
+        self.matview_sql.is_some()
     }
 }
 
@@ -6255,6 +6275,10 @@ impl Database {
                                 m.get("autoguid").and_then(|v| v.as_str()).map(String::from);
                             let view_sql =
                                 m.get("view_sql").and_then(|v| v.as_str()).map(String::from);
+                            let matview_sql = m
+                                .get("matview_sql")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
                             let index_defs = match m.get("index_defs") {
                                 Some(Value::Array(a)) => a
                                     .iter()
@@ -6400,6 +6424,7 @@ impl Database {
                                     autoinc,
                                     autoguid,
                                     view_sql,
+                                    matview_sql,
                                     indexes,
                                     index_defs,
                                     constraint_unique,
@@ -6697,6 +6722,9 @@ impl Database {
                             .collect(),
                     ),
                 );
+            }
+            if let Some(q) = &meta.matview_sql {
+                m.insert("matview_sql".into(), Value::Str(q.clone()));
             }
             if meta.dotted_keys {
                 m.insert("dotted_keys".into(), Value::Bool(true));
@@ -7342,6 +7370,52 @@ impl Database {
 
     /// The uncached parse behind [`Self::parse_classified`].
     fn parse_classified_uncached(sql: &str) -> Result<ParsedStatement> {
+        // REFRESH MATERIALIZED VIEW [CONCURRENTLY] name — the generic
+        // dialect has no REFRESH statement; hand-parse the fixed shape
+        // (same pattern as the user-management statements).
+        {
+            let up = sql.trim_start().to_ascii_uppercase();
+            let body = up
+                .strip_prefix("REFRESH MATERIALIZED VIEW ")
+                .or_else(|| up.strip_prefix("REFRESH MATERIALIZED VIEW	"));
+            if let Some(rest) = body {
+                let mut parts = rest.split_ascii_whitespace();
+                let mut name_part = parts.next().unwrap_or("");
+                if name_part == "CONCURRENTLY" {
+                    // PG's CONCURRENTLY needs a unique index to delta-apply;
+                    // this engine rewrites wholesale — accept and ignore.
+                    name_part = parts.next().unwrap_or("");
+                }
+                if parts.next().is_some() || name_part.is_empty() {
+                    return err("REFRESH MATERIALIZED VIEW takes exactly one view name");
+                }
+                // Recover the original spelling from the source text: the
+                // name is the last token of the statement (after the
+                // optional CONCURRENTLY).
+                let tokens: Vec<&str> = sql.trim().split_ascii_whitespace().collect();
+                let name = tokens
+                    .last()
+                    .copied()
+                    .unwrap_or("")
+                    .trim_end_matches(';')
+                    .to_string();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_alphanumeric() || c == '_' || c == '"' || c == '#')
+                        .unwrap_or(false)
+                {
+                    return err("REFRESH MATERIALIZED VIEW takes exactly one view name");
+                }
+                return Ok(ParsedStatement {
+                    stmt: AnyStmt::RefreshMatview(name),
+                    tx: TxControl::None,
+                    is_write: true,
+                    source: sql.to_string(),
+                });
+            }
+        }
         match crate::useradmin::parse(sql) {
             Some(Ok(ua)) => {
                 return Ok(ParsedStatement {
@@ -7595,6 +7669,12 @@ impl Database {
                 AnyStmt::Sql(stmt) => match stmt.as_ref() {
                     Statement::CreateTable(create) => create.query.is_none(),
                     Statement::AlterTable(_) => true,
+                    // A MATERIALIZED view stores the query text and replays
+                    // it at REFRESH: the fold would freeze one instant into
+                    // every future refresh, silently changing the semantics.
+                    // The determinism gate in exec_create_matview refuses
+                    // the raw call instead.
+                    Statement::CreateView(v) if v.materialized => true,
                     _ => false,
                 },
                 _ => false,
@@ -7669,6 +7749,7 @@ impl Database {
         match parsed.stmt {
             AnyStmt::Sql(stmt) => self.exec_stmt(*stmt),
             AnyStmt::UserAdmin(ua) => self.exec_user_admin(&ua),
+            AnyStmt::RefreshMatview(name) => self.exec_refresh_matview(&name),
         }
     }
 
@@ -7844,6 +7925,7 @@ impl Database {
                         }))
                         .collect(),
                     pages: meta.pages.len(),
+                    matview: meta.is_matview(),
                 }
             })
             .collect()
@@ -8340,9 +8422,24 @@ impl Database {
             .filter(|n| self.tables.get(*n).is_some_and(|m| m.is_view()))
             .cloned()
             .collect();
+        // Materialized views are third kind: real storage but dumped as
+        // CREATE MATERIALIZED VIEW (the replay re-runs the stored query —
+        // deterministic, validated at CREATE — so the restored content is
+        // a fresh recompute over the restored base data, never the
+        // possibly-stale origin rows).
+        let matview_names: Vec<String> = names
+            .iter()
+            .filter(|n| self.tables.get(*n).is_some_and(|m| m.is_matview()))
+            .cloned()
+            .collect();
         let table_names: Vec<String> = names
             .iter()
-            .filter(|n| !self.tables.get(*n).is_some_and(|m| m.is_view()))
+            .filter(|n| {
+                !self
+                    .tables
+                    .get(*n)
+                    .is_some_and(|m| m.is_view() || m.is_matview())
+            })
             .cloned()
             .collect();
         // CREATE order must respect FK dependencies: the engine (rightly)
@@ -8407,7 +8504,7 @@ impl Database {
         // child table's rows could replay before its parent's and fail
         // the per-row FK check.
         let mut dml = String::new();
-        for name in fk_dependency_order(&names, &self.tables) {
+        for name in fk_dependency_order(&table_names, &self.tables) {
             let docs = self.table_docs_cx(&name)?;
             // 自引用表按行级依赖序出:存储序的前向引用曾让回放必败。
             let docs = match self.tables.get(&name) {
@@ -8455,6 +8552,37 @@ impl Database {
         for d in self.triggers.values() {
             ddl.push_str(&create_trigger_sql(d));
             ddl.push_str(";\n");
+        }
+        // Materialized views after views (a matview query may read a view;
+        // the CREATE re-runs the query over the restored data — REFRESH
+        // semantics — so the possibly-stale stored rows are deliberately
+        // NOT dumped) and before users.
+        for name in &matview_names {
+            let meta = self.tables.get(name).cloned().unwrap();
+            let q = meta.matview_sql.as_deref().expect("matview has a query");
+            ddl.push_str(&format!(
+                "CREATE MATERIALIZED VIEW {} AS {q};\n",
+                quote_ident(name)
+            ));
+            for d in &meta.index_defs {
+                let col_text = d
+                    .columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ddl.push_str(&format!(
+                    "CREATE {}INDEX {} ON {} ({}){};\n",
+                    if d.unique { "UNIQUE " } else { "" },
+                    quote_ident(&d.name),
+                    quote_ident(name),
+                    col_text,
+                    d.pred
+                        .as_deref()
+                        .map(|p| format!(" WHERE {p}"))
+                        .unwrap_or_default()
+                ));
+            }
         }
         // Users/roles last of all: `GRANT … ON <object>` validates that the
         // target exists, and a grant on a VIEW must replay after that view
@@ -8787,7 +8915,9 @@ impl Database {
                         }
                     }
                 }
-                if object_type != sqlparser::ast::ObjectType::Table {
+                if object_type != sqlparser::ast::ObjectType::Table
+                    && object_type != sqlparser::ast::ObjectType::MaterializedView
+                {
                     return err("only DROP TABLE/VIEW/INDEX are supported");
                 }
                 // Mixed-kind target: DROP TABLE on a view must not silently
@@ -9071,6 +9201,12 @@ impl Database {
                     if self.tables.get(name).is_some_and(|m| m.is_view()) {
                         return err(format!(
                             "cannot TRUNCATE view {name} (it is a view, not a table)"
+                        ));
+                    }
+                    if self.tables.get(name).is_some_and(|m| m.is_matview()) {
+                        return err(format!(
+                            "cannot TRUNCATE materialized view {name} \
+                             (REFRESH MATERIALIZED VIEW {name} recomputes it)"
                         ));
                     }
                     if self.tables.contains_key(name) {
@@ -9428,6 +9564,12 @@ impl Database {
         if self.tables.get(&tname).is_some_and(|m| m.is_view()) {
             return err(format!(
                 "cannot UPDATE view {tname} (it is a view, not a table)"
+            ));
+        }
+        if self.tables.get(&tname).is_some_and(|m| m.is_matview()) {
+            return err(format!(
+                "cannot UPDATE materialized view {tname} \
+                 (REFRESH MATERIALIZED VIEW {tname} recomputes it)"
             ));
         }
         let tkey = alias
@@ -9915,6 +10057,12 @@ impl Database {
         if self.tables.get(&tname).is_some_and(|m| m.is_view()) {
             return err(format!(
                 "cannot DELETE from view {tname} (it is a view, not a table)"
+            ));
+        }
+        if self.tables.get(&tname).is_some_and(|m| m.is_matview()) {
+            return err(format!(
+                "cannot DELETE from materialized view {tname} \
+                 (REFRESH MATERIALIZED VIEW {tname} recomputes it)"
             ));
         }
         let tkey = alias
@@ -10816,6 +10964,11 @@ impl Database {
             // ALTER the replicated user tables directly, and the altered
             // schema would diverge from every peer's digest.
             return err(format!("cannot ALTER the internal table {tname}"));
+        }
+        if self.tables.get(&tname).is_some_and(|m| m.is_matview()) && !self.internal_ddl {
+            return err(format!(
+                "cannot ALTER materialized view {tname} (it is refreshed, not altered)"
+            ));
         }
         let Some(mut meta) = self.tables.get(&tname).map(|a| a.as_ref().clone()) else {
             return err(format!("table {tname} does not exist"));
@@ -12057,9 +12210,180 @@ impl Database {
         }
     }
 
+    /// CREATE MATERIALIZED VIEW: materialize the query into real storage
+    /// and record the query for REFRESH. The query must be deterministic
+    /// (no NEWID/RAND/wall-clock): REFRESH replays it on every node, and a
+    /// nondeterministic result would silently fork the cluster's derived
+    /// tables.
+    fn exec_create_matview(&mut self, view: sqlparser::ast::CreateView) -> Result<ExecOutcome> {
+        if view.secure || view.with_no_schema_binding {
+            return err("SECURE / WITH NO SCHEMA BINDING is not supported");
+        }
+        if !view.columns.is_empty() {
+            return err("CREATE MATERIALIZED VIEW column list is not supported                  (alias the SELECT outputs)");
+        }
+        let name = obj_name(&view.name);
+        if name.starts_with('#') {
+            return err("temp materialized views (#name) are not supported");
+        }
+        if crate::useradmin::is_user_table(&name) {
+            return err(format!(
+                "materialized view name {name} is reserved for the user/role subsystem"
+            ));
+        }
+        if crate::engine::is_system_table(&name) || is_internal_table(&name) {
+            return err(format!(
+                "materialized view name {name} is reserved for the engine"
+            ));
+        }
+        if is_compat_view(&name) {
+            return err(format!(
+                "materialized view name {name} is reserved for the compatibility \
+                 dictionary views"
+            ));
+        }
+        if let Some(existing) = self.tables.get(&name) {
+            if !view.or_replace {
+                if view.if_not_exists {
+                    return Ok(ExecOutcome::Affected(0));
+                }
+                return err(format!("materialized view {name} already exists"));
+            }
+            if !existing.is_matview() {
+                return err(format!(
+                    "{name} is not a materialized view; use DROP {} before \
+                     CREATE OR REPLACE MATERIALIZED VIEW",
+                    if existing.is_view() { "VIEW" } else { "TABLE" }
+                ));
+            }
+        }
+        let query = view.query.to_string();
+        // Determinism gates — REFRESH replays this text on every node over
+        // the same base data; a nondeterministic result diverges silently.
+        if crate::stmt::mentions_wall_clock(&query) {
+            return err(
+                "materialized view queries cannot call wall-clock functions \
+                 (NOW/SYSDATE/CURRENT_TIMESTAMP/GETDATE): every node would \
+                 recompute a different value at REFRESH",
+            );
+        }
+        if crate::stmt::mentions_nondet_call(&query) {
+            return err(
+                "materialized view queries cannot call NEWID()/NEWSEQUENTIALID()/RAND(): \
+                 every node would recompute a different value at REFRESH",
+            );
+        }
+        // A materialized view over another materialized view would make the
+        // dump's replay order (and every refresh cascade) a dependency
+        // puzzle; v1 refuses the nesting — query base tables (or views).
+        {
+            let objects = |n: &str| self.tables.contains_key(n);
+            let stmt = sqlparser::ast::Statement::Query(view.query.clone());
+            let Some(targets) = Database::stmt_read_targets(&stmt, &objects) else {
+                return err("materialized view queries must be plain SELECTs over base tables");
+            };
+            if let Some(mv) = targets
+                .iter()
+                .find(|t| self.tables.get(*t).is_some_and(|m| m.is_matview()))
+            {
+                return err(format!(
+                    "materialized view {name} cannot query materialized view {mv} \
+                     (refresh cascades and dump ordering are not supported)"
+                ));
+            }
+        }
+        // Materialize now (same shape CTAS produces: columns from the query
+        // outputs, schemaless rows).
+        let ExecOutcome::Rows(r) = self.exec_query_cx((*view.query).clone())? else {
+            return err("CREATE MATERIALIZED VIEW requires a SELECT");
+        };
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            if let Some(dup) = r.columns.iter().find(|c| !seen.insert((*c).clone())) {
+                return err(format!("duplicate column name: {dup}"));
+            }
+        }
+        let docs: Vec<Object> = r
+            .rows
+            .into_iter()
+            .map(|row| r.columns.iter().cloned().zip(row).collect())
+            .collect();
+        let columns = r.columns;
+        // OR REPLACE swaps the definition and the content in one statement:
+        // reuse the storage (rewrite_table frees + rebuilds), never drop and
+        // recreate (a mid-statement failure would leave nothing behind).
+        let mut meta = match self.tables.get(&name).cloned() {
+            Some(prev) if prev.is_matview() => {
+                let mut m = prev.as_ref().clone();
+                m.columns = columns;
+                m
+            }
+            Some(prev) => prev.as_ref().clone(),
+            None => TableMeta {
+                name: name.clone(),
+                columns,
+                ..Default::default()
+            },
+        };
+        meta.matview_sql = Some(query.clone());
+        self.rewrite_table(&name, &mut meta, docs)?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
+    /// REFRESH MATERIALIZED VIEW: re-execute the stored query and replace
+    /// the stored rows wholesale (one rewrite = one atomic statement). The
+    /// stored text was determinism-validated at CREATE; re-validate at
+    /// REFRESH so a pre-validation volume cannot replay a divergent query.
+    fn exec_refresh_matview(&mut self, name: &str) -> Result<ExecOutcome> {
+        let Some(meta) = self.tables.get(name).cloned() else {
+            return err(format!("materialized view {name} does not exist"));
+        };
+        if !meta.is_matview() {
+            return err(format!(
+                "{name} is not a materialized view (it is a {})",
+                if meta.is_view() { "view" } else { "table" }
+            ));
+        }
+        let query = meta.matview_sql.clone().expect("checked above");
+        if crate::stmt::mentions_wall_clock(&query) {
+            return err("materialized view query calls wall-clock functions");
+        }
+        if crate::stmt::mentions_nondet_call(&query) {
+            return err("materialized view query calls NEWID()/NEWSEQUENTIALID()/RAND()");
+        }
+        let parsed = Self::parse_classified(&query)?;
+        let AnyStmt::Sql(stmt) = parsed.stmt else {
+            return err("materialized view query must be a SELECT");
+        };
+        let Statement::Query(q) = *stmt else {
+            return err("materialized view query must be a SELECT");
+        };
+        let ExecOutcome::Rows(r) = self.exec_query_cx(*q)? else {
+            return err("materialized view query must be a SELECT");
+        };
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            if let Some(dup) = r.columns.iter().find(|c| !seen.insert((*c).clone())) {
+                return err(format!("duplicate column name: {dup}"));
+            }
+        }
+        let docs: Vec<Object> = r
+            .rows
+            .into_iter()
+            .map(|row| r.columns.iter().cloned().zip(row).collect())
+            .collect();
+        let mut meta = meta.as_ref().clone();
+        meta.columns = r.columns;
+        // One rewrite = one atomic statement: the old content and every
+        // index tree rebuild together, readers never see a half-refreshed
+        // view (MVCC snapshot reads see the pre-refresh content throughout).
+        self.rewrite_table(name, &mut meta, docs)?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
     fn exec_create_view(&mut self, view: sqlparser::ast::CreateView) -> Result<ExecOutcome> {
         if view.materialized {
-            return err("materialized views are not supported (CREATE VIEW only)");
+            return self.exec_create_matview(view);
         }
         if view.secure || view.with_no_schema_binding {
             return err("SECURE / WITH NO SCHEMA BINDING views are not supported");
@@ -17681,6 +18005,12 @@ fn ensure_not_view(kind: &str, table: &str, meta: &TableMeta) -> Result<()> {
     if meta.is_view() {
         return Err(SqlError::Message(format!(
             "cannot {kind} view {table} (it is a view, not a table)"
+        )));
+    }
+    if meta.is_matview() {
+        return Err(SqlError::Message(format!(
+            "cannot {kind} materialized view {table} (it is refreshed, not written: \
+             REFRESH MATERIALIZED VIEW {table})"
         )));
     }
     Ok(())
@@ -29435,10 +29765,11 @@ mod tests {
         // never silently accept-and-ignore).
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE t (id INT)");
-        let e = db
-            .execute("CREATE MATERIALIZED VIEW v AS SELECT * FROM t")
-            .unwrap_err();
-        assert!(e.to_string().contains("materialized"), "{e}");
+        // CREATE MATERIALIZED VIEW has since been implemented: it
+        // materializes now and refuses writes (REFRESH recomputes).
+        run(&mut db, "CREATE MATERIALIZED VIEW v AS SELECT * FROM t");
+        assert!(db.execute("INSERT INTO v VALUES (1)").is_err());
+        assert!(db.execute("REFRESH MATERIALIZED VIEW v").is_ok());
     }
 
     #[test]
@@ -32450,12 +32781,7 @@ mod tests {
         let mut db = Database::in_memory().unwrap();
         run(&mut db, "CREATE TABLE base_t (id INT PRIMARY KEY, v TEXT)");
         run(&mut db, "INSERT INTO base_t VALUES (1, 'x')");
-        // 装饰/临时/保留名/列清单逐一显式拒绝。
-        assert!(
-            db.execute("CREATE MATERIALIZED VIEW mv AS SELECT 1")
-                .is_err(),
-            "物化视图拒绝"
-        );
+        // 装饰/临时/保留名/列清单逐一显式拒绝(物化视图已升级为受支持)。
         assert!(
             db.execute("CREATE VIEW #tv AS SELECT 1").is_err(),
             "临时视图拒绝"
@@ -33308,10 +33634,7 @@ mod tx_rollback_tests {
             db.execute("PRAGMA foreign_keys = 1"),
             Ok(ExecOutcome::Affected(0))
         ));
-        // 不支持的语句(CREATE VIEW 已升级为受支持,物化视图仍拒绝)
-        assert!(db
-            .execute("CREATE MATERIALIZED VIEW v AS SELECT 1")
-            .is_err());
+        // (CREATE VIEW 与 CREATE MATERIALIZED VIEW 均已升级为受支持)
         // EXPLAIN SELECT 已升级为计划输出(只报不执行);ANALYZE 变体仍拒绝。
         assert!(matches!(
             db.execute("EXPLAIN SELECT 1"),
@@ -37854,6 +38177,257 @@ mod read_view_tests {
 
 /// End-to-end T-SQL compatibility: everything `tsql.rs` promises, driven
 /// through the public `execute` path (preprocess → parse → executor).
+#[cfg(test)]
+mod matview_tests {
+    use super::*;
+
+    fn run(db: &mut Database, sql: &str) -> ExecOutcome {
+        db.execute(sql)
+            .unwrap_or_else(|e| panic!("SQL failed: {sql}\n{e}"))
+    }
+
+    fn rows(db: &mut Database, sql: &str) -> QueryResult {
+        match run(db, sql) {
+            ExecOutcome::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn int_col(r: &QueryResult, c: usize) -> Vec<i64> {
+        r.rows
+            .iter()
+            .map(|row| match &row[c] {
+                Value::Int(i) => *i,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn seed() -> Database {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE orders (id INT PRIMARY KEY, k INT NOT NULL, status TEXT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO orders VALUES (1, 10, 'done'), (2, 20, 'open'), (3, 30, 'done')",
+        );
+        db
+    }
+
+    #[test]
+    fn matview_create_read_and_refresh_lifecycle() {
+        let mut db = seed();
+        run(
+            &mut db,
+            "CREATE MATERIALIZED VIEW done_totals AS \
+             SELECT id, k FROM orders WHERE status = 'done'",
+        );
+        let r = rows(&mut db, "SELECT id FROM done_totals ORDER BY id");
+        assert_eq!(int_col(&r, 0), vec![1, 3]);
+        // Base writes do NOT propagate: the content is frozen until REFRESH.
+        run(&mut db, "INSERT INTO orders VALUES (4, 40, 'done')");
+        let r = rows(&mut db, "SELECT id FROM done_totals ORDER BY id");
+        assert_eq!(int_col(&r, 0), vec![1, 3], "must stay stale pre-refresh");
+        run(&mut db, "REFRESH MATERIALIZED VIEW done_totals");
+        let r = rows(&mut db, "SELECT id FROM done_totals ORDER BY id");
+        assert_eq!(int_col(&r, 0), vec![1, 3, 4]);
+        // Deletes too.
+        run(&mut db, "DELETE FROM orders WHERE id = 1");
+        run(&mut db, "REFRESH MATERIALIZED VIEW done_totals");
+        let r = rows(&mut db, "SELECT id FROM done_totals ORDER BY id");
+        assert_eq!(int_col(&r, 0), vec![3, 4]);
+        // Joins/aggregates are ordinary SELECT bodies.
+        run(&mut db, "CREATE TABLE notes (oid INT, note TEXT)");
+        run(&mut db, "INSERT INTO notes VALUES (3, 'ok')");
+        run(
+            &mut db,
+            "CREATE MATERIALIZED VIEW note_view AS \
+             SELECT o.id, n.note FROM orders o JOIN notes n ON o.id = n.oid",
+        );
+        let r = rows(&mut db, "SELECT note FROM note_view WHERE id = 3");
+        assert_eq!(r.rows, vec![vec![Value::Str("ok".into())]], "{r:?}");
+    }
+
+    #[test]
+    fn matview_determinism_gates() {
+        let mut db = seed();
+        for q in [
+            "SELECT NOW() AS t FROM orders",
+            "SELECT GETDATE() AS t FROM orders",
+            "SELECT NEWID() AS g FROM orders",
+            "SELECT RAND() AS r FROM orders",
+        ] {
+            let e = db
+                .execute(&format!("CREATE MATERIALIZED VIEW bad AS {q}"))
+                .unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("deterministic") || msg.contains("NEWID") || msg.contains("wall"),
+                "{q}: {msg}"
+            );
+        }
+        // A CREATE that slipped through pre-validation cannot REFRESH either.
+        let mut db2 = Database::in_memory().unwrap();
+        {
+            let mut meta = TableMeta {
+                name: "legacy".into(),
+                columns: vec!["v".into()],
+                ..Default::default()
+            };
+            meta.matview_sql = Some("SELECT NOW() AS t".into());
+            let _ = db2.rewrite_table("legacy", &mut meta, Vec::new());
+        }
+        let e = db2.execute("REFRESH MATERIALIZED VIEW legacy").unwrap_err();
+        assert!(e.to_string().contains("wall-clock"), "{e}");
+    }
+
+    #[test]
+    fn matview_write_gates_and_drop() {
+        let mut db = seed();
+        run(
+            &mut db,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM orders WHERE k > 15",
+        );
+        for sql in [
+            "INSERT INTO mv VALUES (9, 9)",
+            "UPDATE mv SET id = 9",
+            "DELETE FROM mv",
+            "TRUNCATE TABLE mv",
+            "ALTER TABLE mv ADD COLUMN pad TEXT",
+            "ALTER TABLE mv DROP COLUMN id",
+        ] {
+            let e = db.execute(sql).unwrap_err().to_string();
+            assert!(
+                e.contains("materialized view") || e.contains("refreshed"),
+                "{sql}: {e}"
+            );
+        }
+        // Indexes are allowed (PG semantics): they probe and survive REFRESH.
+        run(&mut db, "CREATE INDEX mv_k ON mv (id)");
+        let r = rows(&mut db, "EXPLAIN SELECT id FROM mv WHERE id = 30");
+        assert!(
+            matches!(&r.rows[0][1], Value::Str(s) if s.contains("INDEX PROBE ON mv")),
+            "{r:?}"
+        );
+        run(&mut db, "INSERT INTO orders VALUES (4, 40, 'done')");
+        run(&mut db, "REFRESH MATERIALIZED VIEW mv");
+        let r = rows(&mut db, "SELECT id FROM mv WHERE id = 4");
+        assert_eq!(r.rows, vec![vec![Value::Int(4)]], "{r:?}");
+        // Wrong-kind and missing-name errors are loud.
+        run(&mut db, "CREATE TABLE plain (id INT)");
+        let e = db
+            .execute("REFRESH MATERIALIZED VIEW plain")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a materialized view"), "{e}");
+        let e = db
+            .execute("REFRESH MATERIALIZED VIEW ghost")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not exist"), "{e}");
+        // DROP MATERIALIZED VIEW removes it; reads die loudly afterwards.
+        run(&mut db, "DROP MATERIALIZED VIEW mv");
+        let e = db.execute("SELECT id FROM mv").unwrap_err().to_string();
+        assert!(e.contains("does not exist"), "{e}");
+        let e = db
+            .execute("DROP MATERIALIZED VIEW mv")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not exist"), "{e}");
+    }
+
+    #[test]
+    fn matview_or_replace_if_not_exists_and_mat_over_mat() {
+        let mut db = seed();
+        run(
+            &mut db,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM orders WHERE k > 15",
+        );
+        // IF NOT EXISTS on an existing mv is a no-op…
+        run(
+            &mut db,
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT id FROM orders",
+        );
+        let r = rows(&mut db, "SELECT COUNT(*) FROM mv");
+        assert_eq!(r.rows, vec![vec![Value::Int(2)]], "{r:?}");
+        // …OR REPLACE swaps the definition and the content.
+        run(
+            &mut db,
+            "CREATE OR REPLACE MATERIALIZED VIEW mv AS SELECT id FROM orders WHERE status = 'open'",
+        );
+        let r = rows(&mut db, "SELECT id FROM mv");
+        assert_eq!(int_col(&r, 0), vec![2]);
+        // OR REPLACE over a plain table is refused (wrong kind).
+        run(&mut db, "CREATE TABLE plain (id INT)");
+        let e = db
+            .execute("CREATE OR REPLACE MATERIALIZED VIEW plain AS SELECT 1 AS x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a materialized view"), "{e}");
+        // Mat-over-mat is refused (refresh cascades / dump order).
+        let e = db
+            .execute("CREATE MATERIALIZED VIEW mv2 AS SELECT id FROM mv")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot query materialized view"), "{e}");
+    }
+
+    #[test]
+    fn matview_dump_roundtrip_and_replication_convergence() {
+        let mut db = seed();
+        run(
+            &mut db,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id, k FROM orders WHERE status = 'done'",
+        );
+        let script = db.dump_script().unwrap();
+        assert!(script.contains("CREATE MATERIALIZED VIEW"), "{script}");
+        // The stored rows are NOT dumped (the replay recomputes them).
+        let mv_section = &script[script.find("CREATE MATERIALIZED VIEW").unwrap()..];
+        let data_section_start = script.find("INSERT INTO").unwrap();
+        assert!(
+            data_section_start < script.find("CREATE MATERIALIZED VIEW").unwrap(),
+            "matview DDL comes after data"
+        );
+        assert!(
+            !mv_section.contains("INSERT INTO"),
+            "no stored rows for the matview"
+        );
+        let mut dst = Database::in_memory().unwrap();
+        run(&mut dst, "BEGIN");
+        let batch = dst.execute_batch(&script);
+        assert!(batch.error.is_none(), "{:?}", batch.error);
+        run(&mut dst, "COMMIT");
+        let r = rows(&mut dst, "SELECT id FROM mv ORDER BY id");
+        assert_eq!(int_col(&r, 0), vec![1, 3]);
+        // The refreshed content survives the catalog (matview_sql persisted).
+        run(&mut dst, "INSERT INTO orders VALUES (4, 40, 'done')");
+        run(&mut dst, "REFRESH MATERIALIZED VIEW mv");
+        let r = rows(&mut dst, "SELECT id FROM mv ORDER BY id");
+        assert_eq!(int_col(&r, 0), vec![1, 3, 4]);
+        // Replication determinism: replaying the same journal text on two
+        // independent databases (CREATE included) converges byte-for-byte.
+        let mut a = seed();
+        let mut b = seed();
+        let journal = [
+            "CREATE MATERIALIZED VIEW mv AS SELECT id, k FROM orders WHERE status = 'done'",
+            "INSERT INTO orders VALUES (4, 40, 'done')",
+            "REFRESH MATERIALIZED VIEW mv",
+        ];
+        for sql in journal {
+            run(&mut a, sql);
+            run(&mut b, sql);
+        }
+        for q in [
+            "SELECT * FROM mv ORDER BY id",
+            "SELECT id FROM orders ORDER BY id",
+        ] {
+            assert_eq!(rows(&mut a, q).rows, rows(&mut b, q).rows, "{q}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod partial_index_tests {
     use super::*;

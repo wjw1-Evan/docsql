@@ -18,6 +18,7 @@ DocSQL 的 SQL 方言以 **SQL 标准**为基准,并兼容 SQLite(`sqlite_master
 - [ALTER TABLE](#alter-table)
 - [TRUNCATE TABLE / DROP TABLE](#truncate-table--drop-table)
 - [CREATE VIEW / DROP VIEW](#create-view--drop-view)
+- [CREATE MATERIALIZED VIEW / REFRESH](#create-materialized-view--refresh)
 - [CREATE TRIGGER / DROP TRIGGER](#create-trigger--drop-trigger)
 - [CREATE INDEX / DROP INDEX](#create-index--drop-index)
 - [事务语句](#事务语句)
@@ -658,6 +659,46 @@ DROP VIEW active_users;
 ```
 
 
+## CREATE MATERIALIZED VIEW / REFRESH
+
+把一条 SELECT 的**结果**物化为真实存储(可读、可建索引),并可随时按存储的查询重算。
+
+### 语法
+
+```sql
+CREATE [ OR REPLACE ] MATERIALIZED VIEW view_name AS SELECT ...
+REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] view_name
+DROP MATERIALIZED VIEW [ IF EXISTS ] view_name
+```
+
+### 备注
+
+- 与普通视图不同:CREATE 即物化(真实表存储),读取/索引与表一致;基表变化**不会**
+  自动传播,`REFRESH` 按存储的查询整表重算(单语句原子:旧内容与全部索引树一起重建,
+  读侧 MVCC 快照不会看到半刷新状态);
+- 物化视图不可写(INSERT/UPDATE/DELETE/TRUNCATE/ALTER 显式报错,提示 REFRESH);
+  `CREATE INDEX` 允许(PG 语义),REFRESH 后索引树重建仍然有效;
+- **确定性红线**:存储查询禁用 NEWID()/RAND()/墙钟函数——REFRESH 在每个节点重放,
+  非确定结果会静默分叉(CREATE 与 REFRESH 双重校验);物化视图不可嵌套物化视图;
+- `OR REPLACE` 单语句换定义与内容;`CONCURRENTLY` 词法接受(本引擎整表重写,无增量
+  应用);定向场景之外的授权与表一致(admin 建立与刷新);
+- dump/join 快照:物化视图以 `CREATE MATERIALIZED VIEW … AS 查询` 形式在**数据之后**
+  携带——回放按恢复后的基表数据**重算**(新鲜内容),源节点上未刷新的陈旧行不跨快照
+  传播(与 REFRESH 语义一致);
+- `CONCURRENTLY` 增量应用、物化视图嵌套物化视图:不支持(显式报错)。
+
+### 示例
+
+```sql
+CREATE MATERIALIZED VIEW done_totals AS
+    SELECT status, COUNT(*) AS n FROM orders GROUP BY status;
+SELECT * FROM done_totals;                       -- 读物化内容
+INSERT INTO orders VALUES (4, 40, 'done');       -- 基表变化不自动传播
+REFRESH MATERIALIZED VIEW done_totals;           -- 重算
+DROP MATERIALIZED VIEW done_totals;
+```
+
+
 ## CREATE TRIGGER / DROP TRIGGER
 
 行级触发器:表上的 INSERT/UPDATE/DELETE 每影响一行,按 BEFORE/AFTER 时机执行
@@ -962,7 +1003,7 @@ FROM emp;
 
 ### information_schema
 
-| 视图 | 列 |
+| 视图 | 列 ;物化视图已支持(见[CREATE MATERIALIZED VIEW / REFRESH](#create-materialized-view--refresh)) |
 |---|---|
 | `information_schema.tables` | `table_name TEXT`、`pages INT` |
 | `information_schema.columns` | `table_name`、`column_name`、`is_nullable`、`data_type`(自动 GUID 列为 `GUID`,其余为 `ANY`) |
@@ -1217,7 +1258,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 | 子查询/CTE | JOIN ON/GROUP BY/HAVING 内的相关引用、`APPLY` 子查询形式(未限定名的外层引用无法与缺列区分,读 NULL——请写限定名) |
 | 分组 | `WITH ROLLUP`/`WITH TOTALS` 等 GROUP BY 修饰符(请写 `GROUP BY ROLLUP(...)`/`CUBE(...)`)、嵌套/重复分组集合、`CUBE` 超 12 元素、不配合 GROUP BY 或聚合的 `HAVING` |
 | 事务/冲突 | `DEFAULT VALUES`、`ON CONFLICT DO REPLACE`、无匹配唯一约束的 `ON CONFLICT` 目标;upsert-UPDATE 的 SET/WHERE 内子查询引用 `EXCLUDED`/`VALUES()` |
-| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引(JSON_EXTRACT 路径以外)、UNIQUE JSON 路径索引、UNIQUE 部分索引、`CREATE MATERIALIZED VIEW`、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句(`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等)与约束装饰(`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`);触发器的 `TEMP`/`INSTEAD OF`/语句级/`REFERENCING`/`EXECUTE FUNCTION` 变体(基础行级触发器已支持,见上) |
+| DDL | 复合 `PRIMARY KEY`/`UNIQUE` 表约束、表达式索引(JSON_EXTRACT 路径以外)、UNIQUE JSON 路径索引、UNIQUE 部分索引、物化视图嵌套物化视图(`CREATE MATERIALIZED VIEW` 本身**已支持**,见上)、`ALTER TABLE` 的改约束/改类型、CREATE TABLE 存储/布局子句(`INHERITS`/`WITHOUT ROWID`/`LOCATION`/`STORED AS`/`CLUSTERED BY` 等)与约束装饰(`DEFERRABLE`/`INITIALLY DEFERRED`/`NOT ENFORCED`/`NULLS NOT DISTINCT`/`MATCH FULL/PARTIAL`);触发器的 `TEMP`/`INSTEAD OF`/语句级/`REFERENCING`/`EXECUTE FUNCTION` 变体(基础行级触发器已支持,见上) |
 | T-SQL 专有 | `OUTPUT`(用 `RETURNING`)、表提示 `WITH (...)`、旧式 `(NOLOCK)`、`#`/`##` 临时表、`IDENTITY(1,1)`、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED`、索引 `INCLUDE`/`WHERE`/`USING`/存储选项、`sys.*`/`sysobjects`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...`、`TOP ... PERCENT` |
 | 分页 | `FETCH ... PERCENT` |
 | 外键 | `ON DELETE`/`ON UPDATE` 动作 |

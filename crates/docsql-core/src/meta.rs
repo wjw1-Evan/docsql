@@ -107,6 +107,7 @@ pub fn build_meta(db: &Database, db_path: &Path, started: Instant, version: &str
             .collect();
         tables.push(Value::Object(Object::from([
             ("name".into(), str(&t.name)),
+            ("materialized".into(), Value::Bool(t.matview)),
             ("row_count".into(), int(row_count)),
             ("pages".into(), int(t.pages as u64)),
             (
