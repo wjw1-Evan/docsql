@@ -951,7 +951,7 @@ SELECT CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM t;
 
 ### 窗口函数
 
-`… OVER ([PARTITION BY …] [ORDER BY …] [frame])`。窗口在 WHERE 之后、DISTINCT/ORDER BY/LIMIT 之前求值;
+`… OVER ([PARTITION BY …] [ORDER BY …] [frame])`。窗口在 WHERE 之后、QUALIFY/DISTINCT/ORDER BY/LIMIT 之前求值;
 PARTITION BY 按 `cmp_values` 编码分组,ORDER BY 语义与外层 `ORDER BY` 一致
 (同 `NULLS` 规则、稳定序,并列行保持扫描序)。
 
@@ -996,9 +996,13 @@ FROM emp;
 ```
 
 - 窗口调用可出现在 SELECT 列表中(含包在算术/CASE 里的复合表达式);WHERE/HAVING/ORDER BY 内的窗口调用显式报错;
+- **QUALIFY**(Snowflake/DuckDB 拼写):窗口结果的行级过滤——在窗口计算之后、
+  DISTINCT/ORDER BY/LIMIT 之前求值;谓词可引用窗口调用(与 SELECT 列表中相同调用共享
+  计算列)与普通列的混合;与 GROUP BY/聚合不可混用(显式报错);无窗口调用的 QUALIFY
+  等价于一个晚执行的 WHERE;
 - 与 GROUP BY 或聚合投影**不可混用**(显式报错);DISTINCT 在窗口之后求值;
-- 不支持(显式报错):`WINDOW` 命名子句、`QUALIFY`、`IGNORE NULLS`;RANGE 帧的
-  YEAR/MONTH INTERVAL 单位与「INTERVAL 用于数值键」。
+- 不支持(显式报错):`WINDOW` 命名子句、`IGNORE NULLS`;RANGE 帧的
+  YEAR/MONTH INTERVAL 单位与「INTERVAL 用于数值键」。(`QUALIFY` 已支持,见上。)
 
 ## 系统视图与元数据
 
@@ -1252,7 +1256,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 
 | 类别 | 语法 |
 |---|---|
-| 窗口 | `WINDOW` 命名子句、`QUALIFY`、RANGE 帧的 YEAR/MONTH INTERVAL(自定义 ROWS/RANGE/GROUPS 帧与 DAY/HOUR/MINUTE/SECOND INTERVAL **已支持**,见[窗口帧](#窗口帧frame)) |
+| 窗口 | `WINDOW` 命名子句、RANGE 帧的 YEAR/MONTH INTERVAL(自定义 ROWS/RANGE/GROUPS 帧、DAY/HOUR/MINUTE/SECOND INTERVAL 与 `QUALIFY` **已支持**,见[窗口帧](#窗口帧frame)) |
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |

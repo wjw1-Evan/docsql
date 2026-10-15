@@ -137,14 +137,14 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
   聚合 OVER(默认 RANGE 帧,支持 FILTER);WHERE 后、DISTINCT/ORDER BY 前求值;
   **自定义窗口帧**:`ROWS/RANGE/GROUPS BETWEEN … AND …`(含 UNBOUNDED/n PRECEDING/
   FOLLOWING、CURRENT ROW;RANGE 值帧按单键算术偏移划界,TIMESTAMP 键按毫秒或
-  `INTERVAL 'n' DAY/HOUR/MINUTE/SECOND`,DESC 随排序方向翻转);排名/偏移函数带帧、
-  `WINDOW`/`QUALIFY` 显式报错;
+  `INTERVAL 'n' DAY/HOUR/MINUTE/SECOND`,DESC 随排序方向翻转);**QUALIFY** 行级过滤
+  窗口结果(可混引普通列,与 GROUP BY 不可混用);排名/偏移函数带帧、`WINDOW` 显式报错;
 - 派生表(子查询作 FROM)、`SELECT *, expr`、`ROWNUM`、`DUAL` 支持;
 - **NULL / 软删语义**:`x != TRUE` 命中 NULL 与缺失字段(与 Mongo `$ne: true` 的软删过滤一致);
   单列 UNIQUE 允许多个 NULL,`CREATE UNIQUE INDEX` 复合唯一任一列 NULL 的行跳过整键(不判重);
 - 相关子查询:外层引用须限定名,行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的
   WHERE 与 SET)逐行求值;JOIN ON/GROUP BY/HAVING 内相关仍显式报错(未限定外层引用与缺列不可区分,读 NULL——请写限定名);
-- 不支持(均显式报错,不静默吞掉):`WINDOW`/`QUALIFY`、RANGE 帧 YEAR/MONTH INTERVAL、`DISTINCT ON`、
+- 不支持(均显式报错,不静默吞掉):`WINDOW`、RANGE 帧 YEAR/MONTH INTERVAL、`DISTINCT ON`、
   `NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`、`TOP ... PERCENT`、
   `ON CONFLICT DO REPLACE`;

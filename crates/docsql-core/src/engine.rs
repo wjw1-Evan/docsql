@@ -2209,7 +2209,7 @@ impl<'a> ReadCx<'a> {
     fn exec_plain_select(
         &self,
         query: Query,
-        select: sqlparser::ast::Select,
+        mut select: sqlparser::ast::Select,
         rows: Vec<Object>,
         pre_windowed: bool,
     ) -> Result<ExecOutcome> {
@@ -2267,11 +2267,20 @@ impl<'a> ReadCx<'a> {
         };
 
         let mut docs = rows;
-        // SELECT-list window functions: compute over the filtered rowset
-        // (SQL window semantics — after WHERE, before DISTINCT/ORDER BY),
-        // then rewrite each call site into a reference of its private
-        // computed column so projection evaluation is plain column reads.
-        let win_calls = window_calls_of(&select.projection);
+        // SELECT-list + QUALIFY window functions: compute over the filtered
+        // rowset (SQL window semantics — after WHERE, before DISTINCT/ORDER
+        // BY/QUALIFY), then rewrite each call site into a reference of its
+        // private computed column so projection/QUALIFY evaluation is plain
+        // column reads.
+        let mut win_calls = window_calls_of(&select.projection);
+        if let Some(q) = &select.qualify {
+            for c in window_calls_of_expr(q) {
+                if !win_calls.iter().any(|w| format!("{w}") == format!("{c}")) {
+                    win_calls.push(c);
+                }
+            }
+        }
+        let mut win_tmps: Vec<String> = Vec::new();
         if !win_calls.is_empty() {
             if pre_windowed {
                 return err("internal: window function reached the pre-windowed fast path");
@@ -2286,10 +2295,30 @@ impl<'a> ReadCx<'a> {
                     collect_factor_columns(&j.relation, self.tables, &mut from_cols);
                 }
             }
-            let win_tmps = self.compute_windows(&win_calls, &mut docs, &from_cols)?;
+            win_tmps = self.compute_windows(&win_calls, &mut docs, &from_cols)?;
             for (_, e) in project.iter_mut() {
                 rewrite_windows(e, &win_calls, &win_tmps);
             }
+        }
+        // QUALIFY (SQL:1999 T618, Snowflake/DuckDB/Teradata spelling):
+        // row-local filter over the windowed rowset — after windows, before
+        // DISTINCT/ORDER BY. Identical window calls share the projection's
+        // computed columns (dedupe by rendered key). A windowless QUALIFY
+        // (plain columns only) is a late WHERE and filters the same way —
+        // dropping the filter would silently return unqualified rows.
+        if let Some(q) = &mut select.qualify {
+            rewrite_windows(q, &win_calls, &win_tmps);
+            let outer_from = {
+                let mut s = OuterFrom::new();
+                from_list_names(&select.from, &mut s);
+                s
+            };
+            docs.retain(|doc| {
+                matches!(
+                    self.eval_row_expr(q, expr_has_subquery(q), doc, &outer_from),
+                    Ok(Value::Bool(true))
+                )
+            });
         }
         let mut out: Vec<Vec<Value>> = Vec::new();
         // Correlated-subquery support: projection expressions still holding
@@ -3141,6 +3170,12 @@ impl<'a> ReadCx<'a> {
         if let Some(sel) = &mut select.selection {
             self.subst_expr_scoped(sel, &outer_from, true)?;
         }
+        // QUALIFY is a row-local post-window surface (same phase as WHERE,
+        // evaluated after window computation) — uncorrelated subqueries
+        // resolve up front like WHERE's.
+        if let Some(q) = &mut select.qualify {
+            self.subst_expr_scoped(q, &outer_from, true)?;
+        }
         // JOIN ON conditions can carry uncorrelated subqueries too
         // (`ON a.x = (SELECT MIN(y) FROM b)`); without the same substitution
         // the row-local evaluator misreports them as correlated.
@@ -3179,6 +3214,9 @@ impl<'a> ReadCx<'a> {
         }
 
         if select.from.is_empty() {
+            if select.qualify.is_some() {
+                return err("QUALIFY requires a FROM clause (it filters windowed rows)");
+            }
             // FROM-less SELECT: one row of constant expressions; WHERE
             // filters that single row.
             let mut project: Vec<(String, SqlExpr)> = Vec::new();
@@ -3266,9 +3304,17 @@ impl<'a> ReadCx<'a> {
         // them a truncated window, so they are gated off, and mixing with
         // GROUP BY/aggregates is refused up front (window-over-groups is
         // unsupported; refusals stay loud).
-        let has_window = !window_calls_of(&select.projection).is_empty();
+        let has_window = !window_calls_of(&select.projection).is_empty()
+            || select
+                .qualify
+                .as_ref()
+                .is_some_and(|q| !window_calls_of_expr(q).is_empty());
         if has_window && is_aggregate {
             return err("window functions (OVER) are not supported combined with \
+                 GROUP BY or aggregate projections");
+        }
+        if select.qualify.is_some() && is_aggregate {
+            return err("QUALIFY is not supported combined with \
                  GROUP BY or aggregate projections");
         }
 
@@ -17086,6 +17132,16 @@ fn check_window_columns(e: &SqlExpr, cols: &std::collections::HashSet<String>) -
 }
 
 /// Window functions in one SELECT's projection, first-appearance order.
+/// Window calls inside a single expression (QUALIFY predicate): same
+/// dedupe-by-rendered-key as [`window_calls_of`], so an identical call in
+/// the projection and QUALIFY shares one computed column.
+fn window_calls_of_expr(e: &SqlExpr) -> Vec<Function> {
+    let mut out: Vec<Function> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    scan_windows(e, &mut out, &mut seen);
+    out
+}
+
 fn window_calls_of(items: &[SelectItem]) -> Vec<Function> {
     let mut out: Vec<Function> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -21616,9 +21672,6 @@ fn reject_unsupported_select_clauses(select: &sqlparser::ast::Select) -> Result<
     }
     if !select.named_window.is_empty() {
         return err("WINDOW clause is not supported");
-    }
-    if select.qualify.is_some() {
-        return err("QUALIFY is not supported");
     }
     if select.value_table_mode.is_some() {
         return err("SELECT AS VALUE/STRUCT is not supported");
@@ -28597,7 +28650,6 @@ mod tests {
             ("SELECT * FROM t NATURAL JOIN t AS u", "NATURAL JOIN"),
             ("SELECT * FROM t, LATERAL (SELECT 1) AS l", "LATERAL"),
             ("SELECT v FROM t WINDOW w AS (ORDER BY v)", "WINDOW"),
-            ("SELECT v FROM t QUALIFY v = 1", "QUALIFY"),
             // Known table functions work; unknown ones still refuse.
             ("SELECT * FROM make_interval(1)", "table functions"),
             ("SELECT v FROM t GROUP BY v SETTINGS x = 1", "SETTINGS"),
@@ -35528,6 +35580,120 @@ mod window_tests {
         // k%2 over each row's frame: k=1 sees {1,0}, k=2 sees {1,0,1}, k=3 {0,1}.
         assert_eq!(int_col(&r, 1), vec![2, 2, 2]);
         assert_eq!(str_col(&r, 2), vec!["1,2", "1,2,3", "2,3"]);
+    }
+
+    #[test]
+    fn qualify_filters_window_results() {
+        let mut db = Database::in_memory().unwrap();
+        run(
+            &mut db,
+            "CREATE TABLE emp (id INT PRIMARY KEY, dept TEXT, name TEXT, salary INT)",
+        );
+        run(
+            &mut db,
+            "INSERT INTO emp VALUES (1,'a','x',30),(2,'a','y',20),(3,'a','z',10),\
+             (4,'b','p',40),(5,'b','q',50),(6,'b','r',45)",
+        );
+        // Top-1 per group: THE headline QUALIFY shape.
+        let r = rows(
+            &mut db,
+            "SELECT dept, name, salary FROM emp \
+             WHERE dept = 'b' \
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) = 1",
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                Value::Str("b".into()),
+                Value::Str("q".into()),
+                Value::Int(50)
+            ]],
+            "{r:?}"
+        );
+        // Mixed window + plain column conjunct.
+        let r = rows(
+            &mut db,
+            "SELECT name, salary FROM emp \
+             QUALIFY RANK() OVER (ORDER BY salary DESC) <= 2 AND name <> 'q' ORDER BY salary DESC",
+        );
+        // Ranks DESC: q=1, r=2, p=3 — the name filter drops q, r survives.
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Str("r".into()), Value::Int(45)]],
+            "{r:?}"
+        );
+        // LAG comparison: rows whose salary grew over the previous one.
+        run(&mut db, "CREATE TABLE m (d TIMESTAMP, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO m VALUES (TIMESTAMP '2026-01-01 00:00:00', 10), \
+             (TIMESTAMP '2026-01-01 00:01:00', 15), \
+             (TIMESTAMP '2026-01-01 00:02:00', 12), \
+             (TIMESTAMP '2026-01-01 00:03:00', 20)",
+        );
+        // Rows whose value grew over the previous one — including the first
+        // row (its LAG is NULL; the COALESCE default v-1 is always smaller).
+        // Only 12 (drop from 15) is excluded.
+        let r = rows(
+            &mut db,
+            "SELECT v FROM m QUALIFY COALESCE(LAG(v) OVER (ORDER BY d), v - 1) < v ORDER BY d",
+        );
+        assert_eq!(int_col(&r, 0), vec![10, 15, 20], "{r:?}");
+        // DISTINCT + QUALIFY interplay: qualify filters rows, DISTINCT then
+        // dedupes the surviving projections.
+        let r = rows(
+            &mut db,
+            "SELECT DISTINCT dept FROM emp QUALIFY ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) = 1",
+        );
+        let mut got: Vec<String> = str_col(&r, 0);
+        got.sort();
+        assert_eq!(got, vec!["a", "b"]);
+        // Differential: QUALIFY vs the equivalent derived-table subquery.
+        let r1 = rows(
+            &mut db,
+            "SELECT dept, name FROM emp QUALIFY ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) = 1 ORDER BY dept",
+        );
+        let r2 = rows(
+            &mut db,
+            "SELECT dept, name FROM (SELECT dept, name, \
+             ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp) x \
+             WHERE rn = 1 ORDER BY dept",
+        );
+        assert_eq!(r1.rows, r2.rows);
+    }
+
+    #[test]
+    fn qualify_gates_stay_loud() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE t (g TEXT, v INT)");
+        run(&mut db, "INSERT INTO t VALUES ('a', 1), ('b', 2)");
+        // QUALIFY + GROUP BY/aggregates (window-over-groups is unsupported;
+        // the same wall applies).
+        let e = db
+            .execute(
+                "SELECT g, COUNT(*) FROM t GROUP BY g \
+                 QUALIFY ROW_NUMBER() OVER (ORDER BY g) = 1",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("combined with"), "{e}");
+        let e = db
+            .execute("SELECT COUNT(*) FROM t QUALIFY COUNT(*) > 0")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("QUALIFY is not supported combined"), "{e}");
+        // QUALIFY without FROM cannot parse in the generic dialect (`QUALIFY`
+        // is read as a bare alias after `1`); the in-engine guard remains for
+        // dialects that do parse it — exercised nowhere else.
+        // Row-local evaluation keeps the surface honest: a subquery inside
+        // QUALIFY rides the same machinery as WHERE (uncorrelated resolved).
+        run(&mut db, "CREATE TABLE lim (n INT)");
+        run(&mut db, "INSERT INTO lim VALUES (2)");
+        let r = rows(
+            &mut db,
+            "SELECT v FROM t QUALIFY v >= (SELECT MAX(n) FROM lim) ORDER BY v",
+        );
+        assert_eq!(int_col(&r, 0), vec![2], "{r:?}");
     }
 
     #[test]
