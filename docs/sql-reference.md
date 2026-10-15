@@ -971,9 +971,10 @@ bound: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOUNDED
 - **ROWS**:按分区内的物理位置计数(`1 PRECEDING` = 上一行);边界越过分区端即空帧
   (聚合为 NULL,COUNT 0);
 - **RANGE**:值帧——按**单个** ORDER BY 键的算术偏移划界(`[k−n, k+m]`),并列行总是
-  同进同出;偏移要求非负数值常量,键须为数值或 TIMESTAMP(TIMESTAMP 键按毫秒偏移,
-  与 `TIMESTAMP ± INTEGER` 同语义);DESC 时 `PRECEDING`/`FOLLOWING` 随排序方向翻转
-  (`PRECEDING` = 排序序上更靠前 = DESC 下数值更大);NULL 键无算术,帧即其并列行;
+  同进同出;偏移要求非负数值常量或 `INTERVAL 'n' UNIT`(DAY/HOUR/MINUTE/SECOND,可
+  小数秒;仅限 TIMESTAMP 键,按毫秒换算,与 `TIMESTAMP ± INTEGER` 同语义;YEAR/MONTH
+  日历单位不支持);DESC 时 `PRECEDING`/`FOLLOWING` 随排序方向翻转(`PRECEDING` =
+  排序序上更靠前 = DESC 下数值更大);NULL 键无算术,帧即其并列行;
 - **GROUPS**:按并列组计数(`1 PRECEDING` = 前一个并列组);
 - 默认帧 = `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`(有 ORDER BY)/
   整分区(无);显式拼写等价,行为不变;
@@ -996,8 +997,8 @@ FROM emp;
 
 - 窗口调用可出现在 SELECT 列表中(含包在算术/CASE 里的复合表达式);WHERE/HAVING/ORDER BY 内的窗口调用显式报错;
 - 与 GROUP BY 或聚合投影**不可混用**(显式报错);DISTINCT 在窗口之后求值;
-- 不支持(显式报错):`WINDOW` 命名子句、`QUALIFY`、`IGNORE NULLS`、RANGE 的
-  INTERVAL 偏移。
+- 不支持(显式报错):`WINDOW` 命名子句、`QUALIFY`、`IGNORE NULLS`;RANGE 帧的
+  YEAR/MONTH INTERVAL 单位与「INTERVAL 用于数值键」。
 
 ## 系统视图与元数据
 
@@ -1251,7 +1252,7 @@ SELECT @total AS Discounted;   -- → 2(李四类 18→16 触发回滚,不计入
 
 | 类别 | 语法 |
 |---|---|
-| 窗口 | `WINDOW` 命名子句、`QUALIFY`、RANGE 帧的 INTERVAL 偏移(自定义 ROWS/RANGE/GROUPS 帧**已支持**,见[窗口帧](#窗口帧frame)) |
+| 窗口 | `WINDOW` 命名子句、`QUALIFY`、RANGE 帧的 YEAR/MONTH INTERVAL(自定义 ROWS/RANGE/GROUPS 帧与 DAY/HOUR/MINUTE/SECOND INTERVAL **已支持**,见[窗口帧](#窗口帧frame)) |
 | 查询结构 | `SELECT INTO`、`SELECT AS VALUE/STRUCT`、`SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME`、`ORDER BY COLLATE`、`SELECT t.*` |
 | 连接 | `NATURAL JOIN`、`LATERAL` 派生表、未知表函数/`UNNEST`、`TABLESAMPLE`、表时态 `AS OF`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | 锁/伪指令 | `FOR UPDATE`/`FOR SHARE`、`FOR XML`/`FOR JSON`、`SETTINGS`、`FORMAT`、pipe 操作符 |

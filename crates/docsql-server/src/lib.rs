@@ -4111,6 +4111,11 @@ fn authorize_statement(
     }
     match stmt {
         AnyStmt::UserAdmin(_) => Err("user and role management requires the admin role".into()),
+        // REFRESH rewrites a whole derived table: DDL-grade, admin only
+        // (mirrors every other CREATE/DROP/ALTER shape).
+        AnyStmt::RefreshMatview(_) => {
+            Err("materialized view refresh requires the admin role".into())
+        }
         AnyStmt::Sql(s) => {
             // Transaction control itself is not privileged; the buffered
             // statements were each authorized when they arrived.
@@ -4593,6 +4598,9 @@ async fn execute_sql_inner(
             // The user-management family IS the sanctioned path into the
             // reserved user/role tables; what the gate stops is plain DML.
             AnyStmt::UserAdmin(_) => vec![],
+            // A refresh targets a user materialized view (never a system
+            // table — CREATE refuses those names).
+            AnyStmt::RefreshMatview(_) => vec![],
         };
         // The restore path (conn None, not replication) replays dumps that
         // drop and rebuild the reserved user tables wholesale.

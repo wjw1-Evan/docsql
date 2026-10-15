@@ -17369,12 +17369,21 @@ enum FrameRowBound {
     UnboundedFollowing,
 }
 
+/// One RANGE offset: the constant value plus whether the source spelling
+/// was `INTERVAL 'n' UNIT` — an interval offset shifts only a TIMESTAMP
+/// key (by the converted milliseconds), never a numeric one.
+#[derive(Clone, Debug)]
+struct FrameRangeOffset {
+    off: Value,
+    interval: bool,
+}
+
 #[derive(Clone, Debug)]
 enum FrameValueBound {
     Unbounded,
-    Preceding(Value),
+    Preceding(FrameRangeOffset),
     CurrentRow,
-    Following(Value),
+    Following(FrameRangeOffset),
     UnboundedFollowing,
 }
 
@@ -17474,10 +17483,10 @@ fn parse_window_frame(
             // the reverse frames nothing and the standard refuses it).
             let misplaced = match (&start, &end) {
                 (FrameValueBound::Preceding(a), FrameValueBound::Preceding(b)) => {
-                    Value::cmp_values(a, b) == Ordering::Less
+                    Value::cmp_values(&a.off, &b.off) == Ordering::Less
                 }
                 (FrameValueBound::Following(a), FrameValueBound::Following(b)) => {
-                    Value::cmp_values(a, b) == Ordering::Greater
+                    Value::cmp_values(&a.off, &b.off) == Ordering::Greater
                 }
                 _ => false,
             };
@@ -17518,18 +17527,56 @@ fn row_offset(e: &SqlExpr) -> Result<u64> {
 /// RANGE offsets: non-negative numeric constants (Int/Float/Decimal).
 /// INTERVAL spellings are rejected — TIMESTAMP keys shift by integer
 /// milliseconds, mirroring the engine's TIMESTAMP ± INTEGER arithmetic.
-fn range_offset(e: &SqlExpr) -> Result<Value> {
-    if matches!(e, SqlExpr::Interval(_)) {
-        return err(
-            "INTERVAL frame offsets are not supported (TIMESTAMP keys take an integer              millisecond offset: RANGE BETWEEN 60000 PRECEDING AND CURRENT ROW)",
-        );
+fn range_offset(e: &SqlExpr) -> Result<FrameRangeOffset> {
+    if let SqlExpr::Interval(iv) = e {
+        let unit = match iv.leading_field {
+            Some(sqlparser::ast::DateTimeField::Day) => 86_400_000i64,
+            Some(sqlparser::ast::DateTimeField::Hour) => 3_600_000,
+            Some(sqlparser::ast::DateTimeField::Minute) => 60_000,
+            Some(sqlparser::ast::DateTimeField::Second) => 1_000,
+            _ => {
+                return err(
+                    "INTERVAL frame offsets support DAY/HOUR/MINUTE/SECOND only \
+                     (YEAR/MONTH calendar arithmetic is not supported)",
+                );
+            }
+        };
+        if iv.last_field.is_some() || iv.leading_field.is_none() {
+            return err(
+                "INTERVAL frame offsets take a single unit: INTERVAL 'n' DAY/HOUR/MINUTE/SECOND",
+            );
+        }
+        let SqlExpr::Value(v) = iv.value.as_ref() else {
+            return err("INTERVAL frame offset value must be a string literal");
+        };
+        let sqlparser::ast::Value::SingleQuotedString(text) = &v.value else {
+            return err("INTERVAL frame offset value must be a string literal");
+        };
+        let secs: f64 = text
+            .trim()
+            .parse()
+            .map_err(|_| SqlError::Message(format!("invalid INTERVAL value '{text}'")))?;
+        if !secs.is_finite() || secs < 0.0 {
+            return err("INTERVAL frame offsets must be non-negative");
+        }
+        let ms = (secs * unit as f64) as i64;
+        if ms == 0 && secs > 0.0 {
+            return err("INTERVAL frame offset is smaller than one millisecond");
+        }
+        return Ok(FrameRangeOffset {
+            off: Value::Int(ms),
+            interval: true,
+        });
     }
     match eval_const(e)? {
         v @ (Value::Int(_) | Value::Float(_) | Value::Decimal(_)) => {
             if Value::cmp_values(&v, &Value::Int(0)) == Ordering::Less {
                 return err("RANGE frame offsets must be non-negative");
             }
-            Ok(v)
+            Ok(FrameRangeOffset {
+                off: v,
+                interval: false,
+            })
         }
         other => err(format!(
             "RANGE frame offsets must be numeric constants, got {}",
@@ -17552,7 +17599,17 @@ fn frame_offset_f64(off: &Value) -> Result<f64> {
 /// with the 0001..=9999 domain). `None` = the endpoint fell outside the
 /// value domain (Int/Timestamp overflow) — the interval is unbounded on
 /// that side, never a silent truncation.
-fn shift_range_key(key: &Value, off: &Value, up: bool) -> Result<Option<Value>> {
+fn shift_range_key(key: &Value, off: &FrameRangeOffset, up: bool) -> Result<Option<Value>> {
+    // An INTERVAL spelling shifts only a TIMESTAMP key: DAY/HOUR/… are time
+    // units, and applying them to a number would silently reinterpret them.
+    if off.interval && !matches!(key, Value::Timestamp(_) | Value::Null) {
+        return err("INTERVAL frame offsets require a TIMESTAMP ORDER BY key \
+             (numeric keys take a plain constant offset)");
+    }
+    shift_range_key_value(key, &off.off, up)
+}
+
+fn shift_range_key_value(key: &Value, off: &Value, up: bool) -> Result<Option<Value>> {
     match (key, off) {
         (Value::Null, _) => Ok(None),
         (Value::Int(k), Value::Int(o)) => {
@@ -35471,6 +35528,82 @@ mod window_tests {
         // k%2 over each row's frame: k=1 sees {1,0}, k=2 sees {1,0,1}, k=3 {0,1}.
         assert_eq!(int_col(&r, 1), vec![2, 2, 2]);
         assert_eq!(str_col(&r, 2), vec!["1,2", "1,2,3", "2,3"]);
+    }
+
+    #[test]
+    fn frame_range_interval_offsets_day_time_units() {
+        let mut db = Database::in_memory().unwrap();
+        run(&mut db, "CREATE TABLE ev (ts TIMESTAMP, v INT)");
+        run(
+            &mut db,
+            "INSERT INTO ev VALUES \
+             (TIMESTAMP '2026-01-01 00:00:00', 1), \
+             (TIMESTAMP '2026-01-01 00:00:30', 2), \
+             (TIMESTAMP '2026-01-01 00:01:00', 4), \
+             (TIMESTAMP '2026-01-01 00:06:00', 8), \
+             (TIMESTAMP '2026-01-02 00:00:00', 16)",
+        );
+        // INTERVAL '90' SECOND ≡ 90000 ms: each row sums its own window.
+        run(&mut db, "CREATE MATERIALIZED VIEW noop AS SELECT 1 AS x");
+        let _ = db.execute("DROP MATERIALIZED VIEW noop");
+        let r = rows(
+            &mut db,
+            "SELECT v, SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '90' SECOND PRECEDING \
+             AND CURRENT ROW) s FROM ev ORDER BY ts",
+        );
+        assert_eq!(int_col(&r, 0), vec![1, 2, 4, 8, 16]);
+        assert_eq!(int_col(&r, 1), vec![1, 3, 7, 8, 16], "{r:?}");
+        // DAY unit across the midnight boundary.
+        let r = rows(
+            &mut db,
+            "SELECT v, SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '1' DAY PRECEDING \
+             AND CURRENT ROW) s FROM ev ORDER BY ts",
+        );
+        assert_eq!(int_col(&r, 1), vec![1, 3, 7, 15, 31]);
+        // MINUTE unit, FOLLOWING side.
+        let r = rows(
+            &mut db,
+            "SELECT v, SUM(v) OVER (ORDER BY ts RANGE BETWEEN CURRENT ROW \
+             AND INTERVAL '1' MINUTE FOLLOWING) s FROM ev ORDER BY ts",
+        );
+        // 00:01's +1-minute window ends 00:02 — before the 00:06 row.
+        assert_eq!(int_col(&r, 1), vec![7, 6, 4, 8, 16]);
+        // Fractional seconds (0.5s = 500ms).
+        let r = rows(
+            &mut db,
+            "SELECT v, COUNT(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '0.5' SECOND PRECEDING \
+             AND CURRENT ROW) c FROM ev ORDER BY ts",
+        );
+        assert_eq!(int_col(&r, 1), vec![1, 1, 1, 1, 1]);
+        // INTERVAL against a numeric key is a type error.
+        run(&mut db, "CREATE TABLE n (k INT, v INT)");
+        run(&mut db, "INSERT INTO n VALUES (1, 1), (2, 2)");
+        let e = db
+            .execute(
+                "SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN INTERVAL '1' DAY PRECEDING \
+                 AND CURRENT ROW) FROM n",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("TIMESTAMP ORDER BY key"), "{e}");
+        // YEAR/MONTH calendar units refused.
+        let e = db
+            .execute(
+                "SELECT SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '1' MONTH PRECEDING \
+                 AND CURRENT ROW) FROM ev",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("DAY/HOUR/MINUTE/SECOND"), "{e}");
+        // Sub-millisecond interval refused.
+        let e = db
+            .execute(
+                "SELECT SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '0.0001' SECOND PRECEDING \
+                 AND CURRENT ROW) FROM ev",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("smaller than one millisecond"), "{e}");
     }
 
     #[test]
