@@ -101,7 +101,7 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 - 小步提交直接在 `main`;提交信息风格见 git log(如 `M16: ...`),里程碑式概括。
 - 完整流程:过提交门禁 → 相关专项测试 → **最后一步提交并推送源码**(push 即触发 CI:门禁 + dotnet 测试 → 多架构镜像发布 GHCR → main 分支部署测试)。
 - 改动跨复制:本地 e2e 之外必须跑 `./deploy/run-tests.sh`;改动 EF/事务:跑两个 dotnet 套件。
-- 文档分工(内容写对地方,别让同一主题散落两处):入门/快速开始/能力概览 → README;完整功能清单/索引入口 → `docs/features.md`;SQL 语法与函数 → `docs/sql-reference.md`;.NET/CLI/线协议 → `docs/drivers.md`;Aspire 使用手册 → `docs/aspire.md`;部署运维/环境变量/监控 → `docs/operations.md`;安全(含等保对照)→ `docs/security.md`;架构边界与路线 → `docs/limitations.md`;存储/引擎设计文档 → `docs/design/`;开发命令、机制约束与红线 → 本文。
+- 文档分工(内容写对地方,别让同一主题散落两处):入门/快速开始/能力概览 → README;完整功能清单/索引入口 → `docs/features.md`;SQL 语法与函数 → `docs/sql-reference.md`;.NET/CLI/线协议 → `docs/drivers.md`;Aspire 使用手册 → `docs/aspire.md`;部署运维/环境变量/监控 → `docs/operations.md`;安全(含等保对照)→ `docs/security.md`;架构边界与路线 → `docs/limitations.md`;性能基线与容量解读 → `docs/performance.md`;存储/引擎设计文档 → `docs/design/`;开发命令、机制约束与红线 → 本文。
 
 ## 运行时环境变量(开发/测试相关)
 

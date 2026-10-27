@@ -88,7 +88,7 @@ GRANT reporting TO analyst;
 
 ## 性能
 
-主键/UNIQUE/`CREATE INDEX` 列均有 B+ 树支撑(点查/范围 O(log n));`ORDER BY <索引键> + LIMIT` 走索引序窗口,无索引排序走 top-K 堆,`COUNT(*)` 免解码。写入吞吐受每语句一次 fsync 支配(可选 `DOCSQL_ASYNC_COMMIT=1` 组提交)。基准脚本见 `crates/docsql-core/examples/bench*.rs`。
+主键/UNIQUE/`CREATE INDEX` 列均有 B+ 树支撑(点查/范围 O(log n));`ORDER BY <索引键> + LIMIT` 走索引序窗口,无索引排序走 top-K 堆,`COUNT(*)` 免解码。写入吞吐受每语句一次 fsync 支配(可选 `DOCSQL_ASYNC_COMMIT=1` 组提交)。实测基线(2026-10-27,8 核 macOS/APFS):主键点查约 12 µs、单事务批量写约 47 µs/行、逐条 fsync 约 1,000–1,400 行/秒、异步组提交约 2 万行/秒;完整环境、分页/探针/JOIN/DELETE 数据与容量解读见[性能基准与容量参考](docs/performance.md),基准脚本见 `crates/docsql-core/examples/bench*.rs`。
 
 ## 已知边界
 

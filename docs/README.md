@@ -10,6 +10,7 @@
 | 认识 DocSQL、跑起来 | [README · 快速开始](../README.md#快速开始) |
 | 了解数据库全部能力 | [功能总览](features.md) |
 | 查 SQL 语法、函数、不支持项 | [SQL 参考](sql-reference.md) |
+| 评估写入/查询吞吐与容量 | [性能基准](performance.md) |
 | 用 Aspire 编排(单节点/集群/控制台) | [Aspire 集成指南](aspire.md) |
 | 用 .NET ADO.NET / EF Core / CLI / 自研驱动 | [客户端与驱动](drivers.md) |
 | 部署、扩容、备份恢复、环境变量、监控 | [运维手册](operations.md) |
@@ -32,6 +33,7 @@
 | 文档 | 内容 |
 |---|---|
 | [SQL 参考](sql-reference.md) | DDL/DML/查询语法、函数清单(JSON 函数族)、事务与约束、不支持面 |
+| [性能基准](performance.md) | 单节点嵌入引擎实测基线、测试环境与方法、分页/探针/JOIN/DELETE 数据与容量解读 |
 | [客户端与驱动](drivers.md) | ADO.NET / EF Core / Aspire 包安装与用法、CLI、线协议(驱动作者) |
 
 **运维与安全**
