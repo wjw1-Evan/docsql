@@ -1478,3 +1478,625 @@ pub(super) fn reindex_insert(
     }
     Ok(())
 }
+
+impl<'a> ReadCx<'a> {
+    pub(super) fn index_probe(
+        &self,
+        table: &str,
+        alias: Option<&str>,
+        selection: &Option<SqlExpr>,
+        ctes: &Ctes,
+    ) -> Result<Option<Vec<(u64, Object)>>> {
+        let Some(cond) = selection else {
+            return Ok(None);
+        };
+        let Some(meta) = self.tables.get(table) else {
+            return Ok(None);
+        };
+        if meta.index_roots.is_empty() || !ctes.is_empty() {
+            return Ok(None);
+        }
+        let Some((col, plan, _)) = probe_plan(cond, meta, table, alias) else {
+            return Ok(None);
+        };
+        let root = meta.index_roots[&col];
+        let heap = meta.heap_of();
+        let tx = self.pager.begin_tx(); // read-only handle: nothing staged, dropping it is the cleanup
+        let tree = BTree::open(root);
+        let pairs = match self.probe_pairs(&col, &tree, &tx, &plan, None)? {
+            Some(pairs) => pairs,
+            // 混合带不可安全探测:回退通用扫描,结果不能依赖索引存在性。
+            None => return Ok(None),
+        };
+        // Read-only tx: no staged pages, dropping it is the cleanup.
+        drop(tx);
+        let mut out: Vec<(u64, Object)> = Vec::with_capacity(pairs.len());
+        for (_, loc) in pairs {
+            if let Some(doc) = heap.doc_at(&self.reader(), loc)? {
+                out.push((loc, doc));
+            }
+        }
+        // Heap order (page, slot) — loc packing already sorts that way.
+        out.sort_by_key(|(loc, _)| *loc);
+        Ok(Some(out))
+    }
+
+    /// Promote a probe plan's string bounds into the tree's key band: a
+    /// parseable timestamp string against a TIMESTAMP-keyed tree must
+    /// compare chronologically — the raw cmp_values band ranks Str above
+    /// every Timestamp, which would silently turn `WHERE ts > '2026-…'`
+    /// into an empty result. Sampling min+max keys decides the band (two
+    /// leaf reads). Returns `None` when the band is NOT safely probeable:
+    ///
+    /// * a MIXED band (extremes disagree — Timestamps and Strs coexist in
+    ///   the tree): keeping the string literal probes only the Str band and
+    ///   silently loses every Timestamp row, while promoting it pulls the
+    ///   whole Str band into the range — either way the result set depends
+    ///   on whether the index exists. The generic scan path (cmp_coerced)
+    ///   is the only correct answer, so callers fall back to it.
+    /// * an Eq/Prefix composite bound whose element beyond position 0 would
+    ///   be promoted: element purity is only provable at position 0 (the
+    ///   primary sort key); a middle key holding the literal STRING at that
+    ///   position would be missed by the promoted seek.
+    ///
+    /// The bool flag reports whether any bound was actually lifted; callers
+    /// owning an "exact" plan must demote exactness then (promoted bounds
+    /// admit candidates the coercing predicate would exclude).
+    pub(super) fn promote_plan_bounds(
+        &self,
+        tree: &BTree,
+        tx: &crate::pager::Tx,
+        plan: &ProbePlan,
+    ) -> Result<Option<(ProbePlan, bool)>> {
+        // ANY string bound (parseable or not) enters the band analysis: an
+        // unparseable one used to short-circuit the pre-check as "cannot
+        // promote", leaving an exact plan whose raw `k < Str` filter passes
+        // EVERY Timestamp key (Timestamps rank below Strs) — the coercing
+        // predicate evaluates such a comparison as NULL/unknown and excludes
+        // the row, so the window silently returned rows WHERE should have
+        // dropped. Whether the string can actually lift is decided per band
+        // below.
+        let is_str = |v: &Value| -> bool { matches!(v, Value::Str(_)) };
+        fn bound_elements(v: &Value) -> Option<&[Value]> {
+            match v {
+                Value::Array(items) if !items.is_empty() => Some(items),
+                _ => None,
+            }
+        }
+        // Cheap pre-check: no string bound anywhere (scalar or in a
+        // composite Array) → the plan is untouched and the two leaf reads
+        // are not paid.
+        let has_str_bound =
+            match plan {
+                ProbePlan::Eq(v) | ProbePlan::Prefix(v) => {
+                    is_str(v) || bound_elements(v).is_some_and(|items| items.iter().any(is_str))
+                }
+                ProbePlan::In(vals) => vals.iter().any(is_str),
+                ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|(v, _)| {
+                        is_str(v) || bound_elements(v).is_some_and(|items| items.iter().any(is_str))
+                    }),
+            };
+        // A TIMESTAMP-typed bound (TIMESTAMP '…' literal / CAST fold) needs
+        // the same band check from the other side: the coercing predicate
+        // (cmp_coerced) lifts Str KEYS to Timestamps, so a raw-band probe
+        // against a Str or mixed band silently loses rows (Eq probes match
+        // nothing — Timestamps rank below every Str; exact windows return
+        // the whole Str band). Only a pure-Timestamp band keeps the probe.
+        let ts_positions = |v: &Value| -> Vec<usize> {
+            match v {
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches!(e, Value::Timestamp(_)))
+                    .map(|(i, _)| i)
+                    .collect(),
+                Value::Timestamp(_) => vec![0],
+                _ => Vec::new(),
+            }
+        };
+        let has_ts_bound = match plan {
+            ProbePlan::Eq(v) | ProbePlan::Prefix(v) => !ts_positions(v).is_empty(),
+            ProbePlan::In(vals) => vals.iter().any(|v| !ts_positions(v).is_empty()),
+            ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|(v, _)| !ts_positions(v).is_empty()),
+        };
+        // Range sweeps with NUMERIC bounds need the band looked at too (Eq /
+        // Prefix / In probes with numeric elements are safe without it: a
+        // seek that matches nothing mirrors the predicate excluding every
+        // row, so only the sweeping shapes can diverge). The predicate's
+        // Timestamp↔numeric comparison is NULL — the row is excluded — while
+        // the raw band order ranks Timestamps ABOVE numerics, so a numeric
+        // bound over a Timestamp(-containing) band admits keys the predicate
+        // must exclude (`WHERE ts > 0 ORDER BY ts LIMIT 1` would return a
+        // row whose correct answer is zero rows).
+        let is_num = |v: &Value| -> bool {
+            matches!(v, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
+        };
+        let num_positions = |v: &Value| -> Vec<usize> {
+            match v {
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| is_num(e))
+                    .map(|(i, _)| i)
+                    .collect(),
+                other if is_num(other) => vec![0],
+                _ => Vec::new(),
+            }
+        };
+        let has_num_range_bound = match plan {
+            ProbePlan::Range { lo, hi } => [lo.as_ref(), hi.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|(v, _)| !num_positions(v).is_empty()),
+            _ => false,
+        };
+        if !has_str_bound && !has_ts_bound && !has_num_range_bound {
+            return Ok(Some((plan.clone(), false)));
+        }
+        let reader = self.reader();
+        let sample = |rev: bool| -> Result<Vec<(Value, u64)>> {
+            if rev {
+                tree.scan_limited_rev(&reader, tx, Some(1))
+                    .map_err(|e| index_err("probe bound", e))
+            } else {
+                tree.scan_limited(&reader, tx, Some(1))
+                    .map_err(|e| index_err("probe bound", e))
+            }
+        };
+        let min_key = sample(false)?.into_iter().next().map(|(k, _)| k);
+        let max_key = sample(true)?.into_iter().next().map(|(k, _)| k);
+        // Position i of the tree band is Timestamp when both sampled keys
+        // carry a Timestamp there (scalar keys are position 0). Because the
+        // tree is totally ordered and Timestamps rank below every Str, both
+        // extremes being Timestamp PROVES a pure band at the primary sort
+        // position; the same holds for both-Str (no Timestamps exist).
+        let band_ts_at = |i: usize| -> bool {
+            let at = |k: &Option<Value>| -> bool {
+                k.as_ref().is_some_and(|k| match k {
+                    Value::Timestamp(_) if i == 0 => true,
+                    Value::Array(items) => items
+                        .get(i)
+                        .is_some_and(|e| matches!(e, Value::Timestamp(_))),
+                    _ => false,
+                })
+            };
+            at(&min_key) && at(&max_key)
+        };
+        let band_str_at = |i: usize| -> bool {
+            let at = |k: &Option<Value>| -> bool {
+                k.as_ref().is_some_and(|k| match k {
+                    Value::Str(_) if i == 0 => true,
+                    Value::Array(items) => items.get(i).is_some_and(|e| matches!(e, Value::Str(_))),
+                    _ => false,
+                })
+            };
+            at(&min_key) && at(&max_key)
+        };
+        let band_num_at = |i: usize| -> bool {
+            let at = |k: &Option<Value>| -> bool {
+                k.as_ref().is_some_and(|k| match k {
+                    Value::Int(_) | Value::Float(_) | Value::Decimal(_) if i == 0 => true,
+                    Value::Array(items) => items.get(i).is_some_and(|e| {
+                        matches!(e, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
+                    }),
+                    _ => false,
+                })
+            };
+            at(&min_key) && at(&max_key)
+        };
+        // 一致才可判:该位要么纯 Timestamp(提升)、要么纯 Str(保留字面量,
+        // 与 cmp_coerced 的 Str↔Str 明文比较一致);两极不一致 = 混合带。
+        // 只需检查边界里携带字符串的位 —— 其它位的带型与该边界的比较
+        // 语义无关(Int 位永远不会被提升)。
+        let str_positions = |v: &Value| -> Vec<usize> {
+            match v {
+                Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| is_str(e))
+                    .map(|(i, _)| i)
+                    .collect(),
+                other if is_str(other) => vec![0],
+                _ => Vec::new(),
+            }
+        };
+        // Can the string at position i of `v` actually lift to a Timestamp?
+        let parseable_at = |v: &Value, i: usize| -> bool {
+            match v {
+                Value::Array(items) => items.get(i).is_some_and(
+                    |e| matches!(e, Value::Str(s) if crate::value::parse_timestamp_ms(s).is_some()),
+                ),
+                Value::Str(s) => i == 0 && crate::value::parse_timestamp_ms(s).is_some(),
+                _ => false,
+            }
+        };
+        let safe_at = |i: usize| band_ts_at(i) || band_str_at(i);
+        match plan {
+            ProbePlan::Eq(v) | ProbePlan::Prefix(v) => {
+                for i in str_positions(v) {
+                    if i > 0 {
+                        // 复合 Eq/Prefix 的非首元素:纯 Str 带保留字面量即可,
+                        // 其它带型(含纯 Timestamp —— 元素纯度不可证)回退。
+                        if !band_str_at(i) {
+                            return Ok(None);
+                        }
+                    } else if !(band_str_at(0) || (band_ts_at(0) && parseable_at(v, 0))) {
+                        // Timestamp 带上的字符串边界只有真提升成
+                        // Timestamp 才与谓词同义;不可解析字符串对每个
+                        // Timestamp 键都判 NULL/未知 —— 原样保留字面量会让
+                        // 探针/窗口放进谓词必然排除的行,只能整体回退。
+                        return Ok(None);
+                    }
+                }
+                for i in ts_positions(v) {
+                    // Timestamp 边界只在纯 Timestamp 带上与谓词同义;
+                    // Str/混合带回退全扫。
+                    if !band_ts_at(i) {
+                        return Ok(None);
+                    }
+                }
+            }
+            // IN 的每个元素都是一次独立 Eq 探测(位置 0),逐元素套用
+            // Eq 的首元素规则:任一元素与带型不谐即整体回退。
+            ProbePlan::In(vals) => {
+                for v in vals {
+                    for i in str_positions(v) {
+                        if !(band_str_at(i) || (band_ts_at(i) && parseable_at(v, i))) {
+                            return Ok(None);
+                        }
+                    }
+                    for i in ts_positions(v) {
+                        if !band_ts_at(i) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            ProbePlan::Range { lo, hi } => {
+                for (v, _) in [lo.as_ref(), hi.as_ref()].into_iter().flatten() {
+                    for i in str_positions(v) {
+                        if !safe_at(i) {
+                            return Ok(None);
+                        }
+                        // Timestamp 带上的字符串边界必须真能提升;不可解析
+                        // 字符串对每个 Timestamp 键判 NULL/未知,原样保留
+                        // 会让探针放进(或吃掉)谓词必然排除/包含的行。
+                        // 纯 Str 带保留字面量即可,与谓词的 Str↔Str 比较一致。
+                        if band_ts_at(i) && !parseable_at(v, i) {
+                            return Ok(None);
+                        }
+                    }
+                }
+                for i in [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(v, _)| ts_positions(v))
+                {
+                    if !band_ts_at(i) {
+                        return Ok(None);
+                    }
+                }
+                // A numeric bound may only sweep a band PROVABLY free of
+                // Timestamps. Purity is provable when both extremes agree
+                // on one family (anything else ranks strictly outside
+                // [min, max]); a band whose extremes disagree may still
+                // hold Timestamps in between (numeric … Timestamp … Str),
+                // and Str↔numeric stays raw on both sides so a pure Str
+                // band is as safe as a pure numeric one.
+                for i in [lo.as_ref(), hi.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(v, _)| num_positions(v))
+                {
+                    if !(band_num_at(i) || band_str_at(i)) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let any_band_ts = match min_key.as_ref() {
+            Some(Value::Array(items)) => (0..items.len()).any(band_ts_at),
+            Some(_) => band_ts_at(0),
+            None => false,
+        };
+        if !any_band_ts {
+            return Ok(Some((plan.clone(), false)));
+        }
+        let mut promoted_any = false;
+        let promote = |v: &Value, promoted_any: &mut bool| -> Value {
+            match v {
+                Value::Str(s) => {
+                    if band_ts_at(0) {
+                        if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                            *promoted_any = true;
+                            return Value::Timestamp(ms);
+                        }
+                    }
+                    v.clone()
+                }
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| {
+                            if let Value::Str(s) = e {
+                                if band_ts_at(i) {
+                                    if let Some(ms) = crate::value::parse_timestamp_ms(s) {
+                                        *promoted_any = true;
+                                        return Value::Timestamp(ms);
+                                    }
+                                }
+                            }
+                            e.clone()
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            }
+        };
+        let out = match &plan {
+            ProbePlan::Eq(v) => ProbePlan::Eq(promote(v, &mut promoted_any)),
+            ProbePlan::Prefix(v) => ProbePlan::Prefix(promote(v, &mut promoted_any)),
+            ProbePlan::In(vals) => {
+                ProbePlan::In(vals.iter().map(|v| promote(v, &mut promoted_any)).collect())
+            }
+            ProbePlan::Range { lo, hi } => ProbePlan::Range {
+                lo: lo
+                    .as_ref()
+                    .map(|(v, incl)| (promote(v, &mut promoted_any), *incl)),
+                hi: hi
+                    .as_ref()
+                    .map(|(v, incl)| (promote(v, &mut promoted_any), *incl)),
+            },
+        };
+        Ok(Some((out, promoted_any)))
+    }
+
+    /// Index entries selected by `plan`, in key order. `max` caps the walk to
+    /// the first `max` entries; pass it only when every entry the plan can
+    /// return is a result (exact probes), since a non-unique run must not
+    /// spend the cap on entries a filter would drop.
+    pub(super) fn probe_pairs(
+        &self,
+        col: &str,
+        tree: &BTree,
+        tx: &crate::pager::Tx,
+        plan: &ProbePlan,
+        max: Option<usize>,
+    ) -> Result<Option<Vec<(Value, u64)>>> {
+        let reader = self.reader();
+        let plan = match self.promote_plan_bounds(tree, tx, plan)? {
+            Some((p, _)) => p,
+            None => return Ok(None),
+        };
+        let pairs = match &plan {
+            ProbePlan::Eq(v) => {
+                // Bounded range + equal filter so non-unique trees return
+                // every duplicate match (get() would yield one entry).
+                // The hi bound lets the tree stop at the first key past v
+                // instead of walking the whole right side. For composite
+                // indexes v is the full Array key — element-wise cmp_values
+                // equality is exactly a key match.
+                let mut p = tree
+                    .range_bounded_limited(&reader, tx, v, Some((v, true)), max)
+                    .map_err(|e| index_err(col, e))?;
+                p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
+                p
+            }
+            ProbePlan::Prefix(prefix) => {
+                // Composite prefix probe: walk from the prefix (its rank makes
+                // Array(prefix) sort right before every key extending it) and
+                // stop at the first key that leaves the run — the walk itself
+                // yields only prefix matches, so neither a `retain` nor the
+                // tail beyond the run is needed. `max` stays ignored, as
+                // before: the cap exists for plans whose every entry is a
+                // result, and this one keeps nothing else. Walking to the end
+                // of the tree and filtering afterwards (the old shape) made
+                // `WHERE leading = 'x'` cost the whole index in time and in
+                // materialized pairs, however few rows matched.
+                let Value::Array(pfx) = prefix else {
+                    // Only a composite Array key has a prefix run; no other
+                    // shape is probeable — generic path, never a wrong answer.
+                    return Ok(None);
+                };
+                tree.range_prefix_limited(&reader, tx, pfx, None)
+                    .map_err(|e| index_err(col, e))?
+            }
+            ProbePlan::In(vals) => {
+                // Multi-probe equality set: one bounded Eq walk per element
+                // (the cap per element still covers the global first `max` —
+                // each element contributes its smallest keys), merged back
+                // into key order because window plans trust it. Distinct
+                // elements probe disjoint runs; repeated list entries
+                // double-report the same run and dedupe away here.
+                let mut pairs: Vec<(Value, u64)> = Vec::new();
+                for v in vals {
+                    self.deadline.check()?;
+                    let mut p = tree
+                        .range_bounded_limited(&reader, tx, v, Some((v, true)), max)
+                        .map_err(|e| index_err(col, e))?;
+                    p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
+                    pairs.append(&mut p);
+                }
+                // 按 (键, locator) 全对排序:重复列表元素探出的同键同
+                // locator 对必须相邻才能去重;cmp_values 相等的键可以是
+                // 两行(Int(3)/Float(3.0) 同判等,AGENTS 红线 #2),按键
+                // 单独去重会丢掉非唯一树的合法同行键。
+                pairs.sort_by(|a, b| Value::cmp_values(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
+                pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                if let Some(m) = max {
+                    pairs.truncate(m);
+                }
+                pairs
+            }
+            ProbePlan::Range { lo, hi } => {
+                let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
+                let mut pairs = match &lo {
+                    Some((v, true)) => tree
+                        .range_bounded_limited(&reader, tx, v, hi_ref, max)
+                        .map_err(|e| index_err(col, e))?,
+                    // Strict lower bound: the walk drops the equal run itself
+                    // so the cap counts kept entries only.
+                    Some((v, false)) => tree
+                        .range_bounded_excl_limited(&reader, tx, v, hi_ref, max)
+                        .map_err(|e| index_err(col, e))?,
+                    // No lower bound: in-range keys are a prefix of the scan,
+                    // so a cap collects them all (or exactly `max` of them).
+                    None => tree
+                        .scan_limited(&reader, tx, max)
+                        .map_err(|e| index_err(col, e))?,
+                };
+                if let Some((v, incl)) = &hi {
+                    pairs.retain(|(k, _)| {
+                        let o = Value::cmp_values(k, v);
+                        o == std::cmp::Ordering::Less || (*incl && o == std::cmp::Ordering::Equal)
+                    });
+                }
+                pairs
+            }
+        };
+        Ok(Some(pairs))
+    }
+
+    /// [`Database::probe_pairs`] walking in descending key order — the
+    /// `ORDER BY … DESC` window. Same `max` caveats; a prefix scan ignores
+    /// it.
+    pub(super) fn probe_pairs_rev(
+        &self,
+        col: &str,
+        tree: &BTree,
+        tx: &crate::pager::Tx,
+        plan: &ProbePlan,
+        max: Option<usize>,
+    ) -> Result<Option<Vec<(Value, u64)>>> {
+        let reader = self.reader();
+        let plan = match self.promote_plan_bounds(tree, tx, plan)? {
+            Some((p, _)) => p,
+            None => return Ok(None),
+        };
+        let pairs = match &plan {
+            ProbePlan::Eq(v) => tree
+                .range_bounded_rev_limited(&reader, tx, Some((v, true)), Some((v, true)), max)
+                .map_err(|e| index_err(col, e))?,
+            ProbePlan::Prefix(prefix) => {
+                // Descending mirror of the prefix probe: the same bounded
+                // forward run, reversed. `max` stays ignored, as above.
+                let Value::Array(pfx) = prefix else {
+                    return Ok(None);
+                };
+                tree.range_prefix_rev_limited(&reader, tx, pfx, None)
+                    .map_err(|e| index_err(col, e))?
+            }
+            ProbePlan::In(vals) => {
+                // Descending mirror of the In probe: one bounded Eq walk per
+                // element (each takes the element's LAST keys under the cap —
+                // their union covers the global last `max`), merged into
+                // descending key order for the DESC window.
+                let mut pairs: Vec<(Value, u64)> = Vec::new();
+                for v in vals {
+                    self.deadline.check()?;
+                    let mut p = tree
+                        .range_bounded_rev_limited(
+                            &reader,
+                            tx,
+                            Some((v, true)),
+                            Some((v, true)),
+                            max,
+                        )
+                        .map_err(|e| index_err(col, e))?;
+                    p.retain(|(k, _)| Value::cmp_values(k, v) == Ordering::Equal);
+                    pairs.append(&mut p);
+                }
+                // 降序镜像:同键段内按 locator 定序,同对相邻可去重。
+                pairs.sort_by(|a, b| Value::cmp_values(&b.0, &a.0).then_with(|| a.1.cmp(&b.1)));
+                pairs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                if let Some(m) = max {
+                    pairs.truncate(m);
+                }
+                pairs
+            }
+            ProbePlan::Range { lo, hi } => {
+                let lo_ref = lo.as_ref().map(|(v, incl)| (v, *incl));
+                let hi_ref = hi.as_ref().map(|(v, incl)| (v, *incl));
+                tree.range_bounded_rev_limited(&reader, tx, lo_ref, hi_ref, max)
+                    .map_err(|e| index_err(col, e))?
+            }
+        };
+        Ok(Some(pairs))
+    }
+
+    /// `SELECT COUNT(*) FROM t` with no WHERE/GROUP BY/window: count the
+    /// heap's live slots without decoding documents. `None` sends anything
+    /// more complex down the generic aggregate path.
+    pub(super) fn try_count_star(
+        &self,
+        query: &Query,
+        select: &sqlparser::ast::Select,
+        ctes: &Ctes,
+    ) -> Result<Option<ExecOutcome>> {
+        if !ctes.is_empty()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || select.top.is_some()
+            || !matches!(&select.distinct, None | Some(sqlparser::ast::Distinct::All))
+            || query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || query.fetch.is_some()
+            || select.projection.len() != 1
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+        {
+            return Ok(None);
+        }
+        if !plain_table_factor(&select.from[0].relation) {
+            return Ok(None);
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return Ok(None);
+        };
+        let Some(meta) = self.real_table_meta(name) else {
+            return Ok(None);
+        };
+        let (column, expr) = match &select.projection[0] {
+            SelectItem::UnnamedExpr(e) => (expr_name(e), e),
+            SelectItem::ExprWithAlias { expr, alias, .. } => (alias.value.clone(), expr),
+            _ => return Ok(None),
+        };
+        let SqlExpr::Function(f) = expr else {
+            return Ok(None);
+        };
+        if !f.name.to_string().eq_ignore_ascii_case("count")
+            || f.filter.is_some()
+            || f.over.is_some()
+        {
+            return Ok(None);
+        }
+        use sqlparser::ast::{DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments};
+        let is_star = match &f.args {
+            FunctionArguments::List(list) => {
+                !matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+                    && list.args.len() == 1
+                    && matches!(
+                        list.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    )
+            }
+            _ => false,
+        };
+        if !is_star {
+            return Ok(None);
+        }
+        let count = meta.heap_of().live_count(&self.reader())?;
+        Ok(Some(ExecOutcome::Rows(QueryResult {
+            columns: vec![column],
+            rows: vec![vec![Value::Int(count as i64)]],
+        })))
+    }
+}
