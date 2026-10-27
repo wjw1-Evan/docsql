@@ -471,3 +471,442 @@ pub(super) fn create_trigger_sql(d: &TriggerDef) -> String {
     s.push_str("END");
     s
 }
+
+impl Database {
+    // Replication red line: the creating DDL rides the journal like every
+    // other write and every node fires the same bodies over the same rows,
+    // so a body may contain NOTHING nondeterministic — no NEWID()/RAND(),
+    // no wall-clock calls, no INSERT omitting an auto-GUID column, no
+    // INSERT leaving a wall-clock DEFAULT to be filled. Each is refused at
+    // CREATE time: at fire time the divergence has already happened by the
+    // time anyone could notice.
+    pub(super) fn exec_create_trigger(
+        &mut self,
+        ct: sqlparser::ast::CreateTrigger,
+    ) -> Result<ExecOutcome> {
+        if ct.or_alter {
+            return err("CREATE OR ALTER TRIGGER is not supported (use CREATE OR REPLACE TRIGGER)");
+        }
+        if ct.temporary {
+            return err("TEMP triggers are not supported");
+        }
+        if ct.is_constraint {
+            return err("CONSTRAINT triggers are not supported");
+        }
+        if !ct.referencing.is_empty() {
+            return err("REFERENCING (transition tables) is not supported");
+        }
+        if ct.characteristics.is_some() {
+            return err("trigger characteristics (DEFERRABLE / INITIALLY …) are not supported");
+        }
+        if ct.exec_body.is_some() {
+            return err("EXECUTE FUNCTION triggers are not supported (use a BEGIN … END body)");
+        }
+        if ct.statements_as {
+            return err("AS trigger bodies are not supported (use BEGIN … END)");
+        }
+        let before = match ct.period {
+            Some(sqlparser::ast::TriggerPeriod::Before) => true,
+            Some(sqlparser::ast::TriggerPeriod::After) => false,
+            Some(sqlparser::ast::TriggerPeriod::InsteadOf) => {
+                return err("INSTEAD OF triggers are not supported (views are not writable)");
+            }
+            Some(sqlparser::ast::TriggerPeriod::For) | None => {
+                return err("trigger requires BEFORE or AFTER");
+            }
+        };
+        match ct.trigger_object {
+            None => {}
+            Some(sqlparser::ast::TriggerObjectKind::ForEach(
+                sqlparser::ast::TriggerObject::Row,
+            ))
+            | Some(sqlparser::ast::TriggerObjectKind::For(sqlparser::ast::TriggerObject::Row)) => {}
+            Some(_) => {
+                return err(
+                    "statement-level triggers (FOR EACH STATEMENT) are not supported (triggers are row-level)",
+                );
+            }
+        }
+        if ct.events.len() != 1 {
+            return err("exactly one event (INSERT / UPDATE / DELETE) per trigger");
+        }
+        let (insert, delete, update, update_of) = match ct
+            .events
+            .into_iter()
+            .next()
+            .expect("checked above")
+        {
+            sqlparser::ast::TriggerEvent::Insert => (true, false, false, None),
+            sqlparser::ast::TriggerEvent::Delete => (false, true, false, None),
+            sqlparser::ast::TriggerEvent::Update(cols) => (
+                false,
+                false,
+                true,
+                if cols.is_empty() {
+                    None
+                } else {
+                    Some(cols.iter().map(|i| i.value.clone()).collect())
+                },
+            ),
+            sqlparser::ast::TriggerEvent::Truncate => {
+                return err(
+                    "TRUNCATE triggers are not supported (row triggers fire on DELETE; TRUNCATE itself fires none)",
+                );
+            }
+        };
+        let name = obj_name(&ct.name);
+        let table = obj_name(&ct.table_name);
+        if crate::engine::is_system_table(&table) || is_internal_table(&table) {
+            return err(format!("triggers cannot target the internal table {table}"));
+        }
+        let Some(tmeta) = self.tables.get(&table).cloned() else {
+            return err(format!("table {table} does not exist"));
+        };
+        if tmeta.is_view() {
+            return err(format!("cannot create a trigger on view {table}"));
+        }
+        // WHEN: only NEW./OLD. references over literals and operators — an
+        // unqualified column name would silently read NULL and skip every
+        // firing.
+        let when = match &ct.condition {
+            Some(e) => {
+                validate_trigger_when(e)?;
+                Some(e.to_string())
+            }
+            None => None,
+        };
+        let body_statements = match &ct.statements {
+            Some(cs) => cs.statements().clone(),
+            None => return err("trigger body is required (BEGIN … END)"),
+        };
+        if body_statements.is_empty() {
+            return err("trigger body is empty");
+        }
+        let mut body = Vec::with_capacity(body_statements.len());
+        for s in &body_statements {
+            body.push(self.validate_trigger_body_stmt(s)?);
+        }
+        if self.triggers.contains_key(&name) && !ct.or_replace {
+            return err(format!("trigger {name} already exists"));
+        }
+        self.triggers.insert(
+            name.clone(),
+            TriggerDef {
+                name,
+                table,
+                before,
+                insert,
+                delete,
+                update,
+                update_of,
+                when,
+                body,
+            },
+        );
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
+    /// CREATE-time validation of one trigger body statement: the accepted
+    /// shapes (INSERT / UPDATE / DELETE / `SELECT RAISE(ABORT|FAIL, …)`)
+    /// plus the determinism gates that keep every replaying node in
+    /// agreement. Returns the catalog form.
+    pub(super) fn validate_trigger_body_stmt(&self, stmt: &Statement) -> Result<TriggerAction> {
+        match stmt {
+            Statement::Insert(i) => {
+                let sqlparser::ast::TableObject::TableName(n) = &i.table else {
+                    return err("trigger body INSERT must target a simple table");
+                };
+                let t = obj_name(n);
+                self.validate_trigger_target(&t)?;
+                let tmeta = self.tables.get(&t).cloned().unwrap_or_default();
+                // INSERT would otherwise rewrite NEWID per row, and RAND()
+                // would re-roll on every replaying node — same gate the
+                // direct path applies to INSERT ... SELECT sources.
+                let text = stmt.to_string();
+                if crate::stmt::mentions_nondet_call(&text) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are not allowed in trigger bodies \
+                         (each node would generate different values)",
+                    );
+                }
+                if crate::stmt::mentions_wall_clock(&text) {
+                    return err(
+                        "wall-clock functions are not allowed in trigger bodies (each node would stamp its own clock)",
+                    );
+                }
+                // A wall-clock DEFAULT on the TARGET table would be filled
+                // per node at fire time even though the body text is clean:
+                // the body must supply those columns explicitly.
+                let cols: Vec<String> = i.columns.iter().map(obj_name).collect();
+                let positional = cols.is_empty();
+                for (col, text) in &tmeta.defaults {
+                    let Ok(e) = parse_expr_text(text) else {
+                        continue;
+                    };
+                    if expr_calls_wall_clock(&e) && (positional || !cols.iter().any(|c| c == col)) {
+                        return err(format!(
+                            "trigger body INSERT into {t} omits column {col}, whose DEFAULT is a \
+                             wall-clock call (each node would stamp its own clock); supply the \
+                             column explicitly"
+                        ));
+                    }
+                }
+                // An auto-GUID fill is a random id per node. The body must
+                // carry an explicit non-NULL value for that column.
+                if let Some(gcol) = &tmeta.autoguid {
+                    // Positional INSERT maps values onto the DECLARED column
+                    // list; an explicit list must name the column itself.
+                    let idx: Option<usize> = if positional {
+                        tmeta.columns.iter().position(|c| c == gcol)
+                    } else {
+                        cols.iter().position(|c| c == gcol)
+                    };
+                    let values: Option<&Vec<SqlExpr>> =
+                        i.source.as_ref().and_then(|q| match &*q.body {
+                            SetExpr::Values(v) => v.rows.first().map(|r| &r.content),
+                            _ => None,
+                        });
+                    let supplied: Option<&SqlExpr> = match (idx, values) {
+                        (Some(i), Some(vals)) => vals.get(i),
+                        _ => None,
+                    };
+                    let explicit = match supplied {
+                        // NULL literal still triggers the fill at fire time.
+                        Some(SqlExpr::Value(v)) => !matches!(v.value, sqlparser::ast::Value::Null),
+                        // NEW.col / OLD.col references and expressions cannot
+                        // be proven non-NULL here; the runtime NULL-fill is a
+                        // documented edge (substitute a literal to be safe).
+                        Some(_) => true,
+                        None => false,
+                    };
+                    if !explicit {
+                        return err(format!(
+                            "trigger body INSERT into {t} must supply the auto-generated GUID \
+                             column {gcol} explicitly (each node would generate a different id)"
+                        ));
+                    }
+                }
+            }
+            Statement::Update(u) => {
+                let sqlparser::ast::TableFactor::Table { name, .. } = &u.table.relation else {
+                    return err("trigger body UPDATE must target a simple table");
+                };
+                let t = obj_name(name);
+                self.validate_trigger_target(&t)?;
+                if crate::stmt::mentions_nondet_call(&stmt.to_string()) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are not allowed in trigger bodies \
+                         (each node would generate different values)",
+                    );
+                }
+                if crate::stmt::mentions_wall_clock(&stmt.to_string()) {
+                    return err(
+                        "wall-clock functions are not allowed in trigger bodies (each node would stamp its own clock)",
+                    );
+                }
+            }
+            Statement::Delete(d) => {
+                let sqlparser::ast::FromTable::WithFromKeyword(twjs) = &d.from else {
+                    return err("trigger body DELETE must target a simple table");
+                };
+                let Some(sqlparser::ast::TableFactor::Table { name, .. }) =
+                    twjs.first().map(|t| &t.relation)
+                else {
+                    return err("trigger body DELETE must target a simple table");
+                };
+                let t = obj_name(name);
+                self.validate_trigger_target(&t)?;
+                if crate::stmt::mentions_nondet_call(&stmt.to_string()) {
+                    return err(
+                        "NEWID()/NEWSEQUENTIALID()/RAND() are not allowed in trigger bodies \
+                         (each node would generate different values)",
+                    );
+                }
+                if crate::stmt::mentions_wall_clock(&stmt.to_string()) {
+                    return err(
+                        "wall-clock functions are not allowed in trigger bodies (each node would stamp its own clock)",
+                    );
+                }
+            }
+            Statement::Query(q) => return raise_action(q),
+            other => {
+                return err(format!(
+                    "unsupported trigger body statement ({other}); INSERT / UPDATE / DELETE / \
+                     SELECT RAISE(ABORT|FAIL, …) only"
+                ));
+            }
+        }
+        Ok(TriggerAction::Sql(stmt.to_string()))
+    }
+
+    pub(super) fn validate_trigger_target(&self, t: &str) -> Result<()> {
+        if crate::engine::is_system_table(t) || is_internal_table(t) {
+            return err(format!(
+                "trigger bodies cannot write the internal table {t}"
+            ));
+        }
+        let Some(m) = self.tables.get(t) else {
+            return err(format!("table {t} does not exist"));
+        };
+        if m.is_view() {
+            return err(format!("trigger bodies cannot write view {t}"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn exec_drop_trigger(
+        &mut self,
+        names: &[ObjectName],
+        if_exists: bool,
+    ) -> Result<ExecOutcome> {
+        for n in names {
+            let t = obj_name(n);
+            if !self.triggers.contains_key(&t) && !if_exists {
+                return err(format!("trigger {t} does not exist"));
+            }
+        }
+        for n in names {
+            self.triggers.remove(&obj_name(n));
+        }
+        self.save_catalog()?;
+        Ok(ExecOutcome::Affected(0))
+    }
+
+    /// True when any trigger targets `table` — the zero-cost gate for the
+    /// statement guard on deployments without triggers.
+    pub(super) fn triggers_exist_for(&self, table: &str) -> bool {
+        self.triggers.values().any(|d| d.table == table)
+    }
+
+    /// Trigger names defined on `table` (object explorer / console meta),
+    /// catalog (name) order.
+    pub fn trigger_names_of(&self, table: &str) -> Vec<String> {
+        self.triggers
+            .values()
+            .filter(|d| d.table == table)
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    /// Fire matching row triggers for one row image. `old`/`new` carry the
+    /// OLD./NEW. images (None where the event has none: INSERT has no OLD,
+    /// DELETE no NEW). `changed` names the columns an UPDATE assigns — an
+    /// UPDATE OF trigger fires only when they intersect.
+    pub(super) fn fire_row_triggers(
+        &mut self,
+        table: &str,
+        before: bool,
+        ev: TriggerFireEvent<'_>,
+        old: Option<&Object>,
+        new: Option<&Object>,
+    ) -> Result<()> {
+        if self.triggers.is_empty() {
+            return Ok(());
+        }
+        let matched: Vec<TriggerDef> = self
+            .triggers
+            .values()
+            .filter(|d| {
+                d.table == table
+                    && d.before == before
+                    && match ev {
+                        TriggerFireEvent::Insert => d.insert,
+                        TriggerFireEvent::Delete => d.delete,
+                        TriggerFireEvent::Update(changed) => {
+                            d.update
+                                && match (&d.update_of, changed) {
+                                    (None, _) | (_, None) => true,
+                                    (Some(of), Some(ch)) => {
+                                        ch.iter().any(|c| of.iter().any(|o| o == c))
+                                    }
+                                }
+                        }
+                    }
+            })
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            return Ok(());
+        }
+        if self.trigger_depth >= MAX_TRIGGER_DEPTH {
+            return err(format!(
+                "trigger nesting too deep (>{MAX_TRIGGER_DEPTH}); likely an infinite trigger cycle"
+            ));
+        }
+        self.trigger_depth += 1;
+        // The triggering statement's canonical rewrite and assigned id are
+        // ITS replication state — body statements get their own (validated
+        // deterministic, so discarded) and the outer values come back.
+        let saved_resolved = self.resolved_sql.take();
+        let saved_last_id = self.last_insert_id.take();
+        let r = self.run_trigger_bodies(&matched, table, old, new);
+        self.resolved_sql = saved_resolved;
+        self.last_insert_id = saved_last_id;
+        self.trigger_depth -= 1;
+        r
+    }
+
+    pub(super) fn run_trigger_bodies(
+        &mut self,
+        defs: &[TriggerDef],
+        firing_table: &str,
+        old: Option<&Object>,
+        new: Option<&Object>,
+    ) -> Result<()> {
+        for d in defs {
+            if let Some(w) = &d.when {
+                let mut e = parse_expr_text(w)?;
+                subst_new_old_expr(&mut e, old, new)?;
+                // WHEN passes only on TRUE (false and NULL skip, SQL
+                // semantics).
+                if !matches!(eval_expr(&e, &Object::new())?, Value::Bool(true)) {
+                    continue;
+                }
+            }
+            for a in &d.body {
+                self.stmt_deadline.check()?;
+                match a {
+                    TriggerAction::Raise { msg, .. } => {
+                        return err(format!("RAISE in trigger {}: {msg}", d.name));
+                    }
+                    TriggerAction::Sql(text) => {
+                        let stmts = Parser::parse_sql(&GenericDialect {}, text)
+                            .map_err(|e| SqlError::Parse(e.to_string()))?;
+                        let Some(mut stmt) = stmts.into_iter().next() else {
+                            continue;
+                        };
+                        // MySQL's rule, for the same reason: the triggering
+                        // statement's row images are staged in ITS pager
+                        // transaction until it commits — a body write to the
+                        // same table would apply against the pre-statement
+                        // pages and be overwritten when the outer statement
+                        // commits. Reads stay legal (they see the committed
+                        // pre-statement state deterministically, origin and
+                        // replays alike).
+                        if let Some(t) = trigger_dml_target(&stmt) {
+                            if t == firing_table {
+                                return err(format!(
+                                    "cannot modify table {t} from a trigger on {t} while a \
+                                     statement on {t} is in progress (split the write onto a \
+                                     second table)"
+                                ));
+                            }
+                        }
+                        subst_new_old_stmt(&mut stmt, old, new)?;
+                        let text = stmt.to_string();
+                        if text_has_trigger_ref_outside_literals(&text) {
+                            return err(
+                                "NEW./OLD. references inside a subquery are not supported in \
+                                 trigger bodies",
+                            );
+                        }
+                        let parsed = Self::parse_classified(&text)?;
+                        self.execute_parsed(parsed)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

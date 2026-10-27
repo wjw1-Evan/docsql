@@ -4141,13 +4141,17 @@ mod repair_election_tests {
 }
 
 mod authz;
+mod catchup;
 mod config;
+mod conn;
 mod frames;
 mod params;
 mod sync;
 use authz::*;
 pub use authz::{check_token_strength, AUTH_LOCK_THRESHOLD, MIN_TOKEN_LEN};
+use catchup::*;
 pub use config::*;
+use conn::*;
 use frames::*;
 use params::*;
 use sync::*;
