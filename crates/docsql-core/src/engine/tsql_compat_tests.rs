@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn run(db: &mut Database, sql: &str) -> ExecOutcome {
