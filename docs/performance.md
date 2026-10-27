@@ -164,6 +164,98 @@ cargo build --release -p docsql-core --examples
 
 **使用建议**：删除多行时用一条 `DELETE ... WHERE ...`（每个受影响页只 repack 一次），避免在应用层逐行删除；尤其在带二级索引的表上，逐行 DELETE 的吞吐会比单语句低一个数量级。代码层面的优化方向是把 `repack` 的返回过滤为真实 locator 变化（`old != new`），或引入 locator 间接层；本文只记录基线，未改动引擎实现。
 
+## 与 SQL Server 的对比
+
+**先说明可比性边界**：截至 2026-10-27，本文没有给出 SQL Server 的并排实测数字。原因不是 SQL Server 不可测，而是本机环境无法产出可信的同机对比：
+
+- 完整 SQL Server 2022 的 Linux 容器只有 **amd64** 镜像；本机是 arm64。用 QEMU/Rosetta 跑 amd64 SQL Server 测到的是模拟层开销，不能代表 SQL Server。
+- 原生 arm64 的 **Azure SQL Edge** 是 SQL Server 引擎的边缘版（SQL Server 2019 血统，功能与资源上限不同），不能等价为完整 SQL Server。
+- 本机 Docker Desktop 只有 **4 vCPU / 2 GiB**，与前面 8 核 / 8 GiB 的原生 DocSQL 基线不是同一资源档；即使跑起来也不能并排。
+
+拿模拟层或边缘版的数字填“SQL Server”一列，会同时误导两个方向。因此下面只做**架构层面的对比**、**按场景的预期方向**和**可在 x86_64 主机上复现的实测方案**；真实数字应在同机、同资源、同负载下另行采集。
+
+**总体判断**：低并发、简单 OLTP（单条写、主键点查、索引分页）两者预计同量级——DocSQL 的优势是进程内执行、文档整体存储与单二进制部署，SQL Server 的优势是日志缓冲/组提交、成本优化器、并行执行与多写者；复杂分析、非等值/外连接和高并发写入通常 SQL Server 占优。这个判断必须用下一节的同机实测替换成数字。
+
+### 架构差异
+
+| 维度 | DocSQL | SQL Server | 对性能的含义 |
+|---|---|---|---|
+| 执行模型 | 嵌入式单进程、单写者；读走 MVCC 快照，写串行 | 客户端-服务器、多线程、并行查询、锁/闩与行版本 | 低并发简单 OLTP 差距小；高并发混合负载 SQL Server 占优 |
+| 写入与持久化 | WAL；每条 autocommit 语句一次 fsync，显式事务一次 fence | 事务日志 + 日志缓冲区；提交刷盘；多写者；组提交 | 单条写都受刷盘支配；SQL Server 的日志缓冲/组提交通常更有利，需同盘实测 |
+| 存储布局 | 4 KiB 页、文档堆（整文档存储）+ 每个索引一棵 B+ 树 | 8 KiB 页、堆/聚集索引、行存，另有列存 | 范围扫描、覆盖索引、列存分析 SQL Server 更强；DocSQL 的文档整体读写更自然 |
+| 查询优化 | 规则/探针路径，无统计信息与成本模型 | 成本优化器 + 统计信息 + 并行 + 多种连接算法 | 多表复杂查询、非等值/外连接通常 SQL Server 更优 |
+| JOIN | 可提取等值条件走 hash join，否则嵌套循环 | hash / merge / nested loop，可并行 | DocSQL 的 LEFT JOIN 与不等值 JOIN 是实测弱项（见上节） |
+| 聚合/窗口 | 单线程执行 | 并行、批处理模式 | 大数据量分析 SQL Server 通常更快 |
+| 分页 | 索引序窗口 / top-K 堆；keyset 任意深度约 0.04 ms | `TOP` / `OFFSET … FETCH`；优化器选择索引或排序 | 浅页两者都好；深 OFFSET 两者都随偏移线性增长 |
+| 事务/隔离 | WAL + SAVEPOINT；单写者，写事务排队 | 完整隔离级别、锁、行版本、并行事务 | SQL Server 的并发事务能力更完整 |
+| JSON/文档 | JSON 文本 + JSON 路径索引，文档整体存储 | JSON 函数，底层仍是行存 | 文档读写 DocSQL 更自然；复杂关系查询 SQL Server 更成熟 |
+| 集群 | 对等复制/主从转发，每个节点单写者 | Always On、FCI、读写分离等 | 拓扑不同，不能直接把集群吞吐放在一张表里比 |
+
+### 按场景的预期方向
+
+下表左列是前文的 DocSQL 实测（嵌入引擎、本机 APFS），右列是基于架构的**预期方向**，不是 SQL Server 实测值。真正对比时请按下一节的方案在 x86_64 上采数。
+
+| 场景 | DocSQL 实测 | SQL Server 预期方向 | 说明 |
+|---|---|---|---|
+| 单条 autocommit 写 | 1,000–1,400 行/秒 | 同盘同核通常同量级或更高 | 日志缓冲、组提交、恢复模式都会影响；必须同盘实测 |
+| 单事务批量写 | 约 21,000 行/秒 | 通常更高，取决于批量大小与最小日志 | SQL Server 批量导入/最小日志是强项 |
+| 主键点查 | 11–13 µs/次（进程内） | 引擎侧同量级；端到端另加网络往返 | 不要把 DocSQL 进程内延迟与 SQL Server 客户端-服务器延迟直接相减 |
+| 索引序首屏/keyset | 0.018 / 0.038 ms（50 万行） | 浅页与 keyset 通常都很快 | 深 OFFSET 两者都线性变慢 |
+| 索引探针 IN/BETWEEN/LIKE 前缀 | 0.03–4.2 ms | 索引 seek 通常同量级，依赖统计信息 | 全扫基线 178–306 ms；SQL Server 有统计信息与更丰富的访问路径 |
+| 等值 hash JOIN | 5.5 ms / 900 万对 | 通常同量级或更快 | SQL Server 可并行、可选 hash/merge |
+| LEFT JOIN（大量未匹配行） | 281 ms | 通常明显更快 | DocSQL 当前 null 扩展逐右行扫描；SQL Server 优化器会选更合适的连接 |
+| 非等值 JOIN | 3.4 s（嵌套循环） | 通常明显更快 | SQL Server 可用 hash/merge join 与并行；DocSQL 回退嵌套循环 |
+| 逐行 DELETE | 655 行/秒（事务内） | 逐行也有语句开销，但通常高于 DocSQL | DocSQL 的页内索引重指是当前实现的固定成本；两边都应优先集合式删除 |
+| 并发写 | 单写者串行 | 多写者并行 | 这是架构差异，不是调参能消除的 |
+| 并发读 | MVCC 快照，读不阻塞写 | 快照/锁隔离，可并行 | 低并发差距小；高并发 SQL Server 更成熟 |
+
+### 在 x86_64 主机上复现对比
+
+要得到可信的 SQL Server 数字，按下面的约束在同一台 x86_64 Linux 主机上跑：
+
+```bash
+# 1) SQL Server 2022 Developer（amd64 原生，不要在 arm64 上模拟）
+docker run -d --name mssql-bench \
+  -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='Str0ng!Passw0rd' \
+  -p 1433:1433 -v mssql-bench:/var/opt/mssql \
+  --cpus 6 --memory 8g \
+  mcr.microsoft.com/mssql/server:2022-latest
+
+# 2) DocSQL 用同一台机器的同一块本地盘（release）
+cargo build --release -p docsql-core --examples
+./target/release/examples/bench
+./target/release/examples/bench_page 500000
+./target/release/examples/bench_probe 500000
+```
+
+SQL Server 2022 镜像不自带 `sqlcmd`；可在同一网络起 `mcr.microsoft.com/mssql-tools` 容器，或安装 `mssql-tools18` 后用 `sqlcmd -S localhost -U sa -P '…' -C -i compare.sql` 执行脚本（把下面的计时模板与各场景拼成 `compare.sql`）。最小的点查计时模板（服务端循环，避免客户端逐语句往返）：
+
+```sql
+SET NOCOUNT ON;
+DECLARE @t DATETIME2 = SYSUTCDATETIME(), @i INT = 0, @x NVARCHAR(50);
+WHILE @i < 20000
+BEGIN
+    SET @x = (SELECT name FROM bench WHERE id = @i);
+    SET @i += 1;
+END;
+SELECT 'point-query-20k' AS metric,
+       DATEDIFF_BIG(MICROSECOND, @t, SYSUTCDATETIME()) AS us;
+```
+
+写入、批量写、分页、探针、JOIN、删除按同样的模式计时；DocSQL 侧用等价的 `bench*` 脚本或 T-SQL 批循环，保证两边测的是同一件事。
+
+对齐变量：
+
+- **CPU/内存**：给两个引擎相同的 `--cpus` / `--memory`；DocSQL 若跑在容器里也加上同样的限制。不要用“原生 DocSQL vs 2 GiB 容器 SQL Server”。
+- **存储**：同一块本地 SSD、同一文件系统/卷类型；不要一个在 APFS、一个在网络卷。SQL Server 用 Docker volume 时，DocSQL 也用 Docker volume 或同一块盘上的目录。
+- **恢复模式**：SQL Server 默认 FULL；若改 SIMPLE，写入数字会变，必须在报告里注明。DocSQL 对应 `DOCSQL_ASYNC_COMMIT=0/1` 也要分开报。
+- **并行度**：SQL Server 的 `MAXDOP` 默认可能使用多核；DocSQL 是单线程执行。要么固定 `MAXDOP 1` 做单线程引擎对比，要么明确报告“SQL Server 默认并行”的数字。
+- **统计信息/索引**：SQL Server 先让统计信息就绪（或 `UPDATE STATISTICS`），并记录索引/填充因子；DocSQL 没有成本优化器，不要用 SQL Server 的“优化器自动纠正”来解释差异而不说明。
+- **采样**：预热后至少 3 轮，取中位数；fsync 主导的写指标与 CPU 主导的查询指标分开报；记录宿主负载、profile、数据量。
+- **客户端开销**：若要比较端到端延迟，SQL Server 用 `sqlcmd`/驱动，DocSQL 用 CLI/驱动，两边都走真实网络；若只比较引擎，使用服务端循环（SQL Server 的 `WHILE` 批、DocSQL 的 T-SQL 批）避免客户端逐语句往返。
+
+对比时至少覆盖：autocommit 写入、单事务批量写、主键点查、二级索引等值、`IN`/`BETWEEN`/前缀 `LIKE`、50 万行首屏/深 OFFSET/keyset、无索引排序、`COUNT(*)`、等值/LEFT/非等值 JOIN、逐行 vs 集合式 DELETE、以及并发读写（多连接）。**不要**把本机模拟层、Azure SQL Edge 或不同资源档的数字标成“SQL Server 性能”。
+
 ## 容量解读与注意事项
 
 - **写吞吐由 fsync 决定**：单条 autocommit 写在本地 APFS 上约 0.7–1.0 ms/条；生产 Docker 卷、云盘、网络存储的 fsync 延迟可能显著不同，必须用 `bench6` / `bench_write` 在目标环境复测。批量导入用单事务或 `DOCSQL_ASYNC_COMMIT=1`，可把吞吐从约 1 千行/秒提升到约 2 万行/秒。
