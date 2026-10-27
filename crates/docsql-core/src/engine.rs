@@ -2055,6 +2055,42 @@ fn union_of_fields(docs: &[Object]) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+// ---- module manifest (see AGENTS.md key-files) -------------------------
+//
+// Product code is split by domain under engine/; each file owns one slice of
+// the engine and reaches siblings through `pub(super)` items re-exported
+// here. Tests live in sibling files declared `#[cfg(test)]` (their `super`
+// is still this module).
+
+mod agg;
+mod catalog;
+mod classify;
+mod ddl;
+mod dml;
+mod execute;
+mod expr;
+mod join;
+mod journal;
+mod probe;
+mod read_cx;
+mod subst;
+mod targets;
+mod trigger;
+mod types;
+mod window;
+
+use agg::*;
+pub use expr::*;
+use join::*;
+use probe::*;
+pub use read_cx::ReadView;
+pub(crate) use read_cx::*;
+use subst::*;
+use targets::*;
+use trigger::*;
+pub use types::*;
+use window::*;
+
 #[cfg(test)]
 mod complex_query_tests;
 #[cfg(test)]
@@ -2073,33 +2109,3 @@ mod tsql_compat_tests;
 mod tx_rollback_tests;
 #[cfg(test)]
 mod window_tests;
-
-mod read_cx;
-mod types;
-pub use read_cx::ReadView;
-pub(crate) use read_cx::*;
-pub use types::*;
-
-mod agg;
-mod expr;
-mod join;
-mod probe;
-mod subst;
-mod targets;
-mod trigger;
-mod window;
-use agg::*;
-pub use expr::*;
-use join::*;
-use probe::*;
-use subst::*;
-use targets::*;
-use trigger::*;
-use window::*;
-
-mod catalog;
-mod classify;
-mod ddl;
-mod dml;
-mod execute;
-mod journal;
