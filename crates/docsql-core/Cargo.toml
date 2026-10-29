@@ -1,9 +1,12 @@
 [package]
 name = "docsql-core"
-version.workspace = true
+# 版本单独钉住,不继承 workspace:crate 版本随产品 CHANGELOG 节奏发布到
+# crates.io(与 dotnet 包版本对齐),workspace 级 bump 不牵动已发布版本。
+version = "0.9.1"
 edition.workspace = true
 license.workspace = true
 description = "DocSQL embedded core: document storage engine + SQL execution"
+repository = "https://github.com/wjw1-Evan/docsql"
 
 [dependencies]
 thiserror.workspace = true

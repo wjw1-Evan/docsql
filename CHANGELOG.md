@@ -6,6 +6,10 @@
 ## [Unreleased]
 
 ### 变更
+- **crates.io 发布准备**:`docsql-core` 钉版 0.9.1(与 CHANGELOG/dotnet 包版本对齐)+ repository
+  元数据;`docsql-server/cli/web` 标 `publish = false` 防 `--all` 误发;CONTRIBUTING 新增
+  「发布流程」一节(三通道全由 v* tag 驱动,crates.io 为唯一人工步骤:dry-run 已验证
+  58 文件/2.6MiB 打包面可编译);`cargo publish -p docsql-core --dry-run` 通过。
 - **GitHub Releases 二进制分发**(`.github/workflows/release-binaries.yml`):`v*` tag 触发,Linux
   x86_64/aarch64(azurelinux 3.0 容器,与 GHCR 镜像同配方静态 glibc)+ macOS arm64/x86_64,
   产物 tar.gz(`docsql-server`/`docsql-cli`/`docsql-web`)+ `SHA256SUMS` 上传 Release;

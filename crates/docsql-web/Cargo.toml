@@ -2,6 +2,8 @@
 name = "docsql-web"
 version.workspace = true
 edition.workspace = true
+# 应用 crate:不发布 crates.io(cargo publish --all 防误发;二进制走 GitHub Releases)。
+publish = false
 license.workspace = true
 description = "DocSQL web console (REST API + embedded UI)"
 
