@@ -388,7 +388,7 @@ def test_keepalive_does_not_block_on_held_write_lock():
     submod._POLL_SECONDS, submod._KEEPALIVE_POLLS = 0.05, 2
     try:
         t0 = time.monotonic()
-        reader = threading.Thread(target=st._read_frames, daemon=True)
+        reader = threading.Thread(target=st._read_frames, args=(st._generation,), daemon=True)
         reader.start()
         time.sleep(0.4)
         st._closed.set()
@@ -429,7 +429,7 @@ def test_reader_drops_replies_while_stale():
     st._replies_stale = True
     st._control_busy = True  # suppress the keepalive path entirely
     st._conn._transport._poll_results = [(0, RESP_AFFECTED, b"\x00" * 8)]
-    t = threading.Thread(target=st._read_frames, daemon=True)
+    t = threading.Thread(target=st._read_frames, args=(st._generation,), daemon=True)
     t.start()
     time.sleep(0.2)
     st._closed.set()
