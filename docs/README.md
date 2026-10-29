@@ -58,6 +58,7 @@
 | [MVCC 读并发设计](design/003-mvcc-read-concurrency.md) | 快照读分阶段路线、锁兼容矩阵(阶段 A/B 已实施) |
 | [自动故障转移设计](design/004-automatic-failover.md) | QUORUM 多数派栅栏、AUTO_PROMOTE、仲裁者(已实施) |
 | [JSON 路径索引设计](design/005-json-path-indexes.md) | 路径树键提取与查询同源、root_key=索引名(已实施) |
+| [.NET 嵌入式模式设计](design/006-dotnet-embedded-mode.md) | 零守护 SQLite 式体验:方案矩阵(A 子进程违红线/B FFI 推荐/C 裸 server 短期)、ABI 面与红线核对(评估稿) |
 
 ## 五分钟速览
 

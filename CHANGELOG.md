@@ -6,6 +6,10 @@
 ## [Unreleased]
 
 ### 变更
+- **.NET 嵌入式设计稿**(`docs/design/006-dotnet-embedded-mode.md`,评估稿未实现):方案矩阵
+  (A 驱动自动拉起子进程=违红线不推荐 / B FFI 包装 docsql-core=推荐分阶段路线 / C 本地裸 server
+  =短期已交付)+ C ABI 最小面草案 + 红线核对(panic 边界/版本纪律/非目标);limitations 路线表、
+  drivers 收录入口。
 - **crates.io 发布准备**:`docsql-core` 钉版 0.9.1(与 CHANGELOG/dotnet 包版本对齐)+ repository
   元数据;`docsql-server/cli/web` 标 `publish = false` 防 `--all` 误发;CONTRIBUTING 新增
   「发布流程」一节(三通道全由 v* tag 驱动,crates.io 为唯一人工步骤:dry-run 已验证

@@ -53,6 +53,10 @@
 6. **生态**:Kafka/CDC 连接器、全文检索;~~触发器~~ 已落地(SQLite 语法的行级触发器,
    BEFORE/AFTER × INSERT/UPDATE [OF]/DELETE + NEW./OLD. + WHEN + RAISE,语句级原子性、
    级联深度预算、复制确定性建时校验、pg_dump 式 dump 顺序——边界见
-   [features.md 触发器节](features.md#37-触发器) 与 [sql-reference.md](sql-reference.md#create-trigger--drop-trigger))。
+   [features.md 触发器节](features.md#37-触发器) 与 [sql-reference.md](sql-reference.md#create-trigger--drop-trigger));
+7. **.NET 嵌入式(SQLite 式零守护)**:评估稿 [006](design/006-dotnet-embedded-mode.md)——
+   推荐 FFI(C ABI 包装 `docsql-core`)+ NuGet runtimes 资产包路线;「驱动内自动拉起
+   server 子进程」违「生产代码不启动子进程」红线需 owner 裁决才立项;.NET 短期以
+   本地裸 server + host 连接串达成(见 README「无 Docker 快速开始」)。
 
 以上边界均为**显式行为**(报错或文档化策略),不存在静默数据风险;未列出的 SQL 语法一律显式报错。

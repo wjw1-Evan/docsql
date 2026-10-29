@@ -234,6 +234,9 @@ docsql-cli connect 127.0.0.1:7600 --user analyst   # 远程模式:连接 server;
 嵌入式模式把数据库文件直接交给进程内引擎(与 server 同源),无守护进程、无 Docker;第一个
 参数即数据库文件路径。**该文件同一时刻只归属本进程**(见[已知边界](limitations.md))。
 
+Rust 库嵌入与 .NET 嵌入路线评估:[设计 006 · .NET 嵌入式模式](design/006-dotnet-embedded-mode.md)
+(.NET 短期以本地裸 server 达成;FFI 零守护为此设计路线图,评估稿未实现)。
+
 交互细节:`exit`/`quit`/`help` 大小写不敏感、可带可不带分号(嵌入与远程模式行为一致,
 脚本末尾的 `exit;` 行在两种模式下都正常结束);sqlite3/psql 风格元命令(`.exit`、`\q`)不
 支持,会给出提示而非 SQL 解析错误;交互终端(stdin 与 stdout 均为 tty)提供行编辑与
