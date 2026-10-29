@@ -1,0 +1,22 @@
+[package]
+name = "docsql-ffi"
+# 版本跟随产品节奏(与 docsql-core / dotnet 包一致),但本 crate 只作为
+# 原生库随 GitHub Releases 二进制分发,不经 crates.io 发布。
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "DocSQL C ABI: embed the engine in-process (libdocsql_embedded)"
+
+[lib]
+# `docsql_embedded` → libdocsql_embedded.{so,dylib} / docsql_embedded.dll,
+# the name the .NET client's DllImport resolver looks for.
+name = "docsql_embedded"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+docsql-core = { path = "../docsql-core" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

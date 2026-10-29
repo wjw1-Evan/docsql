@@ -275,6 +275,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "docsql-ffi"
+version = "0.1.0"
+dependencies = [
+ "docsql-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "docsql-server"
 version = "0.1.0"
 dependencies = [

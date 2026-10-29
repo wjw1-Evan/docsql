@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/docsql-core",
+    "crates/docsql-ffi",
     "crates/docsql-server",
     "crates/docsql-web",
     "crates/docsql-cli",
