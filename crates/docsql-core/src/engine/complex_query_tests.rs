@@ -2069,3 +2069,87 @@ fn newid_inside_subquery_of_write_rejected() {
     let r = rows(&mut db, "SELECT COUNT(*) FROM t");
     assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
 }
+
+/// Regression: a derived table whose inner projection uses QUALIFIED column
+/// names (`SELECT "p"."Id" …`) must expose bare output keys (`Id`). Kept
+/// qualified, the outer reference `p0.Id` missed the direct key and fell
+/// through `lookup_col`'s join suffix scan onto the RIGHT side's same-named
+/// column (`c.Id`), so a LEFT JOIN could pair a post with another post's
+/// comment. EF Core's `Include` emits exactly this shape.
+#[test]
+fn derived_table_qualified_projection_stays_bare_named() {
+    let mut db = Database::in_memory().unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE posts (id INT AUTOINCREMENT PRIMARY KEY, title VARCHAR)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE comments (id INT AUTOINCREMENT PRIMARY KEY, post_id INT, body VARCHAR)",
+    );
+    run(&mut db, "INSERT INTO posts (title) VALUES ('p1')");
+    run(&mut db, "INSERT INTO posts (title) VALUES ('p2')");
+    run(
+        &mut db,
+        "INSERT INTO comments (post_id, body) VALUES (1, 'c1')",
+    );
+
+    // The EF Include shape: derived table on the LEFT of a LEFT JOIN, no
+    // comment for the selected post → right columns must be NULL, and the
+    // left Id must be post 2 (not the comment's Id 1).
+    let r = rows(
+        &mut db,
+        "SELECT p0.id, p0.title, c.id, c.body
+           FROM (SELECT \"p\".\"id\", \"p\".\"title\" FROM posts AS \"p\"
+                  WHERE \"p\".\"title\" = 'p2' LIMIT 1) AS p0
+           LEFT JOIN comments AS c ON p0.id = c.post_id
+           ORDER BY p0.id",
+    );
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Int(2),
+            Value::Str("p2".into()),
+            Value::Null,
+            Value::Null
+        ]]
+    );
+
+    // A matching child still pairs normally (the earlier false match was
+    // only visible when Ids collided).
+    let r = rows(
+        &mut db,
+        "SELECT p0.id, c.body
+           FROM (SELECT \"p\".\"id\" FROM posts AS \"p\" WHERE \"p\".\"title\" = 'p1') AS p0
+           LEFT JOIN comments AS c ON p0.id = c.post_id",
+    );
+    assert_eq!(r.rows, vec![vec![Value::Int(1), Value::Str("c1".into())]]);
+
+    // Bare (unqualified) reference to the derived output also resolves.
+    let r = rows(
+        &mut db,
+        "SELECT id FROM (SELECT \"p\".\"id\" FROM posts AS \"p\"
+                          WHERE \"p\".\"title\" = 'p2') AS p0",
+    );
+    assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+}
+
+/// Same contract for CTE bodies: qualified inner projections are addressed
+/// by their bare output name through the CTE alias.
+#[test]
+fn cte_qualified_projection_stays_bare_named() {
+    let mut db = Database::in_memory().unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE posts (id INT AUTOINCREMENT PRIMARY KEY, title VARCHAR)",
+    );
+    run(&mut db, "INSERT INTO posts (title) VALUES ('p1')");
+    run(&mut db, "INSERT INTO posts (title) VALUES ('p2')");
+    let r = rows(
+        &mut db,
+        "WITH recent AS (SELECT \"p\".\"id\", \"p\".\"title\" FROM posts AS \"p\"
+                          WHERE \"p\".\"title\" = 'p2')
+         SELECT r.id, r.title FROM recent AS r",
+    );
+    assert_eq!(r.rows, vec![vec![Value::Int(2), Value::Str("p2".into())]]);
+}

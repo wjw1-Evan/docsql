@@ -1,5 +1,36 @@
 use super::*;
 
+/// Output column keys for a derived table / CTE row: the **bare** column
+/// name (`p.Id` → `Id`), matching every SQL dialect's subquery output
+/// naming.
+///
+/// Why this matters: a derived table's rows are keyed exactly like these
+/// names, while every other FROM factor is qualified with its own alias by
+/// `load_from` (`p0.Id`). Leaking the inner projection's qualified spelling
+/// (`p.Id`) into the row meant an outer reference `p0.Id` missed the direct
+/// key lookup and fell through `lookup_col`'s join suffix scan — where the
+/// RIGHT side's same-named column can win the BTreeMap order
+/// (`c.Id` < `p.Id`). EF Core's `Include` emits exactly this shape
+/// (`SELECT p0.Id … FROM (SELECT "p"."Id" …) AS p0 LEFT JOIN Comments c …`),
+/// so a post with zero comments used to read the comment's Id/values.
+/// Explicit aliases (`AS pid`) are unaffected (no dot to strip).
+///
+/// A duplicate bare name keeps the original qualified spelling for the
+/// later occurrence, so ambiguous inner projections stay lossless instead
+/// of silently overwriting a column.
+pub(super) fn output_doc_keys(columns: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    columns
+        .iter()
+        .map(|c| match c.rfind('.') {
+            Some(i) if i + 1 < c.len() && seen.insert(c[i + 1..].to_string()) => {
+                c[i + 1..].to_string()
+            }
+            _ => c.clone(),
+        })
+        .collect()
+}
+
 impl<'a> ReadCx<'a> {
     /// WITH <cte> AS (...), ...: materialize each CTE (they can reference
     /// earlier ones) into a statement-local map on top of `base` — owned by
@@ -34,13 +65,14 @@ impl<'a> ReadCx<'a> {
                 return err("CTE body must be a SELECT");
             };
             let alias_columns = table_alias_columns(&cte.alias.columns, r.columns.len())?;
+            let keys = match &alias_columns {
+                Some(cols) => cols.clone(),
+                None => output_doc_keys(&r.columns),
+            };
             let docs: Vec<Object> = r
                 .rows
                 .into_iter()
-                .map(|row| match &alias_columns {
-                    Some(cols) => cols.iter().cloned().zip(row).collect(),
-                    None => r.columns.iter().cloned().zip(row).collect(),
-                })
+                .map(|row| keys.iter().cloned().zip(row).collect())
                 .collect();
             ctes.insert(name, docs);
         }
@@ -700,5 +732,28 @@ impl<'a> ReadCx<'a> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_doc_keys;
+
+    #[test]
+    fn qualified_projection_names_become_bare() {
+        assert_eq!(
+            output_doc_keys(&["p.Id".into(), "p.Title".into(), "pid".into()]),
+            vec!["Id".to_string(), "Title".to_string(), "pid".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_bare_names_keep_the_qualified_spelling() {
+        // SELECT p.Id, c.Id inside one derived table: the second keeps its
+        // qualifier instead of overwriting the first column.
+        assert_eq!(
+            output_doc_keys(&["p.Id".into(), "c.Id".into()]),
+            vec!["Id".to_string(), "c.Id".to_string()]
+        );
     }
 }

@@ -1111,7 +1111,7 @@ SQLite 兼容的 DDL 自省视图(EF Core schema 同步使用),行:`type`(`table
 
 ## T-SQL 数据操作实例
 
-以下实例基于同一个办公用品订单库,全部在本引擎上实测通过(关键输出以 `-- →` 注释摘录)。嵌入式 CLI(`docsql <db>`)、`docsql-cli connect` 远程会话、控制台 SQL 编辑器均可执行;`PRINT` 消息在远程会话落在服务进程 stderr(嵌入式 CLI 打到本地 stdout)。约定:在 CTE/派生表里引用带表别名的列时显式写 `AS 别名`(当前不带别名的限定列名会原样物化,外层同名引用得到 NULL)。
+以下实例基于同一个办公用品订单库,全部在本引擎上实测通过(关键输出以 `-- →` 注释摘录)。嵌入式 CLI(`docsql <db>`)、`docsql-cli connect` 远程会话、控制台 SQL 编辑器均可执行;`PRINT` 消息在远程会话落在服务进程 stderr(嵌入式 CLI 打到本地 stdout)。派生表/CTE 的输出列名按 SQL 标准取**裸列名**(`SELECT p.Id …` 在派生表内输出 `Id`,带 `AS 别名` 时用别名),外层用 `别名.列` 或裸 `列` 引用都能解析。
 
 **准备数据**
 

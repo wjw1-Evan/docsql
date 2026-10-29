@@ -241,13 +241,14 @@ impl<'a> ReadCx<'a> {
                     Some(a) => table_alias_columns(&a.columns, r.columns.len())?,
                     None => None,
                 };
+                let keys = match &alias_columns {
+                    Some(cols) => cols.clone(),
+                    None => super::subquery::output_doc_keys(&r.columns),
+                };
                 let docs: Vec<Object> = r
                     .rows
                     .into_iter()
-                    .map(|row| match &alias_columns {
-                        Some(cols) => cols.iter().cloned().zip(row).collect(),
-                        None => r.columns.iter().cloned().zip(row).collect(),
-                    })
+                    .map(|row| keys.iter().cloned().zip(row).collect())
                     .collect();
                 let alias = alias
                     .as_ref()

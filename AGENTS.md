@@ -13,7 +13,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 | `crates/docsql-cli` | 嵌入式/远程 SQL shell |
 | `crates/docsql-ffi` | C ABI(库名 `docsql_embedded`):进程内引擎会话/事务守门/JSON 结果桥;.NET `Data Source=…` 的原生库 |
 | `crates/docsql-web` | REST API + 内嵌单页控制台(`console.html` 经 `include_str!`) |
-| `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/BlogSample(博客示例:嵌入式/远程双形态)、samples/AspireSample(AppHost 示例) |
+| `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/BlogSample(博客示例:嵌入式/远程双形态)、samples/BlogWeb(博客前端:最小 API + 内置单页,嵌入式 `Data Source=`)、samples/AspireSample(AppHost 示例) |
 | `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile;`run-tests.sh` 部署测试入口 |
 | `python/` | DB-API 2.0 Python 驱动(纯标准库;`qmark` 服务端绑定 + 精确标量 `$dec`/`$ts`/`$bytes` + TLS/`DOCSQL_KEY` + `Subscriber` 断线续传);pytest 起真实 server(`cargo build -p docsql-server` 先行) |
 
@@ -87,6 +87,8 @@ ZCode 的 Mimosa 插件对 commit/push 做 L3 静态扫描,**native 引擎对任
 21. **堆溢出链(>4KB 文档)** — 超页文档主页槽存 `[0xFF][total:u32][chain_head:u32][内联前缀]`,其余沿 `0xFE` 链页(`next:u32`+`len:u16`+载荷);`0xFE/0xFF` 是 encode 永不产生的字节,读取端按槽首字节判别,**旧卷字节级兼容**;链页回收进 `TableMeta.overflow_free`(catalog 持久化)优先复用;硬上限 `MAX_DOC_SIZE`=16MiB。改 heap 相关代码:一切读槽走 `slot_document_bytes`(防环/截断校验),新存储布局禁止使用 encode tag 0..=7 的首字节。设计见 `docs/design/002-overflow-page-chains.md`。
 
 22. **嵌入式(FFI / .NET `Data Source=…`)— 单进程单引擎,守门不越界** — `crates/docsql-ffi`(库名 `docsql_embedded`)把引擎挂进宿主进程:.NET 连接串写文件路径即在进程内执行,**不 spawn 子进程、不开端口**(方案 A「驱动拉起 server」仍在红线外,需 owner 显式重定)。进程级注册表按**规范化路径**收敛为唯一引擎;锁序固定 **gate(owner)→db.write**,读路径 `read_view()` 微秒读锁后 `ReadView::execute` 全程锁外(读不阻塞写);**事务开启期间读级必须让位**(owner 的 SELECT 走 gated 写路径才看得见自己未提交的写,与 server 的 `classify_read_eligible` 同规——别加「读也并发」的捷径);跨会话语句在 owner 事务期间按调用方 timeout(缺省 30s)排队后响亮报错;panic 必须在 C 边界 `catch_unwind` 收敛(跨 FFI unwind = UB);结果 JSON 必须经 `json::to_string`(与 RESP_ROWS 的 `$dec`/`$bytes`/`$ts`/`$float` 标记同源),.NET 侧以同一 `Frame` 语义消费;参数渲染只许 `docsql_core::bind`;pub/sub、PROMOTE、备份、集群、T-SQL 批会话在嵌入态显式报错;数据文件单进程归属边界不变(FFI 不加跨进程锁)。原生库发现顺序(`DOCSQL_EMBEDDED_NATIVE` → `runtimes/<rid>/native` → 应用目录 → `target/{debug,release}`)与 ABI 版本拒绝见 `dotnet/Docsql.Client/Embedded.cs`,设计见 `docs/design/006-dotnet-embedded-mode.md`。
+
+23. **派生表/CTE 输出列名 = 裸列名** — `subquery::output_doc_keys` 把内层投影的限定名(`p.Id`)归一成裸列名(`Id`;显式 `AS` 别名优先,裸名重名时后者保留限定形式,保证不丢列)。原因:派生表行键即输出列名,而 `load_from` 会按因子别名再 qualify(`p0.Id`);若行键残留 `p.Id`,外层 `p0.Id` 直接查键失败后落入 `lookup_col` 的 JOIN 后缀回退,可能按 BTreeMap 顺序命中**右表同名列**(`c.Id` < `p.Id`)——EF Core `Include` 的 `SELECT p0.Id … FROM (…) p0 LEFT JOIN Comments c` 曾因此把零评论文章配上别人的评论行。改表因子/投影命名时:任何从 `QueryResult.columns` 构造行文档的地方都走 `output_doc_keys`,别直接 `columns.zip(row)`。
 
 ## 性能基准测试规范
 
