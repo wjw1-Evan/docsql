@@ -9,11 +9,12 @@ DocSQL 能力的完整清单与索引入口。语法细节见 [SQL 参考](sql-r
 | 形态 | 说明 |
 |---|---|
 | Docker 单节点 | 一个 `docsql-server` 容器 + 可选 `docsql-web` 控制台;命名卷持久化 |
+| **嵌入式(SQLite 式,无容器)** | `docsql-core` 引擎库进程内嵌入(`Database::open` / `:memory:`,Rust 直接 cargo 依赖);`docsql-cli <file.db>` 单文件直开;单二进制 `docsql-server` 本地裸跑,.NET/EF/控制台直连。同一数据文件同一时刻归属一个进程(见[已知边界](limitations.md)) |
 | 对等集群 | `DOCSQL_PEERS` 互扇出,任意节点可读写;写入自动复制到全部对等节点 |
 | 主从复制 | `DOCSQL_REPLICATE_TO` 指向主节点,副本只读,主写自动转发 |
 | 只读副本 / 提升 | `DOCSQL_READ_ONLY=1` 整节点只读;`PROMOTE`(协议帧/CLI/控制台)清除只读 |
 | Aspire 编排 | `AddDocsql` / `AddDocsqlCluster`,连接串注入消费项目;见 [Aspire 指南](aspire.md) |
-| 嵌入式(开发) | `docsql-cli <file.db>` 直接打开数据文件;运行形态仍以 Docker 为准 |
+| 嵌入式(开发) | `docsql-cli <file.db>` 直接打开数据文件;线程内单引擎,同文件不跨进程,见[运行形态](#1-运行形态)嵌入式行 |
 
 ## 2. 数据模型与类型
 

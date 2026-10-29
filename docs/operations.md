@@ -1,8 +1,8 @@
 # 运维手册
 
-运行仅依赖 Docker。本文覆盖部署拓扑、数据持久化、扩容与修复、备份恢复、环境变量、监控与
-CLI;日常使用入口见 [README](../README.md),Aspire 编排见 [Aspire 集成指南](aspire.md),
-安全配置见[安全指南](security.md)。
+容器部署是集群与服务端的推荐形态。本文覆盖部署拓扑、数据持久化、扩容与修复、备份恢复、环境变量、
+监控与 CLI;嵌入式与无容器裸跑见下方[无容器运行](#无容器运行),日常使用入口见
+[README](../README.md),Aspire 编排见 [Aspire 集成指南](aspire.md),安全配置见[安全指南](security.md)。
 
 ## 部署拓扑
 
@@ -33,6 +33,30 @@ cd deploy && docker compose -f docker-compose.prod.yml --profile cluster up -d
   的 CI 与本地开发共用同一变量);tag 仍走 `DOCSQL_DEV_IMAGE_TAG`。
 - 节点与控制台镜像 tag 分别由 `DOCSQL_DEV_IMAGE_TAG`(默认 `local`)与 `DOCSQL_IMAGE_TAG`
   (生产 `.env`,默认 `latest`)控制,两栈互不影响。
+
+## 无容器运行
+
+三个独立二进制(`docsql-server` / `docsql-cli` / `docsql-web`)本来就不依赖 Docker;离线
+运行形态:
+
+```bash
+# 嵌入式 CLI:直开数据文件(SQLite 使用姿势),无守护进程
+docsql-cli todos.db -f init.sql --json
+
+# 本地 server:参数 [db路径] [listen],默认 docsql.db + 127.0.0.1:7600(回环)
+./docsql-server todos.db 127.0.0.1:7600
+# 可选凭据与加密(语义与容器同形):DOCSQL_TOKEN / DOCSQL_TLS_CERT+KEY / DOCSQL_KEY …
+
+# 可选本地控制台(纯管理工具,指向任意节点):docsql-web [managed-node] [listen]
+./docsql-web 127.0.0.1:7600 127.0.0.1:7700
+```
+
+- `DOCSQL_*` 环境变量与容器运行完全同形(见[环境变量(运维相关)](#环境变量运维相关)一节);备份、审计、
+  TLS、pub/sub 等能力一致;
+- **数据文件单进程归属**:同一 `db` 文件同一时刻只能由一个进程打开(引擎无跨进程文件锁;
+  多客户端并发请连本地 server);
+- 配 `DOCSQL_PEERS` 的同款裸二进制也能组对等集群(交互细节:join/repair 行为与容器一致);
+- 二进制获取:GitHub Releases(见 README「下载」)/ 本地 `cargo build --release -p docsql-server -p docsql-cli -p docsql-web`。
 
 ## 数据持久化与清理
 

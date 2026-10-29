@@ -1,9 +1,10 @@
 # DocSQL
 
-Rust 原生文档数据库:JSON 文档存储 + 完整 SQL + Web 管理控制台 + ADO.NET / EF Core 客户端 + 对等集群复制。**运行仅 Docker**(镜像由 CI 发布至 GHCR)。
+Rust 原生文档数据库:JSON 文档存储 + 完整 SQL + Web 管理控制台 + ADO.NET / EF Core 客户端 + 对等集群复制。**可以像 SQLite 一样嵌入使用**(Rust 库进程内嵌入 / CLI 单文件直开,无 Docker 无守护进程),也支持单二进制裸跑 server 与 Docker/集群部署。
 
 ## 特性一览
 
+- **嵌入式(SQLite 式)** — `docsql-core` 引擎库进程内嵌入(`Database::open` / `:memory:`),`docsql-cli <file.db>` 单文件直开;同一数据文件同一时刻归属一个进程,多客户端走本地 server
 - **文档存储** — JSON 文档整体存储,无强制 schema;手写分页器 + B+ 树索引 + WAL 崩溃恢复
 - **完整 SQL** — DDL/DML/JOIN/聚合/**窗口函数**/事务(SAVEPOINT)/视图/CTAS;精确 `DECIMAL`、`BLOB`、JSON 函数、多列索引、GUID 主键(自动生成 UUIDv7,时序有序)、Oracle 兼容层(DUAL/ROWNUM/NVL 等);未实现的语法一律显式报错,不静默降级
 - **集群** — `DOCSQL_PEERS` 对等复制(任意节点可写)、新节点自动 join 同步、重启反熵修复、主从写转发 + PROMOTE 故障转移
@@ -15,6 +16,38 @@ Rust 原生文档数据库:JSON 文档存储 + 完整 SQL + Web 管理控制台 
 各项能力的完整说明与示例见[功能总览](docs/features.md)。
 
 ## 快速开始
+
+### 无 Docker:嵌入式 / 本地二进制(SQLite 式)
+
+```rust
+// 1a. Rust 项目:进程内嵌入(引擎库与官方 server 同源,全部 SQL 能力可用)
+//     Cargo.toml: docsql-core = { git = "https://github.com/wjw1-Evan/docsql" }
+//     (已发布 crates.io 后可直接用版本号,见 CONTRIBUTING 的发布流程)
+use docsql_core::engine::{Database, ExecOutcome};
+
+let mut db = Database::open(std::path::Path::new("todos.db"))?; // 或 Database::in_memory()?
+db.execute("CREATE TABLE todos (id INT AUTOINCREMENT PRIMARY KEY, title VARCHAR, done BOOLEAN)")?;
+db.execute("INSERT INTO todos (title, done) VALUES ('写方案', true)")?;
+let rows = match db.execute("SELECT id, title, done FROM todos WHERE done = FALSE")? {
+    ExecOutcome::Rows(r) => r,   // r.columns: Vec<String>,r.rows: Vec<Vec<Value>>
+    ExecOutcome::Affected(n) => unreachable!("SELECT 不会返回 Affected({n})"),
+};
+```
+
+```bash
+# 1b. CLI 单文件 shell(SQLite 使用姿势):Rust 嵌入引擎的交互式同款体验
+docsql-cli todos.db -f init.sql     # 脚本批执行;--csv / --json 导出;also :memory: 内存模式
+
+# 1c. 单二进制本地 server + .NET(默认 docsql.db + 127.0.0.1:7600 回环监听,无容器)
+./docsql-server todos.db 127.0.0.1:7600
+#  EF Core / ADO.NET 连接串即 host+port:
+services.AddDbContext<TodoDb>(o => o.UseDocsql("host=127.0.0.1;port=7600"));
+```
+
+> 边界:一个数据文件同一时刻只归属一个进程(引擎无跨进程锁,SQLite 式任意多进程打开不适用)。
+> 需要多客户端并发请用 1c 的本地 server,或集群部署。
+
+### Docker(集群与服务端部署)
 
 ```bash
 # 1. 首次部署先建数据卷(一次性;external 卷,重建容器不丢数据)

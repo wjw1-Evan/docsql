@@ -5,7 +5,12 @@
 
 ## [Unreleased]
 
-(暂无)
+### 变更
+- **嵌入式第一公民(无 Docker 快速路径)**:README 与文档修正「运行仅 Docker」的旧定位——
+  `docsql-core` Rust 库进程内嵌入(`Database::open` / `:memory:`)、`docsql-cli <file.db>`
+  单文件直开、`docsql-server` 单二进制裸跑(默认 `docsql.db` + `127.0.0.1:7600` 回环)写入
+  快速开始/运行形态/运维手册/drivers;明示硬边界「同一数据文件同一时刻只归属一个进程」
+  ([已知边界](docs/limitations.md))。
 
 ## [0.9.1] - 2026-10-11
 

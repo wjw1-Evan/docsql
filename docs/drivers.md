@@ -222,13 +222,17 @@ builder.AddDocsqlConnection("docsql");       // 注册 transient DocsqlConnectio
 ## CLI(docsql-cli)
 
 ```
-docsql connect 127.0.0.1:7600 --user analyst   # 密码走 DOCSQL_PASSWORD 或交互提示;--user 缺值是用法错误(不静默降级匿名)
+docsql-cli todos.db -f init.sql                    # 嵌入式模式:直开数据文件(SQLite 使用姿势,:memory: 内存模式)
+docsql-cli connect 127.0.0.1:7600 --user analyst   # 远程模式:连接 server;密码走 DOCSQL_PASSWORD 或交互提示;--user 缺值是用法错误(不静默降级匿名)
   --csv / --json        行导出(RFC 4180 CSV / JSON 对象数组;启动横幅走 stderr,批处理 stdout 恒为纯格式文档)
   --table               对齐表格输出(默认;按终端显示宽度对齐,CJK 双宽字符不再错位)
   -f script.sql         脚本批执行(错误即退出 1)
   -V, --version         版本号
   help;                 内联命令帮助(含 pub/sub 命令面)
 ```
+
+嵌入式模式把数据库文件直接交给进程内引擎(与 server 同源),无守护进程、无 Docker;第一个
+参数即数据库文件路径。**该文件同一时刻只归属本进程**(见[已知边界](limitations.md))。
 
 交互细节:`exit`/`quit`/`help` 大小写不敏感、可带可不带分号(嵌入与远程模式行为一致,
 脚本末尾的 `exit;` 行在两种模式下都正常结束);sqlite3/psql 风格元命令(`.exit`、`\q`)不
