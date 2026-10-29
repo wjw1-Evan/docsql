@@ -66,6 +66,17 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 
 > GHCR 镜像包默认不可匿名拉取,先 `docker login ghcr.io`。本地开发(源码构建)与扩展节点(`join` profile 自动拉取全量历史)见[运维手册](docs/operations.md)。彻底清数据唯一入口 `./deploy/reset-data.sh`。
 
+## 下载
+
+无 Docker 快速路径所需二进制随 `v*` tag 发布到 [GitHub Releases](https://github.com/wjw1-Evan/docsql/releases),每个平台一个 tar.gz(内含 `docsql-server` / `docsql-cli` / `docsql-web` 三个二进制)与 `SHA256SUMS`:
+
+| 平台 | 形态 |
+|---|---|
+| `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` | 静态 glibc(glibc 2.38 配方,与 GHCR scratch 镜像逐字节同源);Windows 走 WSL 或容器 |
+| `aarch64-apple-darwin` / `x86_64-apple-darwin` | 原生构建 |
+
+Rust 库 `docsql-core` 另发布到 crates.io(流程见[贡献指南](CONTRIBUTING.md))。
+
 ## 文档导航
 
 按任务找文档的完整对照表见 [docs/README.md](docs/README.md)(描述单点维护,避免两处漂移):

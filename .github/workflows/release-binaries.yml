@@ -1,0 +1,135 @@
+name: release-binaries
+
+# GitHub Releases 二进制分发(无 Docker 快速路径):推送 v* tag(或手动)时构建
+# 三个二进制并上传 Release。与 GHCR 镜像同一套配方与门禁(镜像构建本身已含
+# cargo test,本次工作流只负责产物分发):
+# - Linux(x86_64 / aarch64):azurelinux 3.0 容器内构建,glibc 静态链接 —— 与
+#   runtime=scratch 的 GHCR 镜像逐字节同源;
+# - macOS(arm64 原生 + x86_64 交叉):普通 release 构建;
+# - Windows 暂不发布(README 明示走 WSL/容器)。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 与 Dockerfile 的 rustup 工具链一致(1.98.1)。
+  TOOLCHAIN: 1.98.1
+
+jobs:
+  linux:
+    name: linux · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runs-on: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runs-on }}
+    container: mcr.microsoft.com/azurelinux/base/core:3.0
+    env:
+      # Target-scoped RUSTFLAGS(而非全局 env)让宿主产物 proc-macro 动态链接,
+      # 仅目标二进制走 crt-static —— 与 Dockerfile 同一配方,勿合并进 RUSTFLAGS。
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
+      # 本机到 crates.io/rustup 间歇 HTTP/2 重置(与 Dockerfile 同款防护)。
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain(与镜像构建同款:azurelinux + rustup)
+        run: |
+          tdnf install -y gcc binutils glibc-devel libstdc++-devel ca-certificates curl tar gzip which glibc-static && tdnf clean all
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$TOOLCHAIN" --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build(测试门禁由 docker-image.yml / 本地 cargo test 承担,这里只构建)
+        run: |
+          cargo build --release --target "${{ matrix.target }}" \
+            -p docsql-server -p docsql-cli -p docsql-web
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="docsql-${version}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" \
+              -czf "/tmp/${name}" docsql-server docsql-cli docsql-web
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: /tmp/docsql-*.tar.gz
+
+  macos:
+    name: macos · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-14
+    env:
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain + 交叉 target
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build
+        run: |
+          cargo build --release --target "${{ matrix.target }}" \
+            -p docsql-server -p docsql-cli -p docsql-web
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="docsql-${version}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" \
+              -czf "/tmp/${name}" docsql-server docsql-cli docsql-web
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: /tmp/docsql-*.tar.gz
+
+  release:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+
+      - name: 聚合校验和(SHA256SUMS 单一资产)
+        run: |
+          cd dist
+          sha256sum docsql-*.tar.gz > SHA256SUMS
+          ls -la
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            "v"*) ;;  # 只有 v* tag 上传;workflow_dispatch 在分支/默认 ref 上只产出 artifact
+            *) echo "::notice::手动触发且 ref 非 v* tag($tag),跳过 Release 上传"; exit 0 ;;
+          esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 二次重跑:上传覆盖(--clobber),不动既有发布说明。
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "DocSQL $tag" \
+              --notes "二进制分发(v${GITHUB_REF_NAME#v}):每个平台一个 tar.gz(docsql-server / docsql-cli / docsql-web)+ SHA256SUMS。Linux 静态 glibc(与 GHCR 镜像同配方);macOS 原生;Windows 暂不发布。Rust 库与 NuGet 包的发布流程见 CONTRIBUTING.md。"
+          fi

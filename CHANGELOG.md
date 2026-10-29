@@ -6,6 +6,10 @@
 ## [Unreleased]
 
 ### 变更
+- **GitHub Releases 二进制分发**(`.github/workflows/release-binaries.yml`):`v*` tag 触发,Linux
+  x86_64/aarch64(azurelinux 3.0 容器,与 GHCR 镜像同配方静态 glibc)+ macOS arm64/x86_64,
+  产物 tar.gz(`docsql-server`/`docsql-cli`/`docsql-web`)+ `SHA256SUMS` 上传 Release;
+  手动触发于非 tag ref 只产出 artifact 不上传。README 增「下载」一节。
 - **嵌入式第一公民(无 Docker 快速路径)**:README 与文档修正「运行仅 Docker」的旧定位——
   `docsql-core` Rust 库进程内嵌入(`Database::open` / `:memory:`)、`docsql-cli <file.db>`
   单文件直开、`docsql-server` 单二进制裸跑(默认 `docsql.db` + `127.0.0.1:7600` 回环)写入
