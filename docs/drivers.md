@@ -1,5 +1,13 @@
 # 客户端与驱动
 
+> **引用包 ≠ 启动数据库**:`Docsql.Client` / `Docsql.EntityFrameworkCore` /
+> `Docsql.Aspire.*` 都是纯网络协议客户端,装包不会在进程里启动任何数据库 ——
+> server 由部署形态负责(本地裸二进制一行 / compose / Aspire AppHost 拉容器;
+> 演示程序 `EfSample` 是唯一的例外,它自己拉起本地 server 供示例跑通)。
+> 装包后「自动」发生的只有连接级行为:EF 首命令前的懒建表/索引同步、连接池、
+> 服务端 prepared statements。真·零守护(引用即嵌)见
+> [设计 006](design/006-dotnet-embedded-mode.md)(评估稿)。
+
 ## 安装(四个 NuGet 包,GitHub Packages)
 
 包发布在 GitHub Packages 源 `https://nuget.pkg.github.com/wjw1-Evan/index.json`(读取需 GitHub
