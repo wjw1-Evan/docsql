@@ -1987,6 +1987,26 @@ mod tests {
     }
 
     #[test]
+    fn data_file_format_magic_is_pinned() {
+        // 商用升级契约:数据文件格式版本就是 MAGIC 的尾位(P1)。任何落盘
+        // 格式变更都必须显式升版本(P2)并配套迁移说明 —— 本测试钉住常量,
+        // 防止格式悄悄变化而版本号不动(旧二进制会静默误读新文件,版本号
+        // 动了则旧二进制响亮拒绝,见 newer_data_file_version_is_rejected)。
+        assert_eq!(MAGIC, b"DOCSQLP1");
+    }
+
+    #[test]
+    fn newer_data_file_version_is_rejected_loudly() {
+        // 升级安全的另一半:旧二进制遇到新格式文件(P2)必须响亮拒绝,
+        // 绝不静默误读(那会把新版本写入当成垃圾改写)、绝不 panic。
+        let (_dir, path) = tmp_db("future.db");
+        let mut header = encode_header(3);
+        header[..8].copy_from_slice(b"DOCSQLP2");
+        std::fs::write(&path, header).unwrap();
+        assert!(matches!(Pager::open(&path), Err(PagerError::BadHeader)));
+    }
+
+    #[test]
     fn out_of_range_write_and_meta() {
         let (_dir, path) = tmp_db("meta.db");
         let pager = Pager::open(&path).unwrap();

@@ -169,6 +169,50 @@ docker compose -f docker-compose.prod.yml --profile cluster --profile lb up -d  
 
 备份状态在 `REQ_STATUS.backup` 与控制台备份页可见;每次备份成败写入同步日志。
 
+## 版本升级与回滚
+
+**数据格式兼容承诺**:数据文件头 16 字节携带格式版本(`MAGIC = DOCSQLP1`,版本即尾位)。
+同一格式版本内,**新版本二进制读取旧数据文件向后兼容**(恢复/WAL 重放/目录演进均就地完成);
+**旧二进制遇到新格式文件响亮拒绝**(open 即 `BadHeader`,绝不静默误读或改写)——所以升级期间
+唯一要避免的形态是「回滚到旧二进制 + 已被新版本写过的数据卷」:先回镜像,数据卷若已被更高
+格式版本写过,必须连带恢复一份升级前的备份(备份是逻辑快照,任何格式版本都能重放)。
+
+**升级前检查清单**:
+
+1. 确认最新备份存在且校验通过(控制台备份页 / `REQ_STATUS.backup`;备份自带 `.sha256` sidecar,恢复前强校验);
+2. 手动触发一次备份(`POST /api/backup`,带 JSON 体 `{}`)以保证回滚点覆盖当前数据;
+3. 记录当前镜像 tag(compose `.env` 的 `DOCSQL_IMAGE_TAG`)与健康基线(`GET /api/status`、健康检查);
+4. 集群形态确认全部节点升到同一镜像(混跑新旧版本期间,写入落在任一节点都会复制到全部节点,格式版本内互通)。
+
+**单节点升级**:
+
+```bash
+cd deploy
+docker compose -f docker-compose.prod.yml --profile single pull
+docker compose -f docker-compose.prod.yml --profile single up -d
+# 验证:健康检查转 healthy;GET /api/stats 与业务探活;数据卷 external,升级不动数据
+```
+
+**集群滚动升级**(逐节点;集群对重启自愈:反熵修复 + 期刊追赶,期间写入落幸存节点):
+
+```bash
+for n in docsql-a docsql-b docsql-c; do
+  docker stop $n
+  docker compose -f docker-compose.prod.yml --profile cluster up -d $n
+  # 每节点等 healthcheck 转 healthy 再继续下一个
+done
+```
+
+**回滚**:
+
+1. 镜像回退:`DOCSQL_IMAGE_TAG=<上一版本>` 重新 `up -d`;
+2. 若新版本已写入且旧版本拒绝启动该数据卷(启动日志出现 `BadHeader`):恢复升级前备份——
+   按上文「手工归档/重放」用 `docsql-cli` 重放备份脚本(逻辑快照跨格式版本可重放);
+3. 回滚后验证行数/表摘要与升级前基线一致。
+
+**升级后验证**:健康检查转 healthy、`REQ_STATUS` 各 peer 摘要一致且 `replay_failures=0`、
+业务读写探活、备份页出现新备份点。
+
 ## 环境变量(运维相关)
 
 ### 认证与传输

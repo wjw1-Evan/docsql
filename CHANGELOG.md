@@ -46,8 +46,47 @@
   现在派生表/CTE 输出列按 SQL 标准取裸列名(显式 `AS` 别名优先,裸名重名时后者保留限定
   形式),外层 `别名.列` 与裸列都可解析。回归:`complex_query_tests` 2 条 + `subquery`
   单元测试 2 条。
+- **QUALIFY 引用投影别名静默出错**:`… ROW_NUMBER() OVER (…) AS rn … QUALIFY rn = 1` 曾把
+  裸别名按缺失行键求值为 NULL,谓词静默过滤全部行(裸窗口调用形式正常、别名拼写是文档承诺的
+  DuckDB/Snowflake 形态)。QUALIFY 现按源列优先原则代入投影别名(名字被声明列或行键占用时
+  按列解读),代入后的窗口调用折叠到共享计算列不重算;链式别名有界多趟,自引用环封顶。回归
+  `qualify_resolves_projection_aliases` 四形状。
+- **CLI `-f` 脚本/远程循环把触发器 DDL 拆碎**:`CREATE TRIGGER … BEGIN INSERT…; END` 曾报
+  `trigger body is empty` —— `needs_interpretation` 把批解析器读不懂的块一律路由进批解释器,
+  触发器体的分号使其必然解析失败、再被按体分号切碎。改为分层:先经 core `split_statements`
+  吸合(触发器体完整),触发器 DDL 永远直走引擎路径(体禁 `@变量`/控制流建时已校验),
+  真 T-SQL 批路由不变。回归 `needs_interpretation_trigger_ddl_stays_direct`。
+- **嵌入式形态(FFI / `Data Source=`)CTE 全挂**:FFI 读级只判 `!is_write`,未镜像服务端
+  `classify_read_eligible` 的 WITH 排除——任何 CTE 被读级拒绝(`WITH queries must use the
+  write path`)而非回落写路径;CLI 与远程不受影响故一直未暴露。core 新增
+  `ParsedStatement::is_plain_read()`(无 WITH 裸 Query 才可进读级),FFI 与 server 同源共用,
+  回归 `cte_select_falls_back_to_write_path`。
+- **Python Subscriber 回归测试线程漏传参数**(第六轮加代际参数时两处调用点未同步):线程启动
+  即 `TypeError` 死亡,keepalive TOCTOU 与 stale 丢弃两例退化空转型通过;已修复并以
+  `PytestUnhandledThreadExceptionWarning` 升级报错复验。
 
 ### 变更
+- **许可证明示免费商用**:README 声明双许可(Apache-2.0 / MIT)下商业部署、生产使用、闭源
+  集成、修改、再分发与销售均免费,义务仅为保留许可与版权声明;Python 包元数据从单 MIT 对齐为
+  `MIT OR Apache-2.0`(与 Cargo.toml、四个 .csproj 一致)。
+- **升级安全护栏**:数据文件格式版本(`MAGIC = DOCSQLP1`)以测试钉住 —— 任何落盘格式变更必须
+  显式升版本号;旧二进制遇到新格式文件响亮拒绝(`BadHeader`),绝不静默误读(回归
+  `newer_data_file_version_is_rejected_loudly`)。运维手册新增「版本升级与回滚」:格式兼容
+  承诺、升级前检查清单、单节点/集群滚动升级、回滚与验证步骤。
+- **博客演示升级为功能导览**(`dotnet/samples/BlogWeb`):新增数据库面板——`/api/status`
+  (模式/对象清单/行数/文件大小/引擎信息)、`/api/lab` 35 项只读功能演示批(窗口/CTE/分组扩展/
+  T-SQL/Oracle 兼容/JSON/DECIMAL/BLOB/EXPLAIN,每项附原文 SQL 与结果)、写路径演示
+  (upsert 点赞、事务+SAVEPOINT 分步回放、REFRESH 物化视图、MERGE、行级触发器、auto-GUID
+  UUIDv7 订阅);模型扩 DECIMAL/JSON/BLOB 演示列。
+- **镜像发布构建修复**:Dockerfile 预热层补 `docsql-ffi` 工作区成员(其加入 workspace 后
+  连续 5 次 push 的 build & publish 全部失败、GHCR 镜像停更、compose 部署测试连带跳过)。
+
+### 文档
+- 开发与测试段补实测缺口(coverage 本地命令、dotnet 需同建 `docsql-ffi` 原生库、Python 驱动
+  venv+pytest 步骤)并如实说明 CI 范围;SQL 参考窗口节补 QUALIFY 别名与源列优先语义,
+  兼容性矩阵修正陈旧行(QUALIFY、RANGE DAY/SECOND INTERVAL 均已支持)。
+
+## [0.9.1] - 2026-10-11
 - **.NET 嵌入式设计稿**(`docs/design/006-dotnet-embedded-mode.md`,评估稿未实现):方案矩阵
   (A 驱动自动拉起子进程=违红线不推荐 / B FFI 包装 docsql-core=推荐分阶段路线 / C 本地裸 server
   =短期已交付)+ C ABI 最小面草案 + 红线核对(panic 边界/版本纪律/非目标);limitations 路线表、
