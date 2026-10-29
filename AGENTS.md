@@ -14,7 +14,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 | `crates/docsql-ffi` | C ABI(库名 `docsql_embedded`):进程内引擎会话/事务守门/JSON 结果桥;.NET `Data Source=…` 的原生库 |
 | `crates/docsql-web` | REST API + 内嵌单页控制台(`console.html` 经 `include_str!`) |
 | `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/BlogSample(博客示例:嵌入式/远程双形态)、samples/BlogWeb(博客前端:最小 API + 内置单页,嵌入式 `Data Source=`)、samples/AspireSample(AppHost 示例) |
-| `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile;`run-tests.sh` 部署测试入口 |
+| `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile,另带可选 `lb` profile(nginx stream 负载均衡示例,开发 `deploy/lb.Dockerfile` + `deploy/lb/nginx.conf`);`run-tests.sh` 部署测试入口 |
 | `python/` | DB-API 2.0 Python 驱动(纯标准库;`qmark` 服务端绑定 + 精确标量 `$dec`/`$ts`/`$bytes` + TLS/`DOCSQL_KEY` + `Subscriber` 断线续传);pytest 起真实 server(`cargo build -p docsql-server` 先行) |
 
 关键文件:`core/engine.rs`(SQL 执行器根:Database 结构体/公共类型/`mod` 声明,~2.1k 行)及其按域子模块 `core/engine/`——`types.rs`(错误/公共类型/TableMeta/目录快照)、`read_cx.rs`(ReadCx 结构/reader/ReadView/视图展开与相关深度守卫/表文档装载)、`select.rs`(SELECT 全链/分组/窗口计算/load_from/表函数)、`subquery.rs`(CTE 物化/递归 CTE/相关子查询代入)、`plan.rs`(EXPLAIN 文本/无索引与索引序窗口计划)、`explain.rs`(EXPLAIN SELECT 渲染)、`catalog.rs`(open/事务/savepoint/目录编解码/rewrite_table)、`execute.rs`(语句入口/批量/`_cx` shims/exec_stmt 分派)、`ddl.rs`(CREATE/ALTER/INDEX/FK/物化视图)、`dml.rs`(UPDATE/DELETE/快速路径)、`insert.rs`(INSERT)、`merge.rs`(MERGE)、`journal.rs`(表摘要/journal 期刊/位点/dump)、`classify.rs`(读写目标分类/视图依赖)、`expr.rs`(表达式求值/CAST/标量函数)、`probe.rs`(索引探针规划与执行/部分索引/索引键)、`window.rs`(窗口帧/RunningAgg)、`agg.rs`、`join.rs`、`subst.rs`(相关子查询 OUTER 代入)、`targets.rs`(读写目标 walker)、`trigger.rs`(触发器定义/执行/NEW·OLD 代入)、`*_tests.rs`(8 个 `#[cfg(test)]` 模块,测试与产品分文件)——**跨模块项 `pub(super)`,公开面与再导出集中在 engine.rs,新增域文件先在这里声明 `mod`**;`core/btree.rs`、`core/encode.rs`+`core/value.rs`、`core/guid.rs`、`core/useradmin.rs`+`core/kdf.rs`(数据库用户/角色 + PBKDF2)、`core/meta.rs`、`core/stmt.rs`、`core/tsql.rs`(T-SQL 兼容层:preprocess/函数族/表值函数)、`core/tsql_batch.rs`(T-SQL 批解释器:@变量/IF/WHILE/@@ROWCOUNT,逐连接会话)、`core/proto.rs`、`crates/docsql-ffi/src/lib.rs`(C ABI:进程级注册表/事务守门/panic 边界/JSON 结果桥)、`server/lib.rs`(启动/REQ_* 帧处理,模块头注释权威;`mod`/再导出集中于此)及其子模块 `server/`——`conn.rs`(连接循环/帧分派)、`config.rs`(ServerConfig/env 解析)、`authz.rs`(登录/令牌强度/授权语句/行级过滤)、`params.rs`(绑定渲染——注入面)、`frames.rs`(T-SQL 批管道/帧辅助)、`sync.rs`(join/hold/gate/drain/bootstrap)、`catchup.rs`(repair/catchup/peer 探测)、`pubsub.rs`(锁顺序权威)、`querylog.rs`、`backup.rs`、`web/lib.rs`、`web/auth.rs`、`web/console.html`、`dotnet/Docsql.Client/AdoNet.cs`、`Embedded.cs`(嵌入式会话 + 原生库解析)、`DocsqlSubscriber.cs`。基准:`crates/docsql-core/examples/bench*.rs`。
@@ -25,7 +25,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 # 提交门禁(全部通过才能提交)
 cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                      # 1163 用例
+cargo test --workspace                      # 1195 用例
 
 # 覆盖率回归门禁(workspace 行/函数覆盖率低于阈值即失败;默认 85%/80%,
 # 基线 92.9%/88.6%;cargo-llvm-cov 缺失时自动安装)
@@ -34,7 +34,7 @@ cargo test --workspace                      # 1163 用例
 # 改 dotnet 或协议时(cargo build 先行:测试进程会启动 target/debug/docsql-server;
 # 嵌入式套件(Data Source=…)加载 target/debug 的 docsql-ffi 原生库)
 cargo build -p docsql-server -p docsql-ffi
-cd dotnet && dotnet test                    # Client 145 + EFCore 70 + Aspire 13
+cd dotnet && dotnet test                    # Client 152 + EFCore 70 + Aspire 13
 
 # 改复制/部署逻辑后必跑;默认先构建 :local 镜像(构建内含 cargo test 门禁)
 # 测试跑在一次性卷 docsql-dev-testdata-* 上,不动 dev 数据卷;结束恢复原 stack

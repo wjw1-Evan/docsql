@@ -8,6 +8,11 @@ target
 dotnet/**/bin
 dotnet/**/obj
 deploy
+# Keep only the stream-LB demo image inputs visible (name matches root
+# Dockerfile rules: the dockerd.io-unreachable environment builds the LB
+# from the azurelinux base via lb.Dockerfile).
+!deploy/lb
+!deploy/lb.Dockerfile
 .github
 .mimosa
 .zcode

@@ -80,6 +80,12 @@ public sealed class DocsqlSubscriber : IDisposable
     public DocsqlSubscriber(string connectionString, TimeSpan? keepAlive = null)
     {
         var b = new DocsqlConnectionStringBuilder { ConnectionString = connectionString };
+        if (b.IsMultiHost)
+        {
+            throw new ArgumentException(
+                "DocsqlSubscriber 不支持 hosts= 多主机形态:订阅专用连接+专职读线程"
+                + "与节点一一绑定(断线续传按 id 对账),换节点续传需应用侧自行重建");
+        }
         _proto = DocsqlConnection.ConnectAndAuth(b, null, b.ConnectTimeout * 1000);
         _reader = new Thread(ReadLoop) { IsBackground = true, Name = "docsql-subscriber" };
         _reader.Start();

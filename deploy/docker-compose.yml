@@ -5,6 +5,7 @@
 #   docker compose --profile single up -d    # 1 standalone node (:17600) + web (:17710)
 #   docker compose --profile cluster up -d   # 3 symmetric peers + web (see below)
 #   docker compose --profile single --profile cluster up -d   # both at once
+#   docker compose --profile cluster --profile lb up -d   # cluster + TCP LB entry (:17690)
 #
 # Tear down with the same profile flags: docker compose --profile ... down
 # (down -v also works). Data lives in EXTERNAL volumes (default
@@ -257,6 +258,43 @@ services:
     depends_on:
       node-a:
         condition: service_healthy
+
+  # ---- profile: lb -----------------------------------------------------
+  # Simple four-layer load balancing example: in front of the three-node data
+  # cluster hangs a TCP stream load balancer (nginx, per-connection
+  # round-robin + passive health checking), publishing entry 17690. Clients
+  # use a single address 127.0.0.1:17690 to get "healthy node
+  # round-robin connection establishment + automatic ejection of dead
+  # nodes"; TLS data planes go directly through L4 (the client does the TLS
+  # handshake with the node itself, see nginx.conf). This service only
+  # demonstrates topology, does not participate in replication, and has no
+  # volumes. Start with: docker compose --profile cluster --profile lb up -d
+  lb:
+    profiles: ["lb"]
+    build:
+      context: ..
+      dockerfile: deploy/lb.Dockerfile
+    image: "${DOCSQL_LB_IMAGE:-docsql-lb:local}"
+    ports:
+      - "127.0.0.1:17690:7600"
+    networks: [docsql]
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+      node-c:
+        condition: service_healthy
+    healthcheck:
+      # Proves the nginx process is alive (TCP accept works). It does NOT
+      # prove node health: nginx accepts first and dials the upstream after,
+      # so this probe succeeds even with every node down — upstream liveness
+      # is handled by nginx's own passive checks (max_fails in nginx.conf).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7600 && exec 3>&-"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   # ---- profile: single -------------------------------------------------
   # One standalone database node: no DOCSQL_PEERS, no replication — reads

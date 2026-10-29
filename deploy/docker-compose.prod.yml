@@ -4,6 +4,8 @@
 #
 #   docker compose -f docker-compose.prod.yml --profile single up -d
 #   docker compose -f docker-compose.prod.yml --profile cluster up -d
+#   docker compose -f docker-compose.prod.yml --profile cluster --profile lb up -d
+#                                        # cluster + TCP LB entry (:18690)
 #
 # Configure via deploy/.env (see .env.example):
 #   DOCSQL_IMAGE_TAG  image tag (default: latest; pin a released version for
@@ -191,6 +193,43 @@ services:
       timeout: 3s
       retries: 60
       start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ---- profile: lb ----------------------------------------------------
+  # Optional four-layer load-balancing example, same shape as the dev
+  # compose's lb service (nginx stream, per-connection round-robin +
+  # passive health checks): clients use the single entry 18690, dead
+  # nodes drop out of rotation and rejoin without touching the config.
+  # The docsql image is CI-published, but there is no published LB image
+  # — this demo builds it from deploy/lb.Dockerfile (azurelinux base).
+  # No volumes, no replication participation.
+  lb:
+    profiles: ["lb"]
+    build:
+      context: ..
+      dockerfile: deploy/lb.Dockerfile
+    image: "docsql-lb:local"
+    ports:
+      - "127.0.0.1:18690:7600"
+    networks: [docsql]
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+      node-c:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # Proves the nginx process is alive; upstream (node) liveness rides on
+      # nginx's passive checks (max_fails in nginx.conf), NOT this probe.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7600 && exec 3>&-"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

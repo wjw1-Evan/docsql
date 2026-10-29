@@ -196,10 +196,17 @@ public sealed class ProtocolConnection : IProtocolSession
     private byte[] _connChallenge = Array.Empty<byte>();
     private const int PreparedCapacity = 96;
 
+    /// <summary>对端端点(实际连上的节点):hosts= 多主机轮换/failover 下
+    /// 连接建立后据此可观测真实落点(DataSource 读取)。</summary>
+    internal readonly string PeerHost;
+    internal readonly int PeerPort;
+
     public ProtocolConnection(
         string host, int port, byte[]? key = null, int connectTimeoutMs = 15_000,
         TlsOptions? tls = null)
     {
+        PeerHost = host;
+        PeerPort = port;
         // The synchronous TcpClient ctor blocks for the OS connect timeout
         // (often 75s+) on unreachable hosts; bound it so callers fail fast.
         _tcp = new TcpClient();
@@ -230,8 +237,11 @@ public sealed class ProtocolConnection : IProtocolSession
         }
     }
 
-    private ProtocolConnection(TcpClient connected, Stream stream, byte[]? key)
+    private ProtocolConnection(
+        TcpClient connected, Stream stream, byte[]? key, string host, int port)
     {
+        PeerHost = host;
+        PeerPort = port;
         _tcp = connected;
         _stream = stream;
         _key = key;
@@ -398,7 +408,7 @@ public sealed class ProtocolConnection : IProtocolSession
             // accepts but never answers parked OpenAsync indefinitely —
             // the connect timeout only covered the TCP handshake.
             var stream = await WrapTlsAsync(tcp, host, tls, cts.Token).ConfigureAwait(false);
-            var conn = new ProtocolConnection(tcp, stream, key);
+            var conn = new ProtocolConnection(tcp, stream, key, host, port);
             await conn.ReadHandshakeAsync(cts.Token);
             return conn;
         }

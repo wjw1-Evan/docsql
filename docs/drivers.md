@@ -63,6 +63,34 @@ await using var reader = await cmd.ExecuteReaderAsync();
   `DocsqlSubscriber` 专用连接 + 专职读线程(订阅必须独占连接),断线按最后 id 续传;
 - 服务端配置 `DOCSQL_KEY` 后自动启用 AES-256-GCM。**版本配套**:启用了传输加密的部署要求客户端与服务端同版本——每条加密连接以服务端随机挑战(RESP_HELLO)开头并绑定进 GCM AAD(防跨连接重放),跨版本连接会显式失败;升级时先升到同版本再滚动重启。
 
+### 多主机池 `hosts=`(客户端负载均衡 + 故障转移)
+
+连接串给 `hosts=h1:p1,h2:p2[,…]`(逗号分隔;`;` 是连接串的配对分隔符,列表内只能用
+`,`),连接建立即自动轮换 + 失败切换:
+
+```csharp
+await using var conn = new DocsqlConnection("hosts=db1:7600,db2:7600,db3:7600;token=...");
+await conn.OpenAsync();
+conn.DataSource   // 打开后 = 实际连上的节点 host:port(轮换/切换可观测)
+```
+
+- **轮换**:同一 hosts 键的每次 `Open` 按进程级游标轮流打向各节点 —— 三节点集群的
+  新连接均匀散布(负载分摊);池化默认开启,空闲连接命中不拨号也就不轮换;
+- **故障转移**:候选离线、拨号超时、认证拒绝、池验活失败、池满等待超时,一律自动
+  换下一个节点重试,应用代码无感知;全部候选失败 → 一条合并错误,每个端点一行原因;
+- **预算**:`connect timeout`(默认 15s,单位秒)按候选均分到每次尝试(下限 1s),
+  长列表不会把首个死节点拨号拖到趋零;
+- 与 `host=`/`port=` 同时给出显式报错(避免歧义);裸条目(无端口)用默认 7600;
+  嵌入式 `Data Source=` 形态仍优先;`DocsqlSubscriber` 不支持 hosts(订阅专用连接
+  与节点一一绑定,换节点续传需应用侧重建订阅);
+- 池按端点分槽(与单 host 连接串同认 `pooling`/`max pool size`;
+  `ClearPool()` 清空列表内每个端点的池)。
+
+对称集群下推荐 `hosts=` 直连各节点;若更想要**单地址入口**(对外只暴露一个端口、
+死节点自动摘除半小时内自愈),部署侧可用 compose 方案的 stream-LB(见
+`docs/operations.md#负载均衡lb-profile`),两者可叠加:LB 背后仍然轮换三个节点。
+
+
 ### 原生 TLS(连接串开关)
 
 节点启用 `DOCSQL_TLS_CERT`/`DOCSQL_TLS_KEY` 后,连接串加 `tls=true` 即走原生 TLS

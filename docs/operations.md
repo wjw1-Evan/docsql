@@ -88,6 +88,28 @@ docker compose --profile cluster --profile join up -d node-d
 注意:动态注册保存在原节点内存中,原节点重启即丢失——要把 node-d 变成长期成员,请把它写进
 各节点的 `DOCSQL_PEERS` 并重建(数据保留,不会重复同步)。
 
+## 负载均衡(LB profile)
+
+集群 profile 附带一个可选的四层负载均衡示例(nginx stream,纯 TCP 透传),给客户端一个
+**单地址入口**:连接建立轮流打到健康节点(负载分摊),死节点自动摘出轮询、恢复后自动
+回场——全程不改配置:
+
+```bash
+cd deploy && docker compose --profile cluster --profile lb up -d          # dev,入口 127.0.0.1:17690
+docker compose -f docker-compose.prod.yml --profile cluster --profile lb up -d   # prod,入口 127.0.0.1:18690
+```
+
+- **纯 L4**:不感知协议,TLS 数据面直通(客户端与节点直接握手),token 随帧原样通行;
+- **被动健康检查**:`max_fails=2, fail_timeout=10s` —— 节点下线后最多两条新连接各
+  多花一次失败拨号(3s)即被摘除,`proxy_connect_timeout 3s` 保证不会拖死应用;
+- **与扩容的关系**:减实例(停掉节点)LB 自愈;**加实例**需要在
+  `deploy/lb/nginx.conf` 的 upstream 里补一行再重建 lb 容器(静态列表示例,刻意不引
+  DNS-RS/Consul 之类依赖);
+- **客户端侧替代**:.NET 驱动的 `hosts=` 连接串(`docs/drivers.md`)在应用进程内做
+  同样的事(轮换 + 自动换节点),无需任何网络设施;两者可叠加——把 LB 入口放进
+  hosts= 候选之一即可。LB 适合多语言客户端共享一个入口地址的场景;lb 容器无数据卷,
+  重建即丢访问日志。
+
 ## 离线补齐与重启反熵
 
 节点离线/分区期间错过的写不会实时补发,但离线节点**重启时自动修复**:对比各节点表摘要,

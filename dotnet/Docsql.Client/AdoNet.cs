@@ -36,6 +36,72 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
         set => this["port"] = value.ToString();
     }
 
+    /// <summary>
+    /// 多主机池:<c>hosts=h1:p1,h2:p2[,…]</c> 逗号分隔的候选端点(连接串的
+    /// 配对分隔符是 <c>;</c>,列表内只能用 <c>,</c>)。连接建立时按顺序轮换
+    /// 选择候选(进程级计数,同一 hosts 键的所有 Open 轮流打到各节点 =
+    /// 负载分摊);候选拨号/验活/池满失败自动换下一个节点 = 故障转移。
+    /// 与 <c>host</c>/<c>port</c> 同时给出显式报错;嵌入式(Data Source=
+    /// …)仍优先(与单 host 形态同规)。
+    /// </summary>
+    public string Hosts
+    {
+        get => TryGetValue("hosts", out var v)
+            ? string.Join(",", ((string)v).Split(
+                ',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            : "";
+        set => this["hosts"] = value;
+    }
+
+    /// <summary>hosts= 多主机形态是否生效(给了非空 hosts 值)。</summary>
+    public bool IsMultiHost =>
+        TryGetValue("hosts", out var v) && ((string)v ?? "").Trim().Length > 0;
+
+    /// <summary>
+    /// hosts= 的候选端点表(解析懒执行,坏值在这里响亮报错:空列表、
+    /// 非整端口、端口越界;只能出现 host:port 或裸 host —— 后者按单
+    /// host 形态同默认端口 7600)。与 host/port 互斥在这里检查。
+    /// </summary>
+    internal (string host, int port)[] HostList
+    {
+        get
+        {
+            if (ContainsKey("host") || ContainsKey("port"))
+            {
+                throw new ArgumentException(
+                    " hosts= 多主机形态与 host=/port= 同时给出(二选一,避免歧义)");
+            }
+            var entries = Hosts.Split(
+                ',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (entries.Length == 0)
+            {
+                throw new ArgumentException("hosts= 给了但候选端点列表为空");
+            }
+            var eps = new (string host, int port)[entries.Length];
+            for (var i = 0; i < entries.Length; i++)
+            {
+                var e = entries[i];
+                var c = e.IndexOf(':');
+                if (c < 0)
+                {
+                    eps[i] = (e, 7600);
+                    continue;
+                }
+                var h = e[..c].Trim();
+                var ps = e[(c + 1)..].Trim();
+                if (h.Length == 0
+                    || !int.TryParse(ps, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port)
+                    || port is < 1 or > 65535)
+                {
+                    throw new ArgumentException(
+                        $"hosts= 端点 '{e}' 非法(需要 host:port[,host:port…],端口 1..65535)");
+                }
+                eps[i] = (h, port);
+            }
+            return eps;
+        }
+    }
+
     /// <summary>DateTime 参数的线协议形态:<c>ts</c>(默认)发引擎原生
     /// {"$ts":ms} 标记,精度无损、与 TIMESTAMP 列同带比较;<c>iso</c> 发
     /// ISO-8601 文本——对 79a94ba 之前的服务端(不认 $ts,参数会退化成
@@ -164,6 +230,38 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
 }
 
 /// <summary>
+/// hosts= 多主机轮换游标:按规范化 hosts 键(process 级)计数。每次新建
+/// 物理连接轮换一个候选起点(第一个 Open 连 endpoints[0],此后轮流),
+/// 三节点集群的新连接因此均匀散布 = 客户端侧负载分摊。池化形态下轮换
+/// 只影响拨号:各端点的空闲池槽优先复用(命中不拨号,也就不轮换)。
+/// </summary>
+internal static class HostRotation
+{
+    private sealed class Cursor
+    {
+        public long Count;
+    }
+
+    private static readonly ConcurrentDictionary<string, Cursor> Cursors = new();
+
+    /// <summary>从轮换点开始的连接建立次序(endpoints 原样收尾)。</summary>
+    internal static (string host, int port)[] Plan((string host, int port)[] endpoints)
+    {
+        var key = string.Join(",", endpoints.Select(e => $"{e.host}:{e.port}"));
+        var cursor = Cursors.GetOrAdd(key, _ => new Cursor());
+        // 首个 Open 取 0(先 +1 再 -1):并行 Open 各自拿到不同起点,同一
+        // 健康状态不会看向同一个节点两次。
+        var start = (int)((Interlocked.Increment(ref cursor.Count) - 1) % endpoints.Length);
+        var plan = new (string host, int port)[endpoints.Length];
+        for (var i = 0; i < plan.Length; i++)
+        {
+            plan[i] = endpoints[(start + i) % endpoints.Length];
+        }
+        return plan;
+    }
+}
+
+/// <summary>
 /// 物理连接池:按"唯一确定一条已认证会话"的键(host/port/user/password/token/key)池化。
 /// <see cref="ConnectionPool.Slot.Permits"/> 封顶并发借出数(Max Pool Size,与 SqlClient
 /// 同语义):Rent 先取借出名额(池满等待 connect timeout,超时抛 TimeoutException),
@@ -212,7 +310,13 @@ internal static class ConnectionPool
     /// <summary>池命中 / 未命中(新建) / 丢弃(死连接、超容量裁剪) 计数,测试可断言。</summary>
     internal static long Hits, Misses, Discarded;
 
-    internal static string KeyOf(DocsqlConnectionStringBuilder p, string? keyOverride)
+    internal static string KeyOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
+        KeyOfEndpoint((p.Host, p.Port), p, keyOverride);
+
+    /// <summary>端点显式形态的池键(hosts= 多主机按候选端点各开一槽,
+    /// 同一 hosts 串的不同节点不共享空闲连接;死键理论上是 (p.Host, p.Port) 的退化)。</summary>
+    internal static string KeyOfEndpoint(
+        (string host, int port) ep, DocsqlConnectionStringBuilder p, string? keyOverride)
     {
         // The pool registry lives for the process lifetime: keying it on the
         // plaintext password/token retains every credential ever used (and
@@ -226,12 +330,17 @@ internal static class ConnectionPool
         // pooled connection — borrowing across them silently ran the
         // "encrypted" session over plaintext (or failed handshakes the
         // other way around).
-        return string.Join('\u0001', p.Host, p.Port, digest, p.MaxPoolSize,
+        return string.Join('\u0001', ep.host, ep.port, digest, p.MaxPoolSize,
             p.Tls, p.TlsCa, p.TlsHostName);
     }
 
     internal static Slot SlotOf(DocsqlConnectionStringBuilder p, string? keyOverride) =>
-        Pools.GetOrAdd(KeyOf(p, keyOverride), _ => new Slot(p.Host, p.Port, p.MaxPoolSize));
+        SlotOfEndpoint((p.Host, p.Port), p, keyOverride);
+
+    /// <summary>端点显式的槽获取(hosts= 多主机形态按该候选端点开槽)。</summary>
+    internal static Slot SlotOfEndpoint(
+        (string host, int port) ep, DocsqlConnectionStringBuilder p, string? keyOverride) =>
+        Pools.GetOrAdd(KeyOfEndpoint(ep, p, keyOverride), _ => new Slot(ep.host, ep.port, p.MaxPoolSize));
 
     /// <summary>借出即重置:T-SQL 会话状态(@变量/@@IDENTITY/@@ROWCOUNT)挂在
     /// 物理连接上,随连接入池存活 —— 不重置的话,下一个借出者继承上一位的
@@ -286,7 +395,7 @@ internal static class ConnectionPool
         if (!slot.Permits.Wait(timeoutMs))
         {
             throw new TimeoutException(
-                $"pool exhausted: all {slot.MaxSize} connection(s) to {p.Host}:{p.Port} " +
+                $"pool exhausted: all {slot.MaxSize} connection(s) to {slot.Host}:{slot.Port} " +
                 $"were still in use after {timeoutMs} ms");
         }
         try
@@ -297,7 +406,10 @@ internal static class ConnectionPool
                 return live;
             }
             Interlocked.Increment(ref Misses);
-            return DocsqlConnection.ConnectAndAuth(p, keyOverride, timeoutMs);
+            // 拨号按槽自身的端点解析(hosts= 多主机形态按候选换拨号目标,
+            // 单 host 形态槽端点即连接串端点,行为不变)。
+            return DocsqlConnection.ConnectAndAuthEndpoint(
+                slot.Host, slot.Port, p, keyOverride, timeoutMs);
         }
         catch
         {
@@ -316,7 +428,7 @@ internal static class ConnectionPool
                 .ConfigureAwait(false))
         {
             throw new TimeoutException(
-                $"pool exhausted: all {slot.MaxSize} connection(s) to {p.Host}:{p.Port} " +
+                $"pool exhausted: all {slot.MaxSize} connection(s) to {slot.Host}:{slot.Port} " +
                 $"were still in use after {timeoutMs} ms");
         }
         // A CANCELLED WaitAsync throws above, BEFORE any permit is acquired:
@@ -372,7 +484,9 @@ internal static class ConnectionPool
                 proto.Dispose();
             }
             Interlocked.Increment(ref Misses);
-            return await DocsqlConnection.ConnectAndAuthAsync(p, keyOverride, timeoutMs, cancellationToken)
+            // 端点按槽解析(与同步 Rent 同规,hosts= 多主机按候选换拨号目标)。
+            return await DocsqlConnection.ConnectAndAuthEndpointAsync(
+                    slot.Host, slot.Port, p, keyOverride, timeoutMs, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (Exception) when (!permitReleased)
@@ -561,13 +675,23 @@ public sealed class DocsqlConnection : DbConnection
 
     public override string Database => "docsql";
 
-    /// <summary>嵌入式会话 = 数据文件路径;远程会话 = host:port。</summary>
+    /// <summary>嵌入式会话 = 数据文件路径;远程会话 = host:port。
+    /// hosts= 多主机形态:打开之前 = 垂直候选(原文),连接打开后 = 实际连上的
+    /// 节点端点(轮换/故障转移据此可观测)。</summary>
     public override string DataSource
     {
         get
         {
             var p = Parsed;
-            return p.Embedded ? p.DataSource : $"{p.Host}:{p.Port}";
+            if (p.Embedded)
+            {
+                return p.DataSource;
+            }
+            if (_state == ConnectionState.Open && _proto is ProtocolConnection wire)
+            {
+                return $"{wire.PeerHost}:{wire.PeerPort}";
+            }
+            return p.IsMultiHost ? p.Hosts : $"{p.Host}:{p.Port}";
         }
     }
 
@@ -640,12 +764,20 @@ public sealed class DocsqlConnection : DbConnection
         payload.Length >= 8 ? BitConverter.ToInt64(payload, 0) : 0;
 
     /// <summary>建连 + 认证(用户名/密码走 REQ_AUTH_USER,否则 token 走 REQ_AUTH):
-    /// DocsqlConnection.Open 与 DocsqlSubscriber 共用的握手骨架。</summary>
+    /// DocsqlConnection.Open、OpenAcrossEndpoints 与 DocsqlSubscriber 共用的握手骨架。
+    /// hosts= 多主机形态的轮换/failover 只在 OpenAcrossEndpoints;这里按给定端点直连。</summary>
     internal static ProtocolConnection ConnectAndAuth(
-        DocsqlConnectionStringBuilder p, string? keyOverride, int timeoutMs)
+        DocsqlConnectionStringBuilder p, string? keyOverride, int timeoutMs) =>
+        ConnectAndAuthEndpoint(p.Host, p.Port, p, keyOverride, timeoutMs);
+
+    /// <summary>端点显式的建连 + 认证:拨号、TLS 包裹与认证全部以 host:port 为目标
+    /// (未显式配置 tls_host 时,TLS 校验名按该 host 推导 —— 多主机下各端点
+    /// 各自校验各自的证书名)。</summary>
+    internal static ProtocolConnection ConnectAndAuthEndpoint(
+        string host, int port, DocsqlConnectionStringBuilder p, string? keyOverride, int timeoutMs)
     {
         var proto = new ProtocolConnection(
-            p.Host, p.Port, ParseKey(keyOverride ?? p.Key), timeoutMs, TlsOptionsOf(p));
+            host, port, ParseKey(keyOverride ?? p.Key), timeoutMs, TlsOptionsOf(p));
         try
         {
             SendAuth(proto, p);
@@ -663,10 +795,16 @@ public sealed class DocsqlConnection : DbConnection
     /// <summary><see cref="ConnectAndAuth"/> 的真异步形态。</summary>
     internal static async Task<ProtocolConnection> ConnectAndAuthAsync(
         DocsqlConnectionStringBuilder p, string? keyOverride, int timeoutMs,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) => await ConnectAndAuthEndpointAsync(
+        p.Host, p.Port, p, keyOverride, timeoutMs, cancellationToken).ConfigureAwait(false);
+
+    /// <summary><see cref="ConnectAndAuthEndpoint"/> 的真异步形态。</summary>
+    internal static async Task<ProtocolConnection> ConnectAndAuthEndpointAsync(
+        string host, int port, DocsqlConnectionStringBuilder p, string? keyOverride,
+        int timeoutMs, CancellationToken cancellationToken)
     {
         var proto = await ProtocolConnection.ConnectAsync(
-                p.Host, p.Port, ParseKey(keyOverride ?? p.Key), timeoutMs, TlsOptionsOf(p),
+                host, port, ParseKey(keyOverride ?? p.Key), timeoutMs, TlsOptionsOf(p),
                 cancellationToken)
             .ConfigureAwait(false);
         try
@@ -724,6 +862,78 @@ public sealed class DocsqlConnection : DbConnection
         }
     }
 
+    /// <summary>
+    /// hosts= 多主机打开连接。每次 Open 从轮换点起逐个尝试候选:端点
+    /// 离线、拨号超时、认证拒绝、验活失败、池满等待超时一律自动切下一
+    /// 个节点;全部候选失败 → 抛出带各端点失败原因的合并错误(内因 =
+    /// 最后尝试的原始异常)。预算:connect timeout 为总预算,按候选均分
+    /// 到每次尝试(下限 1 秒,避免长列表把单端点拨号卡死到趋零)。
+    /// 池化形态的轮换只发生在新建拨号(空闲命中不拨号也不轮换)。
+    /// </summary>
+    private (IProtocolSession proto, ConnectionPool.Slot? slot) OpenAcrossEndpoints(
+        DocsqlConnectionStringBuilder p)
+    {
+        var endpoints = HostRotation.Plan(p.HostList);
+        var budget = Math.Max(1000, p.ConnectTimeout * 1000 / endpoints.Length);
+        var failures = new List<Exception>(endpoints.Length);
+        foreach (var ep in endpoints)
+        {
+            try
+            {
+                if (p.Pooling)
+                {
+                    var slot = ConnectionPool.SlotOfEndpoint(ep, p, KeyOverride);
+                    return (ConnectionPool.Rent(slot, p, KeyOverride, budget), slot);
+                }
+                return (ConnectAndAuthEndpoint(ep.host, ep.port, p, KeyOverride, budget), null);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // 单个端点不可用不代表集群不可用:记录原因换下一个节点。
+                failures.Add(new DocsqlException($"{ep.host}:{ep.port}: {ex.Message}", ex));
+            }
+        }
+        throw new DocsqlException(
+            $"connect failed: hosts= 的 {endpoints.Length} 个端点全部不可用\n  "
+            + string.Join("\n  ", failures.Select(f => f.Message)),
+            failures[^1]);
+    }
+
+    /// <summary><see cref="OpenAcrossEndpoints"/> 的真异步形态。</summary>
+    private async Task<(IProtocolSession proto, ConnectionPool.Slot? slot)> OpenAcrossEndpointsAsync(
+        DocsqlConnectionStringBuilder p, CancellationToken cancellationToken)
+    {
+        var endpoints = HostRotation.Plan(p.HostList);
+        var budget = Math.Max(1000, p.ConnectTimeout * 1000 / endpoints.Length);
+        var failures = new List<Exception>(endpoints.Length);
+        foreach (var ep in endpoints)
+        {
+            try
+            {
+                if (p.Pooling)
+                {
+                    var slot = ConnectionPool.SlotOfEndpoint(ep, p, KeyOverride);
+                    var proto = await ConnectionPool.RentAsync(
+                            slot, p, KeyOverride, budget, cancellationToken)
+                        .ConfigureAwait(false);
+                    return (proto, slot);
+                }
+                var direct = await ConnectAndAuthEndpointAsync(
+                        ep.host, ep.port, p, KeyOverride, budget, cancellationToken)
+                    .ConfigureAwait(false);
+                return (direct, null);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failures.Add(new DocsqlException($"{ep.host}:{ep.port}: {ex.Message}", ex));
+            }
+        }
+        throw new DocsqlException(
+            $"connect failed: hosts= 的 {endpoints.Length} 个端点全部不可用\n  "
+            + string.Join("\n  ", failures.Select(f => f.Message)),
+            failures[^1]);
+    }
+
     public override void Open()
     {
         if (_state == ConnectionState.Open)
@@ -737,6 +947,11 @@ public sealed class DocsqlConnection : DbConnection
             {
                 // SQLite 式进程内模式:无网络、无池(物理"连接"就是引擎会话)。
                 _proto = EmbeddedSession.Open(p.DataSource);
+            }
+            else if (p.IsMultiHost)
+            {
+                // hosts= 多主机:连接建立时轮换候选、失败自动换下一节点。
+                (_proto, _poolSlot) = OpenAcrossEndpoints(p);
             }
             else if (p.Pooling)
             {
@@ -775,6 +990,12 @@ public sealed class DocsqlConnection : DbConnection
                 // 不额外引入线程池跳转;取消请求在入口处检查一次。
                 cancellationToken.ThrowIfCancellationRequested();
                 _proto = EmbeddedSession.Open(p.DataSource);
+            }
+            else if (p.IsMultiHost)
+            {
+                // hosts= 多主机:轮换候选 + 自动换下一节点(真异步形态)。
+                (_proto, _poolSlot) = await OpenAcrossEndpointsAsync(p, cancellationToken)
+                    .ConfigureAwait(false);
             }
             else if (p.Pooling)
             {
@@ -837,10 +1058,21 @@ public sealed class DocsqlConnection : DbConnection
         _state = ConnectionState.Closed;
     }
 
-    /// <summary>清空与当前连接串对应的池(物理关闭空闲连接)。</summary>
-    public void ClearPool() =>
-        ConnectionPool.ClearSlot(ConnectionPool.KeyOf(
-            EndpointOverride is { } ep ? ep.ToBuilder() : Parsed, KeyOverride));
+    /// <summary>清空与当前连接串对应的池(物理关闭空闲连接)。
+    /// hosts= 多主机形态把每个候选端点的池各自清空。</summary>
+    public void ClearPool()
+    {
+        var src = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
+        if (src.IsMultiHost)
+        {
+            foreach (var e in src.HostList)
+            {
+                ConnectionPool.ClearSlot(ConnectionPool.KeyOfEndpoint(e, src, KeyOverride));
+            }
+            return;
+        }
+        ConnectionPool.ClearSlot(ConnectionPool.KeyOf(src, KeyOverride));
+    }
 
     /// <summary>清空全部池(物理关闭所有空闲连接)。</summary>
     public static void ClearAllPools() => ConnectionPool.ClearAll();
