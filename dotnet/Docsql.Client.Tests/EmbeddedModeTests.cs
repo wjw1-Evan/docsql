@@ -304,4 +304,154 @@ public sealed class EmbeddedModeTests : IDisposable
             Assert.Equal("kept", cmd.ExecuteScalar());
         }
     }
+
+    [Fact]
+    public void UniqueViolation_PreservesTheErrorContract()
+    {
+        var path = NewDb();
+        using var conn = new DocsqlConnection(Cs(path));
+        conn.Open();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE u (id INT AUTOINCREMENT PRIMARY KEY, name VARCHAR UNIQUE)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO u (name) VALUES (@n)";
+        cmd.Parameters.AddWithValue("@n", "dup");
+        cmd.ExecuteNonQuery();
+
+        var ex = Assert.Throws<DocsqlException>(() => cmd.ExecuteNonQuery());
+        Assert.True(ex.IsUniqueViolation, ex.Message);
+
+        // A failed statement does not poison an embedded session (no wire
+        // stream to desynchronize): the next statement just works.
+        cmd.Parameters.Clear();
+        cmd.CommandText = "SELECT COUNT(*) FROM u";
+        Assert.Equal(1L, Convert.ToInt64(cmd.ExecuteScalar()));
+    }
+
+    [Fact]
+    public void Savepoints_WorkInsideTheTransaction()
+    {
+        var path = NewDb();
+        using var conn = new DocsqlConnection(Cs(path));
+        conn.Open();
+        using (var cmd = (DocsqlCommand)conn.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v INT)";
+            cmd.ExecuteNonQuery();
+        }
+        using (var tx = (DocsqlTransaction)conn.BeginTransaction())
+        {
+            using var cmd = (DocsqlCommand)conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "INSERT INTO t (v) VALUES (1)";
+            cmd.ExecuteNonQuery();
+            tx.Save("sp1");
+            cmd.CommandText = "INSERT INTO t (v) VALUES (2)";
+            cmd.ExecuteNonQuery();
+            // Engine semantics: ROLLBACK TO drops the named savepoint itself
+            // (same contract as the server suite) — no Release afterwards.
+            tx.Rollback("sp1");
+            cmd.CommandText = "INSERT INTO t (v) VALUES (3)";
+            cmd.ExecuteNonQuery();
+            tx.Commit();
+        }
+        using var q = (DocsqlCommand)conn.CreateCommand();
+        q.CommandText = "SELECT COUNT(*) FROM t";
+        Assert.Equal(2L, Convert.ToInt64(q.ExecuteScalar()));
+    }
+
+    [Fact]
+    public void ReaderExposesColumnMetadata()
+    {
+        var path = NewDb();
+        using var conn = new DocsqlConnection(Cs(path));
+        conn.Open();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE meta (id INT AUTOINCREMENT PRIMARY KEY, title VARCHAR)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO meta (title) VALUES ('x')";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "SELECT id AS ident, title FROM meta";
+        using var r = cmd.ExecuteReader();
+        Assert.Equal(2, r.FieldCount);
+        Assert.Equal("ident", r.GetName(0));
+        Assert.Equal("title", r.GetName(1));
+        Assert.Equal(typeof(string), r.GetFieldType(1));
+        Assert.True(r.Read());
+    }
+
+    [Fact]
+    public void DataSourceVariants_AndEmbeddedPrecedence()
+    {
+        Assert.Equal(
+            "a.db",
+            new DocsqlConnectionStringBuilder { ConnectionString = "datasource=a.db" }.DataSource);
+        Assert.Equal(
+            "b.db",
+            new DocsqlConnectionStringBuilder { ConnectionString = "filename=b.db" }.DataSource);
+
+        // Data Source wins over host/port: embedded is an explicit mode
+        // choice, so the sentinel address must never be dialed.
+        using var conn = new DocsqlConnection("host=203.0.113.9;port=1;Data Source=:memory:");
+        conn.Open();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        cmd.CommandText = "SELECT 1";
+        Assert.Equal(1L, Convert.ToInt64(cmd.ExecuteScalar()));
+    }
+
+    [Fact]
+    public void NonFiniteDoubleParameters_RoundTrip()
+    {
+        var path = NewDb();
+        using var conn = new DocsqlConnection(Cs(path));
+        conn.Open();
+        using var cmd = (DocsqlCommand)conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE f (id INT AUTOINCREMENT PRIMARY KEY, v FLOAT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO f (v) VALUES (@v)";
+        cmd.Parameters.AddWithValue("@v", double.NaN);
+        cmd.ExecuteNonQuery();
+        cmd.Parameters["@v"].Value = double.PositiveInfinity;
+        cmd.ExecuteNonQuery();
+        cmd.Parameters.Clear();
+
+        cmd.CommandText = "SELECT v FROM f ORDER BY id";
+        using var r = cmd.ExecuteReader();
+        Assert.True(r.Read());
+        Assert.True(double.IsNaN(r.GetDouble(0)));
+        Assert.True(r.Read());
+        Assert.True(double.IsPositiveInfinity(r.GetDouble(0)));
+    }
+
+    [Fact]
+    public async Task AsyncTransactions_CommitAndRollback()
+    {
+        var path = NewDb();
+        await using var conn = new DocsqlConnection(Cs(path));
+        await conn.OpenAsync();
+        await using (var cmd = (DocsqlCommand)conn.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE at (id INT AUTOINCREMENT PRIMARY KEY, v INT)";
+            await cmd.ExecuteNonQueryAsync();
+        }
+        await using (var tx = await conn.BeginTransactionAsync())
+        {
+            await using var cmd = (DocsqlCommand)conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "INSERT INTO at (v) VALUES (1)";
+            await cmd.ExecuteNonQueryAsync();
+            await tx.CommitAsync();
+        }
+        await using (var tx = await conn.BeginTransactionAsync())
+        {
+            await using var cmd = (DocsqlCommand)conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "INSERT INTO at (v) VALUES (2)";
+            await cmd.ExecuteNonQueryAsync();
+            await tx.RollbackAsync();
+        }
+        await using var q = (DocsqlCommand)conn.CreateCommand();
+        q.CommandText = "SELECT COUNT(*) FROM at";
+        Assert.Equal(1L, Convert.ToInt64(await q.ExecuteScalarAsync()));
+    }
 }

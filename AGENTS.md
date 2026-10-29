@@ -34,7 +34,7 @@ cargo test --workspace                      # 1163 用例
 # 改 dotnet 或协议时(cargo build 先行:测试进程会启动 target/debug/docsql-server;
 # 嵌入式套件(Data Source=…)加载 target/debug 的 docsql-ffi 原生库)
 cargo build -p docsql-server -p docsql-ffi
-cd dotnet && dotnet test                    # Client 139 + EFCore 68 + Aspire 13
+cd dotnet && dotnet test                    # Client 145 + EFCore 70 + Aspire 13
 
 # 改复制/部署逻辑后必跑;默认先构建 :local 镜像(构建内含 cargo test 门禁)
 # 测试跑在一次性卷 docsql-dev-testdata-* 上,不动 dev 数据卷;结束恢复原 stack

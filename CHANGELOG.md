@@ -15,7 +15,7 @@
   一份注入面,禁止复制)。原生库随 Releases 发布(`docsql-native-<版本>-<平台>.tar.gz/.zip`,
   Linux/macOS/Windows),加载顺序 `DOCSQL_EMBEDDED_NATIVE` → `runtimes/<rid>/native` →
   应用目录 → `target/{debug,release}`。pub/sub/PROMOTE/备份/集群/T-SQL 批会话在嵌入态
-  显式报错。测试:FFI 7 + Client 嵌入式 12 + EF 嵌入式 5。
+  显式报错。测试:FFI 15 + Client 嵌入式 18 + EF 嵌入式 7。
 
 ### 变更
 - **.NET 嵌入式设计稿**(`docs/design/006-dotnet-embedded-mode.md`,评估稿未实现):方案矩阵

@@ -686,4 +686,194 @@ mod tests {
         unsafe { docsql_embedded_close(handle) };
         unsafe { docsql_embedded_close(std::ptr::null_mut()) };
     }
+
+    #[test]
+    fn guard_converts_panics_into_code_3_and_tolerates_null_out() {
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let rc = guard(&mut out, || std::panic::panic_any("boom for test"));
+        assert_eq!(rc, 3);
+        let msg = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
+        unsafe { docsql_embedded_free(out) };
+        assert!(msg.contains("boom for test"), "{msg}");
+        // A null out-param must not make the panic handler itself UB.
+        assert_eq!(
+            guard(std::ptr::null_mut(), || std::panic::panic_any("x")),
+            3
+        );
+    }
+
+    #[test]
+    fn registry_joins_different_spellings_of_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("same.db");
+        let a = session_for(abs.to_str().unwrap());
+        run(
+            &a,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v INT)",
+        )
+        .unwrap();
+        // Same byte path spelled through a "./" segment: canonicalization must
+        // collapse it onto the SAME engine (a second engine would silently
+        // own a second Pager over one file).
+        let dot = dir.path().join(".").join("same.db");
+        let b = session_for(dot.to_str().unwrap());
+        assert!(Arc::ptr_eq(&a.shared, &b.shared));
+        run(&a, "INSERT INTO t (v) VALUES (3)").unwrap();
+        assert!(run(&b, "SELECT v FROM t").unwrap().contains("[3]"));
+    }
+
+    #[test]
+    fn error_codes_distinguish_usage_sql_and_open_failures() {
+        let s = session_for(":memory:");
+        // Parameter count mismatch is an engine/SQL error → 1.
+        assert_eq!(run_params(&s, "SELECT 1", "[1]").unwrap_err().0, 1);
+        // Malformed / non-array params JSON is caller usage → 2.
+        assert_eq!(run_params(&s, "SELECT ?", "not json").unwrap_err().0, 2);
+        assert_eq!(
+            run_params(&s, "SELECT ?", r#"{"nope":1}"#).unwrap_err().0,
+            2
+        );
+        // A non-database file fails to open → 5 (loud, never overwritten).
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, b"this is not a docsql database").unwrap();
+        let err = match open_shared(junk.to_str().unwrap()) {
+            Ok(_) => panic!("a non-database file must not open successfully"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, 5);
+    }
+
+    #[test]
+    fn affected_counts_are_exact_for_dml() {
+        let s = session_for(":memory:");
+        run(
+            &s,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v INT)",
+        )
+        .unwrap();
+        assert_eq!(
+            run(&s, "INSERT INTO t (v) VALUES (1)").unwrap(),
+            "{\"affected\":1}"
+        );
+        run(&s, "INSERT INTO t (v) VALUES (2)").unwrap();
+        assert_eq!(
+            run(&s, "UPDATE t SET v = v + 1").unwrap(),
+            "{\"affected\":2}"
+        );
+        assert_eq!(
+            run(&s, "DELETE FROM t WHERE v >= 2").unwrap(),
+            "{\"affected\":2}"
+        );
+        assert_eq!(
+            run(&s, "SELECT COUNT(*) AS n FROM t").unwrap(),
+            "{\"columns\":[\"n\"],\"rows\":[[0]]}"
+        );
+    }
+
+    #[test]
+    fn params_cover_null_and_nested_objects() {
+        let s = session_for(":memory:");
+        run(
+            &s,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v VARCHAR)",
+        )
+        .unwrap();
+        run_params(&s, "INSERT INTO t (v) VALUES (?)", "[null]").unwrap();
+        assert!(run(&s, "SELECT v FROM t").unwrap().contains("[[null]]"));
+        // Nested objects travel as JSON text literals (identical to the
+        // server's render_param policy), never as structural values.
+        run_params(&s, "INSERT INTO t (v) VALUES (?)", r#"[{"k":1}]"#).unwrap();
+        let rows = run(&s, "SELECT v FROM t WHERE id = 2").unwrap();
+        assert!(rows.contains("{\\\"k\\\":1}"), "{rows}");
+    }
+
+    #[test]
+    fn concurrent_reads_do_not_block_writers() {
+        let s = session_for(":memory:");
+        run(
+            &s,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v INT)",
+        )
+        .unwrap();
+        for i in 0..20 {
+            run_params(&s, "INSERT INTO t (v) VALUES (?)", &format!("[{i}]")).unwrap();
+        }
+        let shared = s.shared.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let data = shared.clone();
+            let stop = stop.clone();
+            readers.push(std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Snapshot reads run lock-free; a gate/read-lock inversion
+                    // here would deadlock this test.
+                    execute_in_shared(&data, 0, "SELECT COUNT(*) AS n FROM t", None, 500)
+                        .expect("concurrent read");
+                }
+            }));
+        }
+        let started = Instant::now();
+        for i in 0..50 {
+            execute_in_shared(
+                &s.shared,
+                s.token,
+                "INSERT INTO t (v) VALUES (?)",
+                Some(&format!("[{i}]")),
+                500,
+            )
+            .expect("write under concurrent reads");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(run(&s, "SELECT COUNT(*) AS n FROM t")
+            .unwrap()
+            .contains("[70]"));
+    }
+
+    #[test]
+    fn savepoints_keep_ownership_and_commit_releases_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savepoint.db");
+        let p = path.to_str().unwrap();
+        let a = session_for(p);
+        let b = session_for(p);
+        run(
+            &a,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v INT)",
+        )
+        .unwrap();
+        run(&a, "BEGIN").unwrap();
+        run(&a, "INSERT INTO t (v) VALUES (1)").unwrap();
+        run(&a, "SAVEPOINT sp1").unwrap();
+        run(&a, "INSERT INTO t (v) VALUES (2)").unwrap();
+        run(&a, "ROLLBACK TO SAVEPOINT sp1").unwrap();
+        // Engine semantics (same as the server suite): ROLLBACK TO drops the
+        // named savepoint itself, so a fresh one is opened for the RELEASE leg.
+        run(&a, "SAVEPOINT sp2").unwrap();
+        run(&a, "RELEASE SAVEPOINT sp2").unwrap();
+        // Still the owner: another session cannot write yet.
+        assert_eq!(
+            execute_in_shared(
+                &b.shared,
+                b.token,
+                "INSERT INTO t (v) VALUES (9)",
+                None,
+                100
+            )
+            .unwrap_err()
+            .0,
+            4
+        );
+        run(&a, "COMMIT").unwrap();
+        // COMMIT clears ownership: the next statement proceeds immediately.
+        run(&b, "INSERT INTO t (v) VALUES (9)").unwrap();
+        assert!(run(&a, "SELECT COUNT(*) AS n FROM t")
+            .unwrap()
+            .contains("[2]"));
+    }
 }

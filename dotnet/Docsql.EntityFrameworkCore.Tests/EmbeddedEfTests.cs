@@ -137,4 +137,84 @@ public sealed class EmbeddedEfTests : IDisposable
         }
         Assert.Equal(new[] { "a", "b" }, titles);
     }
+
+    [Fact]
+    public async Task UniqueIndex_Violation_SurfacesAsSaveChangesFailure()
+    {
+        var cs = Cs(NewDb());
+        await using (var db = new EmbeddedUserDb(cs))
+        {
+            db.Users.Add(new EmbeddedUser { Email = "dup@example.com" });
+            await db.SaveChangesAsync();
+        }
+        await using (var db = new EmbeddedUserDb(cs))
+        {
+            db.Users.Add(new EmbeddedUser { Email = "dup@example.com" });
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
+            Assert.True(
+                ex.InnerException is Docsql.Client.DocsqlException { IsUniqueViolation: true },
+                ex.ToString());
+        }
+    }
+
+    [Fact]
+    public async Task ModelEvolution_AddsNewTablesWithoutMigrations()
+    {
+        var cs = Cs(NewDb());
+        await using (var db = new EmbeddedTodoDb(cs))
+        {
+            db.Todos.Add(new EmbeddedTodo { Title = "kept" });
+            await db.SaveChangesAsync();
+        }
+        // A second model over the same file: the provider's lazy sync creates
+        // the new table and leaves the existing one untouched.
+        await using (var db = new EmbeddedNoteDb(cs))
+        {
+            db.Notes.Add(new EmbeddedNote { Text = "brand new" });
+            await db.SaveChangesAsync();
+            Assert.Equal("brand new", await db.Notes.Select(n => n.Text).SingleAsync());
+        }
+        await using (var db = new EmbeddedTodoDb(cs))
+        {
+            Assert.Equal("kept", await db.Todos.Select(t => t.Title).SingleAsync());
+        }
+    }
+}
+
+public class EmbeddedUser
+{
+    public int Id { get; set; }
+    public string Email { get; set; } = "";
+}
+
+public class EmbeddedUserDb : DbContext
+{
+    private readonly string _cs;
+
+    public EmbeddedUserDb(string cs) => _cs = cs;
+
+    public DbSet<EmbeddedUser> Users => Set<EmbeddedUser>();
+
+    protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
+
+    protected override void OnModelCreating(ModelBuilder b) =>
+        b.Entity<EmbeddedUser>().HasIndex(u => u.Email).IsUnique()
+            .HasDatabaseName("IX_EmbeddedUsers_Email");
+}
+
+public class EmbeddedNote
+{
+    public int Id { get; set; }
+    public string Text { get; set; } = "";
+}
+
+public class EmbeddedNoteDb : DbContext
+{
+    private readonly string _cs;
+
+    public EmbeddedNoteDb(string cs) => _cs = cs;
+
+    public DbSet<EmbeddedNote> Notes => Set<EmbeddedNote>();
+
+    protected override void OnConfiguring(DbContextOptionsBuilder o) => o.UseDocsql(_cs);
 }
