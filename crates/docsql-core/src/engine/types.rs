@@ -202,6 +202,20 @@ pub struct ParsedStatement {
     /// execute_parsed call site.
     pub source: String,
 }
+
+impl ParsedStatement {
+    /// True when the statement is a plain, WITH-free SELECT — the only shape
+    /// the read tiers accept. WITH queries materialize statement-local temp
+    /// state (`plain_read_query` refuses them), so every read-tier
+    /// classification (server read level, embedded FFI) must use this to
+    /// tier CTEs back to the write path instead of letting them fail there.
+    pub fn is_plain_read(&self) -> bool {
+        matches!(
+            &self.stmt,
+            AnyStmt::Sql(s) if matches!(&**s, Statement::Query(q) if q.with.is_none())
+        )
+    }
+}
 /// A parsed statement: standard SQL (`sqlparser` AST) or one of the
 /// hand-parsed user-management statements (sqlparser 0.62 does not accept
 /// `CREATE USER … PASSWORD` / `GRANT role TO user`). The SQL AST is boxed —

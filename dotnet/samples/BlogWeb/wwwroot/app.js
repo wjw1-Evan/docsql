@@ -146,6 +146,28 @@ async function openPost(id) {
 
   wrap.append(el("div", "body", post.body || "(无正文)"));
 
+  // 类型演示行:DECIMAL 收益 + JSON 元数据;点赞按钮 = ON CONFLICT upsert。
+  const types = el("div", "types");
+  types.append(el("span", "type-chip", `DECIMAL 收益:${post.payout ?? "NULL"}`));
+  if (post.meta) types.append(el("span", "type-chip", `JSON 元数据:${trunc(post.meta, 48)}`));
+  wrap.append(types);
+
+  const actions = el("div", "post-actions");
+  const likeBtn = el("button", "like", `👍 点赞 ${post.likes ?? 0}`);
+  likeBtn.onclick = async () => {
+    likeBtn.disabled = true;
+    try {
+      const r = await api.post(`/api/posts/${post.id}/like`, {});
+      likeBtn.textContent = `👍 点赞 ${r.likes}`;
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      likeBtn.disabled = false;
+    }
+  };
+  actions.append(likeBtn, el("span", "views", `👁 ${post.views ?? 0}`));
+  wrap.append(actions);
+
   wrap.append(el("h3", null, `评论 (${post.comments.length})`));
   const list = el("div", "comments");
   if (post.comments.length === 0) list.append(el("p", "empty", "还没有评论,来说两句。"));
@@ -240,6 +262,161 @@ async function loadAuthors() {
     return opt;
   }));
 }
+
+// ---- 数据库面板(状态 + 写路径演示 + 功能面板) ----
+
+const dbpanel = $("#dbpanel");
+
+$("#db-btn").onclick = () => {
+  dbpanel.showModal();
+  void loadDbPanel();
+};
+$("#db-close").onclick = () => dbpanel.close();
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function fmtUptime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return h > 0 ? `${h}时${m}分` : m > 0 ? `${m}分${s}秒` : `${s}秒`;
+}
+
+function trunc(text, max = 60) {
+  const s = String(text);
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function kvCell(label, value, mono = false) {
+  const cell = el("div", "kv");
+  cell.append(el("span", "kv-label", label));
+  const v = el("span", mono ? "kv-value mono" : "kv-value", value);
+  v.title = String(value);
+  cell.append(v);
+  return cell;
+}
+
+function resultTable(item) {
+  if (item.error) {
+    const box = el("div", "lab-error", `执行报错:${item.error}`);
+    return box;
+  }
+  const table = el("table", "lab-table");
+  const head = el("tr");
+  for (const c of item.columns) head.append(el("th", null, c));
+  table.append(head);
+  for (const row of item.rows) {
+    const tr = el("tr");
+    for (const v of row) {
+      const text = v === null || v === undefined
+        ? "NULL"
+        : v instanceof Object ? JSON.stringify(v) : String(v);
+      tr.append(el("td", null, trunc(text)));
+    }
+    table.append(tr);
+  }
+  if (item.rows.length === 0) {
+    const tr = el("tr");
+    tr.append(el("td", "lab-empty", "(0 行)"));
+    table.append(tr);
+  }
+  return table;
+}
+
+async function loadDbPanel() {
+  $("#lab-action-result").hidden = true;
+  const [status, lab] = await Promise.all([
+    api.get("/api/status"),
+    api.get("/api/lab"),
+  ]);
+
+  // 状态区
+  const box = $("#db-status");
+  box.replaceChildren(
+    kvCell("模式", status.embedded ? "嵌入式(进程内引擎)" : "远程节点"),
+    kvCell("数据库", status.database, true),
+    kvCell("引擎", `${status.engine.name} · DB_NAME=${status.engine.dbName}`),
+    kvCell("客户端版本", status.engine.clientVersion || "—"),
+    kvCell("本进程运行时长", fmtUptime(status.engine.uptimeSeconds)),
+    kvCell("数据文件", status.storage ? fmtBytes(status.storage.dataFileBytes) : "远程(在节点侧)"),
+    kvCell("WAL", status.storage ? fmtBytes(status.storage.walBytes) : "远程(在节点侧)"),
+    kvCell("订阅数(auto-GUID 表)", String(status.subscribers))
+  );
+  const obj = el("div", "db-objects");
+  const objTitle = el("h4", null, `对象清单(表 ${status.objects.tables.length} · 视图 ${status.objects.views.length} · 索引 ${status.objects.indexes.length})`);
+  obj.append(objTitle);
+  const tableRows = el("div", "obj-rows");
+  for (const t of status.objects.tables) {
+    const row = el("div", "obj-row");
+    row.append(el("span", "obj-name", t.name + (t.name.startsWith("mv_") ? " (物化视图)" : "")));
+    row.append(el("span", "obj-count", `${t.rowCount} 行`));
+    tableRows.append(row);
+  }
+  obj.append(tableRows);
+  if (status.objects.views.length > 0) {
+    obj.append(el("div", "obj-note", `视图:${status.objects.views.join("、")}`));
+  }
+  const idx = status.objects.indexes.map((i) => `${i.name}→${i.table}`).join("、");
+  if (idx) obj.append(el("div", "obj-note", `索引:${idx}`));
+  box.append(obj);
+
+  // 功能面板(按组渲染折叠项)
+  const labBox = $("#lab");
+  labBox.replaceChildren();
+  let lastGroup = "";
+  for (const item of lab) {
+    if (item.group !== lastGroup) {
+      lastGroup = item.group;
+      labBox.append(el("h4", "lab-group", item.group));
+    }
+    const details = el("details", "lab-item");
+    const summary = el("summary");
+    summary.append(el("span", null, item.feature), el("span", "lab-id", item.id));
+    details.append(summary);
+    details.append(el("pre", "lab-sql", item.sql));
+    details.append(resultTable(item));
+    labBox.append(details);
+  }
+}
+
+// 写路径演示按钮
+$("#lab-actions").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn) return;
+  const out = $("#lab-action-result");
+  out.hidden = false;
+  out.textContent = "执行中…";
+  btn.disabled = true;
+  try {
+    const r = await api.post(`/api/lab/action/${btn.dataset.action}`, {});
+    out.textContent = JSON.stringify(r, null, 2);
+  } catch (err) {
+    out.textContent = `失败:${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// 订阅(auto-GUID 演示)
+$("#sub-btn").onclick = async () => {
+  const input = $("#sub-email");
+  const out = $("#lab-action-result");
+  out.hidden = false;
+  out.textContent = "执行中…";
+  try {
+    const r = await api.post("/api/subscribers", { email: input.value.trim() });
+    out.textContent = `订阅成功 → 引擎生成的 UUIDv7 主键:${r.id}`;
+    input.value = "";
+    void loadStats();
+  } catch (err) {
+    out.textContent = `失败:${err.message}`;
+  }
+};
 
 // ---- 启动 ----
 

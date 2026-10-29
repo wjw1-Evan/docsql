@@ -218,7 +218,10 @@ fn execute_in_shared(
     // Read tier: only while no transaction is open, mirroring the server's
     // `classify_read_eligible` (owner SELECTs inside a transaction must see
     // their own uncommitted writes, so they go through the gated path).
-    if !is_write {
+    // WITH queries (CTE) must stay on the gated write path — the read tier
+    // refuses them, and without this exclusion every embedded CTE failed
+    // with "WITH queries must use the write path" instead of falling back.
+    if !is_write && parsed.is_plain_read() {
         let gate_free = lock_or_recover(&shared.gate).is_none();
         if gate_free {
             let view = {
@@ -515,6 +518,32 @@ mod tests {
         run(&a, "CREATE TABLE only_a (id INT)").unwrap();
         let err = run(&b, "SELECT * FROM only_a").unwrap_err();
         assert_eq!(err.0, 1, "{err:?}");
+    }
+
+    #[test]
+    fn cte_select_falls_back_to_write_path() {
+        // 读级只收无 WITH 的裸 Query(与 server classify_read_eligible 同规):
+        // CTE 曾直接进读级,被 ReadView 拒绝("WITH queries must use the
+        // write path")而不是回落写路径 —— 嵌入式形态下 CTE 全挂。
+        let s = session_for(":memory:");
+        run(
+            &s,
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v INT)",
+        )
+        .unwrap();
+        run(&s, "INSERT INTO t (v) VALUES (3), (9)").unwrap();
+        let rows = run(
+            &s,
+            "WITH big AS (SELECT v FROM t WHERE v > 5) SELECT v FROM big",
+        )
+        .unwrap();
+        assert!(rows.contains("[9]"), "{rows}");
+        let recursive = run(
+            &s,
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 4) SELECT n FROM seq",
+        )
+        .unwrap();
+        assert!(recursive.contains("[4]"), "{recursive}");
     }
 
     #[test]

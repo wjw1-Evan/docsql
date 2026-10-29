@@ -799,10 +799,9 @@ fn classify_read_eligible(state: &ServerState, sql: &str, user: Option<&UserAuth
     if p.is_write || p.tx != TxControl::None {
         return false;
     }
-    if !matches!(
-        &p.stmt,
-        AnyStmt::Sql(s) if matches!(&**s, sqlparser::ast::Statement::Query(q) if q.with.is_none())
-    ) {
+    // WITH 查询(CTE)必须走写路径:读级拒绝它们,这里不排除就会把
+    // CTE 送进必败的读级。判定与嵌入式 FFI 共用 core 的 is_plain_read。
+    if !p.is_plain_read() {
         return false;
     }
     // The db reference is load-bearing: view base-table expansion (a view

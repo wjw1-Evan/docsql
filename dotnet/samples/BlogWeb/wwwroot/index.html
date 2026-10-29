@@ -16,6 +16,7 @@
     <div class="stats" id="stats"></div>
     <div class="tools">
       <input id="search" type="search" placeholder="搜索标题或正文…" autocomplete="off">
+      <button id="db-btn">数据库面板</button>
       <button id="compose-btn" class="primary">写文章</button>
     </div>
   </header>
@@ -59,6 +60,39 @@
         <button class="primary" type="submit">发布</button>
       </footer>
     </form>
+  </dialog>
+
+  <dialog id="dbpanel" class="dbpanel">
+    <div class="dbpanel-head">
+      <h2>数据库面板</h2>
+      <button id="db-close" class="primary">关闭</button>
+    </div>
+    <div class="dbpanel-body">
+      <section>
+        <h3>数据库状态</h3>
+        <div id="db-status" class="db-status">加载中…</div>
+      </section>
+
+      <section>
+        <h3>写路径演示(真实执行)</h3>
+        <div class="lab-actions" id="lab-actions">
+          <button data-action="refresh-matview">REFRESH 物化视图</button>
+          <button data-action="merge-stats">MERGE 作者统计</button>
+          <button data-action="tx-savepoint">事务 + SAVEPOINT</button>
+          <button data-action="trigger-fire">触发器演示</button>
+        </div>
+        <div class="sub-row">
+          <input id="sub-email" type="email" placeholder="邮箱 — 订阅(auto-GUID,引擎生成 UUIDv7)">
+          <button id="sub-btn">订阅</button>
+        </div>
+        <pre id="lab-action-result" class="lab-result" hidden></pre>
+      </section>
+
+      <section>
+        <h3>功能面板 — 只读演示批(每项附原文 SQL 与结果)</h3>
+        <div id="lab" class="lab">加载中…</div>
+      </section>
+    </div>
   </dialog>
 
   <script src="app.js"></script>
