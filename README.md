@@ -179,4 +179,4 @@ CI 执行 Rust 门禁 + 覆盖率回归 + .NET 套件,然后发布多架构镜�
 
 ## 许可证
 
-双许可:Apache-2.0 或 MIT,任选其一。见 [LICENSE-APACHE](LICENSE-APACHE) / [LICENSE-MIT](LICENSE-MIT)。
+**免费商用** — DocSQL 以双许可发布:Apache-2.0 或 MIT,任选其一(见 [LICENSE-APACHE](LICENSE-APACHE) / [LICENSE-MIT](LICENSE-MIT))。商业部署、生产环境使用、闭源集成、修改、再分发与销售均免费,无需付费或单独授权;唯一义务是随分发保留许可文件与版权声明。许可文本按其条款逐字保留,不做修改。
