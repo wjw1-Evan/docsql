@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DocSQL 博客</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◆</span>
+      <h1>DocSQL 博客</h1>
+      <span class="badge" id="mode-badge">嵌入式</span>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div class="tools">
+      <input id="search" type="search" placeholder="搜索标题或正文…" autocomplete="off">
+      <button id="compose-btn" class="primary">写文章</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="list-pane">
+      <div class="tagbar" id="tags"></div>
+      <div id="posts" class="posts"></div>
+      <p class="empty" id="empty" hidden>没有匹配的文章</p>
+    </section>
+    <aside class="detail-pane" id="detail">
+      <div class="placeholder">
+        <span class="ph-icon">📖</span>
+        <p>选择一篇文章阅读与评论</p>
+        <p class="hint">数据存在本机的一个 <code>blog.db</code> 文件里,没有 server、没有 Docker。</p>
+      </div>
+    </aside>
+  </main>
+
+  <dialog id="composer" class="composer">
+    <form id="post-form" method="dialog">
+      <h2>写文章</h2>
+      <label>标题
+        <input name="title" maxlength="200" required placeholder="一句话说清主题">
+      </label>
+      <div class="row">
+        <label>作者
+          <input name="author" list="author-list" maxlength="60" placeholder="alice">
+          <datalist id="author-list"></datalist>
+        </label>
+        <label>标签(逗号分隔)
+          <input name="tags" maxlength="200" placeholder="dotnet, embedded">
+        </label>
+      </div>
+      <label>正文
+        <textarea name="body" rows="7" placeholder="支持任意文本;缺字段、异形数据都没问题。"></textarea>
+      </label>
+      <p class="err" id="form-err"></p>
+      <footer class="actions">
+        <button type="button" id="cancel-compose">取消</button>
+        <button class="primary" type="submit">发布</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

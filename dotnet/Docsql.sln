@@ -27,6 +27,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "samples", "samples", "{5D20
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BlogSample", "samples\BlogSample\BlogSample.csproj", "{63D3B0C3-8F98-4E04-A576-82319649FAAF}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BlogWeb", "samples\BlogWeb\BlogWeb.csproj", "{5EE60B77-8AF2-47D2-8897-310164E1D685}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -169,11 +171,24 @@ Global
 		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x64.Build.0 = Release|Any CPU
 		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x86.ActiveCfg = Release|Any CPU
 		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x86.Build.0 = Release|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Debug|x64.Build.0 = Debug|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Debug|x86.Build.0 = Debug|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Release|x64.ActiveCfg = Release|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Release|x64.Build.0 = Release|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Release|x86.ActiveCfg = Release|Any CPU
+		{5EE60B77-8AF2-47D2-8897-310164E1D685}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{63D3B0C3-8F98-4E04-A576-82319649FAAF} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{5EE60B77-8AF2-47D2-8897-310164E1D685} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 	EndGlobalSection
 EndGlobal

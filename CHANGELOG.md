@@ -21,6 +21,19 @@
   演示懒建表+唯一索引/外键、标签数组(`List<string>` primitive collection →
   JSON_ARRAY_CONTAINS 筛选)、JOIN/时间倒序分页/LIKE、事务回滚、原生 SQL GROUP BY
   混用与重开验证持久化;已收录 `dotnet/Docsql.sln`。
+- **示例:博客前端(`dotnet/samples/BlogWeb`)** — 可操作体验的博客单页:ASP.NET Core
+  最小 API + 内置零依赖前端(文章列表/标签筛选/搜索/阅读详情/评论/发文章)。
+  后端仍是嵌入式 `Data Source=blog.db`(可用 `DOCSQL_CONN` 切远程节点),启动预置演示数据;
+  `BLOG_URLS` 覆盖监听地址,默认 `http://127.0.0.1:17800`。已收录 `dotnet/Docsql.sln`。
+
+### 修复
+- **派生表/CTE 的限定列名导致外层引用取错值**:内层 `SELECT "p"."Id" …` 的输出列名曾原样
+  保留限定形式(`p.Id`),外层 `p0.Id` 直接查键失败后落入 `lookup_col` 的 JOIN 后缀回退,
+  按 BTreeMap 顺序可能命中**右表同名列**(`c.Id`)——EF Core `Include` 生成的
+  `SELECT p0.Id … FROM (…) p0 LEFT JOIN Comments c` 会把"零评论文章"配上别的文章的评论行。
+  现在派生表/CTE 输出列按 SQL 标准取裸列名(显式 `AS` 别名优先,裸名重名时后者保留限定
+  形式),外层 `别名.列` 与裸列都可解析。回归:`complex_query_tests` 2 条 + `subquery`
+  单元测试 2 条。
 
 ### 变更
 - **.NET 嵌入式设计稿**(`docs/design/006-dotnet-embedded-mode.md`,评估稿未实现):方案矩阵
