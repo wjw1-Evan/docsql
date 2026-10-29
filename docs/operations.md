@@ -106,7 +106,8 @@ docker compose -f docker-compose.prod.yml --profile cluster --profile lb up -d  
   `deploy/lb/nginx.conf` 的 upstream 里补一行再重建 lb 容器(静态列表示例,刻意不引
   DNS-RS/Consul 之类依赖);
 - **客户端侧替代**:.NET 驱动的 `hosts=` 连接串(`docs/drivers.md`)在应用进程内做
-  同样的事(轮换 + 自动换节点),无需任何网络设施;两者可叠加——把 LB 入口放进
+  同样的事(轮换 + 自动换节点),而且只需写一个种子 —— 客户端从任意节点自动发现
+  全集群实例、失败切换后刷新成员表,无需任何网络设施;两者可叠加——把 LB 入口放进
   hosts= 候选之一即可。LB 适合多语言客户端共享一个入口地址的场景;lb 容器无数据卷,
   重建即丢访问日志。
 

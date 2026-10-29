@@ -230,10 +230,16 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
 }
 
 /// <summary>
-/// hosts= 多主机轮换游标:按规范化 hosts 键(process 级)计数。每次新建
-/// 物理连接轮换一个候选起点(第一个 Open 连 endpoints[0],此后轮流),
-/// 三节点集群的新连接因此均匀散布 = 客户端侧负载分摊。池化形态下轮换
-/// 只影响拨号:各端点的空闲池槽优先复用(命中不拨号,也就不轮换)。
+/// hosts= 多主机轮换游标 + 实例自动发现缓存(均为进程级,按规范化 hosts
+/// 键隔离,主机名大小写不敏感):
+///
+/// - 游标:每次新建连接轮换候选起点(三节点集群的新连接均匀散布 = 负载分摊);
+/// - 发现:任意一次成功建连后经 REQ_STATUS 学到该节点的活扇出成员表
+///   (<c>peers</c> 与主从形态的 <c>replicate_to</c>,含动态 join 注册的
+///   节点)。连接串因此只写一个种子即可 —— 首次连接学到全集群,之后按全表
+///   轮换;本轮 Open 有端点失败时强制刷新,从幸存节点重建"全部实例"。
+///   发现是增强不是前置条件:非 admin 用户/旧节点拿不到 status 时安静
+///   退回连接串里的候选表。
 /// </summary>
 internal static class HostRotation
 {
@@ -244,20 +250,127 @@ internal static class HostRotation
 
     private static readonly ConcurrentDictionary<string, Cursor> Cursors = new();
 
-    /// <summary>从轮换点开始的连接建立次序(endpoints 原样收尾)。</summary>
-    internal static (string host, int port)[] Plan((string host, int port)[] endpoints)
+    /// <summary>规范化 hosts 键(配置表本身,不含发现结果):游标与发现
+    /// 缓存都挂在它上面 —— 同一连接串的所有连接共享拓扑知识。</summary>
+    internal static string KeyOf((string host, int port)[] configured) =>
+        string.Join(",", configured.Select(e => $"{e.host.ToLowerInvariant()}:{e.port}"));
+
+    /// <summary>一个 hosts 键的发现结果:节点上报的成员表 + 两条节流时间戳。</summary>
+    internal sealed class Discovery
     {
-        var key = string.Join(",", endpoints.Select(e => $"{e.host}:{e.port}"));
+        private volatile (string host, int port)[] _peers = Array.Empty<(string, int)>();
+        private long _stamp = -1;   // 上次成功学习的 TickCount64
+        private long _attempt = -1; // 上次尝试的 TickCount64(并发 Open 只放一个去问)
+
+        internal (string host, int port)[] Peers => _peers;
+
+        internal void Publish((string host, int port)[] peers) =>
+            (_peers, _stamp) = (peers, Environment.TickCount64);
+
+        /// <summary>
+        /// 本轮是否该向刚建好的连接问拓扑。force = 本次 Open 已有端点失败
+        /// (出错即刷新,不等节流);否则缓存超过 freshMs 才刷新。并发 Open
+        /// 靠 attempt 的 CAS 裁决,同一窗口只有一条连接发 status 往返。
+        /// </summary>
+        internal bool Due(bool force, long freshMs, long retryMs)
+        {
+            var now = Environment.TickCount64;
+            if (force)
+            {
+                // 失败恢复优先:换节点成功后立刻重建成员表(代价只是多一条
+                // status 往返,且只发生在已经出错的 Open 上)。
+                Interlocked.Exchange(ref _attempt, now);
+                return true;
+            }
+            if (now - Interlocked.Read(ref _stamp) < freshMs)
+            {
+                return false;
+            }
+            var last = Interlocked.Read(ref _attempt);
+            if (now - last < retryMs)
+            {
+                return false;
+            }
+            return Interlocked.CompareExchange(ref _attempt, now, last) == last;
+        }
+    }
+
+    private static readonly ConcurrentDictionary<string, Discovery> Discoveries = new();
+
+    internal static Discovery DiscoveryOf(string key) =>
+        Discoveries.GetOrAdd(key, _ => new Discovery());
+
+    /// <summary>近期失败的端点(键 = host:port,值 = 失败时刻 TickCount64)。
+    /// 降温只在排序上体现:失败的候选排到尾部,轮换先打健康节点 —— 宿主机
+    /// 客户端拨 compose 内网名(不可解析)、或节点刚掉线时,不会每次 Open
+    /// 都先吃一次失败拨号。成功一次即清除标记,60s 后自然回到轮换里。</summary>
+    private static readonly ConcurrentDictionary<string, long> Cooling = new();
+    private const long CoolingMs = 60_000;
+
+    private static string EndpointKey(string host, int port) =>
+        $"{host.ToLowerInvariant()}:{port}";
+
+    internal static void NoteFailure((string host, int port) ep) =>
+        Cooling[EndpointKey(ep.host, ep.port)] = Environment.TickCount64;
+
+    internal static void NoteSuccess((string host, int port) ep) =>
+        Cooling.TryRemove(EndpointKey(ep.host, ep.port), out _);
+
+    private static bool IsCooling(string host, int port) =>
+        Cooling.TryGetValue(EndpointKey(host, port), out var at)
+        && Environment.TickCount64 - at < CoolingMs;
+
+    /// <summary>
+    /// 候选顺序 = 配置表 + 发现到的实例(去重,配置表在前),整个合并表从
+    /// 轮换点起轮换 —— 单一种子配置也能把新连接均匀铺到全集群;配置表
+    /// 永远权威(发现只增加候选,不会把用户写的节点挤掉)。近期失败过的
+    /// 端点(见 <see cref="NoteFailure"/>)稳定沉到尾部:轮换先打健康节点,
+    /// 但恢复后仍会被轮到(不用重启进程)。
+    /// </summary>
+    internal static (string host, int port)[] Plan(
+        (string host, int port)[] configured, (string host, int port)[] discovered)
+    {
+        var key = KeyOf(configured);
         var cursor = Cursors.GetOrAdd(key, _ => new Cursor());
+        var merged = new List<(string host, int port)>(configured.Length + discovered.Length);
+        foreach (var ep in configured)
+        {
+            Add(ep);
+        }
+        foreach (var ep in discovered)
+        {
+            Add(ep);
+        }
         // 首个 Open 取 0(先 +1 再 -1):并行 Open 各自拿到不同起点,同一
         // 健康状态不会看向同一个节点两次。
-        var start = (int)((Interlocked.Increment(ref cursor.Count) - 1) % endpoints.Length);
-        var plan = new (string host, int port)[endpoints.Length];
-        for (var i = 0; i < plan.Length; i++)
+        var start = (int)((Interlocked.Increment(ref cursor.Count) - 1) % merged.Count);
+        var plan = new List<(string host, int port)>(merged.Count);
+        for (var i = 0; i < merged.Count; i++)
         {
-            plan[i] = endpoints[(start + i) % endpoints.Length];
+            var ep = merged[(start + i) % merged.Count];
+            if (!IsCooling(ep.host, ep.port))
+            {
+                plan.Add(ep);
+            }
         }
-        return plan;
+        for (var i = 0; i < merged.Count; i++)
+        {
+            var ep = merged[(start + i) % merged.Count];
+            if (IsCooling(ep.host, ep.port))
+            {
+                plan.Add(ep);
+            }
+        }
+        return plan.ToArray();
+
+        void Add((string host, int port) ep)
+        {
+            if (!merged.Any(e => e.port == ep.port
+                    && string.Equals(e.host, ep.host, StringComparison.OrdinalIgnoreCase)))
+            {
+                merged.Add(ep);
+            }
+        }
     }
 }
 
@@ -498,8 +611,10 @@ internal static class ConnectionPool
 
     /// Borrow-side return (cancellation paths): the permit is still held
     /// by THIS caller, so the enqueue mirrors Return's locked body without
-    /// releasing twice.
-    private static void ReturnToIdle(Slot slot, ProtocolConnection proto)
+    /// releasing twice. Also used by hosts= failover when a candidate turns
+    /// unusable AFTER it was rented (discovery refresh failed): the permit
+    /// must go back exactly once.
+    internal static void ReturnToIdle(Slot slot, ProtocolConnection proto)
     {
         lock (slot.Sync)
         {
@@ -697,6 +812,31 @@ public sealed class DocsqlConnection : DbConnection
 
     public override string ServerVersion => "0.1";
 
+    /// <summary>
+    /// hosts= 形态的实例自动发现结果:最近一次从节点学到的全部对等实例
+    /// (host:port,不含连接串里配置的候选;已按配置去重)。连接串只写一个
+    /// 种子也能在这里看到全集群 —— 打开一次之后即可用;非 hosts= 形态或
+    /// 尚未学到(非 admin 用户/旧节点)时为空表。发现缓存按 hosts 键进程内
+    /// 共享,换节点失败切换后自动刷新。
+    /// </summary>
+    public IReadOnlyList<(string host, int port)> DiscoveredPeers
+    {
+        get
+        {
+            var p = Parsed;
+            if (!p.IsMultiHost)
+            {
+                return Array.Empty<(string, int)>();
+            }
+            var configured = p.HostList;
+            var peers = HostRotation.DiscoveryOf(HostRotation.KeyOf(configured)).Peers;
+            return peers
+                .Where(d => !configured.Any(e => e.port == d.port
+                    && string.Equals(e.host, d.host, StringComparison.OrdinalIgnoreCase)))
+                .ToArray();
+        }
+    }
+
     /// <summary>连接/借池等待超时秒数(连接串 connect timeout,默认 15)。</summary>
     public override int ConnectionTimeout => Parsed.ConnectTimeout;
 
@@ -863,32 +1003,46 @@ public sealed class DocsqlConnection : DbConnection
     }
 
     /// <summary>
-    /// hosts= 多主机打开连接。每次 Open 从轮换点起逐个尝试候选:端点
-    /// 离线、拨号超时、认证拒绝、验活失败、池满等待超时一律自动切下一
-    /// 个节点;全部候选失败 → 抛出带各端点失败原因的合并错误(内因 =
-    /// 最后尝试的原始异常)。预算:connect timeout 为总预算,按候选均分
-    /// 到每次尝试(下限 1 秒,避免长列表把单端点拨号卡死到趋零)。
-    /// 池化形态的轮换只发生在新建拨号(空闲命中不拨号也不轮换)。
+    /// hosts= 多主机打开连接。候选 = 连接串配置表(从轮换点起) + 已发现的
+    /// 实例表;逐个尝试:端点离线、拨号超时、认证拒绝、验活失败、池满等待
+    /// 超时一律自动切下一个节点;全部候选失败 → 带各端点失败原因的合并错误
+    /// (内因 = 最后尝试的原始异常)。预算:connect timeout 为总预算,按候选
+    /// 均分到每次尝试(下限 1 秒)。建连成功后按需向该节点要一次成员表
+    /// (REQ_STATUS):本轮有过失败 → 立即刷新(出错即更新全部实例信息),
+    /// 否则缓存过期才刷新。池化形态的轮换只发生在新建拨号(空闲命中不拨号)。
     /// </summary>
     private (IProtocolSession proto, ConnectionPool.Slot? slot) OpenAcrossEndpoints(
         DocsqlConnectionStringBuilder p)
     {
-        var endpoints = HostRotation.Plan(p.HostList);
+        var configured = p.HostList;
+        var discovery = HostRotation.DiscoveryOf(HostRotation.KeyOf(configured));
+        var endpoints = HostRotation.Plan(configured, discovery.Peers);
         var budget = Math.Max(1000, p.ConnectTimeout * 1000 / endpoints.Length);
         var failures = new List<Exception>(endpoints.Length);
         foreach (var ep in endpoints)
         {
+            ConnectionPool.Slot? slot = null;
+            ProtocolConnection? proto = null;
             try
             {
                 if (p.Pooling)
                 {
-                    var slot = ConnectionPool.SlotOfEndpoint(ep, p, KeyOverride);
-                    return (ConnectionPool.Rent(slot, p, KeyOverride, budget), slot);
+                    slot = ConnectionPool.SlotOfEndpoint(ep, p, KeyOverride);
+                    proto = ConnectionPool.Rent(slot, p, KeyOverride, budget);
                 }
-                return (ConnectAndAuthEndpoint(ep.host, ep.port, p, KeyOverride, budget), null);
+                else
+                {
+                    proto = ConnectAndAuthEndpoint(ep.host, ep.port, p, KeyOverride, budget);
+                }
+                // 学到/刷新成员表;往返本身失败(IO/超时)视同该候选不可用。
+                RefreshPeers(discovery, proto, force: failures.Count > 0);
+                HostRotation.NoteSuccess(ep);
+                return (proto, slot);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                RecycleCandidate(slot, proto);
+                HostRotation.NoteFailure(ep);
                 // 单个端点不可用不代表集群不可用:记录原因换下一个节点。
                 failures.Add(new DocsqlException($"{ep.host}:{ep.port}: {ex.Message}", ex));
             }
@@ -903,28 +1057,55 @@ public sealed class DocsqlConnection : DbConnection
     private async Task<(IProtocolSession proto, ConnectionPool.Slot? slot)> OpenAcrossEndpointsAsync(
         DocsqlConnectionStringBuilder p, CancellationToken cancellationToken)
     {
-        var endpoints = HostRotation.Plan(p.HostList);
+        var configured = p.HostList;
+        var discovery = HostRotation.DiscoveryOf(HostRotation.KeyOf(configured));
+        var endpoints = HostRotation.Plan(configured, discovery.Peers);
         var budget = Math.Max(1000, p.ConnectTimeout * 1000 / endpoints.Length);
         var failures = new List<Exception>(endpoints.Length);
         foreach (var ep in endpoints)
         {
+            ConnectionPool.Slot? slot = null;
+            ProtocolConnection? proto = null;
+            // RentAsync/ConnectAndAuthEndpointAsync 失败时自己收尾;只有
+            // 建连成功之后(发现刷新阶段)的异常才需要本层回收。
+            var acquired = false;
             try
             {
                 if (p.Pooling)
                 {
-                    var slot = ConnectionPool.SlotOfEndpoint(ep, p, KeyOverride);
-                    var proto = await ConnectionPool.RentAsync(
+                    slot = ConnectionPool.SlotOfEndpoint(ep, p, KeyOverride);
+                    proto = await ConnectionPool.RentAsync(
                             slot, p, KeyOverride, budget, cancellationToken)
                         .ConfigureAwait(false);
-                    return (proto, slot);
                 }
-                var direct = await ConnectAndAuthEndpointAsync(
-                        ep.host, ep.port, p, KeyOverride, budget, cancellationToken)
+                else
+                {
+                    proto = await ConnectAndAuthEndpointAsync(
+                            ep.host, ep.port, p, KeyOverride, budget, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                acquired = true;
+                await RefreshPeersAsync(discovery, proto, failures.Count > 0, cancellationToken)
                     .ConfigureAwait(false);
-                return (direct, null);
+                acquired = false;
+                HostRotation.NoteSuccess(ep);
+                return (proto, slot);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
             {
+                if (acquired)
+                {
+                    RecycleCandidate(slot, proto);
+                }
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (acquired)
+                {
+                    RecycleCandidate(slot, proto);
+                }
+                HostRotation.NoteFailure(ep);
                 failures.Add(new DocsqlException($"{ep.host}:{ep.port}: {ex.Message}", ex));
             }
         }
@@ -932,6 +1113,169 @@ public sealed class DocsqlConnection : DbConnection
             $"connect failed: hosts= 的 {endpoints.Length} 个端点全部不可用\n  "
             + string.Join("\n  ", failures.Select(f => f.Message)),
             failures[^1]);
+    }
+
+    /// <summary>候选在建连成功之后失败时的收尾:池化连接归还名额(死连接
+    /// 直接丢弃,绝不把 Broken 物理连接塞回池);直连连接直接关闭。</summary>
+    private static void RecycleCandidate(ConnectionPool.Slot? slot, ProtocolConnection? proto)
+    {
+        if (proto is null)
+        {
+            return;
+        }
+        if (slot is null)
+        {
+            proto.Dispose();
+            return;
+        }
+        if (proto.Broken)
+        {
+            proto.Dispose();
+            slot.Permits.Release();
+            return;
+        }
+        ConnectionPool.ReturnToIdle(slot, proto);
+    }
+
+    /// <summary>
+    /// 实例自动发现:REQ_STATUS 的 <c>peers</c>(活扇出成员表,含动态 join
+    /// 注册的节点)与主从形态的 <c>replicate_to</c>,解析成可拨号端点表。
+    /// 拿不到 RESP_STATUS(只读令牌/非 admin 数据库用户/仲裁者/旧节点)
+    /// 或载荷无法解析 → null:安静退回连接串候选表,不影响连接可用性。
+    /// </summary>
+    private static (string host, int port)[]? QueryPeers(ProtocolConnection proto)
+    {
+        var resp = proto.Send(
+            new Frame(FrameType.ReqStatus, 0, 0, Array.Empty<byte>()), 5000);
+        if (resp.Type != FrameType.RespStatus)
+        {
+            return null;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(resp.Payload);
+            return ParsePeers(doc.RootElement);
+        }
+        catch (JsonException)
+        {
+            return null; // 异形载荷:不因发现失败打断建连
+        }
+    }
+
+    /// <summary>"host:port" / "[ipv6]:port" → 端点(DOCSQL_PEERS 的两种写法)。</summary>
+    private static bool TryParseEndpoint(string? text, out (string host, int port) ep)
+    {
+        ep = default;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+        var s = text.Trim();
+        string host;
+        string portText;
+        if (s.StartsWith('['))
+        {
+            var close = s.IndexOf(']');
+            if (close < 0 || close + 1 >= s.Length || s[close + 1] != ':')
+            {
+                return false;
+            }
+            host = s[1..close];
+            portText = s[(close + 2)..];
+        }
+        else
+        {
+            var c = s.LastIndexOf(':');
+            if (c <= 0)
+            {
+                return false;
+            }
+            host = s[..c];
+            portText = s[(c + 1)..];
+        }
+        if (host.Trim().Length == 0
+            || !int.TryParse(portText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port)
+            || port is < 1 or > 65535)
+        {
+            return false;
+        }
+        ep = (host.Trim(), port);
+        return true;
+    }
+
+    /// <summary>按需学习成员表(见 <see cref="OpenAcrossEndpoints"/>):
+    /// 成功应答才更新缓存;IO/超时上抛(该候选判失败,换下一节点)。</summary>
+    private static void RefreshPeers(
+        HostRotation.Discovery discovery, ProtocolConnection proto, bool force)
+    {
+        if (!discovery.Due(force, freshMs: 5_000, retryMs: 1_000))
+        {
+            return;
+        }
+        var peers = QueryPeers(proto);
+        if (peers is not null)
+        {
+            discovery.Publish(peers);
+        }
+    }
+
+    /// <summary><see cref="RefreshPeers"/> 的真异步形态。</summary>
+    private static async Task RefreshPeersAsync(
+        HostRotation.Discovery discovery, ProtocolConnection proto, bool force,
+        CancellationToken cancellationToken)
+    {
+        if (!discovery.Due(force, freshMs: 5_000, retryMs: 1_000))
+        {
+            return;
+        }
+        var resp = await proto.SendAsync(
+                new Frame(FrameType.ReqStatus, 0, 0, Array.Empty<byte>()),
+                cancellationToken, 5000)
+            .ConfigureAwait(false);
+        if (resp.Type != FrameType.RespStatus)
+        {
+            return;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(resp.Payload);
+            var peers = ParsePeers(doc.RootElement);
+            discovery.Publish(peers);
+        }
+        catch (JsonException)
+        {
+            // 异形载荷:保持旧缓存。
+        }
+    }
+
+    /// <summary>状态载荷 → 端点表(同步/异步刷新共用的解析主体)。</summary>
+    private static (string host, int port)[] ParsePeers(JsonElement root)
+    {
+        var list = new List<(string host, int port)>();
+        void Add(string? text)
+        {
+            if (!TryParseEndpoint(text, out var ep))
+            {
+                return;
+            }
+            if (!list.Any(e => e.port == ep.port
+                    && string.Equals(e.host, ep.host, StringComparison.OrdinalIgnoreCase)))
+            {
+                list.Add(ep);
+            }
+        }
+        if (root.TryGetProperty("peers", out var peers) && peers.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in peers.EnumerateArray())
+            {
+                Add(item.ValueKind == JsonValueKind.String ? item.GetString() : null);
+            }
+        }
+        if (root.TryGetProperty("replicate_to", out var to) && to.ValueKind == JsonValueKind.String)
+        {
+            Add(to.GetString());
+        }
+        return list.ToArray();
     }
 
     public override void Open()

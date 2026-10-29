@@ -97,7 +97,7 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 
 - **写入扇出**:任一节点的 SQL 写入按序扇出至全部对等节点;节点间用独立集群凭据(`DOCSQL_CLUSTER_TOKEN`)互相认证
 - **扩容**:起一个指向现有节点的全新容器(`join` profile)即自动拉取全量历史并注册进扇出网格
-- **负载均衡**:.NET 连接串 `hosts=a:7600,b:7600,c:7600`——连接建立轮换分摊 + 失败自动换下一节点([客户端与驱动](docs/drivers.md));compose 可选 `lb` profile 再给一个 nginx stream 单地址入口([运维手册](docs/operations.md))
+- **负载均衡**:.NET 连接串 `hosts=<任一种子>`——连接建立自动发现全集群实例、轮换分摊 + 失败自动换下一节点并刷新实例表([客户端与驱动](docs/drivers.md));compose 可选 `lb` profile 再给一个 nginx stream 单地址入口([运维手册](docs/operations.md))
 - **自愈**:节点离线错过的写在重启时自动增量补齐,超出日志窗口转多数派快照采纳
 - **持久化**:数据在 external 卷,换镜像、重建容器乃至 `down -v` 都不丢
 - **备份**:默认每日自动备份(保留 7 份、带 sha256 校验),控制台或 `POST /api/backup` 可手动触发与一键恢复;支持 PITR 增量链;可选 S3 兼容远端备份副本(`DOCSQL_BACKUP_S3_*`),数据卷损坏后自动回源恢复

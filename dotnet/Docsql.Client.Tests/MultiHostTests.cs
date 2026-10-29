@@ -285,4 +285,132 @@ public sealed class MultiHostTests
             foreach (var node in nodes) node.Dispose();
         }
     }
+
+    // ---- 实例自动发现:单种子 → 全集群(REQ_STATUS peers) ----
+
+    [Fact]
+    public async Task Multi_host_discovers_all_instances_from_a_single_seed()
+    {
+        var nodes = Cluster(3);
+        try
+        {
+            // 只配一个种子:第 1 次 Open 只有一个候选(还没学过拓扑),必然
+            // 落在种子上;建连后自动学到节点 a 的扇出成员表(其余两节点)。
+            var cs = $"hosts=127.0.0.1:{nodes[0].Port};pooling=false";
+            var conns = new List<DocsqlConnection>();
+            try
+            {
+                var first = new DocsqlConnection(cs);
+                await first.OpenAsync();
+                conns.Add(first);
+                Assert.Equal(nodes[0].Port, PortOf(first));
+                Assert.Equal(
+                    new[] { nodes[1].Port, nodes[2].Port }.OrderBy(x => x),
+                    first.DiscoveredPeers.Select(e => e.port).OrderBy(x => x));
+                // 之后按「配置 + 发现」合并表轮换:第 2/3/4 次 Open 依次
+                // 落 b/c/a(单种子配置 = 全集群负载分摊,无需手工列表)。
+                for (var i = 1; i <= 3; i++)
+                {
+                    var c = new DocsqlConnection(cs);
+                    c.Open();
+                    conns.Add(c);
+                    Assert.Equal(nodes[i % 3].Port, PortOf(c));
+                }
+                // 单种子配置下写入照常扇出到全集群。
+                Exec(conns[0], "CREATE TABLE seed (id INT)");
+                for (var i = 0; i < 3; i++)
+                {
+                    Exec(conns[i + 1], $"INSERT INTO seed VALUES ({i})");
+                }
+                foreach (var node in nodes)
+                {
+                    Eventually(
+                        () => Assert.Equal(3, CountOn(node, "seed")),
+                        $"node {node.Port} 未收敛");
+                }
+            }
+            finally
+            {
+                foreach (var c in conns) c.Dispose();
+            }
+        }
+        finally
+        {
+            foreach (var node in nodes) node.Dispose();
+        }
+    }
+
+    // ---- 失败切换后刷新成员表:学到配置之外的实例 ----
+
+    [Fact]
+    public void Multi_host_failover_refreshes_instance_list()
+    {
+        // 非对称拓扑,证明「出错切换 + 更新全部实例信息」:
+        //   a 只认识 b(从 a 发现不到 c);b 认识 a 与 c。
+        // 客户端只配 seed=a:发现 a 的成员表只学到 b;a 死后经 b 成功切换,
+        // 强制刷新从 b 学到 c —— 之后无需重启/改配置就能轮换到 c。
+        var ports = FreePorts(3);
+        var a = PeerNode.Start(ports[0], $"127.0.0.1:{ports[1]}");
+        var b = PeerNode.Start(ports[1], $"127.0.0.1:{ports[0]},127.0.0.1:{ports[2]}");
+        var c = PeerNode.Start(ports[2], "");
+        try
+        {
+            var cs = $"hosts=127.0.0.1:{ports[0]};pooling=false";
+            var conns = new List<DocsqlConnection>();
+            try
+            {
+                var first = new DocsqlConnection(cs);
+                first.Open();
+                conns.Add(first);
+                Assert.Equal(ports[0], PortOf(first));
+                // a 只报 b:c 此时还不可见。
+                Assert.Equal(
+                    new[] { ports[1] },
+                    first.DiscoveredPeers.Select(e => e.port));
+
+                a.Kill();
+                // 第 2 次(游标起点仍指向 b)与第 3 次(起点落在死掉的 a,
+                // 切换成功后强制刷新)b 两次都成功;第 3 次之后 c 入表。
+                var c2 = new DocsqlConnection(cs);
+                c2.Open();
+                conns.Add(c2);
+                Assert.Equal(ports[1], PortOf(c2));
+                var c3 = new DocsqlConnection(cs);
+                c3.Open();
+                conns.Add(c3);
+                Assert.Equal(ports[1], PortOf(c3));
+                Assert.Contains(ports[2], c3.DiscoveredPeers.Select(e => e.port));
+                // 第 4 次:合并表含 c,轮换直接落 c(刷新改变了路由)。
+                var c4 = new DocsqlConnection(cs);
+                c4.Open();
+                conns.Add(c4);
+                Assert.Equal(ports[2], PortOf(c4));
+            }
+            finally
+            {
+                foreach (var conn in conns) conn.Dispose();
+            }
+        }
+        finally
+        {
+            a.Dispose();
+            b.Dispose();
+            c.Dispose();
+        }
+    }
+
+    /// <summary>n 个互不相同的空闲环回端口(每节点一端口)。</summary>
+    private static int[] FreePorts(int n)
+    {
+        var ports = new List<int>();
+        for (var i = 0; i < n; i++)
+        {
+            using var l = new System.Net.Sockets.TcpListener(
+                System.Net.IPAddress.Loopback, 0);
+            l.Start();
+            ports.Add(((System.Net.IPEndPoint)l.LocalEndpoint).Port);
+            l.Stop();
+        }
+        return ports.ToArray();
+    }
 }
