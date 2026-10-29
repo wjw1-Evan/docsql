@@ -110,6 +110,25 @@ public sealed class DocsqlConnectionStringBuilder : DbConnectionStringBuilder
         set => this["tls_host"] = value;
     }
 
+    /// <summary>
+    /// 嵌入式模式(SQLite 式):<c>Data Source=app.db</c>(或 <c>:memory:</c>)
+    /// 直接打开本地数据文件,引擎在本进程内运行 —— 无 server、无端口、无
+    /// Docker。同时给出 host/port 时以本键为准(嵌入优先);集群/远程能力
+    /// (pub/sub、PROMOTE、备份)在嵌入式下显式报错。
+    /// </summary>
+    public string DataSource
+    {
+        get =>
+            TryGetValue("data source", out var v) ? (string)v
+            : TryGetValue("datasource", out v) ? (string)v
+            : TryGetValue("filename", out v) ? (string)v
+            : "";
+        set => this["data source"] = value;
+    }
+
+    /// <summary>是否嵌入式(Data Source 形态;值非空即启用)。</summary>
+    public bool Embedded => DataSource.Length > 0;
+
     /// <summary>每个池的物理连接总数上限(借出 + 空闲):池满时 Open 等待
     /// connect timeout 秒后报错(与 SqlClient 语义一致)。</summary>
     public int MaxPoolSize
@@ -471,7 +490,7 @@ internal static class ConnectionPool
 public sealed class DocsqlConnection : DbConnection
 {
     private ConnectionState _state = ConnectionState.Closed;
-    private ProtocolConnection? _proto;
+    private IProtocolSession? _proto;
     private ConnectionPool.Slot? _poolSlot;
 
     /// <summary>事务打开期间为 true:此时 Close 物理断开(服务器断连自动回滚),连接绝不归还池。</summary>
@@ -542,7 +561,15 @@ public sealed class DocsqlConnection : DbConnection
 
     public override string Database => "docsql";
 
-    public override string DataSource => $"{Parsed.Host}:{Parsed.Port}";
+    /// <summary>嵌入式会话 = 数据文件路径;远程会话 = host:port。</summary>
+    public override string DataSource
+    {
+        get
+        {
+            var p = Parsed;
+            return p.Embedded ? p.DataSource : $"{p.Host}:{p.Port}";
+        }
+    }
 
     public override string ServerVersion => "0.1";
 
@@ -551,7 +578,7 @@ public sealed class DocsqlConnection : DbConnection
 
     public override ConnectionState State => _state;
 
-    internal ProtocolConnection Proto =>
+    internal IProtocolSession Proto =>
         _proto ?? throw new InvalidOperationException("connection is closed");
 
     /// <summary>Proto 的可为空形态:事务代际守卫(<see cref="DocsqlTransaction"/>
@@ -559,7 +586,7 @@ public sealed class DocsqlConnection : DbConnection
     /// _proto=null 时抛 InvalidOperationException,会让 Dispose/Commit/Rollback
     /// 从守卫里逃出该异常而不是走设计的 closed 分支(返回 false)。Close 未
     /// 重开 = null = 不再持有 BEGIN 时那条物理连接,语义与重开换线一致。</summary>
-    internal ProtocolConnection? ProtoOrNull => _proto;
+    internal IProtocolSession? ProtoOrNull => _proto;
 
     public override void ChangeDatabase(string databaseName) { }
 
@@ -706,7 +733,12 @@ public sealed class DocsqlConnection : DbConnection
         var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
         try
         {
-            if (p.Pooling)
+            if (p.Embedded)
+            {
+                // SQLite 式进程内模式:无网络、无池(物理"连接"就是引擎会话)。
+                _proto = EmbeddedSession.Open(p.DataSource);
+            }
+            else if (p.Pooling)
             {
                 var slot = ConnectionPool.SlotOf(p, KeyOverride);
                 _proto = ConnectionPool.Rent(slot, p, KeyOverride, p.ConnectTimeout * 1000);
@@ -737,7 +769,14 @@ public sealed class DocsqlConnection : DbConnection
         var p = EndpointOverride is { } ep ? ep.ToBuilder() : Parsed;
         try
         {
-            if (p.Pooling)
+            if (p.Embedded)
+            {
+                // 打开本地引擎是同步的短操作(打开文件 + WAL 恢复),
+                // 不额外引入线程池跳转;取消请求在入口处检查一次。
+                cancellationToken.ThrowIfCancellationRequested();
+                _proto = EmbeddedSession.Open(p.DataSource);
+            }
+            else if (p.Pooling)
             {
                 var slot = ConnectionPool.SlotOf(p, KeyOverride);
                 _proto = await ConnectionPool.RentAsync(slot, p, KeyOverride, p.ConnectTimeout * 1000, cancellationToken)
@@ -766,16 +805,24 @@ public sealed class DocsqlConnection : DbConnection
         {
             var proto = _proto;
             _proto = null;
-            if (InTransaction || proto.Broken)
+            if (proto is ProtocolConnection wire)
             {
-                // 事务未了结就 Close:物理断开(服务器断连自动 ROLLBACK)。
-                // 归还一个带着开放事务的连接,会把事务泄漏给下一个借出者。
-                // Broken 同理:读超时/IO 失败后帧流停在未知位置。
-                ConnectionPool.Discard(_poolSlot, proto);
+                if (InTransaction || wire.Broken)
+                {
+                    // 事务未了结就 Close:物理断开(服务器断连自动 ROLLBACK)。
+                    // 归还一个带着开放事务的连接,会把事务泄漏给下一个借出者。
+                    // Broken 同理:读超时/IO 失败后帧流停在未知位置。
+                    ConnectionPool.Discard(_poolSlot, wire);
+                }
+                else
+                {
+                    ConnectionPool.Return(_poolSlot, wire);
+                }
             }
             else
             {
-                ConnectionPool.Return(_poolSlot, proto);
+                // 嵌入式会话:关闭即释放引擎句柄(文件/WAL 留待下次打开恢复)。
+                proto.Dispose();
             }
         }
         // The physical connection — and any open transaction on it — is
@@ -1797,7 +1844,7 @@ public sealed class DocsqlTransaction : DbTransaction
     /// <summary>BEGIN 落在这条物理连接上:之后 _conn 被 Close/重 Open 换过物理连接时,
     /// 本事务早已随旧连接断开而回滚 —— 迟到的 Commit/Rollback 绝不能再打到
     /// 新租的连接上(会无声回滚别人的事务)。</summary>
-    private readonly ProtocolConnection _protoAtBegin;
+    private readonly IProtocolSession _protoAtBegin;
     private bool _done;
 
     public DocsqlTransaction(DocsqlConnection conn, IsolationLevel iso)
@@ -2051,6 +2098,10 @@ public sealed class DocsqlFactory : DbProviderFactory
 public sealed class DocsqlException : DbException
 {
     public DocsqlException(string message) : base(message) { }
+
+    /// <summary>带内因异常的构造(嵌入式原生库缺失/加载失败时的诊断链)。</summary>
+    public DocsqlException(string message, Exception innerException)
+        : base(message, innerException) { }
 
     /// <summary>服务端为唯一约束冲突返回的错误(UNIQUE constraint failed[: …])。
     /// 幂等写入路径(webhook 重放等)可据此分支,等价于 Mongo 的 DuplicateKey 判定。</summary>

@@ -50,7 +50,7 @@ jobs:
       - name: Build(测试门禁由 docker-image.yml / 本地 cargo test 承担,这里只构建)
         run: |
           cargo build --release --target "${{ matrix.target }}" \
-            -p docsql-server -p docsql-cli -p docsql-web
+            -p docsql-server -p docsql-cli -p docsql-web -p docsql-ffi
 
       - name: Package
         run: |
@@ -58,6 +58,11 @@ jobs:
           name="docsql-${version}-${{ matrix.target }}.tar.gz"
           tar -C "target/${{ matrix.target }}/release" \
               -czf "/tmp/${name}" docsql-server docsql-cli docsql-web
+          # In-process embedding library (.NET Data Source=…) ships separately
+          # so apps can drop it next to the executable / runtimes/<rid>/native/.
+          tar -C "target/${{ matrix.target }}/release" \
+              -czf "/tmp/docsql-native-${version}-${{ matrix.target }}.tar.gz" \
+              libdocsql_embedded.so
 
       - uses: actions/upload-artifact@v4
         with:
@@ -86,7 +91,7 @@ jobs:
       - name: Build
         run: |
           cargo build --release --target "${{ matrix.target }}" \
-            -p docsql-server -p docsql-cli -p docsql-web
+            -p docsql-server -p docsql-cli -p docsql-web -p docsql-ffi
 
       - name: Package
         run: |
@@ -94,14 +99,47 @@ jobs:
           name="docsql-${version}-${{ matrix.target }}.tar.gz"
           tar -C "target/${{ matrix.target }}/release" \
               -czf "/tmp/${name}" docsql-server docsql-cli docsql-web
+          tar -C "target/${{ matrix.target }}/release" \
+              -czf "/tmp/docsql-native-${version}-${{ matrix.target }}.tar.gz" \
+              libdocsql_embedded.dylib
 
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}
           path: /tmp/docsql-*.tar.gz
 
+  windows:
+    name: windows · embedded native library
+    # Windows 的服务端二进制继续走 WSL/容器(README 明示);此 job 只产
+    # 嵌入式原生库,让 .NET 应用在 Windows 上也有 Data Source=… 的零守护体验。
+    runs-on: windows-latest
+    env:
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$env:TOOLCHAIN" --profile minimal
+          rustup default "$env:TOOLCHAIN"
+
+      - name: Build native library
+        run: cargo build --release --target x86_64-pc-windows-msvc -p docsql-ffi
+
+      - name: Package
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace "^v", ""
+          $name = "docsql-native-$version-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/docsql_embedded.dll" -DestinationPath "$env:RUNNER_TEMP/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/docsql-native-*.zip
+
   release:
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -113,7 +151,7 @@ jobs:
       - name: 聚合校验和(SHA256SUMS 单一资产)
         run: |
           cd dist
-          sha256sum docsql-*.tar.gz > SHA256SUMS
+          sha256sum docsql-* > SHA256SUMS
           ls -la
 
       - name: Upload to GitHub Release

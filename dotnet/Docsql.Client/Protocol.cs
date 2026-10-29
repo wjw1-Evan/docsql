@@ -113,7 +113,25 @@ public sealed class TlsOptions
     public string? HostName { get; init; }
 }
 
-public sealed class ProtocolConnection : IDisposable
+/// The surface the command/transaction layers need from a physical session:
+/// wire transport (<see cref="ProtocolConnection"/>, TCP) or the in-process
+/// embedded backend (<c>EmbeddedSession</c>, `Data Source=…`). Both speak the
+/// exact same request/response frames — embedded mode synthesizes response
+/// frames from the native engine, so the parsing paths below stay shared.
+internal interface IProtocolSession : IDisposable
+{
+    int ReadTimeoutMs { get; set; }
+    bool Broken { get; }
+    Frame Send(Frame request);
+    Frame Send(Frame request, int readTimeoutMs);
+    Task<Frame> SendAsync(
+        Frame request, CancellationToken cancellationToken = default, int readTimeoutMs = -1);
+    (ulong Handle, bool Cached) GetOrPrepare(string template);
+    Task<(ulong Handle, bool Cached)> GetOrPrepareAsync(
+        string template, CancellationToken cancellationToken = default);
+}
+
+public sealed class ProtocolConnection : IProtocolSession
 {
     private const ushort FlagEncrypted = 0x0004;
 
@@ -450,6 +468,16 @@ public sealed class ProtocolConnection : IDisposable
         resp.EnsureOk("prepare failed: ");
         return FinishPrepare(resp, template);
     }
+
+    // The prepare cache surface is internal (test-visible via
+    // InternalsVisibleTo); the shared session interface is internal too, so
+    // these must be explicit to keep the public API unchanged.
+    (ulong Handle, bool Cached) IProtocolSession.GetOrPrepare(string template) =>
+        GetOrPrepare(template);
+
+    Task<(ulong Handle, bool Cached)> IProtocolSession.GetOrPrepareAsync(
+        string template, CancellationToken cancellationToken) =>
+        GetOrPrepareAsync(template, cancellationToken);
 
     private (ulong, bool) FinishPrepare(Frame resp, string template)
     {

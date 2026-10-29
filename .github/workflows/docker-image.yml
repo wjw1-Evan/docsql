@@ -56,6 +56,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The ADO.NET/EF test suites launch target/debug/docsql-server.
       - run: cargo build -p docsql-server
+      # Embedded-mode suites (Data Source=…) load target/debug/libdocsql_embedded.*
+      # through the Docsql.Client native resolver (embedded-native = docsql-ffi).
+      - run: cargo build -p docsql-ffi
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
