@@ -161,6 +161,88 @@ pub enum BTreeError {
 }
 
 pub type Result<T> = std::result::Result<T, BTreeError>;
+/// Bounds-checked byte range;损坏页必须响亮 Corrupt,绝不 slice panic。
+fn take_or(page: &[u8], pos: usize, n: usize) -> Result<&[u8]> {
+    page.get(pos..pos + n)
+        .ok_or(BTreeError::Corrupt("truncated node page"))
+}
+
+/// 节点页形状 + 序列化格起点(每格 u16 klen 字段偏移)。一次线性扫描只读 u16
+/// 长度字段——不解码键、无逐键分配;任何越界 → Corrupt。键按 cmp_values 升序
+/// 有序(插入 partition_point 同一比较器维持),二分单调性成立。
+fn node_starts(page: &[u8]) -> Result<(u8, Option<u32>, Vec<u32>)> {
+    let kind = *page.first().ok_or(BTreeError::Corrupt("empty node page"))?;
+    if kind != LEAF && kind != INTERNAL {
+        return Err(BTreeError::Corrupt("unknown node type"));
+    }
+    let count = u16::from_le_bytes(take_or(page, 1, 2)?.try_into().unwrap()) as usize;
+    let mut pos = if kind == INTERNAL { 7 } else { 3 };
+    let leftmost = if kind == INTERNAL {
+        Some(u32::from_le_bytes(take_or(page, 3, 4)?.try_into().unwrap()))
+    } else {
+        None
+    };
+    let mut starts = Vec::with_capacity(count.min(PAGE_SIZE / 10));
+    for _ in 0..count {
+        starts.push(pos as u32);
+        let klen = u16::from_le_bytes(take_or(page, pos, 2)?.try_into().unwrap()) as usize;
+        pos += 2 + klen + if kind == INTERNAL { 4 } else { 8 };
+    }
+    if pos > page.len() {
+        return Err(BTreeError::Corrupt("truncated node page"));
+    }
+    Ok((kind, leftmost, starts))
+}
+
+/// 解码 `pos`(klen 字段偏移)处的格键,镜像 decode_cell_key 的损坏校验
+/// (klen 权威:解码消耗 != klen → Corrupt,防垃圾键被洗成合法页)。
+fn decode_key_at(page: &[u8], pos: usize) -> Result<Value> {
+    let klen = u16::from_le_bytes(take_or(page, pos, 2)?.try_into().unwrap()) as usize;
+    let buf = take_or(page, pos + 2, klen)?;
+    let (k, used) = encode::decode_prefix(buf)?;
+    if used != klen {
+        return Err(BTreeError::Corrupt("node cell key length mismatch"));
+    }
+    Ok(k)
+}
+
+/// 内部节点格的子页号(u32,紧跟键后)。
+fn child_at(page: &[u8], pos: usize, klen: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        take_or(page, pos + 2 + klen, 4)?.try_into().unwrap(),
+    ))
+}
+
+/// 叶格的值(u64,紧跟键后)。
+fn val_at(page: &[u8], pos: usize, klen: usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        take_or(page, pos + 2 + klen, 8)?.try_into().unwrap(),
+    ))
+}
+
+/// 序列化格上的二分:返回首个与 `key` 的序满足 bound 的格下标。
+/// want_gt=false → 首个 >= key(cmp != Less);want_gt=true → 首个 > key
+/// (cmp == Greater)。键按 cmp_values 升序有序,两个谓词沿格序单调,二分合法;
+/// 每步只解码被比较的那个键。
+fn cells_seek(page: &[u8], starts: &[u32], key: &Value, want_gt: bool) -> Result<usize> {
+    let (mut lo, mut hi) = (0usize, starts.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let k = decode_key_at(page, starts[mid] as usize)?;
+        let ord = Value::cmp_values(&k, key);
+        let go_right = if want_gt {
+            ord != Ordering::Greater
+        } else {
+            ord == Ordering::Less
+        };
+        if go_right {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
 
 enum Node {
     Leaf {
@@ -327,27 +409,64 @@ impl BTree {
         if depth > MAX_TREE_DEPTH {
             return Err(BTreeError::Corrupt("tree depth exceeds limit (cycle?)"));
         }
-        match Self::read_node(reader, tx, id)? {
-            // Leaves are kept sorted by cmp_values (insert uses
-            // partition_point), so the first key >= `key` decides.
-            Node::Leaf { cells } => {
-                let i = cells.partition_point(|(k, _)| Value::cmp_values(k, key) == Ordering::Less);
-                Ok(
-                    if i < cells.len() && Value::cmp_values(&cells[i].0, key) == Ordering::Equal {
-                        Some(cells[i].1)
-                    } else {
-                        None
-                    },
-                )
+        // 惰性读取:边界扫描(不解码键)+ 二分只解码被比较的键;匹配格才解码。
+        let page: Vec<u8> = reader.page(Some(tx), id)?;
+        let (kind, leftmost, starts) = node_starts(&page)?;
+        match kind {
+            LEAF => {
+                let i = cells_seek(&page, &starts, key, false)?;
+                if i < starts.len() {
+                    let pos = starts[i] as usize;
+                    let k = decode_key_at(&page, pos)?;
+                    if Value::cmp_values(&k, key) == Ordering::Equal {
+                        let klen = u16::from_le_bytes(take_or(&page, pos, 2)?.try_into().unwrap())
+                            as usize;
+                        return Ok(Some(val_at(&page, pos, klen)?));
+                    }
+                }
+                Ok(None)
             }
-            Node::Internal { leftmost, cells } => {
-                for child in candidate_children(&cells, leftmost, key) {
+            INTERNAL => {
+                let leftmost =
+                    leftmost.ok_or(BTreeError::Corrupt("internal node missing leftmost"))?;
+                // s = 首个 >= key 的格;g = 首个 > key 的格(= descend 的 partition)。
+                let s = cells_seek(&page, &starts, key, false)?;
+                let g = cells_seek(&page, &starts, key, true)?;
+                // candidate_children 顺序:primary(= cells[g−1],等键 run 时
+                // 最右等键格)→ leftmost(k0 >= key ⇔ s == 0)→ 其余升序
+                // [s−1, g−1)。等键 run 可横跨分裂点,cell s−1 的子树可能含
+                // 等于 key 的键(分裂把等键留在分隔符左侧),必须逐个降级。
+                let primary = if g == 0 {
+                    leftmost
+                } else {
+                    let pos = starts[g - 1] as usize;
+                    let klen =
+                        u16::from_le_bytes(take_or(&page, pos, 2)?.try_into().unwrap()) as usize;
+                    child_at(&page, pos, klen)?
+                };
+                if let Some(v) = Self::get_at(reader, tx, primary, key, depth + 1)? {
+                    return Ok(Some(v));
+                }
+                if s == 0 && leftmost != primary {
+                    if let Some(v) = Self::get_at(reader, tx, leftmost, key, depth + 1)? {
+                        return Ok(Some(v));
+                    }
+                }
+                for &pos_u32 in &starts[s.saturating_sub(1)..g.saturating_sub(1)] {
+                    let pos = pos_u32 as usize;
+                    let klen =
+                        u16::from_le_bytes(take_or(&page, pos, 2)?.try_into().unwrap()) as usize;
+                    let child = child_at(&page, pos, klen)?;
+                    if child == primary {
+                        continue;
+                    }
                     if let Some(v) = Self::get_at(reader, tx, child, key, depth + 1)? {
                         return Ok(Some(v));
                     }
                 }
                 Ok(None)
             }
+            _ => Err(BTreeError::Corrupt("unknown node type")),
         }
     }
 
