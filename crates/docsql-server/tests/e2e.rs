@@ -3312,18 +3312,21 @@ async fn spawn_node_handle(
     addr: &str,
     peers: Vec<String>,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
-    spawn_node_window(dir, name, addr, peers, 0).await
+    spawn_node_window(dir, name, addr, peers, 0, None).await
 }
 
 /// [`spawn_node_handle`] with a catch-up journal window (entries): used
 /// to exercise the snapshot fallback when a rejoining peer's position is
-/// older than the origin's retained window.
+/// older than the origin's retained window. Pass `advertise`
+/// (DOCSQL_ADVERTISE semantics) so the joining node registers itself into
+/// its peers' fan-out lists.
 async fn spawn_node_window(
     dir: &tempfile::TempDir,
     name: &str,
     addr: &str,
     peers: Vec<String>,
     window: u64,
+    advertise: Option<&str>,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
     force_fast_pbkdf2();
     let handle = tokio::spawn(docsql_server::run(docsql_server::ServerConfig {
@@ -3337,7 +3340,7 @@ async fn spawn_node_window(
         cluster_token: None,
         replicate_to: None,
         peers,
-        advertise: None,
+        advertise: advertise.map(String::from),
         read_only: false,
         transport_key: None,
         async_commit: false,
@@ -3635,6 +3638,184 @@ async fn restart_without_divergence_keeps_data() {
     b.abort();
 }
 
+/// The instance add/remove journey: one instance serves alone, further
+/// instances join it one at a time with zero manual steps (each pulls the
+/// full history), writes then spread round-robin across every instance
+/// and converge everywhere, removing an instance leaves the survivors
+/// serving reads and writes untouched, and adding the instance back heals
+/// the writes it missed while it was gone — ending as a full mesh again.
+/// Snapshot-fidelity of the initial dump and the incremental-vs-snapshot
+/// repair paths have their own targeted tests; this one owns the topology
+/// lifecycle.
+#[tokio::test]
+async fn instances_scale_out_and_scale_in_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a_addr, b_addr, c_addr) = (free(), free(), free());
+
+    // One instance, no peers: it serves alone.
+    let a = spawn_node_window(&dir, "isa", &a_addr, vec![], 0, None).await;
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("CREATE TABLE items (id INT PRIMARY KEY, v TEXT)")
+        .await;
+    for i in 1..=5 {
+        ca.sql(&format!("INSERT INTO items VALUES ({i}, 'seed{i}')"))
+            .await;
+    }
+    drop(ca);
+
+    // Scale out #1: the second instance only points at the seed — it must
+    // pull the whole history and start taking part in fan-out. (It
+    // advertises itself so the seed registers it into the mesh.)
+    let b = spawn_node_window(&dir, "isb", &b_addr, vec![a_addr.clone()], 0, Some(&b_addr)).await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT COUNT(id) FROM items", "[[5]]", 500).await,
+        "second instance did not pull the seed history"
+    );
+
+    // Scale out #2: the third instance joins the two-node mesh the same way.
+    let c = spawn_node_window(
+        &dir,
+        "isc",
+        &c_addr,
+        vec![a_addr.clone(), b_addr.clone()],
+        0,
+        Some(&c_addr),
+    )
+    .await;
+    assert!(
+        wait_seen_n(&c_addr, "SELECT COUNT(id) FROM items", "[[5]]", 500).await,
+        "third instance did not pull the history"
+    );
+
+    // Write load spread round-robin across all instances: every insert
+    // must show up on the next instance in the ring no matter which one
+    // took it, and every instance must hold the same picture at the end.
+    let mut ca = Client::connect(&a_addr).await;
+    let mut cb = Client::connect(&b_addr).await;
+    let mut cc = Client::connect(&c_addr).await;
+    for k in 6..=11 {
+        let (writer, watcher) = match (k - 6) % 3 {
+            0 => (&mut ca, &a_addr),
+            1 => (&mut cb, &b_addr),
+            _ => (&mut cc, &c_addr),
+        };
+        let value = format!("rr{k}");
+        let sql = format!("INSERT INTO items VALUES ({k}, '{value}')");
+        let r = writer.sql(&sql).await;
+        assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{sql}");
+        assert!(
+            wait_seen_n(
+                watcher,
+                &format!("SELECT v FROM items WHERE id = {k}"),
+                &value,
+                200
+            )
+            .await,
+            "write for id={k} did not reach the next instance"
+        );
+    }
+    for addr in [&a_addr, &b_addr, &c_addr] {
+        assert!(
+            wait_seen_n(addr, "SELECT COUNT(id) FROM items", "[[11]]", 200).await,
+            "instance {addr} diverged after the round-robin phase"
+        );
+        assert!(
+            wait_seen_n(addr, "SELECT v FROM items WHERE id = 6", "rr6", 100).await,
+            "multi-origin row lost on {addr}"
+        );
+        assert!(
+            wait_seen_n(addr, "SELECT v FROM items WHERE id = 11", "rr11", 100).await,
+            "multi-origin row lost on {addr}"
+        );
+    }
+    drop(ca);
+    drop(cb);
+    drop(cc);
+
+    // Scale in: remove the third instance. The two survivors must keep
+    // serving reads and writes with zero operator action, fanning out
+    // between themselves; the dead peer never blocks them (backoff).
+    c.abort();
+    wait_port_down(&c_addr).await;
+    let mut ca = Client::connect(&a_addr).await;
+    let mut cb = Client::connect(&b_addr).await;
+    ca.sql("INSERT INTO items VALUES (12, 'down-a')").await;
+    assert!(
+        wait_seen_n(&b_addr, "SELECT v FROM items WHERE id = 12", "down-a", 200).await,
+        "survivor stopped taking writes after the scale-in"
+    );
+    cb.sql("INSERT INTO items VALUES (13, 'down-b')").await;
+    assert!(
+        wait_seen_n(&a_addr, "SELECT v FROM items WHERE id = 13", "down-b", 200).await,
+        "survivor-to-survivor fanout broke after the scale-in"
+    );
+    for addr in [&a_addr, &b_addr] {
+        assert!(
+            wait_seen_n(addr, "SELECT COUNT(id) FROM items", "[[13]]", 100).await,
+            "survivors disagree on the count while the third instance is gone"
+        );
+    }
+    drop(ca);
+    drop(cb);
+
+    // Add the instance back: the same data file rejoins the mesh and must
+    // heal the writes it missed while it was gone — they come from two
+    // surviving origins.
+    let c = spawn_node_window(
+        &dir,
+        "isc",
+        &c_addr,
+        vec![a_addr.clone(), b_addr.clone()],
+        0,
+        Some(&c_addr),
+    )
+    .await;
+    assert!(
+        wait_seen_n(&c_addr, "SELECT COUNT(id) FROM items", "[[13]]", 1000).await,
+        "re-added instance did not catch up on the gap"
+    );
+    assert!(
+        wait_seen_n(&c_addr, "SELECT v FROM items WHERE id = 12", "down-a", 200).await,
+        "write missed from origin a was not healed"
+    );
+    assert!(
+        wait_seen_n(&c_addr, "SELECT v FROM items WHERE id = 13", "down-b", 200).await,
+        "write missed from origin b was not healed"
+    );
+
+    // The healed mesh fans out both ways again, then holds one count.
+    let mut cc = Client::connect(&c_addr).await;
+    let r = cc.sql("INSERT INTO items VALUES (14, 'back-c')").await;
+    assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
+    drop(cc);
+    assert!(
+        wait_seen_n(&a_addr, "SELECT v FROM items WHERE id = 14", "back-c", 200).await,
+        "write on the re-added instance did not fan out"
+    );
+    let mut ca = Client::connect(&a_addr).await;
+    ca.sql("INSERT INTO items VALUES (15, 'after-c')").await;
+    drop(ca);
+    assert!(
+        wait_seen_n(&c_addr, "SELECT v FROM items WHERE id = 15", "after-c", 200).await,
+        "write on a survivor did not reach the re-added instance"
+    );
+    for addr in [&a_addr, &b_addr, &c_addr] {
+        assert!(
+            wait_seen_n(addr, "SELECT COUNT(id) FROM items", "[[15]]", 200).await,
+            "instance {addr} diverged at the end of the round trip"
+        );
+    }
+    a.abort();
+    b.abort();
+    c.abort();
+}
+
 /// When the rejoining peer's position is older than the origin's retained
 /// journal window (the window trimmed mid-flight), incremental catch-up
 /// is impossible — the repair must fall back to snapshot adoption and
@@ -3653,7 +3834,7 @@ async fn catchup_falls_back_to_snapshot_after_window_trim() {
     let b_peers = vec![a_addr.clone()];
     // a keeps only a 4-entry journal window (trimmed as it passes each
     // 512-entry mark); b unlimited.
-    let a = spawn_node_window(&dir, "ra", &a_addr, a_peers, 4).await;
+    let a = spawn_node_window(&dir, "ra", &a_addr, a_peers, 4, None).await;
     let b = spawn_node_handle(&dir, "rb", &b_addr, b_peers.clone()).await;
 
     let mut ca = Client::connect(&a_addr).await;
