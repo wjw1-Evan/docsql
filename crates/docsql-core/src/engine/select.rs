@@ -934,19 +934,20 @@ impl<'a> ReadCx<'a> {
             }
         }
         let mut win_tmps: Vec<String> = Vec::new();
+        // Declared columns of the FROM tables: a column ADDed without a
+        // DEFAULT never appears in stored rows, so the row-key universe
+        // alone would misjudge its window references as unknown. Also the
+        // shadowing oracle for QUALIFY alias substitution below.
+        let mut from_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for twj in &select.from {
+            collect_factor_columns(&twj.relation, self.tables, &mut from_cols);
+            for j in &twj.joins {
+                collect_factor_columns(&j.relation, self.tables, &mut from_cols);
+            }
+        }
         if !win_calls.is_empty() {
             if pre_windowed {
                 return err("internal: window function reached the pre-windowed fast path");
-            }
-            // Declared columns of the FROM tables: a column ADDed without a
-            // DEFAULT never appears in stored rows, so the row-key universe
-            // alone would misjudge its window references as unknown.
-            let mut from_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for twj in &select.from {
-                collect_factor_columns(&twj.relation, self.tables, &mut from_cols);
-                for j in &twj.joins {
-                    collect_factor_columns(&j.relation, self.tables, &mut from_cols);
-                }
             }
             win_tmps = self.compute_windows(&win_calls, &mut docs, &from_cols)?;
             for (_, e) in project.iter_mut() {
@@ -960,6 +961,10 @@ impl<'a> ReadCx<'a> {
         // (plain columns only) is a late WHERE and filters the same way —
         // dropping the filter would silently return unqualified rows.
         if let Some(q) = &mut select.qualify {
+            // Projection aliases (… AS rn → QUALIFY rn = 1) resolve here;
+            // without the substitution they read as missing keys (NULL) and
+            // the predicate silently mis-filters.
+            substitute_qualify_aliases(q, &project, &from_cols, &docs);
             rewrite_windows(q, &win_calls, &win_tmps);
             let outer_from = {
                 let mut s = OuterFrom::new();

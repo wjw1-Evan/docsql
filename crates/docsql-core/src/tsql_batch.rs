@@ -2541,11 +2541,34 @@ fn unquote_literal(s: &str) -> String {
 /// multi-statement batch). The server keeps its single-statement fast
 /// path untouched otherwise.
 pub fn needs_interpretation(sql: &str) -> bool {
-    // `;`/GO separators split into several chunks of one Plain statement
-    // each: the per-chunk test below would never fire, yet the engine
-    // accepts exactly one statement per execute — count the batch as a
-    // whole so the interpreter runs the chunks sequentially (matching the
-    // docstring's "more than one statement").
+    // 先交给 core 切分器判定:触发器体的 `;` 在那里被吸合成完整
+    // BEGIN…END,不会污染逐块批判定(曾把 CREATE TRIGGER 整体误路由进
+    // 批解释器,被它按体分号再切碎,引擎收到 "trigger body is empty"
+    // 的残缺 DDL;CLI -f 与远程循环同门)。切出的每条独立判定:
+    // @变量/身份函数/非 Plain 批构造任一命中即走解释器;全是 Plain 时
+    // 仅多语句才走(解释器逐条跑,会话状态等价于直接路径)。
+    if let Ok(stmts) = stmt::split_statements(sql) {
+        let mut plain = 0usize;
+        for s in &stmts {
+            if mentions_var(s) || mentions_identity_fn(s) {
+                return true;
+            }
+            // 触发器 DDL 永远不是批:体语法批解析器读不了(无论 Err 还是
+            // 拆成多语句形状都不可信),体语句在建触发器时已校验禁 @变量/
+            // 控制流,直接路径 + 触发器执行器是正确 owner。
+            if is_trigger_ddl(s) {
+                plain += 1;
+                continue;
+            }
+            match parse_batch(s) {
+                Ok(v) if v.len() == 1 && matches!(v[0], Stmt::Plain(_)) => plain += 1,
+                _ => return true,
+            }
+        }
+        return plain > 1;
+    }
+    // 切不动 = 无分号分隔的多语句 T-SQL 批(DECLARE/IF/WHILE 等):原始
+    // 逐块判定,text_chunks 的块边界在这里不承载语句语义。
     let mut plain_chunks = 0usize;
     for chunk in stmt::text_chunks(sql) {
         let chunk = chunk.trim();
@@ -2572,6 +2595,12 @@ pub fn needs_interpretation(sql: &str) -> bool {
         }
     }
     plain_chunks > 1
+}
+
+/// CREATE TRIGGER DDL(含 CREATE OR REPLACE 拼写):体不是批语法。
+fn is_trigger_ddl(s: &str) -> bool {
+    let up = s.trim_start().to_ascii_uppercase();
+    up.starts_with("CREATE TRIGGER") || up.starts_with("CREATE OR REPLACE TRIGGER")
 }
 
 /// `SCOPE_IDENTITY()`/`IDENT_CURRENT()` appears outside string
@@ -3332,6 +3361,23 @@ mod tests {
         assert!(needs_interpretation("SELECT 1\nSELECT 2"));
         assert!(needs_interpretation("SELECT @x"));
         assert!(!needs_interpretation("SELECT '@x'"));
+    }
+
+    #[test]
+    fn needs_interpretation_trigger_ddl_stays_direct() {
+        // 触发器体的 `;` 让 T-SQL 批解析失败:曾经整体误路由进批解释器,
+        // 被它按体分号切碎,引擎收到 "trigger body is empty" 的残缺 DDL
+        // (CLI -f / 远程循环同门)。触发器必须留在直接路径,由 core 的
+        // split_statements 吸合 BEGIN…END。混入真正的批(@变量)仍走解释器。
+        let trigger = "CREATE TRIGGER trg AFTER INSERT ON comments FOR EACH ROW \
+             WHEN (LENGTH(NEW.text) > 50) BEGIN INSERT INTO audit_log (kind) \
+             VALUES ('long'); END";
+        assert!(!needs_interpretation(trigger));
+        assert!(!needs_interpretation(
+            "CREATE OR REPLACE TRIGGER trg AFTER INSERT ON t FOR EACH ROW \
+                 BEGIN INSERT INTO a VALUES (1); END"
+        ));
+        assert!(needs_interpretation(&format!("DECLARE @x INT\n{trigger}")));
     }
 
     #[test]

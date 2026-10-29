@@ -998,11 +998,13 @@ FROM emp;
 - 窗口调用可出现在 SELECT 列表中(含包在算术/CASE 里的复合表达式);WHERE/HAVING/ORDER BY 内的窗口调用显式报错;
 - **QUALIFY**(Snowflake/DuckDB 拼写):窗口结果的行级过滤——在窗口计算之后、
   DISTINCT/ORDER BY/LIMIT 之前求值;谓词可引用窗口调用(与 SELECT 列表中相同调用共享
-  计算列)与普通列的混合;与 GROUP BY/聚合不可混用(显式报错);无窗口调用的 QUALIFY
-  等价于一个晚执行的 WHERE;
+  计算列)、SELECT 列表别名(`… AS rn … QUALIFY rn = 1`,源列优先:别名与列同名时
+  按列解读,链式别名可代入)与普通列的混合;与 GROUP BY/聚合不可混用(显式报错);
+  无窗口调用的 QUALIFY 等价于一个晚执行的 WHERE;
 - 与 GROUP BY 或聚合投影**不可混用**(显式报错);DISTINCT 在窗口之后求值;
 - 不支持(显式报错):`WINDOW` 命名子句、`IGNORE NULLS`;RANGE 帧的
-  YEAR/MONTH INTERVAL 单位与「INTERVAL 用于数值键」。(`QUALIFY` 已支持,见上。)
+  YEAR/MONTH INTERVAL 单位与「INTERVAL 用于数值键」(`DAY/HOUR/MINUTE/SECOND`
+  INTERVAL 与 `QUALIFY` 均已支持,见上)。
 
 ## 系统视图与元数据
 
@@ -1050,7 +1052,7 @@ SQLite 兼容的 DDL 自省视图(EF Core schema 同步使用),行:`type`(`table
 | 主键与 NULL | `PRIMARY KEY` 不隐含 `NOT NULL` |
 | 主键类型 | 仅单列;复合唯一用 `CREATE UNIQUE INDEX` |
 | 相关子查询 | 已支持:外层引用须限定名,行级表面(SELECT 的 WHERE/投影/ORDER BY、UPDATE·DELETE 的 WHERE 与 SET)逐行求值;JOIN ON/GROUP BY/HAVING 内相关、未限定外层引用仍显式报错 |
-| 窗口函数 | 已支持,含自定义窗口帧(见[窗口函数](#窗口函数)与[窗口帧](#窗口帧frame));`WINDOW` 子句、`QUALIFY`、RANGE 的 INTERVAL 偏移不支持 |
+| 窗口函数 | 已支持,含自定义窗口帧与 QUALIFY、RANGE 的 DAY/HOUR/MINUTE/SECOND INTERVAL 偏移(见[窗口函数](#窗口函数)与[窗口帧](#窗口帧frame));`WINDOW` 子句、`IGNORE NULLS`、RANGE 的 YEAR/MONTH INTERVAL 不支持 |
 | 递归 CTE | 已支持(`WITH [RECURSIVE]` 锚点 `UNION [ALL]` 递归臂,见 [T-SQL 兼容面](#t-sqlsql-server兼容面)) |
 | `SELECT t.*` | 不支持(用 `*`) |
 | `GROUP BY` 输出别名 | 不支持(显式报错);`GROUP BY 1` 按常量 1 处理,无序号语义 |

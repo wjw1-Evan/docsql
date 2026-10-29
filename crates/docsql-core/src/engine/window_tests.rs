@@ -370,6 +370,61 @@ fn qualify_filters_window_results() {
 }
 
 #[test]
+fn qualify_resolves_projection_aliases() {
+    // `… AS rn … QUALIFY rn = 1`: the alias used to read as a missing row
+    // key (NULL) and the predicate silently mis-filtered — the bare window
+    // call form worked, the documented alias form (DuckDB/Snowflake) didn't.
+    let mut db = Database::in_memory().unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE emp (id INT PRIMARY KEY, dept TEXT, name TEXT, salary INT)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO emp VALUES (1,'a','x',30),(2,'a','y',20),(3,'a','z',10),\
+             (4,'b','p',40),(5,'b','q',50),(6,'b','r',45)",
+    );
+    // Top-1 per group through the alias; must equal the derived-table form.
+    let r1 = rows(
+        &mut db,
+        "SELECT dept, name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn \
+             FROM emp QUALIFY rn = 1 ORDER BY dept",
+    );
+    let r2 = rows(
+        &mut db,
+        "SELECT dept, name, rn FROM (SELECT dept, name, \
+             ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp) x \
+             WHERE rn = 1 ORDER BY dept",
+    );
+    assert_eq!(r1.rows, r2.rows, "{r1:?} vs {r2:?}");
+    // The window call shares the projection's computed column, so the
+    // substituted call must not recompute (single rn column, values 1).
+    assert_eq!(int_col(&r1, 2), vec![1, 1], "{r1:?}");
+    // Multiple aliases + shared computed column in one predicate.
+    let r = rows(
+        &mut db,
+        "SELECT salary AS s, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rk \
+             FROM emp QUALIFY rk <= 2 AND s > 10 ORDER BY salary DESC",
+    );
+    assert_eq!(int_col(&r, 0), vec![50, 45], "{r:?}");
+    // Source column wins: an alias named like a real column (dept) stays a
+    // column — shadowing the source with the projection alias would turn
+    // the filter into a salary='a' comparison and return nothing.
+    let r = rows(
+        &mut db,
+        "SELECT salary AS dept FROM emp QUALIFY dept = 'a' ORDER BY salary DESC",
+    );
+    assert_eq!(int_col(&r, 0), vec![30, 20, 10], "{r:?}");
+    // Chain: an alias whose expression references another alias resolves
+    // through re-passes (bounded, so self-references can't spin).
+    let r = rows(
+        &mut db,
+        "SELECT salary AS s, s * 2 AS dbl FROM emp QUALIFY dbl > 80 ORDER BY salary DESC",
+    );
+    assert_eq!(int_col(&r, 0), vec![50, 45], "{r:?}");
+}
+
+#[test]
 fn qualify_gates_stay_loud() {
     let mut db = Database::in_memory().unwrap();
     run(&mut db, "CREATE TABLE t (g TEXT, v INT)");

@@ -712,6 +712,129 @@ pub(super) fn scan_windows(e: &SqlExpr, out: &mut Vec<Function>, seen: &mut Vec<
     }
 }
 
+/// Substitute SELECT-list aliases inside a QUALIFY predicate (in place).
+///
+/// `… ROW_NUMBER() OVER (…) AS rn … QUALIFY rn = 1` used to resolve the bare
+/// `rn` as a source column, find nothing (window results live only in the
+/// private `__win*` columns) and evaluate the whole predicate over NULLs —
+/// silently filtering out every row or, with the engine's total-order NULL
+/// comparisons, keeping all of them. Aliases are the documented shape on
+/// DuckDB/Snowflake, so a bare identifier naming a projection alias is
+/// replaced by the aliased expression; the (now identical) window call then
+/// collapses onto the projection's shared computed column via
+/// [`rewrite_windows`].
+///
+/// Source columns win: a name that is a declared FROM column or appears as a
+/// bare row key is never substituted (alias shadowing stays illegal, column
+/// semantics hold). Chained aliases (`a → b → expr`) resolve via bounded
+/// re-passes; a self-referential cycle just stops at the cap.
+pub(super) fn substitute_qualify_aliases(
+    e: &mut SqlExpr,
+    project: &[(String, SqlExpr)],
+    from_cols: &std::collections::HashSet<String>,
+    docs: &[Object],
+) {
+    let aliases: Vec<(String, SqlExpr)> = project
+        .iter()
+        .filter(|(n, _)| !from_cols.contains(n))
+        .filter(|(n, _)| !docs.iter().any(|d| d.contains_key(n)))
+        .map(|(n, e)| (n.clone(), e.clone()))
+        .collect();
+    if aliases.is_empty() {
+        return;
+    }
+    for _ in 0..8 {
+        let mut changed = false;
+        subst_aliases(e, &aliases, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// One in-place substitution pass over the same expression shapes
+/// [`rewrite_windows`] covers; subqueries keep their own scope (aliases are
+/// a SELECT-list surface, not a scope-wide macro).
+fn subst_aliases(e: &mut SqlExpr, aliases: &[(String, SqlExpr)], changed: &mut bool) {
+    match e {
+        SqlExpr::Identifier(i) => {
+            if let Some((_, rep)) = aliases.iter().find(|(n, _)| *n == i.value) {
+                *e = rep.clone();
+                *changed = true;
+            }
+        }
+        SqlExpr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = a
+                    {
+                        subst_aliases(inner, aliases, changed);
+                    }
+                }
+            }
+            if let Some(filter) = &mut f.filter {
+                subst_aliases(filter, aliases, changed);
+            }
+        }
+        SqlExpr::Nested(inner) => subst_aliases(inner, aliases, changed),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            subst_aliases(left, aliases, changed);
+            subst_aliases(right, aliases, changed);
+        }
+        SqlExpr::UnaryOp { expr, .. } => subst_aliases(expr, aliases, changed),
+        SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::IsTrue(inner)
+        | SqlExpr::IsNotTrue(inner)
+        | SqlExpr::IsFalse(inner)
+        | SqlExpr::IsNotFalse(inner)
+        | SqlExpr::IsUnknown(inner)
+        | SqlExpr::IsNotUnknown(inner) => subst_aliases(inner, aliases, changed),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            subst_aliases(expr, aliases, changed);
+            subst_aliases(low, aliases, changed);
+            subst_aliases(high, aliases, changed);
+        }
+        SqlExpr::IsDistinctFrom(l, r) | SqlExpr::IsNotDistinctFrom(l, r) => {
+            subst_aliases(l, aliases, changed);
+            subst_aliases(r, aliases, changed);
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            subst_aliases(expr, aliases, changed);
+            subst_aliases(pattern, aliases, changed);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            subst_aliases(expr, aliases, changed);
+            for item in list {
+                subst_aliases(item, aliases, changed);
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                subst_aliases(op, aliases, changed);
+            }
+            for w in conditions {
+                subst_aliases(&mut w.condition, aliases, changed);
+                subst_aliases(&mut w.result, aliases, changed);
+            }
+            if let Some(el) = else_result {
+                subst_aliases(el, aliases, changed);
+            }
+        }
+        SqlExpr::Cast { expr, .. } => subst_aliases(expr, aliases, changed),
+        _ => {}
+    }
+}
+
 /// Replace every window call with a reference to its computed column; the
 /// dedup key (full text) matches [`scan_windows`], so indices agree.
 pub(super) fn rewrite_windows(e: &mut SqlExpr, calls: &[Function], names: &[String]) {
