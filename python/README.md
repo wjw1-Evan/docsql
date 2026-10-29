@@ -102,7 +102,7 @@ DB-API 标准:`Error` → `InterfaceError`(传输层,连接作废;协议级
 ```bash
 cargo build -p docsql-server        # 仓库根;测试会启动 debug 二进制
 pip install pytest cryptography
-python -m pytest python/tests -q    # 35 用例
+python -m pytest python/tests -q    # 60 用例
 ```
 
 测试自备自签证书(`tests/fixtures/`,SAN 含 localhost 与 127.0.0.1),

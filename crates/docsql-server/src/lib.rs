@@ -29,8 +29,10 @@
 //! - REQ_HOLD / REQ_RELEASE → cluster-join quiesce helpers exchanged
 //!   between nodes while a snapshot is taken
 //!
-//! Every connection shares one engine instance behind a mutex (single-writer
-//! v1; the cluster milestone brings per-shard concurrency).
+//! Every connection shares one engine instance behind an RwLock: write
+//! statements take the write tier (single-writer v1 — tx_owner/write_order
+//! unchanged), plain SELECTs take the read tier and run concurrently (MVCC
+//! stage A; per-shard concurrency stays a later milestone).
 
 pub mod backup;
 pub mod crypto;
