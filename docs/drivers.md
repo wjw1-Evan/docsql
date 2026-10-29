@@ -341,6 +341,30 @@ using var mem = new DocsqlConnection("Data Source=:memory:");
 - 安全模型与 SQLite 一致:**能加载库的进程 = 全库权限**(本地嵌入没有 token/用户概念;
   文件权限 0600 由引擎创建时保证)。
 
+## 从其他数据库切换
+
+**EF Core 应用**:把 `UseSqlServer` / `UseMySql` / `UseSqlite` 换成 `UseDocsql`,连接串换成
+DocSQL 的 `host=…;port=…`(远程)或 `Data Source=app.db`(进程内嵌入)——模型、LINQ、事务
+与 `EnsureCreated` 语义不变(免迁移,模型漂移自动同步)。
+
+**ADO.NET 应用**:`SqlConnection` / `MySqlConnection` / `SqliteConnection` 换成
+`DocsqlConnection`;SQL 文本按下方方言矩阵核对(常见语句——`TOP`/`LIMIT`、`OFFSET`、
+窗口函数、`ON CONFLICT`/`ON DUPLICATE KEY UPDATE`、`RETURNING`、`NVL`/`IFNULL`/
+`ISNULL`、`::` 转换——已兼容)。
+
+**方言矩阵(测试守着)**:SQL Server(`[方括号]`、`N'…'`、`IDENTITY(1,1)`、
+`SET IDENTITY_INSERT`)、MySQL(backticks、`AUTO_INCREMENT`、`TINYINT(1)`/`UNSIGNED`、
+`ON DUPLICATE KEY UPDATE`)、PostgreSQL(`SERIAL`/`BIGSERIAL`、`GENERATED … AS IDENTITY`、
+`::`、`ILIKE`、`ON CONFLICT … EXCLUDED`)、SQLite(`INSERT OR REPLACE`、`sqlite_master`)、
+Oracle(`NVL`/`DUAL`/`ROWNUM`/`SYSDATE`)均有用例;拒绝面(表选项、`ON UPDATE`、
+`SET`/`SEQUENCE`、`datetime('now')`、Oracle 序列)一律**响亮报错**。完整差异清单见
+[已知边界 · 从其他数据库切换/迁移](limitations.md#从其他数据库切换--迁移)。
+
+> **线协议现实**:DocSQL 使用自有 v1 二进制协议。使用 `Microsoft.Data.SqlClient` /
+> `MySqlConnector` / `Npgsql` / `Microsoft.Data.Sqlite` 等**第三方驱动**的程序无法仅靠
+> 连接串切换——需要换成 `Docsql.Client`(或 Python DB-API / CLI / REST),这一步是驱动级
+> 改动,不是 SQL 级改动。DocSQL 不模拟 Postgres/MySQL 线协议。
+
 ## 驱动作者:线协议参数化
 
 v1 二进制协议(`crates/docsql-core/src/proto.rs`),一句一帧。服务端 prepared statements 三帧:

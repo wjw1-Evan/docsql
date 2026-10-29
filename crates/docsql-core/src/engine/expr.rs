@@ -275,6 +275,19 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                 .map(|p| p.value.clone())
                 .collect::<Vec<_>>()
                 .join(".");
+            // Oracle sequence pseudo-columns have no DocSQL equivalent; a
+            // silent NULL here would corrupt every migrated key. Quote the
+            // name (`"nextval"`) to read a literal field with that name.
+            if let Some(last) = parts.last() {
+                if last.quote_style.is_none()
+                    && (last.value.eq_ignore_ascii_case("nextval")
+                        || last.value.eq_ignore_ascii_case("currval"))
+                {
+                    return err(format!(
+                        "Oracle sequence reference {full} is not supported; migrate the key to AUTOINCREMENT / IDENTITY"
+                    ));
+                }
+            }
             if let Some(v) = doc.get(&full) {
                 Ok(v.clone())
             } else {

@@ -6,6 +6,13 @@
 ## [Unreleased]
 
 ### 新功能
+- **跨数据库直接切换**:方言兼容面补齐 PostgreSQL `SERIAL`/`BIGSERIAL`/
+  `GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY`(折叠为 `AUTOINCREMENT`,
+  不再静默插 NULL)与 Oracle 裸 `SYSDATE`(重写为 `NOW()`,复用写路径墙钟折叠);Oracle
+  `seq.NEXTVAL`/`seq.CURRVAL` 从静默 NULL 改为**响亮报错**(迁移须改 AUTOINCREMENT/IDENTITY)。
+  新增方言矩阵测试 `engine/dialect_tests.rs`(PostgreSQL/SQLite/Oracle 可用面 + 必报错面),
+  与既有迁移套件合计 15 例;drivers 新增「从其他数据库切换」指南(EF Core 换 `UseDocsql`、
+  ADO.NET 换连接类、第三方驱动需换 `Docsql.Client`)与线协议边界说明。
 - **SQL Server 迁移兼容**:`IDENTITY(1,1)` 列修饰符折叠为 `AUTOINCREMENT`(其它 seed/
   increment 显式报错,绝不静默改号)、`SET IDENTITY_INSERT <表> ON|OFF` 兼容空操作
   (schema 限定名支持);新增迁移测试套件 `engine/migration_tests.rs`(SQL Server 与 MySQL

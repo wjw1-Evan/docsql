@@ -153,7 +153,9 @@ pub fn preprocess(sql: &str) -> String {
         || contains_word(&lower, "set")
         || contains_word(&lower, "use")
         || contains_word(&lower, "print")
-        || contains_word(&lower, "identity");
+        || contains_word(&lower, "identity")
+        || lower.contains("serial")
+        || contains_word(&lower, "sysdate");
     if !may_rewrite {
         return sql.to_string();
     }
@@ -165,6 +167,10 @@ pub fn preprocess(sql: &str) -> String {
     // Statement-start tracking: the shims only apply to a leading
     // SET/USE/PRINT (T-SQL never uses them mid-statement).
     let mut at_start = true;
+    // Dialect-ingestion rewrites (PostgreSQL SERIAL / GENERATED … AS
+    // IDENTITY) are CREATE TABLE scoped: the same words are legal column
+    // names elsewhere, and rewriting those would corrupt ordinary queries.
+    let mut in_create_table = false;
     while i < b.len() {
         match b[i] {
             b'\'' => {
@@ -248,6 +254,7 @@ pub fn preprocess(sql: &str) -> String {
                 out.push(';');
                 i += 1;
                 at_start = true;
+                in_create_table = false;
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
@@ -269,6 +276,60 @@ pub fn preprocess(sql: &str) -> String {
                     // instead of silently renumbering ids.
                     if let Some(next) = rewrite_identity(sql, i, &mut out) {
                         i = next;
+                        at_start = false;
+                        continue;
+                    }
+                }
+                if at_start
+                    && word.eq_ignore_ascii_case(b"create")
+                    && peek_word_is(sql, i, b"table")
+                {
+                    in_create_table = true;
+                }
+                if in_create_table
+                    && matches!(
+                        word,
+                        b"serial"
+                            | b"serial2"
+                            | b"serial4"
+                            | b"serial8"
+                            | b"bigserial"
+                            | b"smallserial"
+                    )
+                {
+                    // PostgreSQL `SERIAL` family: the column type implies an
+                    // auto-generated integer key (sequence). DocSQL's value
+                    // model has no sequences — flatten to the engine's
+                    // AUTOINCREMENT so ids behave like the source database
+                    // instead of silently inserting NULLs.
+                    out.push_str("INT AUTOINCREMENT");
+                    at_start = false;
+                    continue;
+                }
+                if in_create_table && word == b"generated" {
+                    // PostgreSQL / Oracle identity columns:
+                    // GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY.
+                    // Same flattening as SERIAL; `(START WITH …)` arguments
+                    // are left verbatim (loud) because a non-default start
+                    // cannot be honored.
+                    if let Some(next) = rewrite_generated_identity(sql, i, &mut out) {
+                        i = next;
+                        at_start = false;
+                        continue;
+                    }
+                }
+                if word == b"sysdate" && (start == 0 || b[start - 1] != b'.') {
+                    // Oracle spells wall-clock time as a bare SYSDATE (no
+                    // parentheses). Rewrite to NOW() so the write path's
+                    // wall-clock folding keeps replication deterministic.
+                    // Qualified `t.sysdate` is a column reference, not the
+                    // function — leave it alone.
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if b.get(j) != Some(&b'(') {
+                        out.push_str("NOW()");
                         at_start = false;
                         continue;
                     }
@@ -368,6 +429,80 @@ fn rewrite_identity(sql: &str, start: usize, out: &mut String) -> Option<usize> 
     }
     i += 1;
     if seed != "1" || inc != "1" {
+        return None;
+    }
+    out.push_str("AUTOINCREMENT");
+    Some(i)
+}
+
+/// Does the word after `i` (skipping whitespace) equal `expected`
+/// (ASCII case-insensitive)? Used for statement-shape checks that must not
+/// fire on lookalike identifiers.
+fn peek_word_is(sql: &str, mut i: usize, expected: &[u8]) -> bool {
+    let b = sql.as_bytes();
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    b[start..i].eq_ignore_ascii_case(expected)
+}
+
+/// PostgreSQL / Oracle identity columns:
+/// `GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY` → AUTOINCREMENT.
+///
+/// Same rationale as [`rewrite_identity`]: the source database generates the
+/// key, so keeping the clause verbatim (an "unsupported column constraint"
+/// error today) would block a migration whose data already relies on it.
+/// `(START WITH …)` options stay verbatim on purpose: a non-default start
+/// cannot be honored here, and silently ignoring it would renumber ids.
+fn rewrite_generated_identity(sql: &str, start: usize, out: &mut String) -> Option<usize> {
+    let b = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let read = |i: &mut usize| -> Option<String> {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        let s = *i;
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+            *i += 1;
+        }
+        (*i > s).then(|| lower[s..*i].to_string())
+    };
+    let mut i = start;
+    match read(&mut i)?.as_str() {
+        "always" => {}
+        "by" => {
+            if read(&mut i)? != "default" {
+                return None;
+            }
+            // Oracle: BY DEFAULT ON NULL AS IDENTITY.
+            let save = i;
+            match read(&mut i) {
+                Some(w) if w == "on" => {
+                    if read(&mut i).as_deref() != Some("null") {
+                        return None;
+                    }
+                }
+                _ => i = save,
+            }
+        }
+        _ => return None,
+    }
+    if read(&mut i)? != "as" {
+        return None;
+    }
+    if read(&mut i)? != "identity" {
+        return None;
+    }
+    // Identity options (START WITH …) cannot be honored → stay verbatim.
+    let mut j = i;
+    while j < b.len() && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if b.get(j) == Some(&b'(') {
         return None;
     }
     out.push_str("AUTOINCREMENT");
@@ -5019,5 +5154,49 @@ mod tests {
             preprocess("SELECT 'IDENTITY(1,1)'"),
             "SELECT 'IDENTITY(1,1)'"
         );
+    }
+
+    #[test]
+    fn preprocess_flattens_serial_and_identity_columns_only_in_create_table() {
+        // PostgreSQL SERIAL family: the type implies the auto key.
+        assert_eq!(
+            preprocess("CREATE TABLE t (id SERIAL PRIMARY KEY, v TEXT)"),
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY, v TEXT)"
+        );
+        assert_eq!(
+            preprocess("CREATE TABLE t (id BIGSERIAL PRIMARY KEY)"),
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY)"
+        );
+        assert_eq!(
+            preprocess("CREATE TABLE t (id SMALLSERIAL PRIMARY KEY)"),
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY)"
+        );
+        // PostgreSQL / Oracle identity columns.
+        assert_eq!(
+            preprocess("CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"),
+            "CREATE TABLE t (id INT AUTOINCREMENT PRIMARY KEY)"
+        );
+        assert_eq!(
+            preprocess("CREATE TABLE t (id INT GENERATED BY DEFAULT ON NULL AS IDENTITY)"),
+            "CREATE TABLE t (id INT AUTOINCREMENT)"
+        );
+        // A non-default START WITH stays verbatim (loud downstream).
+        assert_eq!(
+            preprocess(
+                "CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY (START WITH 100) PRIMARY KEY)"
+            ),
+            "CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY (START WITH 100) PRIMARY KEY)"
+        );
+        // Outside CREATE TABLE the same words are ordinary identifiers.
+        assert_eq!(
+            preprocess("SELECT serial, sysdate FROM t"),
+            "SELECT serial, NOW() FROM t"
+        );
+        // Qualified `t.sysdate` is a column reference, not the Oracle function.
+        assert_eq!(
+            preprocess("SELECT t.sysdate FROM t"),
+            "SELECT t.sysdate FROM t"
+        );
+        assert_eq!(preprocess("SELECT serial FROM t"), "SELECT serial FROM t");
     }
 }

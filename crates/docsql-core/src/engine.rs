@@ -2100,6 +2100,8 @@ pub use types::*;
 #[cfg(test)]
 mod complex_query_tests;
 #[cfg(test)]
+mod dialect_tests;
+#[cfg(test)]
 mod matview_tests;
 #[cfg(test)]
 mod migration_tests;
