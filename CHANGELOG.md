@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+### 新功能
+- **.NET 嵌入式模式(SQLite 式零守护)**:连接串 `Data Source=app.db`(或 `:memory:`)在应用
+  进程内直接跑引擎 —— 无 server、无端口、无 Docker。实现为新 crate `crates/docsql-ffi`
+  (C ABI `docsql_embedded`:`abi_version/open/close/execute/free`,panic 边界
+  `catch_unwind`,进程级单引擎注册表,读走 MVCC 快照锁外执行、事务 owner 守门排队 30s)
+  与 `Docsql.Client` 的 `EmbeddedSession`(`IProtocolSession` 接缝复用同一 Frame/解析管线);
+  EF 懒建表/索引同步与远程模式一致。参数渲染下沉 `docsql_core::bind`(server 与 FFI 共用
+  一份注入面,禁止复制)。原生库随 Releases 发布(`docsql-native-<版本>-<平台>.tar.gz/.zip`,
+  Linux/macOS/Windows),加载顺序 `DOCSQL_EMBEDDED_NATIVE` → `runtimes/<rid>/native` →
+  应用目录 → `target/{debug,release}`。pub/sub/PROMOTE/备份/集群/T-SQL 批会话在嵌入态
+  显式报错。测试:FFI 7 + Client 嵌入式 12 + EF 嵌入式 5。
+
 ### 变更
 - **.NET 嵌入式设计稿**(`docs/design/006-dotnet-embedded-mode.md`,评估稿未实现):方案矩阵
   (A 驱动自动拉起子进程=违红线不推荐 / B FFI 包装 docsql-core=推荐分阶段路线 / C 本地裸 server

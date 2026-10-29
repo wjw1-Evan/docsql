@@ -10,7 +10,7 @@ Rust 原生文档数据库:JSON 文档存储 + 完整 SQL + Web 管理控制台 
 - **集群** — `DOCSQL_PEERS` 对等复制(任意节点可写)、新节点自动 join 同步、重启反熵修复、主从写转发 + PROMOTE 故障转移
 - **持久化 pub/sub** — 消息先落盘(WAL)再推送,重启不丢;订阅可从 `earliest` / 指定 id 续传(at-least-once)
 - **DocSQL Studio** — SSMS 风格 Web 管理控制台(对象浏览器/查询工作台/集群监控/备份/用户管理),自身零存储
-- **.NET 栈** — `Docsql.Client`(ADO.NET)、`Docsql.EntityFrameworkCore`(原生 EF Core 提供程序,免迁移自动同步模型)、Aspire 编排三件套
+- **.NET 栈** — `Docsql.Client`(ADO.NET,支持 `Data Source=app.db` 进程内嵌入)、`Docsql.EntityFrameworkCore`(原生 EF Core 提供程序,免迁移自动同步模型;嵌入/远程同栈)、Aspire 编排三件套
 - **安全** — token / 数据库用户与角色 / 表级权限、AES-256-GCM 传输加密、登录锁定、审计日志、自动备份(带 sha256 校验)与 S3 远端备份副本
 
 各项能力的完整说明与示例见[功能总览](docs/features.md)。
@@ -37,15 +37,25 @@ let rows = match db.execute("SELECT id, title, done FROM todos WHERE done = FALS
 ```bash
 # 1b. CLI 单文件 shell(SQLite 使用姿势):Rust 嵌入引擎的交互式同款体验
 docsql-cli todos.db -f init.sql     # 脚本批执行;--csv / --json 导出;also :memory: 内存模式
+```
 
-# 1c. 单二进制本地 server + .NET(默认 docsql.db + 127.0.0.1:7600 回环监听,无容器)
+```csharp
+// 1c. .NET:进程内嵌入(SQLite 式,零守护)——引用 Docsql.Client +
+//     原生库(Releases 的 docsql-native-*.tar.gz / .zip 放到应用目录)
+services.AddDbContext<TodoDb>(o => o.UseDocsql("Data Source=todos.db"));
+//     完整 SQL/事务/参数化直接可用;无需 server、端口或 Docker。
+```
+
+```bash
+# 1d. 或无容器裸跑 server + host 连接串(多客户端/远程/集群形态)
 ./docsql-server todos.db 127.0.0.1:7600
 #  EF Core / ADO.NET 连接串即 host+port:
 services.AddDbContext<TodoDb>(o => o.UseDocsql("host=127.0.0.1;port=7600"));
 ```
 
-> 边界:一个数据文件同一时刻只归属一个进程(引擎无跨进程锁,SQLite 式任意多进程打开不适用)。
-> 需要多客户端并发请用 1c 的本地 server,或集群部署。
+> 边界:一个数据文件同一时刻只归属一个**进程**(引擎无跨进程锁,SQLite 式任意多进程打开不适用;
+> 进程内的多连接共享同一引擎,事务开启期间其他连接按超时排队)。需要跨进程/跨机并发请用
+> 1d 的 server 或集群部署。
 
 ### Docker(集群与服务端部署)
 
@@ -75,7 +85,7 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 | `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` | 静态 glibc(glibc 2.38 配方,与 GHCR scratch 镜像逐字节同源);Windows 走 WSL 或容器 |
 | `aarch64-apple-darwin` / `x86_64-apple-darwin` | 原生构建 |
 
-Rust 库 `docsql-core` 另发布到 crates.io(流程见[贡献指南](CONTRIBUTING.md))。
+.NET 嵌入式(`Data Source=…`)所需原生库单独发布:**`docsql-native-<版本>-<平台>.tar.gz` / `.zip`**(Linux `.so`、macOS `.dylib`、Windows `.dll`),放到应用目录、`runtimes/<rid>/native/` 或由 `DOCSQL_EMBEDDED_NATIVE` 指定。Rust 库 `docsql-core` 另发布到 crates.io(流程见[贡献指南](CONTRIBUTING.md))。
 
 ## 文档导航
 

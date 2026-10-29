@@ -1,12 +1,13 @@
 # 客户端与驱动
 
 > **引用包 ≠ 启动数据库**:`Docsql.Client` / `Docsql.EntityFrameworkCore` /
-> `Docsql.Aspire.*` 都是纯网络协议客户端,装包不会在进程里启动任何数据库 ——
-> server 由部署形态负责(本地裸二进制一行 / compose / Aspire AppHost 拉容器;
-> 演示程序 `EfSample` 是唯一的例外,它自己拉起本地 server 供示例跑通)。
-> 装包后「自动」发生的只有连接级行为:EF 首命令前的懒建表/索引同步、连接池、
-> 服务端 prepared statements。真·零守护(引用即嵌)见
-> [设计 006](design/006-dotnet-embedded-mode.md)(评估稿)。
+> `Docsql.Aspire.*` 在 `host=…;port=…` 模式下都是纯网络客户端,装包不会在进程里启动
+> 数据库 —— server 由部署形态负责(本地裸二进制一行 / compose / Aspire AppHost 拉容器;
+> 演示程序 `EfSample` 是特例:它自己拉起本地 server 供示例跑通,不属包的职责)。
+> 唯一例外是 **.NET 嵌入式模式(`Data Source=app.db`)**:应用进程内直接跑引擎
+> (原生库 + C ABI,见下方「嵌入式模式」),不需要任何 server。
+> 连接级自动化:EF 首命令前的懒建表/索引同步、连接池、服务端 prepared statements。
+> 真·零守护的边界与设计见[设计 006](design/006-dotnet-embedded-mode.md)。
 
 ## 安装(四个 NuGet 包,GitHub Packages)
 
@@ -261,6 +262,39 @@ Rust 库嵌入与 .NET 嵌入路线评估:[设计 006 · .NET 嵌入式模式](d
 保持数值单元格。注:CLI 暂不支持 `DOCSQL_KEY` 帧加密节点(用 .NET/Python 驱动或 TLS)。
 
 订阅是专用连接 + 专职读线程(CLI 已内置):普通一问一答连接会把推送帧错当成命令响应。
+
+## 嵌入式模式(Data Source,进程内引擎)
+
+.NET 的 SQLite 式形态:**连接串写 `Data Source=<文件>` 就在本进程内跑引擎** ——
+无 server、无端口、零守护(设计 [006](design/006-dotnet-embedded-mode.md),实现为
+`crates/docsql-ffi` 的 C ABI + `Docsql.Client` 的 `EmbeddedSession`)。
+
+```csharp
+// EF Core(懒建表/索引同步与远程模式完全一致)
+services.AddDbContext<TodoDb>(o => o.UseDocsql("Data Source=todos.db"));
+// ADO.NET
+using var conn = new DocsqlConnection("Data Source=todos.db");
+// 进程内内存库:每次 Open 一个独立引擎(不共享)
+using var mem = new DocsqlConnection("Data Source=:memory:");
+```
+
+- **能力**:全部 SQL(DDL/DML/JOIN/聚合/窗口/约束/触发器)、事务(SAVEPOINT)、
+  prepared 路径与参数化 —— 参数渲染复用 `docsql_core::bind`(与 server 同一份实现,
+  注入面不复制);DECIMAL/BLOB/TIMESTAMP 走与线协议相同的 `$dec`/`$bytes`/`$ts` 标记;
+- **原生库获取**:GitHub Releases 的 `docsql-native-<版本>-<平台>.tar.gz/.zip`;
+  加载顺序:`DOCSQL_EMBEDDED_NATIVE`(完整路径)→ 应用目录 `runtimes/<rid>/native/`
+  → 应用目录 → 仓库 `target/{debug,release}`(开发/测试用)。缺库抛
+  `DocsqlException`,消息里带放置指引与 ABI 版本约定;
+- **进程内并发**:同一文件的所有连接共享一个引擎实例(进程级注册表);读走 MVCC
+  快照、不阻塞写;**任一连接开启事务后,其他连接的语句按 `CommandTimeout`(缺省 30s)
+  排队**,超时报 "another connection holds the open transaction";事务 owner 的
+  SELECT 看见自己未提交的写(与 server 的 owner 语义一致);
+- **单进程归属**:数据文件同一时刻只允许一个进程打开(引擎无跨进程锁)——
+  跨进程/跨机并发用 server 形态;
+- **不支持的项(响亮报错)**:pub/sub(`Publish`/订阅)、`Promote`、备份 REST/协议、
+  集群复制、T-SQL 批会话变量 —— 这些能力属于 server,连接 `host=…;port=…` 使用;
+- 安全模型与 SQLite 一致:**能加载库的进程 = 全库权限**(本地嵌入没有 token/用户概念;
+  文件权限 0600 由引擎创建时保证)。
 
 ## 驱动作者:线协议参数化
 

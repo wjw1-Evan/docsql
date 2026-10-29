@@ -1,13 +1,13 @@
 # 设计说明:.NET 嵌入式模式(零守护进程的 SQLite 式体验)
 
-状态:**评估稿(未实现;短期交付 = 文档与本地 server 组合)**。回应方向:「数据应能像
+状态:**阶段 0 + 阶段 1(v1)已实施**(`crates/docsql-ffi` C ABI + .NET `Data Source=…` 进程内引擎;原生库随 GitHub Releases 分发)。剩余:原生库的 NuGet `runtime-*` 资产包(当前由 Releases 归档手动放置)、体验收口。回应的方向:「数据应能像
 SQLite 一样快速在项目里用,不依赖 Docker」。Rust 侧与 CLI 侧的嵌入式已交付
 (`docsql-core` 库 / `docsql-cli <file.db>`,见 README「无 Docker 快速开始」);
-本文只回答 **.NET 栈如何达到同等体验**,给出方案矩阵、红线核对与推荐路线。
+本文给出 **.NET 栈**的方案矩阵、红线核对、推荐路线与实施记录。
 
-## 0. 现状(精确事实)
+## 0. 现状(实施前的精确事实 → 现状见 §6)
 
-- .NET 侧只有网络客户端:`Docsql.Client`(ADO.NET)+ `Docsql.EntityFrameworkCore` +
+- 实施前 .NET 侧只有网络客户端:`Docsql.Client`(ADO.NET)+ `Docsql.EntityFrameworkCore` +
   Aspire 三件套,连接串 `host=host;port=port` —— **没有进程内路径**;
 - 引擎是 Rust(`docsql-core`,同步单写者 + WAL,无 tokio/网络依赖)。进程内单写者
   模型与「一个文件归属一个进程」的家规已经落进文档(limitations「单数据文件单进程
@@ -45,16 +45,21 @@ SQLite 一样快速在项目里用,不依赖 Docker」。Rust 侧与 CLI 侧的�
 
 1. **短期(已交付)**:文档定调「本地 server 一行启动」(README 无 Docker 1c +
    operations「无容器运行」);.NET 侧无代码改动。
-2. **阶段 0 · C ABI 设计稿**:`docsql-core-ffi` crate 草案,最小面
-   `docsql_open(path) / execute / prepare / step / close`,错误以错误码 + UTF-8 文本
-   返回,结果集游标前进式(不回调 —— 回调跨 FFI 与 GC/异常面复杂度不成比例);
-   引擎同步单写者纪律不变;适配 .NET 侧多连接共存:读走进程内 ReadView 快照,写全库互斥不变。
-3. **阶段 1 · NuGet 双包**:`Docsql.Client.Native`(管理面,引用默认向后兼容) +
-   `runtime-*` 资产包(linux-x64 / linux-arm64 / osx-arm64 / win-x64),`Microsoft.Data.Sqlite`
-   同款 `.targets` 复制语义;连接串开关 `mode=embedded` 才启用(不静默分叉);
-   EF 与 ADO.NET 复用现有对象模型(传输后端替换为进程内引擎,不再拨号)。
-4. **阶段 2 · 体验收口**:`:memory:` 路径、测试与 CI(三平台矩阵并入
-   release-binaries 产出 `.dll/.so/.dylib`;dotnet 套件增加嵌入式连接串用例)。
+2. **阶段 0 · C ABI(已交付)**:`docsql-core-ffi` → 实际落地为 `crates/docsql-ffi`
+   (原生库名 `docsql_embedded`):`open/close/execute/free/abi_version` 五个入口,
+   错误码 + UTF-8 文本,结果 JSON 与 RESP_ROWS 同源(`json::to_string` 的
+   `$dec`/`$bytes`/`$ts`/`$float` 标记),panic 在边界 `catch_unwind` 收敛;
+   进程级注册表(规范化路径 → 单一引擎),事务守门(Mutex+超时)与读级
+   `ReadView::execute`(锁外、不阻塞写)。
+3. **阶段 1 · .NET 挂载(已交付 v1)**:连接串 `Data Source=<文件|:memory:>`;`DocsqlConnection`
+   抽出 `IProtocolSession` 接缝,`EmbeddedSession` 以同一 `Frame` 语义桥接原生引擎
+   (SQL/Prepare/Execute/CloseStmt/Ping;其余帧响亮报错);原生库发现顺序
+   `DOCSQL_EMBEDDED_NATIVE` → `runtimes/<rid>/native/` → 应用目录 → 仓库 `target/{debug,release}`;
+   EF 与 ADO.NET 全链路复用现有对象模型(零分支)。**待办**:把原生库打进 NuGet
+   `runtime-*` 资产包(当前:Releases 归档手动放置)。
+4. **阶段 2 · 体验收口(部分)**:`:memory:` 已支持;三平台原生库进 release-binaries
+   (Linux `.so` / macOS `.dylib` / Windows `.dll`)与 dotnet CI 原生构建已接入;
+   待办:全自动「包内资产」与嵌入式 perf 基线。
 
 ## 4. 红线核对表(改代码前再看一遍)
 
@@ -77,3 +82,19 @@ SQLite 一样快速在项目里用,不依赖 Docker」。Rust 侧与 CLI 侧的�
   红线才可立项**,在那之前文档与 CI 一律不引入生产路径的 Process.Start;
 - 不做跨进程文件锁:单写者模型不变,同进程多句柄受支持(引擎既有形态),跨进程
   打开仍由「文件单进程归属」家规约束(限制条目不变),FFI 层不新增锁机制。
+
+## 6. 实施记录(2026-10-29,v1)
+
+| 层 | 落点 | 关键决定 |
+|---|---|---|
+| 引擎 | `crates/docsql-core/src/bind.rs` | 参数渲染从 `server/params.rs` 下沉:**server 与 FFI 共用一份**注入面,杜绝第二份转义实现(server 侧只剩 re-export shim) |
+| C ABI | `crates/docsql-ffi/src/lib.rs`(库名 `docsql_embedded`) | `abi_version/open/close/execute/free` 五入口;错误码 0/1/2/3/4/5;panic 边界 `catch_unwind`;结果 JSON 与 RESP_ROWS 同源(`json::to_string`),.NET 端 0 解析分叉 |
+| 并发 | 同上 | 进程级注册表(规范化路径 → 单一引擎);读 = `read_view()` 微秒锁取快照后 `ReadView::execute` 锁外跑(不阻塞写);写 = 守门 Mutex(owner 令牌)+ `db.write()`;事务开启期间读级让位(与 server `classify_read_eligible` 同规) |
+| .NET | `dotnet/Docsql.Client/Embedded.cs` + `AdoNet.cs`/`Protocol.cs` 的 `IProtocolSession` 接缝 | `Data Source=…`/`:memory:`;嵌入式合成与线协议**同一套 Frame**(RespRows/RespAffected/RespError/RespPrepared),命令/读取/事务路径零分支;原生库发现:env → `runtimes/<rid>/native` → 应用目录 → 仓库 `target/{debug,release}`;ABI 版本不匹配显式拒绝 |
+| 测试 | `docsql-ffi` 7 例 + `Docsql.Client.Tests/EmbeddedModeTests.cs` 12 例 + `Docsql.EntityFrameworkCore.Tests/EmbeddedEfTests.cs` 5 例 | 覆盖 CRUD/参数注入(值恒为数据)/共享文件/`:memory:` 隔离/事务提交回滚与守门超时/prepared 复用/`$dec`+`$bytes`+`$ts` 往返/EF 懒建表与回滚 |
+| CI/分发 | `docker-image.yml` dotnet job 前置 `cargo build -p docsql-ffi`;`release-binaries.yml` 各平台追加 `docsql-native-<版本>-<平台>.tar.gz`(Linux/macOS)与 Windows `.zip` | 原生库与三二进制同一 tag 发布,`SHA256SUMS` 统一校验 |
+
+**仍未做(诚实清单)**:原生库的 NuGet `runtime-*` 资产包(现在从 Releases 归档
+手动放置,或 `DOCSQL_EMBEDDED_NATIVE`);T-SQL 批会话变量与 pub/sub 在嵌入态按
+非目标处理(响亮报错);`docsql-ffi` 无跨进程文件锁(与存储家规一致);嵌入式 perf
+基线待补。
