@@ -149,8 +149,9 @@ SELECT * FROM t, u;                                      -- 逗号 FROM = 交叉
   `NATURAL JOIN`、`LATERAL`、
   `TABLESAMPLE`、`FOR UPDATE`/`FOR SHARE`、`SELECT INTO`、`TOP ... PERCENT`、
   `ON CONFLICT DO REPLACE`;
-  T-SQL 专有形式(`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、`IDENTITY(1,1)`、
-  `sys.*`、`EXEC`/存储过程层)同样报错;
+  T-SQL 专有形式(`OUTPUT`、表提示 `WITH (NOLOCK)`、`#` 临时表、非规范形态的
+  `IDENTITY(n,m)`、`sys.*`、`EXEC`/存储过程层)同样报错(`IDENTITY(1,1)` 与
+  `SET IDENTITY_INSERT … ON|OFF` 已作为迁移兼容面支持);
 - **T-SQL 表达式层已支持**(见 SQL 参考 · T-SQL 兼容面):`SELECT TOP [WITH TIES]`、
   `[方括号]` 标识符、`N'…'` 字面量、字符串 `+` 拼接、位运算 `& | ^ ~`、
   `LIKE '[a-z]'/[^…]` 字符类、日期/字符串/数学/转换(CONVERT 带 style、TRY_CAST/TRY_CONVERT/PARSE)/

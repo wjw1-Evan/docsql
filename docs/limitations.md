@@ -23,6 +23,22 @@
 | 备份 + PITR | 全量 dump(带 journal-seq 锚点)+ 增量段 incr-*.sql(期刊条目 + 提交时间戳)+ `restore ... "to": <时间戳>`;期刊无条件记录(单节点也记) | PITR 窗口 = 期刊保留(本节点自身写);对称多写集群中,他节点发起的写不在本节点期刊里——**集群级 PITR 需在承载全部写的主节点上执行**(主从拓扑天然满足)或以全量兜底;大库备份/恢复 O(数据);恢复中途失败留下部分恢复态(converged=false 如实报告,重跑 restore 即可) |
 | EF 免迁移同步不校验列类型 | 校验覆盖 表/列存在性、索引名/列序/唯一性;引擎为无类型文档模型,`information_schema.columns.data_type` 恒为 ANY,列类型本就不持久化 | 改实体属性类型(TEXT→DECIMAL 等)不会被告警也不会生效于存量数据;类型变更属破坏性变更,需人工评估/迁移新表 |
 
+## 从 SQL Server / MySQL 迁移
+
+有迁移测试守着(`crates/docsql-core/src/engine/migration_tests.rs`:SQL Server / MySQL 方言
+的 schema+数据导入、`dump_script` 回放、以及必须响亮报错的形态)。已知差异:
+
+| 差异点 | 行为 |
+|---|---|
+| SQL Server `IDENTITY(1,1)` | 折叠为 `AUTOINCREMENT`;其它 seed/increment **显式报错**(静默改号不可接受) |
+| `SET IDENTITY_INSERT … ON\|OFF` | 兼容空操作(显式主键本就允许写入,下一个自增值 = max+1) |
+| schema 前缀(`[dbo].[T]` / `dbo.T`) | 按点号表名原样保留(`dbo.T` 就是一张表名带点的表),引号/方括号/裸名三种写法等价 |
+| MySQL `ENGINE=` / `CHARSET=` 表选项 | **显式报错**,导入前从 DDL 去掉 |
+| MySQL `ON UPDATE CURRENT_TIMESTAMP` | **显式报错**(墙钟在 UPDATE 触发会令副本分叉;需要时由应用层写值) |
+| MySQL 反斜杠转义 | 字符串是 SQL 标准字面量:`'a\nb'` 是「反斜杠 + n」,mysqldump 的 `\'` 会解析失败——导入前先转换转义(mysqldump 加 `--hex-blob` 只解决二进制列) |
+| 小数字面量 | 裸 `1.25` 按 Float;DECIMAL 精确性用 `CAST('…' AS DECIMAL)`(dump 生成器通常已 CAST) |
+| `INSERT ... DEFAULT VALUES` | **显式报错**;迁移脚本改写为显式列值 |
+
 ## 已具备的商用面
 
 - 完整门禁与治理:双许可、SECURITY/CONTRIBUTING/CHANGELOG、CI(fmt/clippy/test → 多架构镜像 → 部署测试);

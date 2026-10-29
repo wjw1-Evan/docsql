@@ -152,7 +152,8 @@ pub fn preprocess(sql: &str) -> String {
         || lower.contains("parse")
         || contains_word(&lower, "set")
         || contains_word(&lower, "use")
-        || contains_word(&lower, "print");
+        || contains_word(&lower, "print")
+        || contains_word(&lower, "identity");
     if !may_rewrite {
         return sql.to_string();
     }
@@ -261,6 +262,17 @@ pub fn preprocess(sql: &str) -> String {
                         continue;
                     }
                 }
+                if word == b"identity" {
+                    // T-SQL `IDENTITY(1,1)` column modifier → AUTOINCREMENT;
+                    // only the canonical (1,1) form is flattened — other
+                    // seeds/increments stay verbatim so the DDL fails loudly
+                    // instead of silently renumbering ids.
+                    if let Some(next) = rewrite_identity(sql, i, &mut out) {
+                        i = next;
+                        at_start = false;
+                        continue;
+                    }
+                }
                 if matches!(word, b"convert" | b"try_convert" | b"parse" | b"try_parse") {
                     let marker = match word {
                         b"convert" => "__TSQL_CONVERT__",
@@ -301,6 +313,65 @@ pub fn preprocess(sql: &str) -> String {
         }
     }
     out
+}
+
+/// T-SQL `IDENTITY(seed, increment)` column modifier → the engine's
+/// `AUTOINCREMENT` constraint. SQL Server migration dumps spell every
+/// surrogate key this way. Only the canonical `(1,1)` form is flattened:
+/// another seed/increment would renumber rows and the engine has no
+/// equivalent — leaving it verbatim makes the DDL fail loudly
+/// ("unsupported column constraint") instead of silently changing ids.
+fn rewrite_identity(sql: &str, start: usize, out: &mut String) -> Option<usize> {
+    let b = sql.as_bytes();
+    let mut i = start;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'(') {
+        return None;
+    }
+    i += 1;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let seed_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let seed = &sql[seed_start..i];
+    if seed.is_empty() {
+        return None;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b',') {
+        return None;
+    }
+    i += 1;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let inc_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let inc = &sql[inc_start..i];
+    if inc.is_empty() {
+        return None;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b')') {
+        return None;
+    }
+    i += 1;
+    if seed != "1" || inc != "1" {
+        return None;
+    }
+    out.push_str("AUTOINCREMENT");
+    Some(i)
 }
 
 /// Word-boundary containment on an ASCII-lowercased copy — the preprocess
@@ -353,7 +424,48 @@ fn shim_statement(sql: &str, after_word: usize, word: &[u8], out: &mut String) -
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
-            if opt_start == i || !is_set_option(&sql[opt_start..i]) {
+            if opt_start == i {
+                return None;
+            }
+            // SET IDENTITY_INSERT <table> ON|OFF: SQL Server dumps bracket
+            // explicit-key inserts with this switch. The engine accepts
+            // explicit values in AUTOINCREMENT primary keys, so the switch
+            // is a session compatibility no-op (like the other SET shims).
+            if sql[opt_start..i].eq_ignore_ascii_case("IDENTITY_INSERT") {
+                while i < b.len() && b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let mut name = read_shim_ident(sql, &mut i)?;
+                // Schema-qualified `[dbo].[t]` flattens to the dotted table
+                // name the engine stores (same rule as FROM/JOIN names).
+                while b.get(i) == Some(&b'.') {
+                    i += 1;
+                    name.push('.');
+                    name.push_str(&read_shim_ident(sql, &mut i)?);
+                }
+                while i < b.len() && b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let flag_start = i;
+                while i < b.len() && b[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let flag = &sql[flag_start..i];
+                if !flag.eq_ignore_ascii_case("ON") && !flag.eq_ignore_ascii_case("OFF") {
+                    return None;
+                }
+                if !at_statement_end(sql, i) {
+                    return None;
+                }
+                let _ = name;
+                out.push_str("PRAGMA tsql_set = ");
+                out.push_str(&stmt::sql_string_literal(&format!(
+                    "IDENTITY_INSERT {}",
+                    flag.to_ascii_uppercase()
+                )));
+                return Some(i);
+            }
+            if !is_set_option(&sql[opt_start..i]) {
                 return None;
             }
             let opt = sql[opt_start..i].to_ascii_uppercase();
@@ -3475,6 +3587,22 @@ mod tests {
             preprocess("SET NOCOUNT ON"),
             "PRAGMA tsql_set = 'NOCOUNT ON'"
         );
+        // SQL Server dumps bracket explicit-key inserts with IDENTITY_INSERT;
+        // explicit ids are legal on AUTOINCREMENT keys, so the switch is a
+        // session no-op (schema-qualified target supported).
+        assert_eq!(
+            preprocess("SET IDENTITY_INSERT [dbo].[Customers] ON"),
+            "PRAGMA tsql_set = 'IDENTITY_INSERT ON'"
+        );
+        assert_eq!(
+            preprocess("SET IDENTITY_INSERT dbo.t OFF;"),
+            "PRAGMA tsql_set = 'IDENTITY_INSERT OFF';"
+        );
+        // Missing value / unknown target syntax stays verbatim (loud parser).
+        assert_eq!(
+            preprocess("SET IDENTITY_INSERT [dbo].[t] SOMETIMES"),
+            "SET IDENTITY_INSERT \"dbo\".\"t\" SOMETIMES"
+        );
         assert_eq!(
             preprocess("SET QUOTED_IDENTIFIER OFF;"),
             "PRAGMA tsql_set = 'QUOTED_IDENTIFIER OFF';"
@@ -4868,5 +4996,28 @@ mod tests {
     #[test]
     fn print_shim_accepts_n_prefixed_literal() {
         assert_eq!(preprocess("PRINT N'hello'"), "PRAGMA tsql_print = 'hello'");
+    }
+
+    #[test]
+    fn preprocess_identity_rewrites_only_the_canonical_form() {
+        assert_eq!(
+            preprocess("CREATE TABLE t (Id INT IDENTITY(1,1) PRIMARY KEY)"),
+            "CREATE TABLE t (Id INT AUTOINCREMENT PRIMARY KEY)"
+        );
+        assert_eq!(
+            preprocess("CREATE TABLE t (Id INT IDENTITY (1, 1) PRIMARY KEY)"),
+            "CREATE TABLE t (Id INT AUTOINCREMENT PRIMARY KEY)"
+        );
+        // Non-canonical seeds/increments stay verbatim: the engine rejects
+        // them loudly instead of silently renumbering ids.
+        assert_eq!(
+            preprocess("CREATE TABLE t (Id INT IDENTITY(2,1) PRIMARY KEY)"),
+            "CREATE TABLE t (Id INT IDENTITY(2,1) PRIMARY KEY)"
+        );
+        // String literals are data, not keywords.
+        assert_eq!(
+            preprocess("SELECT 'IDENTITY(1,1)'"),
+            "SELECT 'IDENTITY(1,1)'"
+        );
     }
 }

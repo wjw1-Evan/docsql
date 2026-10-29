@@ -6,6 +6,11 @@
 ## [Unreleased]
 
 ### 新功能
+- **SQL Server 迁移兼容**:`IDENTITY(1,1)` 列修饰符折叠为 `AUTOINCREMENT`(其它 seed/
+  increment 显式报错,绝不静默改号)、`SET IDENTITY_INSERT <表> ON|OFF` 兼容空操作
+  (schema 限定名支持);新增迁移测试套件 `engine/migration_tests.rs`(SQL Server 与 MySQL
+  方言的 schema+数据导入、`dump_script` 回放一致、`ENGINE=`/`ON UPDATE`/非规范 IDENTITY
+  必须响亮报错);迁移差异清单进 limitations。
 - **.NET 嵌入式模式(SQLite 式零守护)**:连接串 `Data Source=app.db`(或 `:memory:`)在应用
   进程内直接跑引擎 —— 无 server、无端口、无 Docker。实现为新 crate `crates/docsql-ffi`
   (C ABI `docsql_embedded`:`abi_version/open/close/execute/free`,panic 边界

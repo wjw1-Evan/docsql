@@ -1087,10 +1087,10 @@ SQLite 兼容的 DDL 自省视图(EF Core schema 同步使用),行:`type`(`table
 | PIVOT/UNPIVOT | `FROM src PIVOT (SUM(x) FOR col IN (v1 [AS c1], v2)) AS p`:隐式分组(除透视列与聚合实参列外的全部字段,按编码字节精确分桶),单聚合(SUM/AVG/MIN/MAX/COUNT),空单元格 COUNT 为 0、其余为 NULL(组内全 NULL 同此),IN 子查询与 `DEFAULT ON NULL` 报错;`FROM src UNPIVOT (val FOR col IN (a [AS α], b)) AS u`:每行×每列出一行,NULL 单元格剔除(`INCLUDE|EXCLUDE NULLS` 报错) |
 | 标识与随机 | `SCOPE_IDENTITY()`/`@@IDENTITY`(逐连接会话状态:连接内最后一条 INSERT 的自增 id,非 INSERT 语句不清除;服务端在写锁内随语句结果快照,跨连接不串值);`RAND()`([0,1) 浮点;每语句一值,同语句内各处同值,与 T-SQL 一致)——**复制安全**:SELECT 读路径可用,INSERT 路径字面量化回写(同 NEWID),UPDATE/DELETE/MERGE 拒绝 |
 | 会话身份 | `SUSER_SNAME()`/`ORIGINAL_LOGIN()`/`SYSTEM_USER`/`SESSION_USER`/`USER_NAME()`/`APP_NAME()`/`HOST_NAME()` —— 经连接身份上下文替换(服务端为登录用户,无上下文时报错) |
-| 会话垫片 | `SET <已知选项> ON/OFF`、`USE <db>`(裸名/`"引号"`/`[方括号]` 均可)、`PRINT <字面量>`、`GO` 批分隔(CLI/控制台多语句)—— 与 PRAGMA 同通道**接受并忽略** |
+| 会话垫片 | `SET <已知选项> ON/OFF`、`SET IDENTITY_INSERT <表> ON/OFF`(显式主键本就允许,迁移兼容空操作)、`USE <db>`(裸名/`"引号"`/`[方括号]` 均可)、`PRINT <字面量>`、`GO` 批分隔(CLI/控制台多语句)—— 与 PRAGMA 同通道**接受并忽略** |
 | 语义对齐 | `CONCAT` 把 NULL 当空串(`\|\|` 仍 NULL 传染)、`LEN` 不计尾随空格(`LENGTH` 计)、`TRIM('ab' FROM x)` 字符集裁剪、`ROUND(x, -n)` 负位数(十位/百位) |
 | 复制确定性 | 写语句中的 `GETDATE()` 族在写入节点折叠成时间戳字面量(与 `DEFAULT NOW()` 同红线);`DEFAULT NEWID()` 按行定值回写 |
-| 其他 | `CAST(... AS BIT)`、`INFORMATION_SCHEMA.*`/`sqlite_master`(大小写不敏感)、`UPDATE ... FROM`、`DELETE ... USING`、`MERGE`(受限)、`JSON_ARRAY_CONTAINS`;`BIT`/`DATETIME2`/`NVARCHAR(MAX)` 等类型名按声明类型接受(值模型不变) |
+| 其他 | `CAST(... AS BIT)`、`IDENTITY(1,1)` 列修饰符(→ `AUTOINCREMENT`,见迁移说明)、`INFORMATION_SCHEMA.*`/`sqlite_master`(大小写不敏感)、`UPDATE ... FROM`、`DELETE ... USING`、`MERGE`(受限)、`JSON_ARRAY_CONTAINS`;`BIT`/`DATETIME2`/`NVARCHAR(MAX)` 等类型名按声明类型接受(值模型不变) |
 
 **显式报错**(不静默、不降级):
 
@@ -1101,7 +1101,7 @@ SQLite 兼容的 DDL 自省视图(EF Core schema 同步使用),行:`type`(`table
 | 运算符/变量 | `@@ROWCOUNT`/`@@VERSION`/`@@ERROR`/`@@IDENTITY` 之外的 `@@` 系统变量 |
 | FROM/联接 | `WITH (NOLOCK)` 等表提示、旧式 `t (NOLOCK)`、`APPLY` 子查询形式、未知表函数、`TABLESAMPLE`(`PIVOT`/`UNPIVOT` 已支持,见上表) |
 | DML | `OUTPUT INSERTED/DELETED...`(用 `RETURNING`)、`MERGE ... OUTPUT`、`MERGE WHEN MATCHED THEN DELETE`、`UPDATE/DELETE ... ORDER BY/LIMIT`、`DELETE t FROM ...` 多表删除(用 `DELETE ... USING`) |
-| DDL | `#temp`/`##temp` 临时表、`IDENTITY(1,1)`(用 `AUTOINCREMENT`)、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
+| DDL | `#temp`/`##temp` 临时表、非规范形态的 `IDENTITY(seed, increment)`(仅 `(1,1)` 折叠为 `AUTOINCREMENT`,其它显式报错)、`ROWGUIDCOL`、`CLUSTERED`/`NONCLUSTERED INDEX`、`INCLUDE`、`WHERE` 过滤索引、`USING` 索引类型、索引存储选项 |
 | 目录 | `sys.*`/`sysobjects`(报错并指向 `information_schema`/`sqlite_master`)、`OBJECT_ID` |
 | 语句/过程 | `EXEC`、`WAITFOR`、`RETURN`、`GOTO`、`DENY`、`CREATE PROCEDURE/TRIGGER/SCHEMA/SEQUENCE`(存储过程/游标层整体是架构边界;`DECLARE`/`SET @x`/`IF`/`WHILE`/`BEGIN…END`/`TRY…CATCH`/`THROW`/`RAISERROR` 批控制流已支持,见上表) |
 | 函数 | `SCOPE_IDENTITY`、`HASHBYTES` 的 `SHA2_512`/`MD2`、`TIMEFROMPARTS`(无 TIME 类型);会话身份函数无连接上下文时报错(有上下文时替换,见上表) |

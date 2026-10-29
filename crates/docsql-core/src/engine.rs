@@ -2102,6 +2102,8 @@ mod complex_query_tests;
 #[cfg(test)]
 mod matview_tests;
 #[cfg(test)]
+mod migration_tests;
+#[cfg(test)]
 mod partial_index_tests;
 #[cfg(test)]
 mod read_view_tests;
