@@ -13,7 +13,7 @@ DocSQL:Rust 原生文档数据库 + .NET 客户端栈。JSON 文档整体存储�
 | `crates/docsql-cli` | 嵌入式/远程 SQL shell |
 | `crates/docsql-ffi` | C ABI(库名 `docsql_embedded`):进程内引擎会话/事务守门/JSON 结果桥;.NET `Data Source=…` 的原生库 |
 | `crates/docsql-web` | REST API + 内嵌单页控制台(`console.html` 经 `include_str!`) |
-| `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/AspireSample(AppHost 示例) |
+| `dotnet/` | Docsql.Client(ADO.NET)、Docsql.EntityFrameworkCore、Aspire 三件套(Hosting/Client/EF 容器级注册)、两套 xUnit、Sample/EfSample、samples/BlogSample(博客示例:嵌入式/远程双形态)、samples/AspireSample(AppHost 示例) |
 | `deploy/` | `docker-compose.yml`(dev,源码构建)/ `docker-compose.prod.yml`(prod,GHCR);均含 `single`/`cluster`/`join` profile;`run-tests.sh` 部署测试入口 |
 | `python/` | DB-API 2.0 Python 驱动(纯标准库;`qmark` 服务端绑定 + 精确标量 `$dec`/`$ts`/`$bytes` + TLS/`DOCSQL_KEY` + `Subscriber` 断线续传);pytest 起真实 server(`cargo build -p docsql-server` 先行) |
 

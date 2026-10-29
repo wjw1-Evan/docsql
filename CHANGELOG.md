@@ -16,6 +16,11 @@
   Linux/macOS/Windows),加载顺序 `DOCSQL_EMBEDDED_NATIVE` → `runtimes/<rid>/native` →
   应用目录 → `target/{debug,release}`。pub/sub/PROMOTE/备份/集群/T-SQL 批会话在嵌入态
   显式报错。测试:FFI 15 + Client 嵌入式 18 + EF 嵌入式 7。
+- **示例:博客(`dotnet/samples/BlogSample`)** — 一个完整小博客(作者/文章/评论/标签):
+  默认嵌入式 `Data Source=blog.db` 零守护,传连接串即切远程模式(代码零差异);
+  演示懒建表+唯一索引/外键、标签数组(`List<string>` primitive collection →
+  JSON_ARRAY_CONTAINS 筛选)、JOIN/时间倒序分页/LIKE、事务回滚、原生 SQL GROUP BY
+  混用与重开验证持久化;已收录 `dotnet/Docsql.sln`。
 
 ### 变更
 - **.NET 嵌入式设计稿**(`docs/design/006-dotnet-embedded-mode.md`,评估稿未实现):方案矩阵

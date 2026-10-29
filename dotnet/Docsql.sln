@@ -23,6 +23,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Docsql.Aspire.Hosting.Tests
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Docsql.Aspire.Client.Tests", "Docsql.Aspire.Client.Tests\Docsql.Aspire.Client.Tests.csproj", "{523E261E-BF4C-4A35-AA50-5C77A0EF83D1}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "samples", "samples", "{5D20AA90-6969-D8BD-9DCD-8634F4692FDA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BlogSample", "samples\BlogSample\BlogSample.csproj", "{63D3B0C3-8F98-4E04-A576-82319649FAAF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -153,8 +157,23 @@ Global
 		{523E261E-BF4C-4A35-AA50-5C77A0EF83D1}.Release|x64.Build.0 = Release|Any CPU
 		{523E261E-BF4C-4A35-AA50-5C77A0EF83D1}.Release|x86.ActiveCfg = Release|Any CPU
 		{523E261E-BF4C-4A35-AA50-5C77A0EF83D1}.Release|x86.Build.0 = Release|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Debug|x64.Build.0 = Debug|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Debug|x86.Build.0 = Debug|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x64.ActiveCfg = Release|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x64.Build.0 = Release|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x86.ActiveCfg = Release|Any CPU
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{63D3B0C3-8F98-4E04-A576-82319649FAAF} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 	EndGlobalSection
 EndGlobal
