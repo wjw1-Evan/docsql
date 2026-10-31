@@ -76,4 +76,4 @@ var cluster = builder.AddDocsqlCluster("docsql", nodeCount: 3);
 
 ## 许可
 
-MIT OR Apache-2.0
+AGPL-3.0-or-later(社区版)。闭源商用需商业许可,见主仓库 README「许可证」。

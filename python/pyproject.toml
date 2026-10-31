@@ -7,15 +7,14 @@ name = "docsql"
 version = "0.1.0"
 description = "DocSQL database driver: DB-API 2.0 over the v1 binary protocol"
 readme = "README.md"
-license = { text = "MIT OR Apache-2.0" }
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.9"
 authors = [{ name = "DocSQL contributors" }]
 keywords = ["docsql", "database", "dbapi", "driver", "json"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",

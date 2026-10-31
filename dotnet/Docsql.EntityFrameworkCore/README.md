@@ -41,4 +41,4 @@ class AppDb(DbContextOptions<AppDb> options) : DbContext(options)
 - CRUD / LINQ / `Include` / 原生 `FromSql` 全支持
 - `Database.Migrate()` 显式报错:DocSQL 不支持 EF Migrations,请使用 EnsureCreated(显式报错并指引,绝不静默)
 
-License: MIT OR Apache-2.0.
+License: AGPL-3.0-or-later(社区版);闭源商用需商业许可。

@@ -34,4 +34,4 @@ while (await reader.ReadAsync()) { /* ... */ }
 
 参数在客户端转义为类型化字面量(字符串单引号强转义);服务端同时提供 REQ_PREPARE/REQ_EXECUTE 服务端绑定帧供自研驱动使用。
 
-License: MIT OR Apache-2.0.
+License: AGPL-3.0-or-later(社区版);闭源商用需商业许可。

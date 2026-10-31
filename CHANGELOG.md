@@ -66,9 +66,15 @@
   `PytestUnhandledThreadExceptionWarning` 升级报错复验。
 
 ### 变更
-- **许可证明示免费商用**:README 声明双许可(Apache-2.0 / MIT)下商业部署、生产使用、闭源
-  集成、修改、再分发与销售均免费,义务仅为保留许可与版权声明;Python 包元数据从单 MIT 对齐为
-  `MIT OR Apache-2.0`(与 Cargo.toml、四个 .csproj 一致)。
+- **许可模式变更(重大):AGPL-3.0 + 商业许可双授权**。自本版本起,社区版以 **AGPL-3.0**
+  发布([LICENSE-AGPL](LICENSE-AGPL)):个人学习、科研、内部业务系统使用永久免费,遵守 AGPL
+  义务(含 §13 网络条款——对外提供数据库服务须向使用者开放服务端源码)的商业部署同样免费;
+  **闭源集成、嵌入商业产品、不愿开放源码的商业部署需购买商业许可**(AGPL 义务豁免 + 支持
+  SLA + 信创合规包,价格见 `docs/pricing.md`)。v0.9.1 及更早已发布版本按 Apache-2.0/MIT
+  (许可不可撤销,继续有效)。全仓库同步:Cargo.toml / pyproject.toml / 四个 .csproj 的
+  许可元数据、CONTRIBUTING 贡献条款(AGPL + 商业发行授权)、依赖审计文档结论复核(全部
+  宽松依赖与 AGPL 主许可兼容)。新增 `docs/pricing.md` 价格体系(商业许可标准/专业/旗舰
+  三档按节点·年、嵌入保障计划、专业服务、折扣渠道、收入路径)。
 - **升级安全护栏**:数据文件格式版本(`MAGIC = DOCSQLP1`)以测试钉住 —— 任何落盘格式变更必须
   显式升版本号;旧二进制遇到新格式文件响亮拒绝(`BadHeader`),绝不静默误读(回归
   `newer_data_file_version_is_rejected_loudly`)。运维手册新增「版本升级与回滚」:格式兼容

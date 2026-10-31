@@ -17,6 +17,7 @@
 | 配用户/角色、审计、加密(等保对照) | [安全指南](security.md) |
 | 确认架构边界与路线 | [已知边界与定位](limitations.md) |
 | 评估国产化销售合规、信创硬件适配、依赖许可 | [合规与国产化销售指南](compliance.md) · [第三方依赖许可审计](third-party-licenses.md) |
+| 采购商业许可、了解价格与折扣 | [价格体系](pricing.md) |
 | 查版本历史 / 报安全漏洞 | [CHANGELOG](../CHANGELOG.md) · [SECURITY](../SECURITY.md) |
 | 参与开发(门禁、红线、测试) | [CONTRIBUTING](../CONTRIBUTING.md) · [AGENTS](../AGENTS.md) |
 
@@ -54,8 +55,9 @@
 
 | 文档 | 内容 |
 |---|---|
-| [合规与国产化销售指南](compliance.md) | 自主可控声明与依据、信创 CPU/OS 支持矩阵、等保/安全对照索引、销售合规行动清单(软著/商标/测评)、双许可商业模式 |
+| [合规与国产化销售指南](compliance.md) | 自主可控声明与依据、信创 CPU/OS 支持矩阵、等保/安全对照索引、销售合规行动清单(软著/商标/测评)、AGPL+商业双授权模式与 AGPL 红线 |
 | [第三方依赖许可审计](third-party-licenses.md) | 全依赖许可清单(175 Rust 包 + .NET + Python)、无传染性许可结论、依赖红线规则 |
+| [价格体系](pricing.md) | 商业许可三档(标准/专业/旗舰按节点·年)、嵌入保障计划(OEM)、专业服务价目、折扣与渠道、收入路径与定价红线 |
 
 **内部设计(贡献者)**
 
