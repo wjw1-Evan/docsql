@@ -924,9 +924,9 @@ agg_name ( [ DISTINCT ] { expr | * } ) [ FILTER ( WHERE condition ) ]
 
 | 分类 | 函数 | 说明 |
 |---|---|---|
-| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`(LEN 不计尾随空格)、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`(另支持 `TRIM('ab' FROM x)` 字符集形式)、`CONCAT(a, b, ...)`(NULL 当空串;`\|\|` 仍传染) | 位置按字符计;除 CONCAT 外 NULL 输入返回 NULL;`SUBSTR` 遵循 SQLite 规则——起点 0 位于虚拟首位(`substr('abcde',0,2)` 得 `'a'`)、负长度取起点之前的字符、负起点从末尾数;T-SQL 字符串函数族(LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT)见[T-SQL 兼容面](#t-sqlsql-server兼容面) |
-| 数值 | `ABS`、`ROUND(x [, digits])` | ROUND 对 DECIMAL 精确四舍五入(半离零),FLOAT 保持浮点 |
-| 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF` | |
+| 字符串 | `UPPER/UCASE`、`LOWER/LCASE`、`LENGTH/LEN`(LEN 不计尾随空格)、`CHAR_LENGTH/CHARACTER_LENGTH`、`OCTET_LENGTH`、`LOCATE(sub, s [, start])`、`POSITION(sub IN s)`、`SUBSTR/SUBSTRING(s, start [, len])`、`TRIM/LTRIM/RTRIM(s)`(另支持 `TRIM('ab' FROM x)` 字符集形式)、`CONCAT(a, b, ...)`(NULL 当空串;`\|\|` 仍传染) | 位置按字符计(1 基,未命中为 0);除 CONCAT 外 NULL 输入返回 NULL;`OCTET_LENGTH` 按 UTF-8 字节;`SUBSTR` 遵循 SQLite 规则——起点 0 位于虚拟首位(`substr('abcde',0,2)` 得 `'a'`)、负长度取起点之前的字符、负起点从末尾数;T-SQL 字符串函数族(LEFT/RIGHT/CHARINDEX/REPLACE/REPLICATE/REVERSE/SPACE/STR/QUOTENAME/ASCII/CHAR/NCHAR/UNICODE/CONCAT_WS/TRANSLATE/STUFF/STRING_ESCAPE/FORMAT)见[T-SQL 兼容面](#t-sqlsql-server兼容面) |
+| 数值 | `ABS`、`ROUND(x [, digits])`、`MOD(a, b)`、`POW/POWER(x, y)`、`TRUNCATE(x, digits)` | ROUND 对 DECIMAL 精确四舍五入(半离零),FLOAT 保持浮点;MOD 与 `%` 同语义(除零得 NULL);TRUNCATE 向零截断(不四舍五入),负 digits 截到十位/百位 |
+| 空值/条件 | `COALESCE`/`IFNULL`/`ISNULL`、`NULLIF`、`IF(cond, a, b)` | `IF` 惰性求值(只执行选中的分支),真值判定为「非零数值 / TRUE」 |
 | 类型 | `TYPEOF(v)` | 返回 `null`/`bool`/`integer`/`float`/`decimal`/`text`/`timestamp`/`blob`/`array`/`object` |
 | 时间 | `NOW()` / `CURRENT_TIMESTAMP` / `NOW_MS` | 当前 UTC 时间,返回 TIMESTAMP 值;`NOW_MS` 为别名 |
 | JSON | `JSON_EXTRACT(doc, '$.a.b[0]')`、`JSON_TYPE(doc, path)`、`JSON_VALID(text)`、`JSON_ARRAY_CONTAINS(json_text, needle)` | 坏文本/缺路径返回 NULL(不中断扫描);`JSON_ARRAY_CONTAINS` 非数组为 FALSE |

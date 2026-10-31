@@ -13,6 +13,11 @@
   新增方言矩阵测试 `engine/dialect_tests.rs`(PostgreSQL/SQLite/Oracle 可用面 + 必报错面),
   与既有迁移套件合计 15 例;drivers 新增「从其他数据库切换」指南(EF Core 换 `UseDocsql`、
   ADO.NET 换连接类、第三方驱动需换 `Docsql.Client`)与线协议边界说明。
+- **跨方言标量函数面**:补齐 MySQL `IF(cond,a,b)`(惰性分支,未选分支不求值)、
+  `LOCATE(sub, s [, start])`、`CHAR_LENGTH`、`MOD`、`POW`、`TRUNCATE(x, digits)` 与标准
+  `POSITION(sub IN str)`、`CHARACTER_LENGTH`、`OCTET_LENGTH`;位置/长度按字符计,
+  `OCTET_LENGTH` 按 UTF-8 字节,`MOD` 与 `%` 同语义(除零得 NULL),`TRUNCATE` 向零截断。
+  方言矩阵测试新增 1 例(共 16 例)。
 - **SQL Server 迁移兼容**:`IDENTITY(1,1)` 列修饰符折叠为 `AUTOINCREMENT`(其它 seed/
   increment 显式报错,绝不静默改号)、`SET IDENTITY_INSERT <表> ON|OFF` 兼容空操作
   (schema 限定名支持);新增迁移测试套件 `engine/migration_tests.rs`(SQL Server 与 MySQL

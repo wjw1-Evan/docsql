@@ -36,10 +36,12 @@ SQL Server / MySQL / PostgreSQL / SQLite / Oracle 方言的 schema+数据导入�
 | schema 前缀(`[dbo].[T]` / `dbo.T`) | 按点号表名原样保留(`dbo.T` 就是一张表名带点的表),引号/方括号/裸名三种写法等价 |
 | MySQL `ENGINE=` / `CHARSET=` 表选项 | **显式报错**,导入前从 DDL 去掉 |
 | MySQL `ON UPDATE CURRENT_TIMESTAMP` | **显式报错**(墙钟在 UPDATE 触发会令副本分叉;需要时由应用层写值) |
+| MySQL `IF(cond,a,b)`、`LOCATE(sub, s [, start])`、`CHAR_LENGTH`、`MOD`、`POW`、`TRUNCATE(x, digits)` | 直接可用(`IF` 惰性求值,未选分支不执行;`MOD` 与 `%` 同语义,除零得 NULL) |
+| 标准 `POSITION(sub IN str)`、`CHARACTER_LENGTH`、`OCTET_LENGTH` | 直接可用;位置/长度按字符计,`OCTET_LENGTH` 按 UTF-8 字节 |
 | MySQL 反斜杠转义 | 字符串是 SQL 标准字面量:`'a\nb'` 是「反斜杠 + n」,mysqldump 的 `\'` 会解析失败——导入前先转换转义(mysqldump 加 `--hex-blob` 只解决二进制列) |
 | 小数字面量 | 裸 `1.25` 按 Float;DECIMAL 精确性用 `CAST('…' AS DECIMAL)`(dump 生成器通常已 CAST) |
 | `INSERT ... DEFAULT VALUES` | **显式报错**;迁移脚本改写为显式列值 |
-| PostgreSQL `SERIAL`/`BIGSERIAL`/`GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY` | 折叠为 `AUTOINCREMENT`;带 `(START WITH …)` 选项显式报错 |
+| PostgreSQL `SERIAL`/`BIGSERIAL`/`GENERATED [ALWAYS \| BY DEFAULT [ON NULL]] AS IDENTITY` | 折叠为 `AUTOINCREMENT`;带 `(START WITH …)` 选项显式报错 |
 | PostgreSQL `::` 转换、`ILIKE`、`now()`、`ON CONFLICT <目标> DO UPDATE SET … EXCLUDED`、`RETURNING` | 直接可用 |
 | PostgreSQL 专属 `$$…$$`、`setval()`、`CREATE/ALTER SEQUENCE` | **显式报错**(迁移时剥离这些行) |
 | SQLite `INSERT OR REPLACE`/`ON CONFLICT DO NOTHING`/`PRAGMA`/`sqlite_master` | 可用;`datetime('now')`/`strftime(...)` 显式报错(改用 `CURRENT_TIMESTAMP`) |

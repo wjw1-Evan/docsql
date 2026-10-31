@@ -354,8 +354,10 @@ DocSQL 的 `host=…;port=…`(远程)或 `Data Source=app.db`(进程内嵌入)�
 
 **方言矩阵(测试守着)**:SQL Server(`[方括号]`、`N'…'`、`IDENTITY(1,1)`、
 `SET IDENTITY_INSERT`)、MySQL(backticks、`AUTO_INCREMENT`、`TINYINT(1)`/`UNSIGNED`、
-`ON DUPLICATE KEY UPDATE`)、PostgreSQL(`SERIAL`/`BIGSERIAL`、`GENERATED … AS IDENTITY`、
-`::`、`ILIKE`、`ON CONFLICT … EXCLUDED`)、SQLite(`INSERT OR REPLACE`、`sqlite_master`)、
+`ON DUPLICATE KEY UPDATE`、`IF`/`LOCATE`/`CHAR_LENGTH`/`MOD`/`POW`/`TRUNCATE`)、
+PostgreSQL(`SERIAL`/`BIGSERIAL`、`GENERATED … AS IDENTITY`、
+`::`、`ILIKE`、`ON CONFLICT … EXCLUDED`、`POSITION`/`OCTET_LENGTH`)、
+SQLite(`INSERT OR REPLACE`、`sqlite_master`)、
 Oracle(`NVL`/`DUAL`/`ROWNUM`/`SYSDATE`)均有用例;拒绝面(表选项、`ON UPDATE`、
 `SET`/`SEQUENCE`、`datetime('now')`、Oracle 序列)一律**响亮报错**。完整差异清单见
 [已知边界 · 从其他数据库切换/迁移](limitations.md#从其他数据库切换--迁移)。

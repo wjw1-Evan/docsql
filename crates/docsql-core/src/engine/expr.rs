@@ -43,6 +43,12 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
             binop(l, op, r)
         }
         SqlExpr::Nested(e) => eval_const(e),
+        // SQL standard POSITION(sub IN str): 1-based, 0 when absent.
+        SqlExpr::Position { expr, r#in } => {
+            let needle = eval_const(expr)?;
+            let hay = eval_const(r#in)?;
+            position_of(&needle, &hay)
+        }
         SqlExpr::Floor { expr, .. } => scalar_function("FLOOR", &[eval_const(expr)?]),
         SqlExpr::Ceil { expr, .. } => scalar_function("CEILING", &[eval_const(expr)?]),
         // CAST of a constant (bound decimal/blob parameters render as
@@ -70,6 +76,11 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
             let name = f.name.to_string().to_uppercase();
             if f.over.is_some() {
                 return err(format!("window functions (OVER) are not supported: {name}"));
+            }
+            // MySQL IF(): lazy branches, like CASE — the untaken branch must
+            // not be evaluated (an error there would be spurious).
+            if name == "IF" {
+                return eval_if_expr(f, eval_const);
             }
             let mut args = Vec::new();
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
@@ -245,6 +256,56 @@ pub(super) fn eval_fn_arg(e: &SqlExpr, name: &str, first: bool, doc: &Object) ->
     eval_expr(e, doc)
 }
 
+/// 1-based character position of `needle` in `hay`, 0 when absent; NULL
+/// propagates. Shared by the standard `POSITION(x IN y)` expression and
+/// MySQL `LOCATE` so both count characters identically.
+fn position_of(needle: &Value, hay: &Value) -> Result<Value> {
+    if matches!(needle, Value::Null) || matches!(hay, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let needle = value_to_text(needle);
+    let hay = value_to_text(hay);
+    Ok(Value::Int(match hay.find(&needle) {
+        Some(b) => hay[..b].chars().count() as i64 + 1,
+        None => 0,
+    }))
+}
+
+/// MySQL `IF(cond, then, else)` with lazy branches: only the taken branch is
+/// evaluated (same as CASE — an error in the untaken branch must not fire).
+/// Truthiness follows MySQL: nonzero numbers are true, NULL is false.
+fn eval_if_expr<F>(f: &sqlparser::ast::Function, mut eval: F) -> Result<Value>
+where
+    F: FnMut(&SqlExpr) -> Result<Value>,
+{
+    let mut exprs: Vec<&SqlExpr> = Vec::new();
+    if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+        for a in &list.args {
+            match a {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    exprs.push(e)
+                }
+                _ => return err("unsupported argument to IF"),
+            }
+        }
+    }
+    if exprs.len() != 3 {
+        return err(format!(
+            "function IF takes exactly 3 arguments, got {}",
+            exprs.len()
+        ));
+    }
+    let truthy = match eval(exprs[0])? {
+        Value::Bool(b) => b,
+        Value::Int(i) => i != 0,
+        Value::Float(x) => x != 0.0,
+        Value::Decimal(d) => !d.is_zero(),
+        Value::Str(s) => s.trim().parse::<f64>().is_ok_and(|x| x != 0.0),
+        _ => false,
+    };
+    eval(exprs[if truthy { 1 } else { 2 }])
+}
+
 /// Evaluate an expression against a document row.
 pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
     match e {
@@ -336,6 +397,12 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             binop(l, op, r)
         }
         SqlExpr::Nested(e) => eval_expr(e, doc),
+        // SQL standard POSITION(sub IN str): 1-based, 0 when absent.
+        SqlExpr::Position { expr, r#in } => {
+            let needle = eval_expr(expr, doc)?;
+            let hay = eval_expr(r#in, doc)?;
+            position_of(&needle, &hay)
+        }
         SqlExpr::IsNull(inner) => Ok(Value::Bool(matches!(eval_expr(inner, doc)?, Value::Null))),
         SqlExpr::IsNotNull(inner) => {
             Ok(Value::Bool(!matches!(eval_expr(inner, doc)?, Value::Null)))
@@ -555,6 +622,11 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                 return err(format!(
                     "aggregate function {name} is not allowed in this context"
                 ));
+            }
+            // MySQL IF(): lazy branches, like CASE — the untaken branch must
+            // not be evaluated (an error there would be spurious).
+            if name == "IF" {
+                return eval_if_expr(f, |e| eval_expr(e, doc));
             }
             let mut args = Vec::new();
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
@@ -1061,6 +1133,59 @@ pub(super) fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 other => value_to_text(other).chars().count() as i64,
             })
         }
+        // SQL standard aliases for character length; MySQL/PostgreSQL
+        // programs use them interchangeably with LENGTH.
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+            exact_arity(name, args, 1)?;
+            match arg(args, 0, name)? {
+                Value::Null => Value::Null,
+                v => Value::Int(value_to_text(v).chars().count() as i64),
+            }
+        }
+        // Byte length: text counts its UTF-8 bytes (PostgreSQL semantics).
+        "OCTET_LENGTH" => {
+            exact_arity(name, args, 1)?;
+            Value::Int(match arg(args, 0, name)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytes(b) => b.len() as i64,
+                v => value_to_text(v).len() as i64,
+            })
+        }
+        // MySQL LOCATE(substr, str [, start]): 1-based character position of
+        // the first occurrence at/after `start`, 0 when absent.
+        "LOCATE" => {
+            if args.len() < 2 || args.len() > 3 {
+                return err(format!(
+                    "function LOCATE takes 2 or 3 arguments, got {}",
+                    args.len()
+                ));
+            }
+            if args.iter().any(null_prop) {
+                return Ok(Value::Null);
+            }
+            let needle = value_to_text(arg(args, 0, name)?);
+            let hay = value_to_text(arg(args, 1, name)?);
+            let start = match args.get(2) {
+                Some(Value::Int(n)) => *n,
+                Some(other) => {
+                    return err(format!(
+                        "function LOCATE: start must be an integer, got {}",
+                        other.type_name()
+                    ))
+                }
+                None => 1,
+            };
+            let chars: Vec<char> = hay.chars().collect();
+            let skip = start.saturating_sub(1);
+            if skip > chars.len() as i64 {
+                return Ok(Value::Int(0));
+            }
+            let tail: String = chars[skip as usize..].iter().collect();
+            Value::Int(match tail.find(&needle) {
+                Some(b) => skip + tail[..b].chars().count() as i64 + 1,
+                None => 0,
+            })
+        }
         "ABS" => {
             exact_arity(name, args, 1)?;
             match arg(args, 0, name)? {
@@ -1118,6 +1243,73 @@ pub(super) fn scalar_function(name: &str, args: &[Value]) -> Result<Value> {
                 };
                 let m = 10f64.powi(digits as i32);
                 Value::Float((x * m).round() / m)
+            }
+        }
+        // MySQL MOD(a,b) — identical semantics to the `%` operator (NULL on
+        // division by zero, exact for DECIMAL).
+        "MOD" => {
+            exact_arity(name, args, 2)?;
+            arith(
+                args[0].clone(),
+                &sqlparser::ast::BinaryOperator::Modulo,
+                args[1].clone(),
+            )?
+        }
+        // MySQL/PowerShell spelling of POWER: one numeric implementation.
+        "POW" => {
+            return crate::tsql::scalar("POWER", args)
+                .expect("POWER is a registered T-SQL scalar function")
+        }
+        // MySQL/SQL Server TRUNCATE(x, digits): truncate toward zero (never
+        // rounds), negative digits cut at tens/hundreds.
+        "TRUNCATE" => {
+            exact_arity(name, args, 2)?;
+            let v = arg(args, 0, name)?;
+            let digits = match arg(args, 1, name)? {
+                Value::Int(d) => (*d).clamp(-15, 28),
+                other => {
+                    return err(format!(
+                        "function TRUNCATE: digits must be an integer, got {}",
+                        other.type_name()
+                    ))
+                }
+            };
+            match v {
+                Value::Null => Value::Null,
+                Value::Int(i) => {
+                    if digits >= 0 {
+                        Value::Int(*i)
+                    } else {
+                        let shift = 10i64
+                            .checked_pow(((-digits).min(15)) as u32)
+                            .unwrap_or(1_000_000_000_000_000);
+                        Value::Int((*i / shift) * shift)
+                    }
+                }
+                Value::Decimal(d) => {
+                    if digits >= 0 {
+                        Value::Decimal(d.round_dp_with_strategy(
+                            (digits as u32).min(28),
+                            rust_decimal::RoundingStrategy::ToZero,
+                        ))
+                    } else {
+                        let shift = Decimal::from(
+                            10i64
+                                .checked_pow(((-digits).min(15)) as u32)
+                                .unwrap_or(1_000_000_000_000_000),
+                        );
+                        Value::Decimal(
+                            (d / shift)
+                                .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero)
+                                * shift,
+                        )
+                    }
+                }
+                Value::Float(f) => {
+                    let m = 10f64.powi(digits as i32);
+                    Value::Float((f * m).trunc() / m)
+                }
+                other => return err(format!("TRUNCATE of non-numeric: {}", other.type_name())),
             }
         }
         "COALESCE" | "IFNULL" | "ISNULL" => {

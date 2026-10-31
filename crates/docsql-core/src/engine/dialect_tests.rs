@@ -258,3 +258,92 @@ fn oracle_sequence_references_are_loud() {
     let e = err_of(&mut db, "SELECT emp_seq.currval FROM DUAL");
     assert!(e.contains("sequence"), "{e}");
 }
+
+/// MySQL / standard scalar surface programs reach for every day:
+/// `IF`, `LOCATE`, `CHAR_LENGTH`/`CHARACTER_LENGTH`, `OCTET_LENGTH`,
+/// `MOD`, `POW`, `TRUNCATE` and the standard `POSITION(x IN y)`.
+/// All count characters (not bytes) where a position is returned.
+#[test]
+fn mysql_and_standard_scalar_functions_import_and_run() {
+    let mut db = Database::in_memory().unwrap();
+
+    // IF is lazy: the untaken branch is never evaluated (CAST('x' AS INT)
+    // would be a loud conversion error).
+    let r = rows(
+        &mut db,
+        "SELECT IF(1 = 1, 'yes', CAST('x' AS INT)) AS a, \
+                IF(0, 'yes', 'no') AS b, IF(NULL, 'yes', 'no') AS c, \
+                IF(3, 'truthy', 'falsy') AS d",
+    );
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Str("yes".into()),
+            Value::Str("no".into()),
+            Value::Str("no".into()),
+            Value::Str("truthy".into()),
+        ]]
+    );
+
+    // Character positions (1-based, 0 when absent), UTF-8 safe.
+    let r = rows(
+        &mut db,
+        "SELECT LOCATE('c', 'abc') AS a, LOCATE('c', 'abcabc', 4) AS b, \
+                LOCATE('z', 'abc') AS c, POSITION('好' IN '你好世界') AS d, \
+                POSITION('z' IN 'abc') AS e",
+    );
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Int(3),
+            Value::Int(6),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(0),
+        ]]
+    );
+
+    // Lengths: characters vs bytes.
+    let r = rows(
+        &mut db,
+        "SELECT CHAR_LENGTH('你好a') AS a, CHARACTER_LENGTH('你好a') AS b, \
+                OCTET_LENGTH('你好a') AS c",
+    );
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(3), Value::Int(3), Value::Int(7)]]
+    );
+
+    // MOD mirrors `%` exactly (NULL on zero, exact for DECIMAL).
+    let r = rows(
+        &mut db,
+        "SELECT MOD(7, 3) AS a, MOD(-7, 3) AS b, \
+                MOD(CAST('7.5' AS DECIMAL), 2) AS c",
+    );
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Int(1),
+            Value::Int(-1),
+            Value::Decimal("1.5".parse().unwrap()),
+        ]]
+    );
+    let r = rows(&mut db, "SELECT MOD(7, 0) AS z");
+    assert_eq!(r.rows, vec![vec![Value::Null]]);
+
+    // POW is POWER; TRUNCATE cuts toward zero (never rounds).
+    let r = rows(
+        &mut db,
+        "SELECT POW(2, 10) AS a, TRUNCATE(CAST('1.239' AS DECIMAL), 2) AS b, \
+                TRUNCATE(123, -1) AS c, TRUNCATE(NULL, 2) AS d",
+    );
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Int(1024),
+            Value::Decimal("1.23".parse().unwrap()),
+            Value::Int(120),
+            Value::Null,
+        ]]
+    );
+}
