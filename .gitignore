@@ -33,3 +33,7 @@ python/.venv/
 python/build/
 python/dist/
 python/*.egg-info/
+
+# NuGet native payloads are populated by .github/workflows/nuget-publish.yml
+# from the release artifacts; never commit platform binaries.
+dotnet/Docsql.Client/runtimes/

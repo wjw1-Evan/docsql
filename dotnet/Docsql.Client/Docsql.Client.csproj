@@ -19,6 +19,14 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <!-- 嵌入式原生库随包分发(引用即用,SQLite 式体验):发布流水线把
+         Releases 的 docsql-native-* 解到 runtimes/<rid>/native/,这里按
+         RID 目录原样打进 nupkg —— .NET 的 DllImport 解析器会自动找
+         runtimes/<rid>/native/。本地产物未填充该目录时,包内只有托管程序集
+         (仓库内开发仍走 target/{debug,release} 回退)。 -->
+    <None Include="runtimes/**/*"
+          Pack="true"
+          PackagePath="runtimes/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>

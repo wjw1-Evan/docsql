@@ -9,7 +9,7 @@ DocSQL 能力的完整清单与索引入口。语法细节见 [SQL 参考](sql-r
 | 形态 | 说明 |
 |---|---|
 | Docker 单节点 | 一个 `docsql-server` 容器 + 可选 `docsql-web` 控制台;命名卷持久化 |
-| **嵌入式(SQLite 式,无容器)** | `docsql-core` 引擎库进程内嵌入(Rust `Database::open` / `:memory:`);`docsql-cli <file.db>` 单文件直开;**`.NET` `Data Source=app.db` 进程内嵌入**(`crates/docsql-ffi` C ABI + Releases 原生库,ADO.NET/EF 全能力、零守护);单二进制 `docsql-server` 本地裸跑供多客户端/远程形态。同一数据文件同一时刻归属一个进程(进程内多连接共享引擎,见[已知边界](limitations.md)) |
+| **嵌入式(SQLite 式,无容器)** | `docsql-core` 引擎库进程内嵌入(Rust `Database::open` / `:memory:`);`docsql-cli <file.db>` 单文件直开;**`.NET` `Data Source=app.db` 进程内嵌入**(`crates/docsql-ffi` C ABI + NuGet 包内置原生库(Releases 归档备用),ADO.NET/EF 全能力、零守护);单二进制 `docsql-server` 本地裸跑供多客户端/远程形态。同一数据文件同一时刻归属一个进程(进程内多连接共享引擎,见[已知边界](limitations.md)) |
 | 对等集群 | `DOCSQL_PEERS` 互扇出,任意节点可读写;写入自动复制到全部对等节点 |
 | 主从复制 | `DOCSQL_REPLICATE_TO` 指向主节点,副本只读,主写自动转发 |
 | 只读副本 / 提升 | `DOCSQL_READ_ONLY=1` 整节点只读;`PROMOTE`(协议帧/CLI/控制台)清除只读 |

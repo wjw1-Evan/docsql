@@ -21,6 +21,67 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Fetch embedded native libraries (Releases)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # release-binaries runs in parallel on the same tag: wait for its
+          # five native assets before packing. A managed-only package would
+          # silently break "dotnet add package → Data Source=app.db".
+          for i in $(seq 1 60); do
+            have=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '[.assets[].name | select(startswith("docsql-native-"))] | length' \
+              2>/dev/null || echo 0)
+            if [ "$have" -ge 5 ]; then break; fi
+            echo "waiting for native release assets ($have/5)…"
+            sleep 30
+          done
+          rm -rf native && mkdir -p native
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'docsql-native-*' --dir native
+          python3 - <<'PY'
+          import glob, os, tarfile, zipfile
+
+          # Rust target triple → .NET runtime identifier. The client's
+          # DllImport resolver looks in runtimes/<rid>/native/, so the
+          # payload must land under exactly these names.
+          rids = {
+              "x86_64-unknown-linux-gnu": "linux-x64",
+              "aarch64-unknown-linux-gnu": "linux-arm64",
+              "aarch64-apple-darwin": "osx-arm64",
+              "x86_64-apple-darwin": "osx-x64",
+              "x86_64-pc-windows-msvc": "win-x64",
+          }
+          dest_root = "dotnet/Docsql.Client/runtimes"
+          packed = []
+          for path in sorted(glob.glob("native/*")):
+              name = os.path.basename(path)
+              target = next(
+                  (t for t in rids if name.endswith(f"-{t}.tar.gz") or name.endswith(f"-{t}.zip")),
+                  None,
+              )
+              if target is None:
+                  print(f"skip unrecognized asset: {name}")
+                  continue
+              out = os.path.join(dest_root, rids[target], "native")
+              os.makedirs(out, exist_ok=True)
+              if name.endswith(".zip"):
+                  with zipfile.ZipFile(path) as z:
+                      z.extractall(out)
+              else:
+                  with tarfile.open(path) as t:
+                      t.extractall(out)
+              packed.append(rids[target])
+              print(f"packed {rids[target]}: {sorted(os.listdir(out))}")
+          missing = sorted(set(rids.values()) - set(packed))
+          if missing:
+              raise SystemExit(f"missing native libraries for: {missing}")
+          PY
+
       - name: Pack
         run: |
           dotnet pack dotnet/Docsql.Client/Docsql.Client.csproj -c Release -o out

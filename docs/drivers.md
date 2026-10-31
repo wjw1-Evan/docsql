@@ -326,7 +326,10 @@ using var mem = new DocsqlConnection("Data Source=:memory:");
 - **能力**:全部 SQL(DDL/DML/JOIN/聚合/窗口/约束/触发器)、事务(SAVEPOINT)、
   prepared 路径与参数化 —— 参数渲染复用 `docsql_core::bind`(与 server 同一份实现,
   注入面不复制);DECIMAL/BLOB/TIMESTAMP 走与线协议相同的 `$dec`/`$bytes`/`$ts` 标记;
-- **原生库获取**:GitHub Releases 的 `docsql-native-<版本>-<平台>.tar.gz/.zip`;
+- **原生库获取**:NuGet 包 `Docsql.Client` 已内置各平台原生库
+  (`runtimes/<rid>/native/`,linux-x64/linux-arm64/osx-x64/osx-arm64/win-x64)——
+  `dotnet add package Docsql.Client` 后直接 `Data Source=app.db`,无需手动放置;
+  不走 NuGet 时用 GitHub Releases 的 `docsql-native-<版本>-<平台>.tar.gz/.zip`。
   加载顺序:`DOCSQL_EMBEDDED_NATIVE`(完整路径)→ 应用目录 `runtimes/<rid>/native/`
   → 应用目录 → 仓库 `target/{debug,release}`(开发/测试用)。缺库抛
   `DocsqlException`,消息里带放置指引与 ABI 版本约定;

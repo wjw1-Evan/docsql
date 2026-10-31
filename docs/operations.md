@@ -52,7 +52,7 @@ docsql-cli todos.db -f init.sql --json
 ```
 
 .NET 的零守护形态不需要 server:连接串写 `Data Source=app.db` 即在应用进程内起引擎
-(原生库随 Releases 下发;用法与边界见[客户端与驱动 · 嵌入式模式](drivers.md#嵌入式模式data-source进程内引擎))。
+(原生库随 NuGet 包下发,Releases 归档备用;用法与边界见[客户端与驱动 · 嵌入式模式](drivers.md#嵌入式模式data-source进程内引擎))。
 
 - `DOCSQL_*` 环境变量与容器运行完全同形(见[环境变量(运维相关)](#环境变量运维相关)一节);备份、审计、
   TLS、pub/sub 等能力一致;

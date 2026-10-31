@@ -6,6 +6,13 @@
 ## [Unreleased]
 
 ### 新功能
+- **NuGet 包内置嵌入式原生库(引用即用)**:`Docsql.Client` 的 nupkg 现在携带
+  `runtimes/<rid>/native/`(linux-x64/linux-arm64/osx-x64/osx-arm64/win-x64)——
+  `dotnet add package Docsql.Client` 之后连接串写 `Data Source=app.db` 即可,不再需要
+  从 Releases 手动下载 `.so/.dylib/.dll`。发布流水线(`nuget-publish.yml`)等同一 tag 的
+  `release-binaries` 资产就绪后按 RID 解包进包(缺任一平台即失败);已用真实 nupkg
+  在仓库外的空控制台工程验证:建表/写入/查询全部走进程内引擎,原生库从包内解析。
+  不走 NuGet 的部署仍可用 Releases 归档或 `DOCSQL_EMBEDDED_NATIVE`。
 - **跨数据库直接切换**:方言兼容面补齐 PostgreSQL `SERIAL`/`BIGSERIAL`/
   `GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY`(折叠为 `AUTOINCREMENT`,
   不再静默插 NULL)与 Oracle 裸 `SYSDATE`(重写为 `NOW()`,复用写路径墙钟折叠);Oracle

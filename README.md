@@ -85,7 +85,11 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 | `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` | 静态 glibc(glibc 2.38 配方,与 GHCR scratch 镜像逐字节同源);Windows 走 WSL 或容器 |
 | `aarch64-apple-darwin` / `x86_64-apple-darwin` | 原生构建 |
 
-.NET 嵌入式(`Data Source=…`)所需原生库单独发布:**`docsql-native-<版本>-<平台>.tar.gz` / `.zip`**(Linux `.so`、macOS `.dylib`、Windows `.dll`),放到应用目录、`runtimes/<rid>/native/` 或由 `DOCSQL_EMBEDDED_NATIVE` 指定。Rust 库 `docsql-core` 另发布到 crates.io(流程见[贡献指南](CONTRIBUTING.md))。
+.NET 嵌入式(`Data Source=…`)所需原生库随 **NuGet 包内置**:`Docsql.Client` 的 nupkg 携带
+`runtimes/<rid>/native/`(linux-x64/linux-arm64/osx-x64/osx-arm64/win-x64),`dotnet add package`
+之后连接串写 `Data Source=app.db` 即可,无需手动下载。不走 NuGet 的部署仍可用 Releases 的
+**`docsql-native-<版本>-<平台>.tar.gz` / `.zip`**(Linux `.so`、macOS `.dylib`、Windows `.dll`),
+放到应用目录或由 `DOCSQL_EMBEDDED_NATIVE` 指定。Rust 库 `docsql-core` 另发布到 crates.io(流程见[贡献指南](CONTRIBUTING.md))。
 
 ## 文档导航
 

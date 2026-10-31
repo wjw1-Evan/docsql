@@ -25,6 +25,11 @@ while (await reader.ReadAsync()) { /* ... */ }
 ```
 
 - 命令面:完整 SQL(DDL/DML/JOIN/聚合/事务/SAVEPOINT/RETURNING)、`RETURNING` 子句、GUID/UUIDv7 自动主键
+- **嵌入式(零守护,SQLite 式)**:连接串写 `Data Source=app.db`(或 `:memory:`)即在
+  当前进程内跑引擎 —— 无 server、无端口、无 Docker。包内自带各平台原生库
+  (`runtimes/<rid>/native/`:linux-x64/linux-arm64/osx-x64/osx-arm64/win-x64),
+  `dotnet add package` 后即可用;EF Core 侧对应 `UseDocsql("Data Source=app.db")`。
+  数据文件同一时刻归属一个进程(跨进程/跨机并发用 `host=…;port=…` 的 server 形态)
 - 真 async:`OpenAsync`/`ExecuteReaderAsync`/`ExecuteNonQueryAsync`/`ExecuteScalarAsync`/`CommitAsync`/`SaveAsync` 全链路异步 IO(不占线程)
 - 事务:`BeginDbTransaction` 映射 BEGIN/COMMIT/ROLLBACK;`Save`/`Rollback(name)`/`Release(name)` 暴露保存点(引擎语义:ROLLBACK TO 会把命名保存点自身丢弃)
 - 认证:协议 token(`token=`)或数据库用户(`user=`/`password=`)二选一

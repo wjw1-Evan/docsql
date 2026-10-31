@@ -1,6 +1,6 @@
 # 设计说明:.NET 嵌入式模式(零守护进程的 SQLite 式体验)
 
-状态:**阶段 0 + 阶段 1(v1)已实施**(`crates/docsql-ffi` C ABI + .NET `Data Source=…` 进程内引擎;原生库随 GitHub Releases 分发)。剩余:原生库的 NuGet `runtime-*` 资产包(当前由 Releases 归档手动放置)、体验收口。回应的方向:「数据应能像
+状态:**阶段 0 + 阶段 1(v1)已实施**(`crates/docsql-ffi` C ABI + .NET `Data Source=…` 进程内引擎;原生库随 GitHub Releases 分发,**并已打进 NuGet 包** `runtimes/<rid>/native/`)。剩余:体验收口(嵌入式 perf 基线)。回应的方向:「数据应能像
 SQLite 一样快速在项目里用,不依赖 Docker」。Rust 侧与 CLI 侧的嵌入式已交付
 (`docsql-core` 库 / `docsql-cli <file.db>`,见 README「无 Docker 快速开始」);
 本文给出 **.NET 栈**的方案矩阵、红线核对、推荐路线与实施记录。
@@ -55,11 +55,15 @@ SQLite 一样快速在项目里用,不依赖 Docker」。Rust 侧与 CLI 侧的�
    抽出 `IProtocolSession` 接缝,`EmbeddedSession` 以同一 `Frame` 语义桥接原生引擎
    (SQL/Prepare/Execute/CloseStmt/Ping;其余帧响亮报错);原生库发现顺序
    `DOCSQL_EMBEDDED_NATIVE` → `runtimes/<rid>/native/` → 应用目录 → 仓库 `target/{debug,release}`;
-   EF 与 ADO.NET 全链路复用现有对象模型(零分支)。**待办**:把原生库打进 NuGet
-   `runtime-*` 资产包(当前:Releases 归档手动放置)。
+   EF 与 ADO.NET 全链路复用现有对象模型(零分支)。原生库已随包分发:
+   `nuget-publish.yml` 等同一 tag 的 release-binaries 资产就绪后,把五个平台的
+   `docsql-native-*` 解到 `dotnet/Docsql.Client/runtimes/<rid>/native/`,
+   `Docsql.Client.csproj` 以 `PackagePath="runtimes/%(RecursiveDir)…"` 打进 nupkg ——
+   `dotnet add package` 后 `Data Source=app.db` 开箱可用(本地已用真实 nupkg 验证)。
 4. **阶段 2 · 体验收口(部分)**:`:memory:` 已支持;三平台原生库进 release-binaries
    (Linux `.so` / macOS `.dylib` / Windows `.dll`)与 dotnet CI 原生构建已接入;
-   待办:全自动「包内资产」与嵌入式 perf 基线。
+   包内资产已自动化(`nuget-publish.yml` 拉取同 tag 资产并按 RID 打进 nupkg);
+   待办:嵌入式 perf 基线。
 
 ## 4. 红线核对表(改代码前再看一遍)
 
@@ -92,9 +96,8 @@ SQLite 一样快速在项目里用,不依赖 Docker」。Rust 侧与 CLI 侧的�
 | 并发 | 同上 | 进程级注册表(规范化路径 → 单一引擎);读 = `read_view()` 微秒锁取快照后 `ReadView::execute` 锁外跑(不阻塞写);写 = 守门 Mutex(owner 令牌)+ `db.write()`;事务开启期间读级让位(与 server `classify_read_eligible` 同规) |
 | .NET | `dotnet/Docsql.Client/Embedded.cs` + `AdoNet.cs`/`Protocol.cs` 的 `IProtocolSession` 接缝 | `Data Source=…`/`:memory:`;嵌入式合成与线协议**同一套 Frame**(RespRows/RespAffected/RespError/RespPrepared),命令/读取/事务路径零分支;原生库发现:env → `runtimes/<rid>/native` → 应用目录 → 仓库 `target/{debug,release}`;ABI 版本不匹配显式拒绝 |
 | 测试 | `docsql-ffi` 7 例 + `Docsql.Client.Tests/EmbeddedModeTests.cs` 12 例 + `Docsql.EntityFrameworkCore.Tests/EmbeddedEfTests.cs` 5 例 | 覆盖 CRUD/参数注入(值恒为数据)/共享文件/`:memory:` 隔离/事务提交回滚与守门超时/prepared 复用/`$dec`+`$bytes`+`$ts` 往返/EF 懒建表与回滚 |
-| CI/分发 | `docker-image.yml` dotnet job 前置 `cargo build -p docsql-ffi`;`release-binaries.yml` 各平台追加 `docsql-native-<版本>-<平台>.tar.gz`(Linux/macOS)与 Windows `.zip` | 原生库与三二进制同一 tag 发布,`SHA256SUMS` 统一校验 |
+| CI/分发 | `docker-image.yml` dotnet job 前置 `cargo build -p docsql-ffi`;`release-binaries.yml` 各平台追加 `docsql-native-<版本>-<平台>.tar.gz`(Linux/macOS)与 Windows `.zip`;`nuget-publish.yml` 等资产就绪后按 RID 打进 `Docsql.Client` nupkg | 原生库与三二进制同一 tag 发布,`SHA256SUMS` 统一校验;NuGet 用户开箱可用 |
 
-**仍未做(诚实清单)**:原生库的 NuGet `runtime-*` 资产包(现在从 Releases 归档
-手动放置,或 `DOCSQL_EMBEDDED_NATIVE`);T-SQL 批会话变量与 pub/sub 在嵌入态按
+**仍未做(诚实清单)**:T-SQL 批会话变量与 pub/sub 在嵌入态按
 非目标处理(响亮报错);`docsql-ffi` 无跨进程文件锁(与存储家规一致);嵌入式 perf
 基线待补。
