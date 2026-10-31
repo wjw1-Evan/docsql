@@ -73,7 +73,7 @@ BEGIN ... END;                               -- × INSERT/UPDATE [OF cols]/DELET
 DROP TRIGGER [IF EXISTS] tg;
 ```
 
-- 表级 `PRIMARY KEY` / `UNIQUE`(仅单列,复合请用 `CREATE UNIQUE INDEX`)/ `CHECK` / `FOREIGN KEY` 支持;`AUTOINCREMENT`/`AUTO_INCREMENT`;
+- 表级 `PRIMARY KEY` / `UNIQUE`(仅单列,复合请用 `CREATE UNIQUE INDEX`)/ `CHECK` / `FOREIGN KEY`(含 `ON DELETE`/`ON UPDATE` 引用动作:CASCADE/SET NULL/SET DEFAULT,传递级联;无动作 = 拒绝式)支持;`AUTOINCREMENT`/`AUTO_INCREMENT`;
 - PK 与表声明 UNIQUE 的 B+ 树**随建表自动创建**(`sqlite_autoindex_<表>_<n>`,派生展示);
 - `ADD COLUMN` 不支持 PK/UNIQUE/FK/自增;物化视图不可写(REFRESH 重算)、不可嵌套物化视图(显式报错);
 - `CREATE TABLE ... INHERITS`/`WITHOUT ROWID` 等存储布局子句与 `DEFERRABLE`/`NULLS NOT DISTINCT`/`MATCH FULL` 等约束装饰显式报错,不静默忽略;

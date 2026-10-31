@@ -883,7 +883,11 @@ impl Database {
                         // pages and be overwritten when the outer statement
                         // commits. Reads stay legal (they see the committed
                         // pre-statement state deterministically, origin and
-                        // replays alike).
+                        // replays alike). Widened for referential actions:
+                        // a cascading statement rewrites EVERY table in its
+                        // plan from pre-computed deltas, so a body write to
+                        // any of them would be silently clobbered by that
+                        // rewrite.
                         if let Some(t) = trigger_dml_target(&stmt) {
                             if t == firing_table {
                                 return err(format!(
@@ -891,6 +895,15 @@ impl Database {
                                      statement on {t} is in progress (split the write onto a \
                                      second table)"
                                 ));
+                            }
+                            if let Some(guarded) = &self.referential_guard {
+                                if guarded.contains(&t) {
+                                    return err(format!(
+                                        "cannot modify table {t} from a trigger while a \
+                                         referential-action statement is rewriting it (split \
+                                         the write onto a second table)"
+                                    ));
+                                }
                             }
                         }
                         subst_new_old_stmt(&mut stmt, old, new)?;

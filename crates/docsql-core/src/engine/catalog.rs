@@ -267,18 +267,37 @@ impl Database {
                                 Some(Value::Array(a)) => a
                                     .iter()
                                     .filter_map(|x| match x {
-                                        Value::Array(t) => match (
-                                            t.first().and_then(|v| v.as_str()),
-                                            t.get(1).and_then(|v| v.as_str()),
-                                            t.get(2).and_then(|v| v.as_str()),
-                                        ) {
-                                            (Some(c), Some(rt), Some(rc)) => Some((
-                                                c.to_string(),
-                                                rt.to_string(),
-                                                rc.to_string(),
-                                            )),
-                                            _ => None,
-                                        },
+                                        // First three elements are the mandatory
+                                        // (column, ref_table, ref_col) triple the
+                                        // engine has always written. Elements 4/5
+                                        // carry `ON DELETE` / `ON UPDATE` actions,
+                                        // written only when non-default; older
+                                        // catalogs decode as `FkAction::None`.
+                                        Value::Array(t) => {
+                                            let (c, rt, rc) = (
+                                                t.first().and_then(|v| v.as_str()),
+                                                t.get(1).and_then(|v| v.as_str()),
+                                                t.get(2).and_then(|v| v.as_str()),
+                                            );
+                                            match (c, rt, rc) {
+                                                (Some(c), Some(rt), Some(rc)) => Some(FkRef {
+                                                    col: c.to_string(),
+                                                    ref_table: rt.to_string(),
+                                                    ref_col: rc.to_string(),
+                                                    on_delete: t
+                                                        .get(3)
+                                                        .and_then(|v| v.as_str())
+                                                        .map(fk_action_from_text)
+                                                        .unwrap_or(FkAction::None),
+                                                    on_update: t
+                                                        .get(4)
+                                                        .and_then(|v| v.as_str())
+                                                        .map(fk_action_from_text)
+                                                        .unwrap_or(FkAction::None),
+                                                }),
+                                                _ => None,
+                                            }
+                                        }
                                         _ => None,
                                     })
                                     .collect(),
@@ -385,6 +404,7 @@ impl Database {
             tables,
             triggers,
             trigger_depth: 0,
+            referential_guard: None,
             async_commit: false,
             pending_sync: false,
             write_unit: 0,
@@ -520,12 +540,24 @@ impl Database {
                     Value::Array(
                         meta.foreign_keys
                             .iter()
-                            .map(|(c, rt, rc)| {
-                                Value::Array(vec![
-                                    Value::Str(c.clone()),
-                                    Value::Str(rt.clone()),
-                                    Value::Str(rc.clone()),
-                                ])
+                            .map(|fk| {
+                                // Triple first (the shape every binary has
+                                // decoded), then the action slots only when
+                                // either side is non-default — old binaries
+                                // read the prefix and ignore the rest. Both
+                                // slots are written together so the DELETE
+                                // / UPDATE positions stay unambiguous.
+                                let mut entry = vec![
+                                    Value::Str(fk.col.clone()),
+                                    Value::Str(fk.ref_table.clone()),
+                                    Value::Str(fk.ref_col.clone()),
+                                ];
+                                if fk.on_delete != FkAction::None || fk.on_update != FkAction::None
+                                {
+                                    entry.push(Value::Str(fk_action_text(fk.on_delete)));
+                                    entry.push(Value::Str(fk_action_text(fk.on_update)));
+                                }
+                                Value::Array(entry)
                             })
                             .collect(),
                     ),

@@ -1011,17 +1011,18 @@ impl Database {
             // (`VALUES (1,1) ON CONFLICT (id) DO UPDATE SET id = 3, p = 1`).
             // Plain INSERT keeps `None`: nothing is replaced, so same_batch
             // plus the pre-state heap is already the final state.
-            let self_final: Option<Vec<Object>> =
-                if !updated.is_empty() && meta.foreign_keys.iter().any(|(_, rt, _)| rt == &table) {
-                    let old_keys: std::collections::BTreeSet<Vec<u8>> =
-                        updated.iter().map(|(_, o, _)| object_key(o)).collect();
-                    let mut final_state = self.table_docs_cx(&table)?;
-                    final_state.retain(|d| !old_keys.contains(&object_key(d)));
-                    final_state.extend(final_docs.iter().cloned());
-                    Some(final_state)
-                } else {
-                    None
-                };
+            let self_final: Option<Vec<Object>> = if !updated.is_empty()
+                && meta.foreign_keys.iter().any(|fk| fk.ref_table == table)
+            {
+                let old_keys: std::collections::BTreeSet<Vec<u8>> =
+                    updated.iter().map(|(_, o, _)| object_key(o)).collect();
+                let mut final_state = self.table_docs_cx(&table)?;
+                final_state.retain(|d| !old_keys.contains(&object_key(d)));
+                final_state.extend(final_docs.iter().cloned());
+                Some(final_state)
+            } else {
+                None
+            };
             for doc in &final_docs {
                 // A big INSERT ... SELECT walks this per placed row: keep the
                 // statement timeout armed like every other row loop.
@@ -1041,7 +1042,7 @@ impl Database {
         // belong to OTHER tables, which do not care whether the target
         // declares FKs of its own.
         if !updated.is_empty() {
-            let has_self_fk = meta.foreign_keys.iter().any(|(_, rt, _)| rt == &table);
+            let has_self_fk = meta.foreign_keys.iter().any(|fk| fk.ref_table == table);
             let self_final: Option<Vec<Object>> = if has_self_fk {
                 let old_keys: std::collections::BTreeSet<Vec<u8>> =
                     updated.iter().map(|(_, o, _)| object_key(o)).collect();

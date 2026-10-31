@@ -8533,3 +8533,48 @@ async fn stale_primary_demotes_on_higher_epoch() {
     let r = cb.sql("CREATE TABLE q (id INT)").await;
     assert_eq!(r.frame_type, proto::RESP_AFFECTED, "{}", payload_str(&r));
 }
+
+/// Referential actions over a fan-out cluster: the origin executes the
+/// cascading DELETE through its engine; peers replay the same statement
+/// text through the same engine path and fire the same cascade — the
+/// cascaded rows vanish everywhere and digests converge. The actions are a
+/// pure function of the pre-statement data (deterministic replay contract),
+/// so no action-specific wire frames are needed.
+#[tokio::test]
+async fn fk_cascade_delete_replicates_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        format!("127.0.0.1:{p}")
+    };
+    let (a, b) = (free(), free());
+    spawn_node(&dir, "fkpeer0", &a, vec![b.clone()], None).await;
+    spawn_node(&dir, "fkpeer1", &b, vec![a.clone()], None).await;
+
+    let mut n0 = Client::connect(&a).await;
+    n0.sql("CREATE TABLE p (id INT PRIMARY KEY)").await;
+    n0.sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE)",
+    )
+    .await;
+    n0.sql("INSERT INTO p VALUES (1), (2)").await;
+    n0.sql("INSERT INTO c VALUES (10, 1), (11, 2)").await;
+    assert!(
+        wait_seen(&b, "SELECT id FROM c ORDER BY id", "[[10],[11]]").await,
+        "peer did not receive the seed data"
+    );
+
+    let resp = n0.sql("DELETE FROM p WHERE id = 1").await;
+    assert_eq!(resp.frame_type, proto::RESP_AFFECTED);
+    assert!(
+        wait_seen(&b, "SELECT id FROM c ORDER BY id", "[[11]]").await,
+        "peer's cascade diverged from the origin"
+    );
+    assert!(
+        wait_seen(&b, "SELECT COUNT(*) FROM p", "[[1]]").await,
+        "peer did not apply the parent delete"
+    );
+}

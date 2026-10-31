@@ -31,6 +31,7 @@ SQL Server / MySQL / PostgreSQL / SQLite / Oracle 方言的 schema+数据导入�
 
 | 差异点 | 行为 |
 |---|---|
+| 外键引用动作 `ON DELETE\|ON UPDATE CASCADE/SET NULL/SET DEFAULT` | 直接可用(级联/置空/置默认,传递闭包;RESTRICT/NO ACTION = 默认拒绝);MERGE 与 `INSERT … ON CONFLICT DO UPDATE` 暂不展开动作(子行引用被移除父键时报 FOREIGN KEY 错) |
 | SQL Server `IDENTITY(1,1)` | 折叠为 `AUTOINCREMENT`;其它 seed/increment **显式报错**(静默改号不可接受) |
 | `SET IDENTITY_INSERT … ON\|OFF` | 兼容空操作(显式主键本就允许写入,下一个自增值 = max+1) |
 | schema 前缀(`[dbo].[T]` / `dbo.T`) | 按点号表名原样保留(`dbo.T` 就是一张表名带点的表),引号/方括号/裸名三种写法等价 |

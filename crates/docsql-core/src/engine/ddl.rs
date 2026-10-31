@@ -507,21 +507,22 @@ impl Database {
                             .tables
                             .iter()
                             .filter(|(_, m)| {
-                                m.foreign_keys.iter().any(|(_, rt, rc)| {
-                                    if rt != tname {
+                                m.foreign_keys.iter().any(|fk| {
+                                    if fk.ref_table != tname {
                                         return false;
                                     }
                                     // Match under the rc spelling the apply
                                     // loop will have produced by the time
                                     // this DROP runs (renames earlier in the
                                     // same statement rewrote it).
-                                    let evolved = renamed.iter().fold(rc.clone(), |cur, (o, n)| {
-                                        if cur == *o {
-                                            n.clone()
-                                        } else {
-                                            cur
-                                        }
-                                    });
+                                    let evolved =
+                                        renamed.iter().fold(fk.ref_col.clone(), |cur, (o, n)| {
+                                            if cur == *o {
+                                                n.clone()
+                                            } else {
+                                                cur
+                                            }
+                                        });
                                     evolved == *name
                                 })
                             })
@@ -847,7 +848,7 @@ impl Database {
                             .filter(|(_, m)| {
                                 m.foreign_keys
                                     .iter()
-                                    .any(|(_, rt, rc)| rt == &tname && rc == &name)
+                                    .any(|fk| fk.ref_table == tname && fk.ref_col == name)
                             })
                             .map(|(t, _)| t.clone())
                             .collect();
@@ -862,7 +863,7 @@ impl Database {
                         meta.constraint_unique.retain(|c| c != &name);
                         meta.not_null.retain(|c| c != &name);
                         meta.defaults.retain(|(c, _)| c != &name);
-                        meta.foreign_keys.retain(|(c, _, _)| c != &name);
+                        meta.foreign_keys.retain(|fk| fk.col != name);
                         if let Some(root) = meta.index_roots.remove(&name) {
                             // Capture the tree BEFORE dropping it from the
                             // map: the rebuild below only frees trees still
@@ -1024,16 +1025,20 @@ impl Database {
                     meta.foreign_keys = meta
                         .foreign_keys
                         .iter()
-                        .map(|(c, rt, rc)| {
-                            (
-                                if c == old { new.clone() } else { c.clone() },
-                                rt.clone(),
-                                if rt == &tname && rc == old {
-                                    new.clone()
-                                } else {
-                                    rc.clone()
-                                },
-                            )
+                        .map(|fk| FkRef {
+                            col: if fk.col == *old {
+                                new.clone()
+                            } else {
+                                fk.col.clone()
+                            },
+                            ref_table: fk.ref_table.clone(),
+                            ref_col: if fk.ref_table == tname && fk.ref_col == *old {
+                                new.clone()
+                            } else {
+                                fk.ref_col.clone()
+                            },
+                            on_delete: fk.on_delete,
+                            on_update: fk.on_update,
                         })
                         .collect();
                     // CHECK texts reference the old column name; leaving them
@@ -1069,7 +1074,7 @@ impl Database {
                             n.as_str() != tname.as_str()
                                 && m.foreign_keys
                                     .iter()
-                                    .any(|(_, rt, rc)| rt == &tname && rc == old)
+                                    .any(|fk| fk.ref_table == tname && fk.ref_col == *old)
                         })
                         .map(|(n, _)| n.clone())
                         .collect();
@@ -1086,9 +1091,9 @@ impl Database {
                         for name in referrers {
                             if let Some(entry) = self.tables.get_mut(&name) {
                                 let m = std::sync::Arc::make_mut(entry);
-                                for (_, rt, rc) in m.foreign_keys.iter_mut() {
-                                    if rt == &tname && rc == old {
-                                        *rc = new.clone();
+                                for fk in m.foreign_keys.iter_mut() {
+                                    if fk.ref_table == tname && fk.ref_col == *old {
+                                        fk.ref_col = new.clone();
                                     }
                                 }
                             }
@@ -1117,9 +1122,9 @@ impl Database {
                     // errors keep naming the table users actually see.
                     meta.name = new_name.clone();
                     // 自引用外键的 rt 跟随新名(与其它引用方一并改写)。
-                    for (_, rt, _) in meta.foreign_keys.iter_mut() {
-                        if *rt == tname {
-                            *rt = new_name.clone();
+                    for fk in meta.foreign_keys.iter_mut() {
+                        if fk.ref_table == tname {
+                            fk.ref_table = new_name.clone();
                         }
                     }
                     self.tables.remove(&tname);
@@ -1186,7 +1191,7 @@ impl Database {
                     let referrers: Vec<String> = self
                         .tables
                         .iter()
-                        .filter(|(_, m)| m.foreign_keys.iter().any(|(_, rt, _)| rt == &tname))
+                        .filter(|(_, m)| m.foreign_keys.iter().any(|fk| fk.ref_table == tname))
                         .map(|(n, _)| n.clone())
                         .collect();
                     // Snapshot first: a failed catalog save must restore the
@@ -1199,9 +1204,9 @@ impl Database {
                     for name in referrers {
                         if let Some(m) = self.tables.get_mut(&name) {
                             let m = std::sync::Arc::make_mut(m);
-                            for (_, rt, _) in m.foreign_keys.iter_mut() {
-                                if *rt == tname {
-                                    *rt = new_name.clone();
+                            for fk in m.foreign_keys.iter_mut() {
+                                if fk.ref_table == tname {
+                                    fk.ref_table = new_name.clone();
                                 }
                             }
                         }
@@ -1264,7 +1269,8 @@ impl Database {
         same_batch: &[Object],
         self_final: Option<&[Object]>,
     ) -> Result<()> {
-        for (col, rtable, rcol) in &meta.foreign_keys {
+        for fk in &meta.foreign_keys {
+            let (col, rtable, rcol) = (&fk.col, &fk.ref_table, &fk.ref_col);
             let Some(v) = doc.get(col) else {
                 continue;
             };
@@ -1336,8 +1342,8 @@ impl Database {
             .flat_map(|(child_name, m)| {
                 m.foreign_keys
                     .iter()
-                    .filter(|(_, rt, _)| rt == table)
-                    .map(|(c, _, rc)| (child_name.clone(), c.clone(), rc.clone()))
+                    .filter(|fk| fk.ref_table == table)
+                    .map(|fk| (child_name.clone(), fk.col.clone(), fk.ref_col.clone()))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1962,12 +1968,6 @@ impl Database {
                             None,
                             fk.match_kind.as_ref(),
                         )?;
-                        if fk.on_delete.is_some() || fk.on_update.is_some() {
-                            return err(
-                                "FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
-                                 (declare the constraint and keep parent keys stable)",
-                            );
-                        }
                         if fk.referred_columns.len() != 1 {
                             // Silently taking the first referred column
                             // quietly changed the constraint's meaning.
@@ -1982,7 +1982,13 @@ impl Database {
                         ) else {
                             return err("FOREIGN KEY requires a table and column");
                         };
-                        meta.foreign_keys.push((col.name.value.clone(), rt, rc));
+                        meta.foreign_keys.push(FkRef {
+                            col: col.name.value.clone(),
+                            ref_table: rt,
+                            ref_col: rc,
+                            on_delete: fk_action_of(fk.on_delete.as_ref()),
+                            on_update: fk_action_of(fk.on_update.as_ref()),
+                        });
                     }
                     CO::DialectSpecific(tokens) => {
                         let text = tokens
@@ -2091,10 +2097,6 @@ impl Database {
                         None,
                         fk.match_kind.as_ref(),
                     )?;
-                    if fk.on_delete.is_some() || fk.on_update.is_some() {
-                        return err("FOREIGN KEY ON DELETE/ON UPDATE actions are not supported \
-                             (declare the constraint and keep parent keys stable)");
-                    }
                     let Some(rt) = fk.foreign_table.0.last().map(|p| match p {
                         ObjectNamePart::Identifier(i) => i.value.clone(),
                         other => other.to_string(),
@@ -2122,8 +2124,13 @@ impl Database {
                         if !meta.columns.contains(&lc.value) {
                             return err(format!("FOREIGN KEY column {} does not exist", lc.value));
                         }
-                        meta.foreign_keys
-                            .push((lc.value.clone(), rt.clone(), rc.value.clone()));
+                        meta.foreign_keys.push(FkRef {
+                            col: lc.value.clone(),
+                            ref_table: rt.clone(),
+                            ref_col: rc.value.clone(),
+                            on_delete: fk_action_of(fk.on_delete.as_ref()),
+                            on_update: fk_action_of(fk.on_update.as_ref()),
+                        });
                     }
                 }
                 other => return err(format!("unsupported table constraint: {other}")),
@@ -2142,7 +2149,8 @@ impl Database {
         // parent exists, the referenced column must be one of its
         // declared columns — an undeclared field would silently match
         // nothing and every child write would fail the constraint.
-        for (fc, rt, rc) in &meta.foreign_keys {
+        for fk in &meta.foreign_keys {
+            let (fc, rt, rc) = (&fk.col, &fk.ref_table, &fk.ref_col);
             if rt == &name {
                 continue;
             }

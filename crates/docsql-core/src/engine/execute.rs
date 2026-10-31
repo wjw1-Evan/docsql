@@ -922,7 +922,7 @@ impl Database {
                         .filter(|(t, m)| {
                             t.as_str() != name.as_str()
                                 && !drop_set.contains(t.as_str())
-                                && m.foreign_keys.iter().any(|(_, rt, _)| rt == name)
+                                && m.foreign_keys.iter().any(|fk| fk.ref_table == *name)
                         })
                         .map(|(t, _)| t.clone())
                         .collect();
@@ -954,7 +954,7 @@ impl Database {
                     for child in &fk_removals {
                         if let Some(meta) = self.catalog_mut(child) {
                             meta.foreign_keys
-                                .retain(|(_, rt, _)| !drop_set.contains(rt.as_str()));
+                                .retain(|fk| !drop_set.contains(fk.ref_table.as_str()));
                         }
                     }
                     for name in &table_dropping {
@@ -1131,7 +1131,9 @@ impl Database {
                             .iter()
                             .filter(|(t, m)| {
                                 !targets.contains(t)
-                                    && m.foreign_keys.iter().any(|(_, rt, _)| targets.contains(rt))
+                                    && m.foreign_keys
+                                        .iter()
+                                        .any(|fk| targets.contains(&fk.ref_table))
                             })
                             .map(|(t, _)| t.clone())
                             .collect();
@@ -1238,7 +1240,12 @@ impl Database {
     pub(super) fn exec_stmt(&mut self, stmt: Statement) -> Result<ExecOutcome> {
         if self.trigger_depth == 0 {
             if let Some(t) = trigger_dml_target(&stmt) {
-                if self.triggers_exist_for(&t) {
+                // Referential actions join triggers under the statement
+                // guard: a cascading statement rewrites several tables in
+                // sequence (each rewrite its own pager tx), and a failure
+                // mid-plan must revert ALL of them — the guard's undo
+                // journal + catalog snapshot do exactly that.
+                if self.triggers_exist_for(&t) || self.referential_actions_reach(&t) {
                     return self.run_with_trigger_guard(move |slf| slf.exec_stmt_inner(stmt));
                 }
             }

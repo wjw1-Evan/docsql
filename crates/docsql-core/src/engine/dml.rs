@@ -72,7 +72,9 @@ impl Database {
 
         // Fast path: probe-able WHERE on an indexed column — update the
         // affected rows in place instead of rewriting the whole table.
-        if from.is_none() {
+        // Referential actions need the generic path (cascaded re-keys or
+        // set-null writes on child tables).
+        if from.is_none() && !self.referential_actions_reach(&tname) {
             if let Some(matches) =
                 self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &Ctes::new())?
             {
@@ -179,6 +181,20 @@ impl Database {
                 (out, changed_docs, old_changed, count)
             }
         };
+        // Referential actions (any transitively reachable FK declaring
+        // ON DELETE/ON UPDATE CASCADE / SET NULL / SET DEFAULT): the plain
+        // checks are replaced by the full multi-table plan — cascaded
+        // re-keys / set-null writes on child tables, restrict FKs still
+        // reject — and every table applies through the same rewrite
+        // machinery.
+        if self.referential_actions_reach(&tname) {
+            return self.exec_update_referential(
+                &tname,
+                old_changed,
+                changed_docs,
+                &update_returning,
+            );
+        }
         // Validate BEFORE writing: a failed UPDATE must not change data.
         // 自引用 FK 的父候选是本语句的最终像集合(不只是表里的旧像)。
         for doc in &out {
@@ -281,7 +297,7 @@ impl Database {
         // statement vacates (`SET id = 3, p = 1 WHERE id = 1`). Only
         // self-FK tables pay the extra table load.
         let self_final: Option<Vec<Object>> =
-            if meta.foreign_keys.iter().any(|(_, rt, _)| rt == &tname) {
+            if meta.foreign_keys.iter().any(|fk| fk.ref_table == tname) {
                 let old_keys: std::collections::BTreeSet<Vec<u8>> =
                     updates.iter().map(|(_, o, _)| object_key(o)).collect();
                 let mut final_state = self.table_docs_cx(&tname)?;
@@ -554,8 +570,10 @@ impl Database {
             .unwrap_or_default();
         // Fast path: probe-able WHERE on an indexed column — remove the
         // matching rows in place (page re-pack) instead of rewriting the
-        // whole table.
-        if using.is_none() {
+        // whole table. Referential actions need the generic path: the
+        // statement may rewrite OTHER tables (cascade/set-null), which the
+        // in-place fast path cannot do.
+        if using.is_none() && !self.referential_actions_reach(&tname) {
             if let Some(matches) =
                 self.index_probe_cx(&tname, Some(tkey.as_str()), &selection, &Ctes::new())?
             {
@@ -601,6 +619,14 @@ impl Database {
             (kept, removed)
         };
         let count = removed.len() as u64;
+        // Referential actions (any transitively reachable FK declaring
+        // ON DELETE/ON UPDATE CASCADE / SET NULL / SET DEFAULT): the plain
+        // restrict check is replaced by the full multi-table plan — actions
+        // delete/update the referencing child rows, restrict FKs still
+        // reject, and everything applies through the same rewrite machinery.
+        if self.referential_actions_reach(&tname) {
+            return self.exec_delete_referential(&tname, removed, &returning);
+        }
         // The self-reference child scan runs over the FINAL state (`kept`):
         // rows deleted by this same statement cannot end up orphaned, so
         // `DELETE FROM self_ref_table` may clear parent and child rows
@@ -652,7 +678,7 @@ impl Database {
         // statement is legal; only self-FK tables pay the extra table load.
         let removed_docs: Vec<Object> = targets.iter().map(|(_, d)| d.clone()).collect();
         let self_final: Option<Vec<Object>> =
-            if meta.foreign_keys.iter().any(|(_, rt, _)| rt == &tname) {
+            if meta.foreign_keys.iter().any(|fk| fk.ref_table == tname) {
                 let rm: std::collections::BTreeSet<Vec<u8>> =
                     targets.iter().map(|(_, d)| object_key(d)).collect();
                 Some(

@@ -475,7 +475,8 @@ impl Database {
             // EXACTLY the final images — `check_fks_in`'s same_batch is only
             // an ADDITIONAL parent source, so the pre-state heap would still
             // satisfy values this very statement removes.
-            for (col, rtable, rcol) in &meta.foreign_keys {
+            for fk in &meta.foreign_keys {
+                let (col, rtable, rcol) = (&fk.col, &fk.ref_table, &fk.ref_col);
                 for doc in updates
                     .iter()
                     .map(|(_, _, n)| n)

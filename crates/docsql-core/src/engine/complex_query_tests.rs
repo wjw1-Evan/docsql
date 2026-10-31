@@ -2153,3 +2153,371 @@ fn cte_qualified_projection_stays_bare_named() {
     );
     assert_eq!(r.rows, vec![vec![Value::Int(2), Value::Str("p2".into())]]);
 }
+
+// ---- FOREIGN KEY referential actions (ON DELETE / ON UPDATE) ------------
+
+/// Cascade chain: grandparent ← parent ← grandchild, all ON DELETE CASCADE.
+/// One DELETE on the top clears every level, child delete triggers fire,
+/// and RETURNING stays scoped to the statement's own table.
+#[test]
+fn fk_on_delete_cascade_clears_transitive_chain() {
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE gp (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE p (id INT PRIMARY KEY, gpid INT, \
+             FOREIGN KEY (gpid) REFERENCES gp (id) ON DELETE CASCADE)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE)",
+    );
+    run(&mut db, "CREATE TABLE audit (tag TEXT)");
+    run(
+        &mut db,
+        "CREATE TRIGGER c_del AFTER DELETE ON c BEGIN \
+             INSERT INTO audit VALUES ('c deleted'); END",
+    );
+    run(&mut db, "INSERT INTO gp VALUES (1), (2)");
+    run(&mut db, "INSERT INTO p VALUES (10, 1), (11, 2)");
+    run(
+        &mut db,
+        "INSERT INTO c VALUES (100, 10), (101, 11), (102, 10)",
+    );
+    let out = run(&mut db, "DELETE FROM gp WHERE id = 1");
+    assert_eq!(
+        out,
+        ExecOutcome::Affected(1),
+        "RETURNING counts origin rows only"
+    );
+    let r = rows(&mut db, "SELECT id FROM p ORDER BY id");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(11)]],
+        "cascade removed p row 10"
+    );
+    let r = rows(&mut db, "SELECT id FROM c ORDER BY id");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(101)]],
+        "cascade removed both children transitively"
+    );
+    // Cascaded rows fire the child table's own delete triggers.
+    let r = rows(&mut db, "SELECT COUNT(*) FROM audit");
+    assert_eq!(r.rows, vec![vec![Value::Int(2)]]);
+}
+
+/// SET NULL: referencing children keep their rows, the FK column goes NULL.
+/// NOT NULL on that column turns the action into a loud rejection that
+/// leaves the whole statement (parent row included) untouched.
+#[test]
+fn fk_on_delete_set_null_clears_or_rejects() {
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE SET NULL)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1), (2)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1), (11, 2)");
+    run(&mut db, "DELETE FROM p WHERE id = 1");
+    let r = rows(&mut db, "SELECT id, pid FROM c ORDER BY id");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Int(10), Value::Null],
+            vec![Value::Int(11), Value::Int(2)]
+        ]
+    );
+
+    // NOT NULL FK column: the SET NULL cannot apply; the statement (and the
+    // cascading delete behind it) reverts entirely.
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT NOT NULL, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE SET NULL)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    let e = db
+        .execute("DELETE FROM p WHERE id = 1")
+        .expect_err("SET NULL on a NOT NULL column must reject");
+    assert!(e.to_string().contains("NOT NULL"), "{e}");
+    let r = rows(&mut db, "SELECT COUNT(*) FROM p");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(1)]],
+        "parent row survives the failed action"
+    );
+    let r = rows(&mut db, "SELECT COUNT(*) FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+}
+
+/// SET DEFAULT: children re-point at the declared default. A default that
+/// names a parent row the SAME statement deletes must fail at plan time
+/// (the pre-state heap would still show it — the plan validates against
+/// the final state), and a default with no matching parent fails the same
+/// way. No declared default means NULL (PostgreSQL semantics).
+#[test]
+fn fk_on_delete_set_default_validates_against_final_state() {
+    // Default survives the delete: children re-point to parent 9.
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT DEFAULT 9, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE SET DEFAULT)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1), (9)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    run(&mut db, "DELETE FROM p WHERE id = 1");
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Int(9)]]);
+
+    // Default names the row being deleted: plan-time rejection, full revert.
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT DEFAULT 1, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE SET DEFAULT)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    let e = db
+        .execute("DELETE FROM p WHERE id = 1")
+        .expect_err("SET DEFAULT onto a value this statement deletes must reject");
+    assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+    let r = rows(&mut db, "SELECT COUNT(*) FROM p");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(1)]],
+        "revert keeps the parent row"
+    );
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Int(1)]], "child untouched");
+
+    // No default at all: NULL, matching PostgreSQL.
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE SET DEFAULT)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    run(&mut db, "DELETE FROM p WHERE id = 1");
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Null]]);
+}
+
+/// ON UPDATE CASCADE: re-keying a parent carries children (and their
+/// children) to the new value. SET NULL / SET DEFAULT replace the value.
+#[test]
+fn fk_on_update_actions_follow_parent_rekeys() {
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE gp (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE p (id INT PRIMARY KEY, gpid INT, \
+             FOREIGN KEY (gpid) REFERENCES gp (id) ON UPDATE CASCADE)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON UPDATE CASCADE)",
+    );
+    run(&mut db, "INSERT INTO gp VALUES (1)");
+    run(&mut db, "INSERT INTO p VALUES (10, 1)");
+    run(&mut db, "INSERT INTO c VALUES (100, 10)");
+    run(&mut db, "UPDATE gp SET id = 7 WHERE id = 1");
+    let r = rows(&mut db, "SELECT gpid FROM p");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(7)]],
+        "ON UPDATE CASCADE re-keys child"
+    );
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(10)]],
+        "grandchild unaffected (its FK targets p)"
+    );
+
+    // SET NULL on update: children detach instead of following.
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON UPDATE SET NULL)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    run(&mut db, "UPDATE p SET id = 2 WHERE id = 1");
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Null]]);
+
+    // SET DEFAULT on update: children re-point at the declared default.
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT DEFAULT 5, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON UPDATE SET DEFAULT)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1), (5)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    run(&mut db, "UPDATE p SET id = 2 WHERE id = 1");
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
+}
+
+/// Restrict FKs (no action, or explicit RESTRICT/NO ACTION spellings) keep
+/// rejecting, and a restrict failure reverts the WHOLE statement — including
+/// the cascade effects on other children that were already planned.
+#[test]
+fn fk_restrict_sibling_fails_whole_statement() {
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE cas (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE res (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE RESTRICT)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1)");
+    run(&mut db, "INSERT INTO cas VALUES (10, 1)");
+    run(&mut db, "INSERT INTO res VALUES (20, 1)");
+    let e = db
+        .execute("DELETE FROM p WHERE id = 1")
+        .expect_err("restrict sibling must reject");
+    assert!(e.to_string().contains("FOREIGN KEY"), "{e}");
+    let r = rows(&mut db, "SELECT COUNT(*) FROM p");
+    assert_eq!(r.rows, vec![vec![Value::Int(1)]], "parent row survives");
+    let r = rows(&mut db, "SELECT COUNT(*) FROM cas");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int(1)]],
+        "planned cascade reverted"
+    );
+    // Removing the restrict child first unblocks the same delete.
+    run(&mut db, "DELETE FROM res WHERE pid = 1");
+    run(&mut db, "DELETE FROM p WHERE id = 1");
+    let r = rows(&mut db, "SELECT COUNT(*) FROM cas");
+    assert_eq!(r.rows, vec![vec![Value::Int(0)]], "cascade then fires");
+}
+
+/// Self-referential FK with actions: deleting rows sets the surviving
+/// children's references to NULL (they are not deleted by this statement),
+/// and a CASCADE self-FK deletes the whole reachable subtree.
+#[test]
+fn fk_self_referential_set_null_and_cascade() {
+    let mut db = Database::in_memory().unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE t (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES t (id) ON DELETE SET NULL)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 1)",
+    );
+    run(&mut db, "DELETE FROM t WHERE id IN (1, 3)");
+    // Row 3 is deleted outright; rows 2 and 4 survive and lose their
+    // references to the deleted row 1.
+    let r = rows(&mut db, "SELECT id, pid FROM t ORDER BY id");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(4), Value::Null]
+        ]
+    );
+
+    let mut db = Database::in_memory().unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE t (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES t (id) ON DELETE CASCADE)",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2)");
+    run(&mut db, "DELETE FROM t WHERE id = 1");
+    let r = rows(&mut db, "SELECT id FROM t ORDER BY id");
+    assert!(r.rows.is_empty(), "cascade clears the whole subtree");
+}
+
+/// The fast paths stay bypassed when actions are reachable: a probe-able
+/// WHERE on an indexed parent column still cascades correctly, and a plain
+/// restrict schema keeps the fast path (results identical).
+#[test]
+fn fk_actions_bypass_fast_path_correctly() {
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1), (2)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1), (11, 2)");
+    // DELETE WHERE id = 1 probes p's PK tree; the actions path must still
+    // take over (the probe fast path cannot cascade).
+    run(&mut db, "DELETE FROM p WHERE id = 1");
+    let r = rows(&mut db, "SELECT id FROM c ORDER BY id");
+    assert_eq!(r.rows, vec![vec![Value::Int(11)]]);
+    // UPDATE with a probe-able WHERE re-keys through the actions path too.
+    run(&mut db, "UPDATE p SET id = 5 WHERE id = 2");
+    let r = rows(&mut db, "SELECT pid FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Int(5)]]);
+}
+
+/// Actions round-trip through the dump and through a reopen: the DDL text
+/// carries ON DELETE/ON UPDATE, replay rebuilds identical enforcement, and
+/// the restrict form is unchanged.
+#[test]
+fn fk_actions_survive_dump_and_reopen() {
+    let mut db = Database::in_memory().unwrap();
+    run(&mut db, "CREATE TABLE p (id INT PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT DEFAULT 1, \
+             FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE ON UPDATE SET NULL)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE r (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p (id))",
+    );
+    run(&mut db, "INSERT INTO p VALUES (1)");
+    run(&mut db, "INSERT INTO c VALUES (10, 1)");
+    let script = db.dump_script().unwrap();
+    assert!(script.contains("ON DELETE CASCADE"), "{script}");
+    assert!(script.contains("ON UPDATE SET NULL"), "{script}");
+    assert!(
+        !script.contains("FOREIGN KEY (pid) REFERENCES p (id)\n"),
+        "restrict form unchanged"
+    );
+
+    let mut replay = Database::in_memory().unwrap();
+    let batch = replay.execute_batch(&script);
+    assert!(
+        batch.error.is_none(),
+        "dump replay failed: {:?}",
+        batch.error
+    );
+    // Enforcement survives: cascade fires on the replayed schema.
+    run(&mut replay, "INSERT INTO c VALUES (11, 1)");
+    run(&mut replay, "DELETE FROM p WHERE id = 1");
+    let r = rows(&mut replay, "SELECT COUNT(*) FROM c");
+    assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+}

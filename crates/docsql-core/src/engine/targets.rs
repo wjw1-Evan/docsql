@@ -420,8 +420,10 @@ pub(super) fn fk_dependency_order(
     while !remaining.is_empty() {
         let next = remaining.iter().position(|n| {
             tables.get(n).is_none_or(|m| {
-                m.foreign_keys.iter().all(|(_, rt, _)| {
-                    rt == n || !names.iter().any(|x| x == rt) || out.iter().any(|o| o == rt)
+                m.foreign_keys.iter().all(|fk| {
+                    fk.ref_table == *n
+                        || !names.iter().any(|x| x.as_str() == fk.ref_table)
+                        || out.iter().any(|o| o.as_str() == fk.ref_table)
                 })
             })
         });
@@ -448,8 +450,8 @@ pub(super) fn self_ref_row_order(table: &str, meta: &TableMeta, docs: Vec<Object
     let self_fks: Vec<(&str, &str)> = meta
         .foreign_keys
         .iter()
-        .filter(|(_, rt, _)| rt == table)
-        .map(|(lc, _, rc)| (lc.as_str(), rc.as_str()))
+        .filter(|fk| fk.ref_table == table)
+        .map(|fk| (fk.col.as_str(), fk.ref_col.as_str()))
         .collect();
     if self_fks.is_empty() || docs.len() < 2 {
         return docs;

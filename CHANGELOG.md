@@ -6,6 +6,18 @@
 ## [Unreleased]
 
 ### 新功能
+- **外键引用动作(ON DELETE / ON UPDATE)**:`FOREIGN KEY` 现支持
+  `ON DELETE|UPDATE CASCADE / SET NULL / SET DEFAULT`(RESTRICT/NO ACTION 关键字接受,
+  即默认拒绝语义)。DELETE/UPDATE 父表时展开为确定性的多表计划:CASCADE 传递闭包连带
+  删除/改写后代子行,SET NULL/SET DEFAULT 改写子行引用列(无默认值 = NULL,PostgreSQL
+  语义;墙钟/随机默认值响亮拒绝——复制重放必须逐节点一致),未删除的幸存子行按动作处理,
+  无动作 FK 仍拒绝;级联触发的子行删除/更新触发子表自己的行触发器。计划整体校验后才应用
+  (SET DEFAULT 指向本语句删除的父行 = 计划期 FOREIGN KEY 报错并整语句回滚;NOT NULL/CHECK/
+  唯一约束在最终态上校验),语句原子性由语句守卫(undo 日志 + 目录快照)保证。目录里 FK
+  条目向后/向前兼容扩展(动作槽仅非默认时写入,旧二进制读前缀不受影响),dump 输出
+  `ON DELETE|UPDATE` 子句、回放逐节点重建一致行为;探测可命中的快路径在有动作可达时
+  自动让位多表计划。MERGE 与 `INSERT … ON CONFLICT DO UPDATE` 暂不展开动作(子行引用
+  被移除父键时按拒绝式报错)。测试:引擎 8 例 + 集群 e2e 1 例(级联删除跨节点收敛)。
 - **NuGet 包内置嵌入式原生库(引用即用)**:`Docsql.Client` 的 nupkg 现在携带
   `runtimes/<rid>/native/`(linux-x64/linux-arm64/osx-x64/osx-arm64/win-x64)——
   `dotnet add package Docsql.Client` 之后连接串写 `Data Source=app.db` 即可,不再需要

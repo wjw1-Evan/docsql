@@ -269,6 +269,68 @@ pub struct TableInfo {
     pub matview: bool,
 }
 
+/// Referential action of a FOREIGN KEY's `ON DELETE` / `ON UPDATE` clause.
+/// `None` (no clause, plus the RESTRICT/NO ACTION spellings) keeps the
+/// engine's restrict semantics: a parent key loss referenced by surviving
+/// child rows rejects the whole statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum FkAction {
+    /// No clause (or RESTRICT / NO ACTION): loud rejection, statement-final.
+    #[default]
+    None,
+    /// Delete (or re-key) referencing child rows together with the parent.
+    Cascade,
+    /// Set referencing child columns to NULL.
+    SetNull,
+    /// Set referencing child columns to their declared DEFAULT (NULL when
+    /// the child column has no default — PostgreSQL semantics).
+    SetDefault,
+}
+
+/// Catalog spelling of an action (encoder side; slot written only when the
+/// action is non-default, next to [`fk_action_from_text`]).
+pub(super) fn fk_action_text(a: FkAction) -> String {
+    match a {
+        FkAction::None => "NO ACTION",
+        FkAction::Cascade => "CASCADE",
+        FkAction::SetNull => "SET NULL",
+        FkAction::SetDefault => "SET DEFAULT",
+    }
+    .to_string()
+}
+
+/// Decode the catalog spelling back. Unknown text (corruption, future
+/// versions) decodes as the default action rather than failing the open —
+/// the tolerant-decode rule every catalog key follows.
+pub(super) fn fk_action_from_text(s: &str) -> FkAction {
+    match s {
+        "CASCADE" => FkAction::Cascade,
+        "SET NULL" => FkAction::SetNull,
+        "SET DEFAULT" => FkAction::SetDefault,
+        _ => FkAction::None,
+    }
+}
+
+/// One FOREIGN KEY declaration: (local column, referenced table, referenced
+/// column) plus the referential actions. Catalog entries decode actions
+/// after the mandatory first three elements; older catalogs decode as
+/// `FkAction::None` (the historical behavior).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FkRef {
+    pub(crate) col: String,
+    pub(crate) ref_table: String,
+    pub(crate) ref_col: String,
+    pub(crate) on_delete: FkAction,
+    pub(crate) on_update: FkAction,
+}
+
+impl FkRef {
+    /// `true` when at least one side declares a non-default action.
+    pub(crate) fn has_action(&self) -> bool {
+        self.on_delete != FkAction::None || self.on_update != FkAction::None
+    }
+}
+
 /// One CREATE INDEX definition as recorded in the catalog.
 ///
 /// `columns.len() >= 1`; `len() > 1` is a composite index whose B+ tree keys
@@ -381,8 +443,8 @@ pub(crate) struct TableMeta {
     pub(super) defaults: Vec<(String, String)>,
     /// CHECK constraint expressions as SQL text (column- or table-level).
     pub(super) checks: Vec<String>,
-    /// Foreign keys: (local column, referenced table, referenced column).
-    pub(super) foreign_keys: Vec<(String, String, String)>,
+    /// Foreign keys with their referential actions.
+    pub(super) foreign_keys: Vec<FkRef>,
     /// Indexed column -> B+ tree root page. PRIMARY KEY and UNIQUE columns
     /// always get trees (duplicates are enforced through them); CREATE
     /// INDEX adds non-unique trees. Lookups over these columns skip the

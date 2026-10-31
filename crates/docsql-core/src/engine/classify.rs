@@ -45,7 +45,10 @@ impl Database {
         self.tables
             .iter()
             .filter(|(t, m)| {
-                !targets.contains(t) && m.foreign_keys.iter().any(|(_, rt, _)| targets.contains(rt))
+                !targets.contains(t)
+                    && m.foreign_keys
+                        .iter()
+                        .any(|fk| targets.contains(&fk.ref_table))
             })
             .map(|(t, _)| t.clone())
             .collect()

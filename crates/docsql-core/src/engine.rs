@@ -32,6 +32,14 @@ pub struct Database {
     /// mid-flight under its statement guard; nested DML joins that guard
     /// instead of opening its own).
     trigger_depth: u8,
+    /// Tables a referential-actions statement (FK ON DELETE/ON UPDATE
+    /// CASCADE / SET NULL / SET DEFAULT) is currently rewriting. While set,
+    /// trigger bodies refuse to write any of them: their deltas were
+    /// computed from the pre-statement state, and a mid-flight write would
+    /// be silently overwritten by the cascade's own rewrite — the same
+    /// MySQL mid-statement rule the firing-table guard enforces, widened to
+    /// every table the statement touches.
+    referential_guard: Option<std::collections::BTreeSet<String>>,
     /// Async-commit mode (MongoDB-style journal interval): every statement
     /// commit skips the WAL fsync; a background flusher batches fsyncs.
     /// Trades bounded (ms) loss window on power failure for throughput.
@@ -824,6 +832,20 @@ fn reject_constraint_decorations(
         ));
     }
     Ok(())
+}
+
+/// Map the AST's referential action onto the engine's. RESTRICT and NO
+/// ACTION both keep the restrict semantics (checks are immediate — the
+/// engine has no constraint deferral, so the two spellings coincide), and a
+/// missing clause is the same default.
+fn fk_action_of(ra: Option<&sqlparser::ast::ReferentialAction>) -> FkAction {
+    use sqlparser::ast::ReferentialAction as RA;
+    match ra {
+        Some(RA::Cascade) => FkAction::Cascade,
+        Some(RA::SetNull) => FkAction::SetNull,
+        Some(RA::SetDefault) => FkAction::SetDefault,
+        Some(RA::Restrict) | Some(RA::NoAction) | None => FkAction::None,
+    }
 }
 
 /// SQL literal for a value carried over into a replicated statement.
@@ -2018,13 +2040,20 @@ fn create_table_ddl(name: &str, meta: &TableMeta) -> String {
     for chk in &meta.checks {
         parts.push(format!("CHECK ({chk})"));
     }
-    for (lc, rt, rc) in &meta.foreign_keys {
-        parts.push(format!(
+    for fk in &meta.foreign_keys {
+        let mut text = format!(
             "FOREIGN KEY ({}) REFERENCES {} ({})",
-            quote_ident(lc),
-            quote_ident(rt),
-            quote_ident(rc)
-        ));
+            quote_ident(&fk.col),
+            quote_ident(&fk.ref_table),
+            quote_ident(&fk.ref_col)
+        );
+        if fk.on_delete != FkAction::None {
+            text.push_str(&format!(" ON DELETE {}", fk_action_text(fk.on_delete)));
+        }
+        if fk.on_update != FkAction::None {
+            text.push_str(&format!(" ON UPDATE {}", fk_action_text(fk.on_update)));
+        }
+        parts.push(text);
     }
     ddl.push_str(&parts.join(",\n"));
     ddl.push_str("\n);");
@@ -2077,6 +2106,7 @@ mod merge;
 mod plan;
 mod probe;
 mod read_cx;
+mod referential;
 mod select;
 mod subquery;
 mod subst;

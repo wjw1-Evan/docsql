@@ -509,7 +509,7 @@ CREATE TABLE [ IF NOT EXISTS ] table_name AS SELECT ...
 | `NOT NULL` | 写入 NULL 或缺字段时报错 |
 | `DEFAULT expr` | INSERT 省略该列时求值填充;`ALTER TABLE ADD COLUMN` 带 DEFAULT 会回填存量行(回填值须满足 CHECK) |
 | `CHECK` | 写入时校验;仅求值为 FALSE 时失败(含 NULL 引用的表达式视为未知通过);引用的列必须存在(DDL 拒绝幽灵列),不能含子查询 |
-| `REFERENCES` | 外键(RESTRICT 式,语句终态判定);不支持 `ON DELETE`/`ON UPDATE` 动作;表级复合形式与列级多被引列显式报错。自引用外键按**语句终态**校验:同语句腾空父键同时让新像引用它(`UPDATE t SET id=3, p=1 WHERE id=1`)被拒;同语句一并删除父子行(`DELETE FROM 自引用表`)合法 |
+| `REFERENCES` | 外键,支持**引用动作**:`ON DELETE`/`ON UPDATE` 后接 `CASCADE`(父行删除/改键连带删除/改写子行,传递闭包到所有后代表)/`SET NULL`/`SET DEFAULT`(子行引用列置 NULL/列默认值,无默认值时置 NULL)/`RESTRICT`/`NO ACTION`(即默认的拒绝语义,检查立即执行)。无动作声明的 FK 保持拒绝式;`MATCH SIMPLE`(可省略)语义,NULL 引用值通过。自引用外键按**语句终态**校验:同语句腾空父键同时让新像引用它(`UPDATE t SET id=3, p=1 WHERE id=1`)被拒;同语句一并删除父子行(`DELETE FROM 自引用表`)合法,未删除的幸存子行按动作处理。表级复合形式与列级多被引列显式报错。MERGE 与 `INSERT … ON CONFLICT DO UPDATE` 暂不展开引用动作(子行引用被本语句移除的父键时按拒绝式报错——响亮、不静默)。级联触发的删除/更新会触发子表自己的行触发器;级联语句执行期间触发器体不得写任何被该语句重写的表(与触发器的「语句进行中不得写本表」同规)。|
 | `AUTOINCREMENT` | 整数列:插入省略/NULL 时取 max+1;GUID 列:生成 UUIDv7 并回写语句 |
 | `GUID` 类型 | `GUID`/`UUID`/`UNIQUEIDENTIFIER`/`UUIDV7` |
 
