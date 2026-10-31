@@ -82,6 +82,13 @@
   连续 5 次 push 的 build & publish 全部失败、GHCR 镜像停更、compose 部署测试连带跳过)。
 
 ### 文档
+- **国产化销售合规材料**:`docs/compliance.md`(自主可控声明与依据——原创引擎/无闭源组件/
+  运行时零外部依赖/密码学自持;信创 CPU/OS 支持矩阵——x86_64(海光/兆芯)、ARM64(鲲鹏/
+  飞腾)官方镜像与 glibc 静态二进制,龙芯 loongarch64 源码构建路径;销售法定动作清单:
+  销售主体/软著登记/商标/测评认证;双许可商业模式说明)+ `docs/third-party-licenses.md`
+  (全部 175 个 Rust 依赖 + .NET + Python 逐包许可审计,结论:全部宽松许可(MIT/Apache/
+  BSD/ISC/BSL-1.0/Unicode-3.0),无 GPL/AGPL/LGPL 传染义务;含依赖红线规则);README 许可证
+  段补版权声明与合规入口,文档导航、docs 索引、AGENTS 文档分工同步。
 - 开发与测试段补实测缺口(coverage 本地命令、dotnet 需同建 `docsql-ffi` 原生库、Python 驱动
   venv+pytest 步骤)并如实说明 CI 范围;SQL 参考窗口节补 QUALIFY 别名与源列优先语义,
   兼容性矩阵修正陈旧行(QUALIFY、RANGE DAY/SECOND INTERVAL 均已支持)。

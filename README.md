@@ -91,7 +91,7 @@ docker exec -it docsql-prod-single docsql-cli connect 127.0.0.1:7600
 
 按任务找文档的完整对照表见 [docs/README.md](docs/README.md)(描述单点维护,避免两处漂移):
 
-[功能总览](docs/features.md) · [SQL 参考](docs/sql-reference.md) · [客户端与驱动](docs/drivers.md) · [Aspire 指南](docs/aspire.md) · [运维手册](docs/operations.md) · [安全指南](docs/security.md) · [已知边界](docs/limitations.md) · [贡献指南](CONTRIBUTING.md) · [AGENTS](AGENTS.md)
+[功能总览](docs/features.md) · [SQL 参考](docs/sql-reference.md) · [客户端与驱动](docs/drivers.md) · [Aspire 指南](docs/aspire.md) · [运维手册](docs/operations.md) · [安全指南](docs/security.md) · [已知边界](docs/limitations.md) · [合规与国产化销售](docs/compliance.md) · [第三方依赖许可审计](docs/third-party-licenses.md) · [贡献指南](CONTRIBUTING.md) · [AGENTS](AGENTS.md)
 
 ## 集群与数据安全
 
@@ -180,3 +180,5 @@ CI 执行 Rust 门禁 + 覆盖率回归 + .NET 套件,然后发布多架构镜�
 ## 许可证
 
 **免费商用** — DocSQL 以双许可发布:Apache-2.0 或 MIT,任选其一(见 [LICENSE-APACHE](LICENSE-APACHE) / [LICENSE-MIT](LICENSE-MIT))。商业部署、生产环境使用、闭源集成、修改、再分发与销售均免费,无需付费或单独授权;唯一义务是随分发保留许可文件与版权声明。许可文本按其条款逐字保留,不做修改。
+
+版权所有 © 2026 DocSQL Contributors。以 DocSQL 品牌商业化销售(国产化资质、软著登记、信创测评、销售主体等法定动作清单)见[合规与国产化销售指南](docs/compliance.md);供应链合规(全部依赖许可审计)见[第三方依赖许可审计](docs/third-party-licenses.md)。
