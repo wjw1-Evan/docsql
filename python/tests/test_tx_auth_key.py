@@ -1,5 +1,6 @@
-"""Transactions (autocommit=False: implicit BEGIN + commit/rollback),
-authentication outcomes, and the DOCSQL_KEY frame-sealing path."""
+"""Transactions (DB-API default: implicit BEGIN + commit/rollback, plus
+explicit ``autocommit=True``), authentication outcomes, and the DOCSQL_KEY
+frame-sealing path."""
 
 import pytest
 
@@ -39,12 +40,48 @@ def test_rollback_discards(server):
             assert cur.fetchone() == (1,)
 
 
-def test_autocommit_default_writes_immediately(server):
+def test_default_transactions_commit_on_standalone_node(server):
+    # The session server has no DOCSQL_PEERS: single-instance deployments
+    # must support transactions too, and the DB-API default is transactional.
     with docsql.connect(host="127.0.0.1", port=server.port, token=TOKEN) as conn:
+        assert conn.autocommit is False
+        assert conn.status()["peers"] == []
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS py_tx_default")
+            cur.execute("CREATE TABLE py_tx_default (id INT PRIMARY KEY)")
+            cur.execute("INSERT INTO py_tx_default VALUES (1)")
+            conn.commit()
+    # A fresh connection sees the committed DDL and row without a commit call.
+    with docsql.connect(
+        host="127.0.0.1", port=server.port, token=TOKEN, autocommit=True
+    ) as conn2:
+        with conn2.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM py_tx_default")
+            assert cur.fetchone() == (1,)
+
+
+def test_default_transactions_rollback_discards(server):
+    with docsql.connect(host="127.0.0.1", port=server.port, token=TOKEN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS py_tx_default_rb")
+            cur.execute("CREATE TABLE py_tx_default_rb (id INT PRIMARY KEY)")
+            conn.commit()  # DDL is transactional too: make it durable first
+            cur.execute("INSERT INTO py_tx_default_rb VALUES (1)")
+            conn.rollback()
+            cur.execute("SELECT COUNT(*) FROM py_tx_default_rb")
+            assert cur.fetchone() == (0,)
+
+
+def test_autocommit_true_writes_immediately(server):
+    with docsql.connect(
+        host="127.0.0.1", port=server.port, token=TOKEN, autocommit=True
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE TABLE py_ac (id INT PRIMARY KEY)")
     # A fresh connection sees the DDL without any commit call.
-    with docsql.connect(host="127.0.0.1", port=server.port, token=TOKEN) as conn2:
+    with docsql.connect(
+        host="127.0.0.1", port=server.port, token=TOKEN, autocommit=True
+    ) as conn2:
         with conn2.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM py_ac")
             assert cur.fetchone() == (0,)

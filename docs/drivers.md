@@ -153,8 +153,10 @@ with docsql.connect(host="127.0.0.1", port=7600, token="...",
 - 精确标量:`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、
   `bytes`↔BLOB(`$bytes`);超 int64 的整数自动走 `$dec`,超出 DECIMAL 值域
   (2^96-1)的整数/`Decimal` 绑定时客户端即抛 `DataError`(不再静默降级为文本);
-- `autocommit` 默认 **True**(单写者网络库,隐式事务会停住全局写路径;
-  DB-API 偏离已在文档明示),`autocommit=False` 为 psycopg2 风格隐式块;
+- 事务**默认启用**(PEP 249:`autocommit` 初始 **False**):块首语句前自动
+  BEGIN,`commit()`/`rollback()` 结束块,DDL 也在事务内;单实例/单节点部署同样
+  支持。单写者引擎下空闲未决事务会占住写路径(其他写者排队 ≤30s),只读/短任务
+  可显式 `autocommit=True` 恢复逐语句提交;
 - 读/写超时会**毒化连接**(服务端仍会送出迟到应答,复用会让下一条语句拿到
   上一条的结果——静默错位一帧);捕获超时后重连,不要复用旧连接对象执行;
 - 原生 TLS 用 stdlib `ssl`(`tls_ca` 缺省 = 只加密不验证,自签形态);

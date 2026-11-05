@@ -90,6 +90,13 @@
   `PytestUnhandledThreadExceptionWarning` 升级报错复验。
 
 ### 变更
+- **Python 驱动默认启用事务(DB-API 语义)**:`docsql.connect()` 的 `autocommit`
+  默认值由 `True` 改为 `False`(PEP 249 要求 auto-commit 初始关闭)。每条连接在
+  块的第一条语句前自动 `BEGIN`,`commit()`/`rollback()` 结束块,DDL 也在事务内;
+  单实例/单节点部署同样生效。需要逐语句提交的只读/短任务显式传
+  `autocommit=True`(旧的逐语句行为完整保留)。单写者引擎下空闲未决事务仍会占住
+  全局写路径(其他写者排队 ≤30s),文档已明示。测试新增默认事务的提交/回滚与
+  单节点(`peers=[]`)用例,原有表面用例改用显式 `autocommit=True` 保持语义。
 - **许可模式变更(重大):AGPL-3.0 + 商业许可双授权**。自本版本起,社区版以 **AGPL-3.0**
   发布([LICENSE-AGPL](LICENSE-AGPL)):个人学习、科研、内部业务系统使用永久免费,遵守 AGPL
   义务(含 §13 网络条款——对外提供数据库服务须向使用者开放服务端源码)的商业部署同样免费;

@@ -118,5 +118,11 @@ def open_server(tmp_path_factory):
 def conn(server):
     import docsql
 
-    with docsql.connect(host="127.0.0.1", port=server.port, token=TOKEN) as c:
+    # Most surface tests exercise one connection in isolation and assume
+    # immediate visibility (and no open transaction blocking the shared
+    # session server). The DB-API default (autocommit=False) is covered by
+    # the dedicated transaction tests instead.
+    with docsql.connect(
+        host="127.0.0.1", port=server.port, token=TOKEN, autocommit=True
+    ) as c:
         yield c

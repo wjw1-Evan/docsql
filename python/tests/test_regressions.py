@@ -94,7 +94,9 @@ def test_ping_reconnect_surfaces_lost_transaction(server):
     # the server on disconnect — commit() must say so instead of silently
     # no-op'ing, prepared handles must be dropped (per-connection server
     # state), and a fresh transaction on the same objects must work.
-    setup = docsql.connect(host=server.addr[0], port=server.addr[1], token=TOKEN)
+    setup = docsql.connect(
+        host=server.addr[0], port=server.addr[1], token=TOKEN, autocommit=True
+    )
     try:
         cur = setup.cursor()
         cur.execute("DROP TABLE IF EXISTS py_reg_tx")

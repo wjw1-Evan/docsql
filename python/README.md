@@ -48,11 +48,26 @@ IEEE double,WHERE 匹配会失配)。
 
 ## 事务
 
-`autocommit` **默认 True**(偏离 DB-API 的隐式事务默认):DocSQL 是单写者
-网络数据库,进程空闲时挂着隐式事务会把整条写路径停住。设
-`autocommit=False` 后驱动按 psycopg2 风格在每个块的第一条语句前发
-BEGIN,`commit()`/`rollback()` 结束块 —— 此模式不要自己写 BEGIN。
-DDL 也在事务内(回滚会撤销建表)。
+事务**默认启用**(PEP 249:auto-commit 初始关闭):驱动按 psycopg2 风格在每个块
+的第一条语句前自动发 BEGIN,`commit()`/`rollback()` 结束当前块,下一次执行
+再开新块 —— 此模式不要自己写 BEGIN。DDL 也在事务内(回滚会撤销建表)。
+**单实例/单节点部署同样如此**,不依赖集群或任何开关。
+
+```python
+with docsql.connect(host="127.0.0.1", port=7600, token="...") as conn:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO orders (id, note) VALUES (?, ?)", (1, "a"))
+        cur.execute("INSERT INTO orders (id, note) VALUES (?, ?)", (2, "b"))
+        conn.commit()          # 两条一起落盘;异常时 conn.rollback()
+```
+
+DocSQL 是单写者引擎:挂着未结束事务的空闲连接会占住全局写路径,其他写者
+最多排队 30s。只读任务或短生命周期脚本可显式 `autocommit=True` 恢复逐语句
+提交(此时 `commit()`/`rollback()` 为空操作):
+
+```python
+conn = docsql.connect(host="127.0.0.1", port=7600, token="...", autocommit=True)
+```
 
 ## 原生 TLS
 
@@ -102,7 +117,7 @@ DB-API 标准:`Error` → `InterfaceError`(传输层,连接作废;协议级
 ```bash
 cargo build -p docsql-server        # 仓库根;测试会启动 debug 二进制
 pip install pytest cryptography
-python -m pytest python/tests -q    # 60 用例
+python -m pytest python/tests -q    # 62 用例
 ```
 
 测试自备自签证书(`tests/fixtures/`,SAN 含 localhost 与 127.0.0.1),

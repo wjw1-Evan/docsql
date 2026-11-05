@@ -2,13 +2,16 @@
 
 Design notes (deviations from PEP 249 are deliberate and documented):
 
-- **autocommit defaults to True.** DocSQL is a network database with a
-  single global writer: an implicitly-open transaction (the DB-API
-  default) would park the write path for the whole deployment while the
-  Python process idles. With ``autocommit=False`` the driver sends BEGIN
-  before the first statement of each block (psycopg2-style) and issues
-  COMMIT/ROLLBACK on ``commit()``/``rollback()``; do not write your own
-  BEGIN in that mode.
+- **Transactions are enabled by default** (PEP 249: auto-commit starts
+  off). The driver sends BEGIN before the first statement of each block
+  (psycopg2-style) and issues COMMIT/ROLLBACK on ``commit()``/``rollback()``;
+  do not write your own BEGIN in that mode. This also holds for a
+  single-instance / single-node deployment. Because DocSQL is a
+  single-writer engine, an idle connection with an open transaction parks
+  the global write path until it commits, rolls back or disconnects (other
+  writers queue for up to 30 s). Callers that want per-statement
+  auto-commit (e.g. read-only jobs) opt out explicitly with
+  ``autocommit=True``.
 - ``paramstyle`` is ``qmark``: templates go through REQ_PREPARE and
   parameters are bound SERVER-SIDE (REQ_EXECUTE) — the template with
   ``?`` placeholders is registered once per connection and reused, and a
@@ -64,7 +67,7 @@ def connect(
     tls_hostname=None,
     key=None,
     timeout=15.0,
-    autocommit=True,
+    autocommit=False,
 ):
     """Open a connection and authenticate.
 
@@ -83,6 +86,11 @@ def connect(
       timeout POISONS the connection (the server still answers the timed-
       out statement later — a reused socket would misalign requests and
       replies by one frame); reconnect after catching it.
+    - ``autocommit``: ``False`` (DB-API default) opens one implicit
+      transaction per block on the first statement and ends it on
+      ``commit()``/``rollback()``. ``True`` commits every statement
+      immediately (opt out for read-only or short-lived work; an idle open
+      transaction parks the single-writer engine until it ends).
     """
     return Connection(
         host=host,
@@ -374,7 +382,7 @@ class Connection:
 
     def __init__(self, **kwargs):
         self._kwargs = kwargs
-        self.autocommit = kwargs.get("autocommit", True)
+        self.autocommit = kwargs.get("autocommit", False)
         self._transport = _Transport(
             host=kwargs.get("host", "127.0.0.1"),
             port=kwargs.get("port", 7600),
@@ -594,8 +602,8 @@ class Cursor:
             _params = list(parameters)
             _handle = self._prepare(operation)
         if not self._conn.autocommit and not self._conn._tx_open:
-            # Implicit transaction block (see the module docstring for why
-            # this is opt-in rather than the default).
+            # Implicit transaction block (PEP 249 default; see the module
+            # docstring).
             ftype, payload = self._conn._transport.round_trip(
                 _proto.REQ_SQL, sql_payload("BEGIN")
             )
