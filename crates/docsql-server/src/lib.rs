@@ -559,8 +559,10 @@ fn is_node_frame(frame_type: u16) -> bool {
     )
 }
 
-/// Resolve when the process is asked to terminate (SIGTERM / SIGINT).
-async fn shutdown_signal() {
+/// Resolve when the process is asked to terminate (SIGTERM / SIGINT). Shared
+/// by the server and the web console (two hand copies used to sit in each
+/// binary).
+pub async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
@@ -1066,7 +1068,7 @@ async fn execute_sql_with_identity(
     user: Option<&UserAuth>,
     stmt_deadline: Option<std::time::Instant>,
     logged_sql: &mut Option<String>,
-) -> (Frame, Option<i64>) {
+) -> (Frame, Option<i64>, u64) {
     #![allow(clippy::too_many_arguments)]
 
     // Statement throughput/error-rate accounting: every executor caller
@@ -1076,7 +1078,7 @@ async fn execute_sql_with_identity(
         .metrics
         .statements_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (resp, identity) = execute_sql_inner(
+    let (resp, identity, rowcount) = execute_sql_inner(
         state,
         sql,
         allow_system_table,
@@ -1095,7 +1097,7 @@ async fn execute_sql_with_identity(
             .statement_errors_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    (resp, identity)
+    (resp, identity, rowcount)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1114,7 +1116,7 @@ async fn execute_sql_inner(
     // journal/fan-out already carry the rewritten text; the log used to
     // keep the user's original, hiding the enforced predicate).
     logged_sql: &mut Option<String>,
-) -> (Frame, Option<i64>) {
+) -> (Frame, Option<i64>, u64) {
     // Row-filter enforcement BEFORE the single parse: the rewritten text is
     // what executes, is logged, journals and replays to peers (a replica
     // replaying the journal without a user identity reproduces exactly what
@@ -1133,7 +1135,7 @@ async fn execute_sql_inner(
                 }
                 Err(m) => {
                     drop(db_ref);
-                    return (Frame::new(proto::RESP_ERROR, err_payload(&m)), None);
+                    return (Frame::new(proto::RESP_ERROR, err_payload(&m)), None, 0);
                 }
             }
         } else {
@@ -1151,6 +1153,7 @@ async fn execute_sql_inner(
             return (
                 Frame::new(proto::RESP_ERROR, err_payload(&e.to_string())),
                 None,
+                0,
             )
         }
     });
@@ -1197,6 +1200,7 @@ async fn execute_sql_inner(
                     )),
                 ),
                 None,
+                0,
             );
         }
     }
@@ -1207,7 +1211,7 @@ async fn execute_sql_inner(
         if let Err(denial) =
             authorize_statement(Some(&db_ref), &p.stmt, &tx_kind, is_write, &u.grants)
         {
-            return (Frame::new(proto::RESP_ERROR, err_payload(&denial)), None);
+            return (Frame::new(proto::RESP_ERROR, err_payload(&denial)), None, 0);
         }
     }
     // Replica read-only gate (replication-internal frames pass through).
@@ -1219,6 +1223,7 @@ async fn execute_sql_inner(
                 err_payload("read-only replica; PROMOTE to accept writes"),
             ),
             None,
+            0,
         );
     }
     // Majority write fence (design 004 §2.2): a quorum-lost node is
@@ -1226,7 +1231,7 @@ async fn execute_sql_inner(
     // replication-internal frames and reads pass.
     if !is_replication && is_write {
         if let Some(denial) = quorum_write_denial(state) {
-            return (Frame::new(proto::RESP_ERROR, err_payload(&denial)), None);
+            return (Frame::new(proto::RESP_ERROR, err_payload(&denial)), None, 0);
         }
     }
     // The single global transaction belongs to the connection that opened
@@ -1246,6 +1251,7 @@ async fn execute_sql_inner(
                     err_payload("transaction is held open by another connection"),
                 ),
                 None,
+                0,
             );
         }
     }
@@ -1262,6 +1268,7 @@ async fn execute_sql_inner(
                 ),
             ),
             None,
+            0,
         );
     }
     // A client BEGIN queues behind an open engine transaction instead of
@@ -1281,6 +1288,7 @@ async fn execute_sql_inner(
                     err_payload("transaction buffer exceeded; COMMIT or ROLLBACK first"),
                 ),
                 None,
+                0,
             );
         }
     }
@@ -1330,6 +1338,7 @@ async fn execute_sql_inner(
                                 ),
                             ),
                             None,
+                            0,
                         );
                     }
                 }
@@ -1356,7 +1365,7 @@ async fn execute_sql_inner(
                             return (Frame::new(
                         proto::RESP_ERROR,
                         err_payload("timed out waiting for the transaction on another connection"),
-                    ), None);
+                    ), None, 0);
                         }
                         tokio::time::sleep(BEGIN_QUEUE_POLL).await;
                         continue;
@@ -1381,7 +1390,7 @@ async fn execute_sql_inner(
                             return (Frame::new(
                         proto::RESP_ERROR,
                         err_payload("replication write timed out waiting for the open transaction"),
-                    ), None);
+                    ), None, 0);
                         }
                         tokio::time::sleep(BEGIN_QUEUE_POLL).await;
                         continue;
@@ -1411,6 +1420,7 @@ async fn execute_sql_inner(
                             ),
                         ),
                         None,
+                        0,
                     );
                 }
                 // User/role writes are authorization state, not transactional
@@ -1435,6 +1445,7 @@ async fn execute_sql_inner(
                             ),
                         ),
                         None,
+                        0,
                     );
                 }
                 // Arm the client-statement deadline inside the engine lock —
@@ -1505,6 +1516,7 @@ async fn execute_sql_inner(
                         err_payload("failed to make the write durable"),
                     ),
                     None,
+                    0,
                 );
             }
             // Lost the race for the engine transaction between the wait and the
@@ -1611,14 +1623,24 @@ async fn execute_sql_inner(
             _ => {}
         }
     }
-    (outcome_frame(outcome), identity)
+    // Row count straight from the outcome (the write-path @@ROWCOUNT
+    // bookkeeping used to re-parse the whole RESP_ROWS JSON for it).
+    let rowcount = match &outcome {
+        Ok(ExecOutcome::Rows(r)) => r.rows.len() as u64,
+        Ok(ExecOutcome::Affected(n)) => *n,
+        Err(_) => 0,
+    };
+    let resp = outcome_frame(outcome);
+    (resp, identity, rowcount)
 }
 
 /// Peer I/O budget: a partitioned or malicious peer must not wedge client
 /// writes for the OS TCP timeout, nor force huge allocations.
 pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 pub(crate) const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-pub(crate) const RECV_CAP: usize = 64 * 1024 * 1024;
+/// Client-facing receive cap: the one wire frame cap (proto) — three
+/// crates used to spell the literal independently.
+pub(crate) const RECV_CAP: usize = MAX_FRAME_BYTES;
 
 /// Read one response frame from an outbound connection.
 async fn read_response_frame_with_guard(

@@ -73,7 +73,7 @@ pub fn eval_const(e: &SqlExpr) -> Result<Value> {
         // to the same value on replay. Only argument shapes the normal
         // expression path accepts are allowed here.
         SqlExpr::Function(f) => {
-            let name = f.name.to_string().to_uppercase();
+            let name = func_upper(&f.name.to_string());
             if f.over.is_some() {
                 return err(format!("window functions (OVER) are not supported: {name}"));
             }
@@ -227,10 +227,17 @@ pub(super) fn lookup_col(doc: &Object, name: &str) -> Result<Value> {
     if !join_shaped || qualifiers < 2 {
         return Ok(Value::Null);
     }
-    let suffix = format!(".{name}");
+    // Suffix match without a per-miss `format!` allocation (the fallback
+    // runs on every unqualified miss over joined rows): `p.name` with the
+    // dot on the boundary — UTF-8 continuation bytes never equal `b'.'`,
+    // so the byte check is boundary-safe.
     Ok(doc
         .iter()
-        .find(|(k, _)| k.ends_with(&suffix))
+        .find(|(k, _)| {
+            k.len() > name.len()
+                && k.ends_with(&*name)
+                && k.as_bytes()[k.len() - name.len() - 1] == b'.'
+        })
         .map(|(_, v)| v.clone())
         .unwrap_or(Value::Null))
 }
@@ -331,11 +338,19 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             ))
         }
         SqlExpr::CompoundIdentifier(parts) => {
-            let full = parts
-                .iter()
-                .map(|p| p.value.clone())
-                .collect::<Vec<_>>()
-                .join(".");
+            // The joined name (no Vec intermediary): one String sized once,
+            // reused for the sequence guard and the exact-key lookup — the
+            // per-row collect().join(".") used to allocate twice per
+            // reference.
+            let mut full = String::with_capacity(
+                parts.iter().map(|p| p.value.len() + 1).sum::<usize>(),
+            );
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    full.push('.');
+                }
+                full.push_str(&p.value);
+            }
             // Oracle sequence pseudo-columns have no DocSQL equivalent; a
             // silent NULL here would corrupt every migrated key. Quote the
             // name (`"nextval"`) to read a literal field with that name.
@@ -349,11 +364,11 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
                     ));
                 }
             }
-            if let Some(v) = doc.get(&full) {
+            if let Some(v) = doc.get(full.as_str()) {
                 Ok(v.clone())
             } else {
-                let last = parts.last().map(|p| p.value.clone()).unwrap_or_default();
-                lookup_col(doc, &last)
+                let last = parts.last().map(|p| p.value.as_str()).unwrap_or_default();
+                lookup_col(doc, last)
             }
         }
         SqlExpr::Value(v) => sql_value(v),
@@ -610,15 +625,13 @@ pub fn eval_expr(e: &SqlExpr, doc: &Object) -> Result<Value> {
             scalar_function("CEILING", &[eval_expr(expr, doc)?])
         }
         SqlExpr::Function(f) => {
-            let name = f.name.to_string().to_uppercase();
+            let name = func_upper(&f.name.to_string());
             if f.over.is_some() {
                 return err(format!("window functions (OVER) are not supported: {name}"));
             }
-            if matches!(
-                name.as_str(),
-                "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
-                    | "STRING_AGG" | "GROUPING"
-            ) {
+            // GROUPING rides the aggregate family for the not-allowed
+            // guard; its evaluation has its own arm.
+            if name == "GROUPING" || parse_agg_name(f).is_some() {
                 return err(format!(
                     "aggregate function {name} is not allowed in this context"
                 ));
@@ -763,6 +776,22 @@ pub(super) fn constant_limit_window(query: &Query) -> Option<(usize, usize)> {
         LimitClause::OffsetCommaLimit { offset, limit } => {
             Some((skip(bound(offset)?), take(bound(limit)?)))
         }
+    }
+}
+
+/// Shared FETCH clause handling: reject PERCENT, evaluate the row count.
+/// WITH TIES semantics stay with the callers — the ordered window extends
+/// the tie run of the last kept row, while the FROM-less SELECT (no ORDER
+/// BY) refuses outright. The two halves used to be hand-mirrored in
+/// `read_cx` and `select`.
+pub(super) fn fetch_row_count(fetch: &sqlparser::ast::Fetch) -> Result<usize> {
+    if fetch.percent {
+        return err("FETCH … PERCENT is not supported");
+    }
+    match fetch.quantity.as_ref().map(eval_const).transpose()? {
+        Some(Value::Int(n)) if n >= 0 => Ok(n as usize),
+        Some(Value::Int(n)) => err(format!("FETCH quantity must be non-negative ({n})")),
+        Some(_) | None => err("FETCH quantity must be an integer"),
     }
 }
 

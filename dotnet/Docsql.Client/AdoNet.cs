@@ -1639,7 +1639,7 @@ public sealed class DocsqlCommand : DbCommand
         ValidateExecutionBinding();
         // CommandTimeout 驱动读取预算(0 = ADO.NET 默认无限制,这里落到连接
         // 默认的 30s 读超时,而不是原来的永久阻塞)。
-        conn.Proto.ReadTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : 30_000;
+        conn.Proto.ReadTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : ProtocolConnection.DefaultReadTimeoutMs;
         if (Parameters.Count == 0)
         {
             return conn.Proto.Send(SqlFrame());
@@ -1661,7 +1661,7 @@ public sealed class DocsqlCommand : DbCommand
             throw new InvalidOperationException("connection is not open");
         }
         ValidateExecutionBinding();
-        int readTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : 30_000;
+        int readTimeoutMs = CommandTimeout > 0 ? CommandTimeout * 1000 : ProtocolConnection.DefaultReadTimeoutMs;
         if (Parameters.Count == 0)
         {
             return await conn.Proto
@@ -1852,7 +1852,7 @@ public sealed class DocsqlCommand : DbCommand
         // (precision loss, WHERE mismatches). Exact path: the $dec marker,
         // same as decimal — the server renders CAST(.. AS DECIMAL).
         ulong u when u > long.MaxValue =>
-            "{\"$dec\":\"" + u.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}",
+            "{\"" + WireMarkers.Dec + "\":\"" + u.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}",
         ulong u => JsonSerializer.Serialize((long)u),
         // 非有限浮点:JSON 数字装不下,发 $float 标记(引擎双向对称)。
         // System.Text.Json 对 NaN/∞ 的 Serialize 直接抛异常,不发标记就发不出去。
@@ -1861,19 +1861,19 @@ public sealed class DocsqlCommand : DbCommand
         float f when !float.IsFinite(f) => FloatJson(f),
         float f => JsonSerializer.Serialize((double)f),
         // 精确小数文本走 $dec 标记,服务端渲染 CAST(... AS DECIMAL)。
-        decimal m => "{\"$dec\":\"" + m.ToString(CultureInfo.InvariantCulture) + "\"}",
+        decimal m => "{\"" + WireMarkers.Dec + "\":\"" + m.ToString(CultureInfo.InvariantCulture) + "\"}",
         // DateTime 族走 $ts 标记(UTC 毫秒):引擎原生 TIMESTAMP 值,
         // 与时间列的时间带比较/排序一致。Kind=Unspecified 按 UTC 存取
         // (不偷偷做本地时区换算);存量 ISO 文本值的读取路径不变。
         DateTime dt when timestampIso => IsoJson(dt.Kind == DateTimeKind.Local
                 ? dt.ToUniversalTime()
                 : DateTime.SpecifyKind(dt, DateTimeKind.Utc)),
-        DateTime dt => "{\"$ts\":" + new DateTimeOffset(dt.Kind == DateTimeKind.Local
+        DateTime dt => "{\"" + WireMarkers.Ts + "\":" + new DateTimeOffset(dt.Kind == DateTimeKind.Local
                 ? dt.ToUniversalTime()
                 : DateTime.SpecifyKind(dt, DateTimeKind.Utc),
             TimeSpan.Zero).ToUnixTimeMilliseconds() + "}",
         DateTimeOffset dto when timestampIso => IsoJson(dto.UtcDateTime),
-        DateTimeOffset dto => "{\"$ts\":" + dto.ToUnixTimeMilliseconds() + "}",
+        DateTimeOffset dto => "{\"" + WireMarkers.Ts + "\":" + dto.ToUnixTimeMilliseconds() + "}",
         TimeSpan ts => JsonSerializer.Serialize(
             ts.ToString("c", CultureInfo.InvariantCulture)),
         DateOnly d => JsonSerializer.Serialize(
@@ -1895,9 +1895,9 @@ public sealed class DocsqlCommand : DbCommand
 
     private static string FloatJson(double d) => d switch
     {
-        _ when double.IsNaN(d) => "{\"$float\":\"NaN\"}",
-        _ when d > 0 => "{\"$float\":\"inf\"}",
-        _ => "{\"$float\":\"-inf\"}",
+        _ when double.IsNaN(d) => "{\"" + WireMarkers.Float + "\":\"NaN\"}",
+        _ when d > 0 => "{\"" + WireMarkers.Float + "\":\"inf\"}",
+        _ => "{\"" + WireMarkers.Float + "\":\"-inf\"}",
     };
 
     /// <summary>ISO-8601 文本参数(timestampformat=iso):对不认 $ts 标记的
@@ -1909,7 +1909,7 @@ public sealed class DocsqlCommand : DbCommand
     private static string BytesJson(byte[] b)
     {
         var sb = new StringBuilder(b.Length * 4 + 12);
-        sb.Append("{\"$bytes\":[");
+        sb.Append("{\"" + WireMarkers.Bytes + "\": [");
         for (int i = 0; i < b.Length; i++)
         {
             if (i > 0)
@@ -2058,19 +2058,31 @@ public sealed class DocsqlDataReader : DbDataReader
         {
             return;
         }
-        using var doc = JsonDocument.Parse(Encoding.UTF8.GetString(payload));
+        // 直接从 UTF-8 字节解析:先 GetString 再 Parse 在大结果集上是
+        // 一整份 UTF-16 拷贝(Utf8JsonReader 原生路径)。
+        using var doc = JsonDocument.Parse(payload);
         foreach (var c in doc.RootElement.GetProperty("columns").EnumerateArray())
         {
             _columns.Add(c.GetString() ?? "");
         }
+        // 列类型 = 首个非空值(单遍扫描):此前每列 FirstOrDefault 各扫
+        // 全部行,N 列 × M 行 = O(N²) 构造开销,大结果集上放大明显。
+        var types = new Type[_columns.Count];
         foreach (var r in doc.RootElement.GetProperty("rows").EnumerateArray())
         {
-            _rows.Add(r.EnumerateArray().Select(ElemToValue).ToArray());
+            var row = r.EnumerateArray().Select(ElemToValue).ToArray();
+            _rows.Add(row);
+            for (int i = 0; i < row.Length && i < types.Length; i++)
+            {
+                if (types[i] is null && row[i] is not null)
+                {
+                    types[i] = row[i]!.GetType();
+                }
+            }
         }
-        // Column type from the first non-null value (schemaless storage).
-        for (int i = 0; i < _columns.Count; i++)
+        for (int i = 0; i < types.Length; i++)
         {
-            _types.Add(_rows.FirstOrDefault(r => r[i] is not null)?[i]?.GetType() ?? typeof(object));
+            _types.Add(types[i] ?? typeof(object));
         }
     }
 
@@ -2101,7 +2113,7 @@ public sealed class DocsqlDataReader : DbDataReader
         // object text, never throws.
         bool singleKey = e.EnumerateObject().Count() == 1;
         if (singleKey
-            && e.TryGetProperty("$dec", out var dec)
+            && e.TryGetProperty(WireMarkers.Dec, out var dec)
             && dec.ValueKind == JsonValueKind.String
             // NumberStyles.Number includes AllowThousands, which neither
             // rust_decimal (from_str) nor Python's Decimal accept: with it,
@@ -2120,18 +2132,16 @@ public sealed class DocsqlDataReader : DbDataReader
         // out-of-domain values stay raw — same fail-safe as the server).
         // Surfaced as UTC DateTime so existing readers keep working; the
         // engine is millisecond-precision, sub-ms digits do not round-trip.
-        const long TsMinMs = -62_135_596_800_000;
-        const long TsMaxMs = 253_402_300_799_999;
         if (singleKey
-            && e.TryGetProperty("$ts", out var ts)
+            && e.TryGetProperty(WireMarkers.Ts, out var ts)
             && ts.ValueKind == JsonValueKind.Number
             && ts.TryGetInt64(out var ms)
-            && ms is >= TsMinMs and <= TsMaxMs)
+            && ms is >= WireMarkers.TsMinMs and <= WireMarkers.TsMaxMs)
         {
             return DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
         }
         if (singleKey
-            && e.TryGetProperty("$bytes", out var bytes)
+            && e.TryGetProperty(WireMarkers.Bytes, out var bytes)
             && bytes.ValueKind == JsonValueKind.Array)
         {
             var b = new byte[bytes.GetArrayLength()];
@@ -2153,7 +2163,7 @@ public sealed class DocsqlDataReader : DbDataReader
         // double constants so GetDouble works instead of handing the caller
         // the raw marker string.
         if (singleKey
-            && e.TryGetProperty("$float", out var f)
+            && e.TryGetProperty(WireMarkers.Float, out var f)
             && f.ValueKind == JsonValueKind.String)
         {
             return f.GetString() switch

@@ -5,56 +5,20 @@ pub(super) fn window_tmp_col(i: usize) -> String {
 }
 
 /// Running (prefix-frame) fold for aggregate OVER with the default frame.
-/// Mirrors `eval_agg`'s Agg arm exactly — same left-to-right evaluation
-/// order, same FILTER/NULL/DISTINCT handling, same tie rules, same AVG
-/// decimal-mode selection — so each snapshot equals the batch aggregate
-/// evaluated over the frame ending at the current peer run, while the whole
-/// partition costs O(n) evaluations instead of O(n²) re-folds.
+/// A thin driver over the shared [`AggState`](super::agg::AggState) — the
+/// semantics (FILTER/NULL/DISTINCT handling, tie rules, AVG decimal-mode
+/// selection) are the batch evaluator's by construction, not by hand
+/// mirror, so each snapshot equals the batch aggregate evaluated over the
+/// frame ending at the current peer run while the whole partition costs
+/// O(n) evaluations instead of O(n²) re-folds.
 pub(super) struct RunningAgg {
-    op: AggOp,
-    sep: Option<String>,
-    distinct: bool,
-    seen: std::collections::BTreeSet<Vec<u8>>,
-    /// COUNT(*): the arg is the `__count__` sentinel — count rows, not
-    /// non-null arg values.
-    count_star: bool,
-    /// Rows passing FILTER (COUNT(*) counts them even when the arg is NULL).
-    kept: i64,
-    /// Non-null, post-DISTINCT argument values (COUNT(x); SUM/AVG empty).
-    nonnull: i64,
-    sum: Option<Value>,
-    /// AVG exact-decimal mode flips on permanently at the first Decimal
-    /// input (batch AVG picks its mode from the whole frame); the pre-flip
-    /// prefix stays buffered for the one-time exact conversion.
-    avg_dec_mode: bool,
-    avg_vals: Vec<Value>,
-    avg_dec: Decimal,
-    avg_f64: f64,
-    min: Option<Value>,
-    max: Option<Value>,
-    concat: String,
-    concat_any: bool,
+    st: AggState,
 }
 
 impl RunningAgg {
     pub(super) fn new(op: AggOp, sep: Option<String>, distinct: bool, count_star: bool) -> Self {
         Self {
-            op,
-            sep,
-            distinct,
-            seen: std::collections::BTreeSet::new(),
-            count_star,
-            kept: 0,
-            nonnull: 0,
-            sum: None,
-            avg_dec_mode: false,
-            avg_vals: Vec::new(),
-            avg_dec: Decimal::ZERO,
-            avg_f64: 0.0,
-            min: None,
-            max: None,
-            concat: String::new(),
-            concat_any: false,
+            st: AggState::new(op, sep, count_star, distinct),
         }
     }
 
@@ -63,122 +27,18 @@ impl RunningAgg {
     /// evaluated, matching the batch evaluator's filter-first order).
     pub(super) fn push_row(&mut self, kept: bool, argval: Option<&Value>) -> Result<()> {
         if kept {
-            self.kept += 1;
+            self.st.note_kept();
         }
         let Some(argval) = argval else {
             return Ok(());
         };
-        if matches!(argval, Value::Null) {
-            return Ok(());
-        }
-        if self.distinct
-            && !self
-                .seen
-                .insert(encode::encode_to_vec(argval).map_err(SqlError::Encode)?)
-        {
-            return Ok(());
-        }
-        self.nonnull += 1;
-        match self.op {
-            AggOp::Count => {}
-            AggOp::Sum => {
-                let next = match self.sum.take() {
-                    None => add_values(Value::Int(0), argval.clone())?,
-                    Some(s) => add_values(s, argval.clone())?,
-                };
-                self.sum = Some(next);
-            }
-            AggOp::Avg => match argval {
-                Value::Decimal(d) => {
-                    if !self.avg_dec_mode {
-                        self.avg_dec_mode = true;
-                        self.avg_dec = Decimal::ZERO;
-                        for v in std::mem::take(&mut self.avg_vals) {
-                            self.avg_dec = self
-                                .avg_dec
-                                .checked_add(as_decimal(&v)?)
-                                .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
-                        }
-                    }
-                    self.avg_dec = self
-                        .avg_dec
-                        .checked_add(*d)
-                        .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
-                }
-                other => {
-                    if self.avg_dec_mode {
-                        self.avg_dec = self
-                            .avg_dec
-                            .checked_add(as_decimal(other)?)
-                            .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
-                    } else {
-                        self.avg_vals.push(other.clone());
-                        self.avg_f64 += match other {
-                            Value::Int(i) => *i as f64,
-                            Value::Float(f) => *f,
-                            _ => return err("AVG of non-numeric"),
-                        };
-                    }
-                }
-            },
-            AggOp::Min => match &self.min {
-                // Ties keep the first value, exactly like the batch reduce.
-                Some(m) if Value::cmp_values(m, argval) != std::cmp::Ordering::Greater => {}
-                _ => self.min = Some(argval.clone()),
-            },
-            AggOp::Max => match &self.max {
-                Some(m) if Value::cmp_values(m, argval) != std::cmp::Ordering::Less => {}
-                _ => self.max = Some(argval.clone()),
-            },
-            AggOp::GroupConcat => {
-                // The separator must precede every element after the FIRST
-                // pushed one (an element rendering as "" still counts).
-                if self.concat_any {
-                    self.concat.push_str(self.sep.as_deref().unwrap_or(","));
-                } else {
-                    self.concat_any = true;
-                }
-                self.concat.push_str(&value_to_text(argval));
-            }
-        }
-        Ok(())
+        self.st.push(argval)
     }
 
     /// Value of the aggregate over everything folded so far — the frame
     /// ending at the current peer run.
     pub(super) fn snapshot(&self) -> Value {
-        match self.op {
-            AggOp::Count => Value::Int(if self.count_star {
-                self.kept
-            } else {
-                self.nonnull
-            }),
-            AggOp::Sum => self.sum.clone().unwrap_or(Value::Null),
-            AggOp::Avg => {
-                if self.nonnull == 0 {
-                    Value::Null
-                } else if self.avg_dec_mode {
-                    match self.avg_dec.checked_div(Decimal::from(self.nonnull)) {
-                        Some(d) => Value::Decimal(d),
-                        None => Value::Null,
-                    }
-                } else {
-                    Value::Float(self.avg_f64 / self.nonnull as f64)
-                }
-            }
-            AggOp::Min => self.min.clone().unwrap_or(Value::Null),
-            AggOp::Max => self.max.clone().unwrap_or(Value::Null),
-            // Zero contributing rows (or an all-NULL frame) is NULL, not the
-            // empty string — the batch reduce keeps the same contract and
-            // IS NULL checks depend on it.
-            AggOp::GroupConcat => {
-                if self.concat_any {
-                    Value::Str(self.concat.clone())
-                } else {
-                    Value::Null
-                }
-            }
-        }
+        self.st.snapshot()
     }
 }
 
@@ -500,7 +360,7 @@ pub(super) fn check_window_columns(
     match e {
         // `__count__` is the COUNT(*) sentinel (never a real column); T-SQL
         // `@var` names get their own loud refusal inside eval_expr.
-        SqlExpr::Identifier(i) if i.value != "__count__" && !i.value.starts_with('@') => {
+        SqlExpr::Identifier(i) if i.value != COUNT_STAR_SENTINEL && !i.value.starts_with('@') => {
             if resolvable(&i.value) {
                 Ok(())
             } else {
@@ -575,7 +435,7 @@ pub(super) fn check_window_columns(
             // a bare datepart keyword (`DATEDIFF(day, a, b)`), never a
             // column reference — validating it as a column would reject
             // every windowed DATEDIFF/DATEADD.
-            let fname = f.name.to_string().to_uppercase();
+            let fname = func_upper(&f.name.to_string());
             let skip_first = takes_datepart_name(&fname);
             let mut first_unnamed = true;
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {

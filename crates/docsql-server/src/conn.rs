@@ -1,5 +1,31 @@
 use super::*;
 
+/// @@ERROR/@@ROWCOUNT/@@IDENTITY bookkeeping shared by the REQ_SQL and
+/// REQ_EXECUTE fast paths — the three hand-copied blocks used to drift
+/// (the EXECUTE arm once skipped both the view rewrite and this
+/// bookkeeping). `is_insert` feeds @@IDENTITY; the read tier passes false.
+fn note_session_outcome(
+    tsql_session: &mut docsql_core::tsql_batch::TsqlSession,
+    resp: &Frame,
+    rowcount: u64,
+    identity: Option<i64>,
+    is_insert: bool,
+) {
+    if is_insert {
+        tsql_session.note_identity(identity.map(docsql_core::Value::Int));
+    }
+    if resp.frame_type == proto::RESP_ERROR {
+        tsql_session.note_error(docsql_core::tsql_batch::error_code_from_text(
+            &String::from_utf8_lossy(&resp.payload),
+        ));
+    } else {
+        // T-SQL refreshes @@ERROR per statement: a success must zero a stale
+        // code from an earlier failed statement in the same batch.
+        tsql_session.note_error(0);
+    }
+    tsql_session.note_rowcount(rowcount);
+}
+
 pub async fn handle_connection(
     stream: tls::BoxConn,
     peer: String,
@@ -881,6 +907,7 @@ pub async fn handle_connection(
                         ))
                     }
                 }
+
                 proto::REQ_SQL if authed => {
                     // Grants were refreshed above, before the frame gates.
                     let started = std::time::Instant::now();
@@ -1050,19 +1077,16 @@ pub async fn handle_connection(
                                         // statements too (it used to leave
                                         // the last interpreted statement's
                                         // values in place).
-                                        if resp.frame_type == proto::RESP_ERROR {
-                                            tsql_session.note_error(
-                                                docsql_core::tsql_batch::error_code_from_text(
-                                                    &String::from_utf8_lossy(&resp.payload),
-                                                ),
-                                            );
-                                        } else {
-                                            tsql_session.note_error(0);
-                                        }
-                                        tsql_session.note_rowcount(rowcount);
+                                        note_session_outcome(
+                                            &mut tsql_session,
+                                            &resp,
+                                            rowcount,
+                                            None,
+                                            false,
+                                        );
                                         resp
                                     } else {
-                                        let (resp, identity) = execute_sql_with_identity(
+                                        let (resp, identity, rowcount) = execute_sql_with_identity(
                                             &state,
                                             &effective,
                                             allow_system,
@@ -1089,27 +1113,13 @@ pub async fn handle_connection(
                                         // later batch sees this statement's
                                         // effects.
                                         if !is_replication {
-                                            if docsql_core::tsql_batch::is_insert_statement(
-                                                &effective,
-                                            ) {
-                                                tsql_session.note_identity(
-                                                    identity.map(docsql_core::Value::Int),
-                                                );
-                                            }
-                                            if resp.frame_type == proto::RESP_ERROR {
-                                                tsql_session.note_error(
-                                                    docsql_core::tsql_batch::error_code_from_text(
-                                                        &String::from_utf8_lossy(&resp.payload),
-                                                    ),
-                                                );
-                                            } else {
-                                                // T-SQL:每条语句都刷新
-                                                // @@ERROR,成功归零 —— 不然
-                                                // 批内失败后紧跟的快路径
-                                                // 成功语句留下 stale 错误码。
-                                                tsql_session.note_error(0);
-                                            }
-                                            tsql_session.note_rowcount(resp_row_count(&resp));
+                                            note_session_outcome(
+                                                &mut tsql_session,
+                                                &resp,
+                                                rowcount,
+                                                identity,
+                                                docsql_core::tsql_batch::is_insert_statement(&effective),
+                                            );
                                         }
                                         resp
                                     }
@@ -1243,9 +1253,9 @@ pub async fn handle_connection(
                                 role == ConnRole::ReadOnly,
                             ) {
                                 // 读日志的查询本身不写日志(避免读日志刷日志)。
-                                Some(f) => ((f, None), false),
+                                Some(f) => ((f, None, 0u64), false),
                                 None if read_eligible => {
-                                    let (f, _rc) = execute_read_sql(
+                                    let (f, rc) = execute_read_sql(
                                         &state,
                                         &sql,
                                         deadline,
@@ -1253,10 +1263,7 @@ pub async fn handle_connection(
                                         &mut exec_logged_sql,
                                     )
                                     .await;
-                                    // The row count is consumed below via
-                                    // resp_row_count, same as the REQ_SQL
-                                    // fast path.
-                                    ((f, None), true)
+                                    ((f, None, rc), true)
                                 }
                                 None => (
                                     execute_sql_with_identity(
@@ -1275,36 +1282,21 @@ pub async fn handle_connection(
                                     true,
                                 ),
                             };
-                            let (resp, identity) = resp;
+                            let (resp, identity, rowcount) = resp;
                             if logged && !is_repl {
                                 // @@ERROR/@@ROWCOUNT parity with the REQ_SQL
                                 // fast paths (a failed EXECUTE used to leave
                                 // the previous statement's code/current
                                 // count in place).
-                                if resp.frame_type == proto::RESP_ERROR {
-                                    tsql_session.note_error(
-                                        docsql_core::tsql_batch::error_code_from_text(
-                                            &String::from_utf8_lossy(&resp.payload),
-                                        ),
-                                    );
-                                } else {
-                                    tsql_session.note_error(0);
-                                }
-                                tsql_session.note_rowcount(resp_row_count(&resp));
+                                note_session_outcome(
+                                    &mut tsql_session,
+                                    &resp,
+                                    rowcount,
+                                    identity,
+                                    docsql_core::tsql_batch::is_insert_statement(&sql),
+                                );
                             }
                             session.finish_statement();
-                            // Same session bookkeeping as the REQ_SQL fast
-                            // path: a parameterized INSERT owns the
-                            // connection's @@IDENTITY/SCOPE_IDENTITY, and a
-                            // later batch must see this statement's effects
-                            // (it used to keep the previous fast-path
-                            // INSERT's id).
-                            if logged
-                                && !is_repl
-                                && docsql_core::tsql_batch::is_insert_statement(&sql)
-                            {
-                                tsql_session.note_identity(identity.map(docsql_core::Value::Int));
-                            }
                             if logged {
                                 querylog::record(
                                     &state,
@@ -1578,5 +1570,8 @@ pub async fn handle_connection(
 /// connection holds open before erroring. The engine supports one global
 /// transaction; without the queue, concurrent EF contexts (one connection
 /// each, SaveChanges wraps in BEGIN..COMMIT) would fail on collision.
-pub(crate) const BEGIN_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 30s cross-connection transaction wait: one constant shared with the
+/// FFI embedded gate (two hand copies used to drift).
+pub(crate) const BEGIN_QUEUE_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(docsql_core::TX_QUEUE_WAIT_MS);
 pub(crate) const BEGIN_QUEUE_POLL: std::time::Duration = std::time::Duration::from_millis(5);

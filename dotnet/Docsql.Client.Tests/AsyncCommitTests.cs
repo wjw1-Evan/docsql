@@ -7,33 +7,8 @@ using Xunit;
 
 public sealed class AsyncCommitTests
 {
-    private static (Process Proc, int Port) StartServer()
-    {
-        using var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-        l.Start();
-        var port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        var exe = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory, "..", "..", "..", "..", "..", "target", "debug", "docsql-server"));
-        Assert.True(File.Exists(exe), $"server binary not found at {exe}");
-        var db = Path.Combine(Path.GetTempPath(), $"docsql-async-{port}.db");
-        try { File.Delete(db); } catch { }
-        var psi = new ProcessStartInfo
-        {
-            FileName = exe, ArgumentList = { db, $"127.0.0.1:{port}" },
-            CreateNoWindow = true, RedirectStandardError = false,
-        };
-        psi.Environment["DOCSQL_ASYNC_COMMIT"] = "1";
-        var proc = Process.Start(psi)!;
-        var up = false;
-        for (var i = 0; i < 100; i++)
-        {
-            try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", port); up = true; break; }
-            catch { Thread.Sleep(50); }
-        }
-        if (!up) throw new InvalidOperationException($"server on port {port} never came up");
-        return (proc, port);
-    }
+    private static (Process Proc, int Port) StartServer() =>
+        TestServers.Start("async", psi => psi.Environment["DOCSQL_ASYNC_COMMIT"] = "1");
 
     [Fact]
     public void Concurrent_writes_all_visible_under_async_commit()

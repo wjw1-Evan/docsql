@@ -115,30 +115,19 @@ public sealed class TransportEncryptionTests
     {
         // 两个节点都启用同一把 DOCSQL_KEY:节点间复制帧同样加密。
         // 先定 b 的端口,a 的 DOCSQL_PEERS 指向 b。
-        using var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-        l.Start();
-        var bPort = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
+        var bPort = TestServers.FreePort();
         using var a = TlsServer.Start(peers: $"127.0.0.1:{bPort}");
-        var exe = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory, "..", "..", "..", "..", "..", "target", "debug", "docsql-server"));
         var db = Path.Combine(Path.GetTempPath(), $"docsql-tlsb-{bPort}.db");
         var psi = new ProcessStartInfo
         {
-            FileName = exe, ArgumentList = { db, $"127.0.0.1:{bPort}" },
+            FileName = TestServers.FindServer(), ArgumentList = { db, $"127.0.0.1:{bPort}" },
             CreateNoWindow = true, RedirectStandardError = false,
         };
         psi.Environment["DOCSQL_KEY"] = TlsServer.KeyHex;
         using var b = Process.Start(psi)!;
         try
         {
-            var up = false;
-            for (var i = 0; i < 100; i++)
-            {
-                try { using var _ = new System.Net.Sockets.TcpClient("127.0.0.1", bPort); up = true; break; }
-                catch { Thread.Sleep(50); }
-            }
-            if (!up) throw new InvalidOperationException($"replica on port {bPort} never came up");
+            TestServers.WaitReady(bPort, "replica");
 
             // 通过 a(带 key)写入,b 同样用 key 连接读到复制数据
             Scalar(a.Cs, "CREATE TABLE esync (v INT)");

@@ -236,7 +236,7 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
         // TLS path drives hyper's connection builder per accepted stream.
         Some(tls) => {
             let acceptor = load_tls_acceptor(&tls)?;
-            let shutdown = shutdown_signal();
+            let shutdown = docsql_server::shutdown_signal();
             tokio::pin!(shutdown);
             // Connection handles for the shutdown drain (pruned so a
             // long-lived console does not accumulate finished entries).
@@ -348,7 +348,7 @@ pub async fn run(cfg: WebConfig, listen: &str) -> std::io::Result<()> {
             // Graceful shutdown: SIGTERM/SIGINT stop the listener; in-flight
             // requests finish before the process exits (container
             // orchestrators impose their own stop timeout on top).
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(docsql_server::shutdown_signal())
             .await
             .map_err(std::io::Error::other)
         }
@@ -377,17 +377,6 @@ fn load_tls_acceptor(tls: &TlsConfig) -> std::io::Result<tokio_rustls::TlsAccept
         std::path::Path::new(&tls.cert_path),
         std::path::Path::new(&tls.key_path),
     )
-}
-
-/// Resolve when the process is asked to terminate (SIGTERM / SIGINT).
-async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
-    }
 }
 
 /// Every response leaves the API uncacheable: payloads carry
@@ -1480,20 +1469,12 @@ async fn api_parse(
 //   * 表名:双引号标识符,内部 " 双写转义(表名可为任意 Unicode)。
 // 其余输入一律拒绝。读侧仅运行四条固定 SELECT。
 
-/// 用户/角色名的字符集白名单(镜像引擎校验,前端给出友好错误)。
-/// 长度按字符数:白名单本就只收 ASCII(此时与字节数一致),非 ASCII 名
-/// 走字符集分支报错,不会再拿「22 个汉字 = 66 字节」去撞长度上限。
+/// 用户/角色名的字符集白名单:直接复用引擎的同一份规则
+/// (docsql_core::useradmin::valid_username)——镜像曾被手写,字符集一旦
+/// 漂移就会接受引擎自己拒绝的名字。白名单本就只收 ASCII,长度按字符与
+/// 按字节一致。
 fn valid_user_ident(name: &str) -> bool {
-    let n = name.chars().count();
-    if n == 0 || n > 64 {
-        return false;
-    }
-    name.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    docsql_core::useradmin::valid_ident(name)
 }
 
 fn sql_str_lit(s: &str) -> String {
@@ -2236,7 +2217,7 @@ const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const NODE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// Mirrors the server's inbound frame cap (64 MiB) so large result sets
 /// round-trip untruncated.
-const NODE_RECV_CAP: usize = 64 * 1024 * 1024;
+const NODE_RECV_CAP: usize = docsql_core::proto::MAX_FRAME_BYTES;
 
 async fn node_write_frame(
     stream: &mut docsql_server::tls::BoxConn,

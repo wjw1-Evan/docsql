@@ -26,36 +26,16 @@ ctr_of() {
     *)       echo docsql-c ;;
   esac
 }
-PASS=0; FAIL=0
-ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
-bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
+source "$(dirname "$0")/lib.sh"
 
-sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$(ctr_of "$1")" docsql-cli connect "$1" 2>&1; }
+sql()   { sql_on "$(ctr_of "$1")" "$1" "$2"; }
 # 事务必须在同一会话内执行:BEGIN 的连接拥有该事务,连接断开即回滚,
 # 外来连接的写也不会并入它。
-sqltx() { local a="$1"; shift; { printf '%s\n' "$@"; echo "exit;"; } | docker exec -i "$(ctr_of "$a")" docsql-cli connect "$a" 2>&1; }
+sqltx() { local a="$1"; shift; sqltx_on "$(ctr_of "$a")" "$a" "$@"; }
 
-# wait_row <node> <sql> <ERE pattern>: poll until the query output matches.
-wait_row() {
-  local out=""
-  for _ in $(seq 1 40); do
-    out=$(sql "$1" "$2")
-    echo "$out" | grep -qE "$3" && break
-    sleep 0.5
-  done
-  echo "$out" | grep -qE "$3"
-}
-
-# absent <node> <sql> <ERE pattern>: poll and require the query to keep
-# returning no match — for writes that will never arrive (no catch-up).
-absent() {
-  for _ in $(seq 1 6); do
-    out=$(sql "$1" "$2")
-    echo "$out" | grep -qE "$3" && return 1
-    sleep 0.5
-  done
-  return 0
-}
+# wait_row / absent 的判定在 lib.sh;这里保留节点寻址包装。
+wait_row() { wait_row_on "$(ctr_of "$1")" "$1" "$2" "$3"; }
+absent()   { absent_on "$(ctr_of "$1")" "$1" "$2" "$3"; }
 
 echo "== 1. node-a accepts SQL writes =="
 out=$(sql "$A" "CREATE TABLE nodes (id INT PRIMARY KEY, host TEXT);")
@@ -80,15 +60,15 @@ wait_row "$A" "SELECT id FROM nodes WHERE id = 4;" "^[[:space:]]*4[[:space:]]*$"
 wait_row "$B" "SELECT id FROM nodes WHERE id = 4;" "^[[:space:]]*4[[:space:]]*$" && ok "b sees c's write" || bad "b missing c's row"
 
 echo "== 5. transactions over the wire (node-b) =="
-before=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+before=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | num)
 sqltx "$B" "BEGIN;" "INSERT INTO nodes VALUES (10, 'tx');" "ROLLBACK;" >/dev/null
-after=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+after=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | num)
 [ "$before" = "$after" ] && ok "rollback over network (count $before == $after)" || bad "tx rollback: $before != $after"
 
 echo "== 6. convergence: all nodes agree =="
-ca=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
-cb=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
-cc=$(sql "$C" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+ca=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | num)
+cb=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | num)
+cc=$(sql "$C" "SELECT COUNT(id) FROM nodes;" | num)
 [ "$ca" = "$cb" ] && [ "$cb" = "$cc" ] && ok "row count converged: a=$ca b=$cb c=$cc" || bad "divergence: a=$ca b=$cb c=$cc"
 
 echo "== 7. web console in docker =="
@@ -161,16 +141,12 @@ grep -q "\[pubsub\] message $ch #" "$tmp" && grep -q "hello-from-b" "$tmp" \
   && ok "a receives b's publish live" || bad "live push: $(cat "$tmp")"
 
 # 8.2 复制的消息在第三节点也持久化(docsql_pubsub 视图)。
-n=$(sql "$C" "SELECT COUNT(*) FROM docsql_pubsub;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+n=$(sql "$C" "SELECT COUNT(*) FROM docsql_pubsub;" | num)
 [ -n "$n" ] && [ "$n" -ge 1 ] && ok "c persisted the replicated message (count=$n)" || bad "c pubsub store count: '$n'"
 
 # 8.3 重启 node-a 后 from=earliest 仍能回放(WAL 持久化)。
 docker restart docsql-a >/dev/null
-up=""
-for _ in $(seq 1 40); do
-  sql "$A" "SELECT 1;" >/dev/null 2>&1 && { up=1; break; }
-  sleep 0.5
-done
+wait_ready "$(ctr_of "$A")" "$A" 40 0.5 && up=1 || up=""
 if [ -n "$up" ]; then
   tmp2=$(mktemp)
   ( printf "subscribe %s earliest;\n" "$ch"; sleep 2; printf "exit;\n" ) \
@@ -201,11 +177,7 @@ wait_row "$A" "SELECT id FROM nodes WHERE id = 21;" "^[[:space:]]*21[[:space:]]*
 
 # 9.3 c 重新上线,等协议端口就绪。
 docker start docsql-c >/dev/null
-up=""
-for _ in $(seq 1 40); do
-  sql "$C" "SELECT 1;" >/dev/null 2>&1 && { up=1; break; }
-  sleep 0.5
-done
+wait_ready "$(ctr_of "$C")" "$C" 40 0.5 && up=1 || up=""
 [ -n "$up" ] && ok "c back online after restart" || bad "c did not come back"
 
 # 9.4 c 保留离线前的数据(重启只掉内存,盘上状态完好)。
@@ -327,7 +299,7 @@ echo "== 11. auto-GUID primary keys converge across nodes =="
 # 随机 GUID 不能像 INT AUTOINCREMENT 的 max+1 那样在对端确定性重算:
 # 写入节点必须把生成的 id 定值下发给对等节点(引擎回写显式值的 INSERT)。
 # UUIDv7 形态:小写十六进制,版本位 '7',变体位 8/9/a/b。
-UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+# UUID_RE 来自 lib.sh
 out=$(sql "$A" "CREATE TABLE gdocs (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT);")
 echo "$out" | grep -q "rows affected" && ok "create guid table on a" || bad "create guid table on a: $out"
 out=$(sql "$A" "INSERT INTO gdocs (v) VALUES ('origin');")
@@ -429,9 +401,9 @@ wait_row_c "SELECT id FROM nodes WHERE id = 41;" "^[[:space:]]*41[[:space:]]*$" 
 # 12.5 收敛:d 与 a/b 行数一致。c 在第 9-10 章离线/分区期间的分歧已由
 #      9.5/10.5 的重连修复(反熵 repair)收敛,但等值断言刻意保持保守
 #      (a=b=d 已覆盖 join 语义;d 的历史来自 a 的快照加加入后的全网写)。
-ca=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
-cb=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
-cd_=$(sqld "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+ca=$(sql "$A" "SELECT COUNT(id) FROM nodes;" | num)
+cb=$(sql "$B" "SELECT COUNT(id) FROM nodes;" | num)
+cd_=$(sqld "SELECT COUNT(id) FROM nodes;" | num)
 [ "$ca" = "$cb" ] && [ "$cb" = "$cd_" ] \
   && ok "joined mesh converged: a=$ca b=$cb d=$cd_" || bad "divergence: a=$ca b=$cb d=$cd_"
 
@@ -443,7 +415,7 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 if [ -n "$up" ]; then
-  out=$(sqld "SELECT COUNT(id) FROM nodes;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+  out=$(sqld "SELECT COUNT(id) FROM nodes;" | num)
   [ "$out" = "$cd_" ] && ok "d retains synced data across restart ($out rows)" || bad "d lost data on restart: $out != $cd_"
   out=$(sql "$A" "INSERT INTO nodes VALUES (42, 'post-d-restart');")
   wait_row_d "SELECT id FROM nodes WHERE id = 42;" "^[[:space:]]*42[[:space:]]*$" \

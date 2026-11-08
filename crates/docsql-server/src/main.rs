@@ -251,16 +251,7 @@ fn config_from_env(
     // Startup-fail-fast only; the consumer is docsql_core::kdf's once-read
     // override (test suites lower it to keep auth-path e2e meaningful).
     if let Some(raw) = getenv("DOCSQL_PBKDF2_ITERATIONS") {
-        let n: u64 = raw
-            .trim()
-            .parse()
-            .map_err(|_| "DOCSQL_PBKDF2_ITERATIONS must be an integer".to_string())?;
-        if n == 0 || n > docsql_core::kdf::MAX_PBKDF2_ITERATIONS as u64 {
-            return Err(format!(
-                "DOCSQL_PBKDF2_ITERATIONS must be 1..={}",
-                docsql_core::kdf::MAX_PBKDF2_ITERATIONS
-            ));
-        }
+        let n = docsql_core::kdf::validate_pbkdf2_iterations(&raw)?;
         if n < 10_000 {
             eprintln!(
                 "warning: DOCSQL_PBKDF2_ITERATIONS={n} is far below the 210000 default — \
@@ -431,16 +422,7 @@ fn env_num<T: std::str::FromStr>(
 /// CR/space in a .env used to make `DOCSQL_READ_ONLY=1␍` read as false —
 /// fail-open on a security flag.
 fn env_bool(name: &str, getenv: &impl Fn(&str) -> Option<String>) -> Result<bool, String> {
-    match getenv(name) {
-        Some(v) if !v.trim().is_empty() => match v.trim() {
-            "1" | "true" => Ok(true),
-            "0" | "false" => Ok(false),
-            other => Err(format!(
-                "{name}: invalid boolean value {other:?} (expected 1/0/true/false)"
-            )),
-        },
-        _ => Ok(false),
-    }
+    docsql_core::envx::env_bool(name, getenv(name))
 }
 
 #[cfg(test)]

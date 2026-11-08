@@ -1,5 +1,9 @@
 use super::*;
 
+/// COUNT(*) is parsed into a sentinel identifier that never names a real
+/// column; every producer/consumer of the rewrite shares this one spelling.
+pub(super) const COUNT_STAR_SENTINEL: &str = "__count__";
+
 #[derive(Clone)]
 pub(super) enum AggOp {
     Count,
@@ -49,7 +53,7 @@ pub(super) fn agg_parts(
     f: &sqlparser::ast::Function,
     for_window: bool,
 ) -> Result<(AggOp, SqlExpr, bool, Option<String>, Option<SqlExpr>)> {
-    let fname = f.name.to_string().to_uppercase();
+    let fname = func_upper(&f.name.to_string());
     // A window frame silently changes the result shape (one row per
     // partition); refusing is better than returning wrong numbers.
     if f.over.is_some() && !for_window {
@@ -91,7 +95,9 @@ pub(super) fn agg_parts(
             };
             let inner = list.args.first().and_then(|a| match a {
                 sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
-                    Some(SqlExpr::Identifier(sqlparser::ast::Ident::new("__count__")))
+                    Some(SqlExpr::Identifier(sqlparser::ast::Ident::new(
+                        COUNT_STAR_SENTINEL,
+                    )))
                 }
                 other => as_expr(other),
             });
@@ -103,15 +109,8 @@ pub(super) fn agg_parts(
     let Some(arg) = inner else {
         return err(format!("unsupported aggregate arguments: {fname}"));
     };
-    let op = match fname.as_str() {
-        // COUNT_BIG is T-SQL's COUNT returning bigint; same semantics here.
-        "COUNT" | "COUNT_BIG" => AggOp::Count,
-        "SUM" => AggOp::Sum,
-        "AVG" => AggOp::Avg,
-        "MIN" => AggOp::Min,
-        "MAX" => AggOp::Max,
-        "GROUP_CONCAT" | "STRING_AGG" => AggOp::GroupConcat,
-        other => return err(format!("unknown function: {other}")),
+    let Some(op) = parse_agg_name(f) else {
+        return err(format!("unknown function: {fname}"));
     };
     let sep = if matches!(op, AggOp::GroupConcat) {
         match second {
@@ -159,6 +158,192 @@ pub(super) fn add_values(a: Value, b: Value) -> Result<Value> {
         (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + y as f64)),
         (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x + y)),
         _ => err("SUM of non-numeric values"),
+    }
+}
+
+/// The ONE aggregate fold (SUM/AVG/MIN/MAX/COUNT/GROUP_CONCAT) behind the
+/// batch evaluator ([`eval_agg`]'s Agg arm), PIVOT's cell reducer and the
+/// window [`RunningAgg`] — the three used to hand-mirror the same
+/// semantics (AVG's exact-decimal mode flip, the `cmp_values` tie rules
+/// keeping the FIRST value, the NULL contracts) in three places, and the
+/// mirrors had already drifted (PIVOT's MAX kept the LAST tie via
+/// `max_by`; its SUM folded through `arith` instead of `add_values`).
+/// The batch evaluator is the authoritative shape the other two now ride.
+///
+/// The sliding-frame window aggregate is the deliberate exception: it also
+/// REMOVES rows (an inverse mirror of add with a degraded-refold path),
+/// which this add-only core does not express.
+pub(super) struct AggState {
+    op: AggOp,
+    sep: Option<String>,
+    /// COUNT(*): the arg is the sentinel identifier — count rows, not
+    /// non-null argument values.
+    count_star: bool,
+    distinct: bool,
+    seen: std::collections::BTreeSet<Vec<u8>>,
+    /// Rows passing FILTER (COUNT(*) counts them even when the arg is NULL).
+    kept: i64,
+    /// Non-null, post-DISTINCT argument values (COUNT(x); SUM/AVG empty).
+    nonnull: i64,
+    sum: Option<Value>,
+    /// AVG exact-decimal mode flips on permanently at the first Decimal
+    /// input (batch AVG picks its mode from the whole frame); the pre-flip
+    /// prefix stays buffered for the one-time exact conversion.
+    avg_dec_mode: bool,
+    avg_vals: Vec<Value>,
+    avg_dec: Decimal,
+    avg_f64: f64,
+    min: Option<Value>,
+    max: Option<Value>,
+    concat: String,
+    concat_any: bool,
+}
+
+impl AggState {
+    pub(super) fn new(op: AggOp, sep: Option<String>, count_star: bool, distinct: bool) -> Self {
+        Self {
+            op,
+            sep,
+            count_star,
+            distinct,
+            seen: std::collections::BTreeSet::new(),
+            kept: 0,
+            nonnull: 0,
+            sum: None,
+            avg_dec_mode: false,
+            avg_vals: Vec::new(),
+            avg_dec: Decimal::ZERO,
+            avg_f64: 0.0,
+            min: None,
+            max: None,
+            concat: String::new(),
+            concat_any: false,
+        }
+    }
+
+    /// A row passing FILTER (COUNT(*) counts these even when the argument
+    /// value is NULL or excluded).
+    pub(super) fn note_kept(&mut self) {
+        self.kept += 1;
+    }
+
+    /// Fold one contributing value: NULL is skipped, DISTINCT dedups by
+    /// encoded bytes (an encode failure is loud — a silent default key
+    /// would dedup unrelated values into one).
+    pub(super) fn push(&mut self, v: &Value) -> Result<()> {
+        if matches!(v, Value::Null) {
+            return Ok(());
+        }
+        if self.distinct
+            && !self
+                .seen
+                .insert(encode::encode_to_vec(v).map_err(SqlError::Encode)?)
+        {
+            return Ok(());
+        }
+        self.nonnull += 1;
+        match self.op {
+            AggOp::Count => {}
+            AggOp::Sum => {
+                let next = match self.sum.take() {
+                    // Fold from a numeric zero so a lone value goes through
+                    // add_values' type check too: SUM over a single
+                    // BLOB/text used to return the value itself and only
+                    // errored once a second row arrived.
+                    None => add_values(Value::Int(0), v.clone())?,
+                    Some(s) => add_values(s, v.clone())?,
+                };
+                self.sum = Some(next);
+            }
+            AggOp::Avg => match v {
+                Value::Decimal(d) => {
+                    if !self.avg_dec_mode {
+                        self.avg_dec_mode = true;
+                        self.avg_dec = Decimal::ZERO;
+                        for buffered in std::mem::take(&mut self.avg_vals) {
+                            self.avg_dec = self
+                                .avg_dec
+                                .checked_add(as_decimal(&buffered)?)
+                                .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                        }
+                    }
+                    self.avg_dec = self
+                        .avg_dec
+                        .checked_add(*d)
+                        .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                }
+                other => {
+                    if self.avg_dec_mode {
+                        self.avg_dec = self
+                            .avg_dec
+                            .checked_add(as_decimal(other)?)
+                            .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
+                    } else {
+                        self.avg_vals.push(other.clone());
+                        self.avg_f64 += match other {
+                            Value::Int(i) => *i as f64,
+                            Value::Float(f) => *f,
+                            _ => return err("AVG of non-numeric"),
+                        };
+                    }
+                }
+            },
+            AggOp::Min => match &self.min {
+                // Ties keep the first value, exactly like the batch reduce.
+                Some(m) if Value::cmp_values(m, v) != std::cmp::Ordering::Greater => {}
+                _ => self.min = Some(v.clone()),
+            },
+            AggOp::Max => match &self.max {
+                Some(m) if Value::cmp_values(m, v) != std::cmp::Ordering::Less => {}
+                _ => self.max = Some(v.clone()),
+            },
+            AggOp::GroupConcat => {
+                // The separator must precede every element after the FIRST
+                // pushed one (an element rendering as "" still counts).
+                if self.concat_any {
+                    self.concat.push_str(self.sep.as_deref().unwrap_or(","));
+                } else {
+                    self.concat_any = true;
+                }
+                self.concat.push_str(&value_to_text(v));
+            }
+        }
+        Ok(())
+    }
+
+    /// Value of the aggregate over everything folded so far.
+    pub(super) fn snapshot(&self) -> Value {
+        match self.op {
+            AggOp::Count => Value::Int(if self.count_star {
+                self.kept
+            } else {
+                self.nonnull
+            }),
+            AggOp::Sum => self.sum.clone().unwrap_or(Value::Null),
+            AggOp::Avg => {
+                if self.nonnull == 0 {
+                    Value::Null
+                } else if self.avg_dec_mode {
+                    match self.avg_dec.checked_div(Decimal::from(self.nonnull)) {
+                        Some(d) => Value::Decimal(d),
+                        None => Value::Null,
+                    }
+                } else {
+                    Value::Float(self.avg_f64 / self.nonnull as f64)
+                }
+            }
+            AggOp::Min => self.min.clone().unwrap_or(Value::Null),
+            AggOp::Max => self.max.clone().unwrap_or(Value::Null),
+            // Zero contributing rows (or an all-NULL frame) is NULL, not the
+            // empty string — IS NULL checks depend on it.
+            AggOp::GroupConcat => {
+                if self.concat_any {
+                    Value::Str(self.concat.clone())
+                } else {
+                    Value::Null
+                }
+            }
+        }
     }
 }
 
@@ -219,7 +404,9 @@ pub(super) fn eval_agg(
             filter,
         } => {
             // FILTER applies first: only rows whose predicate is TRUE take
-            // part in DISTINCT and the aggregate.
+            // part in DISTINCT and the aggregate. The fold itself is the
+            // shared AggState — the batch evaluator is its authoritative
+            // shape.
             let kept: Vec<&Object> = match filter {
                 Some(f) => {
                     let mut kept = Vec::with_capacity(docs.len());
@@ -232,107 +419,15 @@ pub(super) fn eval_agg(
                 }
                 None => docs.to_vec(),
             };
-            let mut vals: Vec<Value> = Vec::new();
+            let count_star =
+                matches!(arg, SqlExpr::Identifier(i) if i.value == COUNT_STAR_SENTINEL);
+            let mut st = AggState::new(op.clone(), sep.clone(), count_star, *distinct);
             for d in &kept {
+                st.note_kept();
                 let v = eval_expr(arg, d)?;
-                if !matches!(v, Value::Null) {
-                    vals.push(v);
-                }
+                st.push(&v)?;
             }
-            // DISTINCT aggregates dedup before combining.
-            if *distinct {
-                let mut seen = std::collections::BTreeSet::new();
-                vals.retain(|v| seen.insert(encode::encode_to_vec(v).unwrap_or_default()));
-            }
-            Ok(match op {
-                AggOp::Count => {
-                    // COUNT(*) is rewritten to a sentinel column that never
-                    // exists, so count rows instead of non-null values.
-                    if matches!(arg, SqlExpr::Identifier(i) if i.value == "__count__") {
-                        Value::Int(kept.len() as i64)
-                    } else {
-                        Value::Int(vals.len() as i64)
-                    }
-                }
-                AggOp::Sum => {
-                    if vals.is_empty() {
-                        Value::Null
-                    } else {
-                        // Fold from a numeric zero so a lone value goes
-                        // through add_values' type check too: SUM over a
-                        // single BLOB/text used to return the value itself
-                        // and only erroed once a second row arrived.
-                        let mut sum = Value::Int(0);
-                        for v in vals {
-                            sum = add_values(sum, v)?;
-                        }
-                        sum
-                    }
-                }
-                AggOp::Avg => {
-                    if vals.is_empty() {
-                        Value::Null
-                    } else if vals.iter().any(|v| matches!(v, Value::Decimal(_))) {
-                        // Exact averaging when any input is decimal: sum first
-                        // (exact), then divide once.
-                        let mut acc = Decimal::ZERO;
-                        for v in &vals {
-                            acc = acc
-                                .checked_add(as_decimal(v)?)
-                                .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
-                        }
-                        match acc.checked_div(Decimal::from(vals.len() as i64)) {
-                            Some(d) => Value::Decimal(d),
-                            None => Value::Null,
-                        }
-                    } else {
-                        let n = vals.len() as f64;
-                        let mut acc = 0.0f64;
-                        for v in &vals {
-                            acc += match v {
-                                Value::Int(i) => *i as f64,
-                                Value::Float(f) => *f,
-                                _ => return err("AVG of non-numeric"),
-                            };
-                        }
-                        Value::Float(acc / n)
-                    }
-                }
-                AggOp::Min => vals
-                    .into_iter()
-                    .reduce(|a, b| {
-                        if Value::cmp_values(&a, &b) != std::cmp::Ordering::Greater {
-                            a
-                        } else {
-                            b
-                        }
-                    })
-                    .unwrap_or(Value::Null),
-                AggOp::Max => vals
-                    .into_iter()
-                    .reduce(|a, b| {
-                        if Value::cmp_values(&a, &b) != std::cmp::Ordering::Less {
-                            a
-                        } else {
-                            b
-                        }
-                    })
-                    .unwrap_or(Value::Null),
-                AggOp::GroupConcat => {
-                    // Zero contributing rows (or all-NULL input) is NULL, not
-                    // the empty string — IS NULL checks depend on it.
-                    if vals.is_empty() {
-                        Value::Null
-                    } else {
-                        Value::Str(
-                            vals.iter()
-                                .map(value_to_text)
-                                .collect::<Vec<_>>()
-                                .join(sep.as_deref().unwrap_or(",")),
-                        )
-                    }
-                }
-            })
+            Ok(st.snapshot())
         }
     }
 }
@@ -401,7 +496,7 @@ pub(super) fn expand_grouping_sets(exprs: &[SqlExpr]) -> Result<Vec<Vec<SqlExpr>
             // Inside GROUPING SETS the parser turns ROLLUP/CUBE/GROUPING
             // into function calls; they are still nested super-grouping.
             if let SqlExpr::Function(f) = e {
-                let name = f.name.to_string().to_uppercase();
+                let name = func_upper(&f.name.to_string());
                 if name == "ROLLUP" || name == "CUBE" || name == "GROUPING" {
                     return err("nested grouping sets are not supported");
                 }
@@ -465,11 +560,24 @@ pub(super) fn is_agg_item(item: &SelectItem) -> bool {
 /// True for the aggregate functions the executor knows (`COUNT`/`SUM`/...),
 /// regardless of window usage: the window aggregate path reuses the same
 /// argument parsing.
+/// True for the aggregate functions the executor knows, regardless of window
+/// usage. The single word list: parse (agg dispatch) and the
+/// aggregate-not-allowed guards read the same one.
+pub(super) fn parse_agg_name(f: &sqlparser::ast::Function) -> Option<AggOp> {
+    match func_upper(&f.name.to_string()).as_str() {
+        // COUNT_BIG is T-SQL.s COUNT returning bigint; same semantics here.
+        "COUNT" | "COUNT_BIG" => Some(AggOp::Count),
+        "SUM" => Some(AggOp::Sum),
+        "AVG" => Some(AggOp::Avg),
+        "MIN" => Some(AggOp::Min),
+        "MAX" => Some(AggOp::Max),
+        "GROUP_CONCAT" | "STRING_AGG" => Some(AggOp::GroupConcat),
+        _ => None,
+    }
+}
+
 pub(super) fn is_agg_name(f: &sqlparser::ast::Function) -> bool {
-    matches!(
-        f.name.to_string().to_uppercase().as_str(),
-        "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STRING_AGG"
-    )
+    parse_agg_name(f).is_some()
 }
 
 /// True for the aggregate functions the executor knows (`COUNT`/`SUM`/...).

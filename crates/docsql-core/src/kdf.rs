@@ -19,6 +19,40 @@ pub const PBKDF2_ITERATIONS: u32 = 210_000;
 /// hashed anew, never verified.
 pub const MAX_PBKDF2_ITERATIONS: u32 = 2_000_000;
 
+/// One violation (None = acceptable) for a credential/token string: at
+/// least `min_len` characters and not a single repeated character. The
+/// server's token gate and the web console's password gate used to
+/// re-spell the two rules with different wording; the strength policy is
+/// one rule and lives with the credential machinery.
+pub fn credential_strength_violation(secret: &str, min_len: usize) -> Option<&'static str> {
+    if secret.chars().count() < min_len {
+        return Some("too short");
+    }
+    let mut chars = secret.chars();
+    let first = chars.next().unwrap_or_default();
+    if secret.chars().all(|c| c == first) {
+        return Some("single repeated character");
+    }
+    None
+}
+
+/// Shared `DOCSQL_PBKDF2_ITERATIONS` validation (server + web configs):
+/// integer in 1..=[`MAX_PBKDF2_ITERATIONS`]. The consumer (kdf's once-read
+/// override) applies the value; the startup check exists so a nonsense
+/// value refuses to boot instead of surfacing at first login.
+pub fn validate_pbkdf2_iterations(raw: &str) -> Result<u64, String> {
+    let n: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| "DOCSQL_PBKDF2_ITERATIONS must be an integer".to_string())?;
+    if n == 0 || n > MAX_PBKDF2_ITERATIONS as u64 {
+        return Err(format!(
+            "DOCSQL_PBKDF2_ITERATIONS must be 1..={MAX_PBKDF2_ITERATIONS}"
+        ));
+    }
+    Ok(n)
+}
+
 /// Upper bound for the salt carried in a stored credential (bytes).
 pub const MAX_SALT_LEN: usize = 64;
 

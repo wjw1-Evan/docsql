@@ -449,12 +449,7 @@ internal static partial class SchemaSync
                 if (!created.Add(iname)) continue;
                 // 模型声明降序索引:引擎对 CREATE INDEX ... DESC 显式报错,这里
                 // 静默建 ASC 会得到一个与模型方向相反的索引——显式失败。
-                // IsDescending 在只读优化模型上对"未存储方向"直接抛
-                // InvalidOperationException(EF 契约:该情况即升序),按契约捕获。
-                bool hasDescending;
-                try { hasDescending = index.IsDescending is { } d && d.Any(x => x); }
-                catch (InvalidOperationException) { hasDescending = false; }
-                if (hasDescending)
+                if (HasDescendingIndex(index))
                 {
                     throw new NotSupportedException(
                         $"descending index {iname} is not supported; declare ascending indexes");
@@ -470,8 +465,7 @@ internal static partial class SchemaSync
                     // model dropped IsUnique) keeps rejecting legitimate
                     // duplicate values forever. Drop and recreate either way.
                     if (ExistingIndexSql(conn, table, iname) is { } ddl
-                        && ddl.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase)
-                            != index.IsUnique)
+                        && IsUniqueIndexDdl(ddl) != index.IsUnique)
                     {
                         using var drop = conn.CreateCommand();
                         drop.CommandText = $"DROP INDEX IF EXISTS {Quote(iname)}";
@@ -493,7 +487,7 @@ internal static partial class SchemaSync
         foreach (var existing in ExistingIndexes(conn, table))
         {
             if (wanted.Contains(existing)) continue;
-            if (!existing.StartsWith("IX_", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsEfIndexName(existing)) continue;
             try
             {
                 using var cmd = conn.CreateCommand();

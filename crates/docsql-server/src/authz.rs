@@ -179,17 +179,13 @@ pub const MIN_TOKEN_LEN: usize = 8;
 /// weak secrets (too short, or a single repeated character) at startup so
 /// a deployment cannot ship with a guessable credential.
 pub fn check_token_strength(name: &str, token: &str) -> Result<(), String> {
-    if token.chars().count() < MIN_TOKEN_LEN {
-        return Err(format!(
+    match docsql_core::kdf::credential_strength_violation(token, MIN_TOKEN_LEN) {
+        Some("too short") => Err(format!(
             "{name} is too weak: use at least {MIN_TOKEN_LEN} characters"
-        ));
+        )),
+        Some(_) => Err(format!("{name} is too weak: single repeated character")),
+        None => Ok(()),
     }
-    let mut chars = token.chars();
-    let first = chars.next().unwrap_or_default();
-    if token.chars().all(|c| c == first) {
-        return Err(format!("{name} is too weak: single repeated character"));
-    }
-    Ok(())
 }
 
 /// Per-statement privilege check for username/password connections.

@@ -5,8 +5,13 @@
 
 pub mod bind;
 pub mod btree;
+/// Cross-connection transaction-queue wait (server BEGIN queue, FFI gated
+/// session): one 30s policy, two consumers.
+pub const TX_QUEUE_WAIT_MS: u64 = 30_000;
+
 pub mod encode;
 pub mod engine;
+pub mod envx;
 pub mod guid;
 pub mod heap;
 pub mod json;

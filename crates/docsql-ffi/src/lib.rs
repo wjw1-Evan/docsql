@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 /// Default wait for a transaction held by another connection (matches the
 /// server's 30 s BEGIN queue bound; the .NET caller can shorten it through
 /// its command/read timeout).
-const DEFAULT_WAIT_MS: u64 = 30_000;
+const DEFAULT_WAIT_MS: u64 = docsql_core::TX_QUEUE_WAIT_MS;
 
 /// Opaque session handle handed to C callers.
 pub struct Session {

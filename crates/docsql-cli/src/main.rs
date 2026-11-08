@@ -39,7 +39,7 @@ use docsql_core::value::Value;
 use std::io::{BufRead, Read, Write};
 
 /// Cap on server-advertised frame sizes (mirrors the server's inbound cap).
-const RECV_CAP: usize = 64 * 1024 * 1024;
+const RECV_CAP: usize = docsql_core::proto::MAX_FRAME_BYTES;
 
 /// Row output format (`--csv` / `--json`; default: aligned table).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -965,16 +965,10 @@ impl Outbound {
 /// anything but the documented values errors out instead of silently
 /// dialing plaintext.
 fn tls_env_enabled() -> Result<bool, String> {
-    match std::env::var("DOCSQL_TLS_CONNECT") {
-        Ok(v) if !v.trim().is_empty() => match v.trim() {
-            "1" | "true" => Ok(true),
-            "0" | "false" => Ok(false),
-            other => Err(format!(
-                "DOCSQL_TLS_CONNECT: invalid boolean value {other:?} (expected 1/0/true/false)"
-            )),
-        },
-        _ => Ok(false),
-    }
+    docsql_core::envx::env_bool(
+        "DOCSQL_TLS_CONNECT",
+        std::env::var("DOCSQL_TLS_CONNECT").ok(),
+    )
 }
 
 /// `TcpStream::connect` has no deadline: a firewalled (DROP) target wedges

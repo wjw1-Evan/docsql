@@ -255,19 +255,10 @@ impl<'a> ReadCx<'a> {
         // NEXT form). WITH TIES extends the window to the whole tie run of
         // the last kept row, so it needs an ORDER BY to define the peers.
         if let Some(fetch) = &query.fetch {
-            if fetch.percent {
-                return err("FETCH … PERCENT is not supported");
-            }
             if fetch.with_ties && keys.is_empty() {
                 return err("FETCH … WITH TIES requires ORDER BY");
             }
-            let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
-                Some(Value::Int(n)) if n >= 0 => n as usize,
-                Some(Value::Int(n)) => {
-                    return err(format!("FETCH quantity must be non-negative ({n})"))
-                }
-                Some(_) | None => return err("FETCH quantity must be an integer"),
-            };
+            let n = fetch_row_count(fetch)?;
             if fetch.with_ties && n > 0 && n < rows.len() {
                 let last = &rows[n - 1];
                 let mut end = n;

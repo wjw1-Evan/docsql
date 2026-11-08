@@ -11,14 +11,12 @@ set -u
 # (no host toolchain needed); host ports stay mapped for external access.
 A="node-single:7600"
 CTR="docsql-single"
-PASS=0; FAIL=0
-ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
-bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
+source "$(dirname "$0")/lib.sh"
 
-sql() { printf "%s\nexit;\n" "$2" | docker exec -i "$CTR" docsql-cli connect "$1" 2>&1; }
+sql()   { sql_on "$CTR" "$1" "$2"; }
 # 事务必须在同一会话内执行:BEGIN 的连接拥有该事务,连接断开即回滚,
 # 外来连接的写也不会并入它。
-sqltx() { local a="$1"; shift; { printf '%s\n' "$@"; echo "exit;"; } | docker exec -i "$CTR" docsql-cli connect "$a" 2>&1; }
+sqltx() { local a="$1"; shift; sqltx_on "$CTR" "$a" "$@"; }
 
 echo "== 1. standalone SQL =="
 out=$(sql "$A" "CREATE TABLE solo (id INT PRIMARY KEY, tag TEXT);")
@@ -27,13 +25,13 @@ out=$(sql "$A" "INSERT INTO solo VALUES (1, 'one'), (2, 'two');")
 echo "$out" | grep -q "2 rows affected" && ok "insert 2 rows" || bad "insert: $out"
 out=$(sql "$A" "SELECT id, tag FROM solo WHERE id = 1;")
 echo "$out" | grep -q "one" && ok "select row back" || bad "select: $out"
-out=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+out=$(sql "$A" "SELECT COUNT(id) FROM solo;" | num)
 [ "$out" = "2" ] && ok "count = 2" || bad "count: '$out'"
 
 echo "== 2. transactions (local) =="
-before=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+before=$(sql "$A" "SELECT COUNT(id) FROM solo;" | num)
 sqltx "$A" "BEGIN;" "INSERT INTO solo VALUES (9, 'tx');" "ROLLBACK;" >/dev/null
-after=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+after=$(sql "$A" "SELECT COUNT(id) FROM solo;" | num)
 [ "$before" = "$after" ] && ok "rollback (count $before == $after)" || bad "rollback: $before != $after"
 
 echo "== 3. persistence across container restart =="
@@ -45,7 +43,7 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 [ -n "$up" ] && ok "node back up after restart" || bad "node did not come back"
-out=$(sql "$A" "SELECT COUNT(id) FROM solo;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+out=$(sql "$A" "SELECT COUNT(id) FROM solo;" | num)
 [ "$out" = "2" ] && ok "sql rows survive restart (count = 2)" || bad "rows lost on restart: '$out'"
 
 echo "== 4. web console (:17710) =="
@@ -107,11 +105,7 @@ grep -q "\[pubsub\] message $ch #" "$tmp" && grep -q "solo-msg" "$tmp" \
 
 # 重启后 from=earliest 回放(消息随 WAL 持久化)。
 docker restart "$CTR" >/dev/null
-up=""
-for _ in $(seq 1 60); do
-  sql "$A" "SELECT 1;" >/dev/null 2>&1 && { up=1; break; }
-  sleep 0.5
-done
+wait_ready "$CTR" "$A" 60 0.5 && up=1 || up=""
 if [ -n "$up" ]; then
   ( printf "subscribe %s earliest;\n" "$ch"; sleep 2; printf "exit;\n" ) \
     | docker exec -i "$CTR" docsql-cli connect "$A" >"$tmp" 2>&1
@@ -127,7 +121,7 @@ fi
 rm -f "$tmp"
 
 echo "== 7. auto-GUID primary key (UUIDv7) =="
-UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+# UUID_RE 来自 lib.sh
 out=$(sql "$A" "CREATE TABLE sg (id GUID PRIMARY KEY AUTOINCREMENT, v TEXT);")
 echo "$out" | grep -q "rows affected" && ok "create guid table" || bad "create guid table: $out"
 out=$(sql "$A" "INSERT INTO sg (v) VALUES ('one');")
@@ -143,15 +137,11 @@ L2=$(echo "$out" | grep -n "one" | head -1 | cut -d: -f1)
   && ok "explicit (all-zero) guid sorts first" || bad "guid ordering: $out"
 # 重启后:旧行保留,自动生成继续(catalog 的 autoguid 标志持久化)
 docker restart "$CTR" >/dev/null
-up=""
-for _ in $(seq 1 60); do
-  sql "$A" "SELECT 1;" >/dev/null 2>&1 && { up=1; break; }
-  sleep 0.5
-done
+wait_ready "$CTR" "$A" 60 0.5 && up=1 || up=""
 if [ -n "$up" ]; then
   out=$(sql "$A" "INSERT INTO sg (v) VALUES ('after-restart');")
   G2=$(sql "$A" "SELECT id FROM sg WHERE v = 'after-restart';" | grep -oE "$UUID_RE" | head -1)
-  cnt=$(sql "$A" "SELECT COUNT(id) FROM sg;" | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | head -1 | tr -d " ")
+  cnt=$(sql "$A" "SELECT COUNT(id) FROM sg;" | num)
   [ -n "$G2" ] && [ "$cnt" = "3" ] && ok "autoguid survives restart (still generating, 3 rows)" \
     || bad "autoguid after restart: id='$G2' count='$cnt'"
 else

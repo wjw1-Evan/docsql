@@ -833,7 +833,7 @@ pub(super) fn probe_plan(
         };
         // JSON_EXTRACT(col, '$.p') OP const — or the mirror image.
         let json_side = [left.as_ref(), right.as_ref()].into_iter().find(|e| {
-            matches!(e, SqlExpr::Function(f) if f.name.to_string().to_uppercase() == "JSON_EXTRACT")
+            matches!(e, SqlExpr::Function(f) if func_upper(&f.name.to_string()) == "JSON_EXTRACT")
         });
         if let Some(SqlExpr::Function(f)) = json_side {
             let (Ok((pcol, ppath)), Ok(v)) = (

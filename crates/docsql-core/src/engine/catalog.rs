@@ -321,6 +321,7 @@ impl Database {
                                     constraint_unique,
                                     defaults,
                                     checks,
+                                    check_cache: std::sync::OnceLock::new(),
                                     foreign_keys,
                                     index_roots,
                                     overflow_free,

@@ -21,6 +21,28 @@ namespace Docsql.EntityFrameworkCore;
 
 internal static partial class SchemaSync
 {
+    /// <summary>校验/同步两侧共用的判据(此前在两个文件里手写镜像):
+    /// 模型声明的降序索引、UNIQUE DDL 形状、IX_ 回收前缀。</summary>
+
+    /// <summary>模型声明降序索引?IsDescending 在只读优化模型上对"未存储
+    /// 方向"直接抛 InvalidOperationException(EF 契约:该情况即升序),按
+    /// 同一契约捕获。校验阶段看见降序 ⇒ 回落全量同步(让 SyncIndexes 抛
+    /// 显式错误);同步阶段看见降序 ⇒ 抛 NotSupportedException。</summary>
+    internal static bool HasDescendingIndex(Microsoft.EntityFrameworkCore.Metadata.IIndex index)
+    {
+        try { return index.IsDescending is { } d && d.Any(x => x); }
+        catch (InvalidOperationException) { return false; }
+    }
+
+    /// <summary>DDL 文本是否 UNIQUE 索引(sqlite_master.sql 前缀判定,
+    /// unique 漂移双向可见的同一锚点)。</summary>
+    internal static bool IsUniqueIndexDdl(string? ddl) =>
+        ddl?.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase) == true;
+
+    /// <summary>EF 惯例命名的索引(回收面只认这个前缀,手工索引不动)。</summary>
+    internal static bool IsEfIndexName(string name) =>
+        name.StartsWith("IX_", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
     /// 模型要求的表/列/索引是否都已存在。子集判定:库中多出的表/列/索引不影响
     /// 结果(同步本身只增不减,索引回收另走 SyncIndexes)。
@@ -89,19 +111,7 @@ internal static partial class SchemaSync
                 // 抛 NotSupportedException(红线:DESC 必须响亮报错)。校验阶段
                 // 看不见方向:存量库里同名 ASC 索引会让校验通过、整场同步被
                 // 跳过,降序声明被静默忽略 —— 声明了降序就回落全量同步。
-                // IsDescending 在只读优化模型上对"未存储方向"直接抛
-                // InvalidOperationException(EF 契约:该情况即升序),按
-                // SchemaSync 同一契约捕获。
-                bool hasDescending;
-                try
-                {
-                    hasDescending = index.IsDescending is { } d && d.Any(x => x);
-                }
-                catch (InvalidOperationException)
-                {
-                    hasDescending = false;
-                }
-                if (hasDescending)
+                if (HasDescendingIndex(index))
                 {
                     return false;
                 }
@@ -122,8 +132,13 @@ internal static partial class SchemaSync
         var actualNotNullColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         using (var cmd = conn.CreateCommand())
         {
+            // 只拉模型涉及的表(目录查询收窄):119 实体规模下,每上下文
+            // 两次校验查询不再做全目录扫描。表名是值,按 SQL 字符串转义。
+            var tableFilter = string.Join(", ", expectedTables.Keys.Select(
+                t => "'" + t.Replace("'", "''") + "'"));
             cmd.CommandText =
-                "SELECT table_name, column_name, is_nullable FROM information_schema.columns";
+                "SELECT table_name, column_name, is_nullable FROM information_schema.columns"
+                + $" WHERE table_name IN ({tableFilter})";
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
@@ -171,14 +186,12 @@ internal static partial class SchemaSync
             if (!actualIndexes.TryGetValue(iname, out var actual)) return false;
             // unique 漂移(同名但非 UNIQUE)由 SyncIndexes 以「先删后建」修复,
             // 校验必须看得见,否则约束永远不会被强制。
-            if (expectedUniqueIndexes.Contains(iname)
-                && !actual.Sql.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
+            if (expectedUniqueIndexes.Contains(iname) && !IsUniqueIndexDdl(actual.Sql))
                 return false;
             // 反向漂移:实际仍是 UNIQUE 而模型已取消 IsUnique —— 免迁移
             // 部署的常规操作。校验看不到它,旧约束就永远强制(合法的
             // 重复值写入持续报 UNIQUE 冲突,且每个上下文都判「已收敛」)。
-            if (!expectedUniqueIndexes.Contains(iname)
-                && actual.Sql.TrimStart().StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase))
+            if (!expectedUniqueIndexes.Contains(iname) && IsUniqueIndexDdl(actual.Sql))
                 return false;
             // 表与列序漂移:同名索引换了表/列时 EF 视为同一索引,只有比较
             // sqlite_master 的 SQL 才能发现(否则旧约束永远留着)。
@@ -197,7 +210,7 @@ internal static partial class SchemaSync
         // IX_ 前缀):留在库里即需要整场同步回收。
         foreach (var (name, actual) in actualIndexes)
         {
-            if (name.StartsWith("IX_", StringComparison.OrdinalIgnoreCase)
+            if (IsEfIndexName(name)
                 && expectedTables.ContainsKey(actual.Table)
                 && !expectedIndexes.Contains(name))
                 return false;

@@ -65,7 +65,7 @@ impl docsql_core::tsql_batch::BatchExecutor for BatchPipeExec<'_> {
                 }
             };
             let mut exec_logged_sql: Option<String> = None;
-            let (frame, identity) = execute_sql_with_identity(
+            let (frame, identity, _rowcount) = execute_sql_with_identity(
                 state,
                 &effective,
                 allow_system,
@@ -162,28 +162,6 @@ pub(super) fn exec_result_frame(out: Option<docsql_core::tsql_batch::ExecResult>
     }
 }
 
-/// Rows affected/returned by a response frame, for @@ROWCOUNT bookkeeping
-/// on the fast paths (RESP_AFFECTED carries a LE u64; RESP_ROWS carries the
-/// JSON result whose `rows` array length is the count; anything else is 0).
-pub(super) fn resp_row_count(f: &Frame) -> u64 {
-    if f.frame_type == proto::RESP_AFFECTED {
-        let mut bytes = [0u8; 8];
-        let n = f.payload.len().min(8);
-        bytes[..n].copy_from_slice(&f.payload[..n]);
-        return u64::from_le_bytes(bytes);
-    }
-    if f.frame_type == proto::RESP_ROWS {
-        if let Ok(docsql_core::Value::Object(obj)) =
-            docsql_core::json::from_str(&String::from_utf8_lossy(&f.payload))
-        {
-            if let Some(docsql_core::Value::Array(rows)) = obj.get("rows") {
-                return rows.len() as u64;
-            }
-        }
-    }
-    0
-}
-
 pub(super) fn outcome_frame<E: std::fmt::Display>(
     outcome: std::result::Result<ExecOutcome, E>,
 ) -> Frame {
@@ -203,7 +181,7 @@ pub(super) fn outcome_frame<E: std::fmt::Display>(
             // past it used to emit a frame the client rejects as malformed —
             // the connection then sat with an unread payload. Refuse with an
             // actionable error instead of a protocol failure.
-            if payload.len() > 64 * 1024 * 1024 {
+            if payload.len() > docsql_core::proto::MAX_FRAME_BYTES {
                 return Frame::new(
                     proto::RESP_ERROR,
                     err_payload(

@@ -113,7 +113,7 @@ impl Database {
                 return err("descending indexes (CREATE INDEX ... DESC) are not supported");
             }
             if let SqlExpr::Function(f) = &c.column.expr {
-                let fname = f.name.to_string().to_uppercase();
+                let fname = func_upper(&f.name.to_string());
                 if fname == "JSON_EXTRACT" {
                     if path.is_some() || cols.len() > 1 {
                         return err("a JSON path index is single-column: one JSON_EXTRACT(col, \

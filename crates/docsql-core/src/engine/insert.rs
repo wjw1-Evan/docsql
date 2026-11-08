@@ -1,5 +1,41 @@
 use super::*;
 
+/// The (root_key, key) unique-index candidates of `doc` across every unique
+/// source of the table: constraint columns with a tree (NULL keys never
+/// enter a tree), composite unique specs and predicate-qualified partial
+/// uniques (only when `doc` itself qualifies). One enumeration shared by
+/// the batch-dedup map, the shadow scan and the displacement probe — the
+/// three used to hand-mirror the same triple loop.
+fn unique_key_pairs(
+    doc: &Object,
+    indexed: &[String],
+    composite_uniques: &[&IdxSpec],
+    partial_uniques: &[&IdxSpec],
+) -> Result<Vec<(String, Value)>> {
+    let mut out = Vec::new();
+    for col in indexed {
+        if let Some(v) = doc.get(col).filter(|v| !matches!(v, Value::Null)) {
+            out.push((col.clone(), v.clone()));
+        }
+    }
+    for spec in composite_uniques {
+        if let Some(k) = index_key_of_spec(doc, spec) {
+            out.push((spec.root_key.clone(), k));
+        }
+    }
+    for spec in partial_uniques {
+        if matches!(
+            eval_expr(spec.pred.as_ref().expect("pred set"), doc)?,
+            Value::Bool(true)
+        ) {
+            if let Some(k) = index_key_of_spec(doc, spec) {
+                out.push((spec.root_key.clone(), k));
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl Database {
     pub(super) fn exec_insert(&mut self, insert: sqlparser::ast::Insert) -> Result<ExecOutcome> {
         if insert.output.is_some() {
@@ -429,58 +465,25 @@ impl Database {
             let mut last_at: std::collections::BTreeMap<(String, Vec<u8>), usize> =
                 std::collections::BTreeMap::new();
             for (i, doc) in new_docs.iter().enumerate() {
-                for col in &indexed {
-                    if let Some(k) = doc
-                        .get(col)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .and_then(|v| encode::encode_to_vec(v).ok())
-                    {
-                        last_at.insert((col.clone(), k), i);
-                    }
-                }
-                for spec in &composite_uniques {
-                    if let Some(k) =
-                        index_key_of_spec(doc, spec).and_then(|v| encode::encode_to_vec(&v).ok())
-                    {
-                        last_at.insert((spec.root_key.clone(), k), i);
-                    }
-                }
-                for spec in &partial_uniques {
-                    if !matches!(
-                        eval_expr(spec.pred.as_ref().expect("pred set"), doc)?,
-                        Value::Bool(true)
-                    ) {
-                        continue;
-                    }
-                    if let Some(k) =
-                        index_key_of_spec(doc, spec).and_then(|v| encode::encode_to_vec(&v).ok())
-                    {
-                        last_at.insert((spec.root_key.clone(), k), i);
+                for (root, k) in
+                    unique_key_pairs(doc, &indexed, &composite_uniques, &partial_uniques)?
+                {
+                    if let Ok(kb) = encode::encode_to_vec(&k) {
+                        last_at.insert((root, kb), i);
                     }
                 }
             }
             let mut kept: Vec<Object> = Vec::with_capacity(new_docs.len());
             for (i, doc) in new_docs.iter().enumerate() {
-                let shadowed = indexed.iter().any(|col| {
-                    doc.get(col)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .and_then(|v| encode::encode_to_vec(v).ok())
-                        .and_then(|k| last_at.get(&(col.clone(), k)))
-                        .is_some_and(|&j| j > i)
-                }) || composite_uniques.iter().any(|spec| {
-                    index_key_of_spec(doc, spec)
-                        .and_then(|v| encode::encode_to_vec(&v).ok())
-                        .and_then(|k| last_at.get(&(spec.root_key.clone(), k)))
-                        .is_some_and(|&j| j > i)
-                }) || partial_uniques.iter().any(|spec| {
-                    matches!(
-                        eval_expr(spec.pred.as_ref().expect("pred set"), doc),
-                        Ok(Value::Bool(true))
-                    ) && index_key_of_spec(doc, spec)
-                        .and_then(|v| encode::encode_to_vec(&v).ok())
-                        .and_then(|k| last_at.get(&(spec.root_key.clone(), k)))
-                        .is_some_and(|&j| j > i)
-                });
+                let shadowed =
+                    unique_key_pairs(doc, &indexed, &composite_uniques, &partial_uniques)?
+                        .iter()
+                        .any(|(root, k)| {
+                            encode::encode_to_vec(k)
+                                .ok()
+                                .and_then(|kb| last_at.get(&(root.clone(), kb)))
+                                .is_some_and(|&j| j > i)
+                        });
                 if !shadowed {
                     kept.push(doc.clone());
                 }
@@ -495,45 +498,12 @@ impl Database {
             && (!indexed.is_empty() || !composite_uniques.is_empty() || !partial_uniques.is_empty())
         {
             for n in &new_docs {
-                for col in &indexed {
-                    let Some(v) = n.get(col) else { continue };
-                    if matches!(v, Value::Null) {
-                        continue;
-                    }
-                    if let Some(loc) = BTree::open(roots[col])
-                        .get(&PageReader::current(&self.pager), &tx, v)
-                        .map_err(|e| index_err(col, e))?
-                    {
-                        displaced.push(loc);
-                    }
-                }
-                for spec in &composite_uniques {
-                    let Some(k) = index_key_of_spec(n, spec) else {
-                        continue;
-                    };
-                    if let Some(loc) = BTree::open(roots[&spec.root_key])
+                for (root, k) in
+                    unique_key_pairs(n, &indexed, &composite_uniques, &partial_uniques)?
+                {
+                    if let Some(loc) = BTree::open(roots[&root])
                         .get(&PageReader::current(&self.pager), &tx, &k)
-                        .map_err(|e| index_err(&spec.root_key, e))?
-                    {
-                        displaced.push(loc);
-                    }
-                }
-                // Predicate-scoped displacement: only a qualifying candidate
-                // can conflict with the partial tree (a non-qualifying row
-                // inserts beside it, displacing nothing).
-                for spec in &partial_uniques {
-                    if !matches!(
-                        eval_expr(spec.pred.as_ref().expect("pred set"), n)?,
-                        Value::Bool(true)
-                    ) {
-                        continue;
-                    }
-                    let Some(k) = index_key_of_spec(n, spec) else {
-                        continue;
-                    };
-                    if let Some(loc) = BTree::open(roots[&spec.root_key])
-                        .get(&PageReader::current(&self.pager), &tx, &k)
-                        .map_err(|e| index_err(&spec.root_key, e))?
+                        .map_err(|e| index_err(&root, e))?
                     {
                         displaced.push(loc);
                     }

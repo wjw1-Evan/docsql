@@ -137,9 +137,15 @@ fn write_value(out: &mut String, v: &Value) {
 /// The clean prefix up to the first escapable char goes in as one slice;
 /// escape_str used to build a fresh `String` per value, which put an
 /// allocation plus full copy on every string cell of every response row.
-fn push_escaped(out: &mut String, s: &str) {
-    let Some(first) = s.find(|c| matches!(c, '"' | '\\' | '\n' | '\r' | '\t') || (c as u32) < 0x20)
-    else {
+///
+/// `tsql` selects the T-SQL `STRING_ESCAPE(…, 'json')` rules: the solidus
+/// escapes too and `\b`/`\f` take their short forms — byte-identical
+/// output is the contract for anyone hashing/comparing the escaped text.
+/// The two shapes of one rule used to live in this file and in `tsql.rs`.
+fn push_escaped(out: &mut String, s: &str, tsql: bool) {
+    let Some(first) = s.find(|c: char| {
+        matches!(c, '"' | '\\' | '\n' | '\r' | '\t') || (c as u32) < 0x20 || (tsql && c == '/')
+    }) else {
         out.push_str(s);
         return;
     };
@@ -151,6 +157,9 @@ fn push_escaped(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if tsql && c == '\u{08}' => out.push_str("\\b"),
+            c if tsql && c == '\u{0c}' => out.push_str("\\f"),
+            c if tsql && c == '/' => out.push_str("\\/"),
             c if (c as u32) < 0x20 => {
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
@@ -163,13 +172,21 @@ fn push_escaped(out: &mut String, s: &str) {
 /// body only, no surrounding quotes (for callers assembling JSON by hand).
 pub fn escape_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    push_escaped(&mut out, s);
+    push_escaped(&mut out, s, false);
+    out
+}
+
+/// The T-SQL `STRING_ESCAPE(…, 'json')` spelling of the same rule: the
+/// solidus escapes too and `\b`/`\f` take their short forms.
+pub fn escape_str_tsql(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    push_escaped(&mut out, s, true);
     out
 }
 
 fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
-    push_escaped(out, s);
+    push_escaped(out, s, false);
     out.push('"');
 }
 

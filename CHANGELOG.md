@@ -5,6 +5,56 @@
 
 ## [Unreleased]
 
+### 性能与通用化重构(行为语义不变,由既有测试网护航)
+
+- **引擎 CHECK 约束解析缓存**:约束体解析结果按文本缓存在表元数据
+  (`TableMeta::check_cache`,不落盘、克隆即重建),INSERT/UPDATE 不再
+  每行每约束跑一次 sqlparser(此前 DML 在 CHECK 表上按行计费;与
+  CHECK 相关的约束测试全量通过)。
+- **写入路径 @@ROWCOUNT 直通**:服务端在引擎 outcome 上直接取行数,
+  不再为 RESP_ROWS 反序列化整个结果集(`execute_sql_with_identity`
+  返回三元组,`resp_row_count` 已删除);T-SQL 会话回填(`@@ERROR`/
+  `@@ROWCOUNT`/`@@IDENTITY`)三处手抄块收敛为 `note_session_outcome`。
+- **DISTINCT 去重键**:复用缓冲逐格长度前缀编码,去掉每行整行 clone
+  与 `Value::Array` 包装。
+- **EF 校验查询收窄**:`information_schema.columns` 只取模型涉及的
+  表(`WHERE table_name IN (...)`),每上下文两次校验不再全目录扫描。
+- **.NET 数据读取器**:RESP_ROWS 直接从 UTF-8 字节 `JsonDocument.Parse`
+  (省 UTF-16 中转),列类型单遍推断(此前每列各扫全部行,N 列 × M 行)。
+- **热路径微优化**:列查找后缀匹配去 `format!` 分配、复合列名拼接免
+  Vec 中转、journal 摘要编码复用缓冲、函数名大写归一。
+
+### 通用化(同一规则一处实现)
+
+- **SQL 词法跳过统一**:`stmt::sql_comment_end` / `sql_quoted_ident_end` /
+  `sql_opaque_run_end` 成为唯一透明规则,替换 stmt/tsql/tsql_batch/
+  useradmin/bind 中十余份手写注释/引号/方括号跳过块;`text_chunks` 与
+  `go_batches` 合一为参数化扫描器(GO 分词此前对 `"…"`/反引号不透明,
+  统一后与文档语义一致)。
+- **聚合折叠收敛为 `AggState`**:批量求值(eval_agg)、PIVOT 单元格与
+  窗口 RunningAgg 共用同一实现(AVG 的 Decimal 精确模式翻转、cmp_values
+  平局规则、NULL 契约一处理解)。PIVOT 的 MAX 平局跟随批量规则保留首个
+  相等值(此前 `max_by` 保留最后一个;Int(3) 与 Float(3.0) 比较相等但
+  渲染不同),PIVOT 的 SUM 改走 `add_values`(错误面与批量一致)。
+- **遍历走权威 `child_exprs`**:CHECK 列引用收集与相关引用收集不再手写
+  分支;宏补上 `InSubquery` 的左侧表达式子节点;CHECK 门禁的 `_ => Ok(())`
+  漏洞随之收紧(未知包装节点内的子查询现在响亮拒绝)。
+- **词表/常量单点**:聚合函数名(`parse_agg_name`)、`__count__` 哨兵、
+  T-SQL 标记函数名、`MAX_DEPTH`、兼容视图名单、函数名大写(`func_upper`)。
+- **密码学原语单点**:T-SQL `HASHBYTES` 的 SHA-256 改调 `kdf::sha256`,
+  MD5/SHA-1 的 Merkle–Damgård 填充抽共享;JSON 字符串转义(线协议与
+  T-SQL `STRING_ESCAPE` 两种形态)共用 `json::push_escaped`。
+- **服务端策略层下沉 core**:登录锁定常量/凭据强度(`kdf::
+  credential_strength_violation`)/用户名白名单(`useradmin::valid_username`)/
+  PBKDF2 env 校验/严格布尔 env(`envx`)/30s 事务排队常量/64 MiB 帧上限
+  全部单点;`shutdown_signal` 由 web 复用 server 实现。
+- **dotnet 单点**:线协议标记词汇与 TIMESTAMP 值域入 `WireMarkers`;
+  EF 校验/同步两侧共用降序契约、UNIQUE DDL 形状与 `IX_` 回收前缀判据;
+  测试启动器收敛为 `TestServers`(含同文件内联副本);读超时常量互引。
+- **deploy**:`deploy/lib.sh` 承载断言计数、SQL 转发、就绪/追平等待与
+  计数行提取(`single-test.sh`/`multinode-test.sh` 共 15 处管道与 4 处等待循环
+  等待循环收敛);`AGENTS.md` 同步修正(web/auth.rs 哈希原语已在 core)。
+
 ### 新功能
 - **外键引用动作(ON DELETE / ON UPDATE)**:`FOREIGN KEY` 现支持
   `ON DELETE|UPDATE CASCADE / SET NULL / SET DEFAULT`(RESTRICT/NO ACTION 关键字接受,

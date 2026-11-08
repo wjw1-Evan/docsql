@@ -43,6 +43,74 @@ pub fn sql_literal_end(sql: &str, open: usize) -> (usize, bool) {
     (b.len(), false)
 }
 
+/// Byte offset just past the comment starting at byte `i` (`-- …` runs to
+/// the newline it ends on; `/* … */` to its closing delimiter), or None
+/// when `b[i]` does not open one. A line comment ends BEFORE its `\n` (the
+/// newline stays visible to the caller); an unterminated comment runs to
+/// the end of the input. Every SQL scanner in the codebase shares this one
+/// transparency rule — independent copies are how `--` inside a literal
+/// ends up treated as a comment (the KELVIN SIGN class of bug).
+pub fn sql_comment_end(b: &[u8], i: usize) -> Option<usize> {
+    match (b.get(i), b.get(i + 1)) {
+        (Some(b'-'), Some(b'-')) => {
+            let mut j = i + 2;
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        (Some(b'/'), Some(b'*')) => {
+            let mut j = i + 2;
+            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                j += 1;
+            }
+            Some(if j + 1 < b.len() { j + 2 } else { b.len() })
+        }
+        _ => None,
+    }
+}
+
+/// Byte offset just past the quoted-identifier run starting at byte `i` —
+/// `"…"` or backtick with doubling escapes, or a `[T-SQL bracket]`
+/// identifier with `]]` as the escaped `]` — or None when `b[i]` does not
+/// open one. Unterminated runs extend to the end of the input (callers let
+/// the parser reject that form loudly).
+pub fn sql_quoted_ident_end(b: &[u8], i: usize) -> Option<usize> {
+    let close = match b.get(i) {
+        Some(c @ (b'"' | b'`')) => *c,
+        Some(b'[') => b']',
+        _ => return None,
+    };
+    let mut j = i + 1;
+    while j < b.len() {
+        if b[j] == close {
+            if b.get(j + 1) == Some(&close) {
+                j += 2;
+                continue;
+            }
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    Some(b.len())
+}
+
+/// Byte offset just past the opaque run starting at byte `i` of `sql`: a
+/// `'…'` string literal ([`sql_literal_end`]), a quoted/bracket identifier
+/// ([`sql_quoted_ident_end`]) or a comment ([`sql_comment_end`]). None when
+/// `sql[i]` opens nothing opaque. The single scanner primitive every
+/// hand-rolled SQL walk shares — string, comment and identifier runs are
+/// data to the scan, never code.
+pub fn sql_opaque_run_end(sql: &str, i: usize) -> Option<usize> {
+    let b = sql.as_bytes();
+    match b.get(i) {
+        Some(b'\'') => Some(sql_literal_end(sql, i).0),
+        Some(b'"') | Some(b'`') | Some(b'[') => sql_quoted_ident_end(b, i),
+        Some(b'-') | Some(b'/') => sql_comment_end(b, i),
+        _ => None,
+    }
+}
+
 /// Word-boundary + call-shape scan for zero-argument non-deterministic
 /// function calls (RAND/NEWID/NEWSEQUENTIALID) outside string literals and
 /// comments. `brand`, `random`, literal text and argument-carrying calls
@@ -116,79 +184,35 @@ fn find_nondet_calls(sql: &str, rand_only: bool) -> Vec<std::ops::Range<usize>> 
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                let (end, _) = sql_literal_end(sql, i);
-                i = end;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let mut j = i + 2;
-                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                    j += 1;
-                }
-                i = if j + 1 < b.len() { j + 2 } else { b.len() };
-            }
-            b'"' | b'`' => {
-                let quote = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == quote {
-                        if b.get(i + 1) == Some(&quote) {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'[' => {
-                // T-SQL bracket identifier: opaque to the scan (`]]` is
-                // the escaped `]`), same as the quoted runs above — the
-                // fourth scanner shares one transparency rule. Without
-                // this arm a column literally named [rand()] looked like
-                // a RAND call and the fold rewrote the IDENTIFIER text.
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b']' {
-                        if b.get(i + 1) == Some(&b']') {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                if !matches!(&lb[start..i], b"rand" | b"newid" | b"newsequentialid") {
-                    continue;
-                }
-                if rand_only && &lb[start..i] != b"rand" {
-                    continue;
-                }
-                let j = skip_ws_comments(b, i);
-                if b.get(j) != Some(&b'(') {
-                    continue;
-                }
-                let k = skip_ws_comments(b, j + 1);
-                if b.get(k) == Some(&b')') {
-                    out.push(start..k + 1);
-                }
-            }
-            _ => i += 1,
+        if let Some(end) = sql_opaque_run_end(sql, i) {
+            // Literals, comments, quoted/bracket identifiers: one shared
+            // transparency rule (a column literally named [rand()] is an
+            // identifier, not a RAND call).
+            i = end;
+            continue;
         }
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            if !matches!(&lb[start..i], b"rand" | b"newid" | b"newsequentialid") {
+                continue;
+            }
+            if rand_only && &lb[start..i] != b"rand" {
+                continue;
+            }
+            let j = skip_ws_comments(b, i);
+            if b.get(j) != Some(&b'(') {
+                continue;
+            }
+            let k = skip_ws_comments(b, j + 1);
+            if b.get(k) == Some(&b')') {
+                out.push(start..k + 1);
+            }
+            continue;
+        }
+        i += 1;
     }
     out
 }
@@ -240,149 +264,89 @@ pub fn fold_wall_clocks(sql: &str, now_ms: i64) -> Option<String> {
     let lower_bytes = lower.as_bytes();
     let mut i = 0usize;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                let (end, _) = sql_literal_end(sql, i);
-                out.push_str(&sql[i..end]);
-                i = end;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                // Line comment: verbatim through the newline. An apostrophe
-                // inside (`-- don't`) must not pair with a real quote and
-                // drag literal contents into the code scan.
-                let start = i;
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                out.push_str(&sql[start..i]);
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                // Block comment: verbatim through `*/` (or end of input —
-                // let the parser complain about the unterminated form).
-                let start = i;
-                let mut j = i + 2;
-                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                    j += 1;
-                }
-                j = if j + 1 < b.len() { j + 2 } else { b.len() };
-                out.push_str(&sql[start..j]);
-                i = j;
-            }
-            b'"' | b'`' => {
-                // Quoted identifier run with doubling escapes.
-                let quote = b[i];
-                out.push_str(&sql[i..i + 1]);
+        if let Some(end) = sql_opaque_run_end(sql, i) {
+            // Literal/comment/quoted/bracket runs are copied verbatim: an
+            // apostrophe inside a comment (`-- don't`) must not pair with a
+            // real quote, and a column literally named [current_timestamp]
+            // must not fold into a CAST literal that would ride the
+            // journal/replication fan-out as a garbage field name.
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if b[i].is_ascii_alphanumeric() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
-                while i < b.len() {
-                    let ch_len = utf8_len(b[i]);
-                    out.push_str(&sql[i..i + ch_len]);
-                    if b[i] == quote {
-                        if b.get(i + 1) == Some(&quote) {
-                            out.push_str(&sql[i + 1..i + 2]);
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += ch_len;
-                }
             }
-            b'[' => {
-                // T-SQL bracket identifier: opaque to the scan (`]]` is the
-                // escaped `]`), same as the quoted runs above. Without this
-                // arm a column literally named [current_timestamp] folded
-                // into a CAST literal — silently writing to a garbage field
-                // name that then rode the journal/replication fan-out.
-                let start = i;
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b']' {
-                        if b.get(i + 1) == Some(&b']') {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += utf8_len(b[i]);
-                }
-                out.push_str(&sql[start..i]);
-            }
-            c if c.is_ascii_alphanumeric() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                let word = &lower_bytes[start..i];
-                // Look past whitespace/comments for the argument list
-                // (`NOW ()`, `NOW /*x*/ ()` are the same call as `NOW()` to
-                // the parser). Only the empty argument list folds; other
-                // arities stay verbatim.
-                let j = skip_ws_comments(b, i);
-                let close = if b.get(j) == Some(&b'(') {
-                    let k = skip_ws_comments(b, j + 1);
-                    if b.get(k) == Some(&b')') {
-                        k + 1
-                    } else {
-                        j
-                    }
+            let word = &lower_bytes[start..i];
+            // Look past whitespace/comments for the argument list
+            // (`NOW ()`, `NOW /*x*/ ()` are the same call as `NOW()` to
+            // the parser). Only the empty argument list folds; other
+            // arities stay verbatim.
+            let j = skip_ws_comments(b, i);
+            let close = if b.get(j) == Some(&b'(') {
+                let k = skip_ws_comments(b, j + 1);
+                if b.get(k) == Some(&b')') {
+                    k + 1
                 } else {
                     j
-                };
-                let empty_call = b.get(j) == Some(&b'(') && close > j;
-                if (word == b"now" || word == b"now_ms" || word == b"sysdate") && empty_call {
-                    // `now_ms` folds to the same TIMESTAMP literal: without
-                    // this arm the word-level match never sees it (the word
-                    // is `now_ms`, not `now`) while `mentions_wall_clock`'s
-                    // substring pre-filter does — the fold branch would run,
-                    // match nothing, and pass the raw call to the journal,
-                    // letting every replay peer stamp its own clock.
-                    out.push_str(if word == b"sysdate" {
-                        &str_lit
-                    } else {
-                        &ts_lit
-                    });
-                    folded = true;
-                    i = close;
-                } else if word == b"current_timestamp" && empty_call {
-                    out.push_str(&ts_lit);
-                    folded = true;
-                    i = close;
-                } else if word == b"current_timestamp" && b.get(j) != Some(&b'(') {
-                    // Bare keyword form.
-                    out.push_str(&ts_lit);
-                    folded = true;
-                } else if matches!(
-                    word,
-                    b"getdate"
-                        | b"getutcdate"
-                        | b"sysdatetime"
-                        | b"sysutcdatetime"
-                        | b"sysdatetimeoffset"
-                ) && empty_call
-                {
-                    // T-SQL clock family: same one-instant rule (all forms
-                    // are UTC here — the engine has no local-time zone).
-                    out.push_str(&ts_lit);
-                    folded = true;
-                    i = close;
-                } else {
-                    out.push_str(&sql[start..i]);
                 }
+            } else {
+                j
+            };
+            let empty_call = b.get(j) == Some(&b'(') && close > j;
+            if (word == b"now" || word == b"now_ms" || word == b"sysdate") && empty_call {
+                // `now_ms` folds to the same TIMESTAMP literal: without
+                // this arm the word-level match never sees it (the word
+                // is `now_ms`, not `now`) while `mentions_wall_clock`'s
+                // substring pre-filter does — the fold branch would run,
+                // match nothing, and pass the raw call to the journal,
+                // letting every replay peer stamp its own clock.
+                out.push_str(if word == b"sysdate" {
+                    &str_lit
+                } else {
+                    &ts_lit
+                });
+                folded = true;
+                i = close;
+            } else if word == b"current_timestamp" && empty_call {
+                out.push_str(&ts_lit);
+                folded = true;
+                i = close;
+            } else if word == b"current_timestamp" && b.get(j) != Some(&b'(') {
+                // Bare keyword form.
+                out.push_str(&ts_lit);
+                folded = true;
+            } else if matches!(
+                word,
+                b"getdate"
+                    | b"getutcdate"
+                    | b"sysdatetime"
+                    | b"sysutcdatetime"
+                    | b"sysdatetimeoffset"
+            ) && empty_call
+            {
+                // T-SQL clock family: same one-instant rule (all forms
+                // are UTC here — the engine has no local-time zone).
+                out.push_str(&ts_lit);
+                folded = true;
+                i = close;
+            } else {
+                out.push_str(&sql[start..i]);
             }
-            c if c < 0x80 => {
-                out.push(c as char);
-                i += 1;
-            }
-            _ => {
-                // Non-ASCII UTF-8 sequence: copy it whole (char boundaries
-                // are guaranteed by the input being a valid &str).
-                let ch_len = utf8_len(b[i]);
-                out.push_str(&sql[i..i + ch_len]);
-                i += ch_len;
-            }
+            continue;
         }
+        if b[i] < 0x80 {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        // Non-ASCII UTF-8 sequence: copy it whole (char boundaries
+        // are guaranteed by the input being a valid &str).
+        let ch_len = utf8_len(b[i]);
+        out.push_str(&sql[i..i + ch_len]);
+        i += ch_len;
     }
     folded.then_some(out)
 }
@@ -398,101 +362,43 @@ pub(crate) fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// Quote/comment-aware split on top-level semicolons: string literals,
-/// quoted identifiers, `--` line comments and `/* */` block comments never
-/// split. Needed because user-management statements are hand-parsed and
-/// cannot ride the sqlparser AST (their grammar is not accepted).
-///
-/// T-SQL batches: a line holding only `GO` (case-insensitive, optional
-/// trailing `;`) is a batch separator like `;` — the line itself is
-/// dropped. `GO <count>` repeats stay verbatim so the parser reports them
-/// (repeat counts are not supported).
-pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
+/// Shared scanner behind [`text_chunks`] and [`go_batches`]: quote/comment/
+/// bracket transparent via [`sql_opaque_run_end`], and a line holding only
+/// `GO` (case-insensitive, optional trailing `;`) always closes the batch
+/// before it and is dropped (`GO <count>` repeats stay verbatim so the
+/// parser reports them). `semicolon_splits` additionally makes every
+/// top-level `;` a chunk edge — `text_chunks` emits chunk edges for both
+/// spellings, while `go_batches` keeps `;` inside the batch: it is a
+/// statement terminator INSIDE a batch and the batch interpreter must keep
+/// @variables alive across it (feeding GO-only edges to the interpreter
+/// used to clear the variables at every semicolon).
+fn split_script(sql: &str, semicolon_splits: bool) -> Vec<String> {
+    let b = sql.as_bytes();
     let mut chunks = Vec::new();
     let mut cur = String::new();
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-    // Char index in `cur` where the current output line began (GO can only
+    // Byte index in `cur` where the current output line began (GO can only
     // appear on a line of its own, outside literals and comments).
     let mut line_begin = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' || c == '"' || c == '`' {
-            // quoted run with doubling escapes (backquote included: the
-            // GenericDialect accepts it as a delimited identifier, so a `;`
-            // inside one must not split the batch); always stays inside the
-            // current chunk
-            let quote = c;
-            cur.push(c);
-            i += 1;
-            while i < chars.len() {
-                cur.push(chars[i]);
-                if chars[i] == quote {
-                    if chars.get(i + 1) == Some(&quote) {
-                        cur.push(*chars.get(i + 1).unwrap());
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(end) = sql_opaque_run_end(sql, i) {
+            // Quoted runs (doubling escapes), `[T-SQL bracket]` identifiers
+            // (`]]` escape) and comments stay inside the current chunk: a
+            // `;` or GO inside one is identifier/comment data, not a
+            // separator. Unterminated runs extend to the end and are
+            // rejected loudly by the parser downstream.
+            cur.push_str(&sql[i..end]);
+            i = end;
             continue;
         }
-        if c == '[' {
-            // T-SQL [bracket identifier]: `;` and GO lines inside are
-            // identifier data, not separators. `]]` escapes a literal `]`
-            // (same rule as tsql::preprocess — the two scanners must agree).
-            // An unterminated bracket runs to end of input and is rejected
-            // loudly by the parser downstream.
-            cur.push(c);
-            i += 1;
-            while i < chars.len() {
-                cur.push(chars[i]);
-                if chars[i] == ']' {
-                    if chars.get(i + 1) == Some(&']') {
-                        cur.push(*chars.get(i + 1).unwrap());
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
-                cur.push(chars[i]);
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            cur.push('/');
-            cur.push('*');
-            i += 2;
-            while i < chars.len() {
-                cur.push(chars[i]);
-                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    cur.push('*');
-                    cur.push('/');
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == ';' {
+        let c = b[i];
+        if c == b';' && semicolon_splits {
             chunks.push(std::mem::take(&mut cur));
             line_begin = 0;
             i += 1;
             continue;
         }
-        if c == '\n' {
+        if c == b'\n' {
             let line = cur[line_begin..].trim();
             let bare = line.strip_suffix(';').unwrap_or(line).trim();
             if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
@@ -508,13 +414,21 @@ pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
                 i += 1;
                 continue;
             }
-            cur.push(c);
+            cur.push('\n');
             line_begin = cur.len();
             i += 1;
             continue;
         }
-        cur.push(c);
-        i += 1;
+        if c < 0x80 {
+            cur.push(c as char);
+            i += 1;
+            continue;
+        }
+        // Non-ASCII UTF-8 sequence: copy it whole (char boundaries are
+        // guaranteed by the input being a valid &str).
+        let ch_len = utf8_len(c);
+        cur.push_str(&sql[i..i + ch_len]);
+        i += ch_len;
     }
     // Trailing GO line without a newline ends the final batch the same way.
     let line = cur[line_begin..].trim();
@@ -529,106 +443,18 @@ pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
     chunks
 }
 
-/// Split a script into GO-separated T-SQL batches. Quote/comment/bracket
-/// aware, same scanner rules as [`text_chunks`]; the GO lines themselves
-/// are dropped. A `;` is NOT a batch boundary here — it is a statement
-/// terminator INSIDE a batch, and the batch interpreter must keep
-/// @variables alive across it (`text_chunks` emits chunk edges for both
-/// spellings; feeding those to the interpreter used to clear the variables
-/// at every semicolon).
+/// Quote/comment-aware split on top-level semicolons: string literals,
+/// quoted identifiers, `--` line comments and `/* */` block comments never
+/// split. Needed because user-management statements are hand-parsed and
+/// cannot ride the sqlparser AST (their grammar is not accepted).
+pub(crate) fn text_chunks(sql: &str) -> Vec<String> {
+    split_script(sql, true)
+}
+
+/// Split a script into GO-separated T-SQL batches; the GO lines themselves
+/// are dropped.
 pub fn go_batches(sql: &str) -> Vec<String> {
-    let chars: Vec<char> = sql.chars().collect();
-    let mut batches = Vec::new();
-    let mut cur = String::new();
-    let mut line_begin = 0usize;
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            cur.push(c);
-            i += 1;
-            while i < chars.len() {
-                cur.push(chars[i]);
-                if chars[i] == '\'' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '[' {
-            cur.push(c);
-            i += 1;
-            while i < chars.len() {
-                cur.push(chars[i]);
-                if chars[i] == ']' {
-                    if chars.get(i + 1) == Some(&']') {
-                        cur.push(*chars.get(i + 1).unwrap());
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
-                cur.push(chars[i]);
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            cur.push('/');
-            cur.push('*');
-            i += 2;
-            while i < chars.len() {
-                cur.push(chars[i]);
-                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    cur.push('*');
-                    cur.push('/');
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '\n' {
-            let line = cur[line_begin..].trim();
-            let bare = line.strip_suffix(';').unwrap_or(line).trim();
-            if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
-                cur.truncate(line_begin);
-                while cur.ends_with(char::is_whitespace) {
-                    cur.pop();
-                }
-                batches.push(std::mem::take(&mut cur));
-                line_begin = 0;
-                i += 1;
-                continue;
-            }
-            cur.push(c);
-            line_begin = cur.len();
-            i += 1;
-            continue;
-        }
-        cur.push(c);
-        i += 1;
-    }
-    let line = cur[line_begin..].trim();
-    let bare = line.strip_suffix(';').unwrap_or(line).trim();
-    if bare.eq_ignore_ascii_case("go") && !bare.is_empty() {
-        cur.truncate(line_begin);
-        while cur.ends_with(char::is_whitespace) {
-            cur.pop();
-        }
-    }
-    batches.push(cur);
-    batches
+    split_script(sql, false)
 }
 
 /// Split `sql` into individual statement texts.

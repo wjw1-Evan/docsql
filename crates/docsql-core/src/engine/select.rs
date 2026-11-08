@@ -1,6 +1,21 @@
 use super::window::*;
 use super::*;
 
+/// The exact predicate the executor gates the index-ordered/unindexed
+/// ORDER-window fast paths on: a single-shape SELECT (no aggregate,
+/// ROWNUM, HAVING, DISTINCT, window). EXPLAIN's plan renderer shares this
+/// one function — the predicate used to be hand-mirrored there, and any
+/// drift made EXPLAIN lie about the chosen plan.
+pub(super) fn fast_window_eligible(
+    select: &sqlparser::ast::Select,
+    is_aggregate: bool,
+    rownum_wanted: bool,
+    distinct_all: bool,
+    has_window: bool,
+) -> bool {
+    !is_aggregate && !rownum_wanted && select.having.is_none() && distinct_all && !has_window
+}
+
 impl<'a> ReadCx<'a> {
     /// Virtual information_schema tables from the catalog.
     pub(super) fn information_schema(&self, which: &str) -> Vec<Object> {
@@ -1025,11 +1040,23 @@ impl<'a> ReadCx<'a> {
                 let mut seen = std::collections::BTreeSet::new();
                 let mut kept_docs = Vec::with_capacity(docs.len());
                 let mut kept_rows = Vec::with_capacity(out.len());
+                // The row encodes cell-by-cell (length prefix per cell) into
+                // REUSED buffers — the per-row `row.clone()` + `Value::Array`
+                // wrapper sat on the encode path of every DISTINCT row. The
+                // key only needs to be injective for this query's local
+                // dedup set; the old byte shape is not part of any contract.
+                let mut key_buf = Vec::new();
+                let mut cell_buf = Vec::new();
                 for (doc, row) in docs.into_iter().zip(out) {
                     self.deadline.check()?;
-                    let key = encode::encode_to_vec(&Value::Array(row.clone()))
-                        .map_err(SqlError::Encode)?;
-                    if seen.insert(key) {
+                    key_buf.clear();
+                    for cell in &row {
+                        cell_buf.clear();
+                        encode::encode(cell, &mut cell_buf).map_err(SqlError::Encode)?;
+                        key_buf.extend_from_slice(&(cell_buf.len() as u32).to_le_bytes());
+                        key_buf.extend_from_slice(&cell_buf);
+                    }
+                    if seen.insert(key_buf.clone()) {
                         kept_docs.push(doc);
                         kept_rows.push(row);
                     }
@@ -1082,7 +1109,7 @@ impl<'a> ReadCx<'a> {
         let mut tmp_names: Vec<String> = Vec::with_capacity(calls.len());
         for (ci, f) in calls.iter().enumerate() {
             self.deadline.check()?;
-            let fname = f.name.to_string().to_uppercase();
+            let fname = func_upper(&f.name.to_string());
             let aggregate = is_agg_name(f);
             let spec = validate_window_spec(f, &fname, aggregate)?;
             // Custom frame (ROWS/RANGE/GROUPS BETWEEN … AND …): structure
@@ -1220,7 +1247,7 @@ impl<'a> ReadCx<'a> {
                 }
                 if let Some((op, arg, distinct, sep, filter)) = &agg {
                     let count_star =
-                        matches!(arg, SqlExpr::Identifier(i) if i.value == "__count__");
+                        matches!(arg, SqlExpr::Identifier(i) if i.value == COUNT_STAR_SENTINEL);
                     // FILTER first, argument second — exactly the batch
                     // order in eval_agg: an argument expression that only
                     // errors on filtered-out rows (e.g. a bitwise op on a
@@ -1910,20 +1937,10 @@ impl<'a> ReadCx<'a> {
                 rows = apply_limit_clause(lc, rows)?;
             }
             if let Some(fetch) = &query.fetch {
-                if fetch.percent {
-                    return err("FETCH … PERCENT is not supported");
-                }
                 if fetch.with_ties {
                     return err("FETCH … WITH TIES requires ORDER BY");
                 }
-                let n = match fetch.quantity.as_ref().map(eval_const).transpose()? {
-                    Some(Value::Int(n)) if n >= 0 => n as usize,
-                    Some(Value::Int(n)) => {
-                        return err(format!("FETCH quantity must be non-negative ({n})"))
-                    }
-                    Some(_) | None => return err("FETCH quantity must be an integer"),
-                };
-                rows.truncate(n);
+                rows.truncate(fetch_row_count(fetch)?);
             }
             return Ok(ExecOutcome::Rows(QueryResult { columns, rows }));
         }
@@ -1986,14 +2003,17 @@ impl<'a> ReadCx<'a> {
 
         // ORDER BY <index key> + LIMIT: index-ordered window, skipping the
         // full heap scan and sort. Already filtered and windowed; the WHERE
-        // pass below would be a no-op, so it is skipped too.
+        // pass below would be a no-op, so it is skipped too. The gate is
+        // the shared predicate EXPLAIN mirrors — a hand copy risks drift
+        // and makes EXPLAIN lie about the chosen plan.
         let mut pre_windowed = false;
-        let mut rows = if !is_aggregate
-            && !rownum_wanted
-            && select.having.is_none()
-            && distinct_all
-            && !has_window
-        {
+        let mut rows = if fast_window_eligible(
+            &select,
+            is_aggregate,
+            rownum_wanted,
+            distinct_all,
+            has_window,
+        ) {
             match self.ordered_index_window(
                 &select,
                 &select.from,

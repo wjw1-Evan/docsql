@@ -377,15 +377,11 @@ fn validate_username(username: &str) -> Result<(), String> {
 }
 
 fn validate_password(password: &str) -> Result<(), String> {
-    if password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(format!("密码至少 {} 个字符", MIN_PASSWORD_LEN));
+    match docsql_core::kdf::credential_strength_violation(password, MIN_PASSWORD_LEN) {
+        Some("too short") => Err(format!("密码至少 {} 个字符", MIN_PASSWORD_LEN)),
+        Some(_) => Err("密码不能为单一字符重复".into()),
+        None => Ok(()),
     }
-    let mut chars = password.chars();
-    let first = chars.next().unwrap();
-    if password.chars().all(|c| c == first) {
-        return Err("密码不能为单一字符重复".into());
-    }
-    Ok(())
 }
 
 /// Why a setup attempt failed. `Exists` counts toward the login lockout

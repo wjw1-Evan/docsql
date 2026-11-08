@@ -22,11 +22,14 @@ impl Database {
             let meta = self.tables.get(name).cloned().unwrap();
             let docs = self.table_docs_cx(name)?;
             let mut rows_hash: u64 = 0;
+            // One reused buffer for the whole digest walk (a fresh Vec sat
+            // on the encode path of every field of every row).
+            let mut buf = Vec::new();
             for doc in &docs {
                 let mut h = DefaultHasher::new();
                 for (k, v) in doc {
                     k.hash(&mut h);
-                    let mut buf = Vec::new();
+                    buf.clear();
                     encode::encode(v, &mut buf)?;
                     h.write(&buf);
                 }

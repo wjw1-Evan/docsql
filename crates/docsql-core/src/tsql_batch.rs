@@ -489,52 +489,14 @@ impl TsqlSession {
         let mut out = String::with_capacity(sql.len() + 32);
         let mut i = 0usize;
         while i < b.len() {
+            if let Some(end) = stmt::sql_opaque_run_end(sql, i) {
+                // Literal/comment/quoted-identifier/bracket runs are opaque and
+                // copied verbatim.
+                out.push_str(&sql[i..end]);
+                i = end;
+                continue;
+            }
             match b[i] {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(sql, i);
-                    out.push_str(&sql[i..end]);
-                    i = end;
-                }
-                b'-' if b.get(i + 1) == Some(&b'-') => {
-                    let start = i;
-                    while i < b.len() && b[i] != b'\n' {
-                        i += 1;
-                    }
-                    out.push_str(&sql[start..i]);
-                }
-                b'/' if b.get(i + 1) == Some(&b'*') => {
-                    let start = i;
-                    let mut j = i + 2;
-                    while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                        j += 1;
-                    }
-                    j = if j + 1 < b.len() { j + 2 } else { b.len() };
-                    out.push_str(&sql[start..j]);
-                    i = j;
-                }
-                b'"' | b'`' | b'[' => {
-                    // Quoted identifier / bracket run: contents are opaque.
-                    let close = match b[i] {
-                        b'[' => b']',
-                        c => c,
-                    };
-                    out.push(b[i] as char);
-                    i += 1;
-                    while i < b.len() {
-                        let ch_len = stmt::utf8_len(b[i]);
-                        out.push_str(&sql[i..i + ch_len]);
-                        if b[i] == close {
-                            if b.get(i + 1) == Some(&close) {
-                                out.push_str(&sql[i + 1..i + 2]);
-                                i += 2;
-                                continue;
-                            }
-                            i += 1;
-                            break;
-                        }
-                        i += ch_len;
-                    }
-                }
                 b'@' => {
                     if b.get(i + 1) == Some(&b'@') {
                         let start = i;
@@ -866,43 +828,13 @@ fn skip_case_expr(sql: &str, lower: &[u8], mut j: usize) -> Option<usize> {
     let lb = lower;
     let mut nesting = 1i32;
     while j < b.len() {
+        if let Some(end) = stmt::sql_opaque_run_end(sql, j) {
+            // Literals/comments/quoted-identifier/bracket runs: words inside
+            // them must not move the CASE nesting.
+            j = end;
+            continue;
+        }
         match b[j] {
-            b'\'' => {
-                let (end, _) = stmt::sql_literal_end(sql, j);
-                j = end;
-                continue;
-            }
-            b'"' | b'`' | b'[' => {
-                let close = match b[j] {
-                    b'[' => b']',
-                    other => other,
-                };
-                j += 1;
-                while j < b.len() {
-                    if b[j] == close {
-                        if b.get(j + 1) == Some(&close) {
-                            j += 2;
-                            continue;
-                        }
-                        j += 1;
-                        break;
-                    }
-                    j += 1;
-                }
-                continue;
-            }
-            b'-' if b.get(j + 1) == Some(&b'-') => {
-                while j < b.len() && b[j] != b'\n' {
-                    j += 1;
-                }
-            }
-            b'/' if b.get(j + 1) == Some(&b'*') => {
-                j += 2;
-                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                    j += 1;
-                }
-                j = (j + 2).min(b.len());
-            }
             c if c.is_ascii_alphabetic()
                 && j > 0
                 && (b[j - 1].is_ascii_alphanumeric()
@@ -953,45 +885,11 @@ fn batch_begin_depth(s: &str) -> i32 {
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < b.len() {
+        if let Some(end) = stmt::sql_opaque_run_end(s, i) {
+            i = end;
+            continue;
+        }
         match b[i] {
-            b'\'' => {
-                let (end, _) = stmt::sql_literal_end(s, i);
-                i = end;
-                continue;
-            }
-            b'"' | b'`' | b'[' => {
-                let close = match b[i] {
-                    b'[' => b']',
-                    other => other,
-                };
-                i += 1;
-                while i < b.len() {
-                    if b[i] == close {
-                        if b.get(i + 1) == Some(&close) {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(b.len());
-                continue;
-            }
             c if c.is_ascii_alphabetic()
                 && i > 0
                 && (b[i - 1].is_ascii_alphanumeric()
@@ -1085,20 +983,8 @@ impl<'a> Parser<'a> {
             while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
                 self.i += 1;
             }
-            if self.b.get(self.i) == Some(&b'-') && self.b.get(self.i + 1) == Some(&b'-') {
-                while self.i < self.b.len() && self.b[self.i] != b'\n' {
-                    self.i += 1;
-                }
-                continue;
-            }
-            if self.b.get(self.i) == Some(&b'/') && self.b.get(self.i + 1) == Some(&b'*') {
-                self.i += 2;
-                while self.i + 1 < self.b.len()
-                    && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
-                {
-                    self.i += 1;
-                }
-                self.i = (self.i + 2).min(self.b.len());
+            if let Some(end) = stmt::sql_comment_end(self.b, self.i) {
+                self.i = end;
                 continue;
             }
             if self.b.get(self.i) == Some(&b';') {
@@ -1256,43 +1142,11 @@ impl<'a> Parser<'a> {
         let b = self.b;
         let lb = self.lb();
         while j < b.len() {
+            if let Some(end) = stmt::sql_opaque_run_end(self.sql, j) {
+                j = end;
+                continue;
+            }
             match b[j] {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(self.sql, j);
-                    j = end;
-                    continue;
-                }
-                b'"' | b'`' | b'[' => {
-                    let close = match b[j] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    j += 1;
-                    while j < b.len() {
-                        if b[j] == close {
-                            if b.get(j + 1) == Some(&close) {
-                                j += 2;
-                                continue;
-                            }
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    continue;
-                }
-                b'-' if b.get(j + 1) == Some(&b'-') => {
-                    while j < b.len() && b[j] != b'\n' {
-                        j += 1;
-                    }
-                }
-                b'/' if b.get(j + 1) == Some(&b'*') => {
-                    j += 2;
-                    while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                        j += 1;
-                    }
-                    j = (j + 2).min(b.len());
-                }
                 c if c.is_ascii_alphabetic()
                     && j > 0
                     && (b[j - 1].is_ascii_alphanumeric()
@@ -1353,68 +1207,38 @@ impl<'a> Parser<'a> {
     /// At `j` (just past a `begin` word): does TRY or CATCH follow
     /// (word-level, trivia-tolerant)? Those spell the compound
     /// TRY…CATCH statement, never a plain BEGIN…END block.
-    fn word_after_is_try_or_catch(&self, mut j: usize) -> bool {
-        loop {
-            while j < self.b.len() && self.b[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if self.b.get(j) == Some(&b'-') && self.b.get(j + 1) == Some(&b'-') {
-                while j < self.b.len() && self.b[j] != b'\n' {
-                    j += 1;
-                }
-                continue;
-            }
-            if self.b.get(j) == Some(&b'/') && self.b.get(j + 1) == Some(&b'*') {
-                j += 2;
-                while j + 1 < self.b.len() && !(self.b[j] == b'*' && self.b[j + 1] == b'/') {
-                    j += 1;
-                }
-                j = (j + 2).min(self.b.len());
-                continue;
-            }
-            break;
-        }
-        let lb = self.lb();
-        for kw in ["try", "catch"] {
-            let kb = kw.as_bytes();
-            if self.b.len() >= j + kb.len()
-                && &lb[j..j + kb.len()] == kb
-                && (self.b.len() == j + kb.len()
-                    || !(self.b[j + kb.len()].is_ascii_alphanumeric()
-                        || self.b[j + kb.len()] == b'_'))
-            {
-                return true;
-            }
-        }
-        false
+    fn word_after_is_try_or_catch(&self, j: usize) -> bool {
+        self.word_after_is(j, &["try", "catch"])
     }
 
     /// At `j` (just past a `begin` word): does a transaction keyword follow,
     /// skipping trivia? Used both at the cursor (`begin_starts_transaction`)
     /// and inside block-shape scans that look ahead.
-    fn word_after_is_transaction(&self, mut j: usize) -> bool {
+    fn word_after_is_transaction(&self, j: usize) -> bool {
+        self.word_after_is(j, &["tran", "transaction", "distributed"])
+    }
+
+    /// From `j`, skip whitespace and comments and return the offset of the
+    /// first real byte (a `;` is a statement boundary, not trivia, here).
+    fn skip_ahead_trivia(&self, mut j: usize) -> usize {
         loop {
             while j < self.b.len() && self.b[j].is_ascii_whitespace() {
                 j += 1;
             }
-            if self.b.get(j) == Some(&b'-') && self.b.get(j + 1) == Some(&b'-') {
-                while j < self.b.len() && self.b[j] != b'\n' {
-                    j += 1;
-                }
+            if let Some(end) = stmt::sql_comment_end(self.b, j) {
+                j = end;
                 continue;
             }
-            if self.b.get(j) == Some(&b'/') && self.b.get(j + 1) == Some(&b'*') {
-                j += 2;
-                while j + 1 < self.b.len() && !(self.b[j] == b'*' && self.b[j + 1] == b'/') {
-                    j += 1;
-                }
-                j = (j + 2).min(self.b.len());
-                continue;
-            }
-            break;
+            return j;
         }
+    }
+
+    /// Word-level keyword match at `j` after skipping trivia, with a word
+    /// boundary so a prefix (`BEGIN TRYX`) never counts.
+    fn word_after_is(&self, j: usize, kws: &[&str]) -> bool {
+        let j = self.skip_ahead_trivia(j);
         let lb = self.lb();
-        for kw in ["tran", "transaction", "distributed"] {
+        for kw in kws {
             let kb = kw.as_bytes();
             if self.b.len() >= j + kb.len()
                 && &lb[j..j + kb.len()] == kb
@@ -1433,34 +1257,10 @@ impl<'a> Parser<'a> {
     /// `BEGIN TRY` — a prefix-only match used to swallow the whole
     /// structure and demand a BEGIN CATCH that never comes.
     fn peek_word_after_begin_is(&self, want: &[u8]) -> bool {
-        let mut j = self.i + 5;
-        loop {
-            while j < self.b.len() && self.b[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if self.b.get(j) == Some(&b'-') && self.b.get(j + 1) == Some(&b'-') {
-                while j < self.b.len() && self.b[j] != b'\n' {
-                    j += 1;
-                }
-                continue;
-            }
-            if self.b.get(j) == Some(&b'/') && self.b.get(j + 1) == Some(&b'*') {
-                j += 2;
-                while j + 1 < self.b.len() && !(self.b[j] == b'*' && self.b[j + 1] == b'/') {
-                    j += 1;
-                }
-                j = (j + 2).min(self.b.len());
-                continue;
-            }
-            break;
-        }
-        if self.b.len() < j + want.len() || &self.lb()[j..j + want.len()] != want {
-            return false;
-        }
-        // Word boundary: the match must not run into a longer identifier.
-        self.b
-            .get(j + want.len())
-            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+        self.word_after_is(
+            self.i + 5,
+            &[std::str::from_utf8(want).expect("keyword literals are UTF-8")],
+        )
     }
 
     fn starts_with_var_ahead(&self) -> bool {
@@ -1576,49 +1376,13 @@ impl<'a> Parser<'a> {
         let mut depth = 0i32;
         while self.i < self.b.len() {
             let c_is_alpha = self.b[self.i].is_ascii_alphabetic();
+            if let Some(end) = stmt::sql_opaque_run_end(self.sql, self.i) {
+                // Literals/quoted identifiers are data: `[order]` must not
+                // hit the clause-starter check on its inner word.
+                self.i = end;
+                continue;
+            }
             match self.b[self.i] {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(self.sql, self.i);
-                    self.i = end;
-                    continue;
-                }
-                // Quoted identifiers are data: `[order]` must not hit the
-                // clause-starter check on its inner word.
-                b'"' | b'`' | b'[' => {
-                    let close = match self.b[self.i] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    self.i += 1;
-                    while self.i < self.b.len() {
-                        if self.b[self.i] == close {
-                            if self.b.get(self.i + 1) == Some(&close) {
-                                self.i += 2;
-                                continue;
-                            }
-                            self.i += 1;
-                            break;
-                        }
-                        self.i += 1;
-                    }
-                    continue;
-                }
-                b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
-                    while self.i < self.b.len() && self.b[self.i] != b'\n' {
-                        self.i += 1;
-                    }
-                    continue;
-                }
-                b'/' if self.b.get(self.i + 1) == Some(&b'*') => {
-                    self.i += 2;
-                    while self.i + 1 < self.b.len()
-                        && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
-                    {
-                        self.i += 1;
-                    }
-                    self.i = (self.i + 2).min(self.b.len());
-                    continue;
-                }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 b',' | b';' if depth == 0 => break,
@@ -1708,45 +1472,11 @@ impl<'a> Parser<'a> {
         let mut top_words: Vec<&[u8]> = Vec::new();
         let mut i = 0usize;
         while i < b.len() {
+            if let Some(end) = stmt::sql_opaque_run_end(prefix, i) {
+                i = end;
+                continue;
+            }
             match b[i] {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(prefix, i);
-                    i = end;
-                    continue;
-                }
-                b'"' | b'`' | b'[' => {
-                    let close = match b[i] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    i += 1;
-                    while i < b.len() {
-                        if b[i] == close {
-                            if b.get(i + 1) == Some(&close) {
-                                i += 2;
-                                continue;
-                            }
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-                b'-' if b.get(i + 1) == Some(&b'-') => {
-                    while i < b.len() && b[i] != b'\n' {
-                        i += 1;
-                    }
-                    continue;
-                }
-                b'/' if b.get(i + 1) == Some(&b'*') => {
-                    i += 2;
-                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                        i += 1;
-                    }
-                    i = (i + 2).min(b.len());
-                    continue;
-                }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 c if c.is_ascii_alphabetic() => {
@@ -1802,47 +1532,11 @@ impl<'a> Parser<'a> {
         let start = self.i;
         let mut depth = 0i32;
         while self.i < self.b.len() {
+            if let Some(end) = stmt::sql_opaque_run_end(self.sql, self.i) {
+                self.i = end;
+                continue;
+            }
             match self.b[self.i] {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(self.sql, self.i);
-                    self.i = end;
-                    continue;
-                }
-                b'"' | b'`' | b'[' => {
-                    let close = match self.b[self.i] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    self.i += 1;
-                    while self.i < self.b.len() {
-                        if self.b[self.i] == close {
-                            if self.b.get(self.i + 1) == Some(&close) {
-                                self.i += 2;
-                                continue;
-                            }
-                            self.i += 1;
-                            break;
-                        }
-                        self.i += 1;
-                    }
-                    continue;
-                }
-                b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
-                    while self.i < self.b.len() && self.b[self.i] != b'\n' {
-                        self.i += 1;
-                    }
-                    continue;
-                }
-                b'/' if self.b.get(self.i + 1) == Some(&b'*') => {
-                    self.i += 2;
-                    while self.i + 1 < self.b.len()
-                        && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
-                    {
-                        self.i += 1;
-                    }
-                    self.i = (self.i + 2).min(self.b.len());
-                    continue;
-                }
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 b';' if depth == 0 => {
@@ -1921,24 +1615,13 @@ impl<'a> Parser<'a> {
             while j < self.b.len() {
                 match self.b[j] {
                     b' ' | b'\t' | b'\r' | b'\n' => j += 1,
-                    b'-' if self.b.get(j + 1) == Some(&b'-') => {
-                        while j < self.b.len() && self.b[j] != b'\n' {
-                            j += 1;
+                    _ => {
+                        if let Some(end) = stmt::sql_comment_end(self.b, j) {
+                            j = end;
+                            continue;
                         }
+                        break;
                     }
-                    b'/' if self.b.get(j + 1) == Some(&b'*') => {
-                        let mut k = j + 2;
-                        while k + 1 < self.b.len() && !(self.b[k] == b'*' && self.b[k + 1] == b'/')
-                        {
-                            k += 1;
-                        }
-                        j = if k + 1 < self.b.len() {
-                            k + 2
-                        } else {
-                            self.b.len()
-                        };
-                    }
-                    _ => break,
                 }
             }
             if self.b.get(j) == Some(&b',') {
@@ -1967,43 +1650,23 @@ impl<'a> Parser<'a> {
                     end = lit_end;
                     continue;
                 }
-                b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
-                    while self.i < self.b.len() && self.b[self.i] != b'\n' {
-                        self.i += 1;
+                _ if stmt::sql_comment_end(self.b, self.i).is_some() => {
+                    // Line comments do not extend the statement end; block
+                    // comments do (per-arm behavior preserved).
+                    let is_line = c == b'-';
+                    let cend = stmt::sql_comment_end(self.b, self.i).unwrap();
+                    self.i = cend;
+                    if !is_line {
+                        end = cend;
                     }
-                    continue;
-                }
-                b'/' if self.b.get(self.i + 1) == Some(&b'*') => {
-                    self.i += 2;
-                    while self.i + 1 < self.b.len()
-                        && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
-                    {
-                        self.i += 1;
-                    }
-                    self.i = (self.i + 2).min(self.b.len());
-                    end = self.i;
                     continue;
                 }
                 // Quoted identifier run: `[select] = 7` must not trip the
                 // statement-starter check on its inner word.
                 b'"' | b'`' | b'[' => {
-                    let close = match self.b[self.i] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    self.i += 1;
-                    while self.i < self.b.len() {
-                        if self.b[self.i] == close {
-                            if self.b.get(self.i + 1) == Some(&close) {
-                                self.i += 2;
-                                continue;
-                            }
-                            self.i += 1;
-                            break;
-                        }
-                        self.i += 1;
-                    }
-                    end = self.i;
+                    let qend = stmt::sql_quoted_ident_end(self.b, self.i).unwrap();
+                    self.i = qend;
+                    end = qend;
                     continue;
                 }
                 b'(' => depth += 1,
@@ -2177,48 +1840,12 @@ impl<'a> Parser<'a> {
         let mut nesting = 1i32;
         let start = self.i;
         while self.i < self.b.len() {
+            if let Some(end) = stmt::sql_opaque_run_end(self.sql, self.i) {
+                self.i = end;
+                continue;
+            }
             let c = self.b[self.i];
             match c {
-                b'\'' => {
-                    let (end, _) = stmt::sql_literal_end(self.sql, self.i);
-                    self.i = end;
-                    continue;
-                }
-                b'"' | b'`' | b'[' => {
-                    let close = match self.b[self.i] {
-                        b'[' => b']',
-                        other => other,
-                    };
-                    self.i += 1;
-                    while self.i < self.b.len() {
-                        if self.b[self.i] == close {
-                            if self.b.get(self.i + 1) == Some(&close) {
-                                self.i += 2;
-                                continue;
-                            }
-                            self.i += 1;
-                            break;
-                        }
-                        self.i += 1;
-                    }
-                    continue;
-                }
-                b'-' if self.b.get(self.i + 1) == Some(&b'-') => {
-                    while self.i < self.b.len() && self.b[self.i] != b'\n' {
-                        self.i += 1;
-                    }
-                    continue;
-                }
-                b'/' if self.b.get(self.i + 1) == Some(&b'*') => {
-                    self.i += 2;
-                    while self.i + 1 < self.b.len()
-                        && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
-                    {
-                        self.i += 1;
-                    }
-                    self.i = (self.i + 2).min(self.b.len());
-                    continue;
-                }
                 c if c.is_ascii_alphabetic()
                     && self
                         .i
@@ -2611,78 +2238,47 @@ fn mentions_identity_fn(sql: &str) -> bool {
     let b = sql.as_bytes();
     let mut i = 0usize;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                let (end, _) = stmt::sql_literal_end(sql, i);
-                i = end;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(b.len());
-            }
-            b'"' | b'`' | b'[' => {
-                let close = match b[i] {
-                    b'[' => b']',
-                    other => other,
-                };
-                i += 1;
-                while i < b.len() {
-                    if b[i] == close {
-                        if b.get(i + 1) == Some(&close) {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                // Keep this list in lockstep with `substitute`'s
-                // empty-arg family below: a call the interpreter WOULD
-                // resolve must route there — a bare `SELECT SUSER_SNAME()`
-                // used to die on the engine's unknown-function path while
-                // the identical call inside a DECLARE batch worked.
-                let name = &sql.as_bytes()[start..i];
-                const IDENTITY_FNS: &[&[u8]] = &[
-                    b"scope_identity",
-                    b"ident_current",
-                    b"error_message",
-                    b"error_number",
-                    b"suser_sname",
-                    b"original_login",
-                    b"system_user",
-                    b"session_user",
-                    b"user_name",
-                    b"app_name",
-                    b"host_name",
-                ];
-                if !IDENTITY_FNS.iter().any(|f| name.eq_ignore_ascii_case(f)) {
-                    continue;
-                }
-                let mut j = i;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'(') && b.get(j + 1) == Some(&b')') {
-                    return true;
-                }
-            }
-            _ => i += 1,
+        if let Some(end) = stmt::sql_opaque_run_end(sql, i) {
+            i = end;
+            continue;
         }
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            // Keep this list in lockstep with `substitute`'s
+            // empty-arg family below: a call the interpreter WOULD
+            // resolve must route there — a bare `SELECT SUSER_SNAME()`
+            // used to die on the engine's unknown-function path while
+            // the identical call inside a DECLARE batch worked.
+            let name = &sql.as_bytes()[start..i];
+            const IDENTITY_FNS: &[&[u8]] = &[
+                b"scope_identity",
+                b"ident_current",
+                b"error_message",
+                b"error_number",
+                b"suser_sname",
+                b"original_login",
+                b"system_user",
+                b"session_user",
+                b"user_name",
+                b"app_name",
+                b"host_name",
+            ];
+            if !IDENTITY_FNS.iter().any(|f| name.eq_ignore_ascii_case(f)) {
+                continue;
+            }
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'(') && b.get(j + 1) == Some(&b')') {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
     }
     false
 }
@@ -2692,44 +2288,14 @@ fn mentions_var(sql: &str) -> bool {
     let b = sql.as_bytes();
     let mut i = 0usize;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                let (end, _) = stmt::sql_literal_end(sql, i);
-                i = end;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(b.len());
-            }
-            b'"' | b'`' | b'[' => {
-                let close = match b[i] {
-                    b'[' => b']',
-                    other => other,
-                };
-                i += 1;
-                while i < b.len() {
-                    if b[i] == close {
-                        if b.get(i + 1) == Some(&close) {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'@' => return true,
-            _ => i += 1,
+        if let Some(end) = stmt::sql_opaque_run_end(sql, i) {
+            i = end;
+            continue;
         }
+        if b[i] == b'@' {
+            return true;
+        }
+        i += 1;
     }
     false
 }

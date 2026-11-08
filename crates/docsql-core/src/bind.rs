@@ -126,24 +126,23 @@ pub fn bind_params(sql: &str, params: &[Value]) -> Result<String, String> {
                 }
                 out.push_str(&sql[start..i]);
             }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                out.push_str(&sql[start..i]);
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let start = i;
-                i += 2;
-                while i < bytes.len() {
-                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        i += 2;
-                        break;
+            b'-' | b'/' => {
+                // A lone `-`/`/` (subtraction, division — e.g. the `LIMIT -1`
+                // the EF provider emits) is not a comment opener: copy one
+                // character. Every arm advances `i` itself (no shared `i += 1`
+                // after this match), so the fallback must move the cursor or
+                // the binding loop spins forever.
+                match crate::stmt::sql_comment_end(bytes, i) {
+                    Some(end) => {
+                        out.push_str(&sql[i..end]);
+                        i = end;
                     }
-                    i += 1;
+                    None => {
+                        let ch_len = sql[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                        out.push_str(&sql[i..i + ch_len]);
+                        i += ch_len;
+                    }
                 }
-                out.push_str(&sql[start..i]);
             }
             b'?' => {
                 let Some(p) = params.get(next) else {
@@ -252,6 +251,26 @@ mod tests {
         assert_eq!(
             bind_params("SELECT [col?], name FROM t WHERE id = ?", &[Value::Int(7)]).unwrap(),
             "SELECT [col?], name FROM t WHERE id = 7"
+        );
+    }
+
+    #[test]
+    fn lone_operators_advance_the_scan() {
+        // The EF provider emits `LIMIT -1 OFFSET ?` for Skip-without-Take.
+        // A bare `-`/`/` is not a comment opener; the scan must step over
+        // it (the comment-skipping arm once left the cursor parked → the
+        // binding loop spun forever and the client timed out).
+        assert_eq!(
+            bind_params(
+                "SELECT id FROM t ORDER BY id LIMIT -1 OFFSET ?",
+                &[Value::Int(5)]
+            )
+            .unwrap(),
+            "SELECT id FROM t ORDER BY id LIMIT -1 OFFSET 5"
+        );
+        assert_eq!(
+            bind_params("SELECT a / ? - ? FROM t", &[Value::Int(2), Value::Int(1)]).unwrap(),
+            "SELECT a / 2 - 1 FROM t"
         );
     }
 

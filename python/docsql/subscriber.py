@@ -498,8 +498,6 @@ class Subscriber:
 
 
 def _from_str(value):
-    if value is None:
-        return "latest"
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    return str(value)
+    """Subscription resume cursor as wire text: ``None`` means "latest";
+    an int is the message id; anything else is already text."""
+    return "latest" if value is None else str(value)

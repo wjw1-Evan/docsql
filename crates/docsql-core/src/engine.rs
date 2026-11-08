@@ -255,7 +255,7 @@ fn pivot_factor(
     let sqlparser::ast::Expr::Function(f) = &agg.expr else {
         return err("PIVOT aggregate must be a function call like SUM(qty)");
     };
-    let agg_name = f.name.to_string().to_uppercase();
+    let agg_name = func_upper(&f.name.to_string());
     let arg_expr = match &f.args {
         sqlparser::ast::FunctionArguments::List(list) if list.args.len() == 1 => {
             match &list.args[0] {
@@ -374,69 +374,37 @@ fn pivot_factor(
 }
 
 /// True when `key` equals `col` or ends with `.col` (schemaless suffix
-/// rule, same as column lookup).
+/// rule, same as column lookup). No per-call `format!` — this runs in the
+/// PIVOT cell loop.
 fn suffix_eq(key: &str, col: &str) -> bool {
-    key == col || key.ends_with(&format!(".{col}"))
+    key == col
+        || (key.len() > col.len()
+            && key.ends_with(col)
+            && key.as_bytes()[key.len() - col.len() - 1] == b'.')
 }
 
 /// SUM/AVG/MIN/MAX/COUNT over evaluated values (PIVOT's local reducer).
 /// Empty input (no rows matched the pivot value, or every matched value is
 /// NULL) follows SQL aggregate semantics: COUNT → 0, everything else → NULL.
+/// The fold is the shared [`AggState`] — this reducer used to hand-mirror
+/// it with drifted rules (MAX kept the LAST tie via `max_by`; SUM folded
+/// through `arith` instead of `add_values`).
 fn reduce_aggregate(name: &str, vals: &[Value]) -> Result<Value> {
-    let non_null: Vec<&Value> = vals.iter().filter(|v| !matches!(v, Value::Null)).collect();
-    match name {
-        "COUNT" | "COUNT_BIG" => Ok(Value::Int(non_null.len() as i64)),
-        "MIN" => Ok(non_null
-            .iter()
-            .min_by(|a, b| Value::cmp_values(a, b))
-            .map(|v| (*v).clone())
-            .unwrap_or(Value::Null)),
-        "MAX" => Ok(non_null
-            .iter()
-            .max_by(|a, b| Value::cmp_values(a, b))
-            .map(|v| (*v).clone())
-            .unwrap_or(Value::Null)),
-        "SUM" | "AVG" => {
-            if non_null.is_empty() {
-                return Ok(Value::Null);
-            }
-            if name == "AVG" {
-                // Mirror eval_agg's AVG (float, or exact when decimal input):
-                // `arith`'s Int/Int Divide truncates, so PIVOT(AVG) used to
-                // disagree with a plain AVG over the same rows.
-                if non_null.iter().any(|v| matches!(v, Value::Decimal(_))) {
-                    let mut acc = Decimal::ZERO;
-                    for v in &non_null {
-                        acc = acc
-                            .checked_add(as_decimal(v)?)
-                            .ok_or_else(|| SqlError::Message("AVG sum overflow".into()))?;
-                    }
-                    return Ok(acc
-                        .checked_div(Decimal::from(non_null.len() as i64))
-                        .map(Value::Decimal)
-                        .unwrap_or(Value::Null));
-                }
-                let n = non_null.len() as f64;
-                let mut acc = 0.0f64;
-                for v in &non_null {
-                    acc += match v {
-                        Value::Int(i) => *i as f64,
-                        Value::Float(f) => *f,
-                        _ => return err("AVG of non-numeric"),
-                    };
-                }
-                return Ok(Value::Float(acc / n));
-            }
-            let mut acc = Value::Int(0);
-            for v in &non_null {
-                acc = arith(acc, &BinaryOperator::Plus, (*v).clone())?;
-            }
-            Ok(acc)
-        }
+    let op = match name {
+        "COUNT" | "COUNT_BIG" => AggOp::Count,
+        "SUM" => AggOp::Sum,
+        "AVG" => AggOp::Avg,
+        "MIN" => AggOp::Min,
+        "MAX" => AggOp::Max,
         other => err(format!(
             "PIVOT aggregate {other} is not supported (SUM/AVG/MIN/MAX/COUNT)"
-        )),
+        ))?,
+    };
+    let mut st = AggState::new(op, None, false, false);
+    for v in vals {
+        st.push(v)?;
     }
+    Ok(st.snapshot())
 }
 
 /// UNPIVOT core: for each row, one output row per listed column with the
@@ -503,7 +471,7 @@ fn qualify(doc: &Object, alias: &str) -> Object {
 pub(crate) fn calls_newid(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Function(f) => {
-            let n = f.name.to_string().to_uppercase();
+            let n = func_upper(&f.name.to_string());
             if matches!(n.as_str(), "NEWID" | "NEWSEQUENTIALID" | "RAND") {
                 return true;
             }
@@ -965,6 +933,13 @@ fn obj_name(name: &ObjectName) -> String {
             other => other.to_string(),
         })
         .unwrap_or_default()
+}
+
+/// Uppercased function name — the ONE normalization every dispatch site
+/// shares (expression eval, aggregates, windows, DDL, EXPLAIN, probes);
+/// the executor used to spell it 13 different ways.
+pub(crate) fn func_upper(name: &str) -> String {
+    name.to_uppercase()
 }
 
 /// True for names that `load_table_factor` resolves to a virtual
@@ -1868,7 +1843,7 @@ fn eval_group_expr(
         SqlExpr::Function(f) => {
             // Scalar function whose arguments may contain aggregates
             // (`COALESCE(SUM(x), 0)`).
-            let name = f.name.to_string().to_uppercase();
+            let name = func_upper(&f.name.to_string());
             if f.over.is_some() {
                 return err(format!("window functions (OVER) are not supported: {name}"));
             }

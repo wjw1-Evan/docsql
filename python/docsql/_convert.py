@@ -143,7 +143,17 @@ def ts_ms(dt):
     driver's Kind=Unspecified handling)."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(round((dt - _EPOCH).total_seconds() * 1000.0))
+    # Integer arithmetic with ROUND-HALF-TO-EVEN, matching the previous
+    # round(total_seconds()*1000) contract exactly: the 9999-12-31 23:59:59
+    # .999999 edge must still round UP to 1000ms (over the engine's domain
+    # upper bound, so the client refuses it instead of silently storing
+    # text). total_seconds()*1000.0 loses microseconds at large dates
+    # (float ULP); divmod keeps the half-even rule on exact integers.
+    us = (dt - _EPOCH) // timedelta(microseconds=1)
+    ms, rem = divmod(us, 1000)
+    if rem > 500 or (rem == 500 and ms % 2 == 1):
+        ms += 1
+    return ms
 
 
 def param_json(value):

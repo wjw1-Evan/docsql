@@ -336,6 +336,11 @@ pub(super) fn walk_expr(
 /// catalog table but not one of the query's own FROM names/aliases — the
 /// correlated-reference shape. Unqualified outer references cannot be told
 /// apart from legitimate schemaless fields, so only qualified ones flag.
+/// The walk rides the authoritative [`child_exprs`]: a qualified outer
+/// reference under ANY wrapper node (BinaryOp/CASE/SUBSTRING/…) is still a
+/// correlation, and missing it let the subquery fall back to the schemaless
+/// NULL read. Subquery bodies are separate trees — their correlations
+/// resolve at their own level and are not children.
 pub(super) fn collect_correlated_refs(
     e: &SqlExpr,
     from_names: &std::collections::BTreeSet<String>,
@@ -351,54 +356,6 @@ pub(super) fn collect_correlated_refs(
                 }
             }
         }
-        SqlExpr::BinaryOp { left, right, .. } => {
-            collect_correlated_refs(left, from_names, catalog, hits);
-            collect_correlated_refs(right, from_names, catalog, hits);
-        }
-        SqlExpr::UnaryOp { expr, .. } => collect_correlated_refs(expr, from_names, catalog, hits),
-        SqlExpr::Nested(inner) => collect_correlated_refs(inner, from_names, catalog, hits),
-        SqlExpr::Between {
-            expr, low, high, ..
-        } => {
-            collect_correlated_refs(expr, from_names, catalog, hits);
-            collect_correlated_refs(low, from_names, catalog, hits);
-            collect_correlated_refs(high, from_names, catalog, hits);
-        }
-        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
-            collect_correlated_refs(expr, from_names, catalog, hits);
-            collect_correlated_refs(pattern, from_names, catalog, hits);
-        }
-        SqlExpr::InList { expr, list, .. } => {
-            collect_correlated_refs(expr, from_names, catalog, hits);
-            for item in list {
-                collect_correlated_refs(item, from_names, catalog, hits);
-            }
-        }
-        SqlExpr::InSubquery { expr, .. } => {
-            collect_correlated_refs(expr, from_names, catalog, hits);
-        }
-        SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
-                collect_correlated_refs(op, from_names, catalog, hits);
-            }
-            for w in conditions {
-                collect_correlated_refs(&w.condition, from_names, catalog, hits);
-                collect_correlated_refs(&w.result, from_names, catalog, hits);
-            }
-            if let Some(el) = else_result {
-                collect_correlated_refs(el, from_names, catalog, hits);
-            }
-        }
-        SqlExpr::Cast { expr, .. } => collect_correlated_refs(expr, from_names, catalog, hits),
-        // Shared traversal (mirror of expr_mentions_outer): a qualified outer
-        // reference under a wrapper node (IS NULL/SUBSTRING/…) is still a
-        // correlation; missing it let the subquery fall back to the
-        // schemaless NULL read.
         _ => {
             for c in child_exprs(e) {
                 collect_correlated_refs(c, from_names, catalog, hits);

@@ -443,6 +443,14 @@ pub(crate) struct TableMeta {
     pub(super) defaults: Vec<(String, String)>,
     /// CHECK constraint expressions as SQL text (column- or table-level).
     pub(super) checks: Vec<String>,
+    /// Parse cache for `checks`, keyed by the stored text. The catalog
+    /// round trip keeps TEXT only, and `TableMeta::check` used to re-run
+    /// the full sqlparser parse PER ROW PER CONSTRAINT — DML on a
+    /// CHECK-constrained table paid the parser setup on every document.
+    /// The field is never serialized (rebuilt from `checks` on first use);
+    /// clones start empty and re-parse, and entries are keyed by text so a
+    /// later catalog mutation can never serve another table's parse.
+    pub(super) check_cache: std::sync::OnceLock<std::collections::BTreeMap<String, SqlExpr>>,
     /// Foreign keys with their referential actions.
     pub(super) foreign_keys: Vec<FkRef>,
     /// Indexed column -> B+ tree root page. PRIMARY KEY and UNIQUE columns
@@ -558,14 +566,27 @@ impl TableMeta {
             }
         }
         for text in &self.checks {
-            let e = parse_expr_text(text)?;
+            // The parsed body comes from the per-table parse cache (a full
+            // sqlparser pass per row per constraint used to sit here).
+            let cache = self.check_cache.get_or_init(|| {
+                self.checks
+                    .iter()
+                    .filter_map(|t| parse_expr_text(t).ok().map(|e| (t.clone(), e)))
+                    .collect()
+            });
+            let e = match cache.get(text) {
+                Some(e) => e,
+                // A body that fails to parse stays uncached: every row
+                // surfaces the same loud error instead of a stale default.
+                None => &parse_expr_text(text)?,
+            };
             // SQL three-valued CHECK semantics: only FALSE rejects; unknown
             // (a NULL operand) passes. A syntactic "any NULL column ref"
             // shortcut is wrong in both directions (`a BETWEEN …` with NULL
             // was rejected, `a > 0 AND b > 0` with one NULL accepted a
             // false conjunct), so the expression is evaluated with proper
             // unknown propagation.
-            if matches!(check_expr_outcome(&e, doc)?, CheckOutcome::Fail) {
+            if matches!(check_expr_outcome(e, doc)?, CheckOutcome::Fail) {
                 return err(format!("CHECK constraint failed on {}: {text}", self.name));
             }
         }
@@ -733,6 +754,9 @@ macro_rules! each_child_expr {
                     $($f)*(c);
                 }
             }
+            // The compared side of `x IN (SELECT …)` is an expression child;
+            // the subquery body is a separate tree (its own walkers own it).
+            SqlExpr::InSubquery { expr, .. } => $($f)*(expr),
             SqlExpr::InUnnest { expr, array_expr, .. } => {
                 $($f)*(expr);
                 $($f)*(array_expr);

@@ -20,6 +20,7 @@
 
 use crate::engine::{Database, ExecOutcome, SqlError};
 use crate::kdf;
+use crate::stmt;
 use crate::value::Object;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -282,50 +283,25 @@ fn find_top_level_word(sql: &str, word: &str, from: usize, last: bool) -> Option
     let mut depth = 0usize;
     let mut hit: Option<usize> = None;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                // '' is the escaped quote (SQL doubling).
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\'' {
-                        if b.get(i + 1) == Some(&b'\'') {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'"' {
-                        if b.get(i + 1) == Some(&b'"') {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
+        if b[i] == b'\'' {
+            let (end, _) = stmt::sql_literal_end(sql, i);
+            i = end;
+            continue;
+        }
+        if b[i] == b'"' {
+            // Same doubling rule the shared quoted-ident helper applies.
+            i = stmt::sql_quoted_ident_end(b, i).unwrap_or(b.len());
+            continue;
+        }
+        if let Some(end) = stmt::sql_comment_end(b, i) {
             // Comments are opaque: a TO inside one (`GRANT … WHERE x = 1
             // /* TO ghost */ TO alice`) must not count as the clause
             // marker — the mis-split turned a legal grant into a parse
             // error. Same skip the to_at scanner already applies.
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let mut j = i + 2;
-                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                    j += 1;
-                }
-                i = if j + 1 < b.len() { j + 2 } else { b.len() };
-            }
+            i = end;
+            continue;
+        }
+        match b[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             _ if depth == 0 && is_word_start(b, i) => {
@@ -1035,6 +1011,36 @@ fn err_str(m: String) -> SqlError {
     SqlError::Message(m)
 }
 
+/// True when `name` matches the user/role CHARSET (1-64 chars,
+/// `[a-zA-Z_][a-zA-Z0-9_$]*`). Charset only, no CREATE-time vetoes: the
+/// console validates existing names (including grants TO a built-in role
+/// like `readonly`) with the same rule the engine's parser enforces.
+pub fn valid_ident(name: &str) -> bool {
+    charset_ok(name)
+}
+
+/// True when `name` is a legal user/role name INCLUDING the CREATE-time
+/// vetoes (built-in role names, privilege keywords). The login gate and
+/// the console's user page used to re-spell the charset; a drifted copy
+/// would accept a name the engine's own parser refuses.
+pub fn valid_username(name: &str) -> bool {
+    validate_name(name).is_ok()
+}
+
+/// The one charset rule every user/role name must satisfy.
+fn charset_ok(name: &str) -> bool {
+    let n = name.len();
+    if n == 0 || n > 64 {
+        return false;
+    }
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 fn validate_name(name: &str) -> Result<(), String> {
     let n = name.len();
     if n == 0 || n > 64 {
@@ -1169,43 +1175,20 @@ fn grant_priv_row(
     // SELECT grant and a SELECT(id)-with-filter grant are DIFFERENT
     // privilege sets (the plain one voids the restrictions at resolve
     // time), so re-granting one must not swallow the other. Plain rows
-    // dedup against plain rows; qualified rows carry their full shape.
+    // dedup against plain rows (no cols/filter at all); qualified rows
+    // carry their full shape. One dedup+insert path serves both shapes.
     let plain: Vec<(&str, &str)> = fields.iter().take(3).copied().collect();
-    if cols.is_empty() && row_filter.is_none() {
-        let rows = table_rows(db, GRANTS_TABLE);
-        let duplicate = rows.iter().any(|d| {
-            plain
-                .iter()
-                .all(|(c, v)| d.get(*c).and_then(|x| x.as_str()) == Some(*v))
-                && d.get("cols").is_none()
-                && d.get("filter").is_none()
-        });
-        if duplicate {
-            return Ok(());
-        }
-        let names = fields
-            .iter()
-            .map(|(c, _)| *c)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let values = fields
-            .iter()
-            .map(|(_, v)| lit(v))
-            .collect::<Vec<_>>()
-            .join(", ");
-        db.execute(&format!(
-            "INSERT INTO {} ({names}) VALUES ({values})",
-            q(GRANTS_TABLE)
-        ))?;
-        return Ok(());
-    }
     let rows = table_rows(db, GRANTS_TABLE);
     let duplicate = rows.iter().any(|d| {
         plain
             .iter()
             .all(|(c, v)| d.get(*c).and_then(|x| x.as_str()) == Some(*v))
-            && d.get("cols").and_then(|x| x.as_str()) == cols_json.as_deref()
-            && d.get("filter").and_then(|x| x.as_str()) == row_filter
+            && if cols.is_empty() && row_filter.is_none() {
+                d.get("cols").is_none() && d.get("filter").is_none()
+            } else {
+                d.get("cols").and_then(|x| x.as_str()) == cols_json.as_deref()
+                    && d.get("filter").and_then(|x| x.as_str()) == row_filter
+            }
     });
     if duplicate {
         return Ok(());

@@ -15,87 +15,27 @@ pub(super) fn expr_name(e: &SqlExpr) -> String {
 /// Column references of a CHECK constraint expression (bare identifiers and
 /// the leaf of qualified names). Subqueries are rejected outright — the
 /// runtime evaluator resolves unknown columns to NULL, so without this DDL
-/// gate a typo'd CHECK would be created and never fire.
+/// gate a typo'd CHECK would be created and never fire. The walk rides the
+/// authoritative [`child_exprs`] instead of a hand-mirrored arm list: the
+/// old copy's `_ => Ok(())` tail silently skipped unknown wrapper nodes
+/// (a subquery hidden inside one was accepted at DDL and never fired).
 pub(super) fn check_expr_column_refs(e: &SqlExpr, out: &mut Vec<String>) -> Result<()> {
-    use SqlExpr::*;
     match e {
-        Identifier(i) => {
-            out.push(i.value.clone());
-            Ok(())
+        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => {
+            return err("CHECK constraints cannot contain subqueries");
         }
-        CompoundIdentifier(parts) => {
+        SqlExpr::Identifier(i) => out.push(i.value.clone()),
+        SqlExpr::CompoundIdentifier(parts) => {
             if let Some(last) = parts.last() {
                 out.push(last.value.clone());
             }
-            Ok(())
         }
-        Value(_) | TypedString { .. } => Ok(()),
-        Nested(i) | IsNull(i) | IsNotNull(i) | Cast { expr: i, .. } => {
-            check_expr_column_refs(i, out)
-        }
-        UnaryOp { expr, .. } => check_expr_column_refs(expr, out),
-        BinaryOp { left, right, .. } => {
-            check_expr_column_refs(left, out)?;
-            check_expr_column_refs(right, out)
-        }
-        IsDistinctFrom(a, b) | IsNotDistinctFrom(a, b) => {
-            check_expr_column_refs(a, out)?;
-            check_expr_column_refs(b, out)
-        }
-        Between {
-            expr, low, high, ..
-        } => {
-            check_expr_column_refs(expr, out)?;
-            check_expr_column_refs(low, out)?;
-            check_expr_column_refs(high, out)
-        }
-        Like { expr, pattern, .. } | ILike { expr, pattern, .. } => {
-            check_expr_column_refs(expr, out)?;
-            check_expr_column_refs(pattern, out)
-        }
-        InList { expr, list, .. } => {
-            check_expr_column_refs(expr, out)?;
-            for item in list {
-                check_expr_column_refs(item, out)?;
-            }
-            Ok(())
-        }
-        Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(o) = operand {
-                check_expr_column_refs(o, out)?;
-            }
-            for w in conditions {
-                check_expr_column_refs(&w.condition, out)?;
-                check_expr_column_refs(&w.result, out)?;
-            }
-            if let Some(r) = else_result {
-                check_expr_column_refs(r, out)?;
-            }
-            Ok(())
-        }
-        Function(f) => {
-            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
-                for a in &list.args {
-                    if let sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(inner),
-                    ) = a
-                    {
-                        check_expr_column_refs(inner, out)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        Subquery(_) | Exists { .. } | InSubquery { .. } => {
-            err("CHECK constraints cannot contain subqueries")
-        }
-        _ => Ok(()),
+        _ => {}
     }
+    for c in child_exprs(e) {
+        check_expr_column_refs(c, out)?;
+    }
+    Ok(())
 }
 
 /// Encoded identity of a document (UPDATE ... FROM / DELETE ... USING match

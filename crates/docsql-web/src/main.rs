@@ -85,33 +85,14 @@ fn config_from_env(
     // Fail fast on a nonsensical override (the consumer is
     // docsql_core::kdf's once-read iterations setting).
     if let Some(raw) = getenv("DOCSQL_PBKDF2_ITERATIONS") {
-        let n: u64 = raw
-            .trim()
-            .parse()
-            .map_err(|_| "DOCSQL_PBKDF2_ITERATIONS must be an integer".to_string())?;
-        if n == 0 || n > docsql_core::kdf::MAX_PBKDF2_ITERATIONS as u64 {
-            return Err(format!(
-                "DOCSQL_PBKDF2_ITERATIONS must be 1..={}",
-                docsql_core::kdf::MAX_PBKDF2_ITERATIONS
-            ));
-        }
+        docsql_core::kdf::validate_pbkdf2_iterations(&raw)?;
     }
     let tls = tls_from_env(&getenv)?;
     // Outbound node TLS: same env contract as the nodes themselves, so one
     // compose environment turns the whole fleet TLS-only. Strict boolean
     // spellings (a typo must refuse startup, not silently dial plaintext).
-    let tls_connect = match getenv("DOCSQL_TLS_CONNECT") {
-        Some(v) if !v.trim().is_empty() => match v.trim() {
-            "1" | "true" => true,
-            "0" | "false" => false,
-            other => {
-                return Err(format!(
-                    "DOCSQL_TLS_CONNECT: invalid boolean value {other:?} (expected 1/0/true/false)"
-                ))
-            }
-        },
-        _ => false,
-    };
+    let tls_connect =
+        docsql_core::envx::env_bool("DOCSQL_TLS_CONNECT", getenv("DOCSQL_TLS_CONNECT"))?;
     let tls_ca = getenv("DOCSQL_TLS_CA").filter(|p| !p.is_empty());
     Ok(WebCfg {
         listen,

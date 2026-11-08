@@ -246,11 +246,15 @@ impl<'a> ReadCx<'a> {
         };
         let meta = self.tables.get(tname).expect("caller resolved the table");
         let ctes = Ctes::new();
-        let fast_eligible = !is_aggregate
-            && !rownum_wanted
-            && select.having.is_none()
-            && distinct_all
-            && !has_window;
+        // The exact predicate the executor gates the window fast paths on:
+        // a hand mirror used to drift and make EXPLAIN lie about the plan.
+        let fast_eligible = super::select::fast_window_eligible(
+            select,
+            is_aggregate,
+            rownum_wanted,
+            distinct_all,
+            has_window,
+        );
         if fast_eligible {
             if let Some(p) = self.ordered_window_plan(
                 select,

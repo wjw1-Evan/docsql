@@ -2,6 +2,64 @@ using Docsql.Client;
 using System.Data.Common;
 using Xunit;
 
+/// Shared docsql-server launcher for this test project — the per-file
+/// copies (12+ 份) drifted in error wording and budgets; one helper, the
+/// per-test environment rides an `Action<ProcessStartInfo>` (ASYNC_COMMIT/
+/// LOG_FILE/KEY/PEERS…). ProcessStartInfo + ArgumentList 形态是既定约定,
+/// 保持不变。
+internal static class TestServers
+{
+    /// 系统分配空闲端口:测试类并行运行时随机区间端口会碰撞。
+    internal static int FreePort()
+    {
+        using var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        var port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
+        return port;
+    }
+
+    internal static string FindServer()
+    {
+        var exe = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory, "..", "..", "..", "..", "..",
+            "target", "debug", "docsql-server"));
+        Assert.True(File.Exists(exe), $"server binary not found at {exe}");
+        return exe;
+    }
+
+    /// Poll until `port` accepts TCP (100 × 50ms budget, shared shape).
+    internal static void WaitReady(int port, string label)
+    {
+        for (int i = 0; i < 100; i++)
+        {
+            try { using var c = new System.Net.Sockets.TcpClient("127.0.0.1", port); return; }
+            catch { Thread.Sleep(50); }
+        }
+        throw new InvalidOperationException($"{label} on port {port} never came up");
+    }
+
+    /// Fresh temp db on a free port; `env` injects per-test environment.
+    internal static (System.Diagnostics.Process Proc, int Port) Start(
+        string name, Action<System.Diagnostics.ProcessStartInfo>? env = null)
+    {
+        var port = FreePort();
+        var db = Path.Combine(Path.GetTempPath(), $"docsql-{name}-{port}.db");
+        try { File.Delete(db); } catch { }
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = FindServer(),
+            ArgumentList = { db, $"127.0.0.1:{port}" },
+            CreateNoWindow = true,
+            RedirectStandardError = false,
+        };
+        env?.Invoke(psi);
+        var proc = System.Diagnostics.Process.Start(psi)!;
+        WaitReady(port, "server");
+        return (proc, port);
+    }
+}
+
 public sealed class ServerFixture : IDisposable
 {
     public int Port { get; }
@@ -9,42 +67,7 @@ public sealed class ServerFixture : IDisposable
 
     public ServerFixture()
     {
-        // 系统分配空闲端口:测试类并行运行时随机区间端口会碰撞。
-        using var l = new System.Net.Sockets.TcpListener(
-            System.Net.IPAddress.Loopback, 0);
-        l.Start();
-        Port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        var tmp = Path.Combine(Path.GetTempPath(), $"docsql-adonet-{Port}.db");
-        try { File.Delete(tmp); } catch { }
-        var exe = FindServer();
-        _proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-        {
-            FileName = exe,
-            ArgumentList = { tmp, $"127.0.0.1:{Port}" },
-            CreateNoWindow = true,
-            RedirectStandardError = false,
-        })!;
-        // wait for port
-        for (int i = 0; i < 100; i++)
-        {
-            try
-            {
-                using var c = new System.Net.Sockets.TcpClient("127.0.0.1", Port);
-                return;
-            }
-            catch { Thread.Sleep(50); }
-        }
-        throw new InvalidOperationException("server did not start");
-    }
-
-    private static string FindServer()
-    {
-        var exe = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..",
-                "target", "debug", "docsql-server"));
-        Assert.True(File.Exists(exe), $"server binary not found at {exe}");
-        return exe;
+        (_proc, Port) = TestServers.Start("adonet");
     }
 
     public void Dispose()
