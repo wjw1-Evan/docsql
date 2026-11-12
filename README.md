@@ -169,6 +169,9 @@ cd dotnet && dotnet test          # 改 dotnet/协议时另需先 cargo build -p
 # Python 驱动(DB-API 2.0;pytest 起真实 server,先 cargo build -p docsql-server)
 cd python && python3 -m venv .venv && .venv/bin/pip install -q ".[crypto]" pytest
 .venv/bin/python -m pytest tests -q
+
+# Java JDBC 驱动(零依赖直构;run-tests.sh 自动 cargo build 起真实 server)
+(cd java && ./run-tests.sh)
 ```
 
 CI 执行 Rust 门禁 + 覆盖率回归 + .NET 套件,然后发布多架构镜像并在 main 分支跑部署测试(Python 驱动套件目前只在本地门禁中运行)。构建、门禁与覆盖率细节见[贡献指南](CONTRIBUTING.md);架构约束与红线见 [AGENTS.md](AGENTS.md)。

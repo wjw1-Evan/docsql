@@ -34,6 +34,9 @@ python/build/
 python/dist/
 python/*.egg-info/
 
+# Java driver build artifacts
+java/build/
+
 # NuGet native payloads are populated by .github/workflows/nuget-publish.yml
 # from the release artifacts; never commit platform binaries.
 dotnet/Docsql.Client/runtimes/

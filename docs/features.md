@@ -419,6 +419,7 @@ REST API(账号门激活时:会话 Cookie 或 `X-Docsql-Token` 程序化旁路;�
 | Aspire | `AddDocsql` / `AddDocsqlCluster` / `WithWebConsole` / `WithDataVolume` + 消费侧 `AddDocsqlConnection` / `AddDocsqlDbContext`;见 [Aspire 指南](aspire.md) |
 | CLI(`docsql-cli`) | 嵌入式(直接开数据文件)与远程 shell;`--csv`/`--json` 导出;`-f script.sql` 批量(快速失败);内联 pub/sub 命令;`--user` 登录(密码走环境/提示) |
 | Python(`python/`,DB-API 2.0) | 纯标准库 DB-API 2.0 驱动:事务默认启用(`autocommit=False`,PEP 249;单实例/单节点同样支持,可显式 `autocommit=True` 逐语句提交)、`qmark` 参数**服务端绑定**、`Decimal`↔DECIMAL(`$dec`)、UTC `datetime`↔TIMESTAMP(`$ts`)、`bytes`↔BLOB(`$bytes`)、原生 TLS(stdlib ssl,`tls_ca` 可选验证)、原生 pub/sub `Subscriber`(专用连接 + 专职读线程 + 断线按最后 id 续传)、`DOCSQL_KEY` 帧加密(`cryptography` 选装);pytest 套件起真实 server 全绿(用例见 `python/tests/`) |
+| Java(`java/`,JDBC) | 零第三方依赖 JDBC 驱动(Java 8 字节码):`jdbc:docsql://host:port?token=…` DriverManager 自动发现、qmark 服务端绑定(`REQ_PREPARE/REQ_EXECUTE`)、`BigDecimal`↔DECIMAL(`$dec`)、`Timestamp`↔TIMESTAMP(`$ts`)、`byte[]`↔BLOB(`$bytes`)、原生 TLS + `DOCSQL_KEY` 帧加密(JDK 自带 javax.net.ssl/javax.crypto,JSON 编解码手写)、原生 pub/sub `Subscriber`(专用连接 + 读线程 + 断线按最后 id 续传)、事务 + SAVEPOINT、`getTables/getColumns` 真查询 sqlite_master;测试 = 81 单元 + 66 e2e 起真实 server(`java/run-tests.sh`) |
 | 线协议(自研驱动) | v1 二进制一句话一帧;`REQ_PREPARE/REQ_EXECUTE/REQ_CLOSE_STMT` 服务端绑定;复制帧、`REQ_STATUS`、`REQ_BACKUP`、订阅帧;参数支持 `$dec`/`$bytes` 精确标记;帧定义见 `crates/docsql-core/src/proto.rs` 模块头 |
 
 ## 11. 可观测性

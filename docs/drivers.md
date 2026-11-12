@@ -346,6 +346,18 @@ using var mem = new DocsqlConnection("Data Source=:memory:");
 - 安全模型与 SQLite 一致:**能加载库的进程 = 全库权限**(本地嵌入没有 token/用户概念;
   文件权限 0600 由引擎创建时保证)。
 
+## Java JDBC(io.docsql)
+
+零第三方依赖的 JDBC 驱动(Java 8 字节码,`java/build.sh` 产出 jar;TLS 与 AES-GCM 走 JDK 自带库,JSON 编解码手写)。DriverManager 自动发现(`META-INF/services/java.sql.Driver`),连接串:
+
+    jdbc:docsql://host:port?token=…&user=…&password=…&tls=true&tlsCa=/path/ca.pem&tlsHostname=localhost&key=<64hex>&timeout=15&autocommit=false
+
+- 参数语义与 .NET/Python 同源:超时报错后连接已毒化须重连;`$dec/$ts/$bytes/$float` 精确标量标记双向对称(`BigDecimal`↔DECIMAL、`java.sql.Timestamp`↔TIMESTAMP、`byte[]`↔BLOB);`setAutoCommit(true)` 时若有未决块则先 COMMIT(JDBC 语义);SAVEPOINT 映射 `SAVEPOINT`/`ROLLBACK TO SAVEPOINT` SQL。
+- qmark 服务端绑定:模板经 `REQ_PREPARE` 注册(每连接句柄缓存,容量 96 溢出清空)、值经 REQ_EXECUTE 服务端渲染,绑定值永远进不了字面量。
+- 原生 API:`io.docsql.DocsqlConnection`/`Subscriber`/`ConnectConfig.builder()…build()` 与 JDBC 层共享同一协议核心(publish/status/ping(reconnect) 也都在);pub/sub 订阅连接必须专用 + 专职读线程。
+- 测试:81 单元(无 server)+ 66 e2e 起真实 server(平文/TLS/DOCSQL_KEY/匿名四形态),`java/run-tests.sh` 一键;CI 暂未包含(与 Python 驱动一致)。
+- 构建:零 Maven/Gradle 依赖(javac + jar,零第三方依赖 = 信创友好);JDK 17 编译 `--release 8` 字节码。
+
 ## 从其他数据库切换
 
 **EF Core 应用**:把 `UseSqlServer` / `UseMySql` / `UseSqlite` 换成 `UseDocsql`,连接串换成
@@ -369,7 +381,7 @@ Oracle(`NVL`/`DUAL`/`ROWNUM`/`SYSDATE`)均有用例;拒绝面(表选项、`ON UP
 
 > **线协议现实**:DocSQL 使用自有 v1 二进制协议。使用 `Microsoft.Data.SqlClient` /
 > `MySqlConnector` / `Npgsql` / `Microsoft.Data.Sqlite` 等**第三方驱动**的程序无法仅靠
-> 连接串切换——需要换成 `Docsql.Client`(或 Python DB-API / CLI / REST),这一步是驱动级
+> 连接串切换——需要换成 `Docsql.Client`(或 Python DB-API / **Java JDBC** / CLI / REST),这一步是驱动级
 > 改动,不是 SQL 级改动。DocSQL 不模拟 Postgres/MySQL 线协议。
 
 ## 驱动作者:线协议参数化

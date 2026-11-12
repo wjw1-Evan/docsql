@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新组件:Java JDBC 驱动(java/)
+
+- **零第三方依赖 JDBC 驱动(Java 8 字节码)**:`jdbc:docsql://host:port?token=…` DriverManager
+  自动发现;qmark **服务端绑定**(`REQ_PREPARE/REQ_EXECUTE`,每连接句柄缓存,值永远进不了字面量);
+  `BigDecimal`↔DECIMAL、`java.sql.Timestamp`↔TIMESTAMP、`byte[]`↔BLOB 与 `$dec/$ts/$bytes/$float`
+  精确标记双向对称;原生 TLS + `DOCSQL_KEY` AES-256-GCM 帧加密(JDK 自带 javax.net.ssl/javax.crypto,
+  JSON 编解码手写零依赖);原生 pub/sub `Subscriber`(专用连接 + 专职读线程、断线自动重订、按最后 id 续传);
+  事务(块首自动 BEGIN,`setAutoCommit(true)` 提交未决块)+ SAVEPOINT;`getTables/getColumns`
+  真查询 sqlite_master。超时毒化、RESP_PUSH 跳过、nonce 重放守卫等协议纪律与 Python/.NET 驱动同源。
+- **测试**:81 单元(帧/JSON/值编码/AES-GCM AAD 与重放守卫/错误映射/URL 解析,无需 server)+
+  66 e2e(真实 server 四形态:平文/TLS/DOCSQL_KEY/匿名;basic/tx/bind/TLS/pubsub 三套/auth/JDBC
+  元数据/SAVEPOINT),`java/run-tests.sh` 一键(自动 cargo build;`DOCSQL_SKIP_CARGO_BUILD=1` 跳过)。
+- **构建**:零 Maven/Gradle 依赖(javac + jar 直构;JDK 17 编译 `--release 8` 字节码;信创友好)。
+  CI 暂未包含 Java 套件(与 Python 驱动一致,本地门禁运行)。
+- **文档**:drivers.md 新增 Java JDBC 节 + 切换指南、features 驱动矩阵、java/README。
+
 ### 性能与通用化重构(行为语义不变,由既有测试网护航)
 
 - **引擎 CHECK 约束解析缓存**:约束体解析结果按文本缓存在表元数据
